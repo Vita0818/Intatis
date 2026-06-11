@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Mac App Store build: sandboxed. Covers Chat (v0.1) and, with libgit2
+         in-process, Code/Cowork read/search/diff/patch. run_shell is NOT
+         possible here (no entitlement exists) — that is the only capability
+         deferred to the Developer-ID build. See ARCHITECTURE.md §9.1. -->
+    <key>com.apple.security.app-sandbox</key>
+    <true/>
+
+    <!-- Call the model API. -->
+    <key>com.apple.security.network.client</key>
+    <true/>
+
+    <!-- User-selected workspace folders, persisted via security-scoped bookmarks. -->
+    <key>com.apple.security.files.user-selected.read-write</key>
+    <true/>
+    <key>com.apple.security.files.bookmarks.app-scope</key>
+    <true/>
+</dict>
+</plist>
