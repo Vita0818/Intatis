@@ -4,6 +4,8 @@ import Combine
 import IntatisCore
 import IntatisProviders
 import IntatisConversation
+import IntatisArtifacts
+import IntatisMultimodal
 import IntatisSharedUI
 
 /// Wires the v0.1 stack: keychain-backed provider registry + per-session event
@@ -13,6 +15,7 @@ final class AppEnvironment: ObservableObject {
     let registry: ProviderRegistry
     let log: EventLog
     let viewModel: ChatViewModel
+    let multimodal: MultimodalService
     @Published var needsAPIKey: Bool
 
     private let keychain: KeychainStore
@@ -31,8 +34,28 @@ final class AppEnvironment: ObservableObject {
         } catch {
             fatalError("Failed to open event log: \(error)")
         }
+        let store: ArtifactStore
+        do {
+            store = try ArtifactStore(root: AppConfig.appSupportDir()
+                .appendingPathComponent(AppConfig.defaultSession.rawValue, isDirectory: true)
+                .appendingPathComponent("artifacts", isDirectory: true))
+        } catch {
+            fatalError("Failed to open artifact store: \(error)")
+        }
+        self.multimodal = MultimodalService(log: log, store: store)
         self.viewModel = ChatViewModel(log: log, registry: registry)
         self.needsAPIKey = (try? keychain.get(account: AppConfig.keychainAccount)) == nil
+
+        // Wire image generation: prompt → MultimodalService → artifact_added → UI.
+        let reg = registry
+        let mm = multimodal
+        viewModel.onGenerateImage = { prompt in
+            Task { @MainActor in
+                guard let provider = try? await reg.defaultImageProvider(),
+                      let model = await reg.imageModel() else { return }
+                _ = try? await mm.generateImage(using: provider, model: model, prompt: prompt)
+            }
+        }
     }
 
     func saveAPIKey(_ key: String) {
@@ -50,9 +73,18 @@ final class AppEnvironment: ObservableObject {
         }
         return CodeViewModel(workspaceRoot: workspace, log: codeLog, registry: registry)
     }
+
+    /// Build a fresh multi-agent Cowork session.
+    func makeCoworkViewModel() -> CoworkViewModel? {
+        let session = SessionID(rawValue: IDGen.random(prefix: "cowork"))
+        guard let coworkLog = try? EventLog(session: session, fileURL: AppConfig.sessionFile(session)) else {
+            return nil
+        }
+        return CoworkViewModel(log: coworkLog, registry: registry)
+    }
 }
 
-enum AppMode: Hashable { case chat, code }
+enum AppMode: Hashable { case chat, code, cowork }
 
 struct RootView: View {
     @EnvironmentObject var env: AppEnvironment
@@ -65,14 +97,16 @@ struct RootView: View {
             switch mode {
             case .chat: ThreeColumnShell(model: env.viewModel)
             case .code: CodeContainer(env: env)
+            case .cowork: CoworkContainer(env: env)
             }
         }
         .toolbar {
-            if PlatformProfile.current.supports(.code) {
+            if PlatformProfile.current.supports(.code) || PlatformProfile.current.supports(.cowork) {
                 ToolbarItem(placement: .principal) {
                     Picker("Mode", selection: $mode) {
                         Text("Chat").tag(AppMode.chat)
-                        Text("Code").tag(AppMode.code)
+                        if PlatformProfile.current.supports(.code) { Text("Code").tag(AppMode.code) }
+                        if PlatformProfile.current.supports(.cowork) { Text("Cowork").tag(AppMode.cowork) }
                     }
                     .pickerStyle(.segmented)
                 }
@@ -145,6 +179,66 @@ struct CodeSessionView: View {
                   onSend: { vm.send() },
                   onResolve: { vm.resolvePermission($0) })
             .task { vm.start() }
+    }
+}
+
+struct CoworkContainer: View {
+    @ObservedObject var env: AppEnvironment
+    @State private var coworkVM: CoworkViewModel?
+
+    var body: some View {
+        if let vm = coworkVM {
+            CoworkSessionView(vm: vm)
+        } else {
+            VStack(spacing: 12) {
+                Image(systemName: "person.2").font(.largeTitle).foregroundStyle(.secondary)
+                Text("Start a Cowork session").font(.headline)
+                Button("New Cowork Session") { coworkVM = env.makeCoworkViewModel() }
+                    .keyboardShortcut("n")
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+}
+
+struct CoworkSessionView: View {
+    @ObservedObject var vm: CoworkViewModel
+    @State private var showAdd = false
+    @State private var agentName = ""
+
+    var body: some View {
+        CoworkShell(items: vm.items,
+                    agents: vm.agents,
+                    pending: vm.pendingPermission,
+                    isWorking: vm.isWorking,
+                    input: $vm.input,
+                    onSend: { vm.send() },
+                    onResolve: { vm.resolvePermission($0) },
+                    onAddAgent: { showAdd = true })
+            .task { vm.start() }
+            .sheet(isPresented: $showAdd) { addAgentSheet }
+    }
+
+    private var addAgentSheet: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Add agent").font(.headline)
+            TextField("Name (e.g. Rokurics)", text: $agentName).textFieldStyle(.roundedBorder)
+            HStack {
+                Spacer()
+                Button("Cancel") { showAdd = false }
+                Button("Choose Folder & Add") {
+                    let name = agentName.trimmingCharacters(in: .whitespaces)
+                    if !name.isEmpty, let url = WorkspaceAccess.choose() {
+                        vm.addAgent(name: name, workspace: url)
+                    }
+                    agentName = ""
+                    showAdd = false
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 360)
     }
 }
 

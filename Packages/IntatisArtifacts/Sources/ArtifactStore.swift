@@ -56,6 +56,11 @@ public actor ArtifactStore {
         index.values.sorted { $0.createdAt < $1.createdAt }
     }
 
+    /// Absolute on-disk URL for an artifact. `nonisolated` because `root` is immutable.
+    public nonisolated func absoluteURL(for ref: ArtifactRef) -> URL {
+        root.appendingPathComponent(ref.path)
+    }
+
     // MARK: - Private
 
     private func persist() throws {

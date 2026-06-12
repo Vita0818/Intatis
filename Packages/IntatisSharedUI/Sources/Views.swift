@@ -22,7 +22,7 @@ public struct ThreeColumnShell: View {
             ThreadView(model: model)
                 .navigationSplitViewColumnWidth(min: 360, ideal: 560)
         } detail: {
-            InspectorView(messages: model.messages, isStreaming: model.isStreaming)
+            InspectorView(messages: model.messages, isStreaming: model.isStreaming, artifacts: model.artifacts)
                 .navigationSplitViewColumnWidth(min: 240, ideal: 300)
         }
         .task { model.start() }
@@ -144,6 +144,14 @@ struct ComposerView: View {
                 .lineLimit(1...6)
                 .onSubmit { model.send() }
             Button {
+                model.generateImage()
+            } label: {
+                Image(systemName: "photo").font(.title3)
+            }
+            .buttonStyle(.plain)
+            .help("Generate image from prompt")
+            .disabled(model.isStreaming || model.input.trimmingCharacters(in: .whitespaces).isEmpty)
+            Button {
                 model.send()
             } label: {
                 Image(systemName: "arrow.up.circle.fill").font(.title2)
@@ -160,19 +168,17 @@ struct ComposerView: View {
 struct InspectorView: View {
     let messages: [ChatMessageView]
     let isStreaming: Bool
+    let artifacts: [ArtifactCardInfo]
 
     var body: some View {
         List {
             Section("Status") {
                 LabeledContent("Messages", value: "\(messages.count)")
                 LabeledContent("Streaming", value: isStreaming ? "Yes" : "No")
-                LabeledContent("Surface", value: "Chat")
+                LabeledContent("Artifacts", value: "\(artifacts.count)")
             }
-            Section("About") {
-                Text("In Code / Cowork this pane switches to diffs, file lists, "
-                     + "terminal output, and per-agent status.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+            Section("Artifacts") {
+                ArtifactInspector(artifacts: artifacts)
             }
         }
     }

@@ -56,6 +56,15 @@ public struct ConversationProjection: Equatable, Sendable {
         case .error(let p):
             messages.append(ChatMessageView(id: MessageID.new(), role: .system,
                                             text: "⚠️ \(p.message)", isComplete: true))
+
+        case .artifactAdded(let p):
+            messages.append(ChatMessageView(id: MessageID.new(), role: .system,
+                                            text: "📎 \(p.kind) artifact" + (p.prompt.map { ": \($0)" } ?? ""),
+                                            isComplete: true))
+
+        case .toolCall, .toolResult, .permissionRequest, .permissionResolved, .patchProposed, .agentStatus,
+             .agentAttached, .agentDetached, .agentMessage, .agentToAgentMessage, .permissionReview, .artifactProgress:
+            break   // tool/permission/agent/progress events are not shown in the chat text view
         }
     }
 

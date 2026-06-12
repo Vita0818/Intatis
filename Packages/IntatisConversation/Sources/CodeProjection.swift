@@ -6,7 +6,7 @@ import IntatisProtocol
 /// patch events (v0.2) plus messages. Pure and testable; SharedUI renders it.
 public struct CodeItem: Identifiable, Equatable, Sendable {
     public enum Kind: String, Sendable {
-        case user, agent, toolCall, toolResult, patch, note, error
+        case user, agent, toolCall, toolResult, patch, note, error, agentToAgent
     }
     public let id: String
     public var kind: Kind
@@ -73,7 +73,32 @@ public struct CodeProjection: Equatable, Sendable {
         case .error(let p):
             items.append(CodeItem(id: freshID(), kind: .error, title: "error", body: p.message))
 
-        case .permissionRequest, .agentStatus:
+        // v0.3 (Cowork)
+        case .agentAttached(let p):
+            items.append(CodeItem(id: freshID(), kind: .note, title: "agent",
+                                  body: "+ @\(p.agent.rawValue) attached (\(p.path))"))
+
+        case .agentDetached(let p):
+            items.append(CodeItem(id: freshID(), kind: .note, title: "agent",
+                                  body: "− @\(p.agent.rawValue) detached"))
+
+        case .agentMessage(let p):
+            items.append(CodeItem(id: p.messageId.rawValue, kind: .agent,
+                                  title: p.agent.rawValue, body: p.content))
+
+        case .agentToAgentMessage(let p):
+            items.append(CodeItem(id: freshID(), kind: .agentToAgent,
+                                  title: "\(p.from.rawValue) → \(p.to.rawValue)", body: p.content))
+
+        case .permissionReview(let p):
+            items.append(CodeItem(id: freshID(), kind: .note, title: "review",
+                                  body: "reviewer(\(p.reviewerModel)): \(p.decision.rawValue) \(p.tool) — \(p.reason)"))
+
+        case .artifactAdded(let p):
+            items.append(CodeItem(id: p.artifactId.rawValue, kind: .note, title: "artifact",
+                                  body: "📎 \(p.kind)" + (p.prompt.map { ": \($0)" } ?? "")))
+
+        case .permissionRequest, .agentStatus, .artifactProgress:
             break
         }
     }

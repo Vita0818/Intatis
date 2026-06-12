@@ -13,9 +13,14 @@ import IntatisConversation
 @MainActor
 public final class ChatViewModel: ObservableObject {
     @Published public private(set) var messages: [ChatMessageView] = []
+    @Published public private(set) var artifacts: [ArtifactCardInfo] = []
     @Published public var input: String = ""
     @Published public private(set) var isStreaming = false
     @Published public var errorText: String?
+
+    /// Wired by the app (v0.4): generate an image from a prompt. The resulting
+    /// `artifact_added` event flows back through the log subscription.
+    public var onGenerateImage: ((String) -> Void)?
 
     private let log: EventLog
     private let registry: ProviderRegistry
@@ -36,6 +41,10 @@ public final class ChatViewModel: ObservableObject {
             for await envelope in stream {
                 projection.apply(envelope)
                 self.messages = projection.messages
+                if case .artifactAdded(let p) = envelope.event {
+                    self.artifacts.append(ArtifactCardInfo(id: p.artifactId.rawValue, kind: p.kind,
+                                                           mime: p.mime, path: p.path, prompt: p.prompt))
+                }
             }
         }
     }
@@ -64,6 +73,14 @@ public final class ChatViewModel: ObservableObject {
             }
             self.isStreaming = false
         }
+    }
+
+    /// Generate an image from the current composer text (wired by the app).
+    public func generateImage() {
+        let prompt = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !prompt.isEmpty else { return }
+        input = ""
+        onGenerateImage?(prompt)
     }
 }
 #endif

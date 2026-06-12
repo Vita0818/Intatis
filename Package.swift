@@ -13,7 +13,8 @@ import PackageDescription
 let package = Package(
     name: "Intatis",
     platforms: [
-        .macOS(.v13)
+        .macOS(.v13),
+        .iOS(.v16),
     ],
     products: [
         .library(name: "IntatisCore", targets: ["IntatisCore"]),
@@ -24,8 +25,11 @@ let package = Package(
         .library(name: "IntatisTools", targets: ["IntatisTools"]),
         .library(name: "IntatisPermission", targets: ["IntatisPermission"]),
         .library(name: "IntatisAgentKernel", targets: ["IntatisAgentKernel"]),
+        .library(name: "IntatisCowork", targets: ["IntatisCowork"]),
+        .library(name: "IntatisMultimodal", targets: ["IntatisMultimodal"]),
         .library(name: "IntatisSharedUI", targets: ["IntatisSharedUI"]),
         .executable(name: "IntatisMac", targets: ["IntatisMac"]),
+        .executable(name: "IntatisiOS", targets: ["IntatisiOS"]),
     ],
     targets: [
         // MARK: Library targets (module == target)
@@ -63,7 +67,8 @@ let package = Package(
         ),
         .target(
             name: "IntatisPermission",
-            dependencies: ["IntatisCore", "IntatisProtocol"],
+            // Providers added in v0.3 for the model-backed reviewer (layer B).
+            dependencies: ["IntatisCore", "IntatisProtocol", "IntatisProviders"],
             path: "Packages/IntatisPermission/Sources"
         ),
         .target(
@@ -73,6 +78,24 @@ let package = Package(
                 "IntatisTools", "IntatisPermission", "IntatisConversation", "IntatisArtifacts",
             ],
             path: "Packages/IntatisAgentKernel/Sources"
+        ),
+        // v0.3 — Cowork: multi-agent orchestration over a mediated message bus.
+        .target(
+            name: "IntatisCowork",
+            dependencies: [
+                "IntatisCore", "IntatisProtocol", "IntatisProviders", "IntatisTools",
+                "IntatisPermission", "IntatisConversation", "IntatisAgentKernel",
+            ],
+            path: "Packages/IntatisCowork/Sources"
+        ),
+        // v0.4 — Multimodal: image/video generation + transcription → artifacts.
+        .target(
+            name: "IntatisMultimodal",
+            dependencies: [
+                "IntatisCore", "IntatisProtocol", "IntatisProviders",
+                "IntatisArtifacts", "IntatisConversation",
+            ],
+            path: "Packages/IntatisMultimodal/Sources"
         ),
         .target(
             name: "IntatisSharedUI",
@@ -85,9 +108,20 @@ let package = Package(
             dependencies: [
                 "IntatisCore", "IntatisProtocol", "IntatisProviders",
                 "IntatisConversation", "IntatisArtifacts", "IntatisSharedUI",
-                "IntatisTools", "IntatisPermission", "IntatisAgentKernel",
+                "IntatisTools", "IntatisPermission", "IntatisAgentKernel", "IntatisCowork",
+                "IntatisMultimodal",
             ],
             path: "Apps/IntatisMac/Sources"
+        ),
+        // v0.5 — iOS: the chat-only subset. Deliberately depends on NONE of
+        // Tools / Permission / AgentKernel / Cowork (ARCHITECTURE.md §4.1).
+        .executableTarget(
+            name: "IntatisiOS",
+            dependencies: [
+                "IntatisCore", "IntatisProtocol", "IntatisProviders",
+                "IntatisConversation", "IntatisArtifacts", "IntatisMultimodal", "IntatisSharedUI",
+            ],
+            path: "Apps/IntatisiOS/Sources"
         ),
 
         // MARK: Test targets (none depend on UI/app targets, so `swift test` is headless)
@@ -123,7 +157,7 @@ let package = Package(
         ),
         .testTarget(
             name: "IntatisPermissionTests",
-            dependencies: ["IntatisPermission", "IntatisCore", "IntatisProtocol"],
+            dependencies: ["IntatisPermission", "IntatisCore", "IntatisProtocol", "IntatisProviders"],
             path: "Packages/IntatisPermission/Tests"
         ),
         .testTarget(
@@ -133,6 +167,22 @@ let package = Package(
                 "IntatisTools", "IntatisPermission", "IntatisConversation",
             ],
             path: "Packages/IntatisAgentKernel/Tests"
+        ),
+        .testTarget(
+            name: "IntatisCoworkTests",
+            dependencies: [
+                "IntatisCowork", "IntatisCore", "IntatisProtocol", "IntatisProviders",
+                "IntatisTools", "IntatisPermission", "IntatisConversation", "IntatisAgentKernel",
+            ],
+            path: "Packages/IntatisCowork/Tests"
+        ),
+        .testTarget(
+            name: "IntatisMultimodalTests",
+            dependencies: [
+                "IntatisMultimodal", "IntatisCore", "IntatisProtocol", "IntatisProviders",
+                "IntatisArtifacts", "IntatisConversation",
+            ],
+            path: "Packages/IntatisMultimodal/Tests"
         ),
     ]
 )

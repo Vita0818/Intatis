@@ -177,6 +177,15 @@ public enum Event: Equatable, Sendable {
     case permissionResolved(PermissionResolvedPayload)
     case patchProposed(PatchProposedPayload)
     case agentStatus(AgentStatusPayload)
+    // v0.3 (Cowork)
+    case agentAttached(AgentAttachedPayload)
+    case agentDetached(AgentDetachedPayload)
+    case agentMessage(AgentMessagePayload)
+    case agentToAgentMessage(AgentToAgentMessagePayload)
+    case permissionReview(PermissionReviewPayload)
+    // v0.4 (Multimodal)
+    case artifactAdded(ArtifactAddedPayload)
+    case artifactProgress(ArtifactProgressPayload)
 
     /// Stable wire discriminator (snake_case) used in the `type` field.
     public enum TypeTag: String, Codable, Sendable {
@@ -190,6 +199,13 @@ public enum Event: Equatable, Sendable {
         case permissionResolved = "permission_resolved"
         case patchProposed = "patch_proposed"
         case agentStatus = "agent_status"
+        case agentAttached = "agent_attached"
+        case agentDetached = "agent_detached"
+        case agentMessage = "agent_message"
+        case agentToAgentMessage = "agent_to_agent_message"
+        case permissionReview = "permission_review"
+        case artifactAdded = "artifact_added"
+        case artifactProgress = "artifact_progress"
     }
 
     public var type: TypeTag {
@@ -204,6 +220,13 @@ public enum Event: Equatable, Sendable {
         case .permissionResolved: return .permissionResolved
         case .patchProposed:      return .patchProposed
         case .agentStatus:        return .agentStatus
+        case .agentAttached:       return .agentAttached
+        case .agentDetached:       return .agentDetached
+        case .agentMessage:        return .agentMessage
+        case .agentToAgentMessage: return .agentToAgentMessage
+        case .permissionReview:    return .permissionReview
+        case .artifactAdded:       return .artifactAdded
+        case .artifactProgress:    return .artifactProgress
         }
     }
 }

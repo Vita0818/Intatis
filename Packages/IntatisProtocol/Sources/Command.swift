@@ -58,6 +58,18 @@ public struct AgentAttachParams: Codable, Equatable, Sendable {
     }
 }
 
+public struct ProfileSetParams: Codable, Equatable, Sendable {
+    public var session: SessionID
+    public var agent: AgentID
+    /// manual / reviewed / autopilot / read_only / locked
+    public var mode: String
+    public init(session: SessionID, agent: AgentID, mode: String) {
+        self.session = session
+        self.agent = agent
+        self.mode = mode
+    }
+}
+
 // MARK: - Command
 
 /// A client→kernel request. Maps onto a JSON-RPC request `{ method, params }`
@@ -71,6 +83,7 @@ public enum Command: Codable, Equatable, Sendable {
     // v0.2
     case permissionRespond(PermissionRespondParams)
     case agentAttach(AgentAttachParams)
+    case profileSet(ProfileSetParams)
 
     public enum Method: String, Codable, Sendable {
         case sessionCreate = "session.create"
@@ -79,6 +92,7 @@ public enum Command: Codable, Equatable, Sendable {
         case messageSend = "message.send"
         case permissionRespond = "permission.respond"
         case agentAttach = "agent.attach"
+        case profileSet = "profile.set"
     }
 
     public var method: Method {
@@ -89,6 +103,7 @@ public enum Command: Codable, Equatable, Sendable {
         case .messageSend:       return .messageSend
         case .permissionRespond: return .permissionRespond
         case .agentAttach:       return .agentAttach
+        case .profileSet:        return .profileSet
         }
     }
 
@@ -112,6 +127,8 @@ public enum Command: Codable, Equatable, Sendable {
             self = .permissionRespond(try c.decode(PermissionRespondParams.self, forKey: .params))
         case .agentAttach:
             self = .agentAttach(try c.decode(AgentAttachParams.self, forKey: .params))
+        case .profileSet:
+            self = .profileSet(try c.decode(ProfileSetParams.self, forKey: .params))
         }
     }
 
@@ -125,6 +142,7 @@ public enum Command: Codable, Equatable, Sendable {
         case .messageSend(let p):       try c.encode(p, forKey: .params)
         case .permissionRespond(let p): try c.encode(p, forKey: .params)
         case .agentAttach(let p):       try c.encode(p, forKey: .params)
+        case .profileSet(let p):        try c.encode(p, forKey: .params)
         }
     }
 }

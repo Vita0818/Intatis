@@ -100,6 +100,8 @@ struct CodeItemRow: View {
             Text(item.body).font(.caption).foregroundStyle(.secondary)
         case .error:
             card(icon: "exclamationmark.triangle", title: "error", body: item.body, tint: .red)
+        case .agentToAgent:
+            card(icon: "arrow.left.arrow.right", title: "↔ \(item.title)", body: item.body, tint: .teal)
         }
     }
 

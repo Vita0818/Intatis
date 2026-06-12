@@ -21,6 +21,7 @@ public struct AgentLoop: Sendable {
     private let allowsShell: Bool
     private let shell: ShellRunner
     private let git: GitService
+    private let messenger: AgentMessenger?
     private let maxIterations: Int
 
     public init(log: EventLog,
@@ -33,6 +34,7 @@ public struct AgentLoop: Sendable {
                 allowsShell: Bool,
                 shell: ShellRunner = ProcessShellRunner(),
                 git: GitService = ProcessGitService(),
+                messenger: AgentMessenger? = nil,
                 maxIterations: Int = 8) {
         self.log = log
         self.provider = provider
@@ -44,10 +46,14 @@ public struct AgentLoop: Sendable {
         self.allowsShell = allowsShell
         self.shell = shell
         self.git = git
+        self.messenger = messenger
         self.maxIterations = maxIterations
     }
 
-    public func send(_ userText: String) async throws {
+    /// Runs the loop and returns the agent's final text answer (empty if it ran
+    /// out of iterations). Discardable for fire-and-forget UI sends.
+    @discardableResult
+    public func send(_ userText: String) async throws -> String {
         let history = await priorHistory()
         try await log.append(.userMessage(UserMessagePayload(text: userText)))
         try await log.append(.agentStatus(AgentStatusPayload(agent: agent.name, state: .thinking)))
@@ -80,7 +86,7 @@ public struct AgentLoop: Sendable {
 
             if pendingToolCalls.isEmpty {
                 try await log.append(.agentStatus(AgentStatusPayload(agent: agent.name, state: .idle)))
-                return  // final answer
+                return assistantText  // final answer
             }
 
             convo.append(.assistant(toolCalls: pendingToolCalls, content: assistantText.isEmpty ? nil : assistantText))
@@ -93,6 +99,7 @@ public struct AgentLoop: Sendable {
         try await log.append(.error(ErrorPayload(code: "max_iterations",
                                                   message: "agent exceeded max tool iterations")))
         try await log.append(.agentStatus(AgentStatusPayload(agent: agent.name, state: .idle)))
+        return ""
     }
 
     // MARK: - Tool execution with permission
@@ -131,7 +138,7 @@ public struct AgentLoop: Sendable {
         }
 
         do {
-            let toolContext = ToolContext(workspaceRoot: agent.workspaceRoot, shell: shell, git: git)
+            let toolContext = ToolContext(workspaceRoot: agent.workspaceRoot, shell: shell, git: git, messenger: messenger)
             let observation = try await tool.execute(args, in: toolContext)
             if let diff = observation.diff, let files = observation.changedFiles {
                 try? await log.append(.patchProposed(PatchProposedPayload(

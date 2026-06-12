@@ -57,6 +57,20 @@ public struct Envelope: Codable, Equatable, Sendable {
             event = .patchProposed(try c.decode(PatchProposedPayload.self, forKey: .payload))
         case .agentStatus:
             event = .agentStatus(try c.decode(AgentStatusPayload.self, forKey: .payload))
+        case .agentAttached:
+            event = .agentAttached(try c.decode(AgentAttachedPayload.self, forKey: .payload))
+        case .agentDetached:
+            event = .agentDetached(try c.decode(AgentDetachedPayload.self, forKey: .payload))
+        case .agentMessage:
+            event = .agentMessage(try c.decode(AgentMessagePayload.self, forKey: .payload))
+        case .agentToAgentMessage:
+            event = .agentToAgentMessage(try c.decode(AgentToAgentMessagePayload.self, forKey: .payload))
+        case .permissionReview:
+            event = .permissionReview(try c.decode(PermissionReviewPayload.self, forKey: .payload))
+        case .artifactAdded:
+            event = .artifactAdded(try c.decode(ArtifactAddedPayload.self, forKey: .payload))
+        case .artifactProgress:
+            event = .artifactProgress(try c.decode(ArtifactProgressPayload.self, forKey: .payload))
         }
     }
 
@@ -78,6 +92,13 @@ public struct Envelope: Codable, Equatable, Sendable {
         case .permissionResolved(let p): try c.encode(p, forKey: .payload)
         case .patchProposed(let p):      try c.encode(p, forKey: .payload)
         case .agentStatus(let p):        try c.encode(p, forKey: .payload)
+        case .agentAttached(let p):       try c.encode(p, forKey: .payload)
+        case .agentDetached(let p):       try c.encode(p, forKey: .payload)
+        case .agentMessage(let p):        try c.encode(p, forKey: .payload)
+        case .agentToAgentMessage(let p): try c.encode(p, forKey: .payload)
+        case .permissionReview(let p):    try c.encode(p, forKey: .payload)
+        case .artifactAdded(let p):       try c.encode(p, forKey: .payload)
+        case .artifactProgress(let p):    try c.encode(p, forKey: .payload)
         }
     }
 }

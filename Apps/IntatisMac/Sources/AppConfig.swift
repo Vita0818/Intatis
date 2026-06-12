@@ -34,9 +34,12 @@ enum AppConfig {
             apiKeyRef: KeychainRef(service: keychainService, account: keychainAccount),
             wire: .openai
         )
-        let models = ResolvedModels(
+        var models = ResolvedModels(
             chat: ModelRef(endpoint: "default", model: ModelID(rawValue: "gpt-4o-mini"))
         )
+        // v0.4: image + transcription default to the same OpenAI endpoint.
+        models.imageGen = ModelRef(endpoint: "default", model: ModelID(rawValue: "dall-e-3"))
+        models.transcription = ModelRef(endpoint: "default", model: ModelID(rawValue: "whisper-1"))
         return ProviderConfig(endpoints: [endpoint], models: models)
     }
 }

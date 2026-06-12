@@ -9,13 +9,16 @@ public actor ProviderRegistry {
     private let config: ProviderConfig
     private let resolver: SecretResolver
     private let http: HTTPByteStreaming
+    private let dataClient: HTTPDataClient
 
     public init(config: ProviderConfig,
                 resolver: SecretResolver,
-                http: HTTPByteStreaming = URLSessionStreamingClient()) {
+                http: HTTPByteStreaming = URLSessionStreamingClient(),
+                dataClient: HTTPDataClient = URLSessionDataClient()) {
         self.config = config
         self.resolver = resolver
         self.http = http
+        self.dataClient = dataClient
     }
 
     public func chatProvider(for ref: ModelRef) async throws -> ChatProvider {
@@ -65,4 +68,42 @@ public actor ProviderRegistry {
     public func agentModel() -> ModelID {
         (config.models.agent ?? config.models.chat).model
     }
+
+    // MARK: Multimodal (v0.4)
+
+    public func imageProvider(for ref: ModelRef) async throws -> ImageGenerationProvider {
+        guard let endpoint = config.endpoint(id: ref.endpoint) else {
+            throw IntatisError.config("unknown endpoint '\(ref.endpoint)'")
+        }
+        let apiKey = try await resolver.secret(for: endpoint.apiKeyRef)
+        switch endpoint.wire {
+        case .openai:
+            return OpenAIImageProvider(endpoint: endpoint, apiKey: apiKey, http: dataClient)
+        }
+    }
+
+    public func transcriptionProvider(for ref: ModelRef) async throws -> TranscriptionProvider {
+        guard let endpoint = config.endpoint(id: ref.endpoint) else {
+            throw IntatisError.config("unknown endpoint '\(ref.endpoint)'")
+        }
+        let apiKey = try await resolver.secret(for: endpoint.apiKeyRef)
+        switch endpoint.wire {
+        case .openai:
+            return OpenAITranscriptionProvider(endpoint: endpoint, apiKey: apiKey, http: dataClient)
+        }
+    }
+
+    /// nil when no image model is configured (`models.imageGen`).
+    public func defaultImageProvider() async throws -> ImageGenerationProvider? {
+        guard let ref = config.models.imageGen else { return nil }
+        return try await imageProvider(for: ref)
+    }
+
+    public func defaultTranscriptionProvider() async throws -> TranscriptionProvider? {
+        guard let ref = config.models.transcription else { return nil }
+        return try await transcriptionProvider(for: ref)
+    }
+
+    public func imageModel() -> ModelID? { config.models.imageGen?.model }
+    public func transcriptionModel() -> ModelID? { config.models.transcription?.model }
 }

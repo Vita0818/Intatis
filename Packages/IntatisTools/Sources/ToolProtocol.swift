@@ -72,16 +72,26 @@ public protocol GitService: Sendable {
     func diff(workspace: URL) async throws -> String      // unified diff
 }
 
+/// Seam for agent-to-agent messaging (v0.3). Cowork provides an implementation
+/// bound to the asking agent; the `ask_agent` tool routes through it so all
+/// cross-agent traffic goes through the mediated Message Bus (ARCHITECTURE.md §7).
+public protocol AgentMessenger: Sendable {
+    func ask(to agent: String, question: String) async -> String
+}
+
 public struct ToolContext: Sendable {
     public let workspaceRoot: URL
     public let shell: ShellRunner
     public let git: GitService
+    public let messenger: AgentMessenger?
     public init(workspaceRoot: URL,
                 shell: ShellRunner = ProcessShellRunner(),
-                git: GitService = ProcessGitService()) {
+                git: GitService = ProcessGitService(),
+                messenger: AgentMessenger? = nil) {
         self.workspaceRoot = workspaceRoot
         self.shell = shell
         self.git = git
+        self.messenger = messenger
     }
 }
 
@@ -110,6 +120,11 @@ public struct ToolRegistry: Sendable {
     public func tool(named name: String) -> (any Tool)? { tools[name] }
     public func all() -> [any Tool] { Array(tools.values) }
     public func descriptors() -> [ToolDescriptor] { all().map { type(of: $0).descriptor } }
+
+    /// A new registry with extra tools added (e.g. Cowork's `ask_agent`).
+    public func adding(_ extra: [any Tool]) -> ToolRegistry {
+        ToolRegistry(all() + extra)
+    }
 
     /// The full v0.2 read/write/git/shell tool set.
     public static func standard() -> ToolRegistry {
