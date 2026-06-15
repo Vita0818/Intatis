@@ -170,6 +170,15 @@ swift run intatis config          # 打印当前解析到的配置
 **会话内 slash 命令**（仿 Claude Code）：`/model <name>` 换模型、`/reasoning <level|off>` 调推理、
 `/mode <chat|code|cowork>` 实时切模式、`/clear` 新会话、`/config` 看当前、`/help`、`/exit`。
 
+**每轮统计**：每条回复结束打印一行 `⎿ 1.8s · ttft 0.32s · 1843 tok (1623 in / 220 out)`——
+总耗时、首字耗时、token（`in` 即上下文占用）。token 需端点支持 `stream_options.include_usage`
+（OpenAI 及多数兼容端点支持）；个别端点若因此报错，设 `INTATIS_USAGE=0` 关掉。
+
+**视觉输入（看图）**：`/attach <图片路径>` 把图片排队（本地图自动转 base64 data URL），下一条消息
+带给模型；非图片的 UTF-8 文本文件会作为上下文内联。**chat 和 code 都支持**（cowork 暂未接）。消息
+`content` 会按 OpenAI vision 格式编码成 `[{text}, {image_url}]`。配合多模态模型用，例如
+`INTATIS_MODEL=qwen-vl-max`。注意这是「看图」（视觉输入），与之前的「生图」（输出）是两回事。
+
 想先零配置确认链路：`swift run intatis selftest` —— 内置 fake 模型，离线把 **chat 完整一轮** +
 **code 写文件再读回**走一遍，复用的就是真正的 ChatLoop / AgentLoop / 渲染 / 审批代码。
 

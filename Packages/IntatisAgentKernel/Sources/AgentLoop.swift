@@ -23,6 +23,7 @@ public struct AgentLoop: Sendable {
     private let git: GitService
     private let messenger: AgentMessenger?
     private let reasoningEffort: ReasoningEffort?
+    private let includeUsage: Bool
     private let maxIterations: Int
 
     public init(log: EventLog,
@@ -37,6 +38,7 @@ public struct AgentLoop: Sendable {
                 git: GitService = ProcessGitService(),
                 messenger: AgentMessenger? = nil,
                 reasoningEffort: ReasoningEffort? = nil,
+                includeUsage: Bool = false,
                 maxIterations: Int = 8) {
         self.log = log
         self.provider = provider
@@ -50,34 +52,45 @@ public struct AgentLoop: Sendable {
         self.git = git
         self.messenger = messenger
         self.reasoningEffort = reasoningEffort
+        self.includeUsage = includeUsage
         self.maxIterations = maxIterations
     }
 
     /// Runs the loop and returns the agent's final text answer (empty if it ran
     /// out of iterations). Discardable for fire-and-forget UI sends.
     @discardableResult
-    public func send(_ userText: String) async throws -> String {
+    public func send(_ userText: String, images: [ImageAttachment] = []) async throws -> String {
         let history = await priorHistory()
         try await log.append(.userMessage(UserMessagePayload(text: userText)))
         try await log.append(.agentStatus(AgentStatusPayload(agent: agent.name, state: .thinking)))
 
-        var convo = context.initialMessages(history: history, userText: userText)
+        var convo = context.initialMessages(history: history, userText: userText, userImages: images)
         let specs = context.toolSpecs(registry)
+        let start = Date()
+        var firstTokenAt: Date?
+        var usage: Usage?
 
         for _ in 0..<maxIterations {
             var assistantText = ""
             var pendingToolCalls: [ToolCall] = []
             let assistantID = MessageID.new()
 
-            for try await chunk in provider.stream(AgentRequest(model: agent.model, messages: convo, tools: specs,
-                                                                reasoningEffort: reasoningEffort)) {
+            let request = AgentRequest(model: agent.model, messages: convo, tools: specs,
+                                       reasoningEffort: reasoningEffort, includeUsage: includeUsage)
+            for try await chunk in provider.stream(request) {
                 switch chunk {
                 case .textDelta(let d):
+                    if firstTokenAt == nil { firstTokenAt = Date() }
                     assistantText += d
                     try await log.append(.messageDelta(
                         MessageDeltaPayload(messageId: assistantID, role: .agent, agent: agent.name, textDelta: d)))
                 case .toolCalls(let calls):
                     pendingToolCalls = calls
+                case .usage(let u):
+                    usage = Usage(
+                        promptTokens: (usage?.promptTokens ?? 0) + (u.promptTokens ?? 0),
+                        completionTokens: (usage?.completionTokens ?? 0) + (u.completionTokens ?? 0),
+                        totalTokens: (usage?.totalTokens ?? 0) + (u.totalTokens ?? 0))
                 case .done:
                     break
                 }
@@ -89,6 +102,7 @@ public struct AgentLoop: Sendable {
             }
 
             if pendingToolCalls.isEmpty {
+                await appendTurnStats(start: start, firstTokenAt: firstTokenAt, usage: usage)
                 try await log.append(.agentStatus(AgentStatusPayload(agent: agent.name, state: .idle)))
                 return assistantText  // final answer
             }
@@ -100,10 +114,22 @@ public struct AgentLoop: Sendable {
             }
         }
 
+        await appendTurnStats(start: start, firstTokenAt: firstTokenAt, usage: usage)
         try await log.append(.error(ErrorPayload(code: "max_iterations",
                                                   message: "agent exceeded max tool iterations")))
         try await log.append(.agentStatus(AgentStatusPayload(agent: agent.name, state: .idle)))
         return ""
+    }
+
+    private func appendTurnStats(start: Date, firstTokenAt: Date?, usage: Usage?) async {
+        let now = Date()
+        try? await log.append(.turnStats(TurnStatsPayload(
+            promptTokens: usage?.promptTokens,
+            completionTokens: usage?.completionTokens,
+            totalTokens: usage?.totalTokens,
+            ttftMillis: firstTokenAt.map { Int($0.timeIntervalSince(start) * 1000) },
+            totalMillis: Int(now.timeIntervalSince(start) * 1000),
+            model: agent.model.rawValue)))
     }
 
     // MARK: - Tool execution with permission

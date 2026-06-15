@@ -71,6 +71,8 @@ public struct Envelope: Codable, Equatable, Sendable {
             event = .artifactAdded(try c.decode(ArtifactAddedPayload.self, forKey: .payload))
         case .artifactProgress:
             event = .artifactProgress(try c.decode(ArtifactProgressPayload.self, forKey: .payload))
+        case .turnStats:
+            event = .turnStats(try c.decode(TurnStatsPayload.self, forKey: .payload))
         }
     }
 
@@ -99,6 +101,7 @@ public struct Envelope: Codable, Equatable, Sendable {
         case .permissionReview(let p):    try c.encode(p, forKey: .payload)
         case .artifactAdded(let p):       try c.encode(p, forKey: .payload)
         case .artifactProgress(let p):    try c.encode(p, forKey: .payload)
+        case .turnStats(let p):           try c.encode(p, forKey: .payload)
         }
     }
 }

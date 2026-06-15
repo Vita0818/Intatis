@@ -9,6 +9,20 @@ import IntatisCowork
 
 enum REPLExit { case quit; case switchTo(Mode) }
 
+private enum S {
+    static let reset = "\u{001B}[0m", bold = "\u{001B}[1m", dim = "\u{001B}[2m"
+    static let green = "\u{001B}[32m", cyan = "\u{001B}[36m"
+}
+
+private func banner(mode: Mode, model: String, host: String) {
+    out("\n\(S.bold)Intatis\(S.reset) \(S.dim)·\(S.reset) \(S.cyan)\(mode.rawValue)\(S.reset) \(S.dim)· \(model) · \(host)\(S.reset)\n")
+    out("\(S.dim)/help for commands · /mode to switch · /exit to quit\(S.reset)\n")
+}
+
+private func prompt(_ mode: Mode) -> String {
+    "\n\(S.green)\(mode.rawValue) ❯\(S.reset) "
+}
+
 func sessionLog() throws -> EventLog {
     let dir = FileManager.default.temporaryDirectory
         .appendingPathComponent("intatis-cli-\(UUID().uuidString)", isDirectory: true)
@@ -33,6 +47,8 @@ func runMode(_ config: CLIConfig, mode startMode: Mode, workspace: URL) async th
 }
 
 private let replHelp = """
+  /attach <path>            queue an image (vision) or text file for the next message
+  /attach clear             clear queued attachments
   /model [name]             show or switch the model for this session
   /reasoning [level|off]    show or set reasoning (minimal|low|medium|high)
   /mode <chat|code|cowork>  switch mode
@@ -47,14 +63,18 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
     let registry = ProviderRegistry(config: config.providerConfig(), resolver: StaticSecretResolver(key: config.apiKey))
     var model = config.model
     var reasoning = config.reasoningEffort
+    var pending = PendingAttachments()
     var log = try sessionLog()
     var render = Task { await renderLoop(log) }
     defer { render.cancel() }
 
-    out("\nIntatis \(mode.rawValue) · \(model) @ \(config.baseURL.host ?? config.baseURL.absoluteString)  ·  /help\n")
+    banner(mode: mode, model: model, host: config.baseURL.host ?? config.baseURL.absoluteString)
 
     while true {
-        out("\n\u{001B}[32m\(mode.rawValue)›\u{001B}[0m ")
+        if !pending.isEmpty {
+            out("\(S.dim)  \(pending.count) attachment(s) queued for your next message\(S.reset)\n")
+        }
+        out(prompt(mode))
         guard let line = readLine() else { return .quit }
         let text = line.trimmingCharacters(in: .whitespacesAndNewlines)
         if text.isEmpty { continue }
@@ -86,6 +106,22 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
                 } else {
                     out("usage: /mode chat|code|cowork\n")
                 }
+            case "attach":
+                if arg.isEmpty || arg == "list" {
+                    out(pending.isEmpty ? "no attachments queued. usage: /attach <path>\n"
+                                        : "\(pending.count) queued (\(pending.images.count) image, \(pending.textFiles.count) text)\n")
+                } else if arg == "clear" {
+                    pending.clear(); out("attachments cleared\n")
+                } else {
+                    switch AttachmentLoader.load(arg) {
+                    case .success(.image(let img)):
+                        pending.images.append(img); out("attached image · \(pending.count) queued\n")
+                    case .success(.text(let name, let content)):
+                        pending.textFiles.append((name, content)); out("attached \(name) · \(pending.count) queued\n")
+                    case .failure(let message):
+                        errOut(message + "\n")
+                    }
+                }
             case "clear":
                 render.cancel(); log = try sessionLog(); render = Task { await renderLoop(log) }
                 out("(new session)\n")
@@ -97,19 +133,28 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
             continue
         }
 
+        // Compose the message, consuming any queued attachments.
+        var sendText = text
+        for file in pending.textFiles { sendText += "\n\n[attached file: \(file.name)]\n\(file.content)" }
+        let sendImages = pending.images
+        pending.clear()
+
         do {
             switch mode {
             case .chat:
                 let provider = try await registry.defaultChatProvider()
-                try await ChatLoop(log: log, provider: provider,
-                                   model: ModelID(rawValue: model), reasoningEffort: reasoning).send(text)
+                try await ChatLoop(log: log, provider: provider, model: ModelID(rawValue: model),
+                                   reasoningEffort: reasoning, includeUsage: config.includeUsage)
+                    .send(sendText, images: sendImages)
             case .code:
                 let provider = try await registry.defaultAgentProvider()
                 let agent = Agent(name: AgentID(rawValue: "cli"), workspaceRoot: workspace,
                                   model: ModelID(rawValue: model), profile: .reviewed)
                 _ = try await AgentLoop(log: log, provider: provider, registry: .standard(),
                                         engine: PermissionEngine(), responder: TerminalResponder(),
-                                        agent: agent, allowsShell: true, reasoningEffort: reasoning).send(text)
+                                        agent: agent, allowsShell: true,
+                                        reasoningEffort: reasoning, includeUsage: config.includeUsage)
+                    .send(sendText, images: sendImages)
             case .cowork:
                 break
             }
@@ -140,10 +185,11 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
         try await registry.defaultAgentProvider()
     }
 
-    out("\nIntatis cowork · attach agents: `/agent add <name> <path>`, then `@name <message>`.  ·  /help\n")
+    banner(mode: .cowork, model: model, host: config.baseURL.host ?? config.baseURL.absoluteString)
+    out("\(S.dim)attach agents: /agent add <name> <path>, then @name <message>\(S.reset)\n")
 
     while true {
-        out("\n\u{001B}[32mcowork›\u{001B}[0m ")
+        out(prompt(.cowork))
         guard let line = readLine() else { return .quit }
         let text = line.trimmingCharacters(in: .whitespacesAndNewlines)
         if text.isEmpty { continue }

@@ -24,11 +24,12 @@ public struct ContextBuilder: Sendable {
         }
     }
 
-    /// system + prior history + the new user turn.
-    public func initialMessages(history: [AgentMessage], userText: String) -> [AgentMessage] {
+    /// system + prior history + the new user turn (optionally with images).
+    public func initialMessages(history: [AgentMessage], userText: String,
+                                userImages: [ImageAttachment] = []) -> [AgentMessage] {
         var messages: [AgentMessage] = [.system(systemPrompt)]
         messages.append(contentsOf: history)
-        messages.append(.user(userText))
+        messages.append(.user(userText, images: userImages))
         return messages
     }
 }

@@ -98,7 +98,7 @@ public struct CodeProjection: Equatable, Sendable {
             items.append(CodeItem(id: p.artifactId.rawValue, kind: .note, title: "artifact",
                                   body: "📎 \(p.kind)" + (p.prompt.map { ": \($0)" } ?? "")))
 
-        case .permissionRequest, .agentStatus, .artifactProgress:
+        case .permissionRequest, .agentStatus, .artifactProgress, .turnStats:
             break
         }
     }

@@ -1,26 +1,24 @@
 import Foundation
 import IntatisCore
+import IntatisProtocol
 #if canImport(FoundationNetworking)
 import FoundationNetworking
 #endif
 
 // MARK: - OpenAI wire DTOs (internal)
 
-private struct OpenAIChatBody: Encodable {
-    struct Msg: Encodable { let role: String; let content: String }
-    let model: String
-    let messages: [Msg]
-    let stream: Bool
-    let temperature: Double?
-    let reasoning_effort: String?
-}
-
 private struct OpenAIStreamChunk: Decodable {
     struct Choice: Decodable {
         struct Delta: Decodable { let content: String? }
-        let delta: Delta
+        let delta: Delta?
+    }
+    struct UsageDTO: Decodable {
+        let prompt_tokens: Int?
+        let completion_tokens: Int?
+        let total_tokens: Int?
     }
     let choices: [Choice]
+    let usage: UsageDTO?
 }
 
 // MARK: - Adapter
@@ -70,8 +68,17 @@ public struct OpenAIWireProvider: ChatProvider {
             continuation.finish()
             return true
         }
-        if let delta = Self.parseDelta(payload), !delta.isEmpty {
-            continuation.yield(.delta(delta))
+        guard let data = payload.data(using: .utf8),
+              let chunk = try? JSONDecoder().decode(OpenAIStreamChunk.self, from: data) else {
+            return false
+        }
+        if let content = chunk.choices.first?.delta?.content, !content.isEmpty {
+            continuation.yield(.delta(content))
+        }
+        if let u = chunk.usage {
+            continuation.yield(.usage(Usage(promptTokens: u.prompt_tokens,
+                                            completionTokens: u.completion_tokens,
+                                            totalTokens: u.total_tokens)))
         }
         return false
     }
@@ -83,23 +90,33 @@ public struct OpenAIWireProvider: ChatProvider {
         r.setValue("application/json", forHTTPHeaderField: "Content-Type")
         r.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         r.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        let body = OpenAIChatBody(
-            model: request.model.rawValue,
-            messages: request.messages.map { .init(role: $0.role.rawValue, content: $0.content) },
-            stream: true,
-            temperature: request.temperature,
-            reasoning_effort: request.reasoningEffort?.rawValue
-        )
-        r.httpBody = try JSONEncoder().encode(body)
+        var root: [String: JSONValue] = [
+            "model": .string(request.model.rawValue),
+            "messages": .array(request.messages.map(Self.chatMessageJSON)),
+            "stream": .bool(true),
+        ]
+        if let t = request.temperature { root["temperature"] = .number(t) }
+        if let reasoning = request.reasoningEffort { root["reasoning_effort"] = .string(reasoning.rawValue) }
+        if request.includeUsage { root["stream_options"] = .object(["include_usage": .bool(true)]) }
+        r.httpBody = try JSONEncoder().encode(JSONValue.object(root))
         return r
     }
 
-    static func parseDelta(_ json: String) -> String? {
-        guard let data = json.data(using: .utf8),
-              let chunk = try? JSONDecoder().decode(OpenAIStreamChunk.self, from: data) else {
-            return nil
+    /// Encodes a message as a plain string, or as a content-parts array when it
+    /// carries images (OpenAI vision format).
+    static func chatMessageJSON(_ m: ChatMessage) -> JSONValue {
+        if m.images.isEmpty {
+            return .object(["role": .string(m.role.rawValue), "content": .string(m.content)])
         }
-        return chunk.choices.first?.delta.content
+        var parts: [JSONValue] = []
+        if !m.content.isEmpty {
+            parts.append(.object(["type": .string("text"), "text": .string(m.content)]))
+        }
+        for image in m.images {
+            parts.append(.object(["type": .string("image_url"),
+                                  "image_url": .object(["url": .string(image.url)])]))
+        }
+        return .object(["role": .string(m.role.rawValue), "content": .array(parts)])
     }
 }
 

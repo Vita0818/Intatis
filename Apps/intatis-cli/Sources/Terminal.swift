@@ -38,6 +38,18 @@ func renderLoop(_ log: EventLog) async {
             out("  \(cyan)↔ \(p.from.rawValue)→\(p.to.rawValue):\(reset) \(truncate(p.content, 300))\n")
         case .artifactAdded(let p):
             out("  📎 \(p.kind): \(p.path)\n")
+        case .turnStats(let p):
+            var parts: [String] = []
+            if let total = p.totalMillis { parts.append(String(format: "%.1fs", Double(total) / 1000)) }
+            if let ttft = p.ttftMillis { parts.append("ttft \(String(format: "%.2fs", Double(ttft) / 1000))") }
+            if let tot = p.totalTokens {
+                if let pin = p.promptTokens, let pout = p.completionTokens {
+                    parts.append("\(tot) tok (\(pin) in / \(pout) out)")
+                } else {
+                    parts.append("\(tot) tok")
+                }
+            }
+            if !parts.isEmpty { out("  \(dim)⎿ \(parts.joined(separator: " · "))\(reset)\n") }
         case .error(let p):
             out("  \(red)! \(p.message)\(reset)\n")
         default:

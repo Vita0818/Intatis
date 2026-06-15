@@ -22,7 +22,13 @@ private struct OAAgentStreamChunk: Decodable {
         let delta: Delta?
         let finish_reason: String?
     }
+    struct UsageDTO: Decodable {
+        let prompt_tokens: Int?
+        let completion_tokens: Int?
+        let total_tokens: Int?
+    }
     let choices: [Choice]
+    let usage: UsageDTO?
 }
 
 private struct ToolCallAccum {
@@ -47,10 +53,15 @@ extension OpenAIWireProvider: ToolCallingProvider {
                     func handle(_ payload: String) {
                         if payload == "[DONE]" { return }
                         guard let data = payload.data(using: .utf8),
-                              let chunk = try? JSONDecoder().decode(OAAgentStreamChunk.self, from: data),
-                              let choice = chunk.choices.first else {
+                              let chunk = try? JSONDecoder().decode(OAAgentStreamChunk.self, from: data) else {
                             return
                         }
+                        if let u = chunk.usage {
+                            continuation.yield(.usage(Usage(promptTokens: u.prompt_tokens,
+                                                            completionTokens: u.completion_tokens,
+                                                            totalTokens: u.total_tokens)))
+                        }
+                        guard let choice = chunk.choices.first else { return }
                         if let content = choice.delta?.content, !content.isEmpty {
                             continuation.yield(.textDelta(content))
                         }
@@ -112,6 +123,9 @@ extension OpenAIWireProvider: ToolCallingProvider {
         if let r = request.reasoningEffort {
             root["reasoning_effort"] = .string(r.rawValue)
         }
+        if request.includeUsage {
+            root["stream_options"] = .object(["include_usage": .bool(true)])
+        }
 
         let url = endpoint.baseURL.appendingPathComponent("chat/completions")
         var r = URLRequest(url: url)
@@ -125,7 +139,17 @@ extension OpenAIWireProvider: ToolCallingProvider {
 
     static func messageJSON(_ m: AgentMessage) -> JSONValue {
         var obj: [String: JSONValue] = ["role": .string(m.role.rawValue)]
-        if let content = m.content {
+        if !m.images.isEmpty {
+            var parts: [JSONValue] = []
+            if let c = m.content, !c.isEmpty {
+                parts.append(.object(["type": .string("text"), "text": .string(c)]))
+            }
+            for image in m.images {
+                parts.append(.object(["type": .string("image_url"),
+                                      "image_url": .object(["url": .string(image.url)])]))
+            }
+            obj["content"] = .array(parts)
+        } else if let content = m.content {
             obj["content"] = .string(content)
         } else if m.role == .assistant {
             obj["content"] = .null   // assistant-with-tool_calls requires explicit null content

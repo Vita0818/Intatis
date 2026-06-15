@@ -35,6 +35,7 @@ struct CLIConfig {
     let wire: WireFormat
     let reasoningEffort: ReasoningEffort?
     let mode: Mode
+    let includeUsage: Bool
 
     static let defaultBaseURL = "https://api.openai.com/v1"
     static let defaultModel = "gpt-4o-mini"
@@ -59,9 +60,13 @@ struct CLIConfig {
         let reasoning = value("INTATIS_REASONING", "reasoning", fallback: nil)
             .flatMap { ReasoningEffort(rawValue: $0.lowercased()) }
         let mode = Mode(rawValue: value("INTATIS_MODE", "mode", fallback: "chat")!.lowercased()) ?? .chat
+        // Ask the endpoint for token usage (default on). Set INTATIS_USAGE=0 if an
+        // endpoint rejects the stream_options field.
+        let usageStr = value("INTATIS_USAGE", "usage", fallback: "1")!.lowercased()
+        let includeUsage = !(usageStr == "0" || usageStr == "false" || usageStr == "off")
 
         return CLIConfig(baseURL: baseURL, apiKey: apiKey, model: model, wire: .openai,
-                         reasoningEffort: reasoning, mode: mode)
+                         reasoningEffort: reasoning, mode: mode, includeUsage: includeUsage)
     }
 
     func providerConfig() -> ProviderConfig {

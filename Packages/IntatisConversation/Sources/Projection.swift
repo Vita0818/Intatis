@@ -63,8 +63,9 @@ public struct ConversationProjection: Equatable, Sendable {
                                             isComplete: true))
 
         case .toolCall, .toolResult, .permissionRequest, .permissionResolved, .patchProposed, .agentStatus,
-             .agentAttached, .agentDetached, .agentMessage, .agentToAgentMessage, .permissionReview, .artifactProgress:
-            break   // tool/permission/agent/progress events are not shown in the chat text view
+             .agentAttached, .agentDetached, .agentMessage, .agentToAgentMessage, .permissionReview,
+             .artifactProgress, .turnStats:
+            break   // tool/permission/agent/progress/stats events are not shown in the chat text view
         }
     }
 

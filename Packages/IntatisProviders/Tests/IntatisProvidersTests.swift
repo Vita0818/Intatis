@@ -63,11 +63,39 @@ final class IntatisProvidersTests: XCTestCase {
                                                            messages: [ChatMessage(role: .user, content: "hi")])) {
             switch chunk {
             case .delta(let d): text += d
+            case .usage: break
             case .done: sawDone = true
             }
         }
         XCTAssertEqual(text, "Hello")
         XCTAssertTrue(sawDone)
+    }
+
+    func testOpenAIStreamingParsesUsage() async throws {
+        let sse = """
+        data: {"choices":[{"delta":{"content":"hi"}}]}
+
+        data: {"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":3,"total_tokens":14}}
+
+        data: [DONE]
+
+        """
+        let bytes = Array(sse.utf8)
+        var chunks: [Data] = []
+        var i = 0
+        while i < bytes.count { let e = min(i + 9, bytes.count); chunks.append(Data(bytes[i..<e])); i = e }
+        let endpoint = ProviderEndpoint(id: "e", baseURL: URL(string: "https://example.test/v1")!,
+                                        apiKeyRef: KeychainRef(service: "s", account: "a"), wire: .openai)
+        let provider = OpenAIWireProvider(endpoint: endpoint, apiKey: "k", http: FakeHTTP(chunks: chunks))
+        var usage: Usage?
+        for try await chunk in provider.stream(ChatRequest(model: ModelID(rawValue: "m"),
+                                                           messages: [ChatMessage(role: .user, content: "hi")],
+                                                           includeUsage: true)) {
+            if case .usage(let u) = chunk { usage = u }
+        }
+        XCTAssertEqual(usage?.promptTokens, 11)
+        XCTAssertEqual(usage?.completionTokens, 3)
+        XCTAssertEqual(usage?.totalTokens, 14)
     }
 
     func testRegistryResolvesOpenAIProvider() async throws {

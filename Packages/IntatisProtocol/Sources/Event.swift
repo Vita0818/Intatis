@@ -186,6 +186,8 @@ public enum Event: Equatable, Sendable {
     // v0.4 (Multimodal)
     case artifactAdded(ArtifactAddedPayload)
     case artifactProgress(ArtifactProgressPayload)
+    // stats
+    case turnStats(TurnStatsPayload)
 
     /// Stable wire discriminator (snake_case) used in the `type` field.
     public enum TypeTag: String, Codable, Sendable {
@@ -206,6 +208,7 @@ public enum Event: Equatable, Sendable {
         case permissionReview = "permission_review"
         case artifactAdded = "artifact_added"
         case artifactProgress = "artifact_progress"
+        case turnStats = "turn_stats"
     }
 
     public var type: TypeTag {
@@ -227,6 +230,7 @@ public enum Event: Equatable, Sendable {
         case .permissionReview:    return .permissionReview
         case .artifactAdded:       return .artifactAdded
         case .artifactProgress:    return .artifactProgress
+        case .turnStats:           return .turnStats
         }
     }
 }

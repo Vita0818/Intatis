@@ -37,17 +37,22 @@ public struct AgentMessage: Equatable, Sendable {
     public var content: String?
     public var toolCalls: [ToolCall]?
     public var toolCallId: String?
+    public var images: [ImageAttachment]
 
     public init(role: AgentRole, content: String? = nil,
-                toolCalls: [ToolCall]? = nil, toolCallId: String? = nil) {
+                toolCalls: [ToolCall]? = nil, toolCallId: String? = nil,
+                images: [ImageAttachment] = []) {
         self.role = role
         self.content = content
         self.toolCalls = toolCalls
         self.toolCallId = toolCallId
+        self.images = images
     }
 
     public static func system(_ text: String) -> AgentMessage { .init(role: .system, content: text) }
-    public static func user(_ text: String) -> AgentMessage { .init(role: .user, content: text) }
+    public static func user(_ text: String, images: [ImageAttachment] = []) -> AgentMessage {
+        .init(role: .user, content: text, images: images)
+    }
     public static func assistant(_ text: String) -> AgentMessage { .init(role: .assistant, content: text) }
     public static func assistant(toolCalls: [ToolCall], content: String? = nil) -> AgentMessage {
         .init(role: .assistant, content: content, toolCalls: toolCalls)
@@ -63,13 +68,15 @@ public struct AgentRequest: Sendable {
     public var tools: [ToolSpec]
     public var temperature: Double?
     public var reasoningEffort: ReasoningEffort?
+    public var includeUsage: Bool
     public init(model: ModelID, messages: [AgentMessage], tools: [ToolSpec],
-                temperature: Double? = nil, reasoningEffort: ReasoningEffort? = nil) {
+                temperature: Double? = nil, reasoningEffort: ReasoningEffort? = nil, includeUsage: Bool = false) {
         self.model = model
         self.messages = messages
         self.tools = tools
         self.temperature = temperature
         self.reasoningEffort = reasoningEffort
+        self.includeUsage = includeUsage
     }
 }
 
@@ -77,6 +84,7 @@ public struct AgentRequest: Sendable {
 public enum AgentChunk: Equatable, Sendable {
     case textDelta(String)
     case toolCalls([ToolCall])
+    case usage(Usage)
     case done(finishReason: String?)
 }
 

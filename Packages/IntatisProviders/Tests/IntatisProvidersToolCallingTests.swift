@@ -55,6 +55,7 @@ final class IntatisProvidersToolCallingTests: XCTestCase {
             switch chunk {
             case .textDelta: break
             case .toolCalls(let c): calls = c
+            case .usage: break
             case .done(let r): sawDone = true; finish = r
             }
         }
@@ -82,6 +83,7 @@ final class IntatisProvidersToolCallingTests: XCTestCase {
             switch chunk {
             case .textDelta(let d): text += d
             case .toolCalls: XCTFail("unexpected tool call")
+            case .usage: break
             case .done(let r): finish = r
             }
         }
@@ -115,5 +117,33 @@ final class IntatisProvidersToolCallingTests: XCTestCase {
             AgentRequest(model: ModelID(rawValue: "m"), messages: [.user("hi")], tools: []))
         let body2 = try JSONSerialization.jsonObject(with: XCTUnwrap(without.httpBody)) as! [String: Any]
         XCTAssertNil(body2["reasoning_effort"])
+    }
+
+    func testAgentMessageWithImageEncodesAsContentArray() {
+        let message = AgentMessage.user("what is this?",
+                                        images: [ImageAttachment(url: "data:image/png;base64,QUJD")])
+        guard case .object(let obj) = OpenAIWireProvider.messageJSON(message),
+              case .array(let parts)? = obj["content"] else { return XCTFail("content should be an array") }
+        XCTAssertEqual(parts.count, 2)
+        guard case .object(let text) = parts[0] else { return XCTFail() }
+        XCTAssertEqual(text["type"], .string("text"))
+        guard case .object(let img) = parts[1] else { return XCTFail() }
+        XCTAssertEqual(img["type"], .string("image_url"))
+        guard case .object(let imageURL)? = img["image_url"] else { return XCTFail() }
+        XCTAssertEqual(imageURL["url"], .string("data:image/png;base64,QUJD"))
+    }
+
+    func testChatMessageWithImageEncodesAsContentArray() {
+        let m = ChatMessage(role: .user, content: "hi", images: [ImageAttachment(url: "https://x/a.png")])
+        guard case .object(let obj) = OpenAIWireProvider.chatMessageJSON(m),
+              case .array(let parts)? = obj["content"] else { return XCTFail("content should be an array") }
+        XCTAssertEqual(parts.count, 2)
+    }
+
+    func testPlainMessageStaysString() {
+        guard case .object(let obj) = OpenAIWireProvider.chatMessageJSON(ChatMessage(role: .user, content: "hi")) else {
+            return XCTFail()
+        }
+        XCTAssertEqual(obj["content"], .string("hi"))
     }
 }
