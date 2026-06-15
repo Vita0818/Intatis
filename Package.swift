@@ -28,8 +28,11 @@ let package = Package(
         .library(name: "IntatisCowork", targets: ["IntatisCowork"]),
         .library(name: "IntatisMultimodal", targets: ["IntatisMultimodal"]),
         .library(name: "IntatisSharedUI", targets: ["IntatisSharedUI"]),
-        .executable(name: "IntatisMac", targets: ["IntatisMac"]),
-        .executable(name: "IntatisiOS", targets: ["IntatisiOS"]),
+        // The CLI IS a SwiftPM executable (no Xcode needed): `swift run intatis chat`.
+        .executable(name: "intatis", targets: ["IntatisCLI"]),
+        // The GUI apps (IntatisMac, IntatisiOS) are Xcode App targets, not SPM
+        // products — SwiftPM cannot build a .app bundle, and iOS apps cannot be
+        // built from SPM at all. See project.yml (XcodeGen) + README.
     ],
     targets: [
         // MARK: Library targets (module == target)
@@ -103,26 +106,19 @@ let package = Package(
             dependencies: ["IntatisCore", "IntatisProtocol", "IntatisProviders", "IntatisConversation", "IntatisArtifacts"],
             path: "Packages/IntatisSharedUI/Sources"
         ),
+        // v0.6 — CLI: clean-room `intatis` command (chat + code agent), talks to
+        // any OpenAI-compatible endpoint via env vars.
         .executableTarget(
-            name: "IntatisMac",
+            name: "IntatisCLI",
             dependencies: [
-                "IntatisCore", "IntatisProtocol", "IntatisProviders",
-                "IntatisConversation", "IntatisArtifacts", "IntatisSharedUI",
+                "IntatisCore", "IntatisProtocol", "IntatisProviders", "IntatisConversation",
                 "IntatisTools", "IntatisPermission", "IntatisAgentKernel", "IntatisCowork",
-                "IntatisMultimodal",
             ],
-            path: "Apps/IntatisMac/Sources"
+            path: "Apps/intatis-cli/Sources"
         ),
-        // v0.5 — iOS: the chat-only subset. Deliberately depends on NONE of
-        // Tools / Permission / AgentKernel / Cowork (ARCHITECTURE.md §4.1).
-        .executableTarget(
-            name: "IntatisiOS",
-            dependencies: [
-                "IntatisCore", "IntatisProtocol", "IntatisProviders",
-                "IntatisConversation", "IntatisArtifacts", "IntatisMultimodal", "IntatisSharedUI",
-            ],
-            path: "Apps/IntatisiOS/Sources"
-        ),
+        // GUI app targets (IntatisMac macOS app, IntatisiOS iOS app) are defined in
+        // the Xcode project generated from project.yml — they link these library
+        // products. The iOS app intentionally links only the subset.
 
         // MARK: Test targets (none depend on UI/app targets, so `swift test` is headless)
         .testTarget(

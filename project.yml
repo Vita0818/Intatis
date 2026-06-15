@@ -1,0 +1,120 @@
+# XcodeGen spec — generates the Xcode project that builds the real .app bundles.
+#
+#   brew install xcodegen      # one-time
+#   xcodegen generate          # creates Intatis.xcodeproj
+#   open Intatis.xcodeproj     # pick the IntatisMac or IntatisiOS scheme, then Run
+#
+# The App targets link the Swift Package products in this repo. The iOS app links
+# ONLY the chat subset (no Tools / Permission / AgentKernel / Cowork).
+
+name: Intatis
+
+options:
+  bundleIdPrefix: com.intatis
+  deploymentTarget:
+    macOS: "13.0"
+    iOS: "16.0"
+  createIntermediateGroups: true
+
+packages:
+  Intatis:
+    path: .
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MARKETING_VERSION: "0.5.0"
+    CURRENT_PROJECT_VERSION: "1"
+    CODE_SIGN_STYLE: Automatic
+    GENERATE_INFOPLIST_FILE: "NO"
+    # To run on a device or archive for distribution, set your team:
+    # DEVELOPMENT_TEAM: ABCDE12345
+
+targets:
+
+  # ---- macOS app: full Chat / Code / Cowork (links all 11 library products) ----
+  IntatisMac:
+    type: application
+    platform: macOS
+    sources:
+      - Apps/IntatisMac/Sources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.intatis.app
+        # Let Xcode synthesize Info.plist (injects CFBundleExecutable etc.).
+        GENERATE_INFOPLIST_FILE: "YES"
+        INFOPLIST_KEY_CFBundleDisplayName: Intatis
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
+        INFOPLIST_KEY_NSHumanReadableCopyright: "Intatis — clean-room. See NOTICE.md."
+        CODE_SIGN_ENTITLEMENTS: Apps/IntatisMac/IntatisMac.AppStore.entitlements
+        # For full Code/Cowork with shell + git, use the non-sandboxed build:
+        #   CODE_SIGN_ENTITLEMENTS: Apps/IntatisMac/IntatisMac.DeveloperID.entitlements
+        #   and set AppConfig.platformProfile = .macDeveloperID
+    dependencies:
+      - package: Intatis
+        product: IntatisCore
+      - package: Intatis
+        product: IntatisProtocol
+      - package: Intatis
+        product: IntatisProviders
+      - package: Intatis
+        product: IntatisConversation
+      - package: Intatis
+        product: IntatisArtifacts
+      - package: Intatis
+        product: IntatisMultimodal
+      - package: Intatis
+        product: IntatisSharedUI
+      - package: Intatis
+        product: IntatisTools
+      - package: Intatis
+        product: IntatisPermission
+      - package: Intatis
+        product: IntatisAgentKernel
+      - package: Intatis
+        product: IntatisCowork
+
+  # ---- iOS app: chat-only SUBSET (deliberately no workspace stack) ----
+  IntatisiOS:
+    type: application
+    platform: iOS
+    sources:
+      - Apps/IntatisiOS/Sources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.intatis.ios
+        TARGETED_DEVICE_FAMILY: "1,2"
+        # Let Xcode synthesize Info.plist (injects CFBundleExecutable etc.).
+        GENERATE_INFOPLIST_FILE: "YES"
+        INFOPLIST_KEY_CFBundleDisplayName: Intatis
+        INFOPLIST_KEY_UILaunchScreen_Generation: "YES"
+        INFOPLIST_KEY_NSMicrophoneUsageDescription: "Intatis uses the microphone for voice input transcription."
+    dependencies:
+      - package: Intatis
+        product: IntatisCore
+      - package: Intatis
+        product: IntatisProtocol
+      - package: Intatis
+        product: IntatisProviders
+      - package: Intatis
+        product: IntatisConversation
+      - package: Intatis
+        product: IntatisArtifacts
+      - package: Intatis
+        product: IntatisMultimodal
+      - package: Intatis
+        product: IntatisSharedUI
+
+schemes:
+  IntatisMac:
+    build:
+      targets:
+        IntatisMac: all
+    run:
+      config: Debug
+  IntatisiOS:
+    build:
+      targets:
+        IntatisiOS: all
+    run:
+      config: Debug

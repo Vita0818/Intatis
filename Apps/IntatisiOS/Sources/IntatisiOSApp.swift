@@ -66,6 +66,8 @@ struct IOSRootView: View {
     @EnvironmentObject var env: IOSAppEnvironment
     @State private var showSettings = false
     @State private var keyInput = ""
+    @State private var baseURLInput = IOSConfig.baseURL
+    @State private var modelInput = IOSConfig.chatModelName
 
     var body: some View {
         // PlatformProfile.iOS makes the shared sidebar chat-only; Code/Cowork are
@@ -81,21 +83,37 @@ struct IOSRootView: View {
     }
 
     private var settingsSheet: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("OpenAI-compatible API key").font(.headline)
-            Text("Stored in your device keychain.").font(.caption).foregroundStyle(.secondary)
-            SecureField("sk-…", text: $keyInput).textFieldStyle(.roundedBorder)
-            HStack {
-                Spacer()
-                Button("Cancel") { showSettings = false }
-                Button("Save") {
-                    env.saveAPIKey(keyInput)
-                    keyInput = ""
-                    showSettings = false
+        NavigationStack {
+            Form {
+                Section("Endpoint") {
+                    TextField(IOSConfig.defaultBaseURL, text: $baseURLInput)
+                        .textInputAutocapitalization(.never).autocorrectionDisabled()
+                    TextField(IOSConfig.defaultModel, text: $modelInput)
+                        .textInputAutocapitalization(.never).autocorrectionDisabled()
+                }
+                Section("API key") {
+                    SecureField("sk-… (any non-empty for local)", text: $keyInput)
+                }
+                Section {
+                    Text("Works with any OpenAI-compatible API. Key is stored in the device keychain; "
+                         + "endpoint/model changes take effect on relaunch.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            .navigationTitle("Settings")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { showSettings = false } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        IOSConfig.baseURL = baseURLInput.trimmingCharacters(in: .whitespacesAndNewlines)
+                        IOSConfig.chatModelName = modelInput.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !keyInput.isEmpty { env.saveAPIKey(keyInput) }
+                        keyInput = ""
+                        showSettings = false
+                    }
                 }
             }
         }
-        .padding(20)
     }
 }
 

@@ -22,6 +22,7 @@ public struct AgentLoop: Sendable {
     private let shell: ShellRunner
     private let git: GitService
     private let messenger: AgentMessenger?
+    private let reasoningEffort: ReasoningEffort?
     private let maxIterations: Int
 
     public init(log: EventLog,
@@ -35,6 +36,7 @@ public struct AgentLoop: Sendable {
                 shell: ShellRunner = ProcessShellRunner(),
                 git: GitService = ProcessGitService(),
                 messenger: AgentMessenger? = nil,
+                reasoningEffort: ReasoningEffort? = nil,
                 maxIterations: Int = 8) {
         self.log = log
         self.provider = provider
@@ -47,6 +49,7 @@ public struct AgentLoop: Sendable {
         self.shell = shell
         self.git = git
         self.messenger = messenger
+        self.reasoningEffort = reasoningEffort
         self.maxIterations = maxIterations
     }
 
@@ -66,7 +69,8 @@ public struct AgentLoop: Sendable {
             var pendingToolCalls: [ToolCall] = []
             let assistantID = MessageID.new()
 
-            for try await chunk in provider.stream(AgentRequest(model: agent.model, messages: convo, tools: specs)) {
+            for try await chunk in provider.stream(AgentRequest(model: agent.model, messages: convo, tools: specs,
+                                                                reasoningEffort: reasoningEffort)) {
                 switch chunk {
                 case .textDelta(let d):
                     assistantText += d

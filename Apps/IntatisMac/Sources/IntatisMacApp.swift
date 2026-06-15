@@ -90,6 +90,8 @@ struct RootView: View {
     @EnvironmentObject var env: AppEnvironment
     @State private var showSettings = false
     @State private var keyInput = ""
+    @State private var baseURLInput = AppConfig.baseURL
+    @State private var modelInput = AppConfig.chatModelName
     @State private var mode: AppMode = .chat
 
     var body: some View {
@@ -122,16 +124,27 @@ struct RootView: View {
 
     private var settingsSheet: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("OpenAI-compatible API key").font(.headline)
-            Text("Stored in your macOS keychain. Never sent anywhere except your configured endpoint.")
+            Text("Endpoint & model").font(.headline)
+            Text("Works with any OpenAI-compatible API — OpenAI, Ollama, vLLM, OpenRouter, DeepSeek, …")
                 .font(.caption).foregroundStyle(.secondary)
-            SecureField("sk-…", text: $keyInput)
-                .textFieldStyle(.roundedBorder)
+            LabeledContent("Base URL") {
+                TextField(AppConfig.defaultBaseURL, text: $baseURLInput).textFieldStyle(.roundedBorder)
+            }
+            LabeledContent("Model") {
+                TextField(AppConfig.defaultModel, text: $modelInput).textFieldStyle(.roundedBorder)
+            }
+            LabeledContent("API key") {
+                SecureField("sk-… (any non-empty for local servers)", text: $keyInput).textFieldStyle(.roundedBorder)
+            }
+            Text("Key is stored in your macOS keychain. Endpoint/model changes take effect on relaunch.")
+                .font(.caption2).foregroundStyle(.secondary)
             HStack {
                 Spacer()
                 Button("Cancel") { showSettings = false }
                 Button("Save") {
-                    env.saveAPIKey(keyInput)
+                    AppConfig.baseURL = baseURLInput.trimmingCharacters(in: .whitespacesAndNewlines)
+                    AppConfig.chatModelName = modelInput.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !keyInput.isEmpty { env.saveAPIKey(keyInput) }
                     keyInput = ""
                     showSettings = false
                 }
@@ -139,7 +152,7 @@ struct RootView: View {
             }
         }
         .padding(20)
-        .frame(width: 400)
+        .frame(width: 460)
     }
 }
 

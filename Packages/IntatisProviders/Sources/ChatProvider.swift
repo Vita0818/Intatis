@@ -16,15 +16,25 @@ public struct ChatMessage: Codable, Equatable, Sendable {
     }
 }
 
+/// Reasoning/thinking effort for reasoning models (OpenAI o-series / gpt-5 style
+/// `reasoning_effort`). Sent on the wire only when set, so non-reasoning models
+/// and endpoints that don't support it are unaffected.
+public enum ReasoningEffort: String, Codable, Sendable {
+    case minimal, low, medium, high
+}
+
 public struct ChatRequest: Equatable, Sendable {
     public var model: ModelID
     public var messages: [ChatMessage]
     public var temperature: Double?
+    public var reasoningEffort: ReasoningEffort?
     public var stream: Bool
-    public init(model: ModelID, messages: [ChatMessage], temperature: Double? = nil, stream: Bool = true) {
+    public init(model: ModelID, messages: [ChatMessage], temperature: Double? = nil,
+                reasoningEffort: ReasoningEffort? = nil, stream: Bool = true) {
         self.model = model
         self.messages = messages
         self.temperature = temperature
+        self.reasoningEffort = reasoningEffort
         self.stream = stream
     }
 }

@@ -12,6 +12,7 @@ private struct OpenAIChatBody: Encodable {
     let messages: [Msg]
     let stream: Bool
     let temperature: Double?
+    let reasoning_effort: String?
 }
 
 private struct OpenAIStreamChunk: Decodable {
@@ -86,7 +87,8 @@ public struct OpenAIWireProvider: ChatProvider {
             model: request.model.rawValue,
             messages: request.messages.map { .init(role: $0.role.rawValue, content: $0.content) },
             stream: true,
-            temperature: request.temperature
+            temperature: request.temperature,
+            reasoning_effort: request.reasoningEffort?.rawValue
         )
         r.httpBody = try JSONEncoder().encode(body)
         return r

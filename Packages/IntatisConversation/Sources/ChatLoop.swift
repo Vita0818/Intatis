@@ -15,12 +15,15 @@ public struct ChatLoop: Sendable {
     private let provider: ChatProvider
     private let model: ModelID
     private let systemPrompt: String?
+    private let reasoningEffort: ReasoningEffort?
 
-    public init(log: EventLog, provider: ChatProvider, model: ModelID, systemPrompt: String? = nil) {
+    public init(log: EventLog, provider: ChatProvider, model: ModelID,
+                systemPrompt: String? = nil, reasoningEffort: ReasoningEffort? = nil) {
         self.log = log
         self.provider = provider
         self.model = model
         self.systemPrompt = systemPrompt
+        self.reasoningEffort = reasoningEffort
     }
 
     /// Send one user message and stream the assistant reply into the log.
@@ -36,7 +39,7 @@ public struct ChatLoop: Sendable {
         let assistantID = MessageID.new()
         var full = ""
         do {
-            for try await chunk in provider.stream(ChatRequest(model: model, messages: messages)) {
+            for try await chunk in provider.stream(ChatRequest(model: model, messages: messages, reasoningEffort: reasoningEffort)) {
                 switch chunk {
                 case .delta(let d):
                     full += d

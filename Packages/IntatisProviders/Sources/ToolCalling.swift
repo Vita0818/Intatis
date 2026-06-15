@@ -62,11 +62,14 @@ public struct AgentRequest: Sendable {
     public var messages: [AgentMessage]
     public var tools: [ToolSpec]
     public var temperature: Double?
-    public init(model: ModelID, messages: [AgentMessage], tools: [ToolSpec], temperature: Double? = nil) {
+    public var reasoningEffort: ReasoningEffort?
+    public init(model: ModelID, messages: [AgentMessage], tools: [ToolSpec],
+                temperature: Double? = nil, reasoningEffort: ReasoningEffort? = nil) {
         self.model = model
         self.messages = messages
         self.tools = tools
         self.temperature = temperature
+        self.reasoningEffort = reasoningEffort
     }
 }
 

@@ -115,29 +115,98 @@ headless Agent Kernel。完整设计见 [`ARCHITECTURE.md`](ARCHITECTURE.md)，c
 
 ## 构建、测试、运行（macOS 13+）
 
-无 UI 的模块（Core / Protocol / Providers / Artifacts / Conversation）可直接命令行构建与测试：
+### 库 / 逻辑层（不需要 Xcode）
 
 ```bash
-swift build
-swift test            # 运行下方的 XCTest 套件——无需联网
+swift build       # 编译 11 个库
+swift test        # 运行全部 XCTest 套件——无需联网
 ```
 
-启动 GUI：
+### 跑起 App（生成 Xcode 工程）
+
+仓库是 **Swift Package（纯库）**，不含 `.xcodeproj`。**App 是 Xcode 的 App target**，链接这些库——
+SwiftPM 产不出 `.app`，iOS app 更是只能由 Xcode 构建。这就是"在 Xcode 里 build 这个 Package
+不出 app"的原因。用 [XcodeGen](https://github.com/yonaskolb/XcodeGen) 一条命令生成工程：
 
 ```bash
-swift run IntatisMac
+brew install xcodegen     # 一次性
+make app                  # = xcodegen generate && open Intatis.xcodeproj
 ```
 
-首次启动时，粘贴一个 OpenAI-compatible API key（存入 Keychain）。默认：端点
-`https://api.openai.com/v1`，模型 `gpt-4o-mini`——可在
-`Apps/IntatisMac/Sources/AppConfig.swift` 修改。
+然后在 Xcode 里选 **IntatisMac** 或 **IntatisiOS** scheme，按 Run。`project.yml` 定义了这两个
+App target（mac 链全部 11 个库；iOS 只链 chat 子集 7 个），并接上各自的 `Info.plist` / entitlements。
 
-若需要正式签名的 `.app`（沙盒 / entitlements），把这些 package 包进一个 Xcode macOS App
-target 并附上下面的 entitlements。上面的 SwiftPM 可执行文件用于开发调试。
+- 真机 / 归档需在 target 的 Signing 里选你的 Team（本地 mac 运行与 iOS 模拟器通常自动签名即可）。
+- 首次启动点右上角 🔑 粘贴 OpenAI-compatible API key（存 Keychain）。默认端点
+  `https://api.openai.com/v1`、模型 `gpt-4o-mini` / `dall-e-3` / `whisper-1`，在
+  `Apps/IntatisMac/Sources/AppConfig.swift`（iOS 在 `IOSConfig.swift`）里改。
+- mac 默认用**沙盒（App Store）entitlements**：Chat 与 Code 的读/写/patch 可用，但 `run_shell`
+  与 `git`（spawn）在沙盒里跑不了。要完整 Code/Cowork（shell+git），按 `project.yml` 注释切到
+  **DeveloperID entitlements** 并设 `AppConfig.platformProfile = .macDeveloperID`。
 
-**iOS**：`IntatisiOS` target 是 chat 子集。`swift build` 会一并编译它做核对；要在设备/模拟器上跑，
-用 Xcode 新建一个 iOS App target，链接子集包（Core / Protocol / Providers / Conversation /
-Artifacts / Multimodal / SharedUI），用 `Apps/IntatisiOS/Info.plist` 作为 Info.plist。
+> 不想装 XcodeGen 也行：Xcode 里 File ▸ New ▸ Target ▸ App 建 macOS/iOS App target，把本仓库
+> 作为 local Swift package 依赖，按上面的库清单勾选 product 即可。
+
+---
+
+## CLI（`intatis`）
+
+CLI 是真正的 SwiftPM 可执行文件，**不需要 Xcode**：
+
+```bash
+swift run intatis settings        # 交互式设置页：endpoint / API key / 模型 / 推理 / 默认模式
+swift run intatis                 # 跑默认模式（设置里选的，默认 chat）
+swift run intatis chat            # 流式对话（无工具）
+swift run intatis code .          # coding agent（读/写/patch/shell/git，写入走终端审批）
+swift run intatis cowork .        # 多 Agent：/agent add <name> <path>，再 @name 发消息
+swift run intatis selftest        # 零配置自检：离线跑通 chat + code 写/读文件（无需 key）
+swift run intatis config          # 打印当前解析到的配置
+```
+
+**首次使用**：跑 `swift run intatis settings` —— 一个编号菜单的设置页，设好 endpoint 和 API key
+（这俩必填），可选地设默认模型 / 推理强度 / 默认模式，保存到 `~/.config/intatis/config.json`。之后
+直接 `swift run intatis` 就用这份配置。优先级：**环境变量 > 配置文件 > 默认值**。
+
+**会话内 slash 命令**（仿 Claude Code）：`/model <name>` 换模型、`/reasoning <level|off>` 调推理、
+`/mode <chat|code|cowork>` 实时切模式、`/clear` 新会话、`/config` 看当前、`/help`、`/exit`。
+
+想先零配置确认链路：`swift run intatis selftest` —— 内置 fake 模型，离线把 **chat 完整一轮** +
+**code 写文件再读回**走一遍，复用的就是真正的 ChatLoop / AgentLoop / 渲染 / 审批代码。
+
+`intatis code` 跑的就是完整 Agent：模型调用 `read_file` / `search_text` / `write_file` /
+`apply_patch` / `run_shell` / `git_status` / `git_diff`，写入和命令在终端里 `[y/N]` 审批（只读
+自动放行）。想装成系统命令：`swift build -c release` 后把 `.build/release/intatis` 放进 `PATH`。
+
+## 接任何家的 API（不只是 OpenAI）
+
+"支持 OpenAI" 指的是 **OpenAI-compatible 协议**，不是只连 openai.com。换个 `INTATIS_BASE_URL`
+就能接任意一家：
+
+```bash
+# Ollama（本地，key 随便填）
+INTATIS_BASE_URL=http://localhost:11434/v1 INTATIS_API_KEY=ollama INTATIS_MODEL=llama3.1 \
+  swift run intatis chat
+# OpenRouter
+INTATIS_BASE_URL=https://openrouter.ai/api/v1 INTATIS_API_KEY=sk-or-... \
+  INTATIS_MODEL=anthropic/claude-3.5-sonnet swift run intatis chat
+# DeepSeek
+INTATIS_BASE_URL=https://api.deepseek.com/v1 INTATIS_API_KEY=sk-... \
+  INTATIS_MODEL=deepseek-chat swift run intatis code .
+```
+
+**切模型**：改 `INTATIS_MODEL`。**切厂商**：改 `INTATIS_BASE_URL`（+ 对应 key / model）。
+**调思考/推理强度**：`INTATIS_REASONING=minimal|low|medium|high` —— 只在设置时才下发
+`reasoning_effort`，普通模型或不支持的端点不受影响：
+
+```bash
+INTATIS_API_KEY=sk-... INTATIS_MODEL=o4-mini INTATIS_REASONING=high swift run intatis chat
+```
+
+`swift run intatis config` 随时看当前解析到的端点 / 模型 / 推理强度。
+
+架构本就端点无关：`ProviderEndpoint.baseURL` 可配，`WireFormat` 是枚举（目前 `.openai`，留了
+加 `.anthropic` / `.gemini` 的缝）。**GUI 设置（右上角 🔑）现在也是 Base URL / Model / API key
+三栏** —— 端点/模型改动重启生效，key 即时生效。
 
 ---
 

@@ -109,6 +109,9 @@ extension OpenAIWireProvider: ToolCallingProvider {
         if let t = request.temperature {
             root["temperature"] = .number(t)
         }
+        if let r = request.reasoningEffort {
+            root["reasoning_effort"] = .string(r.rawValue)
+        }
 
         let url = endpoint.baseURL.appendingPathComponent("chat/completions")
         var r = URLRequest(url: url)
