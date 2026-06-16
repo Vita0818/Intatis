@@ -15,22 +15,23 @@ struct PendingAttachments {
 enum LoadedAttachment {
     case image(ImageAttachment)
     case text(name: String, content: String)
+    case failure(String)
 }
 
 enum AttachmentLoader {
     static let imageExtensions: Set<String> = ["png", "jpg", "jpeg", "gif", "webp", "bmp"]
 
-    /// image → vision attachment; UTF-8 text → inline text block; else an error.
-    static func load(_ path: String) -> Result<LoadedAttachment, String> {
+    /// image → vision attachment; UTF-8 text → inline text block; else `.failure`.
+    static func load(_ path: String) -> LoadedAttachment {
         let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
         guard let data = try? Data(contentsOf: url) else { return .failure("cannot read \(path)") }
         let ext = url.pathExtension.lowercased()
         if imageExtensions.contains(ext) {
             let mime = (ext == "jpg") ? "image/jpeg" : "image/\(ext)"
-            return .success(.image(ImageAttachment.base64(mime: mime, base64: data.base64EncodedString())))
+            return .image(ImageAttachment.base64(mime: mime, base64: data.base64EncodedString()))
         }
         if let text = String(data: data, encoding: .utf8) {
-            return .success(.text(name: url.lastPathComponent, content: text))
+            return .text(name: url.lastPathComponent, content: text)
         }
         return .failure("unsupported file type '.\(ext)' (only images and UTF-8 text)")
     }

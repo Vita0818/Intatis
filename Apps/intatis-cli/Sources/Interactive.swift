@@ -114,9 +114,9 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
                     pending.clear(); out("attachments cleared\n")
                 } else {
                     switch AttachmentLoader.load(arg) {
-                    case .success(.image(let img)):
+                    case .image(let img):
                         pending.images.append(img); out("attached image · \(pending.count) queued\n")
-                    case .success(.text(let name, let content)):
+                    case .text(let name, let content):
                         pending.textFiles.append((name, content)); out("attached \(name) · \(pending.count) queued\n")
                     case .failure(let message):
                         errOut(message + "\n")
