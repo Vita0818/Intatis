@@ -18,6 +18,9 @@ public actor Orchestrator {
     private let engine: PermissionEngine
     private let allowsShell: Bool
     private let responder: PermissionResponder
+    private let reasoningEffort: ReasoningEffort?
+    private let includeUsage: Bool
+    private let maxSteps: Int
     private let providerFor: @Sendable (Agent) async throws -> ToolCallingProvider
 
     public init(log: EventLog,
@@ -25,6 +28,9 @@ public actor Orchestrator {
                 engine: PermissionEngine = PermissionEngine(),
                 allowsShell: Bool,
                 responder: PermissionResponder,
+                reasoningEffort: ReasoningEffort? = nil,
+                includeUsage: Bool = false,
+                maxSteps: Int = 50,
                 providerFor: @escaping @Sendable (Agent) async throws -> ToolCallingProvider) {
         self.log = log
         self.registry = AgentRegistry()
@@ -32,6 +38,9 @@ public actor Orchestrator {
         self.engine = engine
         self.allowsShell = allowsShell
         self.responder = responder
+        self.reasoningEffort = reasoningEffort
+        self.includeUsage = includeUsage
+        self.maxSteps = maxSteps
         self.providerFor = providerFor
     }
 
@@ -47,16 +56,17 @@ public actor Orchestrator {
     }
 
     public func agentNames() -> [AgentID] { registry.names }
+    public func agentList() -> [Agent] { registry.all() }
 
     /// Route a user message to the `@mentioned` agent, or the first attached agent.
-    public func send(_ text: String, to: AgentID? = nil) async {
+    public func send(_ text: String, to: AgentID? = nil, images: [ImageAttachment] = []) async {
         let target = to.flatMap { registry.agent($0) } ?? registry.all().first
         guard let agent = target else {
             try? await log.append(.error(ErrorPayload(code: "no_agent", message: "no agent attached")))
             return
         }
-        try? await log.append(.userMessage(UserMessagePayload(text: text, to: agent.name)))
-        _ = try? await run(agent, input: text)
+        // AgentLoop appends the user message itself — don't double-log it here.
+        _ = try? await run(agent, input: text, images: images)
     }
 
     /// Called by `BusMessenger` when `from` asks the agent named `toName`.
@@ -73,20 +83,62 @@ public actor Orchestrator {
         return forwardedAnswer
     }
 
-    private func run(_ agent: Agent, input: String) async throws -> String {
+    // MARK: - Coordinator tools (a lead agent spawns / lists / removes sub-agents)
+
+    /// Create and attach a new sub-agent bound to `path`. Returns a status line
+    /// the calling (coordinator) agent can read back.
+    func spawnFromTool(name: String, path: String, model: String) async -> String {
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return "error: an agent name is required" }
+        let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardizedFileURL
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue else {
+            return "error: not a folder: \(url.path)"
+        }
+        let id = AgentID(rawValue: trimmed)
+        if registry.agent(id) != nil { return "error: an agent named @\(trimmed) already exists" }
+        await attach(Agent(name: id, workspaceRoot: url,
+                           model: ModelID(rawValue: model), profile: .reviewed))
+        return "spawned @\(trimmed) · model \(model) · \(url.path)"
+    }
+
+    /// One line per active agent, for the coordinator to read.
+    func listForTool() -> String {
+        let all = registry.all()
+        guard !all.isEmpty else { return "(no agents)" }
+        return all.map { "@\($0.name.rawValue) · \($0.model.rawValue) · \($0.workspaceRoot.path)" }
+            .joined(separator: "\n")
+    }
+
+    /// Detach a sub-agent. `@main` is protected so the user always keeps a coordinator.
+    func removeFromTool(name: String) async -> String {
+        let id = AgentID(rawValue: name)
+        guard registry.agent(id) != nil else { return "error: no agent named @\(name)" }
+        if name == "main" { return "error: cannot remove @main" }
+        await detach(id)
+        return "removed @\(name)"
+    }
+
+    private func run(_ agent: Agent, input: String, images: [ImageAttachment] = []) async throws -> String {
         let provider = try await providerFor(agent)
         let messenger = BusMessenger(from: agent.name, orchestrator: self)
+        let manager = OrchestratorManager(orchestrator: self, defaultModel: agent.model.rawValue)
         let loop = AgentLoop(
             log: log,
             provider: provider,
-            registry: ToolRegistry.standard().adding([AskAgentTool()]),
+            registry: ToolRegistry.standard().adding(
+                [AskAgentTool(), SpawnAgentTool(), ListAgentsTool(), RemoveAgentTool()]),
             engine: engine,
             responder: responder,
             agent: agent,
             allowsShell: allowsShell,
-            messenger: messenger
+            messenger: messenger,
+            agentManager: manager,
+            reasoningEffort: reasoningEffort,
+            includeUsage: includeUsage,
+            maxIterations: maxSteps
         )
-        return try await loop.send(input)
+        return try await loop.send(input, images: images)
     }
 }
 
@@ -99,4 +151,18 @@ struct BusMessenger: AgentMessenger {
     func ask(to agent: String, question: String) async -> String {
         await orchestrator.ask(from: from, to: agent, question: question)
     }
+}
+
+/// Coordinator seam handed to each agent's loop; routes lifecycle calls through
+/// the orchestrator actor (and thus its registry + event log). `defaultModel` is
+/// the spawning agent's model, used when the tool call omits one.
+struct OrchestratorManager: AgentManager {
+    let orchestrator: Orchestrator
+    let defaultModel: String
+
+    func spawnAgent(name: String, path: String, model: String?) async -> String {
+        await orchestrator.spawnFromTool(name: name, path: path, model: model ?? defaultModel)
+    }
+    func listAgents() async -> String { await orchestrator.listForTool() }
+    func removeAgent(name: String) async -> String { await orchestrator.removeFromTool(name: name) }
 }

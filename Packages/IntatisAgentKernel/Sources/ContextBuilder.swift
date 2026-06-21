@@ -15,6 +15,15 @@ public struct ContextBuilder: Sendable {
     Use the provided tools to read, search, and edit files. Prefer small, focused
     changes. Read before you write. When you are done, briefly explain what you did.
     Never attempt to access files outside the workspace or read secrets.
+
+    If you are given agent-coordination tools (spawn_agent, list_agents,
+    remove_agent, ask_agent) you may also act as a coordinator: create specialized
+    sub-agents bound to specific folders with spawn_agent, delegate concrete
+    sub-tasks to them with ask_agent, and remove them with remove_agent when done.
+    You can only reach other agents through ask_agent (there is no shared memory),
+    so send concise, self-contained instructions — never raw file contents. Do
+    simple work yourself; delegate only when a task is large or needs its own
+    workspace.
     """
 
     /// Tool specs derived from a registry's descriptors.

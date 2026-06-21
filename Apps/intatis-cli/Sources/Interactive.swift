@@ -23,6 +23,19 @@ private func prompt(_ mode: Mode) -> String {
     "\n\(S.green)\(mode.rawValue) ❯\(S.reset) "
 }
 
+/// Ctrl-A cycles chat → code → cowork → chat.
+private func nextMode(_ m: Mode) -> Mode {
+    switch m { case .chat: return .code; case .code: return .cowork; case .cowork: return .chat }
+}
+
+/// Strip surrounding [] '' "" that users sometimes copy from `[model]`-style help.
+private func unbracket(_ s: String) -> String {
+    var r = Substring(s)
+    while let f = r.first, "[]\"'".contains(f) { r = r.dropFirst() }
+    while let l = r.last, "[]\"'".contains(l) { r = r.dropLast() }
+    return String(r)
+}
+
 func sessionLog() throws -> EventLog {
     let dir = FileManager.default.temporaryDirectory
         .appendingPathComponent("intatis-cli-\(UUID().uuidString)", isDirectory: true)
@@ -51,11 +64,15 @@ private let replHelp = """
   /attach clear             clear queued attachments
   /model [name]             show or switch the model for this session
   /reasoning [level|off]    show or set reasoning (minimal|low|medium|high)
+  /verbose [on|off]         expand tool calls & terminal output (default: collapsed)
   /mode <chat|code|cowork>  switch mode
   /clear                    start a fresh session (clears history)
   /config                   show endpoint / model / reasoning
   /help                     this help
   /exit                     quit
+
+  Keys: ←/→ cursor · Home/End jump · ↑/↓ history · Ctrl-U/K/W edit
+        Ctrl-A mode · Ctrl-L model · Ctrl-S settings · Ctrl-C quit
 
 """
 
@@ -65,8 +82,11 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
     var reasoning = config.reasoningEffort
     var pending = PendingAttachments()
     var log = try sessionLog()
-    var render = Task { await renderLoop(log) }
-    defer { render.cancel() }
+    let spinner = TurnSpinner()
+    let editor = LineEditor()
+    let options = RenderOptions()
+    var render = Task { await renderLoop(log, spinner: spinner, options: options) }
+    defer { render.cancel(); spinner.stop() }
 
     banner(mode: mode, model: model, host: config.baseURL.host ?? config.baseURL.absoluteString)
 
@@ -74,8 +94,22 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
         if !pending.isEmpty {
             out("\(S.dim)  \(pending.count) attachment(s) queued for your next message\(S.reset)\n")
         }
-        out(prompt(mode))
-        guard let line = readLine() else { return .quit }
+        let line: String
+        switch editor.readLine(prompt: prompt(mode)) {
+        case .eof: return .quit
+        case .shortcut(.exit): return .quit
+        case .shortcut(.cycleMode): return .switchTo(nextMode(mode))
+        case .shortcut(.switchModel):
+            if case .text(let m) = editor.readLine(prompt: "\(S.green)model ❯\(S.reset) ") {
+                let name = unbracket(m.trimmingCharacters(in: .whitespaces))
+                if !name.isEmpty { model = name; out("model → \(model)\n") }
+            }
+            continue
+        case .shortcut(.settings):
+            try runSettings(); out("(settings saved — restart to apply endpoint/model changes)\n")
+            continue
+        case .text(let l): line = l
+        }
         let text = line.trimmingCharacters(in: .whitespacesAndNewlines)
         if text.isEmpty { continue }
 
@@ -100,6 +134,11 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
                 } else {
                     out("usage: /reasoning minimal|low|medium|high|off\n")
                 }
+            case "verbose":
+                if arg.lowercased() == "off" { options.verbose = false }
+                else if arg.lowercased() == "on" { options.verbose = true }
+                else { options.verbose.toggle() }
+                out("verbose → \(options.verbose ? "on" : "off")\n")
             case "mode":
                 if let m = Mode(rawValue: arg.lowercased()) {
                     if m == mode { out("already in \(m.rawValue)\n") } else { return .switchTo(m) }
@@ -123,7 +162,7 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
                     }
                 }
             case "clear":
-                render.cancel(); log = try sessionLog(); render = Task { await renderLoop(log) }
+                render.cancel(); log = try sessionLog(); render = Task { await renderLoop(log, spinner: spinner, options: options) }
                 out("(new session)\n")
             case "config":
                 out("endpoint \(config.baseURL.absoluteString) · model \(model) · reasoning \(reasoning?.rawValue ?? "off")\n")
@@ -139,6 +178,7 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
         let sendImages = pending.images
         pending.clear()
 
+        spinner.start()
         do {
             switch mode {
             case .chat:
@@ -153,7 +193,8 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
                 _ = try await AgentLoop(log: log, provider: provider, registry: .standard(),
                                         engine: PermissionEngine(), responder: TerminalResponder(),
                                         agent: agent, allowsShell: true,
-                                        reasoningEffort: reasoning, includeUsage: config.includeUsage)
+                                        reasoningEffort: reasoning, includeUsage: config.includeUsage,
+                                        maxIterations: config.maxSteps)
                     .send(sendText, images: sendImages)
             case .cowork:
                 break
@@ -161,36 +202,72 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
         } catch {
             errOut("error: \(error.localizedDescription)\n")
         }
+        spinner.stop()
     }
 }
 
 private let coworkHelp = """
-  /agent add <name> <path>   attach an agent bound to a workspace
-  /agents                    list attached agents
-  @name <message>            send to a specific agent
-  <message>                  send to the first agent
-  /mode <chat|code|cowork>   switch mode
+  Just talk to @main — it can spawn / list / remove its own helper agents.
+  /agent add <name> <path> [model]   manually attach an agent (optional model)
+  /agent remove <name>               detach an agent
+  /agents                            list attached agents
+  /model [name]                      default model for newly added agents
+  /verbose [on|off]                  expand tool calls & terminal output
+  /attach <path>                     queue an image/text file for the next message
+  @name <message>                    send to a specific agent
+  <message>                          send to @main
+  /mode <chat|code|cowork>           switch mode
   /help   /exit
+
+  Keys: ←/→ cursor · Home/End jump · ↑/↓ history · Ctrl-U/K/W edit
+        Ctrl-A mode · Ctrl-L model · Ctrl-S settings · Ctrl-C quit
 
 """
 
 private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REPLExit {
     let registry = ProviderRegistry(config: config.providerConfig(), resolver: StaticSecretResolver(key: config.apiKey))
-    let model = config.model
+    var defaultModel = config.model
+    var pending = PendingAttachments()
     let log = try sessionLog()
-    let render = Task { await renderLoop(log) }
-    defer { render.cancel() }
+    let spinner = TurnSpinner()
+    let editor = LineEditor()
+    let options = RenderOptions()
+    let render = Task { await renderLoop(log, showAgentLabels: true, spinner: spinner, options: options) }
+    defer { render.cancel(); spinner.stop() }
 
-    let orchestrator = Orchestrator(log: log, allowsShell: true, responder: TerminalResponder()) { _ in
-        try await registry.defaultAgentProvider()
-    }
+    let orchestrator = Orchestrator(
+        log: log, allowsShell: true, responder: TerminalResponder(),
+        reasoningEffort: config.reasoningEffort, includeUsage: config.includeUsage,
+        maxSteps: config.maxSteps
+    ) { _ in try await registry.defaultAgentProvider() }
 
-    banner(mode: .cowork, model: model, host: config.baseURL.host ?? config.baseURL.absoluteString)
-    out("\(S.dim)attach agents: /agent add <name> <path>, then @name <message>\(S.reset)\n")
+    // A default agent so you can just talk; add more with /agent add.
+    await orchestrator.attach(Agent(name: AgentID(rawValue: "main"), workspaceRoot: workspace,
+                                    model: ModelID(rawValue: defaultModel), profile: .reviewed))
+
+    banner(mode: .cowork, model: defaultModel, host: config.baseURL.host ?? config.baseURL.absoluteString)
+    out("\(S.dim)@main is ready in \(workspace.lastPathComponent) — just describe the task; it can spawn its own helper agents. /agents to list · /help\(S.reset)\n")
 
     while true {
-        out(prompt(.cowork))
-        guard let line = readLine() else { return .quit }
+        if !pending.isEmpty {
+            out("\(S.dim)  \(pending.count) attachment(s) queued for your next message\(S.reset)\n")
+        }
+        let line: String
+        switch editor.readLine(prompt: prompt(.cowork)) {
+        case .eof: return .quit
+        case .shortcut(.exit): return .quit
+        case .shortcut(.cycleMode): return .switchTo(nextMode(.cowork))
+        case .shortcut(.switchModel):
+            if case .text(let m) = editor.readLine(prompt: "\(S.green)model ❯\(S.reset) ") {
+                let name = unbracket(m.trimmingCharacters(in: .whitespaces))
+                if !name.isEmpty { defaultModel = name; out("default model for new agents → \(defaultModel)\n") }
+            }
+            continue
+        case .shortcut(.settings):
+            try runSettings(); out("(settings saved — restart to apply)\n")
+            continue
+        case .text(let l): line = l
+        }
         let text = line.trimmingCharacters(in: .whitespacesAndNewlines)
         if text.isEmpty { continue }
 
@@ -205,19 +282,44 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
             case "mode":
                 if parts.count > 1, let m = Mode(rawValue: parts[1].lowercased()) { return .switchTo(m) }
                 else { out("usage: /mode chat|code|cowork\n") }
+            case "model":
+                if parts.count > 1 { defaultModel = parts[1]; out("default model for new agents → \(defaultModel)\n") }
+                else { out("default model for new agents: \(defaultModel)\n") }
+            case "verbose":
+                if parts.count > 1, parts[1].lowercased() == "off" { options.verbose = false }
+                else if parts.count > 1, parts[1].lowercased() == "on" { options.verbose = true }
+                else { options.verbose.toggle() }
+                out("verbose → \(options.verbose ? "on" : "off")\n")
             case "agents":
-                let names = await orchestrator.agentNames().map { "@\($0.rawValue)" }.joined(separator: ", ")
-                out(names.isEmpty ? "(no agents attached)\n" : names + "\n")
+                let list = await orchestrator.agentList()
+                if list.isEmpty { out("(no agents attached)\n") }
+                else { for a in list { out("  @\(a.name.rawValue)  \(S.dim)\(a.model.rawValue) · \(a.workspaceRoot.path)\(S.reset)\n") } }
+            case "attach":
+                if parts.count < 2 || parts[1] == "list" {
+                    out(pending.isEmpty ? "no attachments queued. usage: /attach <path>\n" : "\(pending.count) queued\n")
+                } else if parts[1] == "clear" {
+                    pending.clear(); out("attachments cleared\n")
+                } else {
+                    switch AttachmentLoader.load(parts[1]) {
+                    case .image(let img): pending.images.append(img); out("attached image · \(pending.count) queued\n")
+                    case .text(let name, let content): pending.textFiles.append((name, content)); out("attached \(name) · \(pending.count) queued\n")
+                    case .failure(let message): errOut(message + "\n")
+                    }
+                }
             case "agent":
                 if parts.count >= 4, parts[1] == "add" {
                     let name = parts[2]
-                    let path = parts[3...].joined(separator: " ")
+                    let path = parts[3]
+                    let model = parts.count >= 5 ? unbracket(parts[4]) : defaultModel
                     let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardizedFileURL
                     await orchestrator.attach(Agent(name: AgentID(rawValue: name), workspaceRoot: url,
                                                     model: ModelID(rawValue: model), profile: .reviewed))
-                    out("attached @\(name) → \(url.path)\n")
+                    out("attached @\(name) · \(model) · \(url.path)\n")
+                } else if parts.count >= 3, parts[1] == "remove" {
+                    await orchestrator.detach(AgentID(rawValue: parts[2]))
+                    out("removed @\(parts[2])\n")
                 } else {
-                    out("usage: /agent add <name> <path>\n")
+                    out("usage: /agent add <name> <path> [model]  |  /agent remove <name>\n")
                 }
             default:
                 out("unknown command /\(cmd) — /help\n")
@@ -225,14 +327,20 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
             continue
         }
 
+        // Determine target agent + message, consuming any queued attachments.
+        // No @mention → the default @main agent.
+        var target: AgentID? = AgentID(rawValue: "main")
+        var message = text
         if text.hasPrefix("@") {
-            let rest = String(text.dropFirst())
-            let bits = rest.split(separator: " ", maxSplits: 1).map(String.init)
-            let name = bits.first ?? ""
-            let message = bits.count > 1 ? bits[1] : ""
-            await orchestrator.send(message, to: AgentID(rawValue: name))
-        } else {
-            await orchestrator.send(text, to: nil)
+            let bits = String(text.dropFirst()).split(separator: " ", maxSplits: 1).map(String.init)
+            target = AgentID(rawValue: bits.first ?? "")
+            message = bits.count > 1 ? bits[1] : ""
         }
+        for file in pending.textFiles { message += "\n\n[attached file: \(file.name)]\n\(file.content)" }
+        let images = pending.images
+        pending.clear()
+        spinner.start()
+        await orchestrator.send(message, to: target, images: images)
+        spinner.stop()
     }
 }

@@ -79,19 +79,32 @@ public protocol AgentMessenger: Sendable {
     func ask(to agent: String, question: String) async -> String
 }
 
+/// Seam for agent lifecycle management (v0.3 coordinator). Cowork provides an
+/// implementation bound to the orchestrator so a coordinator agent can create,
+/// list, and remove sub-agents through tools. Like `AgentMessenger`, the real
+/// work happens in the orchestrator/registry — tools are just thin executors.
+public protocol AgentManager: Sendable {
+    func spawnAgent(name: String, path: String, model: String?) async -> String
+    func listAgents() async -> String
+    func removeAgent(name: String) async -> String
+}
+
 public struct ToolContext: Sendable {
     public let workspaceRoot: URL
     public let shell: ShellRunner
     public let git: GitService
     public let messenger: AgentMessenger?
+    public let agentManager: AgentManager?
     public init(workspaceRoot: URL,
                 shell: ShellRunner = ProcessShellRunner(),
                 git: GitService = ProcessGitService(),
-                messenger: AgentMessenger? = nil) {
+                messenger: AgentMessenger? = nil,
+                agentManager: AgentManager? = nil) {
         self.workspaceRoot = workspaceRoot
         self.shell = shell
         self.git = git
         self.messenger = messenger
+        self.agentManager = agentManager
     }
 }
 

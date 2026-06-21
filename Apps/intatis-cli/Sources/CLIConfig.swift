@@ -36,6 +36,7 @@ struct CLIConfig {
     let reasoningEffort: ReasoningEffort?
     let mode: Mode
     let includeUsage: Bool
+    let maxSteps: Int
 
     static let defaultBaseURL = "https://api.openai.com/v1"
     static let defaultModel = "gpt-4o-mini"
@@ -64,9 +65,13 @@ struct CLIConfig {
         // endpoint rejects the stream_options field.
         let usageStr = value("INTATIS_USAGE", "usage", fallback: "1")!.lowercased()
         let includeUsage = !(usageStr == "0" || usageStr == "false" || usageStr == "off")
+        // How many tool round-trips one turn may take before giving up. Long
+        // agentic tasks need plenty; override with INTATIS_MAX_STEPS.
+        let maxSteps = max(1, Int(value("INTATIS_MAX_STEPS", "maxSteps", fallback: "50")!) ?? 50)
 
         return CLIConfig(baseURL: baseURL, apiKey: apiKey, model: model, wire: .openai,
-                         reasoningEffort: reasoning, mode: mode, includeUsage: includeUsage)
+                         reasoningEffort: reasoning, mode: mode, includeUsage: includeUsage,
+                         maxSteps: maxSteps)
     }
 
     func providerConfig() -> ProviderConfig {

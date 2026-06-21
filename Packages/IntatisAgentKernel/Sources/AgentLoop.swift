@@ -22,6 +22,7 @@ public struct AgentLoop: Sendable {
     private let shell: ShellRunner
     private let git: GitService
     private let messenger: AgentMessenger?
+    private let agentManager: AgentManager?
     private let reasoningEffort: ReasoningEffort?
     private let includeUsage: Bool
     private let maxIterations: Int
@@ -37,9 +38,10 @@ public struct AgentLoop: Sendable {
                 shell: ShellRunner = ProcessShellRunner(),
                 git: GitService = ProcessGitService(),
                 messenger: AgentMessenger? = nil,
+                agentManager: AgentManager? = nil,
                 reasoningEffort: ReasoningEffort? = nil,
                 includeUsage: Bool = false,
-                maxIterations: Int = 8) {
+                maxIterations: Int = 50) {
         self.log = log
         self.provider = provider
         self.registry = registry
@@ -51,6 +53,7 @@ public struct AgentLoop: Sendable {
         self.shell = shell
         self.git = git
         self.messenger = messenger
+        self.agentManager = agentManager
         self.reasoningEffort = reasoningEffort
         self.includeUsage = includeUsage
         self.maxIterations = maxIterations
@@ -70,6 +73,7 @@ public struct AgentLoop: Sendable {
         var firstTokenAt: Date?
         var usage: Usage?
 
+        do {
         for _ in 0..<maxIterations {
             var assistantText = ""
             var pendingToolCalls: [ToolCall] = []
@@ -119,6 +123,12 @@ public struct AgentLoop: Sendable {
                                                   message: "agent exceeded max tool iterations")))
         try await log.append(.agentStatus(AgentStatusPayload(agent: agent.name, state: .idle)))
         return ""
+        } catch {
+            // Surface provider/stream/tool errors instead of failing silently.
+            try? await log.append(.error(ErrorPayload(code: "agent", message: error.localizedDescription)))
+            try? await log.append(.agentStatus(AgentStatusPayload(agent: agent.name, state: .idle)))
+            return ""
+        }
     }
 
     private func appendTurnStats(start: Date, firstTokenAt: Date?, usage: Usage?) async {
@@ -168,7 +178,7 @@ public struct AgentLoop: Sendable {
         }
 
         do {
-            let toolContext = ToolContext(workspaceRoot: agent.workspaceRoot, shell: shell, git: git, messenger: messenger)
+            let toolContext = ToolContext(workspaceRoot: agent.workspaceRoot, shell: shell, git: git, messenger: messenger, agentManager: agentManager)
             let observation = try await tool.execute(args, in: toolContext)
             if let diff = observation.diff, let files = observation.changedFiles {
                 try? await log.append(.patchProposed(PatchProposedPayload(

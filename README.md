@@ -168,7 +168,16 @@ swift run intatis config          # 打印当前解析到的配置
 直接 `swift run intatis` 就用这份配置。优先级：**环境变量 > 配置文件 > 默认值**。
 
 **会话内 slash 命令**（仿 Claude Code）：`/model <name>` 换模型、`/reasoning <level|off>` 调推理、
-`/mode <chat|code|cowork>` 实时切模式、`/clear` 新会话、`/config` 看当前、`/help`、`/exit`。
+`/verbose [on|off]` 展开/折叠工具输出、`/mode <chat|code|cowork>` 实时切模式、`/clear` 新会话、
+`/config` 看当前、`/help`、`/exit`。
+
+**键盘 / 快捷键**：CLI 用自带的 raw-mode 行编辑器（不再走 `readLine` 的 canonical 模式），所以
+**中文整字退格**、←/→ 移光标、Home/End 跳行首尾、↑/↓ 翻历史、Ctrl-U/K/W 删除都正常（之前按一次退格
+只删半个汉字、方向键冒 `^[[C`，正是 canonical 模式所致）。Ctrl 快捷键：**Ctrl-A** 切模式、**Ctrl-L**
+换模型、**Ctrl-S** 打开设置、**Ctrl-C** 退出。非交互（管道 / `selftest`）自动回退普通 `readLine`。
+
+**折叠输出**：工具调用与终端输出默认折叠成单行摘要（`⎿ 首行… (+N 行)`），`/verbose on` 一键展开、`off`
+收起。**等待模型**时底部转 `⠋ Thinking… 650ms` 计时，首个 token 到达即清除。
 
 **每轮统计**：每条回复结束打印一行 `⎿ 1.8s · ttft 0.32s · 1843 tok (1623 in / 220 out)`——
 总耗时、首字耗时、token（`in` 即上下文占用）。token 需端点支持 `stream_options.include_usage`
@@ -179,12 +188,43 @@ swift run intatis config          # 打印当前解析到的配置
 `content` 会按 OpenAI vision 格式编码成 `[{text}, {image_url}]`。配合多模态模型用，例如
 `INTATIS_MODEL=qwen-vl-max`。注意这是「看图」（视觉输入），与之前的「生图」（输出）是两回事。
 
+**Cowork（多 Agent，带协调者）**：`intatis cowork` 进入后，自动有一个协调者 `@main`（绑当前目录）。
+**直接描述任务就行** —— `@main` 能自己用 `spawn_agent` / `ask_agent` / `list_agents` / `remove_agent`
+新建、委派、卸载子 agent（即业界常见的 *supervisor / orchestrator-worker* 模式），不必手动 `/agent add`：
+
+```text
+cowork ❯ 读一下当前项目，再开一个 reviewer 复核我的改动
+         # @main 自己 spawn 出子 agent，用 ask_agent 委派、汇总，必要时 remove_agent
+cowork ❯ /agents                                  # 看名册（含 @main 自己 spawn 的）
+cowork ❯ @reviewer 重点看并发安全                   # 也可手动定向给某个 agent
+```
+
+仍可手动接管：`/agent add <name> <path> [model]` 加 agent、`/agent remove <name>` 卸载、`/attach`
+把图带给目标 agent；不带 `@` 默认发给 `@main`（`@main` 受保护，不会被 `remove_agent` 删）。每个 Agent
+绑不同 workspace、可各用不同模型。Agent 之间**只能**经受控 message bus 通信（输出里 `↔ A→B` +
+`permission_review` 审计；密钥/超长内容会被 Mediator 拦），每段回复前有 `● 名字` 标明谁在说。等待模型
+时底部显示 `⠋ Thinking… 650ms` 计时，首个 token 到达即清除。统计/推理强度对每个 agent 同样生效。
+
 想先零配置确认链路：`swift run intatis selftest` —— 内置 fake 模型，离线把 **chat 完整一轮** +
 **code 写文件再读回**走一遍，复用的就是真正的 ChatLoop / AgentLoop / 渲染 / 审批代码。
 
 `intatis code` 跑的就是完整 Agent：模型调用 `read_file` / `search_text` / `write_file` /
 `apply_patch` / `run_shell` / `git_status` / `git_diff`，写入和命令在终端里 `[y/N]` 审批（只读
-自动放行）。想装成系统命令：`swift build -c release` 后把 `.build/release/intatis` 放进 `PATH`。
+自动放行）。
+
+**装成系统命令**（像 `curl` / `chmod` 那样从任何目录用 `intatis` 唤醒）：
+
+```bash
+make release            # 编译 release 版到 .build/release/intatis
+sudo make install       # 软链到 /usr/local/bin/intatis（在默认 PATH 上）
+# 没 sudo 也行：make install BINDIR=$HOME/.local/bin（再把该目录加进 PATH）
+which intatis && intatis help
+```
+
+软链一次即可：之后每次 `make release` 都即时生效，无需重装。然后 `cd` 进任意真实项目目录，
+直接 `intatis code` / `intatis cowork` / `intatis chat`（workspace 默认就是当前目录，不用写 `.`）。
+端点/key/模型从 `~/.config/intatis/config.json` 读，与所在目录无关，先跑一次 `intatis settings`
+配好即可。卸载：`sudo make uninstall`。
 
 ## 接任何家的 API（不只是 OpenAI）
 
@@ -210,6 +250,9 @@ INTATIS_BASE_URL=https://api.deepseek.com/v1 INTATIS_API_KEY=sk-... \
 ```bash
 INTATIS_API_KEY=sk-... INTATIS_MODEL=o4-mini INTATIS_REASONING=high swift run intatis chat
 ```
+
+**调单轮工具步数上限**：长任务（多次读写/委派）默认每轮最多 50 个工具往返，到顶才报
+`max_iterations`。嫌不够就调大：`INTATIS_MAX_STEPS=200`（chat / code / cowork 都生效）。
 
 `swift run intatis config` 随时看当前解析到的端点 / 模型 / 推理强度。
 
