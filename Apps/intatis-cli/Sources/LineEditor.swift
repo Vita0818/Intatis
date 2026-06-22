@@ -51,7 +51,11 @@ final class LineEditor {
         var histIndex = history.count        // == count → editing a fresh line
         var stash = ""                       // the fresh line, parked while browsing history
 
-        out(prompt)
+        // In raw mode the terminal's \n→\r\n mapping is off, so a bare LF drops
+        // straight down without returning to column 0 — leaving the prompt indented
+        // wherever the previous (concurrently-rendered) line left the cursor. Force
+        // \r\n so the prompt always lands at column 0.
+        out(prompt.replacingOccurrences(of: "\n", with: "\r\n"))
         out("\u{001B}7")                     // DECSC: save cursor right after the prompt
         refresh(buf, cursor)
 
@@ -187,6 +191,10 @@ final class LineEditor {
     /// Assemble a full UTF-8 scalar from its lead byte so multi-byte (CJK) input
     /// becomes a single `Character` — the key to whole-character editing.
     private func readUTF8(_ lead: UInt8) -> Key {
+        // Single-byte ASCII (0xxxxxxx): letters, digits, space, punctuation — the
+        // common case. Without this branch every printable ASCII key falls through
+        // to `.ignore` and nothing registers (CJK still works: its lead byte ≥ 0xC0).
+        if lead & 0x80 == 0 { return .char(Character(UnicodeScalar(lead))) }
         let need: Int
         if lead & 0xE0 == 0xC0 { need = 1 }
         else if lead & 0xF0 == 0xE0 { need = 2 }

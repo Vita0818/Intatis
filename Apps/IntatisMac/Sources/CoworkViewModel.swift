@@ -65,7 +65,7 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             guard let self else { return }
             let model = await self.registry.agentModel()
             await orchestrator.attach(Agent(name: AgentID(rawValue: name), workspaceRoot: workspace,
-                                            model: model, profile: .reviewed))
+                                            model: model, profile: .reviewed, canCoordinate: true))
         }
     }
 

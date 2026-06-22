@@ -243,7 +243,8 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
 
     // A default agent so you can just talk; add more with /agent add.
     await orchestrator.attach(Agent(name: AgentID(rawValue: "main"), workspaceRoot: workspace,
-                                    model: ModelID(rawValue: defaultModel), profile: .reviewed))
+                                    model: ModelID(rawValue: defaultModel), profile: .reviewed,
+                                    canCoordinate: true))
 
     banner(mode: .cowork, model: defaultModel, host: config.baseURL.host ?? config.baseURL.absoluteString)
     out("\(S.dim)@main is ready in \(workspace.lastPathComponent) — just describe the task; it can spawn its own helper agents. /agents to list · /help\(S.reset)\n")
@@ -313,7 +314,8 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
                     let model = parts.count >= 5 ? unbracket(parts[4]) : defaultModel
                     let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardizedFileURL
                     await orchestrator.attach(Agent(name: AgentID(rawValue: name), workspaceRoot: url,
-                                                    model: ModelID(rawValue: model), profile: .reviewed))
+                                                    model: ModelID(rawValue: model), profile: .reviewed,
+                                                    canCoordinate: true))
                     out("attached @\(name) · \(model) · \(url.path)\n")
                 } else if parts.count >= 3, parts[1] == "remove" {
                     await orchestrator.detach(AgentID(rawValue: parts[2]))

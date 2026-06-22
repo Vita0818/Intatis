@@ -123,11 +123,16 @@ public actor Orchestrator {
         let provider = try await providerFor(agent)
         let messenger = BusMessenger(from: agent.name, orchestrator: self)
         let manager = OrchestratorManager(orchestrator: self, defaultModel: agent.model.rawValue)
+        // Only coordinators get the team-building tools. Tool-spawned workers get
+        // the standard toolset, so they do the task and report back instead of
+        // recursively spawning their own sub-teams.
+        let toolRegistry = agent.canCoordinate
+            ? ToolRegistry.standard().adding([AskAgentTool(), SpawnAgentTool(), ListAgentsTool(), RemoveAgentTool()])
+            : ToolRegistry.standard()
         let loop = AgentLoop(
             log: log,
             provider: provider,
-            registry: ToolRegistry.standard().adding(
-                [AskAgentTool(), SpawnAgentTool(), ListAgentsTool(), RemoveAgentTool()]),
+            registry: toolRegistry,
             engine: engine,
             responder: responder,
             agent: agent,
