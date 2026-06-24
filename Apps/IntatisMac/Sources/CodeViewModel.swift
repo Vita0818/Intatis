@@ -40,11 +40,17 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
         guard subscription == nil else { return }
         subscription = Task { @MainActor [weak self] in
             guard let self else { return }
-            let stream = await self.log.stream(from: 0)
-            var projection = CodeProjection()
+            let replayed = await self.log.replay()
+            var projection = CodeProjection.build(from: replayed)
+            var permissions = PermissionProjection.build(from: replayed, markNeedsRerun: true)
+            self.items = projection.items
+            self.pendingPermission = permissions.latest?.request
+            let stream = await self.log.stream(from: (replayed.last?.seq ?? -1) + 1)
             for await envelope in stream {
                 projection.apply(envelope)
+                permissions.apply(envelope)
                 self.items = projection.items
+                self.pendingPermission = permissions.latest?.request
                 if case .agentStatus(let p) = envelope.event { self.agentState = p.state.rawValue }
             }
         }
@@ -93,8 +99,21 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
     }
 
     func resolvePermission(_ decision: PermissionDecision) {
+        guard let continuation = permissionContinuation else {
+            guard let request = pendingPermission else { return }
+            pendingPermission = nil
+            Task { [log] in
+                try? await log.append(.permissionResolved(PermissionResolvedPayload(
+                    requestId: request.requestId,
+                    tool: request.tool,
+                    decision: .deny,
+                    risk: request.risk,
+                    reason: "permission request expired; rerun the task")))
+            }
+            return
+        }
         pendingPermission = nil
-        permissionContinuation?.resume(returning: decision)
+        continuation.resume(returning: decision)
         permissionContinuation = nil
     }
 }

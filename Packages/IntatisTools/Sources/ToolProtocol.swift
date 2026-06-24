@@ -77,6 +77,14 @@ public protocol GitService: Sendable {
 /// cross-agent traffic goes through the mediated Message Bus (ARCHITECTURE.md §7).
 public protocol AgentMessenger: Sendable {
     func ask(to agent: String, question: String) async -> String
+    func sendMessage(to agent: String, content: String) async -> String
+    func requestInformation(to agent: String, question: String) async -> String
+    func replyMessage(to agent: String, content: String, inReplyTo: String?) async -> String
+    func requestDelegation(objective: String, reason: String) async -> String
+    func delegateTask(to agent: String,
+                      objective: String,
+                      roleHint: String?,
+                      expectedDeliverable: String?) async -> String
 }
 
 /// Seam for agent lifecycle management (v0.3 coordinator). Cowork provides an

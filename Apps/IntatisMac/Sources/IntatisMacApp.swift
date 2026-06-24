@@ -84,77 +84,9 @@ final class AppEnvironment: ObservableObject {
     }
 }
 
-enum AppMode: Hashable { case chat, code, cowork }
-
-struct RootView: View {
-    @EnvironmentObject var env: AppEnvironment
-    @State private var showSettings = false
-    @State private var keyInput = ""
-    @State private var baseURLInput = AppConfig.baseURL
-    @State private var modelInput = AppConfig.chatModelName
-    @State private var mode: AppMode = .chat
-
-    var body: some View {
-        Group {
-            switch mode {
-            case .chat: ThreeColumnShell(model: env.viewModel)
-            case .code: CodeContainer(env: env)
-            case .cowork: CoworkContainer(env: env)
-            }
-        }
-        .toolbar {
-            if PlatformProfile.current.supports(.code) || PlatformProfile.current.supports(.cowork) {
-                ToolbarItem(placement: .principal) {
-                    Picker("Mode", selection: $mode) {
-                        Text("Chat").tag(AppMode.chat)
-                        if PlatformProfile.current.supports(.code) { Text("Code").tag(AppMode.code) }
-                        if PlatformProfile.current.supports(.cowork) { Text("Cowork").tag(AppMode.cowork) }
-                    }
-                    .pickerStyle(.segmented)
-                }
-            }
-            ToolbarItem {
-                Button { showSettings = true } label: { Image(systemName: "key") }
-                    .help("API key")
-            }
-        }
-        .sheet(isPresented: $showSettings) { settingsSheet }
-        .task { if env.needsAPIKey { showSettings = true } }
-    }
-
-    private var settingsSheet: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Endpoint & model").font(.headline)
-            Text("Works with any OpenAI-compatible API — OpenAI, Ollama, vLLM, OpenRouter, DeepSeek, …")
-                .font(.caption).foregroundStyle(.secondary)
-            LabeledContent("Base URL") {
-                TextField(AppConfig.defaultBaseURL, text: $baseURLInput).textFieldStyle(.roundedBorder)
-            }
-            LabeledContent("Model") {
-                TextField(AppConfig.defaultModel, text: $modelInput).textFieldStyle(.roundedBorder)
-            }
-            LabeledContent("API key") {
-                SecureField("sk-… (any non-empty for local servers)", text: $keyInput).textFieldStyle(.roundedBorder)
-            }
-            Text("Key is stored in your macOS keychain. Endpoint/model changes take effect on relaunch.")
-                .font(.caption2).foregroundStyle(.secondary)
-            HStack {
-                Spacer()
-                Button("Cancel") { showSettings = false }
-                Button("Save") {
-                    AppConfig.baseURL = baseURLInput.trimmingCharacters(in: .whitespacesAndNewlines)
-                    AppConfig.chatModelName = modelInput.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !keyInput.isEmpty { env.saveAPIKey(keyInput) }
-                    keyInput = ""
-                    showSettings = false
-                }
-                .keyboardShortcut(.defaultAction)
-            }
-        }
-        .padding(20)
-        .frame(width: 460)
-    }
-}
+// The shell now lives in IntatisMacRootView (gold sidebar + NavigationSplitView);
+// settings moved into IntatisSettingsPanel. CodeContainer / CoworkContainer below
+// are reused by the new root for the Code / Cowork tabs.
 
 struct CodeContainer: View {
     @ObservedObject var env: AppEnvironment
@@ -261,7 +193,7 @@ struct IntatisMacApp: App {
 
     var body: some Scene {
         WindowGroup {
-            RootView().environmentObject(env)
+            IntatisMacRootView().environmentObject(env)
         }
     }
 }

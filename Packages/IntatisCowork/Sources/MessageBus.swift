@@ -33,4 +33,69 @@ public struct MessageBus: Sendable {
             return nil
         }
     }
+
+    public func sendMessage(from: AgentID, to: AgentID, content: String, taskID: TaskID? = nil) async -> String? {
+        switch await mediator.mediate(from: from, to: to, content: content) {
+        case .forward(let forwarded):
+            try? await log.append(.agentMessage(AgentMessagePayload(
+                from: from,
+                to: to,
+                content: forwarded,
+                kind: .sendMessage,
+                taskID: taskID,
+                mediated: true)))
+            try? await log.append(.permissionReview(
+                PermissionReviewPayload(agent: from, tool: "send_message", reviewerModel: "mediator",
+                                        decision: .allow, risk: .low, reason: "forwarded after mediation")))
+            return forwarded
+        case .block(let reason):
+            try? await log.append(.permissionReview(
+                PermissionReviewPayload(agent: from, tool: "send_message", reviewerModel: "mediator",
+                                        decision: .deny, risk: .high, reason: reason)))
+            return nil
+        }
+    }
+
+    public func requestInformation(from: AgentID, to: AgentID, question: String, taskID: TaskID? = nil) async -> String? {
+        switch await mediator.mediate(from: from, to: to, content: question) {
+        case .forward(let forwarded):
+            try? await log.append(.informationRequested(InformationRequestedPayload(
+                from: from,
+                to: to,
+                question: forwarded,
+                mediated: true,
+                taskID: taskID)))
+            try? await log.append(.permissionReview(
+                PermissionReviewPayload(agent: from, tool: "request_information", reviewerModel: "mediator",
+                                        decision: .allow, risk: .low, reason: "forwarded after mediation")))
+            return forwarded
+        case .block(let reason):
+            try? await log.append(.permissionReview(
+                PermissionReviewPayload(agent: from, tool: "request_information", reviewerModel: "mediator",
+                                        decision: .deny, risk: .high, reason: reason)))
+            return nil
+        }
+    }
+
+    public func replyMessage(from: AgentID, to: AgentID, content: String, inReplyTo: MessageID?, taskID: TaskID? = nil) async -> String? {
+        switch await mediator.mediate(from: from, to: to, content: content) {
+        case .forward(let forwarded):
+            try? await log.append(.informationReplied(InformationRepliedPayload(
+                inReplyTo: inReplyTo,
+                from: from,
+                to: to,
+                content: forwarded,
+                mediated: true,
+                taskID: taskID)))
+            try? await log.append(.permissionReview(
+                PermissionReviewPayload(agent: from, tool: "reply_message", reviewerModel: "mediator",
+                                        decision: .allow, risk: .low, reason: "forwarded after mediation")))
+            return forwarded
+        case .block(let reason):
+            try? await log.append(.permissionReview(
+                PermissionReviewPayload(agent: from, tool: "reply_message", reviewerModel: "mediator",
+                                        decision: .deny, risk: .high, reason: reason)))
+            return nil
+        }
+    }
 }

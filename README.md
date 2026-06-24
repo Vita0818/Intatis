@@ -1,10 +1,39 @@
 # Intatis
 
 一个 clean-room 的本地 AI 工作台：**Chat + Cowork + Code** 三合一，底层是同一个
-headless Agent Kernel。完整设计见 [`ARCHITECTURE.md`](ARCHITECTURE.md)，clean-room
+headless Agent Kernel。架构设计见 [`ARCHITECTURE.md`](ARCHITECTURE.md)，clean-room
 声明见 [`NOTICE.md`](NOTICE.md)。
 
-本仓库实现了 **v0.1（Chat）→ v0.5（iOS 子集）** 的完整路线：kernel 化聊天脊柱、单 workspace 带权限闸的 coding agent、多 Agent 受控协作、生图 / 转写 / 生视频产物，以及 iOS 上的 chat 真子集。
+当前仓库已经有可运行的 Chat / Code / Cowork 核心路径，但仍处在 v0.9.x 硬化阶段。下面按
+**implemented / partial / planned** 标明真实状态，避免把半成品能力写成完整功能。
+
+## 功能状态
+
+### Implemented
+
+- OpenAI-compatible 流式聊天，事件日志驱动 projection。
+- 单 workspace Code agent：读文件、列目录、搜索、写文件、apply patch、git status/diff、shell 工具。
+- 确定性权限闸：敏感路径 / workspace escape / sandbox shell / 危险 shell 命令硬拒绝，写入和大多数 shell 默认问用户。
+- Cowork thread：多 Agent registry、`@mention` 路由、受控 message bus、agent-to-agent 转发审计。
+- Artifact store：文件附件、图片产物、转写文本、视频任务产物的存储抽象。
+- iOS 真子集 target：只链接 Chat / Provider / Conversation / Artifact / Multimodal / SharedUI 子集。
+- CLI：`chat` / `code` / `cowork` REPL、slash commands、附件输入、离线 selftest。
+
+### Partial
+
+- GUI：三栏壳、Chat/Code/Cowork 基本工作流、permission card、artifact inspector；完整 recent threads / projects / session browser 仍未产品化。
+- Multimodal：图片生成和批量转写有 OpenAI-compatible provider；视频只有 submit/poll 抽象和测试 fake provider。
+- App Store 级 git backend：当前 git 仍是 `ProcessGitService` spawn `git`，App Store 沙盒内需要进程内 git backend。
+- Permission recovery：pending permission 可从 event log 恢复显示；旧 async tool continuation 暂不恢复，需重跑任务。
+- Model permission reviewer：类型和单元测试存在，但本轮未接入默认权限链路，不会自动批准工具。
+
+### Planned
+
+- 实时流式语音输入 / ASR session。
+- 完整视频 provider 配置与 GUI 入口。
+- 完整 session history / resume 管理界面。
+- 进程外 kernel transport（stdio / daemon）。
+- 自动权限审查链路和 reviewer 配置 UI。
 
 ---
 
@@ -20,7 +49,7 @@ headless Agent Kernel。完整设计见 [`ARCHITECTURE.md`](ARCHITECTURE.md)，c
 - OpenAI-compatible 流式聊天（SSE），且多端点 / 多 wire 的接缝已经就位
   （`WireFormat`、`ProviderEndpoint`、`ModelRef`）。
 - append-only 的每会话事件日志（JSONL）作为唯一真相源，支持 replay + resume。
-- Codex App 风格的三栏 SwiftUI 外壳（sidebar / thread / inspector）。
+- 三栏 SwiftUI 外壳（sidebar / thread / inspector）。
 - API key 存入 Keychain。
 - Artifact store 骨架（附件 / 转写）。
 
@@ -36,7 +65,7 @@ headless Agent Kernel。完整设计见 [`ARCHITECTURE.md`](ARCHITECTURE.md)，c
 
 - 工具：`read_file` / `list_files` / `search_text` / `write_file` / `apply_patch`（unified diff applier）/ `run_shell` / `git_status` / `git_diff`，每个都过**路径围栏**（`..`、越界、symlink 逃逸一律拒绝）。
 - OpenAI function-calling：流式 `tool_calls` 按 index 累积装配。
-- 确定性权限闸（A 层）：密钥 / `.env` / 越界 / `sudo` 等硬 `deny`；只读自动 `allow`；写 / patch / shell 默认回到用户确认（reviewer 是 v0.3）。
+- 确定性权限闸（A 层）：密钥 / `.env` / 越界 / `sudo` 等硬 `deny`；普通写 / patch / shell 默认回到用户确认；只有极窄的 confined read-only shell argv 会自动放行。
 - 单 Agent 工具循环：`流式 → tool_call → 权限 → 执行 → observation → 续`，带迭代上限。
 - Code 三栏界面：tool-call 卡、permission 卡（`apply_patch` 内联显示 diff，Approve/Reject 即 accept/reject）、patch / terminal 输出；workspace 选择（security-scoped）。
 
@@ -53,23 +82,23 @@ headless Agent Kernel。完整设计见 [`ARCHITECTURE.md`](ARCHITECTURE.md)，c
 - **多 Agent 编排**（`Orchestrator`）：`@AgentName` 把消息定向给某个 Agent，多 Agent 输出合并进同一 thread（按 agent 名区分）。
 - **受控 Agent 间通信**：唯一通道是 `ask_agent` 工具 → per-agent `AgentMessenger` → `MessageBus` → `Mediator`。Agent **不能**直接读彼此目录。
 - **Mediator 转发规则**：`SecretScanner` 命中（密钥/token/private key）硬 `block`；超长原文 `block`（强制摘要）；可选 `ForwardingReviewer` 做"摘要 vs 大段源码"判断。每次转发都记 `agent_to_agent_message` + `permission_review`。
-- **Permission B 层**（`ModelPermissionReviewer`）：把 gate 判 `pass` 的写/patch/shell 交给独立模型判定，输出结构化 JSON；送审内容当不可信数据包裹（抗注入），解析失败回退 `ask_user`。硬 `deny` 永远到不了 reviewer。
+- `ModelPermissionReviewer` 类型保留在代码中并有测试，但默认权限链路暂未接入自动 reviewer；本阶段不会让模型自动批准权限请求。
 - **Cowork 界面**：左栏 agent 名册 + Add Agent，中栏合并 thread（含 `↔` agent-to-agent 卡），右栏 per-agent 详情；`@mention` composer。
 
 ---
 
 ## v0.4 包含什么（Multimodal）
 
-生图 / 转写 / 生视频，产物进 Artifact Store，并以 `artifact_added` / `artifact_progress` 事件出现在 thread 与右栏。
+生图 / 转写 / 视频任务抽象，产物进 Artifact Store，并以 `artifact_added` / `artifact_progress` 事件出现在 thread 与右栏。
 
 已包含：
 
 - **Provider 能力扩展**：`ImageGenerationProvider`（OpenAI `/images/generations`，b64）、`TranscriptionProvider`（OpenAI `/audio/transcriptions`，multipart）、`VideoGenerationProvider`（submit/poll 抽象，无标准 wire，注入式）。
-- **`MultimodalService`**（actor）：调 provider → 写 `ArtifactStore` → 发事件；生视频轮询发 `artifact_progress`，完成发 `artifact_added`。
+- **`MultimodalService`**（actor）：调 provider → 写 `ArtifactStore` → 发事件；视频任务轮询发 `artifact_progress`，完成发 `artifact_added`。
 - **Chat 集成**：composer 的 🖼 按钮用当前输入当 prompt 生图；右栏 artifact 面板显示图片预览 / transcript 文本。
 - 默认 `dall-e-3` / `whisper-1` 走同一 OpenAI 端点（可在 `AppConfig` 改）。
 
-> **注意**：v0.4 是批量转写（音频 → 文本）；实时流式 ASR（websocket）与音频采集 UI 留作后续。视频无标准 OpenAI 端点，需注入具体 provider。
+> **注意**：v0.4 是批量转写（音频 → 文本）；实时流式 ASR（websocket）与音频采集 UI 留作后续。视频无默认 OpenAI-compatible 端点，需注入具体 provider。
 
 ---
 
@@ -78,7 +107,7 @@ headless Agent Kernel。完整设计见 [`ARCHITECTURE.md`](ARCHITECTURE.md)，c
 `iOS ⊂ macOS` 的真子集：iOS app **只链接** Core / Protocol / Providers / Conversation / Artifacts / Multimodal / SharedUI。
 
 - **结构性保证**：`IntatisiOS` 的依赖闭包**不含** Tools / Permission / AgentKernel / Cowork —— 不是运行时关开关，而是这些包根本没被链接，没有任何通往本地 workspace 的代码路径（ARCHITECTURE.md §4.1）。校验脚本确认其传递闭包里没有 workspace stack。
-- **保留**：流式聊天、OpenAI-compatible、artifact（生图/转写/视频）、会话历史、Keychain、右栏 artifact 面板。
+- **保留**：流式聊天、OpenAI-compatible、artifact store（图片/转写/视频任务产物）、基础会话日志、Keychain、右栏 artifact 面板。
 - **删除**：本地 workspace agent、shell / git / diff / patch、多本地 Agent。
 - **复用**：`ChatViewModel` + `ThreeColumnShell` 原样复用；`PlatformProfile.current = .iOS` 让侧栏只剩 Chat；图片预览在 iOS 走 UIKit 分支。
 - iOS 文件访问止于附件，不会升级为 workspace —— 因为升级逻辑就在 iOS 不链接的那些包里。
@@ -167,7 +196,7 @@ swift run intatis config          # 打印当前解析到的配置
 （这俩必填），可选地设默认模型 / 推理强度 / 默认模式，保存到 `~/.config/intatis/config.json`。之后
 直接 `swift run intatis` 就用这份配置。优先级：**环境变量 > 配置文件 > 默认值**。
 
-**会话内 slash 命令**（仿 Claude Code）：`/model <name>` 换模型、`/reasoning <level|off>` 调推理、
+**会话内 slash 命令**：`/model <name>` 换模型、`/reasoning <level|off>` 调推理、
 `/verbose [on|off]` 展开/折叠工具输出、`/mode <chat|code|cowork>` 实时切模式、`/clear` 新会话、
 `/config` 看当前、`/help`、`/exit`。
 
@@ -305,7 +334,7 @@ v0.2：
 v0.3：
 
 - **Protocol（v0.3）** —— 5 个 Cowork 事件 round-trip；`agent_to_agent_message` wire type；`profile.set` 命令。
-- **Permission（reviewer）** —— 解析 allow / deny（含前后包裹文本）/ 不可解析回退 ask；engine 把 `pass` 路由到 reviewer；硬 `deny` 永不经过 reviewer。
+- **Permission（reviewer 类型）** —— 解析 allow / deny（含前后包裹文本）/ 不可解析回退 ask；engine 对 hard `deny` 的测试覆盖存在。默认产品链路暂未接入自动 reviewer。
 - **Cowork** —— Mediator 正常转发 / 密钥 block / 超长 block / reviewer block；MessageBus 转发记两条日志、block 返回 nil 并记 `deny`；Orchestrator 端到端 agent-to-agent 经双向 mediation 并记录；含密钥的问题在到达对端前被拦截。
 
 v0.4：

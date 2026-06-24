@@ -56,6 +56,36 @@ public struct AgentID: TypedID {
     public init(rawValue: String) { self.rawValue = rawValue }
 }
 
+public struct TaskID: TypedID {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public static func new() -> TaskID { TaskID(rawValue: IDGen.random(prefix: "task")) }
+}
+
+public struct TaskGroupID: TypedID {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public static func new() -> TaskGroupID { TaskGroupID(rawValue: IDGen.random(prefix: "taskgrp")) }
+}
+
+public struct WorkspaceID: TypedID {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public static func new() -> WorkspaceID { WorkspaceID(rawValue: IDGen.random(prefix: "ws")) }
+}
+
+public struct WorkspaceLeaseID: TypedID {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public static func new() -> WorkspaceLeaseID { WorkspaceLeaseID(rawValue: IDGen.random(prefix: "wlease")) }
+}
+
+public struct CapabilityLeaseID: TypedID {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public static func new() -> CapabilityLeaseID { CapabilityLeaseID(rawValue: IDGen.random(prefix: "clease")) }
+}
+
 public struct ArtifactID: TypedID {
     public let rawValue: String
     public init(rawValue: String) { self.rawValue = rawValue }

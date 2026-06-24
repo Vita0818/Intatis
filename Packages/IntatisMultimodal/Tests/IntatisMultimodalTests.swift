@@ -43,9 +43,11 @@ final class IntatisMultimodalTests: XCTestCase {
         let service = MultimodalService(log: log, store: store)
         let provider = FakeImage(images: [GeneratedImage(data: Data("PNG".utf8), mime: "image/png")])
         let ref = try await service.generateImage(using: provider, model: ModelID(rawValue: "img"), prompt: "a cat")
+        let storedData = try await store.data(for: ref.id)
+        let eventTypes = await log.replay().map { $0.event.type }
         XCTAssertEqual(ref.kind, .image)
-        XCTAssertEqual(try await store.data(for: ref.id), Data("PNG".utf8))
-        XCTAssertTrue(await log.replay().map { $0.event.type }.contains(.artifactAdded))
+        XCTAssertEqual(storedData, Data("PNG".utf8))
+        XCTAssertTrue(eventTypes.contains(.artifactAdded))
     }
 
     func testTranscribeStoresTranscript() async throws {
@@ -54,9 +56,10 @@ final class IntatisMultimodalTests: XCTestCase {
         let service = MultimodalService(log: log, store: store)
         let (text, ref) = try await service.transcribe(using: FakeTranscribe(text: "hello"),
                                                         model: ModelID(rawValue: "whisper"), audio: Data([1, 2, 3]))
+        let storedData = try await store.data(for: ref.id)
         XCTAssertEqual(text, "hello")
         XCTAssertEqual(ref.kind, .transcript)
-        XCTAssertEqual(String(decoding: try await store.data(for: ref.id), as: UTF8.self), "hello")
+        XCTAssertEqual(String(decoding: storedData, as: UTF8.self), "hello")
     }
 
     func testGenerateVideoEmitsProgressThenArtifact() async throws {

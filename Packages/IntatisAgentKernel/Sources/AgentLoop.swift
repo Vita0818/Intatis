@@ -63,7 +63,7 @@ public struct AgentLoop: Sendable {
     /// out of iterations). Discardable for fire-and-forget UI sends.
     @discardableResult
     public func send(_ userText: String, images: [ImageAttachment] = []) async throws -> String {
-        let history = await priorHistory()
+        let history = await projectedHistory()
         try await log.append(.userMessage(UserMessagePayload(text: userText)))
         try await log.append(.agentStatus(AgentStatusPayload(agent: agent.name, state: .thinking)))
 
@@ -219,6 +219,13 @@ public struct AgentLoop: Sendable {
             try? await log.append(.agentStatus(AgentStatusPayload(agent: agent.name, state: .tool)))
             return userDecision
         }
+    }
+
+    private func projectedHistory() async -> [AgentMessage] {
+        guard context.contextBundle == nil else {
+            return []
+        }
+        return await priorHistory()
     }
 
     private func priorHistory() async -> [AgentMessage] {

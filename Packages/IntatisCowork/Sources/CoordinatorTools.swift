@@ -3,13 +3,9 @@ import IntatisCore
 import IntatisProtocol
 import IntatisTools
 
-/// Coordinator tools (ARCHITECTURE.md §7). They let a lead agent build and steer
-/// a small team of sub-agents itself, instead of the user wiring everything up by
-/// hand. This mirrors the "supervisor / orchestrator-worker" pattern used by
-/// frameworks like LangGraph, CrewAI, AutoGen and OpenAI Swarm: one agent owns
-/// the plan and delegates concrete sub-tasks. All three are `readOnly` — they
-/// only touch the in-memory agent registry, never the filesystem; the agents they
-/// create still run under the normal permission gate.
+/// Coordinator tools (ARCHITECTURE.md §7). They let an explicit lead agent build
+/// and steer a small team of worker agents. Creating an agent expands the active
+/// workspace/capability boundary, so `spawn_agent` is intentionally not read-only.
 
 /// Create + attach a new sub-agent bound to a folder.
 public struct SpawnAgentTool: Tool {
@@ -19,8 +15,8 @@ public struct SpawnAgentTool: Tool {
         name: "spawn_agent",
         description: "Create a new sub-agent bound to a folder so you can delegate work to it. "
             + "Give it a short name and an absolute folder path; model is optional (defaults to "
-            + "yours). After spawning, talk to it with ask_agent.",
-        sideEffect: .readOnly,
+            + "yours). After spawning, assign work with delegate_task.",
+        sideEffect: .write,
         parameters: .object([
             "type": .string("object"),
             "properties": .object([

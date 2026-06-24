@@ -41,21 +41,39 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         }
         subscription = Task { @MainActor [weak self] in
             guard let self else { return }
-            let stream = await self.log.stream(from: 0)
-            var projection = CodeProjection()
+            let replayed = await self.log.replay()
+            var projection = CodeProjection.build(from: replayed)
+            var permissions = PermissionProjection.build(from: replayed, markNeedsRerun: true)
+            self.items = projection.items
+            self.pendingPermission = permissions.latest?.request
+            for envelope in replayed {
+                self.applyRosterEvent(envelope.event)
+            }
+            let stream = await self.log.stream(from: (replayed.last?.seq ?? -1) + 1)
             for await envelope in stream {
                 projection.apply(envelope)
+                permissions.apply(envelope)
                 self.items = projection.items
-                switch envelope.event {
-                case .agentAttached(let p):
-                    self.agents.append(CoworkAgentInfo(id: p.agent.rawValue, name: p.agent.rawValue,
-                                                       workspace: p.path, model: p.model.rawValue, profile: p.profile))
-                case .agentDetached(let p):
-                    self.agents.removeAll { $0.id == p.agent.rawValue }
-                default:
-                    break
-                }
+                self.pendingPermission = permissions.latest?.request
+                self.applyRosterEvent(envelope.event)
             }
+        }
+    }
+
+    private func applyRosterEvent(_ event: Event) {
+        switch event {
+        case .agentAttached(let p):
+            agents.removeAll { $0.id == p.agent.rawValue }
+            agents.append(CoworkAgentInfo(id: p.agent.rawValue, name: p.agent.rawValue,
+                                          workspace: p.path, model: p.model.rawValue, profile: p.profile))
+        case .agentSpawned(let p):
+            agents.removeAll { $0.id == p.agent.rawValue }
+            agents.append(CoworkAgentInfo(id: p.agent.rawValue, name: p.agent.rawValue,
+                                          workspace: p.path, model: p.model.rawValue, profile: "reviewed"))
+        case .agentDetached(let p):
+            agents.removeAll { $0.id == p.agent.rawValue }
+        default:
+            break
         }
     }
 
@@ -65,7 +83,8 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             guard let self else { return }
             let model = await self.registry.agentModel()
             await orchestrator.attach(Agent(name: AgentID(rawValue: name), workspaceRoot: workspace,
-                                            model: model, profile: .reviewed, canCoordinate: true))
+                                            model: model, profile: .reviewed,
+                                            coordinationDepth: Agent.defaultCoordinationDepth))
         }
     }
 
@@ -102,8 +121,21 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
     }
 
     func resolvePermission(_ decision: PermissionDecision) {
+        guard let continuation = permissionContinuation else {
+            guard let request = pendingPermission else { return }
+            pendingPermission = nil
+            Task { [log] in
+                try? await log.append(.permissionResolved(PermissionResolvedPayload(
+                    requestId: request.requestId,
+                    tool: request.tool,
+                    decision: .deny,
+                    risk: request.risk,
+                    reason: "permission request expired; rerun the task")))
+            }
+            return
+        }
         pendingPermission = nil
-        permissionContinuation?.resume(returning: decision)
+        continuation.resume(returning: decision)
         permissionContinuation = nil
     }
 }

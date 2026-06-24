@@ -63,9 +63,15 @@ public struct ConversationProjection: Equatable, Sendable {
                                             isComplete: true))
 
         case .toolCall, .toolResult, .permissionRequest, .permissionResolved, .patchProposed, .agentStatus,
-             .agentAttached, .agentDetached, .agentMessage, .agentToAgentMessage, .permissionReview,
+             .agentAttached, .agentAttachRequested, .agentDetached, .agentSpawnRequested, .agentSpawned,
+             .agentMessage, .agentToAgentMessage, .permissionReview,
+             .informationRequested, .informationReplied,
+             .delegationRequested, .delegationApproved, .delegationRejected, .taskDelegated,
+             .workspaceLeaseRequested, .workspaceLeaseGranted, .workspaceLeaseDenied,
+             .capabilityLeaseCreated, .capabilityLeaseRevoked,
+             .taskCreated, .taskAssigned, .taskQueued, .taskStarted, .taskCompleted, .taskFailed, .taskRejected,
              .artifactProgress, .turnStats:
-            break   // tool/permission/agent/progress/stats events are not shown in the chat text view
+            break   // tool/permission/agent/task/progress/stats events are not shown in the chat text view
         }
     }
 

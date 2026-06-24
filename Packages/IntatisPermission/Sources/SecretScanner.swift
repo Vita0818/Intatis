@@ -1,4 +1,5 @@
 import Foundation
+import IntatisCore
 
 /// Deterministic detection of sensitive files, secret-bearing content, and
 /// protected config — the hard rules that must never depend on a model
@@ -71,8 +72,14 @@ public enum ShellInspector {
         "git push", "git pull", "git fetch", "nc ", "ssh ", "scp ",
     ]
     private static let readOnlyAllowlist: Set<String> = [
-        "ls", "pwd", "cat", "grep", "rg", "echo", "head", "tail", "wc", "find", "true",
+        "pwd", "ls", "find", "rg", "grep", "cat",
     ]
+
+    public enum ReadOnlyInspection: Equatable, Sendable {
+        case allow(String)
+        case ask(String)
+        case deny(String)
+    }
 
     public static func isDangerous(_ command: String) -> Bool {
         let lower = command.lowercased()
@@ -88,5 +95,99 @@ public enum ShellInspector {
         let trimmed = command.trimmingCharacters(in: .whitespaces)
         guard let first = trimmed.split(separator: " ").first.map(String.init) else { return false }
         return readOnlyAllowlist.contains(first) && !isDangerous(command)
+    }
+
+    public static func inspectReadOnlyCommand(_ command: String, workspaceRoot: URL) -> ReadOnlyInspection {
+        if containsShellMetacharacter(command) {
+            return .ask("shell metacharacters require user approval")
+        }
+        guard let argv = parseArgv(command), let executable = argv.first, !executable.contains("/") else {
+            return .ask("shell command is not a simple argv form")
+        }
+        guard readOnlyAllowlist.contains(executable) else {
+            return .ask("shell command is not in the read-only allowlist")
+        }
+
+        let paths: [String]
+        switch executable {
+        case "pwd":
+            guard argv.count == 1 else { return .ask("pwd arguments require user approval") }
+            paths = []
+        case "ls":
+            let rest = argv.dropFirst()
+            let nonOption = rest.filter { !$0.hasPrefix("-") }
+            paths = nonOption.isEmpty ? ["."] : Array(nonOption)
+        case "cat":
+            let rest = Array(argv.dropFirst())
+            guard !rest.isEmpty else { return .ask("cat requires explicit file paths") }
+            guard !rest.contains(where: { $0.hasPrefix("-") }) else {
+                return .ask("cat options require user approval")
+            }
+            paths = rest
+        case "rg", "grep":
+            let rest = Array(argv.dropFirst())
+            guard !rest.isEmpty else { return .ask("\(executable) requires a pattern") }
+            guard !rest.contains(where: { $0.hasPrefix("-") }) else {
+                return .ask("\(executable) options require user approval")
+            }
+            paths = rest.count > 1 ? Array(rest.dropFirst()) : ["."]
+        case "find":
+            let rest = Array(argv.dropFirst())
+            if rest.contains(where: { $0.hasPrefix("-") || $0 == "!" || $0 == "(" || $0 == ")" }) {
+                return .ask("find predicates require user approval")
+            }
+            paths = rest.isEmpty ? ["."] : rest
+        default:
+            return .ask("shell command is not in the read-only allowlist")
+        }
+
+        for path in paths {
+            if SecretScanner.isSensitivePath(path) || PathConfinement.isSensitivePath(path) {
+                return .deny("touches sensitive path: \(path)")
+            }
+            do {
+                _ = try PathConfinement.resolve(path, within: workspaceRoot)
+            } catch {
+                return .deny(error.localizedDescription)
+            }
+        }
+        return .allow("simple read-only shell command within workspace")
+    }
+
+    private static func containsShellMetacharacter(_ command: String) -> Bool {
+        if command.contains("\n") || command.contains("\r") { return true }
+        let markers = ["|", ">", "<", ";", "&&", "||", "$", "`", "*", "?", "~", "&"]
+        return markers.contains { command.contains($0) }
+    }
+
+    private static func parseArgv(_ command: String) -> [String]? {
+        var args: [String] = []
+        var current = ""
+        var quote: Character?
+
+        for ch in command {
+            if ch == "\\" { return nil }
+            if let q = quote {
+                if ch == q {
+                    quote = nil
+                } else {
+                    current.append(ch)
+                }
+                continue
+            }
+            if ch == "'" || ch == "\"" {
+                quote = ch
+            } else if ch == " " || ch == "\t" {
+                if !current.isEmpty {
+                    args.append(current)
+                    current.removeAll(keepingCapacity: true)
+                }
+            } else {
+                current.append(ch)
+            }
+        }
+        guard quote == nil else { return nil }
+        if !current.isEmpty { args.append(current) }
+        return args.isEmpty ? nil : args
     }
 }

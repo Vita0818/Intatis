@@ -59,14 +59,56 @@ public struct Envelope: Codable, Equatable, Sendable {
             event = .agentStatus(try c.decode(AgentStatusPayload.self, forKey: .payload))
         case .agentAttached:
             event = .agentAttached(try c.decode(AgentAttachedPayload.self, forKey: .payload))
+        case .agentAttachRequested:
+            event = .agentAttachRequested(try c.decode(AgentAttachRequestedPayload.self, forKey: .payload))
         case .agentDetached:
             event = .agentDetached(try c.decode(AgentDetachedPayload.self, forKey: .payload))
+        case .agentSpawnRequested:
+            event = .agentSpawnRequested(try c.decode(AgentSpawnRequestedPayload.self, forKey: .payload))
+        case .agentSpawned:
+            event = .agentSpawned(try c.decode(AgentSpawnedPayload.self, forKey: .payload))
         case .agentMessage:
             event = .agentMessage(try c.decode(AgentMessagePayload.self, forKey: .payload))
         case .agentToAgentMessage:
             event = .agentToAgentMessage(try c.decode(AgentToAgentMessagePayload.self, forKey: .payload))
+        case .informationRequested:
+            event = .informationRequested(try c.decode(InformationRequestedPayload.self, forKey: .payload))
+        case .informationReplied:
+            event = .informationReplied(try c.decode(InformationRepliedPayload.self, forKey: .payload))
+        case .delegationRequested:
+            event = .delegationRequested(try c.decode(DelegationRequestedPayload.self, forKey: .payload))
+        case .delegationApproved:
+            event = .delegationApproved(try c.decode(DelegationApprovedPayload.self, forKey: .payload))
+        case .delegationRejected:
+            event = .delegationRejected(try c.decode(DelegationRejectedPayload.self, forKey: .payload))
+        case .taskDelegated:
+            event = .taskDelegated(try c.decode(TaskDelegatedPayload.self, forKey: .payload))
+        case .workspaceLeaseRequested:
+            event = .workspaceLeaseRequested(try c.decode(WorkspaceLeaseRequestedPayload.self, forKey: .payload))
+        case .workspaceLeaseGranted:
+            event = .workspaceLeaseGranted(try c.decode(WorkspaceLeaseGrantedPayload.self, forKey: .payload))
+        case .workspaceLeaseDenied:
+            event = .workspaceLeaseDenied(try c.decode(WorkspaceLeaseDeniedPayload.self, forKey: .payload))
+        case .capabilityLeaseCreated:
+            event = .capabilityLeaseCreated(try c.decode(CapabilityLeaseCreatedPayload.self, forKey: .payload))
+        case .capabilityLeaseRevoked:
+            event = .capabilityLeaseRevoked(try c.decode(CapabilityLeaseRevokedPayload.self, forKey: .payload))
         case .permissionReview:
             event = .permissionReview(try c.decode(PermissionReviewPayload.self, forKey: .payload))
+        case .taskCreated:
+            event = .taskCreated(try c.decode(TaskCreatedPayload.self, forKey: .payload))
+        case .taskAssigned:
+            event = .taskAssigned(try c.decode(TaskAssignedPayload.self, forKey: .payload))
+        case .taskQueued:
+            event = .taskQueued(try c.decode(TaskQueuedPayload.self, forKey: .payload))
+        case .taskStarted:
+            event = .taskStarted(try c.decode(TaskStartedPayload.self, forKey: .payload))
+        case .taskCompleted:
+            event = .taskCompleted(try c.decode(TaskCompletedPayload.self, forKey: .payload))
+        case .taskFailed:
+            event = .taskFailed(try c.decode(TaskFailedPayload.self, forKey: .payload))
+        case .taskRejected:
+            event = .taskRejected(try c.decode(TaskRejectedPayload.self, forKey: .payload))
         case .artifactAdded:
             event = .artifactAdded(try c.decode(ArtifactAddedPayload.self, forKey: .payload))
         case .artifactProgress:
@@ -95,10 +137,31 @@ public struct Envelope: Codable, Equatable, Sendable {
         case .patchProposed(let p):      try c.encode(p, forKey: .payload)
         case .agentStatus(let p):        try c.encode(p, forKey: .payload)
         case .agentAttached(let p):       try c.encode(p, forKey: .payload)
+        case .agentAttachRequested(let p): try c.encode(p, forKey: .payload)
         case .agentDetached(let p):       try c.encode(p, forKey: .payload)
+        case .agentSpawnRequested(let p): try c.encode(p, forKey: .payload)
+        case .agentSpawned(let p):        try c.encode(p, forKey: .payload)
         case .agentMessage(let p):        try c.encode(p, forKey: .payload)
         case .agentToAgentMessage(let p): try c.encode(p, forKey: .payload)
+        case .informationRequested(let p): try c.encode(p, forKey: .payload)
+        case .informationReplied(let p):   try c.encode(p, forKey: .payload)
+        case .delegationRequested(let p):  try c.encode(p, forKey: .payload)
+        case .delegationApproved(let p):   try c.encode(p, forKey: .payload)
+        case .delegationRejected(let p):   try c.encode(p, forKey: .payload)
+        case .taskDelegated(let p):        try c.encode(p, forKey: .payload)
+        case .workspaceLeaseRequested(let p): try c.encode(p, forKey: .payload)
+        case .workspaceLeaseGranted(let p):   try c.encode(p, forKey: .payload)
+        case .workspaceLeaseDenied(let p):    try c.encode(p, forKey: .payload)
+        case .capabilityLeaseCreated(let p):  try c.encode(p, forKey: .payload)
+        case .capabilityLeaseRevoked(let p):  try c.encode(p, forKey: .payload)
         case .permissionReview(let p):    try c.encode(p, forKey: .payload)
+        case .taskCreated(let p):          try c.encode(p, forKey: .payload)
+        case .taskAssigned(let p):         try c.encode(p, forKey: .payload)
+        case .taskQueued(let p):           try c.encode(p, forKey: .payload)
+        case .taskStarted(let p):          try c.encode(p, forKey: .payload)
+        case .taskCompleted(let p):        try c.encode(p, forKey: .payload)
+        case .taskFailed(let p):           try c.encode(p, forKey: .payload)
+        case .taskRejected(let p):         try c.encode(p, forKey: .payload)
         case .artifactAdded(let p):       try c.encode(p, forKey: .payload)
         case .artifactProgress(let p):    try c.encode(p, forKey: .payload)
         case .turnStats(let p):           try c.encode(p, forKey: .payload)

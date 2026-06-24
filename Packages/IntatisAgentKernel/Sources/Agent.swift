@@ -10,18 +10,21 @@ public struct Agent: Sendable {
     public var workspaceRoot: URL
     public var model: ModelID
     public var profile: PermissionProfile
-    /// May this agent build & steer its own sub-team (spawn_agent / ask_agent /
-    /// list_agents / remove_agent)? Only top-level coordinators (@main and
-    /// user-added agents) get this; tool-spawned workers do not, which keeps the
-    /// orchestrator-worker hierarchy two levels deep instead of recursing.
-    public var canCoordinate: Bool
+    /// Temporary compatibility fuse for Cowork coordination tools. Explicit
+    /// coordinators get the coordination tools while this is > 0; tool-spawned
+    /// children default to 0 and run as workers.
+    public var coordinationDepth: Int
+
+    /// Default marker for a top-level coordinator (@main, user-added agents).
+    /// Phase 0 still uses this as a tool-exposure fuse, not as a task role model.
+    public static let defaultCoordinationDepth = 2
 
     public init(name: AgentID, workspaceRoot: URL, model: ModelID,
-                profile: PermissionProfile = .reviewed, canCoordinate: Bool = false) {
+                profile: PermissionProfile = .reviewed, coordinationDepth: Int = 0) {
         self.name = name
         self.workspaceRoot = workspaceRoot
         self.model = model
         self.profile = profile
-        self.canCoordinate = canCoordinate
+        self.coordinationDepth = coordinationDepth
     }
 }
