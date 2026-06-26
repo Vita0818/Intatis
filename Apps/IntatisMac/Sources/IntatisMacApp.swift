@@ -155,11 +155,17 @@ struct CoworkSessionView: View {
         CoworkShell(items: vm.items,
                     agents: vm.agents,
                     pending: vm.pendingPermission,
+                    summary: vm.summary,
+                    composerError: vm.composerError,
                     isWorking: vm.isWorking,
                     input: $vm.input,
                     onSend: { vm.send() },
                     onResolve: { vm.resolvePermission($0) },
-                    onAddAgent: { showAdd = true })
+                    onAddAgent: {
+                        agentName = ""
+                        vm.resetAddAgentStatus()
+                        showAdd = true
+                    })
             .task { vm.start() }
             .sheet(isPresented: $showAdd) { addAgentSheet }
     }
@@ -167,23 +173,64 @@ struct CoworkSessionView: View {
     private var addAgentSheet: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Add agent").font(.headline)
-            TextField("Name (e.g. Rokurics)", text: $agentName).textFieldStyle(.roundedBorder)
+            TextField("Name (e.g. Rokurics)", text: $agentName)
+                .textFieldStyle(.roundedBorder)
+                .disabled(vm.addAgentStatus.isBusy)
+            if let message = vm.addAgentStatus.message {
+                HStack(spacing: 8) {
+                    if vm.addAgentStatus.isBusy {
+                        ProgressView().controlSize(.small)
+                    }
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(addAgentMessageColor)
+                }
+            }
+            if case .attaching = vm.addAgentStatus,
+               let pending = vm.pendingPermission,
+               pending.request.tool == "agent.attach" {
+                PermissionCard(permission: pending, onResolve: { vm.resolvePermission($0) })
+            }
             HStack {
                 Spacer()
-                Button("Cancel") { showAdd = false }
-                Button("Choose Folder & Add") {
-                    let name = agentName.trimmingCharacters(in: .whitespaces)
-                    if !name.isEmpty, let url = WorkspaceAccess.choose() {
-                        vm.addAgent(name: name, workspace: url)
-                    }
-                    agentName = ""
+                Button("Cancel") {
+                    vm.resetAddAgentStatus()
                     showAdd = false
                 }
+                .disabled(vm.addAgentStatus.isBusy)
+                Button("Choose Folder & Add") {
+                    let name = agentName.trimmingCharacters(in: .whitespaces)
+                    guard vm.prepareAddAgent(name: name) else { return }
+                    if let url = WorkspaceAccess.choose() {
+                        vm.addAgent(name: name, workspace: url)
+                    } else {
+                        vm.cancelAddAgentSelection()
+                    }
+                }
                 .keyboardShortcut(.defaultAction)
+                .disabled(vm.addAgentStatus.isBusy || agentName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .onChange(of: vm.addAgentStatus) { status in
+            if case .attached = status {
+                agentName = ""
+                showAdd = false
+                vm.resetAddAgentStatus()
             }
         }
         .padding(20)
         .frame(width: 360)
+    }
+
+    private var addAgentMessageColor: Color {
+        switch vm.addAgentStatus {
+        case .denied, .failed:
+            return .red
+        case .attached:
+            return .green
+        case .idle, .validating, .attaching:
+            return .secondary
+        }
     }
 }
 

@@ -19,7 +19,7 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
     @Published var input: String = ""
     @Published private(set) var isWorking = false
     @Published private(set) var agentState: String = "idle"
-    @Published var pendingPermission: PermissionRequestPayload?
+    @Published var pendingPermission: PendingPermission?
 
     let workspaceName: String
 
@@ -44,13 +44,13 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
             var projection = CodeProjection.build(from: replayed)
             var permissions = PermissionProjection.build(from: replayed, markNeedsRerun: true)
             self.items = projection.items
-            self.pendingPermission = permissions.latest?.request
+            self.pendingPermission = permissions.latest
             let stream = await self.log.stream(from: (replayed.last?.seq ?? -1) + 1)
             for await envelope in stream {
                 projection.apply(envelope)
                 permissions.apply(envelope)
                 self.items = projection.items
-                self.pendingPermission = permissions.latest?.request
+                self.pendingPermission = permissions.latest
                 if case .agentStatus(let p) = envelope.event { self.agentState = p.state.rawValue }
             }
         }
@@ -92,27 +92,28 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
     nonisolated func requestApproval(_ request: PermissionRequestPayload) async -> PermissionDecision {
         await withCheckedContinuation { (continuation: CheckedContinuation<PermissionDecision, Never>) in
             Task { @MainActor in
-                self.pendingPermission = request
+                self.pendingPermission = PendingPermission(request: request, state: .livePending, requestedSeq: -1)
                 self.permissionContinuation = continuation
             }
         }
     }
 
     func resolvePermission(_ decision: PermissionDecision) {
+        guard pendingPermission?.state.isActionable == true else { return }
         guard let continuation = permissionContinuation else {
-            guard let request = pendingPermission else { return }
-            pendingPermission = nil
-            Task { [log] in
-                try? await log.append(.permissionResolved(PermissionResolvedPayload(
-                    requestId: request.requestId,
-                    tool: request.tool,
-                    decision: .deny,
-                    risk: request.risk,
-                    reason: "permission request expired; rerun the task")))
+            if pendingPermission?.state == .needsRerun {
+                return
+            }
+            if var pending = pendingPermission {
+                pending.state = .expired
+                pendingPermission = pending
             }
             return
         }
-        pendingPermission = nil
+        if var pending = pendingPermission {
+            pending.state = .resolving
+            pendingPermission = pending
+        }
         continuation.resume(returning: decision)
         permissionContinuation = nil
     }

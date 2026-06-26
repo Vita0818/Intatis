@@ -56,7 +56,10 @@ public struct CoworkProjection: Equatable, Sendable {
     public private(set) var rejectedDelegations: [DelegationRejectedPayload] = []
     public private(set) var workspaceLeases: [WorkspaceLeaseID: WorkspaceLease] = [:]
     public private(set) var capabilityLeases: [CapabilityLeaseID: CapabilityLease] = [:]
+    public private(set) var workspaceLeaseAgents: [WorkspaceLeaseID: AgentID] = [:]
+    public private(set) var capabilityLeaseAgents: [CapabilityLeaseID: AgentID] = [:]
     public private(set) var agentMessages: [AgentMessagePayload] = []
+    public private(set) var agentStatuses: [AgentID: AgentState] = [:]
 
     public init() {}
 
@@ -94,6 +97,11 @@ public struct CoworkProjection: Equatable, Sendable {
                 metadata: payload.metadata)
         case .agentDetached(let payload):
             agentRoster.removeValue(forKey: payload.agent)
+            agentStatuses.removeValue(forKey: payload.agent)
+        case .agentStatus(let payload):
+            if let agent = payload.agent {
+                agentStatuses[agent] = payload.state
+            }
         case .agentMessage(let payload):
             agentMessages.append(payload)
             if let to = payload.to {
@@ -149,13 +157,20 @@ public struct CoworkProjection: Equatable, Sendable {
             }
         case .workspaceLeaseGranted(let payload):
             workspaceLeases[payload.lease.id] = payload.lease
+            if let agent = payload.agent {
+                workspaceLeaseAgents[payload.lease.id] = agent
+            }
         case .capabilityLeaseCreated(let payload):
             capabilityLeases[payload.lease.id] = payload.lease
+            if let agent = payload.agent {
+                capabilityLeaseAgents[payload.lease.id] = agent
+            }
         case .capabilityLeaseRevoked(let payload):
             capabilityLeases.removeValue(forKey: payload.leaseID)
+            capabilityLeaseAgents.removeValue(forKey: payload.leaseID)
         case .userMessage, .messageDelta, .messageCompleted, .error,
              .toolCall, .toolResult, .permissionRequest, .permissionResolved,
-             .patchProposed, .agentStatus, .agentAttachRequested,
+             .patchProposed, .agentAttachRequested,
              .agentSpawnRequested, .agentToAgentMessage, .workspaceLeaseRequested,
              .workspaceLeaseDenied, .permissionReview, .artifactAdded,
              .artifactProgress, .turnStats:

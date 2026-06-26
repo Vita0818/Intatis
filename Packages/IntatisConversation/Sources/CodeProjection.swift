@@ -37,7 +37,7 @@ public struct CodeProjection: Equatable, Sendable {
     public mutating func apply(_ envelope: Envelope) {
         switch envelope.event {
         case .userMessage(let p):
-            items.append(CodeItem(id: freshID(), kind: .user, title: "You", body: p.text))
+            items.append(CodeItem(id: stableID(envelope, "user"), kind: .user, title: "You", body: p.text))
 
         case .messageDelta(let p):
             if let i = agentIndex(p.messageId.rawValue) {
@@ -67,31 +67,31 @@ public struct CodeProjection: Equatable, Sendable {
             items.append(CodeItem(id: p.patchId, kind: .patch, title: "patch", body: p.diff, files: p.files))
 
         case .permissionResolved(let p):
-            items.append(CodeItem(id: freshID(), kind: .note, title: "permission",
+            items.append(CodeItem(id: stableID(envelope, "permission_resolved"), kind: .note, title: "permission",
                                   body: "\(p.decision.rawValue): \(p.tool) — \(p.reason)"))
 
         case .error(let p):
-            items.append(CodeItem(id: freshID(), kind: .error, title: "error", body: p.message))
+            items.append(CodeItem(id: stableID(envelope, "error"), kind: .error, title: "error", body: p.message))
 
         // v0.3 (Cowork)
         case .agentAttached(let p):
-            items.append(CodeItem(id: freshID(), kind: .note, title: "agent",
+            items.append(CodeItem(id: stableID(envelope, "agent_attached"), kind: .note, title: "agent",
                                   body: "+ @\(p.agent.rawValue) attached (\(p.path))"))
 
         case .agentAttachRequested(let p):
-            items.append(CodeItem(id: freshID(), kind: .note, title: "agent attach requested",
+            items.append(CodeItem(id: stableID(envelope, "agent_attach_requested"), kind: .note, title: "agent attach requested",
                                   body: "@\(p.agent.rawValue): \(p.path)"))
 
         case .agentDetached(let p):
-            items.append(CodeItem(id: freshID(), kind: .note, title: "agent",
+            items.append(CodeItem(id: stableID(envelope, "agent_detached"), kind: .note, title: "agent",
                                   body: "− @\(p.agent.rawValue) detached"))
 
         case .agentSpawnRequested(let p):
-            items.append(CodeItem(id: freshID(), kind: .note, title: "agent spawn requested",
+            items.append(CodeItem(id: stableID(envelope, "agent_spawn_requested"), kind: .note, title: "agent spawn requested",
                                   body: "@\(p.agent.rawValue): \(p.path)"))
 
         case .agentSpawned(let p):
-            items.append(CodeItem(id: freshID(), kind: .note, title: "agent spawned",
+            items.append(CodeItem(id: stableID(envelope, "agent_spawned"), kind: .note, title: "agent spawned",
                                   body: "@\(p.agent.rawValue): \(p.path)"))
 
         case .agentMessage(let p):
@@ -101,7 +101,7 @@ public struct CodeProjection: Equatable, Sendable {
                                   title: title, body: p.content))
 
         case .agentToAgentMessage(let p):
-            items.append(CodeItem(id: freshID(), kind: .agentToAgent,
+            items.append(CodeItem(id: stableID(envelope, "agent_to_agent"), kind: .agentToAgent,
                                   title: "\(p.from.rawValue) → \(p.to.rawValue)", body: p.content))
 
         case .informationRequested(let p):
@@ -117,11 +117,11 @@ public struct CodeProjection: Equatable, Sendable {
                                   body: "\(p.requester.rawValue): \(p.objective) — \(p.reason)"))
 
         case .delegationApproved(let p):
-            items.append(CodeItem(id: freshID(), kind: .note, title: "delegation approved",
+            items.append(CodeItem(id: stableID(envelope, "delegation_approved"), kind: .note, title: "delegation approved",
                                   body: "@\(p.contract.assignee.rawValue): \(p.contract.objective)"))
 
         case .delegationRejected(let p):
-            items.append(CodeItem(id: freshID(), kind: .error, title: "delegation rejected",
+            items.append(CodeItem(id: stableID(envelope, "delegation_rejected"), kind: .error, title: "delegation rejected",
                                   body: "\(p.objective) — \(p.reason)"))
 
         case .taskDelegated(let p):
@@ -129,7 +129,7 @@ public struct CodeProjection: Equatable, Sendable {
                                   body: "@\(p.assignee.rawValue): \(p.contract.objective)"))
 
         case .workspaceLeaseRequested(let p):
-            items.append(CodeItem(id: freshID(), kind: .note, title: "workspace lease requested",
+            items.append(CodeItem(id: stableID(envelope, "workspace_lease_requested"), kind: .note, title: "workspace lease requested",
                                   body: "\(p.access.rawValue): \(p.rootPath)"))
 
         case .workspaceLeaseGranted(let p):
@@ -137,7 +137,7 @@ public struct CodeProjection: Equatable, Sendable {
                                   body: "\(p.lease.access.rawValue): \(p.lease.rootPath)"))
 
         case .workspaceLeaseDenied(let p):
-            items.append(CodeItem(id: freshID(), kind: .error, title: "workspace lease denied",
+            items.append(CodeItem(id: stableID(envelope, "workspace_lease_denied"), kind: .error, title: "workspace lease denied",
                                   body: "\(p.rootPath) — \(p.reason)"))
 
         case .capabilityLeaseCreated(let p):
@@ -149,7 +149,7 @@ public struct CodeProjection: Equatable, Sendable {
                                   body: p.reason))
 
         case .permissionReview(let p):
-            items.append(CodeItem(id: freshID(), kind: .note, title: "review",
+            items.append(CodeItem(id: stableID(envelope, "permission_review"), kind: .note, title: "review",
                                   body: "reviewer(\(p.reviewerModel)): \(p.decision.rawValue) \(p.tool) — \(p.reason)"))
 
         case .taskCreated(let p):
@@ -177,7 +177,7 @@ public struct CodeProjection: Equatable, Sendable {
                                   title: p.agent.rawValue, body: p.error))
 
         case .taskRejected(let p):
-            items.append(CodeItem(id: p.contract?.id.rawValue ?? freshID(), kind: .error,
+            items.append(CodeItem(id: p.contract?.id.rawValue ?? stableID(envelope, "task_rejected"), kind: .error,
                                   title: "task rejected", body: "\(p.objective) — \(p.reason)"))
 
         case .artifactAdded(let p):
@@ -199,12 +199,22 @@ public struct CodeProjection: Equatable, Sendable {
         items.firstIndex { $0.id == id && $0.kind == .agent }
     }
 
-    private func freshID() -> String { IDGen.random(prefix: "item", length: 10) }
+    private func stableID(_ envelope: Envelope, _ suffix: String) -> String {
+        "\(envelope.session.rawValue):\(envelope.seq):\(suffix)"
+    }
 }
 
 public enum PendingPermissionState: String, Equatable, Sendable {
-    case active
+    case livePending = "live_pending"
+    case resolving
+    case approved
+    case rejected
+    case expired
     case needsRerun = "needs_rerun"
+
+    public var isActionable: Bool {
+        self == .livePending
+    }
 }
 
 public struct PendingPermission: Identifiable, Equatable, Sendable {
@@ -214,7 +224,7 @@ public struct PendingPermission: Identifiable, Equatable, Sendable {
     public var requestedSeq: Int
 
     public init(request: PermissionRequestPayload,
-                state: PendingPermissionState = .active,
+                state: PendingPermissionState = .livePending,
                 requestedSeq: Int) {
         self.request = request
         self.state = state
@@ -246,7 +256,6 @@ public struct PermissionProjection: Equatable, Sendable {
         pending = pending.map {
             var item = $0
             item.state = .needsRerun
-            item.request.reason += " (needs rerun)"
             return item
         }
     }

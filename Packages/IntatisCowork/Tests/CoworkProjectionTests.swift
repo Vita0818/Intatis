@@ -101,6 +101,49 @@ final class CoworkProjectionTests: XCTestCase {
         XCTAssertEqual(projection.mailboxes[worker]?.pendingMessages, [MessageID(rawValue: "msg_status")])
     }
 
+    func testProjectionRestoresAgentStatusAndReplayIsStable() {
+        let contract = taskContract()
+        let workspaceLease = WorkspaceLease(
+            id: WorkspaceLeaseID(rawValue: "wlease_projection"),
+            workspaceID: WorkspaceID(rawValue: "workspace_projection"),
+            rootPath: "/tmp/worker",
+            access: .readOnly)
+        let capabilityLease = CapabilityLease(
+            id: CapabilityLeaseID(rawValue: "clease_projection"),
+            taskID: contract.id,
+            tools: [.readWorkspace, .searchWorkspace, .requestDelegation])
+        let envelopes: [Envelope] = [
+            env(0, .agentAttached(AgentAttachedPayload(
+                agent: worker,
+                path: "/tmp/worker",
+                model: ModelID(rawValue: "m"),
+                profile: "reviewed"))),
+            env(1, .workspaceLeaseGranted(WorkspaceLeaseGrantedPayload(agent: worker, lease: workspaceLease))),
+            env(2, .capabilityLeaseCreated(CapabilityLeaseCreatedPayload(agent: worker, lease: capabilityLease))),
+            env(3, .taskCreated(TaskCreatedPayload(contract: contract))),
+            env(4, .taskQueued(TaskQueuedPayload(
+                contract: contract,
+                rootTaskID: contract.id,
+                issuer: main,
+                assignee: worker,
+                hopCount: 1,
+                visitedAgents: [main, worker]))),
+            env(5, .agentStatus(AgentStatusPayload(agent: worker, state: .thinking, task: "count files"))),
+            env(6, .taskStarted(TaskStartedPayload(taskID: contract.id, agent: worker))),
+        ]
+
+        let first = CoworkProjection.build(from: envelopes)
+        let second = CoworkProjection.build(from: envelopes)
+
+        XCTAssertEqual(first, second)
+        XCTAssertEqual(first.agentRoster[worker]?.path, "/tmp/worker")
+        XCTAssertEqual(first.agentStatuses[worker], .thinking)
+        XCTAssertEqual(first.runningTasks.map(\.id), [contract.id])
+        XCTAssertEqual(first.mailboxes[worker]?.pendingTasks, [])
+        XCTAssertEqual(first.workspaceLeases[workspaceLease.id], workspaceLease)
+        XCTAssertEqual(first.capabilityLeases[capabilityLease.id], capabilityLease)
+    }
+
     private func taskContract() -> TaskContract {
         TaskContract(
             id: TaskID(rawValue: "task_projection"),

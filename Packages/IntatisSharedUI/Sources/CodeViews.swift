@@ -9,7 +9,7 @@ import IntatisConversation
 /// Tools/Permission/AgentKernel dependencies).
 public struct CodeShell: View {
     private let items: [CodeItem]
-    private let pending: PermissionRequestPayload?
+    private let pending: PendingPermission?
     private let isWorking: Bool
     private let workspaceName: String
     private let agentState: String
@@ -18,7 +18,7 @@ public struct CodeShell: View {
     private let onResolve: (PermissionDecision) -> Void
 
     public init(items: [CodeItem],
-                pending: PermissionRequestPayload?,
+                pending: PendingPermission?,
                 isWorking: Bool,
                 workspaceName: String,
                 agentState: String,
@@ -33,6 +33,11 @@ public struct CodeShell: View {
         self._input = input
         self.onSend = onSend
         self.onResolve = onResolve
+    }
+
+    private var permissionBlocksComposer: Bool {
+        guard let pending else { return false }
+        return pending.state == .livePending || pending.state == .resolving
     }
 
     public var body: some View {
@@ -61,7 +66,7 @@ public struct CodeShell: View {
                 }
             }
             if let pending {
-                PermissionCard(request: pending, onResolve: onResolve)
+                PermissionCard(permission: pending, onResolve: onResolve)
             }
             Divider()
             HStack(alignment: .bottom, spacing: 8) {
@@ -69,10 +74,10 @@ public struct CodeShell: View {
                     .textFieldStyle(.plain)
                     .lineLimit(1...6)
                     .onSubmit(onSend)
-                    .disabled(isWorking || pending != nil)
+                    .disabled(isWorking || permissionBlocksComposer)
                 Button(action: onSend) { Image(systemName: "arrow.up.circle.fill").font(.title2) }
                     .buttonStyle(.plain)
-                    .disabled(isWorking || pending != nil || input.trimmingCharacters(in: .whitespaces).isEmpty)
+                    .disabled(isWorking || permissionBlocksComposer || input.trimmingCharacters(in: .whitespaces).isEmpty)
             }
             .padding(10)
         }
@@ -126,11 +131,18 @@ struct CodeItemRow: View {
     }
 }
 
-struct PermissionCard: View {
-    let request: PermissionRequestPayload
+public struct PermissionCard: View {
+    let permission: PendingPermission
     let onResolve: (PermissionDecision) -> Void
 
-    var body: some View {
+    public init(permission: PendingPermission, onResolve: @escaping (PermissionDecision) -> Void) {
+        self.permission = permission
+        self.onResolve = onResolve
+    }
+
+    private var request: PermissionRequestPayload { permission.request }
+
+    public var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Label("Permission needed", systemImage: "lock.shield").font(.headline)
@@ -138,6 +150,9 @@ struct PermissionCard: View {
                 Text(request.risk.rawValue.uppercased()).font(.caption.bold()).foregroundStyle(riskColor)
             }
             Text("\(request.tool) — \(request.reason)").font(.callout)
+            Text(statusText)
+                .font(.caption)
+                .foregroundStyle(statusColor)
             if let diff = Self.diff(from: request.args) {
                 ScrollView { Text(diff).font(.system(.caption, design: .monospaced))
                     .frame(maxWidth: .infinity, alignment: .leading) }
@@ -148,8 +163,13 @@ struct PermissionCard: View {
             }
             HStack {
                 Spacer()
-                Button("Reject") { onResolve(.deny) }
-                Button("Approve") { onResolve(.allow) }.keyboardShortcut(.defaultAction)
+                if permission.state == .resolving {
+                    ProgressView().controlSize(.small)
+                    Text("Resolving…").font(.caption).foregroundStyle(.secondary)
+                } else if permission.state.isActionable {
+                    Button("Reject") { onResolve(.deny) }
+                    Button("Approve") { onResolve(.allow) }.keyboardShortcut(.defaultAction)
+                }
             }
         }
         .padding(12)
@@ -167,7 +187,35 @@ struct PermissionCard: View {
         }
     }
 
-    static func diff(from args: String) -> String? {
+    private var statusText: String {
+        switch permission.state {
+        case .livePending:
+            return "Waiting for your decision."
+        case .resolving:
+            return "Applying your decision."
+        case .approved:
+            return "Approved."
+        case .rejected:
+            return "Rejected."
+        case .expired:
+            return "This approval channel expired. Rerun the task to continue."
+        case .needsRerun:
+            return "This request was restored from history. Rerun the task to continue."
+        }
+    }
+
+    private var statusColor: Color {
+        switch permission.state {
+        case .livePending, .resolving:
+            return .secondary
+        case .approved:
+            return .green
+        case .rejected, .expired, .needsRerun:
+            return .orange
+        }
+    }
+
+    public static func diff(from args: String) -> String? {
         struct A: Decodable { let diff: String? }
         return (try? JSONDecoder().decode(A.self, from: Data(args.utf8)))?.diff
     }

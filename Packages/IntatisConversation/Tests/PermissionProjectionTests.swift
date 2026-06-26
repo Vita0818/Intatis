@@ -26,6 +26,8 @@ final class PermissionProjectionTests: XCTestCase {
 
         XCTAssertEqual(projection.pending.count, 1)
         XCTAssertEqual(projection.latest?.request.requestId, RequestID(rawValue: "req_1"))
+        XCTAssertEqual(projection.latest?.state, .livePending)
+        XCTAssertEqual(projection.latest?.state.isActionable, true)
     }
 
     func testPermissionResolvedRemovesPending() {
@@ -62,6 +64,15 @@ final class PermissionProjectionTests: XCTestCase {
         ], markNeedsRerun: true)
 
         XCTAssertEqual(projection.latest?.state, .needsRerun)
-        XCTAssertTrue(projection.latest?.request.reason.contains("needs rerun") == true)
+        XCTAssertEqual(projection.latest?.state.isActionable, false)
+        XCTAssertFalse(projection.latest?.request.reason.contains("needs rerun") == true)
+    }
+
+    func testResolvingAndExpiredPermissionsAreNotActionable() {
+        XCTAssertFalse(PendingPermissionState.resolving.isActionable)
+        XCTAssertFalse(PendingPermissionState.approved.isActionable)
+        XCTAssertFalse(PendingPermissionState.rejected.isActionable)
+        XCTAssertFalse(PendingPermissionState.expired.isActionable)
+        XCTAssertFalse(PendingPermissionState.needsRerun.isActionable)
     }
 }
