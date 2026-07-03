@@ -17,7 +17,10 @@ final class IntatisProtocolTests: XCTestCase {
         let s = SessionID(rawValue: "sess_x")
         let m = MessageID(rawValue: "msg_1")
         try roundTrip(Envelope(seq: 1, ts: Date(timeIntervalSince1970: 1_700_000_000), session: s,
-                               event: .userMessage(.init(text: "hi", to: AgentID(rawValue: "Rokurics")))))
+                               event: .userMessage(.init(text: "hi",
+                                                         to: AgentID(rawValue: "Rokurics"),
+                                                         tags: ["Goal"],
+                                                         goal: "hi"))))
         try roundTrip(Envelope(seq: 2, ts: Date(timeIntervalSince1970: 1_700_000_001), session: s,
                                event: .messageDelta(.init(messageId: m, role: .assistant, textDelta: "he"))))
         try roundTrip(Envelope(seq: 3, ts: Date(timeIntervalSince1970: 1_700_000_002), session: s,
@@ -39,6 +42,21 @@ final class IntatisProtocolTests: XCTestCase {
         let payload = try XCTUnwrap(json["payload"] as? [String: Any])
         XCTAssertEqual(payload["textDelta"] as? String, "x")
         XCTAssertEqual(payload["role"] as? String, "assistant")
+    }
+
+    func testLegacyUserMessageWithoutGoalMetadataDecodes() throws {
+        let json = """
+        {"seq":1,"ts":"2023-11-14T22:13:20Z","session":"sess_legacy","v":1,"type":"user_message","payload":{"text":"hi"}}
+        """
+
+        let envelope = try dec.decode(Envelope.self, from: Data(json.utf8))
+
+        guard case .userMessage(let payload) = envelope.event else {
+            return XCTFail("expected user_message")
+        }
+        XCTAssertEqual(payload.text, "hi")
+        XCTAssertNil(payload.tags)
+        XCTAssertNil(payload.goal)
     }
 
     func testCommandRoundTrip() throws {

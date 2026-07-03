@@ -62,9 +62,11 @@ public struct AgentLoop: Sendable {
     /// Runs the loop and returns the agent's final text answer (empty if it ran
     /// out of iterations). Discardable for fire-and-forget UI sends.
     @discardableResult
-    public func send(_ userText: String, images: [ImageAttachment] = []) async throws -> String {
+    public func send(_ userText: String,
+                     images: [ImageAttachment] = [],
+                     userMessage: UserMessagePayload? = nil) async throws -> String {
         let history = await projectedHistory()
-        try await log.append(.userMessage(UserMessagePayload(text: userText)))
+        try await log.append(.userMessage(userMessage ?? UserMessagePayload(text: userText)))
         try await log.append(.agentStatus(AgentStatusPayload(agent: agent.name, state: .thinking)))
 
         var convo = context.initialMessages(history: history, userText: userText, userImages: images)
@@ -127,7 +129,7 @@ public struct AgentLoop: Sendable {
             // Surface provider/stream/tool errors instead of failing silently.
             try? await log.append(.error(ErrorPayload(code: "agent", message: error.localizedDescription)))
             try? await log.append(.agentStatus(AgentStatusPayload(agent: agent.name, state: .idle)))
-            return ""
+            throw error
         }
     }
 

@@ -64,6 +64,7 @@ public enum PathConfinement {
         guard let base = components.last else { return false }
 
         if base == ".env" || base.hasPrefix(".env.") { return true }
+        if isAgentConfigSecretPath(components: components, base: base) { return true }
         if [".ssh", ".aws", ".gnupg", ".gpg"].contains(where: { components.contains($0) }) { return true }
         if components.contains("secrets") || components.contains("keychains") { return true }
         if base == ".netrc" || base == ".pgpass" || base == ".npmrc" || base == ".pypirc" { return true }
@@ -77,6 +78,27 @@ public enum PathConfinement {
             return true
         }
         return false
+    }
+
+    private static func isAgentConfigSecretPath(components: [String], base: String) -> Bool {
+        if base == "auth.json",
+           components.contains(".local"),
+           components.contains("share"),
+           (components.contains("opencode") || components.contains("intatis")) {
+            return true
+        }
+
+        let configBasenames = Set([
+            "opencode.json", "opencode.jsonc", "intatis.json", "intatis.jsonc",
+            "config.json", "config.jsonc",
+        ])
+        guard configBasenames.contains(base),
+              let configIndex = components.firstIndex(of: ".config"),
+              components.indices.contains(configIndex + 1) else {
+            return false
+        }
+        let owner = components[configIndex + 1]
+        return owner == "opencode" || owner == "intatis"
     }
 
     private static func requireInside(_ candidate: URL, root: URL, original: String) throws {

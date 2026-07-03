@@ -25,6 +25,9 @@ final class IntatisPermissionTests: XCTestCase {
         XCTAssertTrue(SecretScanner.isSensitivePath("config/.env.local"))
         XCTAssertTrue(SecretScanner.isSensitivePath("home/.ssh/id_rsa"))
         XCTAssertTrue(SecretScanner.isSensitivePath("certs/server.pem"))
+        XCTAssertTrue(SecretScanner.isSensitivePath("~/.config/opencode/opencode.json"))
+        XCTAssertTrue(SecretScanner.isSensitivePath("~/.config/intatis/config.json"))
+        XCTAssertTrue(SecretScanner.isSensitivePath("~/.local/share/opencode/auth.json"))
         XCTAssertFalse(SecretScanner.isSensitivePath("src/main.swift"))
     }
 

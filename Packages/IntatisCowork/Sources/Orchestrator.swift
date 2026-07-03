@@ -7,17 +7,37 @@ import IntatisPermission
 import IntatisConversation
 import IntatisAgentKernel
 
+public enum OrchestratorSendResult: Equatable, Sendable {
+    case sent
+    case failed(String)
+
+    public var errorMessage: String? {
+        if case .failed(let message) = self { return message }
+        return nil
+    }
+}
+
+public enum AutomaticPermissionReviewResult: Equatable, Sendable {
+    case enabled(AgentID)
+    case alreadyEnabled(AgentID)
+    case failed(String)
+}
+
 /// Coordinates multiple agents over one shared event log (ARCHITECTURE.md §7).
 /// Routes `@mentioned` user messages to the right agent, and mediates every
 /// agent-to-agent exchange through the Message Bus. An `actor`, so concurrent /
 /// reentrant agent runs serialize safely.
 public actor Orchestrator {
+    public static let automaticPermissionReviewerID = AgentID(rawValue: "permission-reviewer")
+
     private let log: EventLog
     private var registry: AgentRegistry
     private let bus: MessageBus
     private let engine: PermissionEngine
     private let allowsShell: Bool
     private let responder: PermissionResponder
+    private var automaticPermissionResponder: AgentPermissionResponder?
+    private var automaticPermissionReviewerAgentID: AgentID?
     private var capabilityLeases: [CapabilityLeaseID: CapabilityLease]
     private var workspaceLeases: [WorkspaceLeaseID: WorkspaceLease]
     private var defaultCapabilityLeaseIDs: [AgentID: CapabilityLeaseID]
@@ -46,6 +66,8 @@ public actor Orchestrator {
         self.engine = engine
         self.allowsShell = allowsShell
         self.responder = responder
+        self.automaticPermissionResponder = nil
+        self.automaticPermissionReviewerAgentID = nil
         self.capabilityLeases = [:]
         self.workspaceLeases = [:]
         self.defaultCapabilityLeaseIDs = [:]
@@ -62,6 +84,12 @@ public actor Orchestrator {
     @discardableResult
     public func attach(_ agent: Agent) async -> Bool {
         let id = agent.name
+        guard id != Self.automaticPermissionReviewerID else {
+            try? await log.append(.error(ErrorPayload(
+                code: "reserved_agent",
+                message: "@\(id.rawValue) is reserved for automatic permission review")))
+            return false
+        }
         guard registry.agent(id) == nil else {
             try? await log.append(.error(ErrorPayload(code: "agent_exists",
                                                        message: "agent @\(id.rawValue) already exists")))
@@ -103,7 +131,7 @@ public actor Orchestrator {
             return false
         }
 
-        let decision = await responder.requestApproval(request)
+        let decision = await activePermissionResponder().requestApproval(request)
         guard decision == .allow else {
             try? await log.append(.permissionResolved(PermissionResolvedPayload(
                 requestId: requestID, tool: "agent.attach", decision: .deny,
@@ -152,6 +180,10 @@ public actor Orchestrator {
     }
 
     public func detach(_ name: AgentID) async {
+        if name == automaticPermissionReviewerAgentID {
+            automaticPermissionResponder = nil
+            automaticPermissionReviewerAgentID = nil
+        }
         registry.remove(name)
         if let capabilityLeaseID = defaultCapabilityLeaseIDs.removeValue(forKey: name) {
             capabilityLeases.removeValue(forKey: capabilityLeaseID)
@@ -171,6 +203,7 @@ public actor Orchestrator {
 
     public func agentNames() -> [AgentID] { registry.names }
     public func agentList() -> [Agent] { registry.all() }
+    public func automaticPermissionReviewEnabled() -> Bool { automaticPermissionResponder != nil }
     func capabilityLeaseList() -> [CapabilityLease] { Array(capabilityLeases.values) }
     func workspaceLeaseList() -> [WorkspaceLease] { Array(workspaceLeases.values) }
     func capabilityLease(id: CapabilityLeaseID) -> CapabilityLease? { capabilityLeases[id] }
@@ -181,16 +214,216 @@ public actor Orchestrator {
     func taskGraphSnapshot() -> TaskGraph { taskGraph }
     func taskGraphNode(_ taskID: TaskID) -> TaskNode? { taskGraph.node(taskID) }
 
-    /// Route a user message to the `@mentioned` agent, or the first attached agent.
-    public func send(_ text: String, to: AgentID? = nil, images: [ImageAttachment] = []) async {
-        let target = to.flatMap { registry.agent($0) } ?? registry.all().first
-        guard let agent = target else {
-            try? await log.append(.error(ErrorPayload(code: "no_agent", message: "no agent attached")))
-            return
+    @discardableResult
+    public func enableAutomaticPermissionReview(model: ModelID,
+                                                 workspaceRoot: URL,
+                                                 name: AgentID = Orchestrator.automaticPermissionReviewerID) async -> AutomaticPermissionReviewResult {
+        guard automaticPermissionResponder == nil else {
+            return .alreadyEnabled(automaticPermissionReviewerAgentID ?? name)
+        }
+        guard name == Self.automaticPermissionReviewerID else {
+            return .failed("automatic permission reviewer must use @\(Self.automaticPermissionReviewerID.rawValue)")
+        }
+        guard registry.agent(name) == nil else {
+            return .failed("@\(name.rawValue) already exists; the automatic reviewer identity is reserved")
+        }
+
+        let assessment = assessWorkspaceAttach(workspaceRoot)
+        guard assessment.canAskUser, let canonical = assessment.canonical else {
+            return .failed(assessment.reason)
+        }
+
+        let reviewer = Agent(
+            name: name,
+            workspaceRoot: canonical,
+            model: model,
+            profile: .readOnly,
+            coordinationDepth: 0)
+
+        let provider: ToolCallingProvider
+        do {
+            provider = try await providerFor(reviewer)
+        } catch {
+            return .failed(error.localizedDescription)
+        }
+
+        let workspaceLease = WorkspaceLease(rootPath: reviewer.workspaceRoot.path, access: .readOnly)
+        let capabilityLease = CapabilityLease(
+            tools: [],
+            communication: .none,
+            delegation: .none,
+            expiresAtTaskCompletion: false)
+
+        registry.add(reviewer)
+        workspaceLeases[workspaceLease.id] = workspaceLease
+        capabilityLeases[capabilityLease.id] = capabilityLease
+        defaultWorkspaceLeaseIDs[reviewer.name] = workspaceLease.id
+        defaultCapabilityLeaseIDs[reviewer.name] = capabilityLease.id
+        automaticPermissionReviewerAgentID = reviewer.name
+        automaticPermissionResponder = AgentPermissionResponder(
+            log: log,
+            reviewerAgent: reviewer,
+            provider: provider,
+            fallback: responder)
+
+        try? await log.append(.workspaceLeaseGranted(WorkspaceLeaseGrantedPayload(
+            agent: reviewer.name,
+            lease: workspaceLease,
+            metadata: CoworkEventMetadata(
+                agentID: reviewer.name,
+                workspaceID: workspaceLease.workspaceID,
+                workspaceLeaseID: workspaceLease.id,
+                scope: .workspace))))
+        try? await log.append(.capabilityLeaseCreated(CapabilityLeaseCreatedPayload(
+            agent: reviewer.name,
+            lease: capabilityLease,
+            metadata: CoworkEventMetadata(
+                agentID: reviewer.name,
+                capabilityLeaseID: capabilityLease.id,
+                scope: .capability))))
+        try? await log.append(.agentAttached(AgentAttachedPayload(
+            agent: reviewer.name,
+            path: reviewer.workspaceRoot.path,
+            model: reviewer.model,
+            profile: reviewer.profile.rawValue,
+            metadata: CoworkEventMetadata(agentID: reviewer.name, scope: .agent))))
+        return .enabled(reviewer.name)
+    }
+
+    @discardableResult
+    public func disableAutomaticPermissionReview() async -> Bool {
+        guard let reviewerID = automaticPermissionReviewerAgentID else {
+            return false
+        }
+
+        automaticPermissionResponder = nil
+        automaticPermissionReviewerAgentID = nil
+        registry.remove(reviewerID)
+        if let capabilityLeaseID = defaultCapabilityLeaseIDs.removeValue(forKey: reviewerID) {
+            capabilityLeases.removeValue(forKey: capabilityLeaseID)
+            try? await log.append(.capabilityLeaseRevoked(CapabilityLeaseRevokedPayload(
+                agent: reviewerID,
+                leaseID: capabilityLeaseID,
+                reason: "automatic permission review disabled",
+                metadata: CoworkEventMetadata(
+                    agentID: reviewerID,
+                    capabilityLeaseID: capabilityLeaseID,
+                    scope: .capability))))
+        }
+        if let workspaceLeaseID = defaultWorkspaceLeaseIDs.removeValue(forKey: reviewerID) {
+            workspaceLeases.removeValue(forKey: workspaceLeaseID)
+        }
+        try? await log.append(.agentDetached(AgentDetachedPayload(
+            agent: reviewerID,
+            metadata: CoworkEventMetadata(agentID: reviewerID, scope: .agent))))
+        return true
+    }
+
+    public func restore(from projection: CoworkProjection) {
+        for payload in projection.agentRoster.values {
+            guard payload.agent != Self.automaticPermissionReviewerID else { continue }
+            let profile = PermissionProfile(rawValue: payload.profile) ?? .reviewed
+            registry.add(Agent(
+                name: payload.agent,
+                workspaceRoot: URL(fileURLWithPath: payload.path),
+                model: payload.model,
+                profile: profile,
+                coordinationDepth: Agent.defaultCoordinationDepth))
+        }
+        workspaceLeases = projection.workspaceLeases
+        capabilityLeases = projection.capabilityLeases
+        defaultWorkspaceLeaseIDs = reverseLeaseAgents(projection.workspaceLeaseAgents)
+        defaultCapabilityLeaseIDs = reverseLeaseAgents(projection.capabilityLeaseAgents)
+    }
+
+    /// Route a user message to the explicit target, or to the first attached agent
+    /// only when the caller did not specify a target.
+    @discardableResult
+    public func send(_ text: String,
+                     to: AgentID? = nil,
+                     images: [ImageAttachment] = [],
+                     userMessage: UserMessagePayload? = nil) async -> OrchestratorSendResult {
+        let agent: Agent
+        if let to {
+            guard to != Self.automaticPermissionReviewerID else {
+                let message = "@\(Self.automaticPermissionReviewerID.rawValue) is reserved for automatic permission review."
+                try? await log.append(.error(ErrorPayload(code: "reserved_agent", message: message)))
+                return .failed(message)
+            }
+            guard let explicitTarget = registry.agent(to) else {
+                try? await log.append(.error(ErrorPayload(
+                    code: "no_such_agent",
+                    message: "no attached agent named @\(to.rawValue)")))
+                return .failed("No attached agent named @\(to.rawValue).")
+            }
+            agent = explicitTarget
+        } else {
+            guard let defaultTarget = registry.all().first(where: { $0.name != Self.automaticPermissionReviewerID }) else {
+                try? await log.append(.error(ErrorPayload(code: "no_agent", message: "no agent attached")))
+                return .failed("No agent attached.")
+            }
+            agent = defaultTarget
         }
         // AgentLoop appends the user message itself — don't double-log it here.
-        _ = try? await run(agent, input: text, images: images)
+        do {
+            _ = try await run(agent, input: text, images: images, userMessage: userMessage)
+        } catch {
+            let message = error.localizedDescription
+            try? await log.append(.error(ErrorPayload(code: "agent", message: message)))
+            return .failed(message)
+        }
         await runSchedulerUntilIdle()
+        return .sent
+    }
+
+    @discardableResult
+    public func retry(_ task: CoworkTaskView) async -> OrchestratorSendResult {
+        guard let contract = task.contract else {
+            return .failed("This task cannot be retried because its contract is missing.")
+        }
+        let assignee = task.assignee ?? contract.assignee
+        guard assignee != Self.automaticPermissionReviewerID else {
+            return .failed("@\(Self.automaticPermissionReviewerID.rawValue) is reserved for automatic permission review.")
+        }
+        guard registry.agent(assignee) != nil else {
+            let message = "No attached agent named @\(assignee.rawValue)."
+            try? await log.append(.error(ErrorPayload(code: "no_such_agent", message: message)))
+            return .failed(message)
+        }
+
+        let rootTaskID = task.rootTaskID ?? contract.parentTaskID ?? contract.id
+        let parentTaskID = task.parentTaskID ?? contract.parentTaskID
+        let issuer = task.issuer ?? contract.issuer
+        let visitedAgents = Self.uniqueAgents([issuer, assignee].compactMap { $0 })
+        let scheduled = ScheduledTask(
+            contract: contract,
+            input: contract.objective,
+            rootTaskID: rootTaskID,
+            parentTaskID: parentTaskID,
+            issuer: issuer,
+            assignee: assignee,
+            causalParentID: parentTaskID,
+            hopCount: max(0, visitedAgents.count - 1),
+            visitedAgents: visitedAgents)
+        scheduler.enqueue(scheduled)
+        taskGraph.updateStatus(taskID: contract.id, status: .queued)
+        try? await log.append(.taskQueued(TaskQueuedPayload(
+            contract: contract,
+            rootTaskID: scheduled.rootTaskID,
+            parentTaskID: scheduled.parentTaskID,
+            issuer: scheduled.issuer,
+            assignee: scheduled.assignee,
+            causalParentID: scheduled.causalParentID,
+            hopCount: scheduled.hopCount,
+            visitedAgents: scheduled.visitedAgents,
+            metadata: taskMetadata(
+                contract: contract,
+                rootTaskID: scheduled.rootTaskID,
+                parentTaskID: scheduled.parentTaskID,
+                sender: scheduled.issuer,
+                recipient: scheduled.assignee))))
+        await runSchedulerUntilIdle()
+        return .sent
     }
 
     /// Called by `BusMessenger` when `from` asks the agent named `toName`.
@@ -207,6 +440,9 @@ public actor Orchestrator {
             try? await log.append(.error(ErrorPayload(code: "agent_self_call",
                                                        message: "agent cannot ask itself")))
             return (nil, "error: agent cannot ask itself")
+        }
+        guard to != Self.automaticPermissionReviewerID else {
+            return (nil, "@\(Self.automaticPermissionReviewerID.rawValue) is reserved for automatic permission review")
         }
         guard registry.agent(to) != nil else { return (nil, "no such agent: \(toName)") }
         guard let forwardedQuestion = await bus.deliver(from: from, to: to, content: question) else {
@@ -229,6 +465,9 @@ public actor Orchestrator {
         let normalizedName = Self.normalizedAgentName(toName)
         let to = AgentID(rawValue: normalizedName)
         guard to != from else { return "error: agent cannot message itself" }
+        guard to != Self.automaticPermissionReviewerID else {
+            return "@\(Self.automaticPermissionReviewerID.rawValue) is reserved for automatic permission review"
+        }
         guard registry.agent(to) != nil else { return "no such agent: \(toName)" }
         guard await bus.sendMessage(from: from, to: to, content: content, taskID: taskID) != nil else {
             return "your message was blocked by the mediator"
@@ -240,6 +479,9 @@ public actor Orchestrator {
         let normalizedName = Self.normalizedAgentName(toName)
         let to = AgentID(rawValue: normalizedName)
         guard to != from else { return "error: agent cannot request information from itself" }
+        guard to != Self.automaticPermissionReviewerID else {
+            return "@\(Self.automaticPermissionReviewerID.rawValue) is reserved for automatic permission review"
+        }
         guard registry.agent(to) != nil else { return "no such agent: \(toName)" }
         guard await bus.requestInformation(from: from, to: to, question: question, taskID: taskID) != nil else {
             return "your information request was blocked by the mediator"
@@ -251,6 +493,9 @@ public actor Orchestrator {
         let normalizedName = Self.normalizedAgentName(toName)
         let to = AgentID(rawValue: normalizedName)
         guard to != from else { return "error: agent cannot reply to itself" }
+        guard to != Self.automaticPermissionReviewerID else {
+            return "@\(Self.automaticPermissionReviewerID.rawValue) is reserved for automatic permission review"
+        }
         guard registry.agent(to) != nil else { return "no such agent: \(toName)" }
         let replyID = inReplyTo.map { MessageID(rawValue: $0) }
         guard await bus.replyMessage(from: from, to: to, content: content, inReplyTo: replyID, taskID: taskID) != nil else {
@@ -281,6 +526,7 @@ public actor Orchestrator {
                         objective: String,
                         roleHint: String = "root task coordinator",
                         expectedDeliverable: String = "Coordinate assigned subtasks and synthesize the result.") async -> TaskID? {
+        guard assignee != Self.automaticPermissionReviewerID else { return nil }
         guard let agent = registry.agent(assignee) else { return nil }
         let workspaceLeaseID = defaultWorkspaceLeaseIDs[agent.name]
         let workspaceID = workspaceLeaseID.flatMap { workspaceLeases[$0]?.workspaceID }
@@ -294,7 +540,7 @@ public actor Orchestrator {
             workspaceID: workspaceID,
             workspaceLeaseID: workspaceLeaseID,
             capabilityLeaseID: defaultCapabilityLeaseIDs[agent.name],
-            relatedAgents: registry.names.filter { $0 != agent.name })
+            relatedAgents: agentVisibleNames(excluding: agent.name))
         switch taskGraph.addRootTask(contract) {
         case .success:
             let metadata = taskMetadata(
@@ -348,6 +594,9 @@ public actor Orchestrator {
                               parentTaskID: TaskID? = nil) async -> (taskID: TaskID?, message: String) {
         let normalizedName = Self.normalizedAgentName(toName)
         let to = AgentID(rawValue: normalizedName)
+        guard to != Self.automaticPermissionReviewerID else {
+            return (nil, "@\(Self.automaticPermissionReviewerID.rawValue) is reserved for automatic permission review")
+        }
         guard let toAgent = registry.agent(to) else { return (nil, "no such agent: \(toName)") }
 
         let prepared = prepareDelegatedTask(
@@ -457,6 +706,9 @@ public actor Orchestrator {
             return "error: not a folder: \(url.path)"
         }
         let id = AgentID(rawValue: trimmed)
+        guard id != Self.automaticPermissionReviewerID else {
+            return "error: @\(Self.automaticPermissionReviewerID.rawValue) is reserved for automatic permission review"
+        }
         if registry.agent(id) != nil { return "error: an agent named @\(trimmed) already exists" }
         try? await log.append(.agentSpawnRequested(AgentSpawnRequestedPayload(
             agent: id,
@@ -480,7 +732,7 @@ public actor Orchestrator {
 
     /// One line per active agent, for the coordinator to read.
     func listForTool() -> String {
-        let all = registry.all()
+        let all = registry.all().filter { $0.name != Self.automaticPermissionReviewerID }
         guard !all.isEmpty else { return "(no agents)" }
         return all.map { "@\($0.name.rawValue) · \($0.model.rawValue) · \($0.workspaceRoot.path)" }
             .joined(separator: "\n")
@@ -491,11 +743,17 @@ public actor Orchestrator {
         let id = AgentID(rawValue: name)
         guard registry.agent(id) != nil else { return "error: no agent named @\(name)" }
         if name == "main" { return "error: cannot remove @main" }
+        if id == Self.automaticPermissionReviewerID {
+            return "error: @\(Self.automaticPermissionReviewerID.rawValue) is controlled by /default"
+        }
         await detach(id)
         return "removed @\(name)"
     }
 
-    private func run(_ agent: Agent, input: String, images: [ImageAttachment] = [],
+    private func run(_ agent: Agent,
+                     input: String,
+                     images: [ImageAttachment] = [],
+                     userMessage: UserMessagePayload? = nil,
                      taskContract: TaskContract? = nil) async throws -> String {
         let provider = try await providerFor(agent)
         let messenger = BusMessenger(from: agent.name, currentTaskID: taskContract?.id, orchestrator: self)
@@ -521,7 +779,7 @@ public actor Orchestrator {
             provider: provider,
             registry: toolRegistry,
             engine: engine,
-            responder: responder,
+            responder: activePermissionResponder(),
             agent: agent,
             context: ContextBuilder(systemPrompt: systemPrompt,
                                     taskContract: taskContract,
@@ -533,12 +791,31 @@ public actor Orchestrator {
             includeUsage: includeUsage,
             maxIterations: maxSteps
         )
-        return try await loop.send(input, images: images)
+        return try await loop.send(input, images: images, userMessage: userMessage)
     }
 
     private static func normalizedAgentName(_ raw: String) -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.hasPrefix("@") ? String(trimmed.dropFirst()) : trimmed
+    }
+
+    private func reverseLeaseAgents<ID: Hashable>(_ leaseAgents: [ID: AgentID]) -> [AgentID: ID] {
+        var result: [AgentID: ID] = [:]
+        for (leaseID, agent) in leaseAgents where result[agent] == nil {
+            guard agent != Self.automaticPermissionReviewerID else { continue }
+            result[agent] = leaseID
+        }
+        return result
+    }
+
+    private func activePermissionResponder() -> PermissionResponder {
+        automaticPermissionResponder ?? responder
+    }
+
+    private func agentVisibleNames(excluding excluded: AgentID) -> [AgentID] {
+        registry.names.filter {
+            $0 != excluded && $0 != Self.automaticPermissionReviewerID
+        }
     }
 
     private func prepareDelegatedTask(issuer: AgentID,
@@ -548,7 +825,7 @@ public actor Orchestrator {
                                       expectedDeliverable: String? = nil,
                                       parentTaskID: TaskID? = nil) -> PreparedDelegatedTask {
         let trimmedObjective = objective.trimmingCharacters(in: .whitespacesAndNewlines)
-        let relatedAgents = registry.names.filter { $0 != assignee.name }
+        let relatedAgents = agentVisibleNames(excluding: assignee.name)
         let taskID = TaskID.new()
         let capabilityLease = CapabilityLease.worker(taskID: taskID)
         let workspaceLease = workspaceLeaseForTask(agent: assignee, access: .readOnly, store: false)
@@ -677,16 +954,28 @@ public actor Orchestrator {
             return true
         }
 
-        let result = (try? await run(agent, input: task.input, taskContract: task.contract)) ?? ""
-        scheduler.recordCompleted(task: task, result: result)
-        taskGraph.updateStatus(taskID: task.contract.id, status: .completed)
-        try? await log.append(.taskCompleted(TaskCompletedPayload(
-            taskID: task.contract.id,
-            agent: task.assignee,
-            result: result,
-            metadata: metadata)))
-        if let replyTarget = scheduledReplyTargets.removeValue(forKey: task.contract.id) {
-            _ = await bus.deliver(from: task.assignee, to: replyTarget, content: result)
+        do {
+            let result = try await run(agent, input: task.input, taskContract: task.contract)
+            scheduler.recordCompleted(task: task, result: result)
+            taskGraph.updateStatus(taskID: task.contract.id, status: .completed)
+            try? await log.append(.taskCompleted(TaskCompletedPayload(
+                taskID: task.contract.id,
+                agent: task.assignee,
+                result: result,
+                metadata: metadata)))
+            if let replyTarget = scheduledReplyTargets.removeValue(forKey: task.contract.id) {
+                _ = await bus.deliver(from: task.assignee, to: replyTarget, content: result)
+            }
+        } catch {
+            let message = error.localizedDescription
+            scheduledReplyTargets.removeValue(forKey: task.contract.id)
+            scheduler.recordFailed(task: task, error: message)
+            taskGraph.updateStatus(taskID: task.contract.id, status: .failed)
+            try? await log.append(.taskFailed(TaskFailedPayload(
+                taskID: task.contract.id,
+                agent: task.assignee,
+                error: message,
+                metadata: metadata)))
         }
         return true
     }

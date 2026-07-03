@@ -74,6 +74,8 @@ func renderLoop(_ log: EventLog, showAgentLabels: Bool = false, spinner: TurnSpi
             }
         case .permissionResolved(let p):
             out("  \(yellow)[\(p.decision.rawValue): \(p.tool) — \(p.reason)]\(reset)\n")
+        case .permissionReview(let p):
+            out("  \(yellow)[review \(p.decision.rawValue): \(p.tool) by \(p.reviewerModel) — \(p.reason)]\(reset)\n")
         case .patchProposed(let p):
             out("  \(magenta)± patch: \(p.files.joined(separator: ", "))\(reset)\n")
         case .agentToAgentMessage(let p):

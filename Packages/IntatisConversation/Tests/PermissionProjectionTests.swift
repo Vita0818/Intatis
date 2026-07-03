@@ -43,6 +43,29 @@ final class PermissionProjectionTests: XCTestCase {
         XCTAssertTrue(projection.pending.isEmpty)
     }
 
+    func testPermissionResolvedRetainsLatestNoticeWithStableID() {
+        let projection = PermissionProjection.build(from: [
+            env(0, .permissionRequest(request())),
+            env(1, .permissionResolved(.init(requestId: RequestID(rawValue: "req_1"),
+                                             tool: "write_file",
+                                             decision: .allow,
+                                             risk: .medium,
+                                             reason: "user approved")))
+        ])
+        let replayed = PermissionProjection.build(from: [
+            env(0, .permissionRequest(request())),
+            env(1, .permissionResolved(.init(requestId: RequestID(rawValue: "req_1"),
+                                             tool: "write_file",
+                                             decision: .allow,
+                                             risk: .medium,
+                                             reason: "user approved")))
+        ])
+
+        XCTAssertEqual(projection.latestResolved?.id, "permission:req_1:resolved")
+        XCTAssertEqual(projection.latestResolved?.decision, .allow)
+        XCTAssertEqual(projection.latestResolved, replayed.latestResolved)
+    }
+
     func testReplayAfterReloadPreservesPendingPermissionState() async throws {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("intatis-perm-\(UUID().uuidString)", isDirectory: true)

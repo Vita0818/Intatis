@@ -22,7 +22,11 @@ public struct ThreeColumnShell: View {
             ThreadView(model: model)
                 .navigationSplitViewColumnWidth(min: 360, ideal: 560)
         } detail: {
-            InspectorView(messages: model.messages, isStreaming: model.isStreaming, artifacts: model.artifacts)
+            InspectorView(messages: model.messages,
+                          isStreaming: model.isStreaming,
+                          isGeneratingArtifact: model.isGeneratingArtifact,
+                          artifacts: model.artifacts,
+                          artifactProgress: model.artifactProgress)
                 .navigationSplitViewColumnWidth(min: 240, ideal: 300)
         }
         .task { model.start() }
@@ -104,9 +108,14 @@ struct MessageRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(roleLabel)
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            HStack(spacing: 6) {
+                Text(roleLabel)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                ForEach(message.tags, id: \.self) { tag in
+                    tagBadge(tag)
+                }
+            }
             Text(displayText)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -132,6 +141,15 @@ struct MessageRow: View {
     private var background: Color {
         message.role == .user ? Color.accentColor.opacity(0.12) : Color.gray.opacity(0.10)
     }
+
+    private func tagBadge(_ tag: String) -> some View {
+        Text(tag.uppercased())
+            .font(.caption2.bold())
+            .foregroundStyle(Color.accentColor)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(Color.accentColor.opacity(0.14), in: Capsule())
+    }
 }
 
 struct ComposerView: View {
@@ -143,21 +161,26 @@ struct ComposerView: View {
                 .textFieldStyle(.plain)
                 .lineLimit(1...6)
                 .onSubmit { model.send() }
+                .disabled(model.isBusy)
             Button {
                 model.generateImage()
             } label: {
-                Image(systemName: "photo").font(.title3)
+                if model.isGeneratingArtifact {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Image(systemName: "photo").font(.title3)
+                }
             }
             .buttonStyle(.plain)
             .help("Generate image from prompt")
-            .disabled(model.isStreaming || model.input.trimmingCharacters(in: .whitespaces).isEmpty)
+            .disabled(model.isBusy || model.input.trimmingCharacters(in: .whitespaces).isEmpty)
             Button {
                 model.send()
             } label: {
                 Image(systemName: "arrow.up.circle.fill").font(.title2)
             }
             .buttonStyle(.plain)
-            .disabled(model.isStreaming || model.input.trimmingCharacters(in: .whitespaces).isEmpty)
+            .disabled(model.isBusy || model.input.trimmingCharacters(in: .whitespaces).isEmpty)
         }
         .padding(10)
     }
@@ -168,17 +191,21 @@ struct ComposerView: View {
 struct InspectorView: View {
     let messages: [ChatMessageView]
     let isStreaming: Bool
+    let isGeneratingArtifact: Bool
     let artifacts: [ArtifactCardInfo]
+    let artifactProgress: [ArtifactProgressSnapshot]
 
     var body: some View {
         List {
             Section("Status") {
                 LabeledContent("Messages", value: "\(messages.count)")
                 LabeledContent("Streaming", value: isStreaming ? "Yes" : "No")
+                LabeledContent("Image job", value: isGeneratingArtifact ? "Running" : "Idle")
+                LabeledContent("Artifact progress", value: artifactProgress.isEmpty ? "None" : "\(artifactProgress.count) active")
                 LabeledContent("Artifacts", value: "\(artifacts.count)")
             }
             Section("Artifacts") {
-                ArtifactInspector(artifacts: artifacts)
+                ArtifactInspector(artifacts: artifacts, progress: artifactProgress)
             }
         }
     }

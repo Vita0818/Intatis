@@ -6,6 +6,17 @@ import IntatisProtocol
 import IntatisProviders
 import IntatisConversation
 
+public enum ChatArtifactGenerationState: Equatable, Sendable {
+    case idle
+    case running
+    case failed(String)
+
+    public var isRunning: Bool {
+        if case .running = self { return true }
+        return false
+    }
+}
+
 /// Bridges the event log to SwiftUI. It subscribes to the log's event stream and
 /// folds it into `messages`; it never talks to a provider directly except
 /// through `ChatLoop`. This is the UI-side enforcement of "consume structured
@@ -14,22 +25,32 @@ import IntatisConversation
 public final class ChatViewModel: ObservableObject {
     @Published public private(set) var messages: [ChatMessageView] = []
     @Published public private(set) var artifacts: [ArtifactCardInfo] = []
+    @Published public private(set) var artifactProgress: [ArtifactProgressSnapshot] = []
     @Published public var input: String = ""
     @Published public private(set) var isStreaming = false
+    @Published public private(set) var imageGenerationState: ChatArtifactGenerationState = .idle
     @Published public var errorText: String?
 
     /// Wired by the app (v0.4): generate an image from a prompt. The resulting
     /// `artifact_added` event flows back through the log subscription.
-    public var onGenerateImage: ((String) -> Void)?
+    public var onGenerateImage: (@MainActor (String) async throws -> Void)?
 
     private let log: EventLog
-    private let registry: ProviderRegistry
+    private var registry: ProviderRegistry
     private var subscription: Task<Void, Never>?
 
     public init(log: EventLog, registry: ProviderRegistry) {
         self.log = log
         self.registry = registry
     }
+
+    public func updateProviderRegistry(_ registry: ProviderRegistry) {
+        self.registry = registry
+    }
+
+    public var isGeneratingArtifact: Bool { imageGenerationState.isRunning }
+
+    public var isBusy: Bool { isStreaming || isGeneratingArtifact }
 
     /// Begin folding the log into `messages`. Call once (e.g. from `.task`).
     public func start() {
@@ -38,9 +59,12 @@ public final class ChatViewModel: ObservableObject {
             guard let self else { return }
             let stream = await self.log.stream(from: 0)
             var projection = ConversationProjection()
+            var artifactProgressProjection = ArtifactProgressProjection()
             for await envelope in stream {
                 projection.apply(envelope)
+                artifactProgressProjection.apply(envelope)
                 self.messages = projection.messages
+                self.artifactProgress = artifactProgressProjection.active
                 if case .artifactAdded(let p) = envelope.event {
                     self.artifacts.append(ArtifactCardInfo(id: p.artifactId.rawValue, kind: p.kind,
                                                            mime: p.mime, path: p.path, prompt: p.prompt))
@@ -56,8 +80,18 @@ public final class ChatViewModel: ObservableObject {
 
     /// Send the composed message. Streaming output arrives via the log subscription.
     public func send() {
-        let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, !isStreaming else { return }
+        guard !isBusy else { return }
+        let originalInput = input
+        let parsed: ParsedUserInput
+        switch GoalInputParser.parse(originalInput) {
+        case .success(let value):
+            parsed = value
+        case .failure(.empty):
+            return
+        case .failure(let error):
+            errorText = error.message
+            return
+        }
         input = ""
         isStreaming = true
         errorText = nil
@@ -67,9 +101,12 @@ public final class ChatViewModel: ObservableObject {
                 let provider = try await self.registry.defaultChatProvider()
                 let model = await self.registry.chatModel()
                 let loop = ChatLoop(log: self.log, provider: provider, model: model)
-                try await loop.send(text)
+                try await loop.send(parsed.text, userMessage: parsed.userMessagePayload)
             } catch {
                 self.errorText = error.localizedDescription
+                if self.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    self.input = originalInput
+                }
             }
             self.isStreaming = false
         }
@@ -78,9 +115,30 @@ public final class ChatViewModel: ObservableObject {
     /// Generate an image from the current composer text (wired by the app).
     public func generateImage() {
         let prompt = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !prompt.isEmpty else { return }
+        guard !prompt.isEmpty, !isBusy else { return }
+        guard let onGenerateImage else {
+            let message = "Image generation is not available."
+            imageGenerationState = .failed(message)
+            errorText = message
+            return
+        }
         input = ""
-        onGenerateImage?(prompt)
+        errorText = nil
+        imageGenerationState = .running
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await onGenerateImage(prompt)
+                self.imageGenerationState = .idle
+            } catch {
+                let message = "Image generation failed: \(error.localizedDescription)"
+                self.errorText = message
+                self.imageGenerationState = .failed(message)
+                if self.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    self.input = prompt
+                }
+            }
+        }
     }
 }
 #endif

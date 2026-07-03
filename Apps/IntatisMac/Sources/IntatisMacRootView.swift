@@ -84,7 +84,7 @@ struct IntatisMacRootView: View {
             IntatisSettingsPanel()
         } else {
             switch selection {
-            case .chat:   IntatisChatScreen(model: env.viewModel)
+            case .chat:   IntatisChatScreen(env: env)
             case .code:   CodeContainer(env: env)
             case .cowork: CoworkContainer(env: env)
             }

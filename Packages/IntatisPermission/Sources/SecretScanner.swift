@@ -15,6 +15,8 @@ public enum SecretScanner {
     ]
     private static let sensitiveDirHints: [String] = [
         "/.ssh/", "/.aws/", "/.gnupg/", "/.gpg/", "secrets/", "/.config/gh/",
+        ".config/opencode/", ".config/intatis/",
+        ".local/share/opencode/", ".local/share/intatis/",
     ]
 
     /// A path that must never be read or written by a tool.

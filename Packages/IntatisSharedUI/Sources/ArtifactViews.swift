@@ -1,5 +1,6 @@
 #if canImport(SwiftUI)
 import SwiftUI
+import IntatisConversation
 #if canImport(AppKit)
 import AppKit
 #endif
@@ -28,14 +29,44 @@ public struct ArtifactCardInfo: Identifiable, Equatable, Sendable {
 /// for other kinds (ARCHITECTURE.md §3 inspector).
 public struct ArtifactInspector: View {
     private let artifacts: [ArtifactCardInfo]
-    public init(artifacts: [ArtifactCardInfo]) { self.artifacts = artifacts }
+    private let progress: [ArtifactProgressSnapshot]
+
+    public init(artifacts: [ArtifactCardInfo], progress: [ArtifactProgressSnapshot] = []) {
+        self.artifacts = artifacts
+        self.progress = progress
+    }
 
     public var body: some View {
-        if artifacts.isEmpty {
+        if artifacts.isEmpty && progress.isEmpty {
             Text("No artifacts yet").font(.caption).foregroundStyle(.secondary)
         } else {
+            ForEach(progress) { ArtifactProgressRow(progress: $0) }
             ForEach(artifacts) { ArtifactCardView(artifact: $0) }
         }
+    }
+}
+
+struct ArtifactProgressRow: View {
+    let progress: ArtifactProgressSnapshot
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(progress.state).font(.caption.bold())
+                Spacer(minLength: 6)
+                Text("\(Int(clampedProgress * 100))%")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            ProgressView(value: clampedProgress)
+        }
+        .padding(8)
+        .background(Color.gray.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var clampedProgress: Double {
+        min(max(progress.progress, 0), 1)
     }
 }
 

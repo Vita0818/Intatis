@@ -15,10 +15,18 @@ public struct UserMessagePayload: Codable, Equatable, Sendable {
     public var text: String
     public var attachments: [ArtifactID]?
     public var to: AgentID?
-    public init(text: String, attachments: [ArtifactID]? = nil, to: AgentID? = nil) {
+    public var tags: [String]?
+    public var goal: String?
+    public init(text: String,
+                attachments: [ArtifactID]? = nil,
+                to: AgentID? = nil,
+                tags: [String]? = nil,
+                goal: String? = nil) {
         self.text = text
         self.attachments = attachments
         self.to = to
+        self.tags = tags
+        self.goal = goal
     }
 }
 

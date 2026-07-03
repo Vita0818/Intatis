@@ -27,6 +27,21 @@ final class IntatisConversationCodeTests: XCTestCase {
         XCTAssertEqual(projection.items.first(where: { $0.kind == .patch })?.files, ["a.swift"])
     }
 
+    func testCodeProjectionKeepsGoalMetadataOnUserItems() {
+        let s = SessionID(rawValue: "goal_code")
+        let envelopes: [Envelope] = [
+            Envelope(seq: 0, ts: Date(timeIntervalSince1970: 0), session: s,
+                     event: .userMessage(.init(text: "ship v0.12", tags: ["Goal"], goal: "ship v0.12"))),
+        ]
+
+        let item = CodeProjection.build(from: envelopes).items.first
+
+        XCTAssertEqual(item?.kind, .user)
+        XCTAssertEqual(item?.body, "ship v0.12")
+        XCTAssertEqual(item?.tags ?? [], ["Goal"])
+        XCTAssertEqual(item?.goal, "ship v0.12")
+    }
+
     func testCodeProjectionUsesStableItemIDsAcrossReplay() {
         let s = SessionID(rawValue: "stable")
         func env(_ seq: Int, _ e: Event) -> Envelope {

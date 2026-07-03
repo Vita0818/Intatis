@@ -127,8 +127,7 @@ extension OpenAIWireProvider: ToolCallingProvider {
             root["stream_options"] = .object(["include_usage": .bool(true)])
         }
 
-        let url = endpoint.baseURL.appendingPathComponent("chat/completions")
-        var r = URLRequest(url: url)
+        var r = URLRequest(url: endpoint.chatCompletionsURL)
         r.httpMethod = "POST"
         r.setValue("application/json", forHTTPHeaderField: "Content-Type")
         r.setValue("text/event-stream", forHTTPHeaderField: "Accept")

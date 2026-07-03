@@ -453,7 +453,7 @@ public struct AgentToAgentMessagePayload: Codable, Equatable, Sendable {
     }
 }
 
-/// Audit record of an automatic permission decision (gate `pass` → reviewer).
+/// Audit record of an automatic permission decision or mediated agent exchange.
 public struct PermissionReviewPayload: Codable, Equatable, Sendable {
     public var agent: AgentID?
     public var tool: String

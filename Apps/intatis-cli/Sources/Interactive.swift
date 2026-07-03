@@ -211,6 +211,8 @@ private let coworkHelp = """
   /agent add <name> <path> [model]   manually attach an agent (optional model)
   /agent remove <name>               detach an agent
   /agents                            list attached agents
+  /auto                              enable automatic permission review
+  /default                           disable automatic permission review
   /model [name]                      default model for newly added agents
   /verbose [on|off]                  expand tool calls & terminal output
   /attach <path>                     queue an image/text file for the next message
@@ -299,6 +301,23 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
                 let list = await orchestrator.agentList()
                 if list.isEmpty { out("(no agents attached)\n") }
                 else { for a in list { out("  @\(a.name.rawValue)  \(S.dim)\(a.model.rawValue) · \(a.workspaceRoot.path)\(S.reset)\n") } }
+            case "auto":
+                let result = await orchestrator.enableAutomaticPermissionReview(
+                    model: ModelID(rawValue: defaultModel),
+                    workspaceRoot: workspace)
+                switch result {
+                case .enabled(let id):
+                    out("automatic permission review → on (@\(id.rawValue), model \(defaultModel))\n")
+                case .alreadyEnabled(let id):
+                    out("automatic permission review already on (@\(id.rawValue))\n")
+                case .failed(let message):
+                    out("automatic permission review not enabled: \(message)\n")
+                }
+            case "default":
+                let disabled = await orchestrator.disableAutomaticPermissionReview()
+                out(disabled
+                    ? "automatic permission review → off\n"
+                    : "automatic permission review already off\n")
             case "attach":
                 if parts.count < 2 || parts[1] == "list" {
                     out(pending.isEmpty ? "no attachments queued. usage: /attach <path>\n" : "\(pending.count) queued\n")

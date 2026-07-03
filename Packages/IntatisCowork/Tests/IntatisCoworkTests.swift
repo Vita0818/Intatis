@@ -55,6 +55,20 @@ private final class CapturingProvider: ToolCallingProvider, @unchecked Sendable 
     }
 }
 
+private enum ProviderFailure: LocalizedError {
+    case unavailable
+
+    var errorDescription: String? { "provider unavailable" }
+}
+
+private struct ThrowingProvider: ToolCallingProvider {
+    func stream(_ request: AgentRequest) -> AsyncThrowingStream<AgentChunk, Error> {
+        AsyncThrowingStream { continuation in
+            continuation.finish(throwing: ProviderFailure.unavailable)
+        }
+    }
+}
+
 private func tempLog() throws -> EventLog {
     let url = FileManager.default.temporaryDirectory
         .appendingPathComponent("intatis-cowork-\(UUID().uuidString)", isDirectory: true)
@@ -143,6 +157,98 @@ final class IntatisCoworkTests: XCTestCase {
     }
 
     // MARK: Orchestrator
+
+    func testExplicitMissingSendTargetDoesNotFallbackToFirstAgent() async throws {
+        let log = try tempLog()
+        let wsA = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: wsA) }
+        let provider = CapturingProvider([.textDelta("should not run"), .done(finishReason: "stop")])
+        let orch = Orchestrator(log: log, allowsShell: true, responder: FixedResponder(.allow)) { _ in provider }
+
+        await orch.attach(Agent(name: A, workspaceRoot: wsA, model: ModelID(rawValue: "m"), profile: .reviewed))
+        await orch.send("do not fallback", to: AgentID(rawValue: "Ghost"))
+
+        XCTAssertTrue(provider.requests.isEmpty)
+        let errors = await log.replay().compactMap { envelope -> ErrorPayload? in
+            if case .error(let payload) = envelope.event { return payload }
+            return nil
+        }
+        XCTAssertEqual(errors.last?.code, "no_such_agent")
+    }
+
+    func testSendReturnsFailureWhenAgentRunFails() async throws {
+        let log = try tempLog()
+        let wsA = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: wsA) }
+        let orch = Orchestrator(log: log, allowsShell: true, responder: FixedResponder(.allow)) { _ in
+            ThrowingProvider()
+        }
+
+        await orch.attach(Agent(name: A, workspaceRoot: wsA, model: ModelID(rawValue: "m"), profile: .reviewed))
+        let result = await orch.send("fail visibly", to: A)
+
+        XCTAssertEqual(result, .failed("provider unavailable"))
+        let errors = await log.replay().compactMap { envelope -> ErrorPayload? in
+            if case .error(let payload) = envelope.event { return payload }
+            return nil
+        }
+        XCTAssertEqual(errors.last?.message, "provider unavailable")
+    }
+
+    func testSendRecordsGoalPayloadForTargetedCoworkMessage() async throws {
+        let log = try tempLog()
+        let wsA = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: wsA) }
+        let provider = CapturingProvider([.textDelta("ok"), .done(finishReason: "stop")])
+        let orch = Orchestrator(log: log, allowsShell: true, responder: FixedResponder(.allow)) { _ in provider }
+        await orch.attach(Agent(name: A, workspaceRoot: wsA, model: ModelID(rawValue: "m"), profile: .reviewed))
+
+        let result = await orch.send(
+            "ship v0.12",
+            to: A,
+            userMessage: UserMessagePayload(text: "ship v0.12", to: A, tags: ["Goal"], goal: "ship v0.12"))
+
+        XCTAssertEqual(result, .sent)
+        let payloads = await log.replay().compactMap { envelope -> UserMessagePayload? in
+            if case .userMessage(let payload) = envelope.event { return payload }
+            return nil
+        }
+        XCTAssertEqual(payloads.last?.text, "ship v0.12")
+        XCTAssertEqual(payloads.last?.to, A)
+        XCTAssertEqual(payloads.last?.tags ?? [], ["Goal"])
+        XCTAssertEqual(payloads.last?.goal, "ship v0.12")
+        let userMessages = provider.requests.last?.messages.filter { $0.role == .user }.compactMap(\.content)
+        XCTAssertEqual(userMessages?.last, "ship v0.12")
+    }
+
+    func testRetryFailedTaskRequeuesExistingContract() async throws {
+        let log = try tempLog()
+        let wsA = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: wsA) }
+        let provider = CapturingProvider([.textDelta("retried"), .done(finishReason: "stop")])
+        let orch = Orchestrator(log: log, allowsShell: true, responder: FixedResponder(.allow)) { _ in provider }
+        await orch.attach(Agent(name: A, workspaceRoot: wsA, model: ModelID(rawValue: "m"), profile: .reviewed))
+        let contract = TaskContract(
+            id: TaskID(rawValue: "task_retry"),
+            issuer: nil,
+            assignee: A,
+            objective: "Retry the failed task.",
+            roleHint: "retry worker",
+            expectedDeliverable: "retried")
+        let failed = CoworkTaskView(
+            id: contract.id,
+            contract: contract,
+            status: .failed,
+            assignee: A,
+            error: "provider failed")
+
+        let result = await orch.retry(failed)
+
+        XCTAssertEqual(result, .sent)
+        let projection = CoworkProjection.build(from: await log.replay())
+        XCTAssertEqual(projection.tasks[contract.id]?.status, .completed)
+        XCTAssertEqual(projection.tasks[contract.id]?.result, "retried")
+    }
 
     func testAgentToAgentFlowIsMediatedAndLogged() async throws {
         let log = try tempLog()

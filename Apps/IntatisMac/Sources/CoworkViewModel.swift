@@ -22,6 +22,7 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
     @Published var input: String = ""
     @Published private(set) var isWorking = false
     @Published var pendingPermission: PendingPermission?
+    @Published private(set) var permissionNotice: PermissionResolutionNotice?
     @Published private(set) var composerError: String?
     @Published private(set) var projectionError: String?
     @Published private(set) var addAgentStatus: CoworkAddAgentStatus = .idle
@@ -31,6 +32,7 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
     private var orchestrator: Orchestrator?
     private var subscription: Task<Void, Never>?
     private var permissionContinuation: CheckedContinuation<PermissionDecision, Never>?
+    private var retryableTasks: [String: CoworkTaskView] = [:]
 
     init(log: EventLog, registry: ProviderRegistry) {
         self.log = log
@@ -49,8 +51,11 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             var codeProjection = CodeProjection.build(from: replayed)
             var coworkProjection = CoworkProjection.build(from: replayed)
             var permissions = PermissionProjection.build(from: replayed, markNeedsRerun: true)
+            self.restoreWorkspaceAccess(for: coworkProjection)
+            await self.orchestrator?.restore(from: coworkProjection)
             self.items = codeProjection.items
             self.pendingPermission = permissions.latest
+            self.permissionNotice = permissions.latestResolved
             self.applyCoworkProjection(coworkProjection)
             let stream = await self.log.stream(from: (replayed.last?.seq ?? -1) + 1)
             for await envelope in stream {
@@ -59,6 +64,7 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                 permissions.apply(envelope)
                 self.items = codeProjection.items
                 self.pendingPermission = permissions.latest
+                self.permissionNotice = permissions.latestResolved
                 self.applyCoworkProjection(coworkProjection)
             }
         }
@@ -97,6 +103,7 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             runningTasks: projection.runningTasks.map(taskLine),
             failedTasks: projection.failedTasks.map(taskLine),
             recentCompletedTasks: Array(projection.completedTasks.suffix(3)).map(taskLine))
+        retryableTasks = Dictionary(uniqueKeysWithValues: projection.failedTasks.map { ($0.id.rawValue, $0) })
         projectionError = nil
     }
 
@@ -125,6 +132,12 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         let title = task.contract.map { "\(assignee) · \($0.roleHint)" } ?? assignee
         let detail = task.error ?? task.result ?? task.contract?.objective ?? ""
         return CoworkTaskLine(id: task.id.rawValue, title: title, detail: detail, status: task.status.rawValue)
+    }
+
+    private func restoreWorkspaceAccess(for projection: CoworkProjection) {
+        for payload in projection.agentRoster.values {
+            WorkspaceAccess.restoreAccess(forPath: payload.path)
+        }
     }
 
     @discardableResult
@@ -182,22 +195,76 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
 
     func send() {
         guard !isWorking, let orchestrator else { return }
+        let originalInput = input
+        let initialParsed: ParsedUserInput
+        switch GoalInputParser.parse(originalInput) {
+        case .success(let value):
+            initialParsed = value
+        case .failure(.empty):
+            composerError = CoworkMentionRouteError.emptyMessage.message
+            return
+        case .failure(let error):
+            composerError = error.message
+            return
+        }
+        let routeInput = initialParsed.isGoal ? initialParsed.text : originalInput
         let route = CoworkMentionRouter.route(
-            input: input,
+            input: routeInput,
             attachedAgents: agents.map { AgentID(rawValue: $0.name) })
         switch route.outcome {
         case .blocked(let error):
             composerError = error.message
             return
         case .send(let text, let target):
+            let finalParsed: ParsedUserInput
+            switch GoalInputParser.parse(text) {
+            case .success(let parsed) where parsed.isGoal:
+                finalParsed = parsed
+            case .failure(.missingGoal):
+                composerError = GoalInputParseError.missingGoal.message
+                return
+            default:
+                finalParsed = initialParsed.isGoal
+                    ? ParsedUserInput(text: text, goal: text, tags: [ParsedUserInput.goalTag])
+                    : ParsedUserInput(text: text)
+            }
+            let payload = UserMessagePayload(
+                text: finalParsed.text,
+                to: target,
+                tags: finalParsed.tags.isEmpty ? nil : finalParsed.tags,
+                goal: finalParsed.goal)
             input = ""
             composerError = nil
             isWorking = true
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                await orchestrator.send(text, to: target)
+                let result = await orchestrator.send(finalParsed.text, to: target, userMessage: payload)
+                if let message = result.errorMessage {
+                    self.composerError = message
+                    if self.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        self.input = originalInput
+                    }
+                }
                 self.isWorking = false
             }
+        }
+    }
+
+    func retryFailedTask(id: String) {
+        guard !isWorking, let orchestrator else { return }
+        guard let task = retryableTasks[id] else {
+            composerError = "This failed task is no longer retryable."
+            return
+        }
+        composerError = nil
+        isWorking = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let result = await orchestrator.retry(task)
+            if let message = result.errorMessage {
+                self.composerError = message
+            }
+            self.isWorking = false
         }
     }
 

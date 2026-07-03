@@ -84,8 +84,7 @@ public struct OpenAIWireProvider: ChatProvider {
     }
 
     func buildRequest(_ request: ChatRequest) throws -> URLRequest {
-        let url = endpoint.baseURL.appendingPathComponent("chat/completions")
-        var r = URLRequest(url: url)
+        var r = URLRequest(url: endpoint.chatCompletionsURL)
         r.httpMethod = "POST"
         r.setValue("application/json", forHTTPHeaderField: "Content-Type")
         r.setValue("text/event-stream", forHTTPHeaderField: "Accept")

@@ -10,26 +10,32 @@ import IntatisConversation
 public struct CodeShell: View {
     private let items: [CodeItem]
     private let pending: PendingPermission?
+    private let permissionNotice: PermissionResolutionNotice?
     private let isWorking: Bool
     private let workspaceName: String
     private let agentState: String
+    private let composerError: String?
     @Binding private var input: String
     private let onSend: () -> Void
     private let onResolve: (PermissionDecision) -> Void
 
     public init(items: [CodeItem],
                 pending: PendingPermission?,
+                permissionNotice: PermissionResolutionNotice? = nil,
                 isWorking: Bool,
                 workspaceName: String,
                 agentState: String,
+                composerError: String? = nil,
                 input: Binding<String>,
                 onSend: @escaping () -> Void,
                 onResolve: @escaping (PermissionDecision) -> Void) {
         self.items = items
         self.pending = pending
+        self.permissionNotice = permissionNotice
         self.isWorking = isWorking
         self.workspaceName = workspaceName
         self.agentState = agentState
+        self.composerError = composerError
         self._input = input
         self.onSend = onSend
         self.onResolve = onResolve
@@ -67,8 +73,18 @@ public struct CodeShell: View {
             }
             if let pending {
                 PermissionCard(permission: pending, onResolve: onResolve)
+            } else if let permissionNotice {
+                PermissionResolutionNoticeView(notice: permissionNotice)
             }
             Divider()
+            if let composerError {
+                Text(composerError)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 10)
+                    .padding(.top, 6)
+            }
             HStack(alignment: .bottom, spacing: 8) {
                 TextField("Ask the agent to read or edit files…", text: $input, axis: .vertical)
                     .textFieldStyle(.plain)
@@ -90,7 +106,7 @@ struct CodeItemRow: View {
     var body: some View {
         switch item.kind {
         case .user:
-            bubble(title: "You", body: item.body, tint: Color.accentColor.opacity(0.12), mono: false)
+            bubble(title: "You", body: item.body, tint: Color.accentColor.opacity(0.12), mono: false, tags: item.tags)
         case .agent:
             bubble(title: item.title, body: item.body.isEmpty && !item.complete ? "…" : item.body,
                    tint: Color.gray.opacity(0.10), mono: false)
@@ -110,9 +126,14 @@ struct CodeItemRow: View {
         }
     }
 
-    private func bubble(title: String, body: String, tint: Color, mono: Bool) -> some View {
+    private func bubble(title: String, body: String, tint: Color, mono: Bool, tags: [String] = []) -> some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(title).font(.caption).foregroundStyle(.secondary)
+            HStack(spacing: 6) {
+                Text(title).font(.caption).foregroundStyle(.secondary)
+                ForEach(tags, id: \.self) { tag in
+                    tagBadge(tag)
+                }
+            }
             Text(body).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(10).background(tint).clipShape(RoundedRectangle(cornerRadius: 10))
@@ -128,6 +149,44 @@ struct CodeItemRow: View {
         .background(tint.opacity(0.08))
         .overlay(RoundedRectangle(cornerRadius: 8).stroke(tint.opacity(0.25)))
         .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private func tagBadge(_ tag: String) -> some View {
+        Text(tag.uppercased())
+            .font(.caption2.bold())
+            .foregroundStyle(Color.accentColor)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(Color.accentColor.opacity(0.14), in: Capsule())
+    }
+}
+
+public struct PermissionResolutionNoticeView: View {
+    let notice: PermissionResolutionNotice
+
+    public init(notice: PermissionResolutionNotice) {
+        self.notice = notice
+    }
+
+    public var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: notice.decision == .allow ? "checkmark.circle.fill" : "xmark.circle.fill")
+                .foregroundStyle(notice.decision == .allow ? .green : .orange)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("\(notice.tool) \(notice.decision == .allow ? "approved" : "rejected")")
+                    .font(.caption.bold())
+                Text(notice.reason)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(10)
+        .background(Color.gray.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .padding(.horizontal)
+        .padding(.vertical, 4)
     }
 }
 

@@ -20,12 +20,14 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
     @Published private(set) var isWorking = false
     @Published private(set) var agentState: String = "idle"
     @Published var pendingPermission: PendingPermission?
+    @Published private(set) var permissionNotice: PermissionResolutionNotice?
+    @Published private(set) var composerError: String?
 
     let workspaceName: String
 
     private let workspaceRoot: URL
     private let log: EventLog
-    private let registry: ProviderRegistry
+    private var registry: ProviderRegistry
     private var subscription: Task<Void, Never>?
     private var permissionContinuation: CheckedContinuation<PermissionDecision, Never>?
 
@@ -33,6 +35,10 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
         self.workspaceRoot = workspaceRoot
         self.workspaceName = workspaceRoot.lastPathComponent
         self.log = log
+        self.registry = registry
+    }
+
+    func updateProviderRegistry(_ registry: ProviderRegistry) {
         self.registry = registry
     }
 
@@ -45,22 +51,35 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
             var permissions = PermissionProjection.build(from: replayed, markNeedsRerun: true)
             self.items = projection.items
             self.pendingPermission = permissions.latest
+            self.permissionNotice = permissions.latestResolved
             let stream = await self.log.stream(from: (replayed.last?.seq ?? -1) + 1)
             for await envelope in stream {
                 projection.apply(envelope)
                 permissions.apply(envelope)
                 self.items = projection.items
                 self.pendingPermission = permissions.latest
+                self.permissionNotice = permissions.latestResolved
                 if case .agentStatus(let p) = envelope.event { self.agentState = p.state.rawValue }
             }
         }
     }
 
     func send() {
-        let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, !isWorking else { return }
+        guard !isWorking else { return }
+        let originalInput = input
+        let parsed: ParsedUserInput
+        switch GoalInputParser.parse(originalInput) {
+        case .success(let value):
+            parsed = value
+        case .failure(.empty):
+            return
+        case .failure(let error):
+            composerError = error.message
+            return
+        }
         input = ""
         isWorking = true
+        composerError = nil
         Task { @MainActor [weak self] in
             guard let self else { return }
             do {
@@ -79,9 +98,14 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
                     agent: agent,
                     allowsShell: PlatformProfile.current.allowsShell
                 )
-                try await loop.send(text)
+                try await loop.send(parsed.text, userMessage: parsed.userMessagePayload)
             } catch {
-                try? await self.log.append(.error(ErrorPayload(code: "agent", message: error.localizedDescription)))
+                let message = error.localizedDescription
+                self.composerError = message
+                if self.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    self.input = originalInput
+                }
+                try? await self.log.append(.error(ErrorPayload(code: "agent", message: message)))
             }
             self.isWorking = false
         }

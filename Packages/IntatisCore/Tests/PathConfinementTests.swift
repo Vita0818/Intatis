@@ -61,6 +61,15 @@ final class PathConfinementTests: XCTestCase {
         XCTAssertThrowsError(try PathConfinement.resolve("~/.ssh/id_rsa", within: root))
     }
 
+    func testAgentConfigSecretPathsDenied() throws {
+        let root = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        XCTAssertThrowsError(try PathConfinement.resolve("~/.config/opencode/opencode.json", within: root))
+        XCTAssertThrowsError(try PathConfinement.resolve("~/.config/intatis/config.json", within: root))
+        XCTAssertThrowsError(try PathConfinement.resolve("~/.local/share/opencode/auth.json", within: root))
+    }
+
     func testNonExistingChildUnderWorkspaceAllowedWhenParentConfined() throws {
         let root = try tempWorkspace()
         defer { try? FileManager.default.removeItem(at: root) }

@@ -30,9 +30,11 @@ public struct ChatLoop: Sendable {
     }
 
     /// Send one user message and stream the assistant reply into the log.
-    public func send(_ userText: String, images: [ImageAttachment] = []) async throws {
+    public func send(_ userText: String,
+                     images: [ImageAttachment] = [],
+                     userMessage: UserMessagePayload? = nil) async throws {
         let history = await buildHistory()
-        try await log.append(.userMessage(UserMessagePayload(text: userText)))
+        try await log.append(.userMessage(userMessage ?? UserMessagePayload(text: userText)))
 
         var messages: [ChatMessage] = []
         if let systemPrompt { messages.append(ChatMessage(role: .system, content: systemPrompt)) }

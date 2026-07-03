@@ -102,6 +102,7 @@ public struct CoworkShell: View {
     private let items: [CodeItem]
     private let agents: [CoworkAgentInfo]
     private let pending: PendingPermission?
+    private let permissionNotice: PermissionResolutionNotice?
     private let summary: CoworkStatusSummary
     private let composerError: String?
     private let isWorking: Bool
@@ -109,20 +110,25 @@ public struct CoworkShell: View {
     private let onSend: () -> Void
     private let onResolve: (PermissionDecision) -> Void
     private let onAddAgent: () -> Void
+    private let onRetryTask: ((String) -> Void)?
+    @State private var selectedAgentID: String?
 
     public init(items: [CodeItem],
                 agents: [CoworkAgentInfo],
                 pending: PendingPermission?,
+                permissionNotice: PermissionResolutionNotice? = nil,
                 summary: CoworkStatusSummary,
                 composerError: String?,
                 isWorking: Bool,
                 input: Binding<String>,
                 onSend: @escaping () -> Void,
                 onResolve: @escaping (PermissionDecision) -> Void,
-                onAddAgent: @escaping () -> Void) {
+                onAddAgent: @escaping () -> Void,
+                onRetryTask: ((String) -> Void)? = nil) {
         self.items = items
         self.agents = agents
         self.pending = pending
+        self.permissionNotice = permissionNotice
         self.summary = summary
         self.composerError = composerError
         self.isWorking = isWorking
@@ -130,6 +136,7 @@ public struct CoworkShell: View {
         self.onSend = onSend
         self.onResolve = onResolve
         self.onAddAgent = onAddAgent
+        self.onRetryTask = onRetryTask
     }
 
     private var permissionBlocksComposer: Bool {
@@ -142,11 +149,24 @@ public struct CoworkShell: View {
             List {
                 Section("Agents") {
                     ForEach(agents) { agent in
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("@\(agent.name)").font(.callout.bold())
-                            Text("\(agent.status) · \(agent.workspace)")
-                                .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        Button {
+                            selectedAgentID = agent.id
+                        } label: {
+                            HStack(spacing: 8) {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("@\(agent.name)").font(.callout.bold())
+                                    Text("\(agent.status) · \(agent.workspace)")
+                                        .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                                }
+                                Spacer(minLength: 6)
+                                if selectedAgentID == agent.id {
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
                         }
+                        .buttonStyle(.plain)
                     }
                 }
                 Button(action: onAddAgent) { Label("Add Agent…", systemImage: "plus") }
@@ -166,6 +186,30 @@ public struct CoworkShell: View {
                             Text("Mailbox \(agent.pendingMessages + agent.pendingTasks) pending · \(agent.completedTasks) completed")
                                 .font(.caption).foregroundStyle(.secondary)
                         }
+                    }
+                }
+                Section("Agent Detail") {
+                    if let agent = selectedAgent {
+                        LabeledContent("Name", value: "@\(agent.name)")
+                        LabeledContent("Status", value: agent.status)
+                        LabeledContent("Model", value: agent.model)
+                        LabeledContent("Profile", value: agent.profile)
+                        Text(agent.workspace)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                        LabeledContent("Pending messages", value: "\(agent.pendingMessages)")
+                        LabeledContent("Pending tasks", value: "\(agent.pendingTasks)")
+                        LabeledContent("Completed tasks", value: "\(agent.completedTasks)")
+                        if let workspaceLease = agent.workspaceLease {
+                            LabeledContent("Workspace lease", value: workspaceLease)
+                        }
+                        if let capabilityLease = agent.capabilityLease {
+                            LabeledContent("Capability lease", value: capabilityLease)
+                        }
+                    } else {
+                        Text(agents.isEmpty ? "No agent selected" : "Select an agent for details")
+                            .font(.caption).foregroundStyle(.secondary)
                     }
                 }
                 Section("Tasks") {
@@ -191,7 +235,13 @@ public struct CoworkShell: View {
                     if summary.failedTasks.isEmpty {
                         Text("No failed tasks").font(.caption).foregroundStyle(.secondary)
                     } else {
-                        ForEach(summary.failedTasks) { task in CoworkTaskLineRow(task: task) }
+                        ForEach(summary.failedTasks) { task in
+                            CoworkTaskLineRow(
+                                task: task,
+                                actionTitle: onRetryTask == nil ? nil : "Retry",
+                                actionDisabled: isWorking,
+                                action: onRetryTask.map { retry in { retry(task.id) } })
+                        }
                     }
                 }
                 if !summary.recentCompletedTasks.isEmpty {
@@ -207,6 +257,18 @@ public struct CoworkShell: View {
             }
             .navigationSplitViewColumnWidth(min: 240, ideal: 300)
         }
+        .onChange(of: agents) { newAgents in
+            if let selectedAgentID,
+               newAgents.contains(where: { $0.id == selectedAgentID }) {
+                return
+            }
+            selectedAgentID = newAgents.first?.id
+        }
+    }
+
+    private var selectedAgent: CoworkAgentInfo? {
+        guard let selectedAgentID else { return nil }
+        return agents.first { $0.id == selectedAgentID }
     }
 
     private var thread: some View {
@@ -224,6 +286,8 @@ public struct CoworkShell: View {
             }
             if let pending {
                 PermissionCard(permission: pending, onResolve: onResolve)
+            } else if let permissionNotice {
+                PermissionResolutionNoticeView(notice: permissionNotice)
             }
             Divider()
             if let composerError {
@@ -252,12 +316,30 @@ public struct CoworkShell: View {
 
 private struct CoworkTaskLineRow: View {
     let task: CoworkTaskLine
+    let actionTitle: String?
+    let actionDisabled: Bool
+    let action: (() -> Void)?
+
+    init(task: CoworkTaskLine,
+         actionTitle: String? = nil,
+         actionDisabled: Bool = false,
+         action: (() -> Void)? = nil) {
+        self.task = task
+        self.actionTitle = actionTitle
+        self.actionDisabled = actionDisabled
+        self.action = action
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack {
                 Text(task.title).lineLimit(1)
                 Spacer(minLength: 6)
+                if let actionTitle, let action {
+                    Button(actionTitle, action: action)
+                        .buttonStyle(.borderless)
+                        .disabled(actionDisabled)
+                }
                 Text(task.status).font(.caption).foregroundStyle(.secondary)
             }
             if !task.detail.isEmpty {

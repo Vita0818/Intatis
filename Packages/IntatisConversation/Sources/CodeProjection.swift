@@ -14,15 +14,67 @@ public struct CodeItem: Identifiable, Equatable, Sendable {
     public var body: String
     public var complete: Bool
     public var files: [String]
+    public var tags: [String]
+    public var goal: String?
 
     public init(id: String, kind: Kind, title: String, body: String,
-                complete: Bool = true, files: [String] = []) {
+                complete: Bool = true,
+                files: [String] = [],
+                tags: [String] = [],
+                goal: String? = nil) {
         self.id = id
         self.kind = kind
         self.title = title
         self.body = body
         self.complete = complete
         self.files = files
+        self.tags = tags
+        self.goal = goal
+    }
+}
+
+public struct ArtifactProgressSnapshot: Identifiable, Equatable, Sendable {
+    public var id: ArtifactID
+    public var progress: Double
+    public var state: String
+    public var seq: Int
+
+    public init(id: ArtifactID, progress: Double, state: String, seq: Int) {
+        self.id = id
+        self.progress = progress
+        self.state = state
+        self.seq = seq
+    }
+}
+
+public struct ArtifactProgressProjection: Equatable, Sendable {
+    public private(set) var progressByID: [ArtifactID: ArtifactProgressSnapshot] = [:]
+
+    public init() {}
+
+    public mutating func apply(_ envelope: Envelope) {
+        switch envelope.event {
+        case .artifactProgress(let payload):
+            progressByID[payload.artifactId] = ArtifactProgressSnapshot(
+                id: payload.artifactId,
+                progress: payload.progress,
+                state: payload.state,
+                seq: envelope.seq)
+        case .artifactAdded(let payload):
+            progressByID.removeValue(forKey: payload.artifactId)
+        default:
+            break
+        }
+    }
+
+    public var active: [ArtifactProgressSnapshot] {
+        progressByID.values.sorted { $0.seq < $1.seq }
+    }
+
+    public static func build(from envelopes: [Envelope]) -> ArtifactProgressProjection {
+        var p = ArtifactProgressProjection()
+        for e in envelopes { p.apply(e) }
+        return p
     }
 }
 
@@ -37,7 +89,12 @@ public struct CodeProjection: Equatable, Sendable {
     public mutating func apply(_ envelope: Envelope) {
         switch envelope.event {
         case .userMessage(let p):
-            items.append(CodeItem(id: stableID(envelope, "user"), kind: .user, title: "You", body: p.text))
+            items.append(CodeItem(id: stableID(envelope, "user"),
+                                  kind: .user,
+                                  title: "You",
+                                  body: p.text,
+                                  tags: p.tags ?? [],
+                                  goal: p.goal))
 
         case .messageDelta(let p):
             if let i = agentIndex(p.messageId.rawValue) {
@@ -232,11 +289,38 @@ public struct PendingPermission: Identifiable, Equatable, Sendable {
     }
 }
 
+public struct PermissionResolutionNotice: Identifiable, Equatable, Sendable {
+    public var id: String
+    public var requestId: RequestID?
+    public var tool: String
+    public var decision: PermissionDecision
+    public var risk: RiskLevel
+    public var reason: String
+    public var resolvedSeq: Int
+
+    public init(id: String,
+                requestId: RequestID?,
+                tool: String,
+                decision: PermissionDecision,
+                risk: RiskLevel,
+                reason: String,
+                resolvedSeq: Int) {
+        self.id = id
+        self.requestId = requestId
+        self.tool = tool
+        self.decision = decision
+        self.risk = risk
+        self.reason = reason
+        self.resolvedSeq = resolvedSeq
+    }
+}
+
 /// Folds permission request/resolution events into recoverable pending state.
 /// A replayed pending request may no longer have a live async tool continuation;
 /// callers can mark it `needs_rerun` while still showing it in the UI.
 public struct PermissionProjection: Equatable, Sendable {
     public private(set) var pending: [PendingPermission] = []
+    public private(set) var resolved: [PermissionResolutionNotice] = []
 
     public init() {}
 
@@ -245,8 +329,17 @@ public struct PermissionProjection: Equatable, Sendable {
         case .permissionRequest(let request):
             upsert(PendingPermission(request: request, requestedSeq: envelope.seq))
         case .permissionResolved(let resolved):
-            guard let requestID = resolved.requestId else { return }
-            pending.removeAll { $0.request.requestId == requestID }
+            if let requestID = resolved.requestId {
+                pending.removeAll { $0.request.requestId == requestID }
+            }
+            self.resolved.append(PermissionResolutionNotice(
+                id: stableResolvedID(envelope, requestID: resolved.requestId),
+                requestId: resolved.requestId,
+                tool: resolved.tool,
+                decision: resolved.decision,
+                risk: resolved.risk,
+                reason: resolved.reason,
+                resolvedSeq: envelope.seq))
         default:
             break
         }
@@ -264,6 +357,10 @@ public struct PermissionProjection: Equatable, Sendable {
         pending.sorted { $0.requestedSeq < $1.requestedSeq }.last
     }
 
+    public var latestResolved: PermissionResolutionNotice? {
+        resolved.sorted { $0.resolvedSeq < $1.resolvedSeq }.last
+    }
+
     public static func build(from envelopes: [Envelope], markNeedsRerun: Bool = false) -> PermissionProjection {
         var p = PermissionProjection()
         for e in envelopes { p.apply(e) }
@@ -274,5 +371,12 @@ public struct PermissionProjection: Equatable, Sendable {
     private mutating func upsert(_ item: PendingPermission) {
         pending.removeAll { $0.request.requestId == item.request.requestId }
         pending.append(item)
+    }
+
+    private func stableResolvedID(_ envelope: Envelope, requestID: RequestID?) -> String {
+        if let requestID {
+            return "permission:\(requestID.rawValue):resolved"
+        }
+        return "\(envelope.session.rawValue):\(envelope.seq):permission_resolved"
     }
 }
