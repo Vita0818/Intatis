@@ -17,56 +17,77 @@ import IntatisSharedUI
 final class IOSAppEnvironment: ObservableObject {
     @Published private(set) var registry: ProviderRegistry
     @Published private(set) var providerCatalog: IOSProviderCatalog
-    let log: EventLog
-    let viewModel: ChatViewModel
-    let multimodal: MultimodalService
+    @Published private(set) var chatSessionID: SessionID
+    @Published private(set) var viewModel: ChatViewModel
+    @Published private(set) var chatSessionError: String?
+    private(set) var log: EventLog
+    private(set) var multimodal: MultimodalService
     @Published var needsAPIKey: Bool
 
-    private let keychain: KeychainStore
-    private let secrets: KeychainSecretResolver
+    private let secrets: ConfigSecretResolver
 
     init() {
         PlatformProfile.current = .iOS   // chat-only, no workspace, no shell
 
-        self.keychain = KeychainStore(service: IOSConfig.keychainService)
-        self.secrets = KeychainSecretResolver()
+        self.secrets = ConfigSecretResolver()
         self.providerCatalog = IOSConfig.providerCatalog
         let initialRegistry = Self.makeProviderRegistry(resolver: secrets)
         self.registry = initialRegistry
+        let initialSession = IOSConfig.recentSessions().first?.id ?? IOSConfig.defaultSession
+        self.chatSessionID = initialSession
         do {
-            self.log = try EventLog(session: IOSConfig.defaultSession, fileURL: IOSConfig.sessionFile())
+            self.log = try EventLog(session: initialSession, fileURL: IOSConfig.sessionFile(initialSession))
         } catch {
             fatalError("Failed to open event log: \(error)")
         }
         let store: ArtifactStore
         do {
-            store = try ArtifactStore(root: IOSConfig.artifactsDir())
+            store = try ArtifactStore(root: IOSConfig.artifactsDir(initialSession))
         } catch {
             fatalError("Failed to open artifact store: \(error)")
         }
         self.multimodal = MultimodalService(log: log, store: store)
         self.viewModel = ChatViewModel(log: log, registry: initialRegistry)
-        self.needsAPIKey = !Self.hasAPIKey(ref: IOSConfig.selectedAPIKeyRef,
-                                           keychain: keychain)
+        self.needsAPIKey = !Self.hasAPIKey(ref: IOSConfig.selectedAPIKeyRef)
 
         wireImageGeneration()
+    }
+
+    func startNewChatSession() {
+        do {
+            try switchChatSession(to: SessionID.new())
+        } catch {
+            chatSessionError = "Could not start chat session: \(error.localizedDescription)"
+        }
+    }
+
+    func resumeChatSession(_ session: IOSSessionSummary) {
+        do {
+            try switchChatSession(to: session.id)
+        } catch {
+            chatSessionError = "Could not resume chat session: \(error.localizedDescription)"
+        }
+    }
+
+    func recentChatSessions() -> [IOSSessionSummary] {
+        IOSConfig.recentSessions()
     }
 
     func saveAPIKey(_ key: String) {
         let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        let account = IOSConfig.selectedAPIKeyAccount
-        try? keychain.set(trimmed, account: account)
-        secrets.cache(trimmed, for: KeychainRef(service: IOSConfig.keychainService, account: account))
+        let providerID = providerCatalog.selectedProvider?.id ?? "default"
+        try? ConfigSecretResolver.writeSecrets([providerID: trimmed])
+        secrets.cache(trimmed, for: .authFile(providerID: providerID))
         needsAPIKey = false
     }
 
     func hasAPIKey(account: String) -> Bool {
-        Self.hasAPIKey(account: account, keychain: keychain)
+        Self.hasAPIKey(ref: .authFile(providerID: account))
     }
 
     func hasAPIKey(for provider: IOSProviderSettings) -> Bool {
-        Self.hasAPIKey(ref: IOSConfig.apiKeyRef(for: provider), keychain: keychain)
+        Self.hasAPIKey(ref: IOSConfig.apiKeyRef(for: provider))
     }
 
     func saveSettings(catalog rawCatalog: IOSProviderCatalog,
@@ -75,19 +96,15 @@ final class IOSAppEnvironment: ObservableObject {
         for index in catalog.providers.indices {
             let provider = catalog.providers[index]
             let key = apiKeysByProviderID[provider.id]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            if !key.isEmpty {
-                try keychain.set(key, account: provider.apiKeyAccount)
-                secrets.cache(key, for: KeychainRef(service: IOSConfig.keychainService,
-                                                    account: provider.apiKeyAccount))
-                catalog.providers[index].apiKeySource = nil
-            }
+            guard !key.isEmpty else { continue }
+            try ConfigSecretResolver.writeSecrets([provider.id: key])
+            catalog.providers[index].apiKeySource = IOSProviderAPIKeySource(type: "authFile", value: "")
+            secrets.cache(key, for: IOSConfig.apiKeyRef(for: catalog.providers[index]))
         }
         IOSConfig.providerCatalog = catalog
         providerCatalog = IOSConfig.providerCatalog
         needsAPIKey = !Self.hasAPIKey(ref: catalog.selectedProvider.map(IOSConfig.apiKeyRef(for:))
-                                      ?? KeychainRef(service: IOSConfig.keychainService,
-                                                     account: IOSConfig.keychainAccount),
-                                      keychain: keychain)
+                                      ?? .authFile(providerID: "default"))
 
         refreshProviderRegistry()
     }
@@ -96,13 +113,15 @@ final class IOSAppEnvironment: ObservableObject {
         let catalog = IOSConfig.selectProviderModel(providerID: providerID, modelID: modelID)
         providerCatalog = catalog
         needsAPIKey = !Self.hasAPIKey(ref: catalog.selectedProvider.map(IOSConfig.apiKeyRef(for:))
-                                      ?? KeychainRef(service: IOSConfig.keychainService,
-                                                     account: IOSConfig.keychainAccount),
-                                      keychain: keychain)
+                                      ?? .authFile(providerID: "default"))
         refreshProviderRegistry()
     }
 
-    private static func makeProviderRegistry(resolver: KeychainSecretResolver) -> ProviderRegistry {
+    func healthCheckSelectedProvider() async -> ProviderHealthReport {
+        await registry.healthCheck(role: .chat, options: ProviderHealthCheckOptions(timeoutSeconds: 15))
+    }
+
+    private static func makeProviderRegistry(resolver: ConfigSecretResolver) -> ProviderRegistry {
         ProviderRegistry(config: IOSConfig.providerConfig(), resolver: resolver)
     }
 
@@ -113,12 +132,22 @@ final class IOSAppEnvironment: ObservableObject {
         wireImageGeneration()
     }
 
-    private static func hasAPIKey(account: String, keychain: KeychainStore) -> Bool {
-        keychain.exists(account: account)
+    private func switchChatSession(to session: SessionID) throws {
+        viewModel.stop()
+        let log = try EventLog(session: session, fileURL: IOSConfig.sessionFile(session))
+        let store = try ArtifactStore(root: IOSConfig.artifactsDir(session))
+        let model = ChatViewModel(log: log, registry: registry)
+        self.log = log
+        self.multimodal = MultimodalService(log: log, store: store)
+        self.viewModel = model
+        self.chatSessionID = session
+        self.chatSessionError = nil
+        wireImageGeneration()
+        model.start()
     }
 
-    private static func hasAPIKey(ref: KeychainRef, keychain: KeychainStore) -> Bool {
-        KeychainSecretResolver.exists(ref, keychain: keychain)
+    private static func hasAPIKey(ref: KeychainRef) -> Bool {
+        ConfigSecretResolver.exists(ref)
     }
 
     private func wireImageGeneration() {
@@ -139,24 +168,103 @@ struct IOSRootView: View {
     @State private var catalog = IOSConfig.providerCatalog
     @State private var apiKeysByProviderID: [String: String] = [:]
     @State private var settingsError: String?
+    @State private var isTestingProvider = false
+    @State private var providerHealthReport: ProviderHealthReport?
+    @State private var recentSessions: [IOSSessionSummary] = []
 
     var body: some View {
-        // PlatformProfile.iOS makes the shared sidebar chat-only; Code/Cowork are
-        // never shown and their packages are not even linked.
-        ThreeColumnShell(model: env.viewModel)
+        // iOS uses the shared chat thread in single-column mode; Code/Cowork are
+        // not linked, so no local workspace execution is reachable.
+        ThreeColumnShell(model: env.viewModel, layout: .iOSChat)
+            .id(env.chatSessionID.rawValue)
             .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    sessionHistoryMenu
+                }
                 ToolbarItem(placement: .principal) {
                     IOSChatModelMenu(
                         catalog: env.providerCatalog,
                         isBusy: env.viewModel.isBusy,
                         onSelect: env.selectProviderModel(providerID:modelID:))
                 }
-                ToolbarItem {
+                ToolbarItemGroup(placement: .navigationBarTrailing) {
+                    Button {
+                        env.startNewChatSession()
+                        refreshSessions()
+                    } label: {
+                        Image(systemName: "plus")
+                    }
+                    .disabled(env.viewModel.isBusy)
+
                     Button { showSettings = true } label: { Image(systemName: "key") }
                 }
             }
+            .overlay(alignment: .top) {
+                sessionErrorBanner
+            }
             .sheet(isPresented: $showSettings) { settingsSheet }
-            .task { if env.needsAPIKey { showSettings = true } }
+            .task(id: env.chatSessionID.rawValue) {
+                refreshSessions()
+                if env.needsAPIKey { showSettings = true }
+            }
+    }
+
+    private var sessionHistoryMenu: some View {
+        Menu {
+            Button {
+                env.startNewChatSession()
+                refreshSessions()
+            } label: {
+                Label("New Chat", systemImage: "plus")
+            }
+            .disabled(env.viewModel.isBusy)
+
+            Section("Recent") {
+                if recentSessions.isEmpty {
+                    Text("No chat sessions")
+                } else {
+                    ForEach(Array(recentSessions.prefix(12))) { session in
+                        Button {
+                            env.resumeChatSession(session)
+                            refreshSessions()
+                        } label: {
+                            Label(sessionMenuTitle(session),
+                                  systemImage: session.id == env.chatSessionID
+                                  ? "checkmark.circle.fill"
+                                  : "clock")
+                        }
+                        .disabled(env.viewModel.isBusy || session.id == env.chatSessionID)
+                    }
+                }
+            }
+        } label: {
+            Image(systemName: "clock.arrow.circlepath")
+        }
+        .disabled(env.viewModel.isBusy && recentSessions.isEmpty)
+    }
+
+    @ViewBuilder private var sessionErrorBanner: some View {
+        if let error = env.chatSessionError {
+            Text(error)
+                .font(.caption)
+                .foregroundStyle(.red)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(.thinMaterial, in: Capsule())
+                .padding(.top, 8)
+        }
+    }
+
+    private func refreshSessions() {
+        recentSessions = env.recentChatSessions()
+    }
+
+    private func sessionMenuTitle(_ session: IOSSessionSummary) -> String {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .short
+        formatter.timeStyle = .short
+        let count = session.eventCount == 1 ? "1 event" : "\(session.eventCount) events"
+        return "\(formatter.string(from: session.updatedAt)) · \(count)"
     }
 
     private var settingsSheet: some View {
@@ -213,12 +321,34 @@ struct IOSRootView: View {
 
                         Button("Add Model") { addModel(providerIndex: providerIndex) }
                     }
+
+                    Section("Health Check") {
+                        Button {
+                            testProvider()
+                        } label: {
+                            Label(isTestingProvider ? "Testing Provider" : "Test Provider",
+                                  systemImage: isTestingProvider ? "hourglass" : "checkmark.seal")
+                        }
+                        .disabled(isTestingProvider)
+
+                        if isTestingProvider {
+                            ProgressView("Testing provider...")
+                        } else if let report = providerHealthReport {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Label(report.displayTitle,
+                                      systemImage: report.isOK ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                                    .foregroundStyle(report.isOK ? .green : .red)
+                                Text(report.displaySummary)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Text(report.displayDetail)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
                 }
 
-                Section {
-                    Text("Provider metadata is stored in settings. API keys stay in the device keychain. The selected model applies to new requests immediately.")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
                 if let settingsError {
                     Section {
                         Text(settingsError).font(.caption).foregroundStyle(.red)
@@ -235,6 +365,7 @@ struct IOSRootView: View {
                             catalog = IOSConfig.providerCatalog
                             apiKeysByProviderID = [:]
                             settingsError = nil
+                            providerHealthReport = nil
                             showSettings = false
                         } catch {
                             settingsError = "Could not save settings: \(error.localizedDescription)"
@@ -345,6 +476,24 @@ struct IOSRootView: View {
     private func apiKeyPlaceholder(for provider: IOSProviderSettings) -> String {
         env.hasAPIKey(for: provider) ? "••••••••••••••••" : "Enter API key"
     }
+
+    private func testProvider() {
+        guard !isTestingProvider else { return }
+        isTestingProvider = true
+        settingsError = nil
+        providerHealthReport = nil
+        Task { @MainActor in
+            defer { isTestingProvider = false }
+            do {
+                try env.saveSettings(catalog: catalog, apiKeysByProviderID: apiKeysByProviderID)
+                catalog = IOSConfig.providerCatalog
+                apiKeysByProviderID = [:]
+                providerHealthReport = await env.healthCheckSelectedProvider()
+            } catch {
+                settingsError = "Could not test provider: \(error.localizedDescription)"
+            }
+        }
+    }
 }
 
 private struct IOSChatModelMenu: View {
@@ -354,39 +503,40 @@ private struct IOSChatModelMenu: View {
 
     private var selectedProvider: IOSProviderSettings? { catalog.selectedProvider }
     private var selectedModel: IOSProviderModel? { catalog.selectedModel }
-
-    var body: some View {
-        Menu {
-            ForEach(catalog.providers) { provider in
-                Section(provider.title) {
-                    ForEach(provider.models) { model in
-                        Button {
-                            onSelect(provider.id, model.id)
-                        } label: {
-                            Label(model.title,
-                                  systemImage: isSelected(providerID: provider.id, modelID: model.id)
-                                  ? "checkmark"
-                                  : "circle")
-                        }
-                    }
-                }
-            }
-        } label: {
-            HStack(spacing: 6) {
-                Image(systemName: "cpu")
-                Text(selectedModel?.title ?? IOSConfig.defaultDisplayName(for: IOSConfig.defaultModel))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                Text(selectedProvider?.title ?? "OpenAI")
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
+    private var menuProviders: [ProviderModelMenuProvider] {
+        catalog.providers.map { provider in
+            ProviderModelMenuProvider(
+                id: provider.id,
+                title: provider.title,
+                models: provider.models.map { ProviderModelMenuModel(id: $0.id, title: $0.title) })
         }
-        .disabled(isBusy)
     }
 
-    private func isSelected(providerID: String, modelID: String) -> Bool {
-        catalog.selectedProviderID == providerID && catalog.selectedModelID == modelID
+    var body: some View {
+        ProviderModelSelectionMenu(
+            providers: menuProviders,
+            selectedProviderID: catalog.selectedProviderID,
+            selectedModelID: catalog.selectedModelID,
+            isBusy: isBusy,
+            onSelect: onSelect) {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "cpu")
+                        Text(selectedModel?.title ?? IOSConfig.defaultModel)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Text(selectedProvider?.title ?? "OpenAI")
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    HStack(spacing: 6) {
+                        Image(systemName: "cpu")
+                        Text(selectedModel?.title ?? IOSConfig.defaultModel)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                }
+        }
     }
 }
 

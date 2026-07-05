@@ -2,73 +2,11 @@
 import Foundation
 import IntatisCore
 import IntatisProviders
-#if canImport(Security)
-import Security
-#endif
 
-/// iOS keychain glue (per-app platform code — §4.4). Same generic-password API as
-/// macOS; kept local to the iOS target to avoid touching the macOS app.
-public struct KeychainStore {
-    public let service: String
-    public init(service: String) { self.service = service }
-
-    public func set(_ value: String, account: String) throws {
-        #if canImport(Security)
-        let base: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-        ]
-        SecItemDelete(base as CFDictionary)
-        var add = base
-        add[kSecValueData as String] = Data(value.utf8)
-        let status = SecItemAdd(add as CFDictionary, nil)
-        guard status == errSecSuccess else { throw IntatisError.io("keychain write failed (OSStatus \(status))") }
-        #else
-        throw IntatisError.io("keychain unavailable on this platform")
-        #endif
-    }
-
-    public func get(account: String) throws -> String {
-        #if canImport(Security)
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        var item: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &item)
-        guard status == errSecSuccess, let data = item as? Data, let string = String(data: data, encoding: .utf8) else {
-            throw IntatisError.notFound("keychain item '\(account)'")
-        }
-        return string
-        #else
-        throw IntatisError.notFound("keychain unavailable on this platform")
-        #endif
-    }
-
-    public func exists(account: String) -> Bool {
-        #if canImport(Security)
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecReturnAttributes as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-            kSecUseAuthenticationUI as String: kSecUseAuthenticationUISkip,
-        ]
-        var item: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &item)
-        return status == errSecSuccess || status == errSecInteractionNotAllowed
-        #else
-        return false
-        #endif
-    }
-}
-
-public final class KeychainSecretResolver: SecretResolver, @unchecked Sendable {
+/// Resolves provider secrets from configuration files, environment variables,
+/// and explicit secret files. Legacy `.keychain` refs are treated as config refs
+/// so iOS chat requests never call the Keychain APIs.
+public final class ConfigSecretResolver: SecretResolver, @unchecked Sendable {
     private let lock = NSLock()
     private var cache: [String: String] = [:]
 
@@ -81,7 +19,8 @@ public final class KeychainSecretResolver: SecretResolver, @unchecked Sendable {
         let secret: String
         switch ref.source {
         case .keychain:
-            secret = try KeychainStore(service: ref.service).get(account: ref.account)
+            let providerID = Self.authProviderID(from: ref.account) ?? ref.account
+            secret = try Self.readAuthFileSecret(providerID: providerID)
         case .environment:
             guard let value = ProcessInfo.processInfo.environment[ref.account],
                   !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -114,18 +53,38 @@ public final class KeychainSecretResolver: SecretResolver, @unchecked Sendable {
         lock.unlock()
     }
 
-    public static func exists(_ ref: KeychainRef, keychain: KeychainStore) -> Bool {
+    public static func exists(_ ref: KeychainRef) -> Bool {
         switch ref.source {
         case .keychain:
-            return keychain.exists(account: ref.account)
+            let providerID = Self.authProviderID(from: ref.account) ?? ref.account
+            return authFileContainsSecret(providerID: providerID)
         case .environment:
             return !(ProcessInfo.processInfo.environment[ref.account] ?? "")
                 .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         case .file:
             return FileManager.default.fileExists(atPath: expandedPath(ref.account))
         case .authFile:
-            return FileManager.default.fileExists(atPath: authFileURL().path)
+            return authFileContainsSecret(providerID: ref.account)
         }
+    }
+
+    public static func writeSecrets(_ apiKeysByProviderID: [String: String]) throws {
+        let entries = apiKeysByProviderID.compactMapValues { nonEmpty($0) }
+        guard !entries.isEmpty else { return }
+
+        let url = authFileURL()
+        var providers = existingAuthProviderMap(from: url)
+        for (providerID, secret) in entries {
+            providers[providerID] = secret
+        }
+
+        let object: [String: [String: String]] = ["providers": providers]
+        let data = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true)
+        try data.write(to: url, options: .atomic)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
     }
 
     private static func cacheKey(for ref: KeychainRef) -> String {
@@ -144,20 +103,92 @@ public final class KeychainSecretResolver: SecretResolver, @unchecked Sendable {
     }
 
     private static func readAuthFileSecret(providerID: String) throws -> String {
+        let candidateIDs = authProviderIDCandidates(from: providerID)
         let data = try Data(contentsOf: authFileURL())
         let object = try JSONSerialization.jsonObject(with: data)
-        if let flat = object as? [String: String],
-           let value = flat[providerID]?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !value.isEmpty {
-            return value
-        }
-        if let root = object as? [String: Any],
-           let providers = root["providers"] as? [String: String],
-           let value = providers[providerID]?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !value.isEmpty {
-            return value
+        for candidate in candidateIDs {
+            if let value = authSecret(in: object, providerID: candidate) {
+                return value
+            }
         }
         throw IntatisError.notFound("auth file secret for provider '\(providerID)'")
+    }
+
+    private static func authFileContainsSecret(providerID: String) -> Bool {
+        guard FileManager.default.fileExists(atPath: authFileURL().path),
+              let data = try? Data(contentsOf: authFileURL()),
+              let object = try? JSONSerialization.jsonObject(with: data) else {
+            return false
+        }
+        return authProviderIDCandidates(from: providerID).contains {
+            authSecret(in: object, providerID: $0) != nil
+        }
+    }
+
+    private static func authSecret(in object: Any, providerID: String) -> String? {
+        if let flat = object as? [String: String],
+           let value = nonEmpty(flat[providerID]) {
+            return value
+        }
+        guard let root = object as? [String: Any] else { return nil }
+        if let value = nonEmpty(root[providerID] as? String) {
+            return value
+        }
+        if let providers = root["providers"] as? [String: String],
+           let value = nonEmpty(providers[providerID]) {
+            return value
+        }
+        if let provider = root["provider"] as? [String: String],
+           let value = nonEmpty(provider[providerID]) {
+            return value
+        }
+        return nil
+    }
+
+    private static func authProviderID(from value: String) -> String? {
+        if value == "default" || value == "default-openai" {
+            return "openai"
+        }
+        let prefix = "provider-"
+        guard value.hasPrefix(prefix) else { return nil }
+        let providerID = String(value.dropFirst(prefix.count))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return providerID.isEmpty ? nil : providerID
+    }
+
+    private static func authProviderIDCandidates(from raw: String) -> [String] {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalized = authProviderID(from: trimmed) ?? trimmed
+        var candidates = [trimmed, normalized]
+        if trimmed == "default" || normalized == "openai" {
+            candidates.append("OpenAI")
+        }
+        var seen = Set<String>()
+        return candidates.compactMap { candidate in
+            let value = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !value.isEmpty, !seen.contains(value.lowercased()) else { return nil }
+            seen.insert(value.lowercased())
+            return value
+        }
+    }
+
+    private static func existingAuthProviderMap(from url: URL) -> [String: String] {
+        guard FileManager.default.fileExists(atPath: url.path),
+              let data = try? Data(contentsOf: url),
+              let object = try? JSONSerialization.jsonObject(with: data) else {
+            return [:]
+        }
+        if let flat = object as? [String: String] {
+            return flat
+        }
+        guard let root = object as? [String: Any] else { return [:] }
+        if let providers = root["providers"] as? [String: String] {
+            return providers
+        }
+        if let providers = root["provider"] as? [String: String] {
+            return providers
+        }
+        return [:]
     }
 
     private static func authFileURL() -> URL {
@@ -176,6 +207,14 @@ public final class KeychainSecretResolver: SecretResolver, @unchecked Sendable {
         let home = NSHomeDirectory()
         if trimmed == "~" { return home }
         return home + String(trimmed.dropFirst())
+    }
+
+    private static func nonEmpty(_ value: String?) -> String? {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty else {
+            return nil
+        }
+        return trimmed
     }
 }
 #endif

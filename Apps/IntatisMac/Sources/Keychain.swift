@@ -2,77 +2,11 @@
 import Foundation
 import IntatisCore
 import IntatisProviders
-#if canImport(Security)
-import Security
-#endif
 
-/// Thin wrapper over the macOS keychain (generic password items).
-public struct KeychainStore {
-    public let service: String
-    public init(service: String) { self.service = service }
-
-    public func set(_ value: String, account: String) throws {
-        #if canImport(Security)
-        let base: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-        ]
-        SecItemDelete(base as CFDictionary)
-        var add = base
-        add[kSecValueData as String] = Data(value.utf8)
-        let status = SecItemAdd(add as CFDictionary, nil)
-        guard status == errSecSuccess else {
-            throw IntatisError.io("keychain write failed (OSStatus \(status))")
-        }
-        #else
-        throw IntatisError.io("keychain unavailable on this platform")
-        #endif
-    }
-
-    public func get(account: String) throws -> String {
-        #if canImport(Security)
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        var item: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &item)
-        guard status == errSecSuccess,
-              let data = item as? Data,
-              let string = String(data: data, encoding: .utf8) else {
-            throw IntatisError.notFound("keychain item '\(account)'")
-        }
-        return string
-        #else
-        throw IntatisError.notFound("keychain unavailable on this platform")
-        #endif
-    }
-
-    public func exists(account: String) -> Bool {
-        #if canImport(Security)
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecReturnAttributes as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-            kSecUseAuthenticationUI as String: kSecUseAuthenticationUISkip,
-        ]
-        var item: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &item)
-        return status == errSecSuccess || status == errSecInteractionNotAllowed
-        #else
-        return false
-        #endif
-    }
-}
-
-/// Resolves provider secrets from the keychain using the ref's own service/account.
-public final class KeychainSecretResolver: SecretResolver, @unchecked Sendable {
+/// Resolves provider secrets from configuration files, environment variables,
+/// and explicit secret files. Legacy `.keychain` refs are treated as config refs
+/// so provider requests never call the macOS Keychain APIs.
+public final class ConfigSecretResolver: SecretResolver, @unchecked Sendable {
     private let lock = NSLock()
     private var cache: [String: String] = [:]
 
@@ -85,14 +19,8 @@ public final class KeychainSecretResolver: SecretResolver, @unchecked Sendable {
         let secret: String
         switch ref.source {
         case .keychain:
-            do {
-                secret = try KeychainStore(service: ref.service).get(account: ref.account)
-            } catch {
-                guard let providerID = Self.authProviderID(from: ref.account) else {
-                    throw error
-                }
-                secret = try Self.readAuthFileSecret(providerID: providerID)
-            }
+            let providerID = Self.authProviderID(from: ref.account) ?? ref.account
+            secret = try Self.readAuthFileSecret(providerID: providerID)
         case .environment:
             guard let value = ProcessInfo.processInfo.environment[ref.account],
                   !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -125,14 +53,13 @@ public final class KeychainSecretResolver: SecretResolver, @unchecked Sendable {
         lock.unlock()
     }
 
-    public static func exists(_ ref: KeychainRef, keychain: KeychainStore) -> Bool {
+    public static func exists(_ ref: KeychainRef) -> Bool {
         switch ref.source {
         case .keychain:
-            if keychain.exists(account: ref.account) { return true }
-            guard Self.authProviderID(from: ref.account) != nil else { return false }
+            let providerID = Self.authProviderID(from: ref.account) ?? ref.account
             return Self.authFileURLs().contains {
                 FileManager.default.fileExists(atPath: $0.path)
-                    && Self.authFileContainsSecret(providerID: ref.account, url: $0)
+                    && Self.authFileContainsSecret(providerID: providerID, url: $0)
             }
         case .environment:
             return !(ProcessInfo.processInfo.environment[ref.account] ?? "")
@@ -145,6 +72,34 @@ public final class KeychainSecretResolver: SecretResolver, @unchecked Sendable {
                     && Self.authFileContainsSecret(providerID: ref.account, url: $0)
             }
         }
+    }
+
+    public static func writableAuthFileURL() -> URL {
+        if let override = ProcessInfo.processInfo.environment["INTATIS_AUTH_FILE"],
+           !override.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return URL(fileURLWithPath: expandedPath(override))
+        }
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        return home.appendingPathComponent(".config/intatis/auth.json")
+    }
+
+    public static func writeSecrets(_ apiKeysByProviderID: [String: String]) throws {
+        let entries = apiKeysByProviderID.compactMapValues(nonEmpty)
+        guard !entries.isEmpty else { return }
+
+        let url = writableAuthFileURL()
+        var providers = existingAuthProviderMap(from: url)
+        for (providerID, secret) in entries {
+            providers[providerID] = secret
+        }
+
+        let object: [String: [String: String]] = ["providers": providers]
+        let data = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true)
+        try data.write(to: url, options: .atomic)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
     }
 
     private static func cacheKey(for ref: KeychainRef) -> String {
@@ -163,29 +118,34 @@ public final class KeychainSecretResolver: SecretResolver, @unchecked Sendable {
     }
 
     private static func readAuthFileSecret(providerID: String) throws -> String {
-        let normalizedProviderID = authProviderID(from: providerID) ?? providerID
+        let candidateIDs = authProviderIDCandidates(from: providerID)
         for url in authFileURLs() where FileManager.default.fileExists(atPath: url.path) {
             guard let data = try? jsonCompatibleData(from: url),
-                  let object = try? JSONSerialization.jsonObject(with: data),
-                  let secret = authSecret(in: object,
-                                          providerID: normalizedProviderID,
-                                          configDirectory: url.deletingLastPathComponent()) else {
+                  let object = try? JSONSerialization.jsonObject(with: data) else {
                 continue
             }
-            return secret
+            for candidate in candidateIDs {
+                if let secret = authSecret(in: object,
+                                           providerID: candidate,
+                                           configDirectory: url.deletingLastPathComponent()) {
+                    return secret
+                }
+            }
         }
         throw IntatisError.notFound("auth file secret for provider '\(providerID)'")
     }
 
     private static func authFileContainsSecret(providerID: String, url: URL) -> Bool {
-        let normalizedProviderID = authProviderID(from: providerID) ?? providerID
+        let candidateIDs = authProviderIDCandidates(from: providerID)
         guard let data = try? jsonCompatibleData(from: url),
               let object = try? JSONSerialization.jsonObject(with: data) else {
             return false
         }
-        return authSecret(in: object,
-                          providerID: normalizedProviderID,
-                          configDirectory: url.deletingLastPathComponent()) != nil
+        return candidateIDs.contains { candidate in
+            authSecret(in: object,
+                       providerID: candidate,
+                       configDirectory: url.deletingLastPathComponent()) != nil
+        }
     }
 
     private static func authSecret(in object: Any,
@@ -314,6 +274,7 @@ public final class KeychainSecretResolver: SecretResolver, @unchecked Sendable {
             urls.append(URL(fileURLWithPath: expandedPath(configOverride)))
         }
         urls.append(contentsOf: [
+            writableAuthFileURL(),
             home.appendingPathComponent(".local/share/intatis/auth.json"),
             home.appendingPathComponent(".local/share/opencode/auth.json"),
             home.appendingPathComponent(".config/intatis/opencode.json"),
@@ -334,15 +295,50 @@ public final class KeychainSecretResolver: SecretResolver, @unchecked Sendable {
         return urls
     }
 
-    private static func authProviderID(from keychainAccount: String) -> String? {
-        if keychainAccount == "default-openai" {
+    private static func authProviderID(from legacyAccount: String) -> String? {
+        if legacyAccount == "default" || legacyAccount == "default-openai" {
             return "openai"
         }
         let prefix = "provider-"
-        guard keychainAccount.hasPrefix(prefix) else { return nil }
-        let providerID = String(keychainAccount.dropFirst(prefix.count))
+        guard legacyAccount.hasPrefix(prefix) else { return nil }
+        let providerID = String(legacyAccount.dropFirst(prefix.count))
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return providerID.isEmpty ? nil : providerID
+    }
+
+    private static func authProviderIDCandidates(from raw: String) -> [String] {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalized = authProviderID(from: trimmed) ?? trimmed
+        var candidates = [trimmed, normalized]
+        if trimmed == "default" || normalized == "openai" {
+            candidates.append("OpenAI")
+        }
+        var seen = Set<String>()
+        return candidates.compactMap { candidate in
+            let value = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !value.isEmpty, !seen.contains(value.lowercased()) else { return nil }
+            seen.insert(value.lowercased())
+            return value
+        }
+    }
+
+    private static func existingAuthProviderMap(from url: URL) -> [String: String] {
+        guard FileManager.default.fileExists(atPath: url.path),
+              let data = try? jsonCompatibleData(from: url),
+              let object = try? JSONSerialization.jsonObject(with: data) else {
+            return [:]
+        }
+        if let flat = object as? [String: String] {
+            return flat
+        }
+        guard let root = object as? [String: Any] else { return [:] }
+        if let providers = root["providers"] as? [String: String] {
+            return providers
+        }
+        if let providers = root["provider"] as? [String: String] {
+            return providers
+        }
+        return [:]
     }
 
     private static func expandedPath(_ path: String) -> String {

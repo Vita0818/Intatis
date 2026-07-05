@@ -12,10 +12,101 @@ private struct FakeHTTP: HTTPByteStreaming {
     }
 }
 
+private struct DelayedHTTP: HTTPByteStreaming {
+    let delayNanoseconds: UInt64
+    func stream(_ request: URLRequest) -> AsyncThrowingStream<Data, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    try await Task.sleep(nanoseconds: delayNanoseconds)
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+}
+
+private struct StreamAttempt {
+    var chunks: [Data]
+    var error: Error?
+}
+
+private final class SequencedHTTP: HTTPByteStreaming, @unchecked Sendable {
+    private let queue = DispatchQueue(label: "intatis.tests.sequenced-http")
+    private var index = 0
+    private let attempts: [StreamAttempt]
+
+    init(attempts: [StreamAttempt]) {
+        self.attempts = attempts
+    }
+
+    var attemptCount: Int {
+        queue.sync { index }
+    }
+
+    func stream(_ request: URLRequest) -> AsyncThrowingStream<Data, Error> {
+        let attempt = queue.sync { () -> StreamAttempt in
+            let value = attempts[min(index, attempts.count - 1)]
+            index += 1
+            return value
+        }
+        return AsyncThrowingStream { continuation in
+            for chunk in attempt.chunks {
+                continuation.yield(chunk)
+            }
+            if let error = attempt.error {
+                continuation.finish(throwing: error)
+            } else {
+                continuation.finish()
+            }
+        }
+    }
+}
+
+private final class CapturingHTTP: HTTPByteStreaming, @unchecked Sendable {
+    private let queue = DispatchQueue(label: "intatis.tests.capturing-http")
+    private let chunks: [Data]
+    private var requestBodies: [Data] = []
+
+    init(chunks: [Data]) {
+        self.chunks = chunks
+    }
+
+    var lastBody: Data? {
+        queue.sync { requestBodies.last }
+    }
+
+    func stream(_ request: URLRequest) -> AsyncThrowingStream<Data, Error> {
+        queue.sync {
+            requestBodies.append(request.httpBody ?? Data())
+        }
+        return AsyncThrowingStream { continuation in
+            for chunk in chunks {
+                continuation.yield(chunk)
+            }
+            continuation.finish()
+        }
+    }
+}
+
 private struct StaticSecret: SecretResolver {
     let key: String
     func secret(for ref: KeychainRef) async throws -> String { key }
 }
+
+private let openAIEndpoint = ProviderEndpoint(id: "e",
+                                              baseURL: URL(string: "https://example.test/v1")!,
+                                              apiKeyRef: KeychainRef(service: "s", account: "a"),
+                                              wire: .openai)
+
+private let nonHTTPChatEndpoint = ProviderEndpoint(id: "bad-chat",
+                                                   baseURL: URL(string: "https://example.test/v1")!,
+                                                   chatEndpoint: URL(fileURLWithPath: "/tmp/intatis-chat"),
+                                                   apiKeyRef: KeychainRef(service: "s", account: "a"),
+                                                   wire: .openai)
 
 final class IntatisProvidersTests: XCTestCase {
 
@@ -75,7 +166,7 @@ final class IntatisProvidersTests: XCTestCase {
         let sse = """
         data: {"choices":[{"delta":{"content":"hi"}}]}
 
-        data: {"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":3,"total_tokens":14}}
+        data: {"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":3,"total_tokens":14,"prompt_tokens_details":{"cached_tokens":4}}}
 
         data: [DONE]
 
@@ -94,8 +185,351 @@ final class IntatisProvidersTests: XCTestCase {
             if case .usage(let u) = chunk { usage = u }
         }
         XCTAssertEqual(usage?.promptTokens, 11)
+        XCTAssertEqual(usage?.cachedPromptTokens, 4)
         XCTAssertEqual(usage?.completionTokens, 3)
         XCTAssertEqual(usage?.totalTokens, 14)
+    }
+
+    func testOpenAIStreamingTreatsFinishReasonAsDoneWithoutDoneMarker() async throws {
+        let sse = """
+        data: {"choices":[{"delta":{"content":"OK"}}]}
+
+        data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+
+        """
+        let provider = OpenAIWireProvider(endpoint: openAIEndpoint,
+                                          apiKey: "k",
+                                          http: FakeHTTP(chunks: [Data(sse.utf8)]))
+
+        var text = ""
+        var doneCount = 0
+        for try await chunk in provider.stream(ChatRequest(model: ModelID(rawValue: "m"),
+                                                           messages: [ChatMessage(role: .user, content: "hi")])) {
+            switch chunk {
+            case .delta(let value):
+                text += value
+            case .usage:
+                break
+            case .done:
+                doneCount += 1
+            }
+        }
+
+        XCTAssertEqual(text, "OK")
+        XCTAssertEqual(doneCount, 1)
+    }
+
+    func testOpenAIStreamingReadsContentAndFinishFromNonFirstChoice() async throws {
+        let sse = """
+        data: {"choices":[{"index":0,"delta":{}},{"index":1,"delta":{"content":"OK"},"finish_reason":"stop"}]}
+
+        """
+        let provider = OpenAIWireProvider(endpoint: openAIEndpoint,
+                                          apiKey: "k",
+                                          http: FakeHTTP(chunks: [Data(sse.utf8)]))
+
+        var text = ""
+        var doneCount = 0
+        for try await chunk in provider.stream(ChatRequest(model: ModelID(rawValue: "m"),
+                                                           messages: [ChatMessage(role: .user, content: "hi")])) {
+            switch chunk {
+            case .delta(let value):
+                text += value
+            case .usage:
+                break
+            case .done:
+                doneCount += 1
+            }
+        }
+
+        XCTAssertEqual(text, "OK")
+        XCTAssertEqual(doneCount, 1)
+    }
+
+    func testOpenAIStreamingKeepsUsageAfterFinishReasonAndDoesNotDuplicateDone() async throws {
+        let sse = """
+        data: {"choices":[{"delta":{"content":"OK"}}]}
+
+        data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+
+        data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":1,"total_tokens":6}}
+
+        data: [DONE]
+
+        """
+        let provider = OpenAIWireProvider(endpoint: openAIEndpoint,
+                                          apiKey: "k",
+                                          http: FakeHTTP(chunks: [Data(sse.utf8)]))
+
+        var usage: Usage?
+        var doneCount = 0
+        for try await chunk in provider.stream(ChatRequest(model: ModelID(rawValue: "m"),
+                                                           messages: [ChatMessage(role: .user, content: "hi")],
+                                                           includeUsage: true)) {
+            switch chunk {
+            case .delta:
+                break
+            case .usage(let value):
+                usage = value
+            case .done:
+                doneCount += 1
+            }
+        }
+
+        XCTAssertEqual(doneCount, 1)
+        XCTAssertEqual(usage?.promptTokens, 5)
+        XCTAssertEqual(usage?.completionTokens, 1)
+        XCTAssertEqual(usage?.totalTokens, 6)
+    }
+
+    func testOpenAIStreamingThrowsWhenCompletionMarkerMissing() async throws {
+        let sse = """
+        data: {"choices":[{"delta":{"content":"partial"}}]}
+
+        """
+        let provider = OpenAIWireProvider(endpoint: openAIEndpoint,
+                                          apiKey: "k",
+                                          http: FakeHTTP(chunks: [Data(sse.utf8)]))
+
+        var text = ""
+        do {
+            for try await chunk in provider.stream(ChatRequest(model: ModelID(rawValue: "m"),
+                                                               messages: [ChatMessage(role: .user, content: "hi")])) {
+                switch chunk {
+                case .delta(let value):
+                    text += value
+                case .usage:
+                    break
+                case .done:
+                    XCTFail("unexpected done for incomplete stream")
+                }
+            }
+            XCTFail("expected incomplete stream error")
+        } catch {
+            XCTAssertEqual(text, "partial")
+            XCTAssertTrue(error.localizedDescription.contains("completion marker"))
+        }
+    }
+
+    func testOpenAIStreamingRejectsNonHTTPChatEndpointBeforeTransport() async {
+        let provider = OpenAIWireProvider(
+            endpoint: nonHTTPChatEndpoint,
+            apiKey: "k",
+            http: FakeHTTP(chunks: [Data("data: [DONE]\n\n".utf8)]))
+
+        do {
+            for try await _ in provider.stream(ChatRequest(model: ModelID(rawValue: "m"),
+                                                           messages: [ChatMessage(role: .user, content: "hi")])) {}
+            XCTFail("expected invalid provider endpoint error")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("invalid provider endpoint 'bad-chat'"))
+            XCTAssertTrue(error.localizedDescription.contains("Chat endpoint scheme 'file' is not supported"))
+            XCTAssertTrue(error.localizedDescription.contains("http:// or https://"))
+        }
+    }
+
+    func testProviderHTTPErrorIncludesStatusGuidanceAndProviderMessage() {
+        let body = Data(#"{"error":{"message":"bad API key","type":"auth","code":"invalid_key"}}"#.utf8)
+        let error = ProviderErrorFormatting.httpStatus(401, body: body, operation: "streaming request")
+
+        XCTAssertTrue(error.localizedDescription.contains("HTTP 401 Unauthorized"))
+        XCTAssertTrue(error.localizedDescription.contains("Check the API key"))
+        XCTAssertTrue(error.localizedDescription.contains("bad API key"))
+        XCTAssertTrue(error.localizedDescription.contains("code=invalid_key"))
+    }
+
+    func testProviderHTTPErrorUsesPreviewForUnstructuredBody() {
+        let body = Data(#"<html><body>gateway generated an HTML error page</body></html>"#.utf8)
+        let error = ProviderErrorFormatting.httpStatus(502, body: body, operation: "streaming request")
+
+        XCTAssertTrue(error.localizedDescription.contains("HTTP 502 Bad Gateway"))
+        XCTAssertTrue(error.localizedDescription.contains("upstream gateway failed"))
+        XCTAssertTrue(error.localizedDescription.contains("Preview: <html><body>gateway generated an HTML error page"))
+        XCTAssertFalse(error.localizedDescription.contains("Provider said:"))
+    }
+
+    func testProviderHTTPErrorIncludesRetryAfterHeaderGuidance() {
+        let error = ProviderErrorFormatting.httpStatus(
+            429,
+            body: Data(#"{"error":{"message":"rate limited"}}"#.utf8),
+            headers: ["Retry-After": "2"],
+            operation: "streaming request")
+
+        XCTAssertTrue(error.localizedDescription.contains("HTTP 429 Too Many Requests"))
+        XCTAssertTrue(error.localizedDescription.contains("retry after about 2s"))
+        XCTAssertTrue(error.localizedDescription.contains("retry-after"))
+        XCTAssertTrue(error.localizedDescription.contains("rate limited"))
+    }
+
+    func testRetryAfterHeaderControlsRuntimeDelayAndCapsLongValues() {
+        let hint = ProviderErrorFormatting.retryHint(headers: ["Retry-After": "3"])
+        XCTAssertEqual(hint?.delaySeconds, 3)
+
+        let policy = ProviderRuntimePolicy(maxAttempts: 2,
+                                           requestTimeoutSeconds: 1,
+                                           initialRetryDelaySeconds: 0.1,
+                                           maxRetryDelaySeconds: 0.5,
+                                           maxRetryAfterDelaySeconds: 5)
+        XCTAssertEqual(ProviderRuntime.retryDelayNanoseconds(forNextAttempt: 2,
+                                                             policy: policy,
+                                                             retryHint: hint),
+                       3_000_000_000)
+
+        let cappedPolicy = ProviderRuntimePolicy(maxAttempts: 2,
+                                                 requestTimeoutSeconds: 1,
+                                                 initialRetryDelaySeconds: 0.1,
+                                                 maxRetryDelaySeconds: 0.5,
+                                                 maxRetryAfterDelaySeconds: 1)
+        XCTAssertEqual(ProviderRuntime.retryDelayNanoseconds(forNextAttempt: 2,
+                                                             policy: cappedPolicy,
+                                                             retryHint: hint),
+                       1_000_000_000)
+    }
+
+    func testRetryHintHandlesCaseDuplicateHeadersAndHTTPDates() {
+        let duplicateCaseHint = ProviderErrorFormatting.retryHint(headers: [
+            "Retry-After": "2",
+            "retry-after": "3",
+        ])
+        XCTAssertTrue([2, 3].contains(Int(duplicateCaseHint?.delaySeconds ?? -1)))
+        XCTAssertEqual(duplicateCaseHint?.source, "retry-after")
+
+        let now = Date(timeIntervalSince1970: 1_445_412_470)
+        let dateHint = ProviderErrorFormatting.retryHint(
+            headers: ["x-ratelimit-reset": "Wed, 21 Oct 2015 07:28:00 GMT"],
+            now: now)
+        XCTAssertEqual(dateHint?.delaySeconds, 10)
+        XCTAssertEqual(dateHint?.source, "x-ratelimit-reset")
+    }
+
+    func testRetryHintParsesDurationStyleRateLimitHeaders() {
+        let millisecondHint = ProviderErrorFormatting.retryHint(headers: [
+            "x-ratelimit-reset-tokens": "750ms",
+        ])
+        XCTAssertEqual(millisecondHint?.delaySeconds, 0.75)
+        XCTAssertEqual(millisecondHint?.source, "x-ratelimit-reset-tokens")
+
+        let combinedHint = ProviderErrorFormatting.retryHint(headers: [
+            "x-ratelimit-reset-requests": "1m30s",
+        ])
+        XCTAssertEqual(combinedHint?.delaySeconds, 90)
+        XCTAssertEqual(combinedHint?.source, "x-ratelimit-reset-requests")
+
+        let spacedHint = ProviderErrorFormatting.retryHint(headers: [
+            "ratelimit-reset": "2 s",
+        ])
+        XCTAssertEqual(spacedHint?.delaySeconds, 2)
+        XCTAssertEqual(spacedHint?.source, "ratelimit-reset")
+    }
+
+    func testOpenAIStreamingThrowsProviderErrorPayload() async throws {
+        let sse = """
+        data: {"error":{"message":"model not found","type":"invalid_request_error","code":"model_not_found"}}
+
+        """
+        let provider = OpenAIWireProvider(endpoint: openAIEndpoint, apiKey: "k", http: FakeHTTP(chunks: [Data(sse.utf8)]))
+
+        do {
+            for try await _ in provider.stream(ChatRequest(model: ModelID(rawValue: "missing"),
+                                                           messages: [ChatMessage(role: .user, content: "hi")])) {}
+            XCTFail("expected provider error")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("model not found"))
+            XCTAssertTrue(error.localizedDescription.contains("model_not_found"))
+        }
+    }
+
+    func testOpenAIStreamingThrowsOnMalformedSSEPayload() async throws {
+        let sse = """
+        data: not-json
+
+        """
+        let provider = OpenAIWireProvider(endpoint: openAIEndpoint, apiKey: "k", http: FakeHTTP(chunks: [Data(sse.utf8)]))
+
+        do {
+            for try await _ in provider.stream(ChatRequest(model: ModelID(rawValue: "m"),
+                                                           messages: [ChatMessage(role: .user, content: "hi")])) {}
+            XCTFail("expected decoding error")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("non-JSON SSE data"))
+            XCTAssertTrue(error.localizedDescription.contains("not-json"))
+        }
+    }
+
+    func testOpenAIStreamingRetriesRetryableHTTPBeforeResponseBytes() async throws {
+        let sse = """
+        data: {"choices":[{"delta":{"content":"OK"}}]}
+
+        data: [DONE]
+
+        """
+        let http = SequencedHTTP(attempts: [
+            StreamAttempt(
+                chunks: [],
+                error: ProviderErrorFormatting.httpStatus(
+                    503,
+                    body: Data(#"{"error":{"message":"upstream overloaded"}}"#.utf8),
+                    operation: "streaming request")),
+            StreamAttempt(chunks: [Data(sse.utf8)], error: nil),
+        ])
+        let provider = OpenAIWireProvider(
+            endpoint: openAIEndpoint,
+            apiKey: "k",
+            http: http,
+            runtimePolicy: ProviderRuntimePolicy(maxAttempts: 2,
+                                                 requestTimeoutSeconds: 1,
+                                                 initialRetryDelaySeconds: 0,
+                                                 maxRetryDelaySeconds: 0))
+
+        var text = ""
+        for try await chunk in provider.stream(ChatRequest(model: ModelID(rawValue: "m"),
+                                                           messages: [ChatMessage(role: .user, content: "hi")])) {
+            if case .delta(let value) = chunk {
+                text += value
+            }
+        }
+
+        XCTAssertEqual(text, "OK")
+        XCTAssertEqual(http.attemptCount, 2)
+    }
+
+    func testOpenAIStreamingDoesNotRetryAfterResponseBytes() async throws {
+        let sse = """
+        data: {"choices":[{"delta":{"content":"partial"}}]}
+
+        """
+        let http = SequencedHTTP(attempts: [
+            StreamAttempt(
+                chunks: [Data(sse.utf8)],
+                error: ProviderErrorFormatting.httpStatus(
+                    503,
+                    body: Data(#"{"error":{"message":"upstream failed mid-stream"}}"#.utf8),
+                    operation: "streaming request")),
+            StreamAttempt(chunks: [Data("data: [DONE]\n\n".utf8)], error: nil),
+        ])
+        let provider = OpenAIWireProvider(
+            endpoint: openAIEndpoint,
+            apiKey: "k",
+            http: http,
+            runtimePolicy: ProviderRuntimePolicy(maxAttempts: 2,
+                                                 requestTimeoutSeconds: 1,
+                                                 initialRetryDelaySeconds: 0,
+                                                 maxRetryDelaySeconds: 0))
+
+        do {
+            for try await chunk in provider.stream(ChatRequest(model: ModelID(rawValue: "m"),
+                                                               messages: [ChatMessage(role: .user, content: "hi")])) {
+                if case .delta = chunk {
+                    // The important invariant is that a stream that has already
+                    // yielded response bytes is not retried, because that can
+                    // duplicate text or tool calls.
+                }
+            }
+            XCTFail("expected mid-stream provider error")
+        } catch {
+            XCTAssertEqual(http.attemptCount, 1)
+            XCTAssertTrue(error.localizedDescription.contains("HTTP 503"))
+        }
     }
 
     func testRegistryResolvesOpenAIProvider() async throws {
@@ -122,5 +556,149 @@ final class IntatisProvidersTests: XCTestCase {
         } catch {
             // expected
         }
+    }
+
+    func testHealthCheckReportsOKForCompletedChatStream() async {
+        let sse = """
+        data: {"choices":[{"delta":{"content":"OK"}}]}
+
+        data: {"choices":[],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}
+
+        data: [DONE]
+
+        """
+        let config = ProviderConfig(
+            endpoints: [openAIEndpoint],
+            models: ResolvedModels(chat: ModelRef(endpoint: "e", model: ModelID(rawValue: "gpt-health"))))
+        let registry = ProviderRegistry(config: config, resolver: StaticSecret(key: "k"), http: FakeHTTP(chunks: [Data(sse.utf8)]))
+
+        let report = await registry.healthCheck()
+
+        XCTAssertEqual(report.status, .ok)
+        XCTAssertEqual(report.role, .chat)
+        XCTAssertEqual(report.endpointID, "e")
+        XCTAssertEqual(report.model.rawValue, "gpt-health")
+        XCTAssertEqual(report.wire, .openai)
+        XCTAssertEqual(report.totalTokens, 3)
+        XCTAssertEqual(report.responsePreview, "OK")
+        XCTAssertNil(report.code)
+    }
+
+    func testHealthCheckReportsPartialStreamWhenDoneMarkerMissing() async {
+        let sse = """
+        data: {"choices":[{"delta":{"content":"partial"}}]}
+
+        """
+        let config = ProviderConfig(
+            endpoints: [openAIEndpoint],
+            models: ResolvedModels(chat: ModelRef(endpoint: "e", model: ModelID(rawValue: "gpt-health"))))
+        let registry = ProviderRegistry(config: config, resolver: StaticSecret(key: "k"), http: FakeHTTP(chunks: [Data(sse.utf8)]))
+
+        let report = await registry.healthCheck()
+
+        XCTAssertEqual(report.status, .failed)
+        XCTAssertEqual(report.code, "provider.partial_stream")
+        XCTAssertEqual(report.responsePreview, "partial")
+        XCTAssertTrue(report.message.contains("completion marker"))
+    }
+
+    func testHealthCheckAcceptsFinishReasonWhenDoneMarkerMissing() async {
+        let sse = """
+        data: {"choices":[{"delta":{"content":"OK"}}]}
+
+        data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+
+        """
+        let config = ProviderConfig(
+            endpoints: [openAIEndpoint],
+            models: ResolvedModels(chat: ModelRef(endpoint: "e", model: ModelID(rawValue: "gpt-health"))))
+        let registry = ProviderRegistry(config: config,
+                                        resolver: StaticSecret(key: "k"),
+                                        http: FakeHTTP(chunks: [Data(sse.utf8)]))
+
+        let report = await registry.healthCheck()
+
+        XCTAssertEqual(report.status, .ok)
+        XCTAssertEqual(report.code, nil)
+        XCTAssertEqual(report.responsePreview, "OK")
+    }
+
+    func testHealthCheckReportsTimeout() async {
+        let config = ProviderConfig(
+            endpoints: [openAIEndpoint],
+            models: ResolvedModels(chat: ModelRef(endpoint: "e", model: ModelID(rawValue: "gpt-health"))))
+        let registry = ProviderRegistry(
+            config: config,
+            resolver: StaticSecret(key: "k"),
+            http: DelayedHTTP(delayNanoseconds: 2_000_000_000))
+
+        let report = await registry.healthCheck(options: ProviderHealthCheckOptions(timeoutSeconds: 0.01))
+
+        XCTAssertEqual(report.status, .failed)
+        XCTAssertEqual(report.code, "provider.timeout")
+        XCTAssertTrue(report.message.contains("timed out"))
+    }
+
+    func testHealthCheckReportsUnknownEndpointWithoutThrowing() async {
+        let config = ProviderConfig(
+            endpoints: [],
+            models: ResolvedModels(chat: ModelRef(endpoint: "missing", model: ModelID(rawValue: "x"))))
+        let registry = ProviderRegistry(config: config, resolver: StaticSecret(key: "k"), http: FakeHTTP(chunks: []))
+
+        let report = await registry.healthCheck()
+
+        XCTAssertEqual(report.status, .failed)
+        XCTAssertEqual(report.code, "config")
+        XCTAssertEqual(report.endpointID, "missing")
+        XCTAssertTrue(report.message.contains("unknown endpoint"))
+    }
+
+    func testHealthCheckReportsInvalidProviderURLAsConfigError() async {
+        let config = ProviderConfig(
+            endpoints: [nonHTTPChatEndpoint],
+            models: ResolvedModels(chat: ModelRef(endpoint: "bad-chat", model: ModelID(rawValue: "x"))))
+        let registry = ProviderRegistry(
+            config: config,
+            resolver: StaticSecret(key: "k"),
+            http: FakeHTTP(chunks: [Data("data: [DONE]\n\n".utf8)]))
+
+        let report = await registry.healthCheck()
+
+        XCTAssertEqual(report.status, .failed)
+        XCTAssertEqual(report.code, "config")
+        XCTAssertEqual(report.endpointID, "bad-chat")
+        XCTAssertTrue(report.message.contains("invalid provider endpoint 'bad-chat'"))
+        XCTAssertTrue(report.message.contains("Chat endpoint scheme 'file' is not supported"))
+    }
+
+    func testHealthCheckCanUseAgentRole() async throws {
+        let sse = """
+        data: {"choices":[{"delta":{"content":"OK"}}]}
+
+        data: {"choices":[],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}
+
+        data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+
+        """
+        let config = ProviderConfig(
+            endpoints: [openAIEndpoint],
+            models: ResolvedModels(
+                chat: ModelRef(endpoint: "e", model: ModelID(rawValue: "gpt-chat")),
+                agent: ModelRef(endpoint: "e", model: ModelID(rawValue: "gpt-agent"))))
+        let http = CapturingHTTP(chunks: [Data(sse.utf8)])
+        let registry = ProviderRegistry(config: config, resolver: StaticSecret(key: "k"), http: http)
+
+        let report = await registry.healthCheck(role: .agent)
+
+        XCTAssertEqual(report.status, .ok)
+        XCTAssertEqual(report.role, .agent)
+        XCTAssertEqual(report.model.rawValue, "gpt-agent")
+        XCTAssertEqual(report.totalTokens, 3)
+        XCTAssertEqual(report.responsePreview, "OK")
+
+        let body = try XCTUnwrap(http.lastBody)
+        let root = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        let streamOptions = try XCTUnwrap(root["stream_options"] as? [String: Any])
+        XCTAssertEqual(streamOptions["include_usage"] as? Bool, true)
     }
 }

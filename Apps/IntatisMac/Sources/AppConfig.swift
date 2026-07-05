@@ -3,12 +3,7 @@ import Foundation
 import IntatisCore
 import IntatisProviders
 
-struct AppSessionSummary: Identifiable, Equatable {
-    let id: SessionID
-    let kind: SessionKind
-    let updatedAt: Date
-    let eventCount: Int
-}
+typealias AppSessionSummary = SessionSummary
 
 struct AppProviderModel: Identifiable, Codable, Equatable {
     var id: String
@@ -45,7 +40,7 @@ struct AppProviderAPIKeySource: Codable, Equatable {
         case "authfile", "auth_file", "auth-json", "authjson", "json":
             return "authFile"
         default:
-            return "keychain"
+            return "authFile"
         }
     }
 
@@ -63,7 +58,7 @@ struct AppProviderAPIKeySource: Codable, Equatable {
         }
     }
 
-    var isKeychain: Bool { normalizedType == "keychain" }
+    var isLegacyKeychain: Bool { normalizedType == "keychain" }
 
     var openCodeAPIKeyValue: String? {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -151,7 +146,7 @@ struct AppProviderSettings: Identifiable, Codable, Equatable {
         self.chatEndpoint = try container.decodeIfPresent(String.self, forKey: .chatEndpoint)
             ?? AppConfig.chatEndpoint(forBaseURL: baseURL)
         self.apiKeyAccount = try container.decodeIfPresent(String.self, forKey: .apiKeyAccount)
-            ?? (self.id == "default" ? AppConfig.keychainAccount : "provider-\(self.id)")
+            ?? (self.id == "default" ? AppConfig.legacyAPIKeyAccount : "provider-\(self.id)")
         self.apiKeySource = try container.decodeIfPresent(AppProviderAPIKeySource.self, forKey: .apiKeySource)
         self.models = try container.decode([AppProviderModel].self, forKey: .models)
     }
@@ -183,12 +178,11 @@ private struct AppProviderSelection: Codable, Equatable {
     var modelID: String
 }
 
-/// v0.1 app configuration. Defaults to an OpenAI endpoint; the API key lives in
-/// the keychain (entered on first launch). The macOS build runs as the
-/// sandboxed App Store profile by default (no shell) — see ARCHITECTURE.md §9.1.
+/// App configuration. Defaults to an OpenAI-compatible endpoint; provider
+/// secrets are resolved from config/auth files, env vars, or explicit files.
+/// The macOS build runs as the sandboxed App Store profile by default (no shell).
 enum AppConfig {
-    static let keychainService = "com.intatis.app"
-    static let keychainAccount = "default-openai"
+    static let legacyAPIKeyAccount = "default-openai"
 
     /// Switch to `.macDeveloperID` for the notarized, shell-enabled build.
     static let platformProfile: PlatformProfile = .macAppStore
@@ -253,13 +247,9 @@ enum AppConfig {
         providerCatalog.selectedProvider?.title ?? "OpenAI"
     }
 
-    static var selectedAPIKeyAccount: String {
-        providerCatalog.selectedProvider?.apiKeyAccount ?? keychainAccount
-    }
-
     static var selectedAPIKeyRef: KeychainRef {
         guard let provider = providerCatalog.selectedProvider else {
-            return KeychainRef(service: keychainService, account: keychainAccount)
+            return .authFile(providerID: defaultProviderID)
         }
         return apiKeyRef(for: provider)
     }
@@ -341,6 +331,29 @@ enum AppConfig {
         }
     }
 
+    @discardableResult
+    static func writeEditableProviderConfig(catalog rawCatalog: AppProviderCatalog,
+                                            apiKeysByProviderID: [String: String]) throws -> URL {
+        let catalog = normalizedCatalog(rawCatalog)
+        let apiKeys = normalizedAPIKeys(apiKeysByProviderID)
+        let target = editableConfigFileURL()
+        do {
+            try writeProviderConfig(to: target,
+                                    catalog: catalog,
+                                    apiKeysByProviderID: apiKeys)
+            return target
+        } catch {
+            if configOverridePath() != nil {
+                throw error
+            }
+            let fallback = appSupportDir().appendingPathComponent("opencode.json")
+            try writeProviderConfig(to: fallback,
+                                    catalog: catalog,
+                                    apiKeysByProviderID: apiKeys)
+            return fallback
+        }
+    }
+
     static func appSupportDir() -> URL {
         let base = FileManager.default
             .urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
@@ -348,43 +361,15 @@ enum AppConfig {
     }
 
     static func sessionFile(_ session: SessionID) -> URL {
-        appSupportDir()
-            .appendingPathComponent(session.rawValue, isDirectory: true)
-            .appendingPathComponent("events.jsonl")
+        SessionHistoryStore.sessionFile(root: appSupportDir(), session: session)
+    }
+
+    static func artifactsDir(_ session: SessionID) -> URL {
+        SessionHistoryStore.artifactsDir(root: appSupportDir(), session: session)
     }
 
     static func recentSessions(kind: SessionKind) -> [AppSessionSummary] {
-        let prefix: String
-        switch kind {
-        case .chat:
-            prefix = "sess_"
-        case .code:
-            prefix = "code_"
-        case .cowork:
-            prefix = "cowork_"
-        }
-
-        let root = appSupportDir()
-        guard let sessions = try? FileManager.default.contentsOfDirectory(
-            at: root,
-            includingPropertiesForKeys: [.contentModificationDateKey],
-            options: [.skipsHiddenFiles]) else {
-            return []
-        }
-
-        return sessions.compactMap { url -> AppSessionSummary? in
-            let raw = url.lastPathComponent
-            guard raw.hasPrefix(prefix) else { return nil }
-            let events = url.appendingPathComponent("events.jsonl")
-            guard FileManager.default.fileExists(atPath: events.path) else { return nil }
-            let values = try? events.resourceValues(forKeys: [.contentModificationDateKey])
-            return AppSessionSummary(
-                id: SessionID(rawValue: raw),
-                kind: kind,
-                updatedAt: values?.contentModificationDate ?? .distantPast,
-                eventCount: eventCount(in: events))
-        }
-        .sorted { $0.updatedAt > $1.updatedAt }
+        SessionHistoryStore.recentSessions(root: appSupportDir(), kind: kind)
     }
 
     static func providerConfig() -> ProviderConfig {
@@ -417,7 +402,7 @@ enum AppConfig {
             id: id,
             displayName: "New Provider",
             baseURL: defaultBaseURL,
-            apiKeyAccount: keychainAccount(forProviderID: id),
+            apiKeyAccount: legacyAPIKeyAccount(forProviderID: id),
             models: [AppProviderModel(id: defaultModel, displayName: defaultDisplayName(for: defaultModel))])
     }
 
@@ -449,7 +434,7 @@ enum AppConfig {
                 baseURL: baseURL,
                 chatEndpoint: chatEndpoint,
                 apiKeyAccount: provider.apiKeyAccount.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    ? keychainAccount(forProviderID: id)
+                    ? legacyAPIKeyAccount(forProviderID: id)
                     : provider.apiKeyAccount.trimmingCharacters(in: .whitespacesAndNewlines),
                 apiKeySource: provider.apiKeySource,
                 models: models.isEmpty
@@ -485,7 +470,7 @@ enum AppConfig {
             displayName: "OpenAI",
             baseURL: baseURL,
             chatEndpoint: chatEndpoint(forBaseURL: baseURL),
-            apiKeyAccount: keychainAccount,
+            apiKeyAccount: legacyAPIKeyAccount,
             models: [AppProviderModel(id: model, displayName: defaultDisplayName(for: model))])
         return AppProviderCatalog(selectedProviderID: provider.id,
                                   selectedModelID: model,
@@ -524,7 +509,7 @@ enum AppConfig {
             id: defaultProviderID,
             displayName: "OpenAI",
             baseURL: defaultBaseURL,
-            apiKeyAccount: keychainAccount,
+            apiKeyAccount: legacyAPIKeyAccount,
             models: [AppProviderModel(id: defaultModel, displayName: defaultDisplayName(for: defaultModel))])
     }
 
@@ -538,8 +523,8 @@ enum AppConfig {
     }
 
     static func apiKeyRef(for provider: AppProviderSettings) -> KeychainRef {
-        let keychainRef = KeychainRef(service: keychainService, account: provider.apiKeyAccount)
-        return provider.apiKeySource?.ref(defaultRef: keychainRef, providerID: provider.id) ?? keychainRef
+        let configRef = KeychainRef.authFile(providerID: provider.id)
+        return provider.apiKeySource?.ref(defaultRef: configRef, providerID: provider.id) ?? configRef
     }
 
     static func chatEndpoint(forBaseURL baseURL: String) -> String {
@@ -617,6 +602,37 @@ enum AppConfig {
         }
     }
 
+    static func defaultAPIKeyConfigValue(forProviderID providerID: String) -> String {
+        let normalized = normalizedProviderID(providerID)
+        let name: String
+        switch normalized {
+        case "default", "openai":
+            name = "OPENAI_API_KEY"
+        case "openrouter":
+            name = "OPENROUTER_API_KEY"
+        case "deepseek":
+            name = "DEEPSEEK_API_KEY"
+        case "groq":
+            name = "GROQ_API_KEY"
+        case "xai":
+            name = "XAI_API_KEY"
+        case "together":
+            name = "TOGETHER_API_KEY"
+        case "fireworks":
+            name = "FIREWORKS_API_KEY"
+        case "cerebras":
+            name = "CEREBRAS_API_KEY"
+        case "moonshot":
+            name = "MOONSHOT_API_KEY"
+        default:
+            let suffix = providerID.uppercased().map { character -> Character in
+                character.isLetter || character.isNumber ? character : "_"
+            }
+            name = "\(String(suffix))_API_KEY"
+        }
+        return "{env:\(name)}"
+    }
+
     private static func trimTrailingPathSeparators(_ value: String) -> String {
         var result = value.trimmingCharacters(in: .whitespacesAndNewlines)
         while result.hasSuffix("/") && !result.hasSuffix("://") {
@@ -625,8 +641,8 @@ enum AppConfig {
         return result
     }
 
-    private static func keychainAccount(forProviderID providerID: String) -> String {
-        providerID == defaultProviderID ? keychainAccount : "provider-\(providerID)"
+    private static func legacyAPIKeyAccount(forProviderID providerID: String) -> String {
+        providerID == defaultProviderID ? legacyAPIKeyAccount : "provider-\(providerID)"
     }
 
     static func defaultDisplayName(for modelID: String) -> String {
@@ -711,15 +727,177 @@ enum AppConfig {
         return trimmed.isEmpty ? nil : trimmed
     }
 
+    private static func editableConfigFileURL() -> URL {
+        if let existing = existingConfigFileURL(),
+           configOverridePath() != nil || isModernConfigFile(existing) {
+            return existing
+        }
+        return preferredConfigFileURL()
+    }
+
     private static func writeConfigTemplate(to url: URL) throws {
+        try writeConfigTemplate(to: url,
+                                catalog: normalizedCatalog(providerCatalog),
+                                apiKeysByProviderID: [:])
+    }
+
+    private static func writeConfigTemplate(to url: URL,
+                                            catalog: AppProviderCatalog,
+                                            apiKeysByProviderID: [String: String]) throws {
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(),
             withIntermediateDirectories: true)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        let data = try encoder.encode(AppProviderConfigTemplate(catalog: normalizedCatalog(providerCatalog)))
+        let data = try encoder.encode(
+            AppProviderConfigTemplate(catalog: catalog,
+                                      apiKeysByProviderID: apiKeysByProviderID))
         try data.write(to: url, options: .atomic)
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    }
+
+    private static func writeProviderConfig(to url: URL,
+                                            catalog: AppProviderCatalog,
+                                            apiKeysByProviderID: [String: String]) throws {
+        if FileManager.default.fileExists(atPath: url.path),
+           var object = existingProviderConfigObject(from: url) {
+            applyProviderConfig(catalog: catalog,
+                                apiKeysByProviderID: apiKeysByProviderID,
+                                to: &object)
+            let data = try JSONSerialization.data(
+                withJSONObject: object,
+                options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true)
+            try data.write(to: url, options: .atomic)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+            return
+        }
+        try writeConfigTemplate(to: url,
+                                catalog: catalog,
+                                apiKeysByProviderID: apiKeysByProviderID)
+    }
+
+    private static func existingProviderConfigObject(from url: URL) -> [String: Any]? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        let configData = jsonCompatibleData(from: data)
+        guard let object = try? JSONSerialization.jsonObject(with: configData),
+              let root = object as? [String: Any] else {
+            return nil
+        }
+        return root
+    }
+
+    private static func applyProviderConfig(catalog: AppProviderCatalog,
+                                            apiKeysByProviderID: [String: String],
+                                            to root: inout [String: Any]) {
+        let existingAPIKeys = existingAPIKeyValues(in: root)
+        root.removeValue(forKey: "providers")
+        root["$schema"] = "https://opencode.ai/config.json"
+        root["enabled_providers"] = catalog.providers.map(\.id)
+        root["model"] = selectedOpenCodeModel(in: catalog)
+
+        var providerMap = root["provider"] as? [String: Any] ?? [:]
+        for provider in catalog.providers {
+            var providerObject = providerMap[provider.id] as? [String: Any] ?? [:]
+            providerObject["npm"] = providerObject["npm"] as? String ?? "@ai-sdk/openai-compatible"
+            providerObject["name"] = provider.title
+
+            var options = providerObject["options"] as? [String: Any] ?? [:]
+            options["baseURL"] = provider.baseURL
+            let chatEndpoint = provider.chatEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !chatEndpoint.isEmpty, chatEndpoint != AppConfig.chatEndpoint(forBaseURL: provider.baseURL) {
+                options["chatEndpoint"] = chatEndpoint
+            } else {
+                options.removeValue(forKey: "chatEndpoint")
+            }
+            options["apiKey"] = apiKeyConfigValue(
+                for: provider,
+                explicitAPIKeys: apiKeysByProviderID,
+                existingAPIKeys: existingAPIKeys)
+            providerObject["options"] = options
+
+            let existingModels = providerObject["models"] as? [String: Any] ?? [:]
+            providerObject["models"] = modelConfigValues(for: provider, existingModels: existingModels)
+            providerMap[provider.id] = providerObject
+        }
+        root["provider"] = providerMap
+    }
+
+    private static func selectedOpenCodeModel(in catalog: AppProviderCatalog) -> String {
+        let selectedProvider = catalog.providers.first { $0.id == catalog.selectedProviderID }
+            ?? catalog.providers.first
+        guard let selectedProvider else { return defaultModel }
+        let selectedModel = selectedProvider.models.first { $0.id == catalog.selectedModelID }
+            ?? selectedProvider.models.first
+        return "\(selectedProvider.id)/\(selectedModel?.id ?? defaultModel)"
+    }
+
+    private static func modelConfigValues(for provider: AppProviderSettings,
+                                          existingModels: [String: Any]) -> [String: Any] {
+        var models: [String: Any] = [:]
+        for model in provider.models {
+            var object = existingModels[model.id] as? [String: Any] ?? [:]
+            object["name"] = model.title
+            models[model.id] = object
+        }
+        return models
+    }
+
+    private static func apiKeyConfigValue(for provider: AppProviderSettings,
+                                          explicitAPIKeys: [String: String],
+                                          existingAPIKeys: [String: String]) -> String {
+        if let explicit = value(in: explicitAPIKeys, providerID: provider.id) {
+            return explicit
+        }
+        if let existing = value(in: existingAPIKeys, providerID: provider.id) {
+            return existing
+        }
+        return provider.apiKeySource?.openCodeAPIKeyValue
+            ?? defaultAPIKeyConfigValue(forProviderID: provider.id)
+    }
+
+    private static func existingAPIKeyValues(in root: [String: Any]) -> [String: String] {
+        guard let providerMap = root["provider"] as? [String: Any] else { return [:] }
+        var values: [String: String] = [:]
+        for (providerID, rawProvider) in providerMap {
+            guard let providerObject = rawProvider as? [String: Any] else { continue }
+            let optionValue = (providerObject["options"] as? [String: Any])?["apiKey"] as? String
+            let directValue = providerObject["apiKey"] as? String
+            if let value = nonEmpty(optionValue ?? directValue) {
+                values[providerID] = value
+            }
+        }
+        return values
+    }
+
+    private static func normalizedAPIKeys(_ apiKeysByProviderID: [String: String]) -> [String: String] {
+        var result: [String: String] = [:]
+        for (providerID, rawKey) in apiKeysByProviderID {
+            guard let id = nonEmpty(providerID),
+                  let key = nonEmpty(rawKey) else {
+                continue
+            }
+            result[id] = key
+        }
+        return result
+    }
+
+    private static func value(in map: [String: String], providerID: String) -> String? {
+        if let exact = nonEmpty(map[providerID]) { return exact }
+        let normalized = normalizedProviderID(providerID)
+        return map.first {
+            normalizedProviderID($0.key) == normalized
+        }.flatMap { nonEmpty($0.value) }
+    }
+
+    private static func nonEmpty(_ value: String?) -> String? {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty else {
+            return nil
+        }
+        return trimmed
     }
 
     private static func jsonCompatibleData(from data: Data) -> Data {
@@ -851,10 +1029,6 @@ enum AppConfig {
         return home + String(trimmed.dropFirst())
     }
 
-    private static func eventCount(in fileURL: URL) -> Int {
-        guard let data = try? Data(contentsOf: fileURL), !data.isEmpty else { return 0 }
-        return data.split(separator: 0x0A, omittingEmptySubsequences: true).count
-    }
 }
 
 private struct AppProviderConfigTemplate: Encodable {
@@ -870,7 +1044,8 @@ private struct AppProviderConfigTemplate: Encodable {
         case provider
     }
 
-    init(catalog: AppProviderCatalog) {
+    init(catalog: AppProviderCatalog,
+         apiKeysByProviderID: [String: String] = [:]) {
         self.enabledProviders = catalog.providers.map(\.id)
         let selectedProvider = catalog.providers.first { $0.id == catalog.selectedProviderID }
             ?? catalog.providers.first
@@ -884,7 +1059,9 @@ private struct AppProviderConfigTemplate: Encodable {
         }
 
         self.provider = Dictionary(uniqueKeysWithValues: catalog.providers.map { provider in
-            (provider.id, AppProviderConfigTemplateProvider(provider: provider))
+            (provider.id, AppProviderConfigTemplateProvider(
+                provider: provider,
+                apiKey: apiKeysByProviderID[provider.id]))
         })
     }
 }
@@ -895,9 +1072,9 @@ private struct AppProviderConfigTemplateProvider: Encodable {
     var options: AppProviderConfigTemplateOptions
     var models: [String: AppProviderConfigTemplateModel]
 
-    init(provider: AppProviderSettings) {
+    init(provider: AppProviderSettings, apiKey: String?) {
         self.name = provider.title
-        self.options = AppProviderConfigTemplateOptions(provider: provider)
+        self.options = AppProviderConfigTemplateOptions(provider: provider, apiKey: apiKey)
         self.models = Dictionary(uniqueKeysWithValues: provider.models.map { model in
             (model.id, AppProviderConfigTemplateModel(name: model.title))
         })
@@ -908,9 +1085,15 @@ private struct AppProviderConfigTemplateOptions: Encodable {
     var baseURL: String
     var apiKey: String?
 
-    init(provider: AppProviderSettings) {
+    init(provider: AppProviderSettings, apiKey: String?) {
         self.baseURL = provider.baseURL
-        self.apiKey = provider.apiKeySource?.openCodeAPIKeyValue
+        let trimmed = apiKey?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !trimmed.isEmpty {
+            self.apiKey = trimmed
+        } else {
+            self.apiKey = provider.apiKeySource?.openCodeAPIKeyValue
+                ?? AppConfig.defaultAPIKeyConfigValue(forProviderID: provider.id)
+        }
     }
 }
 
@@ -991,7 +1174,7 @@ private struct AppProviderConfigFile: Decodable {
             id: id,
             displayName: AppConfig.defaultProviderDisplayName(forProviderID: id),
             baseURL: baseURL,
-            apiKeyAccount: id == "default" ? AppConfig.keychainAccount : "provider-\(id)",
+            apiKeyAccount: id == "default" ? AppConfig.legacyAPIKeyAccount : "provider-\(id)",
             models: [AppProviderModel(id: modelID,
                                       displayName: AppConfig.defaultDisplayName(for: modelID))])
     }
@@ -1096,8 +1279,8 @@ private struct AppProviderConfigFileProvider: Decodable {
             displayName: displayName ?? name ?? AppConfig.defaultProviderDisplayName(forProviderID: id),
             baseURL: base,
             chatEndpoint: options?.chatEndpoint ?? chatEndpoint,
-            apiKeyAccount: apiKeyAccount ?? (id == "default" ? AppConfig.keychainAccount : "provider-\(id)"),
-            apiKeySource: source?.isKeychain == true ? nil : source,
+            apiKeyAccount: apiKeyAccount ?? (id == "default" ? AppConfig.legacyAPIKeyAccount : "provider-\(id)"),
+            apiKeySource: source?.isLegacyKeychain == true ? nil : source,
             models: modelList.isEmpty
                 ? [AppProviderModel(id: AppConfig.defaultModel, displayName: AppConfig.defaultModel)]
                 : modelList)

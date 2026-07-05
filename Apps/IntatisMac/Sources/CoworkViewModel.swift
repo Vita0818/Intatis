@@ -11,6 +11,26 @@ import IntatisAgentKernel
 import IntatisCowork
 import IntatisSharedUI
 
+private actor ProviderRegistryBox {
+    private var registry: ProviderRegistry
+
+    init(_ registry: ProviderRegistry) {
+        self.registry = registry
+    }
+
+    func update(_ registry: ProviderRegistry) {
+        self.registry = registry
+    }
+
+    func defaultAgentProvider() async throws -> ToolCallingProvider {
+        try await registry.defaultAgentProvider()
+    }
+
+    func agentModel() async -> ModelID {
+        await registry.agentModel()
+    }
+}
+
 /// Drives a Cowork session: owns the `Orchestrator`, folds the shared event log
 /// into items + an agent roster, parses `@mention` routing, and serves as the
 /// `PermissionResponder` for whichever agent is currently acting.
@@ -23,27 +43,38 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
     @Published private(set) var isWorking = false
     @Published var pendingPermission: PendingPermission?
     @Published private(set) var permissionNotice: PermissionResolutionNotice?
+    @Published private(set) var latestTurnStats: TurnStatsSnapshot?
     @Published private(set) var composerError: String?
     @Published private(set) var projectionError: String?
     @Published private(set) var addAgentStatus: CoworkAddAgentStatus = .idle
 
     private let log: EventLog
-    private let registry: ProviderRegistry
+    private let registryBox: ProviderRegistryBox
     private var orchestrator: Orchestrator?
     private var subscription: Task<Void, Never>?
     private var permissionContinuation: CheckedContinuation<PermissionDecision, Never>?
     private var retryableTasks: [String: CoworkTaskView] = [:]
+    let sessionID: SessionID
 
-    init(log: EventLog, registry: ProviderRegistry) {
+    init(sessionID: SessionID, log: EventLog, registry: ProviderRegistry) {
+        self.sessionID = sessionID
         self.log = log
-        self.registry = registry
+        self.registryBox = ProviderRegistryBox(registry)
+    }
+
+    deinit {
+        subscription?.cancel()
+    }
+
+    func updateProviderRegistry(_ registry: ProviderRegistry) {
+        Task { await registryBox.update(registry) }
     }
 
     func start() {
         guard orchestrator == nil else { return }
-        let reg = registry
+        let registryBox = registryBox
         orchestrator = Orchestrator(log: log, allowsShell: PlatformProfile.current.allowsShell, responder: self) { _ in
-            try await reg.defaultAgentProvider()
+            try await registryBox.defaultAgentProvider()
         }
         subscription = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -51,23 +82,43 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             var codeProjection = CodeProjection.build(from: replayed)
             var coworkProjection = CoworkProjection.build(from: replayed)
             var permissions = PermissionProjection.build(from: replayed, markNeedsRerun: true)
+            var turnStats = TurnStatsProjection.build(from: replayed)
             self.restoreWorkspaceAccess(for: coworkProjection)
             await self.orchestrator?.restore(from: coworkProjection)
             self.items = codeProjection.items
             self.pendingPermission = permissions.latest
             self.permissionNotice = permissions.latestResolved
+            self.latestTurnStats = turnStats.latest
             self.applyCoworkProjection(coworkProjection)
             let stream = await self.log.stream(from: (replayed.last?.seq ?? -1) + 1)
             for await envelope in stream {
                 codeProjection.apply(envelope)
                 coworkProjection.apply(envelope)
                 permissions.apply(envelope)
+                turnStats.apply(envelope)
                 self.items = codeProjection.items
                 self.pendingPermission = permissions.latest
                 self.permissionNotice = permissions.latestResolved
+                self.latestTurnStats = turnStats.latest
                 self.applyCoworkProjection(coworkProjection)
             }
         }
+    }
+
+    func stop() {
+        subscription?.cancel()
+        subscription = nil
+        if let continuation = permissionContinuation {
+            continuation.resume(returning: .deny)
+            permissionContinuation = nil
+        }
+        if var pending = pendingPermission, pending.state.isActionable {
+            pending.state = .expired
+            pendingPermission = pending
+        }
+        orchestrator = nil
+        isWorking = false
+        addAgentStatus = .idle
     }
 
     private func applyCoworkProjection(_ projection: CoworkProjection) {
@@ -180,7 +231,7 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             guard let self else { return }
             let replayed = await self.log.replay()
             let startSeq = replayed.last?.seq ?? -1
-            let model = await self.registry.agentModel()
+            let model = await self.registryBox.agentModel()
             let attached = await orchestrator.attach(Agent(name: AgentID(rawValue: normalizedName), workspaceRoot: workspace,
                                             model: model, profile: .reviewed,
                                             coordinationDepth: Agent.defaultCoordinationDepth))

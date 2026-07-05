@@ -25,6 +25,14 @@ private func summary(_ s: String) -> String {
     return extra > 0 ? "\(head)  (+\(extra) 行，/verbose 看全部)" : head
 }
 
+private func isFailureObservation(_ s: String) -> Bool {
+    let lower = s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    return lower.hasPrefix("tool error:")
+        || lower.hasPrefix("permission denied:")
+        || lower.hasPrefix("unknown tool:")
+        || lower.hasPrefix("invalid tool input:")
+}
+
 /// Shared, mutable render verbosity. Collapsed by default; `/verbose` flips it.
 final class RenderOptions: @unchecked Sendable {
     private let lock = NSLock()
@@ -67,10 +75,11 @@ func renderLoop(_ log: EventLog, showAgentLabels: Bool = false, spinner: TurnSpi
             let args = options.verbose ? truncate(p.args, 800) : oneLine(p.args, 72)
             out("\n  \(cyan)· \(p.name)\(reset) \(dim)\(args)\(reset)\n")
         case .toolResult(let p):
+            let color = isFailureObservation(p.observation) ? red : dim
             if options.verbose {
-                out("  \(dim)⎿\(reset) \(truncate(p.observation, 4000))\n")
+                out("  \(color)⎿\(reset) \(truncate(p.observation, 4000))\n")
             } else {
-                out("  \(dim)⎿ \(summary(p.observation))\(reset)\n")
+                out("  \(color)⎿ \(summary(p.observation))\(reset)\n")
             }
         case .permissionResolved(let p):
             out("  \(yellow)[\(p.decision.rawValue): \(p.tool) — \(p.reason)]\(reset)\n")

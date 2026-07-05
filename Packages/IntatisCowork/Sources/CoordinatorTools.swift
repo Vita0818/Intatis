@@ -28,6 +28,7 @@ public struct SpawnAgentTool: Tool {
                                   "description": .string("optional model id; defaults to your model")]),
             ]),
             "required": .array([.string("name"), .string("path")]),
+            "additionalProperties": .bool(false),
         ])
     )
 
@@ -53,6 +54,7 @@ public struct ListAgentsTool: Tool {
         parameters: .object([
             "type": .string("object"),
             "properties": .object([:]),
+            "additionalProperties": .bool(false),
         ])
     )
 
@@ -79,6 +81,7 @@ public struct RemoveAgentTool: Tool {
                                  "description": .string("the agent name to remove")]),
             ]),
             "required": .array([.string("name")]),
+            "additionalProperties": .bool(false),
         ])
     )
 

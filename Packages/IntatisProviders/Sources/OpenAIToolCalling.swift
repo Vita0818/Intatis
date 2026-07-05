@@ -14,20 +14,99 @@ private struct OAAgentStreamChunk: Decodable {
             let tool_calls: [ToolCallFragment]?
         }
         struct ToolCallFragment: Decodable {
-            struct Fn: Decodable { let name: String?; let arguments: String? }
-            let index: Int
+            struct Fn: Decodable {
+                let name: String?
+                let arguments: String?
+
+                enum CodingKeys: String, CodingKey {
+                    case name
+                    case arguments
+                }
+
+                init(from decoder: Decoder) throws {
+                    let container = try decoder.container(keyedBy: CodingKeys.self)
+                    name = try container.decodeIfPresent(String.self, forKey: .name)
+                    if let stringArguments = try? container.decodeIfPresent(String.self, forKey: .arguments) {
+                        arguments = stringArguments
+                    } else if container.contains(.arguments) {
+                        let value = try container.decode(JSONValue.self, forKey: .arguments)
+                        arguments = try Self.argumentString(from: value)
+                    } else {
+                        arguments = nil
+                    }
+                }
+
+                private static func argumentString(from value: JSONValue) throws -> String? {
+                    if value == .null { return nil }
+                    let data = try JSONEncoder().encode(value)
+                    return String(data: data, encoding: .utf8)
+                }
+            }
+            let index: Int?
             let id: String?
             let function: Fn?
+
+            enum CodingKeys: String, CodingKey {
+                case index
+                case id
+                case function
+            }
+
+            init(from decoder: Decoder) throws {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                if let intIndex = try? container.decodeIfPresent(Int.self, forKey: .index) {
+                    index = intIndex
+                } else if let stringIndex = try? container.decodeIfPresent(String.self, forKey: .index),
+                          let parsed = Int(stringIndex) {
+                    index = parsed
+                } else {
+                    index = nil
+                }
+                id = try container.decodeIfPresent(String.self, forKey: .id)
+                function = try container.decodeIfPresent(Fn.self, forKey: .function)
+            }
         }
+        let index: Int?
         let delta: Delta?
         let finish_reason: String?
+
+        enum CodingKeys: String, CodingKey {
+            case index
+            case delta
+            case finish_reason
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            if let intIndex = try? container.decodeIfPresent(Int.self, forKey: .index) {
+                index = intIndex
+            } else if let stringIndex = try? container.decodeIfPresent(String.self, forKey: .index),
+                      let parsed = Int(stringIndex) {
+                index = parsed
+            } else {
+                index = nil
+            }
+            delta = try container.decodeIfPresent(Delta.self, forKey: .delta)
+            finish_reason = try container.decodeIfPresent(String.self, forKey: .finish_reason)
+        }
     }
     struct UsageDTO: Decodable {
+        struct PromptTokensDetailsDTO: Decodable {
+            let cached_tokens: Int?
+        }
         let prompt_tokens: Int?
         let completion_tokens: Int?
         let total_tokens: Int?
+        let prompt_tokens_details: PromptTokensDetailsDTO?
+
+        var usage: Usage {
+            Usage(promptTokens: prompt_tokens,
+                  cachedPromptTokens: prompt_tokens_details?.cached_tokens,
+                  completionTokens: completion_tokens,
+                  totalTokens: total_tokens)
+        }
     }
-    let choices: [Choice]
+    let choices: [Choice]?
     let usage: UsageDTO?
 }
 
@@ -35,6 +114,43 @@ private struct ToolCallAccum {
     var id = ""
     var name = ""
     var args = ""
+}
+
+private struct ToolCallAccumKey: Comparable, Hashable {
+    var choiceIndex: Int
+    var toolIndex: Int
+
+    static func < (lhs: ToolCallAccumKey, rhs: ToolCallAccumKey) -> Bool {
+        if lhs.choiceIndex != rhs.choiceIndex {
+            return lhs.choiceIndex < rhs.choiceIndex
+        }
+        return lhs.toolIndex < rhs.toolIndex
+    }
+}
+
+private func preferredToolFinishReason(_ current: String?, _ candidate: String) -> String {
+    if candidate == "tool_calls" || candidate == "function_call" {
+        return candidate
+    }
+    return current ?? candidate
+}
+
+private func validatedToolCallArguments(_ arguments: String,
+                                        key: ToolCallAccumKey,
+                                        reason: String) throws -> String {
+    let trimmed = arguments.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return arguments }
+    guard let data = trimmed.data(using: .utf8) else {
+        throw ProviderErrorFormatting.invalidToolCallStream(
+            "The provider finished with \(reason) but emitted non-UTF-8 arguments for choice/tool index \(key.choiceIndex):\(key.toolIndex).")
+    }
+    do {
+        _ = try JSONDecoder().decode(JSONValue.self, from: data)
+    } catch {
+        throw ProviderErrorFormatting.invalidToolCallStream(
+            "The provider finished with \(reason) but emitted invalid JSON arguments for choice/tool index \(key.choiceIndex):\(key.toolIndex).")
+    }
+    return arguments
 }
 
 // MARK: - ToolCallingProvider conformance
@@ -46,62 +162,140 @@ extension OpenAIWireProvider: ToolCallingProvider {
             let task = Task {
                 do {
                     let urlRequest = try buildAgentRequest(request)
-                    let parser = SSEParser()
-                    var acc: [Int: ToolCallAccum] = [:]
-                    var finished = false
+                    var attempt = 1
 
-                    func handle(_ payload: String) {
-                        if payload == "[DONE]" { return }
-                        guard let data = payload.data(using: .utf8),
-                              let chunk = try? JSONDecoder().decode(OAAgentStreamChunk.self, from: data) else {
+                    while true {
+                        let parser = SSEParser()
+                        var acc: [ToolCallAccumKey: ToolCallAccum] = [:]
+                        var finished = false
+                        var receivedResponseBytes = false
+
+                        func handle(_ payload: String) throws -> Bool {
+                            if payload == "[DONE]" {
+                                if !finished {
+                                    continuation.yield(.done(finishReason: nil))
+                                    finished = true
+                                }
+                                continuation.finish()
+                                return true
+                            }
+                            let trimmed = payload.trimmingCharacters(in: .whitespacesAndNewlines)
+                            guard !trimmed.isEmpty, let data = trimmed.data(using: .utf8) else {
+                                return false
+                            }
+                            if let providerError = ProviderErrorFormatting.streamErrorPayload(data) {
+                                throw providerError
+                            }
+                            let chunk: OAAgentStreamChunk
+                            do {
+                                chunk = try JSONDecoder().decode(OAAgentStreamChunk.self, from: data)
+                            } catch {
+                                throw ProviderErrorFormatting.invalidStreamPayload(trimmed, underlying: error)
+                            }
+                            if let u = chunk.usage {
+                                continuation.yield(.usage(u.usage))
+                            }
+                            var finishReason: String?
+                            if let choices = chunk.choices {
+                                for (choiceOffset, choice) in choices.enumerated() {
+                                    let choiceIndex = choice.index ?? choiceOffset
+                                    if let content = choice.delta?.content, !content.isEmpty {
+                                        continuation.yield(.textDelta(content))
+                                    }
+                                    if let frags = choice.delta?.tool_calls {
+                                        for (toolOffset, f) in frags.enumerated() {
+                                            let key = ToolCallAccumKey(choiceIndex: choiceIndex,
+                                                                       toolIndex: f.index ?? toolOffset)
+                                            var e = acc[key] ?? ToolCallAccum()
+                                            if let id = f.id { e.id = id }
+                                            if let fn = f.function {
+                                                if let n = fn.name { e.name = n }
+                                                if let a = fn.arguments { e.args += a }
+                                            }
+                                            acc[key] = e
+                                        }
+                                    }
+                                    if let reason = choice.finish_reason {
+                                        finishReason = preferredToolFinishReason(finishReason, reason)
+                                    }
+                                }
+                            }
+                            if let reason = finishReason, !finished {
+                                let toolCallKeys = acc.keys.sorted()
+                                let incomplete = toolCallKeys.filter { key in
+                                    guard let entry = acc[key] else { return true }
+                                    return entry.name.isEmpty
+                                }
+                                if reason == "tool_calls" || reason == "function_call" {
+                                    if toolCallKeys.isEmpty {
+                                        throw ProviderErrorFormatting.invalidToolCallStream(
+                                            "The provider finished with \(reason) but did not emit any tool call deltas.")
+                                    }
+                                }
+                                if !incomplete.isEmpty {
+                                    let indexes = incomplete
+                                        .map { "\($0.choiceIndex):\($0.toolIndex)" }
+                                        .joined(separator: ", ")
+                                    throw ProviderErrorFormatting.invalidToolCallStream(
+                                        "The provider finished with \(reason) but omitted tool names for choice/tool index \(indexes).")
+                                }
+                                let calls: [ToolCall] = try toolCallKeys.map { key in
+                                    guard let e = acc[key], !e.name.isEmpty else {
+                                        throw ProviderErrorFormatting.invalidToolCallStream(
+                                            "The provider finished with \(reason) but omitted tool names for choice/tool index \(key.choiceIndex):\(key.toolIndex).")
+                                    }
+                                    let fallbackID = key.choiceIndex == 0
+                                        ? "call_\(key.toolIndex)"
+                                        : "call_\(key.choiceIndex)_\(key.toolIndex)"
+                                    let arguments = try validatedToolCallArguments(e.args, key: key, reason: reason)
+                                    return ToolCall(id: e.id.isEmpty ? fallbackID : e.id,
+                                                    name: e.name, arguments: arguments)
+                                }
+                                if !calls.isEmpty { continuation.yield(.toolCalls(calls)) }
+                                continuation.yield(.done(finishReason: reason))
+                                finished = true
+                            }
+                            return false
+                        }
+
+                        do {
+                            for try await chunk in http.stream(urlRequest) {
+                                receivedResponseBytes = true
+                                for payload in parser.consume(chunk) {
+                                    if try handle(payload) { return }
+                                }
+                            }
+                            for payload in parser.flush() {
+                                if try handle(payload) { return }
+                            }
+                            guard finished else {
+                                continuation.finish(throwing: ProviderErrorFormatting.incompleteStream(
+                                    operation: "tool-calling streaming request"))
+                                return
+                            }
+                            continuation.finish()
+                            return
+                        } catch {
+                            if ProviderRuntime.shouldRetry(error: error,
+                                                           attempt: attempt,
+                                                           policy: runtimePolicy,
+                                                           receivedResponseBytes: receivedResponseBytes) {
+                                attempt += 1
+                                try await ProviderRuntime.sleepBeforeRetry(
+                                    nextAttempt: attempt,
+                                    policy: runtimePolicy,
+                                    retryHint: ProviderErrorFormatting.retryHint(from: error))
+                                continue
+                            }
+                            continuation.finish(throwing: ProviderRuntime.exhausted(
+                                error,
+                                attempts: attempt,
+                                operation: "tool-calling streaming request"))
                             return
                         }
-                        if let u = chunk.usage {
-                            continuation.yield(.usage(Usage(promptTokens: u.prompt_tokens,
-                                                            completionTokens: u.completion_tokens,
-                                                            totalTokens: u.total_tokens)))
-                        }
-                        guard let choice = chunk.choices.first else { return }
-                        if let content = choice.delta?.content, !content.isEmpty {
-                            continuation.yield(.textDelta(content))
-                        }
-                        if let frags = choice.delta?.tool_calls {
-                            for f in frags {
-                                var e = acc[f.index] ?? ToolCallAccum()
-                                if let id = f.id { e.id = id }
-                                if let fn = f.function {
-                                    if let n = fn.name { e.name = n }
-                                    if let a = fn.arguments { e.args += a }
-                                }
-                                acc[f.index] = e
-                            }
-                        }
-                        if let reason = choice.finish_reason {
-                            let calls: [ToolCall] = acc.keys.sorted().compactMap { idx in
-                                guard let e = acc[idx], !e.name.isEmpty else { return nil }
-                                return ToolCall(id: e.id.isEmpty ? "call_\(idx)" : e.id,
-                                                name: e.name, arguments: e.args)
-                            }
-                            if !calls.isEmpty { continuation.yield(.toolCalls(calls)) }
-                            continuation.yield(.done(finishReason: reason))
-                            finished = true
-                        }
                     }
-
-                    for try await chunk in http.stream(urlRequest) {
-                        for payload in parser.consume(chunk) {
-                            handle(payload)
-                            if finished { continuation.finish(); return }
-                        }
-                    }
-                    for payload in parser.flush() {
-                        handle(payload)
-                        if finished { continuation.finish(); return }
-                    }
-                    if !finished { continuation.yield(.done(finishReason: nil)) }
-                    continuation.finish()
                 } catch {
-                    continuation.finish(throwing: error)
+                    continuation.finish(throwing: ProviderErrorFormatting.transport(error))
                 }
             }
             continuation.onTermination = { _ in task.cancel() }
@@ -127,7 +321,8 @@ extension OpenAIWireProvider: ToolCallingProvider {
             root["stream_options"] = .object(["include_usage": .bool(true)])
         }
 
-        var r = URLRequest(url: endpoint.chatCompletionsURL)
+        var r = URLRequest(url: try endpoint.validatedChatCompletionsURL(operation: "tool-calling streaming request"))
+        ProviderRuntime.apply(runtimePolicy, to: &r)
         r.httpMethod = "POST"
         r.setValue("application/json", forHTTPHeaderField: "Content-Type")
         r.setValue("text/event-stream", forHTTPHeaderField: "Accept")

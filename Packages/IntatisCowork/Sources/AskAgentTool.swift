@@ -22,6 +22,7 @@ public struct AskAgentTool: Tool {
                 "question": .object(["type": .string("string")]),
             ]),
             "required": .array([.string("to"), .string("question")]),
+            "additionalProperties": .bool(false),
         ])
     )
 

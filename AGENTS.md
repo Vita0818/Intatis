@@ -10,6 +10,7 @@
 3. `docs/ARCHITECTURE.md`
 4. `docs/DO_NOT_BREAK.md`
 5. `docs/TESTING.md`
+6. `docs/NEXT_TARGET.md`（如果存在）
 6. `docs/COWORK_PRINCIPLES.md`（修改 Cowork / AgentKernel / MessageBus / 权限 / agent 编排前必读）
 
 如果文档与源码、工程配置、测试或脚本冲突，必须以当前源码和配置为准，并在最终报告中明确指出冲突位置和采用源码为准的原因。
@@ -87,6 +88,7 @@ git status --short
 - `docs/CURRENT_STATE.md`：当前真实状态、已有能力、风险、工作区改动。
 - `docs/TESTING.md`：环境、构建、测试、lint/format 与手动验证方式。
 - `docs/DO_NOT_BREAK.md`：工程禁区、数据格式、协议、路径和回归要求。
+- `docs/NEXT_TARGET.md`：临时下一目标记录；目标完成或不再有效后删除。
 - `docs/COWORK_PRINCIPLES.md`：Cowork 架构原则（agent 身份/任务契约/能力租约/上下文投影/递归禁止/安全边界/实现顺序/测试期望）。
 
 ## 完成标准
@@ -97,6 +99,7 @@ git status --short
 - 只修改任务范围内文件。
 - 保留用户已有改动。
 - 运行与任务相称的检查；文档任务至少运行 `git diff --check` 与 `git status --short`。
+- 将本轮已完成的持久性改动及时回写到相关项目文档；若无需更新文档，最终报告说明原因。
 - 如未运行构建或测试，最终报告必须明确写"未运行构建/测试"。
 
 ## 最终报告格式

@@ -38,12 +38,67 @@ public enum ReasoningEffort: String, Codable, Sendable {
 /// Token usage reported by the endpoint (when available).
 public struct Usage: Equatable, Sendable {
     public var promptTokens: Int?
+    public var cachedPromptTokens: Int?
     public var completionTokens: Int?
     public var totalTokens: Int?
-    public init(promptTokens: Int? = nil, completionTokens: Int? = nil, totalTokens: Int? = nil) {
+    public var contextWindowTokens: Int?
+    public init(promptTokens: Int? = nil,
+                cachedPromptTokens: Int? = nil,
+                completionTokens: Int? = nil,
+                totalTokens: Int? = nil,
+                contextWindowTokens: Int? = nil) {
         self.promptTokens = promptTokens
+        self.cachedPromptTokens = cachedPromptTokens
         self.completionTokens = completionTokens
         self.totalTokens = totalTokens
+        self.contextWindowTokens = contextWindowTokens
+    }
+}
+
+public extension Usage {
+    /// Merge usage chunks from the same provider response. Later non-nil fields
+    /// win, while nil fields do not erase values reported by earlier chunks.
+    static func merging(_ current: Usage?, with update: Usage) -> Usage {
+        current?.merged(with: update) ?? update
+    }
+
+    /// Add usage totals from separate provider requests, such as each turn in a
+    /// tool-calling loop.
+    static func adding(_ current: Usage?, _ increment: Usage?) -> Usage? {
+        guard let increment else { return current }
+        guard let current else { return increment }
+        return current.adding(increment)
+    }
+
+    func merged(with update: Usage) -> Usage {
+        Usage(
+            promptTokens: update.promptTokens ?? promptTokens,
+            cachedPromptTokens: update.cachedPromptTokens ?? cachedPromptTokens,
+            completionTokens: update.completionTokens ?? completionTokens,
+            totalTokens: update.totalTokens ?? totalTokens,
+            contextWindowTokens: update.contextWindowTokens ?? contextWindowTokens)
+    }
+
+    func adding(_ other: Usage) -> Usage {
+        Usage(
+            promptTokens: Self.add(promptTokens, other.promptTokens),
+            cachedPromptTokens: Self.add(cachedPromptTokens, other.cachedPromptTokens),
+            completionTokens: Self.add(completionTokens, other.completionTokens),
+            totalTokens: Self.add(totalTokens, other.totalTokens),
+            contextWindowTokens: contextWindowTokens ?? other.contextWindowTokens)
+    }
+
+    private static func add(_ lhs: Int?, _ rhs: Int?) -> Int? {
+        switch (lhs, rhs) {
+        case let (l?, r?):
+            return l + r
+        case let (l?, nil):
+            return l
+        case let (nil, r?):
+            return r
+        case (nil, nil):
+            return nil
+        }
     }
 }
 

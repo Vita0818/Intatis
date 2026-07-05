@@ -11,6 +11,7 @@
 
 #if canImport(SwiftUI)
 import SwiftUI
+import IntatisSharedUI
 
 // MARK: - Color tokens
 
@@ -84,6 +85,27 @@ enum IntatisType {
     static func caption(_ size: CGFloat = 12, _ w: Font.Weight = .medium) -> Font { .system(size: size, weight: w) }
     static func mono(_ size: CGFloat = 13, _ w: Font.Weight = .regular) -> Font { .system(size: size, weight: w, design: .monospaced) }
     static func chat(_ size: CGFloat = 15, _ w: Font.Weight = .regular) -> Font { .system(size: size, weight: w) }
+}
+
+extension IntatisThreadStyle {
+    static func intatisMac(_ scheme: ColorScheme) -> IntatisThreadStyle {
+        IntatisThreadStyle(
+            primaryText: IntatisTheme.deepText(scheme),
+            secondaryText: IntatisTheme.softText(scheme),
+            tertiaryText: IntatisTheme.tertiaryText(scheme),
+            accent: IntatisTheme.goldDeep,
+            accentSoft: IntatisTheme.goldSoft.opacity(scheme == .dark ? 0.24 : 0.45),
+            surface: IntatisTheme.glassSurface(scheme),
+            stroke: IntatisTheme.glassStroke(scheme).opacity(scheme == .dark ? 0.50 : 0.85),
+            userBubble: IntatisTheme.sand.opacity(scheme == .dark ? 0.16 : 0.85),
+            assistantBubble: IntatisTheme.glassSurface(scheme).opacity(scheme == .dark ? 0.30 : 0.70),
+            cardSurface: IntatisTheme.glassSurface(scheme).opacity(scheme == .dark ? 0.28 : 0.64),
+            cardStroke: IntatisTheme.glassStroke(scheme).opacity(scheme == .dark ? 0.40 : 0.70),
+            warningSurface: IntatisTheme.goldSoft.opacity(scheme == .dark ? 0.16 : 0.20),
+            warningStroke: IntatisTheme.gold.opacity(scheme == .dark ? 0.32 : 0.42),
+            error: .red,
+            material: .ultraThinMaterial)
+    }
 }
 
 // MARK: - Liquid-glass material

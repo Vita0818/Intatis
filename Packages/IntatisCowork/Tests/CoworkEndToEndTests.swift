@@ -315,8 +315,8 @@ final class CoworkEndToEndTests: XCTestCase {
             if case .toolResult(let payload) = envelope.event { return payload }
             return nil
         }
-        XCTAssertTrue(toolResults.contains { $0.observation == "unknown tool: delegate_task" })
-        XCTAssertTrue(toolResults.contains { $0.observation == "unknown tool: spawn_agent" })
+        XCTAssertTrue(toolResults.contains { $0.observation.hasPrefix("unknown tool: delegate_task") })
+        XCTAssertTrue(toolResults.contains { $0.observation.hasPrefix("unknown tool: spawn_agent") })
         XCTAssertFalse(events.contains { if case .agentSpawned = $0.event { return true } else { return false } })
         let graphStatus = await orch.taskGraphNode(taskID)?.status
         let queuedCount = await orch.queuedTasks().count

@@ -16,12 +16,16 @@ public struct CodeItem: Identifiable, Equatable, Sendable {
     public var files: [String]
     public var tags: [String]
     public var goal: String?
+    public var isFailure: Bool
+    public var recoveryAdvice: RuntimeRecoveryAdvice?
 
     public init(id: String, kind: Kind, title: String, body: String,
                 complete: Bool = true,
                 files: [String] = [],
                 tags: [String] = [],
-                goal: String? = nil) {
+                goal: String? = nil,
+                isFailure: Bool = false,
+                recoveryAdvice: RuntimeRecoveryAdvice? = nil) {
         self.id = id
         self.kind = kind
         self.title = title
@@ -30,6 +34,8 @@ public struct CodeItem: Identifiable, Equatable, Sendable {
         self.files = files
         self.tags = tags
         self.goal = goal
+        self.isFailure = isFailure
+        self.recoveryAdvice = recoveryAdvice
     }
 }
 
@@ -78,6 +84,62 @@ public struct ArtifactProgressProjection: Equatable, Sendable {
     }
 }
 
+public struct TurnStatsSnapshot: Identifiable, Equatable, Sendable {
+    public var id: String
+    public var promptTokens: Int?
+    public var cachedPromptTokens: Int?
+    public var completionTokens: Int?
+    public var totalTokens: Int?
+    public var contextWindowTokens: Int?
+    public var ttftMillis: Int?
+    public var totalMillis: Int?
+    public var model: String?
+
+    public init(id: String, payload: TurnStatsPayload) {
+        self.id = id
+        self.promptTokens = payload.promptTokens
+        self.cachedPromptTokens = payload.cachedPromptTokens
+        self.completionTokens = payload.completionTokens
+        self.totalTokens = payload.totalTokens
+        self.contextWindowTokens = payload.contextWindowTokens
+        self.ttftMillis = payload.ttftMillis
+        self.totalMillis = payload.totalMillis
+        self.model = payload.model
+    }
+
+    public var hasDisplayableMetrics: Bool {
+        promptTokens != nil
+            || cachedPromptTokens != nil
+            || completionTokens != nil
+            || totalTokens != nil
+            || contextWindowTokens != nil
+            || ttftMillis != nil
+            || totalMillis != nil
+    }
+}
+
+public struct TurnStatsProjection: Equatable, Sendable {
+    public private(set) var latest: TurnStatsSnapshot?
+
+    public init() {}
+
+    public mutating func apply(_ envelope: Envelope) {
+        guard case .turnStats(let payload) = envelope.event else { return }
+        let snapshot = TurnStatsSnapshot(
+            id: "\(envelope.session.rawValue):\(envelope.seq):turn_stats",
+            payload: payload)
+        latest = snapshot.hasDisplayableMetrics ? snapshot : nil
+    }
+
+    public static func build(from envelopes: [Envelope]) -> TurnStatsProjection {
+        var projection = TurnStatsProjection()
+        for envelope in envelopes {
+            projection.apply(envelope)
+        }
+        return projection
+    }
+}
+
 /// Folds the event stream into `[CodeItem]`. `permission_request` is intentionally
 /// not folded here — the pending request is surfaced separately as an actionable
 /// card (the gate runs before execution).
@@ -117,8 +179,13 @@ public struct CodeProjection: Equatable, Sendable {
             items.append(CodeItem(id: p.toolCallId, kind: .toolCall, title: p.name, body: p.args))
 
         case .toolResult(let p):
+            let toolName = toolName(for: p.toolCallId)
+            let title = toolName.map { "result · \($0)" } ?? "result"
+            let isFailure = Self.isFailureObservation(p.observation)
             items.append(CodeItem(id: p.toolCallId + ":result", kind: .toolResult,
-                                  title: "result", body: p.observation))
+                                  title: title, body: p.observation,
+                                  isFailure: isFailure,
+                                  recoveryAdvice: RuntimeErrorPresentation.recoveryAdvice(forToolObservation: p.observation)))
 
         case .patchProposed(let p):
             items.append(CodeItem(id: p.patchId, kind: .patch, title: "patch", body: p.diff, files: p.files))
@@ -128,7 +195,13 @@ public struct CodeProjection: Equatable, Sendable {
                                   body: "\(p.decision.rawValue): \(p.tool) — \(p.reason)"))
 
         case .error(let p):
-            items.append(CodeItem(id: stableID(envelope, "error"), kind: .error, title: "error", body: p.message))
+            markCurrentPartialAgentStopped(with: p)
+            items.append(CodeItem(id: stableID(envelope, "error"),
+                                  kind: .error,
+                                  title: "error · \(p.code)",
+                                  body: p.message,
+                                  isFailure: true,
+                                  recoveryAdvice: RuntimeErrorPresentation.recoveryAdvice(for: p)))
 
         // v0.3 (Cowork)
         case .agentAttached(let p):
@@ -179,7 +252,10 @@ public struct CodeProjection: Equatable, Sendable {
 
         case .delegationRejected(let p):
             items.append(CodeItem(id: stableID(envelope, "delegation_rejected"), kind: .error, title: "delegation rejected",
-                                  body: "\(p.objective) — \(p.reason)"))
+                                  body: "\(p.objective) — \(p.reason)",
+                                  recoveryAdvice: RuntimeErrorPresentation.recoveryAdvice(
+                                    code: "delegation_rejected",
+                                    message: p.reason)))
 
         case .taskDelegated(let p):
             items.append(CodeItem(id: p.contract.id.rawValue + ":delegated", kind: .note, title: "task delegated",
@@ -195,7 +271,10 @@ public struct CodeProjection: Equatable, Sendable {
 
         case .workspaceLeaseDenied(let p):
             items.append(CodeItem(id: stableID(envelope, "workspace_lease_denied"), kind: .error, title: "workspace lease denied",
-                                  body: "\(p.rootPath) — \(p.reason)"))
+                                  body: "\(p.rootPath) — \(p.reason)",
+                                  recoveryAdvice: RuntimeErrorPresentation.recoveryAdvice(
+                                    code: "permission_denied",
+                                    message: p.reason)))
 
         case .capabilityLeaseCreated(let p):
             items.append(CodeItem(id: p.lease.id.rawValue, kind: .note, title: "capability lease",
@@ -231,11 +310,19 @@ public struct CodeProjection: Equatable, Sendable {
 
         case .taskFailed(let p):
             items.append(CodeItem(id: p.taskID.rawValue + ":failed", kind: .error,
-                                  title: p.agent.rawValue, body: p.error))
+                                  title: p.agent.rawValue,
+                                  body: p.error,
+                                  recoveryAdvice: RuntimeErrorPresentation.recoveryAdvice(
+                                    code: "task_failed",
+                                    message: p.error)))
 
         case .taskRejected(let p):
             items.append(CodeItem(id: p.contract?.id.rawValue ?? stableID(envelope, "task_rejected"), kind: .error,
-                                  title: "task rejected", body: "\(p.objective) — \(p.reason)"))
+                                  title: "task rejected",
+                                  body: "\(p.objective) — \(p.reason)",
+                                  recoveryAdvice: RuntimeErrorPresentation.recoveryAdvice(
+                                    code: "task_rejected",
+                                    message: p.reason)))
 
         case .artifactAdded(let p):
             items.append(CodeItem(id: p.artifactId.rawValue, kind: .note, title: "artifact",
@@ -254,6 +341,25 @@ public struct CodeProjection: Equatable, Sendable {
 
     private func agentIndex(_ id: String) -> Int? {
         items.firstIndex { $0.id == id && $0.kind == .agent }
+    }
+
+    private func toolName(for toolCallId: String) -> String? {
+        items.first { $0.id == toolCallId && $0.kind == .toolCall }?.title
+    }
+
+    private mutating func markCurrentPartialAgentStopped(with payload: ErrorPayload) {
+        guard let index = items.indices.last else { return }
+        guard items[index].kind == .agent, !items[index].complete else { return }
+        items[index].isFailure = true
+        items[index].recoveryAdvice = RuntimeErrorPresentation.partialResponseAdvice(for: payload)
+    }
+
+    private static func isFailureObservation(_ observation: String) -> Bool {
+        let lower = observation.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return lower.hasPrefix("tool error:")
+            || lower.hasPrefix("permission denied:")
+            || lower.hasPrefix("unknown tool:")
+            || lower.hasPrefix("invalid tool input:")
     }
 
     private func stableID(_ envelope: Envelope, _ suffix: String) -> String {

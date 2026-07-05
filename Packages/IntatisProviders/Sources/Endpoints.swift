@@ -9,9 +9,9 @@ public enum WireFormat: String, Codable, Sendable {
     // case anthropic, gemini, …  (later)
 }
 
-/// A reference to a secret. GUI-created providers default to the OS keychain;
-/// advanced config can point at env vars, files, or an auth JSON entry. The app
-/// supplies a `SecretResolver`; the secret is fetched lazily at call time.
+/// A reference to a secret. `keychain` is retained as a legacy wire value, but
+/// app resolvers may map it to configuration files. New GUI provider configs use
+/// env vars, files, or auth JSON entries instead of OS credential stores.
 public enum SecretRefSource: String, Codable, Sendable {
     case keychain
     case environment
@@ -85,6 +85,43 @@ public struct ProviderEndpoint: Codable, Equatable, Sendable {
 
     public var chatCompletionsURL: URL {
         chatEndpoint ?? baseURL.appendingPathComponent("chat/completions")
+    }
+}
+
+extension ProviderEndpoint {
+    func validatedChatCompletionsURL(operation: String) throws -> URL {
+        let field = chatEndpoint == nil ? "Base URL" : "Chat endpoint"
+        return try Self.validatedHTTPURL(chatCompletionsURL,
+                                         endpointID: id,
+                                         field: field,
+                                         operation: operation)
+    }
+
+    func validatedBaseURLAppendingPathComponent(_ pathComponent: String,
+                                                operation: String) throws -> URL {
+        try Self.validatedHTTPURL(baseURL.appendingPathComponent(pathComponent),
+                                  endpointID: id,
+                                  field: "Base URL",
+                                  operation: operation)
+    }
+
+    private static func validatedHTTPURL(_ url: URL,
+                                         endpointID: String,
+                                         field: String,
+                                         operation: String) throws -> URL {
+        guard let scheme = url.scheme?.lowercased(), !scheme.isEmpty else {
+            throw IntatisError.config(
+                "invalid provider endpoint '\(endpointID)' for \(operation): \(field) is missing a URL scheme. Use an http:// or https:// URL with a host.")
+        }
+        guard scheme == "http" || scheme == "https" else {
+            throw IntatisError.config(
+                "invalid provider endpoint '\(endpointID)' for \(operation): \(field) scheme '\(scheme)' is not supported. Use an http:// or https:// URL with a host.")
+        }
+        guard let host = url.host, !host.isEmpty else {
+            throw IntatisError.config(
+                "invalid provider endpoint '\(endpointID)' for \(operation): \(field) host is missing. Check the Base URL or Chat endpoint.")
+        }
+        return url
     }
 }
 

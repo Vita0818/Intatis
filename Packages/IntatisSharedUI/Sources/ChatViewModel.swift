@@ -26,6 +26,7 @@ public final class ChatViewModel: ObservableObject {
     @Published public private(set) var messages: [ChatMessageView] = []
     @Published public private(set) var artifacts: [ArtifactCardInfo] = []
     @Published public private(set) var artifactProgress: [ArtifactProgressSnapshot] = []
+    @Published public private(set) var latestTurnStats: TurnStatsSnapshot?
     @Published public var input: String = ""
     @Published public private(set) var isStreaming = false
     @Published public private(set) var imageGenerationState: ChatArtifactGenerationState = .idle
@@ -60,11 +61,14 @@ public final class ChatViewModel: ObservableObject {
             let stream = await self.log.stream(from: 0)
             var projection = ConversationProjection()
             var artifactProgressProjection = ArtifactProgressProjection()
+            var turnStatsProjection = TurnStatsProjection()
             for await envelope in stream {
                 projection.apply(envelope)
                 artifactProgressProjection.apply(envelope)
+                turnStatsProjection.apply(envelope)
                 self.messages = projection.messages
                 self.artifactProgress = artifactProgressProjection.active
+                self.latestTurnStats = turnStatsProjection.latest
                 if case .artifactAdded(let p) = envelope.event {
                     self.artifacts.append(ArtifactCardInfo(id: p.artifactId.rawValue, kind: p.kind,
                                                            mime: p.mime, path: p.path, prompt: p.prompt))

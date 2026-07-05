@@ -160,13 +160,29 @@ public struct ToolRegistry: Sendable {
 
 enum Schema {
     static let string = JSONValue.object(["type": .string("string")])
+    static let nonEmptyString = boundedString(minLength: 1)
     static let integer = JSONValue.object(["type": .string("integer")])
+
+    static func boundedString(minLength: Int? = nil, maxLength: Int? = nil) -> JSONValue {
+        var schema: [String: JSONValue] = ["type": .string("string")]
+        if let minLength { schema["minLength"] = .number(Double(minLength)) }
+        if let maxLength { schema["maxLength"] = .number(Double(maxLength)) }
+        return .object(schema)
+    }
+
+    static func boundedInteger(minimum: Int? = nil, maximum: Int? = nil) -> JSONValue {
+        var schema: [String: JSONValue] = ["type": .string("integer")]
+        if let minimum { schema["minimum"] = .number(Double(minimum)) }
+        if let maximum { schema["maximum"] = .number(Double(maximum)) }
+        return .object(schema)
+    }
 
     static func object(_ properties: [String: JSONValue], required: [String]) -> JSONValue {
         .object([
             "type": .string("object"),
             "properties": .object(properties),
             "required": .array(required.map { .string($0) }),
+            "additionalProperties": .bool(false),
         ])
     }
 }

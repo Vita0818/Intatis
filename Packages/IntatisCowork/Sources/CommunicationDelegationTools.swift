@@ -17,6 +17,7 @@ public struct SendMessageTool: Tool {
                 "content": .object(["type": .string("string")]),
             ]),
             "required": .array([.string("to"), .string("content")]),
+            "additionalProperties": .bool(false),
         ])
     )
 
@@ -45,6 +46,7 @@ public struct RequestInformationTool: Tool {
                 "question": .object(["type": .string("string")]),
             ]),
             "required": .array([.string("to"), .string("question")]),
+            "additionalProperties": .bool(false),
         ])
     )
 
@@ -74,6 +76,7 @@ public struct ReplyMessageTool: Tool {
                 "inReplyTo": .object(["type": .string("string"), "description": .string("optional message id")]),
             ]),
             "required": .array([.string("to"), .string("content")]),
+            "additionalProperties": .bool(false),
         ])
     )
 
@@ -102,6 +105,7 @@ public struct RequestDelegationTool: Tool {
                 "reason": .object(["type": .string("string")]),
             ]),
             "required": .array([.string("objective"), .string("reason")]),
+            "additionalProperties": .bool(false),
         ])
     )
 
@@ -132,6 +136,7 @@ public struct DelegateTaskTool: Tool {
                 "expectedDeliverable": .object(["type": .string("string")]),
             ]),
             "required": .array([.string("to"), .string("objective")]),
+            "additionalProperties": .bool(false),
         ])
     )
 

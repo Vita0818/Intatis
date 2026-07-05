@@ -32,11 +32,16 @@ public struct OpenAITranscriptionProvider: TranscriptionProvider {
     private let endpoint: ProviderEndpoint
     private let apiKey: String
     private let http: HTTPDataClient
+    private let runtimePolicy: ProviderRuntimePolicy
 
-    public init(endpoint: ProviderEndpoint, apiKey: String, http: HTTPDataClient) {
+    public init(endpoint: ProviderEndpoint,
+                apiKey: String,
+                http: HTTPDataClient,
+                runtimePolicy: ProviderRuntimePolicy = .nonStreaming) {
         self.endpoint = endpoint
         self.apiKey = apiKey
         self.http = http
+        self.runtimePolicy = runtimePolicy
     }
 
     private struct Response: Decodable { let text: String }
@@ -53,16 +58,26 @@ public struct OpenAITranscriptionProvider: TranscriptionProvider {
         body.append(request.audio)
         body.appendString("\r\n--\(boundary)--\r\n")
 
-        var r = URLRequest(url: endpoint.baseURL.appendingPathComponent("audio/transcriptions"))
+        var r = URLRequest(url: try endpoint.validatedBaseURLAppendingPathComponent("audio/transcriptions",
+                                                                                    operation: "transcription"))
+        ProviderRuntime.apply(runtimePolicy, to: &r)
         r.httpMethod = "POST"
         r.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
         r.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         r.httpBody = body
 
-        let (data, status) = try await http.send(r)
-        guard (200..<300).contains(status) else {
-            throw IntatisError.provider("transcription HTTP \(status)")
+        let data = try await ProviderRuntime.sendData(r,
+                                                      via: http,
+                                                      policy: runtimePolicy,
+                                                      operation: "transcription")
+        do {
+            return try JSONDecoder().decode(Response.self, from: data).text
+        } catch {
+            throw ProviderErrorFormatting.invalidResponsePayload(
+                data,
+                operation: "transcription",
+                expected: "OpenAI-compatible transcription JSON with text",
+                underlying: error)
         }
-        return try JSONDecoder().decode(Response.self, from: data).text
     }
 }

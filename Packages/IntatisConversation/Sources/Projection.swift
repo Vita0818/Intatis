@@ -12,6 +12,7 @@ public struct ChatMessageView: Identifiable, Equatable, Sendable {
     public var isComplete: Bool
     public var tags: [String]
     public var goal: String?
+    public var recoveryAdvice: RuntimeRecoveryAdvice?
 
     public init(id: MessageID,
                 role: MessageRole,
@@ -19,7 +20,8 @@ public struct ChatMessageView: Identifiable, Equatable, Sendable {
                 text: String,
                 isComplete: Bool,
                 tags: [String] = [],
-                goal: String? = nil) {
+                goal: String? = nil,
+                recoveryAdvice: RuntimeRecoveryAdvice? = nil) {
         self.id = id
         self.role = role
         self.agent = agent
@@ -27,6 +29,7 @@ public struct ChatMessageView: Identifiable, Equatable, Sendable {
         self.isComplete = isComplete
         self.tags = tags
         self.goal = goal
+        self.recoveryAdvice = recoveryAdvice
     }
 }
 
@@ -75,8 +78,10 @@ public struct ConversationProjection: Equatable, Sendable {
             }
 
         case .error(let p):
+            markCurrentPartialMessageStopped(with: p)
             messages.append(ChatMessageView(id: syntheticID("error"), role: .system,
-                                            text: "⚠️ \(p.message)", isComplete: true))
+                                            text: "⚠️ \(p.message)", isComplete: true,
+                                            recoveryAdvice: RuntimeErrorPresentation.recoveryAdvice(for: p)))
 
         case .artifactAdded(let p):
             messages.append(ChatMessageView(id: syntheticID("artifact"), role: .system,
@@ -101,5 +106,16 @@ public struct ConversationProjection: Equatable, Sendable {
         var p = ConversationProjection()
         for e in envelopes { p.apply(e) }
         return p
+    }
+
+    private mutating func markCurrentPartialMessageStopped(with payload: ErrorPayload) {
+        guard let index = messages.indices.last else { return }
+        guard !messages[index].isComplete else { return }
+        switch messages[index].role {
+        case .assistant, .agent:
+            messages[index].recoveryAdvice = RuntimeErrorPresentation.partialResponseAdvice(for: payload)
+        case .user, .system:
+            break
+        }
     }
 }

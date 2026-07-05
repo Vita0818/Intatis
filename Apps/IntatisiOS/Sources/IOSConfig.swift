@@ -3,6 +3,8 @@ import Foundation
 import IntatisCore
 import IntatisProviders
 
+typealias IOSSessionSummary = SessionSummary
+
 struct IOSProviderModel: Identifiable, Codable, Equatable {
     var id: String
     var displayName: String
@@ -26,7 +28,7 @@ struct IOSProviderAPIKeySource: Codable, Equatable {
         case "authfile", "auth_file", "auth-json", "authjson", "json":
             return "authFile"
         default:
-            return "keychain"
+            return "authFile"
         }
     }
 
@@ -117,7 +119,7 @@ struct IOSProviderSettings: Identifiable, Codable, Equatable {
         self.chatEndpoint = try container.decodeIfPresent(String.self, forKey: .chatEndpoint)
             ?? IOSConfig.chatEndpoint(forBaseURL: baseURL)
         self.apiKeyAccount = try container.decodeIfPresent(String.self, forKey: .apiKeyAccount)
-            ?? (self.id == "default" ? IOSConfig.keychainAccount : "provider-\(self.id)")
+            ?? (self.id == "default" ? IOSConfig.legacyAPIKeyAccount : "provider-\(self.id)")
         self.apiKeySource = try container.decodeIfPresent(IOSProviderAPIKeySource.self, forKey: .apiKeySource)
         self.models = try container.decode([IOSProviderModel].self, forKey: .models)
     }
@@ -149,11 +151,10 @@ private struct IOSProviderSelection: Codable, Equatable {
     var modelID: String
 }
 
-/// iOS app configuration. Mirrors the macOS chat config; there is deliberately no
-/// workspace/shell/agent setup — iOS is the chat-only subset (ARCHITECTURE.md §4).
+/// iOS app configuration. Mirrors the macOS chat config with file-backed
+/// provider secrets; there is deliberately no workspace/shell/agent setup.
 enum IOSConfig {
-    static let keychainService = "com.intatis.ios"
-    static let keychainAccount = "default-openai"
+    static let legacyAPIKeyAccount = "default-openai"
     static let defaultSession = SessionID(rawValue: "sess_ios")
 
     // User-configurable endpoint + model (persisted in UserDefaults).
@@ -204,13 +205,9 @@ enum IOSConfig {
         }
     }
 
-    static var selectedAPIKeyAccount: String {
-        providerCatalog.selectedProvider?.apiKeyAccount ?? keychainAccount
-    }
-
     static var selectedAPIKeyRef: KeychainRef {
         guard let provider = providerCatalog.selectedProvider else {
-            return KeychainRef(service: keychainService, account: keychainAccount)
+            return .authFile(providerID: defaultProviderID)
         }
         return apiKeyRef(for: provider)
     }
@@ -262,13 +259,23 @@ enum IOSConfig {
     }
 
     static func sessionFile() -> URL {
-        appSupportDir().appendingPathComponent(defaultSession.rawValue, isDirectory: true)
-            .appendingPathComponent("events.jsonl")
+        sessionFile(defaultSession)
+    }
+
+    static func sessionFile(_ session: SessionID) -> URL {
+        SessionHistoryStore.sessionFile(root: appSupportDir(), session: session)
     }
 
     static func artifactsDir() -> URL {
-        appSupportDir().appendingPathComponent(defaultSession.rawValue, isDirectory: true)
-            .appendingPathComponent("artifacts", isDirectory: true)
+        artifactsDir(defaultSession)
+    }
+
+    static func artifactsDir(_ session: SessionID) -> URL {
+        SessionHistoryStore.artifactsDir(root: appSupportDir(), session: session)
+    }
+
+    static func recentSessions() -> [IOSSessionSummary] {
+        SessionHistoryStore.recentSessions(root: appSupportDir(), kind: .chat)
     }
 
     static func providerConfig() -> ProviderConfig {
@@ -299,7 +306,7 @@ enum IOSConfig {
             id: id,
             displayName: "New Provider",
             baseURL: defaultBaseURL,
-            apiKeyAccount: keychainAccount(forProviderID: id),
+            apiKeyAccount: legacyAPIKeyAccount(forProviderID: id),
             models: [IOSProviderModel(id: defaultModel, displayName: defaultDisplayName(for: defaultModel))])
     }
 
@@ -331,7 +338,7 @@ enum IOSConfig {
             baseURL: baseURL,
             chatEndpoint: chatEndpoint,
             apiKeyAccount: provider.apiKeyAccount.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                ? keychainAccount(forProviderID: id)
+                ? legacyAPIKeyAccount(forProviderID: id)
                 : provider.apiKeyAccount.trimmingCharacters(in: .whitespacesAndNewlines),
             apiKeySource: provider.apiKeySource,
             models: models.isEmpty
@@ -365,7 +372,7 @@ enum IOSConfig {
             displayName: "OpenAI",
             baseURL: baseURL,
             chatEndpoint: chatEndpoint(forBaseURL: baseURL),
-            apiKeyAccount: keychainAccount,
+            apiKeyAccount: legacyAPIKeyAccount,
             models: [IOSProviderModel(id: model, displayName: defaultDisplayName(for: model))])
         return IOSProviderCatalog(selectedProviderID: provider.id,
                                   selectedModelID: model,
@@ -404,7 +411,7 @@ enum IOSConfig {
             id: defaultProviderID,
             displayName: "OpenAI",
             baseURL: defaultBaseURL,
-            apiKeyAccount: keychainAccount,
+            apiKeyAccount: legacyAPIKeyAccount,
             models: [IOSProviderModel(id: defaultModel, displayName: defaultDisplayName(for: defaultModel))])
     }
 
@@ -418,8 +425,8 @@ enum IOSConfig {
     }
 
     static func apiKeyRef(for provider: IOSProviderSettings) -> KeychainRef {
-        let keychainRef = KeychainRef(service: keychainService, account: provider.apiKeyAccount)
-        return provider.apiKeySource?.ref(defaultRef: keychainRef, providerID: provider.id) ?? keychainRef
+        let configRef = KeychainRef.authFile(providerID: provider.id)
+        return provider.apiKeySource?.ref(defaultRef: configRef, providerID: provider.id) ?? configRef
     }
 
     static func chatEndpoint(forBaseURL baseURL: String) -> String {
@@ -447,8 +454,8 @@ enum IOSConfig {
         return result
     }
 
-    private static func keychainAccount(forProviderID providerID: String) -> String {
-        providerID == defaultProviderID ? keychainAccount : "provider-\(providerID)"
+    private static func legacyAPIKeyAccount(forProviderID providerID: String) -> String {
+        providerID == defaultProviderID ? legacyAPIKeyAccount : "provider-\(providerID)"
     }
 
     private static func defaultDisplayName(for modelID: String) -> String {

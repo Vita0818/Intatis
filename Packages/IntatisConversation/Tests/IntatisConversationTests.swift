@@ -15,6 +15,28 @@ private struct MockProvider: ChatProvider {
     }
 }
 
+private struct PartialThenFailingProvider: ChatProvider {
+    func stream(_ request: ChatRequest) -> AsyncThrowingStream<ChatChunk, Error> {
+        AsyncThrowingStream { continuation in
+            continuation.yield(.delta("partial"))
+            continuation.finish(throwing: IntatisError.decoding(
+                "streaming request ended before a completion marker. Check endpoint compatibility."))
+        }
+    }
+}
+
+private struct SplitUsageProvider: ChatProvider {
+    func stream(_ request: ChatRequest) -> AsyncThrowingStream<ChatChunk, Error> {
+        AsyncThrowingStream { continuation in
+            continuation.yield(.delta("ok"))
+            continuation.yield(.usage(Usage(promptTokens: 7, cachedPromptTokens: 3)))
+            continuation.yield(.usage(Usage(completionTokens: 2, totalTokens: 9)))
+            continuation.yield(.done)
+            continuation.finish()
+        }
+    }
+}
+
 final class IntatisConversationTests: XCTestCase {
 
     private func tmpFile() -> URL {
@@ -80,6 +102,53 @@ final class IntatisConversationTests: XCTestCase {
         XCTAssertTrue(projection.messages[1].isComplete)
     }
 
+    func testChatLoopPreservesPartialTextWhenStreamEndsWithoutCompletionMarker() async throws {
+        let url = tmpFile()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let log = try EventLog(session: SessionID(rawValue: "sess_partial_eof"), fileURL: url)
+        let loop = ChatLoop(log: log,
+                            provider: PartialThenFailingProvider(),
+                            model: ModelID(rawValue: "m"))
+
+        do {
+            try await loop.send("hi")
+            XCTFail("expected incomplete stream error")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("completion marker"))
+        }
+
+        let projection = ConversationProjection.build(from: await log.replay())
+        XCTAssertEqual(projection.messages.count, 3)
+        XCTAssertEqual(projection.messages[0].role, .user)
+        XCTAssertEqual(projection.messages[1].role, .assistant)
+        XCTAssertEqual(projection.messages[1].text, "partial")
+        XCTAssertFalse(projection.messages[1].isComplete)
+        XCTAssertEqual(projection.messages[1].recoveryAdvice?.title, "Response stopped before completion")
+        XCTAssertEqual(projection.messages[2].role, .system)
+        XCTAssertEqual(projection.messages[2].recoveryAdvice?.title, "Check endpoint compatibility")
+    }
+
+    func testChatLoopMergesSplitUsageChunksIntoTurnStats() async throws {
+        let url = tmpFile()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let log = try EventLog(session: SessionID(rawValue: "sess_split_usage"), fileURL: url)
+        let loop = ChatLoop(log: log,
+                            provider: SplitUsageProvider(),
+                            model: ModelID(rawValue: "m"),
+                            includeUsage: true)
+
+        try await loop.send("hi")
+
+        let stats = await log.replay().compactMap { envelope -> TurnStatsPayload? in
+            guard case .turnStats(let payload) = envelope.event else { return nil }
+            return payload
+        }.last
+        XCTAssertEqual(stats?.promptTokens, 7)
+        XCTAssertEqual(stats?.cachedPromptTokens, 3)
+        XCTAssertEqual(stats?.completionTokens, 2)
+        XCTAssertEqual(stats?.totalTokens, 9)
+    }
+
     func testChatLoopCanPersistGoalUserPayload() async throws {
         let url = tmpFile()
         defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
@@ -131,6 +200,47 @@ final class IntatisConversationTests: XCTestCase {
         let second = ConversationProjection.build(from: envelopes).messages.map(\.id)
 
         XCTAssertEqual(first, second)
+    }
+
+    func testConversationProjectionAddsRecoveryAdviceForProviderErrors() {
+        let session = SessionID(rawValue: "sess_chat_error_recovery")
+        let envelope = Envelope(
+            seq: 0,
+            ts: Date(timeIntervalSince1970: 0),
+            session: session,
+            event: .error(.init(
+                code: "provider",
+                message: "streaming request failed with HTTP 401 Unauthorized. Check your API key.")))
+
+        let message = ConversationProjection.build(from: [envelope]).messages.first
+
+        XCTAssertEqual(message?.role, .system)
+        XCTAssertEqual(message?.recoveryAdvice?.title, "Fix provider configuration")
+        XCTAssertEqual(message?.recoveryAdvice?.retryable, false)
+    }
+
+    func testConversationProjectionMarksPartialStreamStoppedByError() {
+        let session = SessionID(rawValue: "sess_chat_partial_stop")
+        let messageID = MessageID(rawValue: "m_partial")
+        func env(_ seq: Int, _ event: Event) -> Envelope {
+            Envelope(seq: seq, ts: Date(timeIntervalSince1970: Double(seq)), session: session, event: event)
+        }
+        let envelopes: [Envelope] = [
+            env(0, .messageDelta(.init(messageId: messageID, role: .assistant, textDelta: "partial"))),
+            env(1, .error(.init(
+                code: "provider",
+                message: "streaming request failed with HTTP 503 Service Unavailable. Retry later."))),
+        ]
+
+        let projection = ConversationProjection.build(from: envelopes)
+
+        XCTAssertEqual(projection.messages.count, 2)
+        XCTAssertEqual(projection.messages[0].id, messageID)
+        XCTAssertEqual(projection.messages[0].text, "partial")
+        XCTAssertFalse(projection.messages[0].isComplete)
+        XCTAssertEqual(projection.messages[0].recoveryAdvice?.title, "Response stopped before completion")
+        XCTAssertEqual(projection.messages[0].recoveryAdvice?.retryable, true)
+        XCTAssertEqual(projection.messages[1].recoveryAdvice?.title, "Retry or switch provider")
     }
 
     func testConversationProjectionKeepsGoalMetadata() {

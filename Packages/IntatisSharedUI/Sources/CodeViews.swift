@@ -11,10 +11,15 @@ public struct CodeShell: View {
     private let items: [CodeItem]
     private let pending: PendingPermission?
     private let permissionNotice: PermissionResolutionNotice?
+    private let latestTurnStats: TurnStatsSnapshot?
     private let isWorking: Bool
     private let workspaceName: String
     private let agentState: String
     private let composerError: String?
+    private let threadStyle: IntatisThreadStyle
+    private let onShowSessions: (() -> Void)?
+    private let onNewSession: (() -> Void)?
+    private let composerAccessory: AnyView?
     @Binding private var input: String
     private let onSend: () -> Void
     private let onResolve: (PermissionDecision) -> Void
@@ -22,23 +27,35 @@ public struct CodeShell: View {
     public init(items: [CodeItem],
                 pending: PendingPermission?,
                 permissionNotice: PermissionResolutionNotice? = nil,
+                latestTurnStats: TurnStatsSnapshot? = nil,
                 isWorking: Bool,
                 workspaceName: String,
                 agentState: String,
                 composerError: String? = nil,
+                threadStyle: IntatisThreadStyle = .standard(.light),
+                splitLayout: IntatisSplitColumnLayout = .workspace,
+                onShowSessions: (() -> Void)? = nil,
+                onNewSession: (() -> Void)? = nil,
+                composerAccessory: AnyView? = nil,
                 input: Binding<String>,
                 onSend: @escaping () -> Void,
                 onResolve: @escaping (PermissionDecision) -> Void) {
         self.items = items
         self.pending = pending
         self.permissionNotice = permissionNotice
+        self.latestTurnStats = latestTurnStats
         self.isWorking = isWorking
         self.workspaceName = workspaceName
         self.agentState = agentState
         self.composerError = composerError
+        self.threadStyle = threadStyle
+        self.onShowSessions = onShowSessions
+        self.onNewSession = onNewSession
+        self.composerAccessory = composerAccessory
         self._input = input
         self.onSend = onSend
         self.onResolve = onResolve
+        _ = splitLayout
     }
 
     private var permissionBlocksComposer: Bool {
@@ -47,96 +64,230 @@ public struct CodeShell: View {
     }
 
     public var body: some View {
-        NavigationSplitView {
-            List { Label("Code", systemImage: "chevron.left.forwardslash.chevron.right") }
-                .navigationSplitViewColumnWidth(min: 160, ideal: 200)
-        } content: {
-            thread.navigationSplitViewColumnWidth(min: 380, ideal: 600)
-        } detail: {
-            CodeInspectorView(workspaceName: workspaceName, agentState: agentState, itemCount: items.count)
-                .navigationSplitViewColumnWidth(min: 240, ideal: 300)
+        GeometryReader { proxy in
+            content(rawWidth: proxy.size.width)
         }
     }
 
-    private var thread: some View {
+    @ViewBuilder private func content(rawWidth: CGFloat) -> some View {
+        if rawWidth >= 940 {
+            HStack(spacing: 0) {
+                threadColumn(layout: IntatisThreadContentLayout(rawWidth: rawWidth - 300))
+                    .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
+                Divider().opacity(0.45)
+                CodeInspectorView(
+                    workspaceName: workspaceName,
+                    agentState: agentState,
+                    itemCount: items.count,
+                    pending: pending,
+                    latestTurnStats: latestTurnStats,
+                    failedItems: failedItems,
+                    style: threadStyle)
+                .frame(width: 292)
+                .frame(maxHeight: .infinity)
+            }
+        } else {
+            threadColumn(layout: IntatisThreadContentLayout(rawWidth: rawWidth))
+        }
+    }
+
+    private var failedItems: [CodeItem] {
+        Array(items.filter { $0.isFailure || $0.kind == .error }.suffix(4))
+    }
+
+    private func threadColumn(layout: IntatisThreadContentLayout) -> some View {
         VStack(spacing: 0) {
+            header(layout: layout)
+            thread(layout: layout)
+            permissionArea(layout: layout)
+            composerArea(layout: layout)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func header(layout: IntatisThreadContentLayout) -> some View {
+        IntatisWorkspaceThreadHeader(
+            title: "Code",
+            subtitle: "\(workspaceName) · \(agentState)",
+            style: threadStyle,
+            actions: [])
+        .frame(maxWidth: layout.contentMaxWidth)
+        .frame(maxWidth: .infinity)
+        .padding(.horizontal, layout.horizontalPadding)
+        .padding(.top, 26)
+        .padding(.bottom, 12)
+    }
+
+    private var headerActions: [IntatisThreadHeaderAction] {
+        var actions: [IntatisThreadHeaderAction] = []
+        if let onShowSessions {
+            actions.append(IntatisThreadHeaderAction(title: "Sessions", systemImage: "clock.arrow.circlepath", action: onShowSessions))
+        }
+        if let onNewSession {
+            actions.append(IntatisThreadHeaderAction(title: "New", systemImage: "plus", action: onNewSession))
+        }
+        return actions
+    }
+
+    @ViewBuilder private func thread(layout: IntatisThreadContentLayout) -> some View {
+        if items.isEmpty {
+            CodeEmptyThreadView(style: threadStyle)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(.horizontal, layout.horizontalPadding)
+        } else {
             ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 10) {
-                        ForEach(items) { CodeItemRow(item: $0).id($0.id) }
+                    LazyVStack(alignment: .leading, spacing: 12) {
+                        ForEach(items) { item in
+                            CodeItemRow(item: item, style: threadStyle, layout: layout)
+                                .id(item.id)
+                        }
                     }
-                    .padding()
+                    .frame(width: layout.contentWidth)
+                    .frame(maxWidth: .infinity)
+                    .padding(.horizontal, layout.horizontalPadding)
+                    .padding(.vertical, 16)
                 }
+                .scrollContentBackground(.hidden)
                 .onChange(of: items.count) { _ in
                     if let last = items.last { withAnimation { proxy.scrollTo(last.id, anchor: .bottom) } }
                 }
             }
-            if let pending {
-                PermissionCard(permission: pending, onResolve: onResolve)
-            } else if let permissionNotice {
-                PermissionResolutionNoticeView(notice: permissionNotice)
-            }
-            Divider()
+        }
+    }
+
+    @ViewBuilder private func permissionArea(layout: IntatisThreadContentLayout) -> some View {
+        if let pending {
+            PermissionCard(permission: pending, onResolve: onResolve)
+                .frame(maxWidth: layout.contentMaxWidth)
+                .padding(.horizontal, layout.horizontalPadding)
+        } else if let permissionNotice {
+            PermissionResolutionNoticeView(notice: permissionNotice)
+                .frame(maxWidth: layout.contentMaxWidth)
+                .padding(.horizontal, layout.horizontalPadding)
+        }
+    }
+
+    private func composerArea(layout: IntatisThreadContentLayout) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
             if let composerError {
                 Text(composerError)
                     .font(.caption)
-                    .foregroundStyle(.red)
+                    .foregroundStyle(threadStyle.error)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 10)
-                    .padding(.top, 6)
             }
-            HStack(alignment: .bottom, spacing: 8) {
-                TextField("Ask the agent to read or edit files…", text: $input, axis: .vertical)
-                    .textFieldStyle(.plain)
-                    .lineLimit(1...6)
-                    .onSubmit(onSend)
-                    .disabled(isWorking || permissionBlocksComposer)
-                Button(action: onSend) { Image(systemName: "arrow.up.circle.fill").font(.title2) }
-                    .buttonStyle(.plain)
-                    .disabled(isWorking || permissionBlocksComposer || input.trimmingCharacters(in: .whitespaces).isEmpty)
-            }
-            .padding(10)
+            IntatisThreadComposer(
+                placeholder: "Message Coder...",
+                input: $input,
+                canSend: !isWorking
+                    && !permissionBlocksComposer
+                    && !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                isInputDisabled: isWorking || permissionBlocksComposer,
+                style: threadStyle,
+                accessory: {
+                    if let composerAccessory {
+                        composerAccessory
+                    } else if let latestTurnStats {
+                        IntatisTurnStatsSummaryView(stats: latestTurnStats, style: threadStyle)
+                    }
+                },
+                onSend: onSend)
         }
+        .frame(maxWidth: layout.contentMaxWidth)
+        .padding(.horizontal, layout.horizontalPadding)
+        .padding(.top, 10)
+        .padding(.bottom, 22)
     }
 }
 
 struct CodeItemRow: View {
     let item: CodeItem
+    let style: IntatisThreadStyle
+    let layout: IntatisThreadContentLayout
+
+    init(item: CodeItem,
+         style: IntatisThreadStyle = .standard(.light),
+         layout: IntatisThreadContentLayout = IntatisThreadContentLayout(rawWidth: 900)) {
+        self.item = item
+        self.style = style
+        self.layout = layout
+    }
 
     var body: some View {
         switch item.kind {
         case .user:
-            bubble(title: "You", body: item.body, tint: Color.accentColor.opacity(0.12), mono: false, tags: item.tags)
+            bubble(title: "You", body: item.body, isUser: true, tags: item.tags)
         case .agent:
             bubble(title: item.title, body: item.body.isEmpty && !item.complete ? "…" : item.body,
-                   tint: Color.gray.opacity(0.10), mono: false)
+                   isUser: false)
         case .toolCall:
             card(icon: "wrench.and.screwdriver", title: "tool · \(item.title)", body: item.body, tint: .blue)
         case .toolResult:
-            card(icon: "arrow.turn.down.right", title: "result", body: item.body, tint: .gray)
+            card(icon: item.isFailure ? "exclamationmark.triangle" : "arrow.turn.down.right",
+                 title: item.title,
+                 body: item.body,
+                 tint: item.isFailure ? .red : .gray)
         case .patch:
             card(icon: "doc.badge.gearshape", title: "patch · \(item.files.joined(separator: ", "))",
                  body: item.body, tint: .purple)
         case .note:
             Text(item.body).font(.caption).foregroundStyle(.secondary)
         case .error:
-            card(icon: "exclamationmark.triangle", title: "error", body: item.body, tint: .red)
+            card(icon: "exclamationmark.triangle", title: item.title, body: item.body, tint: .red)
         case .agentToAgent:
             card(icon: "arrow.left.arrow.right", title: "↔ \(item.title)", body: item.body, tint: .teal)
         }
     }
 
-    private func bubble(title: String, body: String, tint: Color, mono: Bool, tags: [String] = []) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
+    private func bubble(title: String, body: String, isUser: Bool, tags: [String] = []) -> some View {
+        IntatisThreadBubbleRow(
+            isTrailing: isUser,
+            rowWidth: layout.contentWidth,
+            maxWidth: layout.messageMaxWidth,
+            gutter: layout.messageGutter) {
+                bubbleContent(title: title, body: body, isUser: isUser, tags: tags)
+            }
+    }
+
+    private func bubbleContent(title: String, body: String, isUser: Bool, tags: [String]) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
             HStack(spacing: 6) {
-                Text(title).font(.caption).foregroundStyle(.secondary)
+                Text(title.uppercased())
+                    .font(.caption2.bold())
+                    .foregroundStyle(isUser ? style.accent : style.tertiaryText)
                 ForEach(tags, id: \.self) { tag in
                     tagBadge(tag)
                 }
             }
-            Text(body).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+            Text(body)
+                .font(.system(size: 15))
+                .foregroundStyle(style.primaryText)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+            if let advice = item.recoveryAdvice {
+                IntatisRecoveryAdviceView(
+                    advice: advice,
+                    tint: item.isFailure ? style.error : style.accent,
+                    style: style)
+            }
         }
-        .padding(10).background(tint).clipShape(RoundedRectangle(cornerRadius: 10))
+        .padding(.horizontal, 15)
+        .padding(.vertical, 11)
+        .background {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(isUser ? style.userBubble : style.assistantBubble)
+                .background(style.material, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .stroke(bubbleStroke(isUser: isUser), lineWidth: 1)
+                }
+        }
+    }
+
+    private func bubbleStroke(isUser: Bool) -> Color {
+        if isUser { return style.accentSoft }
+        if item.isFailure { return style.error.opacity(0.36) }
+        return style.stroke
     }
 
     private func card(icon: String, title: String, body: String, tint: Color) -> some View {
@@ -144,20 +295,42 @@ struct CodeItemRow: View {
             Label(title, systemImage: icon).font(.caption.bold()).foregroundStyle(tint)
             Text(body).font(.system(.caption, design: .monospaced))
                 .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+            if let advice = item.recoveryAdvice {
+                IntatisRecoveryAdviceView(advice: advice, tint: tint, style: style)
+            }
         }
-        .padding(10)
-        .background(tint.opacity(0.08))
-        .overlay(RoundedRectangle(cornerRadius: 8).stroke(tint.opacity(0.25)))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .padding(11)
+        .background(style.cardSurface)
+        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(tint.opacity(0.25)))
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .frame(maxWidth: min(layout.contentMaxWidth, 740), alignment: .leading)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func tagBadge(_ tag: String) -> some View {
         Text(tag.uppercased())
             .font(.caption2.bold())
-            .foregroundStyle(Color.accentColor)
+            .foregroundStyle(style.accent)
             .padding(.horizontal, 6)
             .padding(.vertical, 2)
-            .background(Color.accentColor.opacity(0.14), in: Capsule())
+            .background(style.accentSoft, in: Capsule())
+    }
+}
+
+private struct CodeEmptyThreadView: View {
+    let style: IntatisThreadStyle
+
+    var body: some View {
+        VStack(spacing: 12) {
+            Spacer()
+            Image(systemName: "chevron.left.forwardslash.chevron.right")
+                .font(.system(size: 30, weight: .semibold))
+                .foregroundStyle(style.accent)
+                .frame(width: 76, height: 76)
+                .background(style.accentSoft, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+            Spacer()
+        }
+        .multilineTextAlignment(.center)
     }
 }
 
@@ -280,23 +453,108 @@ public struct PermissionCard: View {
     }
 }
 
-struct CodeInspectorView: View {
+private struct CodeInspectorView: View {
     let workspaceName: String
     let agentState: String
     let itemCount: Int
+    let pending: PendingPermission?
+    let latestTurnStats: TurnStatsSnapshot?
+    let failedItems: [CodeItem]
+    let style: IntatisThreadStyle
 
     var body: some View {
-        List {
-            Section("Agent") {
-                LabeledContent("Workspace", value: workspaceName)
-                LabeledContent("State", value: agentState)
-                LabeledContent("Items", value: "\(itemCount)")
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                inspectorHeader
+                inspectorSection("Plan") {
+                    inspectorRow("Current task", value: agentState)
+                    inspectorRow("Thread events", value: "\(itemCount)")
+                    if let pending {
+                        inspectorRow("Permission", value: pending.request.tool)
+                    } else {
+                        inspectorRow("Permission", value: "none pending")
+                    }
+                }
+                inspectorSection("Workspace") {
+                    inspectorRow("Root", value: workspaceName)
+                    inspectorRow("Git", value: "status only")
+                    Text("Commit, branch, PR, CI, and review workflows are deferred.")
+                        .font(.caption2)
+                        .foregroundStyle(style.tertiaryText)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                inspectorSection("Recent Failures") {
+                    if failedItems.isEmpty {
+                        Text("No failed tool or runtime events in the current projection.")
+                            .font(.caption)
+                            .foregroundStyle(style.tertiaryText)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        ForEach(failedItems) { item in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(item.title)
+                                    .font(.caption.bold())
+                                    .foregroundStyle(style.primaryText)
+                                    .lineLimit(1)
+                                Text(item.body)
+                                    .font(.caption2)
+                                    .foregroundStyle(style.secondaryText)
+                                    .lineLimit(3)
+                            }
+                            .padding(.vertical, 3)
+                        }
+                    }
+                }
+                if let latestTurnStats {
+                    inspectorSection("Last Turn") {
+                        IntatisTurnStatsSummaryView(stats: latestTurnStats, style: style)
+                    }
+                }
             }
-            Section("About") {
-                Text("Tool calls and patches require approval unless the gate auto-allows "
-                     + "a read-only action. Reviewer auto-approval arrives in v0.3.")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
+            .padding(16)
+        }
+        .background(style.cardSurface.opacity(0.38))
+    }
+
+    private var inspectorHeader: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Inspector")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(style.primaryText)
+            Text("Task and workspace status")
+                .font(.caption)
+                .foregroundStyle(style.secondaryText)
+        }
+    }
+
+    private func inspectorSection<Content: View>(_ title: String,
+                                                 @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title.uppercased())
+                .font(.caption2.bold())
+                .foregroundStyle(style.tertiaryText)
+            content()
+        }
+        .padding(11)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(style.cardSurface, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(style.cardStroke, lineWidth: 1)
+        }
+    }
+
+    private func inspectorRow(_ title: String, value: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(style.secondaryText)
+            Spacer(minLength: 8)
+            Text(value)
+                .font(.caption.bold())
+                .foregroundStyle(style.primaryText)
+                .lineLimit(1)
+                .truncationMode(.middle)
         }
     }
 }

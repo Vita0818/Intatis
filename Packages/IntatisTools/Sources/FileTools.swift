@@ -9,7 +9,7 @@ public struct ReadFileTool: Tool {
         name: "read_file",
         description: "Read a UTF-8 text file within the workspace.",
         sideEffect: .readOnly,
-        parameters: Schema.object(["path": Schema.string, "maxBytes": Schema.integer], required: ["path"])
+        parameters: Schema.object(["path": Schema.nonEmptyString, "maxBytes": Schema.boundedInteger(minimum: 1)], required: ["path"])
     )
     struct Args: Decodable { let path: String; let maxBytes: Int? }
 
@@ -36,7 +36,7 @@ public struct ListFilesTool: Tool {
         name: "list_files",
         description: "List entries of a directory within the workspace.",
         sideEffect: .readOnly,
-        parameters: Schema.object(["path": Schema.string], required: [])
+        parameters: Schema.object(["path": Schema.nonEmptyString], required: [])
     )
     struct Args: Decodable { let path: String? }
 
@@ -65,7 +65,7 @@ public struct SearchTextTool: Tool {
         name: "search_text",
         description: "Search for a literal substring in text files under a workspace path.",
         sideEffect: .readOnly,
-        parameters: Schema.object(["query": Schema.string, "path": Schema.string], required: ["query"])
+        parameters: Schema.object(["query": Schema.nonEmptyString, "path": Schema.nonEmptyString], required: ["query"])
     )
     struct Args: Decodable { let query: String; let path: String? }
 
@@ -109,7 +109,7 @@ public struct WriteFileTool: Tool {
         name: "write_file",
         description: "Write (create or overwrite) a UTF-8 text file within the workspace.",
         sideEffect: .write,
-        parameters: Schema.object(["path": Schema.string, "content": Schema.string], required: ["path", "content"])
+        parameters: Schema.object(["path": Schema.nonEmptyString, "content": Schema.string], required: ["path", "content"])
     )
     struct Args: Decodable { let path: String; let content: String }
 

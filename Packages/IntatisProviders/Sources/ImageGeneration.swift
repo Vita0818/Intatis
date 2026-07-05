@@ -36,11 +36,16 @@ public struct OpenAIImageProvider: ImageGenerationProvider {
     private let endpoint: ProviderEndpoint
     private let apiKey: String
     private let http: HTTPDataClient
+    private let runtimePolicy: ProviderRuntimePolicy
 
-    public init(endpoint: ProviderEndpoint, apiKey: String, http: HTTPDataClient) {
+    public init(endpoint: ProviderEndpoint,
+                apiKey: String,
+                http: HTTPDataClient,
+                runtimePolicy: ProviderRuntimePolicy = .nonStreaming) {
         self.endpoint = endpoint
         self.apiKey = apiKey
         self.http = http
+        self.runtimePolicy = runtimePolicy
     }
 
     private struct Response: Decodable {
@@ -49,7 +54,9 @@ public struct OpenAIImageProvider: ImageGenerationProvider {
     }
 
     public func generate(_ request: ImageRequest) async throws -> [GeneratedImage] {
-        var r = URLRequest(url: endpoint.baseURL.appendingPathComponent("images/generations"))
+        var r = URLRequest(url: try endpoint.validatedBaseURLAppendingPathComponent("images/generations",
+                                                                                    operation: "image generation"))
+        ProviderRuntime.apply(runtimePolicy, to: &r)
         r.httpMethod = "POST"
         r.setValue("application/json", forHTTPHeaderField: "Content-Type")
         r.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
@@ -62,14 +69,32 @@ public struct OpenAIImageProvider: ImageGenerationProvider {
         ]
         r.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (data, status) = try await http.send(r)
-        guard (200..<300).contains(status) else {
-            throw IntatisError.provider("image generation HTTP \(status)")
+        let data = try await ProviderRuntime.sendData(r,
+                                                      via: http,
+                                                      policy: runtimePolicy,
+                                                      operation: "image generation")
+        let decoded: Response
+        do {
+            decoded = try JSONDecoder().decode(Response.self, from: data)
+        } catch {
+            throw ProviderErrorFormatting.invalidResponsePayload(
+                data,
+                operation: "image generation",
+                expected: "OpenAI-compatible image JSON with data[].b64_json",
+                underlying: error)
         }
-        let decoded = try JSONDecoder().decode(Response.self, from: data)
+        guard !decoded.data.isEmpty else {
+            throw ProviderErrorFormatting.invalidResponsePayload(
+                data,
+                operation: "image generation",
+                expected: "OpenAI-compatible image JSON with data[].b64_json")
+        }
         return try decoded.data.map { item in
             guard let b64 = item.b64_json, let bytes = Data(base64Encoded: b64) else {
-                throw IntatisError.provider("image response missing b64_json")
+                throw ProviderErrorFormatting.invalidResponsePayload(
+                    data,
+                    operation: "image generation",
+                    expected: "OpenAI-compatible image JSON with data[].b64_json")
             }
             return GeneratedImage(data: bytes, mime: "image/png")
         }

@@ -100,7 +100,7 @@ public struct ApplyPatchTool: Tool {
         name: "apply_patch",
         description: "Apply a unified diff to files within the workspace.",
         sideEffect: .write,
-        parameters: Schema.object(["diff": Schema.string], required: ["diff"])
+        parameters: Schema.object(["diff": Schema.nonEmptyString], required: ["diff"])
     )
     struct Args: Decodable { let diff: String }
 

@@ -25,6 +25,105 @@ final class IntatisConversationCodeTests: XCTestCase {
         XCTAssertEqual(projection.items.last?.body, "Done.")
         XCTAssertEqual(projection.items.last?.complete, true)
         XCTAssertEqual(projection.items.first(where: { $0.kind == .patch })?.files, ["a.swift"])
+        let result = projection.items.first(where: { $0.kind == .toolResult })
+        XCTAssertEqual(result?.title, "result · apply_patch")
+        XCTAssertEqual(result?.isFailure, false)
+    }
+
+    func testCodeProjectionMarksFailedToolResults() {
+        let s = SessionID(rawValue: "tool_failure")
+        func env(_ seq: Int, _ e: Event) -> Envelope {
+            Envelope(seq: seq, ts: Date(timeIntervalSince1970: Double(seq)), session: s, event: e)
+        }
+        let envs: [Envelope] = [
+            env(0, .toolCall(.init(toolCallId: "c1", name: "write_file", args: "{}"))),
+            env(1, .toolResult(.init(toolCallId: "c1", observation: "permission denied: user denied"))),
+        ]
+
+        let result = CodeProjection.build(from: envs).items.last
+
+        XCTAssertEqual(result?.title, "result · write_file")
+        XCTAssertEqual(result?.isFailure, true)
+        XCTAssertEqual(result?.recoveryAdvice?.title, "Rerun after permission change")
+        XCTAssertEqual(result?.recoveryAdvice?.retryable, false)
+    }
+
+    func testCodeProjectionMarksInvalidToolInputResults() {
+        let s = SessionID(rawValue: "invalid_tool_input")
+        func env(_ seq: Int, _ e: Event) -> Envelope {
+            Envelope(seq: seq, ts: Date(timeIntervalSince1970: Double(seq)), session: s, event: e)
+        }
+        let envs: [Envelope] = [
+            env(0, .toolCall(.init(toolCallId: "c1", name: "write_file", args: #"{"path":"out.txt""#))),
+            env(1, .toolResult(.init(
+                toolCallId: "c1",
+                observation: "invalid tool input: arguments for write_file must be valid JSON."))),
+        ]
+
+        let result = CodeProjection.build(from: envs).items.last
+
+        XCTAssertEqual(result?.title, "result · write_file")
+        XCTAssertEqual(result?.isFailure, true)
+        XCTAssertEqual(result?.recoveryAdvice?.title, "Fix tool input")
+        XCTAssertEqual(result?.recoveryAdvice?.retryable, true)
+    }
+
+    func testCodeProjectionAddsRecoveryAdviceForRetryableProviderErrors() {
+        let s = SessionID(rawValue: "provider_recovery")
+        let envelope = Envelope(
+            seq: 0,
+            ts: Date(timeIntervalSince1970: 0),
+            session: s,
+            event: .error(.init(
+                code: "provider",
+                message: "streaming request failed with HTTP 429 Too Many Requests. Retry later.")))
+
+        let item = CodeProjection.build(from: [envelope]).items.first
+
+        XCTAssertEqual(item?.kind, .error)
+        XCTAssertEqual(item?.recoveryAdvice?.title, "Retry or switch provider")
+        XCTAssertEqual(item?.recoveryAdvice?.retryable, true)
+    }
+
+    func testCodeProjectionAddsRecoveryAdviceForEndpointCompatibilityErrors() {
+        let s = SessionID(rawValue: "decode_recovery")
+        let envelope = Envelope(
+            seq: 0,
+            ts: Date(timeIntervalSince1970: 0),
+            session: s,
+            event: .error(.init(
+                code: "decoding",
+                message: "provider stream returned non-JSON SSE data. Check endpoint compatibility.")))
+
+        let item = CodeProjection.build(from: [envelope]).items.first
+
+        XCTAssertEqual(item?.kind, .error)
+        XCTAssertEqual(item?.recoveryAdvice?.title, "Check endpoint compatibility")
+        XCTAssertEqual(item?.recoveryAdvice?.retryable, false)
+    }
+
+    func testCodeProjectionMarksPartialAgentStreamStoppedByError() {
+        let s = SessionID(rawValue: "agent_partial_stop")
+        let messageID = MessageID(rawValue: "agent_msg_partial")
+        func env(_ seq: Int, _ e: Event) -> Envelope {
+            Envelope(seq: seq, ts: Date(timeIntervalSince1970: Double(seq)), session: s, event: e)
+        }
+        let envs: [Envelope] = [
+            env(0, .messageDelta(.init(messageId: messageID, role: .agent, agent: AgentID(rawValue: "Coder"), textDelta: "partial"))),
+            env(1, .error(.init(
+                code: "provider",
+                message: "streaming request failed with HTTP 503 Service Unavailable. Retry later."))),
+        ]
+
+        let projection = CodeProjection.build(from: envs)
+
+        XCTAssertEqual(projection.items.count, 2)
+        XCTAssertEqual(projection.items[0].id, messageID.rawValue)
+        XCTAssertEqual(projection.items[0].body, "partial")
+        XCTAssertFalse(projection.items[0].complete)
+        XCTAssertTrue(projection.items[0].isFailure)
+        XCTAssertEqual(projection.items[0].recoveryAdvice?.title, "Response stopped before completion")
+        XCTAssertEqual(projection.items[1].recoveryAdvice?.title, "Retry or switch provider")
     }
 
     func testCodeProjectionKeepsGoalMetadataOnUserItems() {

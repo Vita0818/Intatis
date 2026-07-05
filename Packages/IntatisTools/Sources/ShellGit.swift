@@ -39,7 +39,7 @@ public struct RunShellTool: Tool {
         name: "run_shell",
         description: "Run a shell command in the workspace directory.",
         sideEffect: .exec,
-        parameters: Schema.object(["command": Schema.string], required: ["command"])
+        parameters: Schema.object(["command": Schema.nonEmptyString], required: ["command"])
     )
     struct Args: Decodable { let command: String }
 
