@@ -17,6 +17,7 @@ public enum SecretRefSource: String, Codable, Sendable {
     case environment
     case file
     case authFile
+    case providerConfig
 }
 
 public struct KeychainRef: Codable, Equatable, Sendable {
@@ -40,6 +41,10 @@ public struct KeychainRef: Codable, Equatable, Sendable {
 
     public static func authFile(providerID: String) -> KeychainRef {
         KeychainRef(source: .authFile, service: "auth-file", account: providerID)
+    }
+
+    public static func providerConfig(path: String, providerID: String) -> KeychainRef {
+        KeychainRef(source: .providerConfig, service: path, account: providerID)
     }
 
     private init(source: SecretRefSource, service: String, account: String) {

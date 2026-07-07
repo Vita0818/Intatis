@@ -28,6 +28,7 @@ public enum AutomaticPermissionReviewResult: Equatable, Sendable {
 /// agent-to-agent exchange through the Message Bus. An `actor`, so concurrent /
 /// reentrant agent runs serialize safely.
 public actor Orchestrator {
+    public static let mainAgentID = AgentID(rawValue: "main")
     public static let automaticPermissionReviewerID = AgentID(rawValue: "permission-reviewer")
 
     private let log: EventLog
@@ -358,7 +359,9 @@ public actor Orchestrator {
             }
             agent = explicitTarget
         } else {
-            guard let defaultTarget = registry.all().first(where: { $0.name != Self.automaticPermissionReviewerID }) else {
+            let defaultTarget = registry.agent(Self.mainAgentID)
+                ?? registry.all().first(where: { $0.name != Self.automaticPermissionReviewerID })
+            guard let defaultTarget else {
                 try? await log.append(.error(ErrorPayload(code: "no_agent", message: "no agent attached")))
                 return .failed("No agent attached.")
             }
@@ -697,7 +700,7 @@ public actor Orchestrator {
 
     /// Create and attach a new sub-agent bound to `path`. Returns a status line
     /// the calling (coordinator) agent can read back.
-    func spawnFromTool(name: String, path: String, model: String) async -> String {
+    func spawnFromTool(name: String, path: String, model: String, canCoordinate: Bool = false) async -> String {
         let trimmed = name.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else { return "error: an agent name is required" }
         let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardizedFileURL
@@ -715,9 +718,10 @@ public actor Orchestrator {
             path: url.path,
             model: ModelID(rawValue: model),
             metadata: CoworkEventMetadata(agentID: id, scope: .agent))))
+        let coordinationDepth = canCoordinate ? Agent.defaultCoordinationDepth : 0
         let attached = await attach(Agent(name: id, workspaceRoot: url,
                                           model: ModelID(rawValue: model), profile: .reviewed,
-                                          coordinationDepth: 0))
+                                          coordinationDepth: coordinationDepth))
         if attached {
             try? await log.append(.agentSpawned(AgentSpawnedPayload(
                 agent: id,
@@ -726,7 +730,7 @@ public actor Orchestrator {
                 metadata: CoworkEventMetadata(agentID: id, scope: .agent))))
         }
         return attached
-            ? "spawned @\(trimmed) · model \(model) · \(url.path)"
+            ? "spawned @\(trimmed) · model \(model) · \(canCoordinate ? "coordinator" : "worker") · \(url.path)"
             : "permission denied: workspace attach for @\(trimmed)"
     }
 
@@ -1247,8 +1251,12 @@ struct OrchestratorManager: AgentManager {
     let orchestrator: Orchestrator
     let defaultModel: String
 
-    func spawnAgent(name: String, path: String, model: String?) async -> String {
-        await orchestrator.spawnFromTool(name: name, path: path, model: model ?? defaultModel)
+    func spawnAgent(name: String, path: String, model: String?, canCoordinate: Bool) async -> String {
+        await orchestrator.spawnFromTool(
+            name: name,
+            path: path,
+            model: model ?? defaultModel,
+            canCoordinate: canCoordinate)
     }
     func listAgents() async -> String { await orchestrator.listForTool() }
     func removeAgent(name: String) async -> String { await orchestrator.removeFromTool(name: name) }

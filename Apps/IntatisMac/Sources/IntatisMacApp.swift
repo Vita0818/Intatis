@@ -152,15 +152,31 @@ final class AppEnvironment: ObservableObject {
         return CodeViewModel(sessionID: session, workspaceRoot: workspace, log: codeLog, registry: registry)
     }
 
-    /// Build a fresh multi-agent Cowork session.
-    func makeCoworkViewModel() throws -> CoworkViewModel {
+    /// Build a fresh multi-agent Cowork project session bound to a primary workspace.
+    func makeCoworkViewModel(primaryWorkspace: URL) throws -> CoworkViewModel {
         let session = SessionID(rawValue: IDGen.random(prefix: "cowork"))
-        return try makeCoworkViewModel(session: session)
+        WorkspaceAccess.remember(primaryWorkspace, for: session)
+        let settings = CoworkProjectSettings.fresh(
+            sessionID: session,
+            primaryWorkspace: primaryWorkspace,
+            catalog: providerCatalog)
+        CoworkProjectSettingsStore.save(settings)
+        return try makeCoworkViewModel(session: session, projectSettings: settings)
     }
 
     func makeCoworkViewModel(session: SessionID) throws -> CoworkViewModel {
+        let settings = CoworkProjectSettingsStore.load(sessionID: session, catalog: providerCatalog)
+        return try makeCoworkViewModel(session: session, projectSettings: settings)
+    }
+
+    private func makeCoworkViewModel(session: SessionID,
+                                     projectSettings: CoworkProjectSettings) throws -> CoworkViewModel {
         let coworkLog = try EventLog(session: session, fileURL: AppConfig.sessionFile(session))
-        return CoworkViewModel(sessionID: session, log: coworkLog, registry: registry)
+        return CoworkViewModel(
+            sessionID: session,
+            log: coworkLog,
+            registry: registry,
+            projectSettings: projectSettings)
     }
 
     func recentCodeSessions() -> [AppSessionSummary] {
@@ -190,6 +206,7 @@ final class AppEnvironment: ObservableObject {
     }
 
     private func refreshProviderRegistry() {
+        secrets.clearCache()
         let updated = Self.makeProviderRegistry(resolver: secrets)
         registry = updated
         viewModel.updateProviderRegistry(updated)
@@ -429,8 +446,7 @@ struct CoworkSessionView: View {
     let onSelectModel: (String, String) -> Void
     let onShowSessions: () -> Void
     let onNewSession: () -> Void
-    @State private var showAdd = false
-    @State private var agentName = ""
+    @State private var showProjectSettings = false
     @Environment(\.colorScheme) private var scheme
 
     var body: some View {
@@ -440,11 +456,13 @@ struct CoworkSessionView: View {
                     permissionNotice: vm.permissionNotice,
                     latestTurnStats: vm.latestTurnStats,
                     summary: vm.summary,
+                    project: vm.project,
                     composerError: vm.composerError,
                     isWorking: vm.isWorking,
                     threadStyle: .intatisMac(scheme),
                     onShowSessions: onShowSessions,
                     onNewSession: onNewSession,
+                    onShowProjectSettings: { showProjectSettings = true },
                     composerAccessory: AnyView(IntatisComposerAccessory(
                         catalog: catalog,
                         isBusy: vm.isWorking,
@@ -454,14 +472,10 @@ struct CoworkSessionView: View {
                     input: $vm.input,
                     onSend: { vm.send() },
                     onResolve: { vm.resolvePermission($0) },
-                    onAddAgent: {
-                        agentName = ""
-                        vm.resetAddAgentStatus()
-                        showAdd = true
-                    },
+                    onRemoveAgent: { vm.removeAgent(name: $0) },
                     onRetryTask: { vm.retryFailedTask(id: $0) })
             .task { vm.start() }
-            .sheet(isPresented: $showAdd) { addAgentSheet }
+            .sheet(isPresented: $showProjectSettings) { projectSettingsSheet }
     }
 
     private var contextLabel: String? {
@@ -476,67 +490,15 @@ struct CoworkSessionView: View {
         return formatter
     }()
 
-    private var addAgentSheet: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Add agent").font(.headline)
-            TextField("Name (e.g. Rokurics)", text: $agentName)
-                .textFieldStyle(.roundedBorder)
-                .disabled(vm.addAgentStatus.isBusy)
-            if let message = vm.addAgentStatus.message {
-                HStack(spacing: 8) {
-                    if vm.addAgentStatus.isBusy {
-                        ProgressView().controlSize(.small)
-                    }
-                    Text(message)
-                        .font(.caption)
-                        .foregroundStyle(addAgentMessageColor)
+    private var projectSettingsSheet: some View {
+        CoworkProjectSettingsSheet(
+            vm: vm,
+            catalog: catalog,
+            onAddWorkspace: {
+                if let url = WorkspaceAccess.choose(prompt: "Choose Project Workspace") {
+                    vm.addProjectWorkspace(url)
                 }
-            }
-            if case .attaching = vm.addAgentStatus,
-               let pending = vm.pendingPermission,
-               pending.request.tool == "agent.attach" {
-                PermissionCard(permission: pending, onResolve: { vm.resolvePermission($0) })
-            }
-            HStack {
-                Spacer()
-                Button("Cancel") {
-                    vm.resetAddAgentStatus()
-                    showAdd = false
-                }
-                .disabled(vm.addAgentStatus.isBusy)
-                Button("Choose Folder & Add") {
-                    let name = agentName.trimmingCharacters(in: .whitespaces)
-                    guard vm.prepareAddAgent(name: name) else { return }
-                    if let url = WorkspaceAccess.choose() {
-                        vm.addAgent(name: name, workspace: url)
-                    } else {
-                        vm.cancelAddAgentSelection()
-                    }
-                }
-                .keyboardShortcut(.defaultAction)
-                .disabled(vm.addAgentStatus.isBusy || agentName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            }
-        }
-        .onChange(of: vm.addAgentStatus) { status in
-            if case .attached = status {
-                agentName = ""
-                showAdd = false
-                vm.resetAddAgentStatus()
-            }
-        }
-        .padding(20)
-        .frame(minWidth: 300, idealWidth: 360, maxWidth: 440)
-    }
-
-    private var addAgentMessageColor: Color {
-        switch vm.addAgentStatus {
-        case .denied, .failed:
-            return .red
-        case .attached:
-            return .green
-        case .idle, .validating, .attaching:
-            return .secondary
-        }
+            })
     }
 }
 

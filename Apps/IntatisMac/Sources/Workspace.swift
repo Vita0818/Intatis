@@ -9,13 +9,13 @@ import AppKit
 /// access via a user-selected security-scoped resource (ARCHITECTURE.md §9.1).
 enum WorkspaceAccess {
     @MainActor
-    static func choose() -> URL? {
+    static func choose(prompt: String = "Choose Workspace") -> URL? {
         #if canImport(AppKit)
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
-        panel.prompt = "Choose Workspace"
+        panel.prompt = prompt
         guard panel.runModal() == .OK, let url = panel.url else { return nil }
         _ = url.startAccessingSecurityScopedResource()
         remember(url)

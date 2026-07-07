@@ -92,7 +92,7 @@ public protocol AgentMessenger: Sendable {
 /// list, and remove sub-agents through tools. Like `AgentMessenger`, the real
 /// work happens in the orchestrator/registry — tools are just thin executors.
 public protocol AgentManager: Sendable {
-    func spawnAgent(name: String, path: String, model: String?) async -> String
+    func spawnAgent(name: String, path: String, model: String?, canCoordinate: Bool) async -> String
     func listAgents() async -> String
     func removeAgent(name: String) async -> String
 }

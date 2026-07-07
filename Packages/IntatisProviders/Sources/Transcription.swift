@@ -63,7 +63,8 @@ public struct OpenAITranscriptionProvider: TranscriptionProvider {
         ProviderRuntime.apply(runtimePolicy, to: &r)
         r.httpMethod = "POST"
         r.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-        r.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        r.setValue(ProviderAuthorization.bearerHeaderValue(apiKey: apiKey),
+                   forHTTPHeaderField: "Authorization")
         r.httpBody = body
 
         let data = try await ProviderRuntime.sendData(r,

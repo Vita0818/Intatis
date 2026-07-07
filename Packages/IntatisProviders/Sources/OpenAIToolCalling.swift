@@ -326,7 +326,8 @@ extension OpenAIWireProvider: ToolCallingProvider {
         r.httpMethod = "POST"
         r.setValue("application/json", forHTTPHeaderField: "Content-Type")
         r.setValue("text/event-stream", forHTTPHeaderField: "Accept")
-        r.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        r.setValue(ProviderAuthorization.bearerHeaderValue(apiKey: apiKey),
+                   forHTTPHeaderField: "Authorization")
         r.httpBody = try JSONEncoder().encode(JSONValue.object(root))
         return r
     }

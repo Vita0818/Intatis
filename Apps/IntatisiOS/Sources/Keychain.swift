@@ -31,6 +31,8 @@ public final class ConfigSecretResolver: SecretResolver, @unchecked Sendable {
             secret = try Self.readSecretFile(path: ref.account)
         case .authFile:
             secret = try Self.readAuthFileSecret(providerID: ref.account)
+        case .providerConfig:
+            secret = try Self.readProviderConfigSecret(providerID: ref.account, path: ref.service)
         }
         cache(secret, for: ref)
         return secret
@@ -38,6 +40,12 @@ public final class ConfigSecretResolver: SecretResolver, @unchecked Sendable {
 
     public func cache(_ secret: String, for ref: KeychainRef) {
         store(secret, for: Self.cacheKey(for: ref))
+    }
+
+    public func clearCache() {
+        lock.lock()
+        cache.removeAll()
+        lock.unlock()
     }
 
     private func cachedSecret(for cacheKey: String) -> String? {
@@ -65,6 +73,10 @@ public final class ConfigSecretResolver: SecretResolver, @unchecked Sendable {
             return FileManager.default.fileExists(atPath: expandedPath(ref.account))
         case .authFile:
             return authFileContainsSecret(providerID: ref.account)
+        case .providerConfig:
+            let url = URL(fileURLWithPath: expandedPath(ref.service))
+            return FileManager.default.fileExists(atPath: url.path)
+                && providerConfigContainsSecret(providerID: ref.account, url: url)
         }
     }
 
@@ -114,9 +126,31 @@ public final class ConfigSecretResolver: SecretResolver, @unchecked Sendable {
         throw IntatisError.notFound("auth file secret for provider '\(providerID)'")
     }
 
+    private static func readProviderConfigSecret(providerID: String, path: String) throws -> String {
+        let url = URL(fileURLWithPath: expandedPath(path))
+        let data = try Data(contentsOf: url)
+        let object = try JSONSerialization.jsonObject(with: data)
+        for candidate in authProviderIDCandidates(from: providerID) {
+            if let value = authSecret(in: object, providerID: candidate) {
+                return value
+            }
+        }
+        throw IntatisError.notFound("provider config secret for provider '\(providerID)'")
+    }
+
     private static func authFileContainsSecret(providerID: String) -> Bool {
         guard FileManager.default.fileExists(atPath: authFileURL().path),
               let data = try? Data(contentsOf: authFileURL()),
+              let object = try? JSONSerialization.jsonObject(with: data) else {
+            return false
+        }
+        return authProviderIDCandidates(from: providerID).contains {
+            authSecret(in: object, providerID: $0) != nil
+        }
+    }
+
+    private static func providerConfigContainsSecret(providerID: String, url: URL) -> Bool {
+        guard let data = try? Data(contentsOf: url),
               let object = try? JSONSerialization.jsonObject(with: data) else {
             return false
         }

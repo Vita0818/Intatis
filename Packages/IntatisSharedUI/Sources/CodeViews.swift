@@ -1,4 +1,5 @@
 #if canImport(SwiftUI)
+import Foundation
 import SwiftUI
 import IntatisCore
 import IntatisProtocol
@@ -8,6 +9,7 @@ import IntatisConversation
 /// kernel-driving view model lives in the app, not here (keeps SharedUI free of
 /// Tools/Permission/AgentKernel dependencies).
 public struct CodeShell: View {
+    private static let bottomAnchorID = "intatis-code-thread-bottom"
     private let items: [CodeItem]
     private let pending: PendingPermission?
     private let permissionNotice: PermissionResolutionNotice?
@@ -142,6 +144,9 @@ public struct CodeShell: View {
                             CodeItemRow(item: item, style: threadStyle, layout: layout)
                                 .id(item.id)
                         }
+                        Color.clear
+                            .frame(height: 1)
+                            .id(Self.bottomAnchorID)
                     }
                     .frame(width: layout.contentWidth)
                     .frame(maxWidth: .infinity)
@@ -149,9 +154,35 @@ public struct CodeShell: View {
                     .padding(.vertical, 16)
                 }
                 .scrollContentBackground(.hidden)
-                .onChange(of: items.count) { _ in
-                    if let last = items.last { withAnimation { proxy.scrollTo(last.id, anchor: .bottom) } }
+                .onAppear {
+                    scrollToBottom(proxy, animated: false)
                 }
+                .onChange(of: itemScrollSignature) { _ in
+                    scrollToBottom(proxy)
+                }
+            }
+        }
+    }
+
+    private var itemScrollSignature: String {
+        guard let last = items.last else { return "0" }
+        return [
+            "\(items.count)",
+            last.id,
+            "\(last.body.count)",
+            "\(last.complete)",
+            "\(isWorking)"
+        ].joined(separator: ":")
+    }
+
+    private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool = true) {
+        DispatchQueue.main.async {
+            if animated {
+                withAnimation(.easeOut(duration: 0.18)) {
+                    proxy.scrollTo(Self.bottomAnchorID, anchor: .bottom)
+                }
+            } else {
+                proxy.scrollTo(Self.bottomAnchorID, anchor: .bottom)
             }
         }
     }

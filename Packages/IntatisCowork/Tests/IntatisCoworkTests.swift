@@ -86,9 +86,10 @@ private func askArgs(to: String, question: String) -> String {
     String(decoding: try! JSONSerialization.data(withJSONObject: ["to": to, "question": question]), as: UTF8.self)
 }
 
-private func spawnArgs(name: String, path: String, model: String? = nil) -> String {
-    var object = ["name": name, "path": path]
+private func spawnArgs(name: String, path: String, model: String? = nil, canCoordinate: Bool? = nil) -> String {
+    var object: [String: Any] = ["name": name, "path": path]
     if let model { object["model"] = model }
+    if let canCoordinate { object["canCoordinate"] = canCoordinate }
     return String(decoding: try! JSONSerialization.data(withJSONObject: object), as: UTF8.self)
 }
 
@@ -174,6 +175,35 @@ final class IntatisCoworkTests: XCTestCase {
             return nil
         }
         XCTAssertEqual(errors.last?.code, "no_such_agent")
+    }
+
+    func testImplicitSendDefaultsToMainWhenMultipleAgentsAreAttached() async throws {
+        let log = try tempLog()
+        let main = AgentID(rawValue: "main")
+        let worker = AgentID(rawValue: "worker")
+        let wsMain = try tempWorkspace()
+        let wsWorker = try tempWorkspace()
+        defer {
+            try? FileManager.default.removeItem(at: wsMain)
+            try? FileManager.default.removeItem(at: wsWorker)
+        }
+        let mainProvider = CapturingProvider()
+        let workerProvider = CapturingProvider()
+        let orch = Orchestrator(log: log, allowsShell: true, responder: FixedResponder(.allow)) { agent in
+            agent.name == main ? mainProvider : workerProvider
+        }
+
+        await orch.attach(Agent(name: worker, workspaceRoot: wsWorker, model: ModelID(rawValue: "m"), profile: .reviewed))
+        await orch.attach(Agent(name: main,
+                                workspaceRoot: wsMain,
+                                model: ModelID(rawValue: "m"),
+                                profile: .reviewed,
+                                coordinationDepth: Agent.defaultCoordinationDepth))
+
+        let result = await orch.send("default project task")
+        XCTAssertEqual(result, .sent)
+        XCTAssertEqual(mainProvider.requests.count, 1)
+        XCTAssertEqual(workerProvider.requests.count, 0)
     }
 
     func testSendReturnsFailureWhenAgentRunFails() async throws {
@@ -420,6 +450,58 @@ final class IntatisCoworkTests: XCTestCase {
         XCTAssertFalse(systemPrompt.contains("remove_agent"))
         XCTAssertFalse(systemPrompt.contains("COORDINATOR"))
         XCTAssertFalse(systemPrompt.lowercased().contains("delegate"))
+    }
+
+    func testMainCanExplicitlySpawnCoordinatorSubAgent() async throws {
+        let log = try tempLog()
+        let main = AgentID(rawValue: "main")
+        let lead = AgentID(rawValue: "feature-lead")
+        let wsMain = try tempWorkspace()
+        let wsLead = try tempWorkspace()
+        defer {
+            try? FileManager.default.removeItem(at: wsMain)
+            try? FileManager.default.removeItem(at: wsLead)
+        }
+        let mainProvider = ScriptedProvider([
+            [.toolCalls([ToolCall(id: "spawn", name: "spawn_agent",
+                                  arguments: spawnArgs(name: lead.rawValue,
+                                                       path: wsLead.path,
+                                                       model: "m",
+                                                       canCoordinate: true))]),
+             .done(finishReason: "tool_calls")],
+            [.textDelta("lead ready"), .done(finishReason: "stop")],
+        ])
+        let leadProvider = CapturingProvider()
+        let orch = Orchestrator(log: log, allowsShell: true, responder: FixedResponder(.allow)) { agent in
+            if agent.name == lead {
+                return leadProvider
+            }
+            return mainProvider
+        }
+
+        let attached = await orch.attach(Agent(name: main,
+                                               workspaceRoot: wsMain,
+                                               model: ModelID(rawValue: "m"),
+                                               profile: .reviewed,
+                                               coordinationDepth: Agent.defaultCoordinationDepth))
+        XCTAssertTrue(attached)
+        await orch.send("create a sub coordinator for this feature", to: main)
+
+        let spawned = await orch.agentList().first { $0.name == lead }
+        XCTAssertNotNil(spawned)
+        XCTAssertEqual(spawned?.coordinationDepth, Agent.defaultCoordinationDepth)
+
+        await orch.send("coordinate the nested implementation work", to: lead)
+        let request = try XCTUnwrap(leadProvider.requests.last)
+        let toolNames = Set(request.tools.map(\.name))
+        XCTAssertTrue(toolNames.contains("spawn_agent"))
+        XCTAssertTrue(toolNames.contains("delegate_task"))
+        XCTAssertTrue(toolNames.contains("list_agents"))
+        XCTAssertTrue(toolNames.contains("remove_agent"))
+
+        let systemPrompt = try XCTUnwrap(request.messages.first?.content)
+        XCTAssertTrue(systemPrompt.contains("You may also act as a COORDINATOR"))
+        XCTAssertTrue(systemPrompt.contains("Agents you create are"))
     }
 
     func testWorkerCannotAskItself() async throws {

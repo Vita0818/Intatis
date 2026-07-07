@@ -161,7 +161,8 @@ public struct OpenAIWireProvider: ChatProvider {
         r.httpMethod = "POST"
         r.setValue("application/json", forHTTPHeaderField: "Content-Type")
         r.setValue("text/event-stream", forHTTPHeaderField: "Accept")
-        r.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        r.setValue(ProviderAuthorization.bearerHeaderValue(apiKey: apiKey),
+                   forHTTPHeaderField: "Authorization")
         var root: [String: JSONValue] = [
             "model": .string(request.model.rawValue),
             "messages": .array(request.messages.map(Self.chatMessageJSON)),

@@ -8,6 +8,7 @@
 //
 
 #if canImport(SwiftUI)
+import Foundation
 import SwiftUI
 #if canImport(AppKit)
 import AppKit
@@ -67,6 +68,7 @@ private struct IntatisChatSessionScreen: View {
     @ObservedObject var env: AppEnvironment
     @ObservedObject var model: ChatViewModel
     @Environment(\.colorScheme) private var scheme
+    private static let bottomAnchorID = "intatis-chat-thread-bottom"
 
     var body: some View {
         GeometryReader { proxy in
@@ -145,6 +147,9 @@ private struct IntatisChatSessionScreen: View {
                         if model.isStreaming, model.messages.last?.role == .user {
                             thinkingRow(layout: layout)
                         }
+                        Color.clear
+                            .frame(height: 1)
+                            .id(Self.bottomAnchorID)
                     }
                     .frame(width: layout.contentWidth)
                     .frame(maxWidth: .infinity)
@@ -152,11 +157,35 @@ private struct IntatisChatSessionScreen: View {
                     .padding(.vertical, 16)
                 }
                 .scrollContentBackground(.hidden)
-                .onChange(of: model.messages.count) { _ in
-                    if let last = model.messages.last {
-                        withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
-                    }
+                .onAppear {
+                    scrollToBottom(proxy, animated: false)
                 }
+                .onChange(of: chatScrollSignature) { _ in
+                    scrollToBottom(proxy)
+                }
+            }
+        }
+    }
+
+    private var chatScrollSignature: String {
+        guard let last = model.messages.last else { return "0" }
+        return [
+            "\(model.messages.count)",
+            last.id.rawValue,
+            "\(last.text.count)",
+            "\(last.isComplete)",
+            "\(model.isStreaming)"
+        ].joined(separator: ":")
+    }
+
+    private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool = true) {
+        DispatchQueue.main.async {
+            if animated {
+                withAnimation(.easeOut(duration: 0.18)) {
+                    proxy.scrollTo(Self.bottomAnchorID, anchor: .bottom)
+                }
+            } else {
+                proxy.scrollTo(Self.bottomAnchorID, anchor: .bottom)
             }
         }
     }
@@ -1039,6 +1068,8 @@ struct IntatisSettingsPanel: View {
             return ref.account.isEmpty ? "environment" : "env \(ref.account)"
         case .file:
             return "secret file"
+        case .providerConfig:
+            return "provider config"
         case .keychain:
             return "legacy keychain"
         }

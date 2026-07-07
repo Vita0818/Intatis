@@ -129,9 +129,6 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
             } catch {
                 let message = error.localizedDescription
                 self.composerError = message
-                if self.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    self.input = originalInput
-                }
                 if !didEnterAgentLoop {
                     try? await self.log.append(.error(
                         RuntimeErrorPresentation.payload(for: error, fallbackCode: "agent")))

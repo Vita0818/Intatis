@@ -15,7 +15,8 @@ public struct SpawnAgentTool: Tool {
         name: "spawn_agent",
         description: "Create a new sub-agent bound to a folder so you can delegate work to it. "
             + "Give it a short name and an absolute folder path; model is optional (defaults to "
-            + "yours). After spawning, assign work with delegate_task.",
+            + "yours). Set canCoordinate only when this sub-agent must manage lower-level agents. "
+            + "After spawning, assign work with delegate_task.",
         sideEffect: .write,
         parameters: .object([
             "type": .string("object"),
@@ -26,20 +27,26 @@ public struct SpawnAgentTool: Tool {
                                  "description": .string("absolute path to the agent's workspace folder")]),
                 "model": .object(["type": .string("string"),
                                   "description": .string("optional model id; defaults to your model")]),
+                "canCoordinate": .object(["type": .string("boolean"),
+                                           "description": .string("optional; true grants coordinator tools to this sub-agent")]),
             ]),
             "required": .array([.string("name"), .string("path")]),
             "additionalProperties": .bool(false),
         ])
     )
 
-    struct Args: Decodable { let name: String; let path: String; let model: String? }
+    struct Args: Decodable { let name: String; let path: String; let model: String?; let canCoordinate: Bool? }
 
     public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {
         let a = try args.decode(Args.self)
         guard let manager = context.agentManager else {
             return ToolObservation(text: "agent management is not available in this session")
         }
-        return ToolObservation(text: await manager.spawnAgent(name: a.name, path: a.path, model: a.model))
+        return ToolObservation(text: await manager.spawnAgent(
+            name: a.name,
+            path: a.path,
+            model: a.model,
+            canCoordinate: a.canCoordinate ?? false))
     }
 }
 

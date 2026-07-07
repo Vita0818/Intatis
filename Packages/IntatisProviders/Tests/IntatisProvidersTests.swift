@@ -69,6 +69,7 @@ private final class SequencedHTTP: HTTPByteStreaming, @unchecked Sendable {
 private final class CapturingHTTP: HTTPByteStreaming, @unchecked Sendable {
     private let queue = DispatchQueue(label: "intatis.tests.capturing-http")
     private let chunks: [Data]
+    private var requests: [URLRequest] = []
     private var requestBodies: [Data] = []
 
     init(chunks: [Data]) {
@@ -79,8 +80,13 @@ private final class CapturingHTTP: HTTPByteStreaming, @unchecked Sendable {
         queue.sync { requestBodies.last }
     }
 
+    var lastRequest: URLRequest? {
+        queue.sync { requests.last }
+    }
+
     func stream(_ request: URLRequest) -> AsyncThrowingStream<Data, Error> {
         queue.sync {
+            requests.append(request)
             requestBodies.append(request.httpBody ?? Data())
         }
         return AsyncThrowingStream { continuation in
@@ -160,6 +166,27 @@ final class IntatisProvidersTests: XCTestCase {
         }
         XCTAssertEqual(text, "Hello")
         XCTAssertTrue(sawDone)
+    }
+
+    func testOpenAIStreamingNormalizesBearerAPIKeyInAuthorizationHeader() async throws {
+        let sse = """
+        data: {"choices":[{"delta":{"content":"OK"},"finish_reason":"stop"}]}
+
+        data: [DONE]
+
+        """
+        let http = CapturingHTTP(chunks: [Data(sse.utf8)])
+        let provider = OpenAIWireProvider(endpoint: openAIEndpoint,
+                                          apiKey: " \"Bearer valid-token\" ",
+                                          http: http)
+
+        for try await _ in provider.stream(ChatRequest(model: ModelID(rawValue: "m"),
+                                                       messages: [ChatMessage(role: .user, content: "hi")])) {}
+
+        XCTAssertEqual(http.lastRequest?.value(forHTTPHeaderField: "Authorization"),
+                       "Bearer valid-token")
+        XCTAssertEqual(ProviderAuthorization.bearerHeaderValue(apiKey: "'Bearer valid-token'"),
+                       "Bearer valid-token")
     }
 
     func testOpenAIStreamingParsesUsage() async throws {

@@ -227,7 +227,15 @@ struct IntatisMacRootView: View {
             ? "Unknown date"
             : session.updatedAt.formatted(date: .abbreviated, time: .shortened)
         let count = session.eventCount == 1 ? "1 event" : "\(session.eventCount) events"
-        let workspace = selection == .code ? WorkspaceAccess.workspacePath(for: session.id).map { " · \($0)" } ?? "" : ""
+        let workspace: String
+        switch selection {
+        case .code:
+            workspace = WorkspaceAccess.workspacePath(for: session.id).map { " · \($0)" } ?? ""
+        case .cowork:
+            workspace = CoworkProjectSettingsStore.primaryWorkspacePath(sessionID: session.id).map { " · \($0)" } ?? ""
+        case .chat:
+            workspace = ""
+        }
         return "\(count) · \(timestamp)\(workspace)"
     }
 
@@ -313,11 +321,12 @@ struct IntatisMacRootView: View {
     }
 
     private func startNewCoworkSession() {
+        guard let workspace = WorkspaceAccess.choose(prompt: "Choose Cowork Workspace") else { return }
         selection = .cowork
         isSettings = false
         coworkVM?.stop()
         do {
-            coworkVM = try env.makeCoworkViewModel()
+            coworkVM = try env.makeCoworkViewModel(primaryWorkspace: workspace)
             coworkSessionError = nil
             refreshCoworkSessions()
         } catch {

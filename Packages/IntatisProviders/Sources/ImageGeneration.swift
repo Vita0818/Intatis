@@ -59,7 +59,8 @@ public struct OpenAIImageProvider: ImageGenerationProvider {
         ProviderRuntime.apply(runtimePolicy, to: &r)
         r.httpMethod = "POST"
         r.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        r.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        r.setValue(ProviderAuthorization.bearerHeaderValue(apiKey: apiKey),
+                   forHTTPHeaderField: "Authorization")
         let body: [String: Any] = [
             "model": request.model.rawValue,
             "prompt": request.prompt,

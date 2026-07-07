@@ -111,6 +111,8 @@ unbounded agent spawning
 
 ## 5. 工作区与安全规则
 
+Cowork 可以采用项目制：一个 session 绑定一个或多个用户选择的工作目录，并有一个 `@main` 主 agent。用户默认只向 `@main` 下达项目任务；`@main` 通过工具创建、委派、调取、删除子 agent，并管理任务、上下文、权限 profile、token budget 等 project metadata。但 project/session settings 只是本地元数据与 UI 投影，不得替代 task contract、capability lease、workspace lease 或权限门。
+
 工作区扩展**绝非**只读。创建或附加 agent 到新目录是能力/工作区扩展，必须经权限。
 
 不得让 model 静默附加到：
@@ -124,6 +126,8 @@ secret/token/key directories
 ```
 
 所有文件访问必须经工作区约束与权限策略。
+
+新增或删除项目工作目录是 session/project metadata 变更；真正派生工作 agent 应由 `@main` 或被显式授予协调权的 agent 通过调度器和工具完成。新建子 agent 默认只获得普通 worker 能力；除非 task contract/capability lease 明确授予（例如显式协调授权），不得让子 agent 继承 `@main` 的 `spawn_agent` / `remove_agent` / `delegate_task` 等 coordinator 工具。`@main` 和自动权限审查者不应作为普通删除对象。
 
 自动权限审查若启用，审查者也必须是受控子 agent：
 ```text

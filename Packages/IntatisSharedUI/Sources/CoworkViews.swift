@@ -1,4 +1,5 @@
 #if canImport(SwiftUI)
+import Foundation
 import SwiftUI
 import IntatisCore
 import IntatisProtocol
@@ -11,11 +12,13 @@ public struct CoworkAgentInfo: Identifiable, Equatable, Sendable {
     public let model: String
     public let profile: String
     public let status: String
+    public let role: String
     public let pendingTasks: Int
     public let pendingMessages: Int
     public let completedTasks: Int
     public let workspaceLease: String?
     public let capabilityLease: String?
+    public let canRemove: Bool
 
     public init(id: String,
                 name: String,
@@ -23,22 +26,26 @@ public struct CoworkAgentInfo: Identifiable, Equatable, Sendable {
                 model: String,
                 profile: String,
                 status: String = "idle",
+                role: String = "worker",
                 pendingTasks: Int = 0,
                 pendingMessages: Int = 0,
                 completedTasks: Int = 0,
                 workspaceLease: String? = nil,
-                capabilityLease: String? = nil) {
+                capabilityLease: String? = nil,
+                canRemove: Bool = true) {
         self.id = id
         self.name = name
         self.workspace = workspace
         self.model = model
         self.profile = profile
         self.status = status
+        self.role = role
         self.pendingTasks = pendingTasks
         self.pendingMessages = pendingMessages
         self.completedTasks = completedTasks
         self.workspaceLease = workspaceLease
         self.capabilityLease = capabilityLease
+        self.canRemove = canRemove
     }
 }
 
@@ -53,6 +60,54 @@ public struct CoworkTaskLine: Identifiable, Equatable, Sendable {
         self.title = title
         self.detail = detail
         self.status = status
+    }
+}
+
+public struct CoworkWorkspaceInfo: Identifiable, Equatable, Sendable {
+    public let id: String
+    public let path: String
+    public let displayName: String
+    public let agentName: String?
+    public let isPrimary: Bool
+    public let access: String
+    public let canRemove: Bool
+
+    public init(path: String,
+                displayName: String,
+                agentName: String? = nil,
+                isPrimary: Bool = false,
+                access: String = "read_write",
+                canRemove: Bool = true) {
+        self.id = path
+        self.path = path
+        self.displayName = displayName
+        self.agentName = agentName
+        self.isPrimary = isPrimary
+        self.access = access
+        self.canRemove = canRemove
+    }
+}
+
+public struct CoworkProjectInfo: Equatable, Sendable {
+    public let sessionID: String
+    public let mainAgentName: String
+    public let defaultModel: String
+    public let defaultPermission: String
+    public let tokenBudget: String?
+    public let workspaces: [CoworkWorkspaceInfo]
+
+    public init(sessionID: String = "",
+                mainAgentName: String = "main",
+                defaultModel: String = "current model",
+                defaultPermission: String = "reviewed",
+                tokenBudget: String? = nil,
+                workspaces: [CoworkWorkspaceInfo] = []) {
+        self.sessionID = sessionID
+        self.mainAgentName = mainAgentName
+        self.defaultModel = defaultModel
+        self.defaultPermission = defaultPermission
+        self.tokenBudget = tokenBudget
+        self.workspaces = workspaces
     }
 }
 
@@ -94,27 +149,29 @@ public struct CoworkStatusSummary: Equatable, Sendable {
     }
 }
 
-/// Presentational Cowork thread (v0.3): agent roster + add button on the left,
-/// the merged multi-agent thread in the middle (reuses `CodeItemRow`, including
-/// the `agentToAgent` card), per-agent details on the right. `@mention` parsing
-/// happens in the view model; the composer just hints at it.
+/// Presentational Cowork project thread: the user gives work to Main, while
+/// the roster/inspector exposes the sub-agent activity Main schedules.
 public struct CoworkShell: View {
+    private static let bottomAnchorID = "intatis-cowork-thread-bottom"
     private let items: [CodeItem]
     private let agents: [CoworkAgentInfo]
     private let pending: PendingPermission?
     private let permissionNotice: PermissionResolutionNotice?
     private let latestTurnStats: TurnStatsSnapshot?
     private let summary: CoworkStatusSummary
+    private let project: CoworkProjectInfo
     private let composerError: String?
     private let isWorking: Bool
     private let threadStyle: IntatisThreadStyle
     private let onShowSessions: (() -> Void)?
     private let onNewSession: (() -> Void)?
+    private let onShowProjectSettings: (() -> Void)?
     private let composerAccessory: AnyView?
     @Binding private var input: String
     private let onSend: () -> Void
     private let onResolve: (PermissionDecision) -> Void
-    private let onAddAgent: () -> Void
+    private let onAddAgent: (() -> Void)?
+    private let onRemoveAgent: ((String) -> Void)?
     private let onRetryTask: ((String) -> Void)?
     @State private var selectedAgentID: String?
 
@@ -124,17 +181,20 @@ public struct CoworkShell: View {
                 permissionNotice: PermissionResolutionNotice? = nil,
                 latestTurnStats: TurnStatsSnapshot? = nil,
                 summary: CoworkStatusSummary,
+                project: CoworkProjectInfo = CoworkProjectInfo(),
                 composerError: String?,
                 isWorking: Bool,
                 threadStyle: IntatisThreadStyle = .standard(.light),
                 splitLayout: IntatisSplitColumnLayout = .workspace,
                 onShowSessions: (() -> Void)? = nil,
                 onNewSession: (() -> Void)? = nil,
+                onShowProjectSettings: (() -> Void)? = nil,
                 composerAccessory: AnyView? = nil,
                 input: Binding<String>,
                 onSend: @escaping () -> Void,
                 onResolve: @escaping (PermissionDecision) -> Void,
-                onAddAgent: @escaping () -> Void,
+                onAddAgent: (() -> Void)? = nil,
+                onRemoveAgent: ((String) -> Void)? = nil,
                 onRetryTask: ((String) -> Void)? = nil) {
         self.items = items
         self.agents = agents
@@ -142,16 +202,19 @@ public struct CoworkShell: View {
         self.permissionNotice = permissionNotice
         self.latestTurnStats = latestTurnStats
         self.summary = summary
+        self.project = project
         self.composerError = composerError
         self.isWorking = isWorking
         self.threadStyle = threadStyle
         self.onShowSessions = onShowSessions
         self.onNewSession = onNewSession
+        self.onShowProjectSettings = onShowProjectSettings
         self.composerAccessory = composerAccessory
         self._input = input
         self.onSend = onSend
         self.onResolve = onResolve
         self.onAddAgent = onAddAgent
+        self.onRemoveAgent = onRemoveAgent
         self.onRetryTask = onRetryTask
         _ = splitLayout
     }
@@ -226,7 +289,16 @@ public struct CoworkShell: View {
     private func headerActions(showsCompactActions: Bool) -> [IntatisThreadHeaderAction] {
         var actions: [IntatisThreadHeaderAction] = []
         if showsCompactActions {
-            actions.append(IntatisThreadHeaderAction(title: "Add Agent", systemImage: "person.badge.plus", action: onAddAgent))
+            if let onShowProjectSettings {
+                actions.append(IntatisThreadHeaderAction(
+                    title: "Project",
+                    systemImage: "slider.horizontal.3",
+                    isDisabled: isWorking,
+                    action: onShowProjectSettings))
+            }
+            if let onAddAgent {
+                actions.append(IntatisThreadHeaderAction(title: "Attach", systemImage: "person.badge.plus", action: onAddAgent))
+            }
         }
         return actions
     }
@@ -235,6 +307,9 @@ public struct CoworkShell: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
                 inspectorHeader
+                inspectorSection("Project") {
+                    projectSection
+                }
                 inspectorSection("Agents") {
                     HStack(spacing: 8) {
                         metric("Active", summary.activeCount)
@@ -244,17 +319,14 @@ public struct CoworkShell: View {
                         metric("Failed", summary.failedCount)
                         metric("Mailbox", summary.pendingMailboxCount)
                     }
-                    Button(action: onAddAgent) {
-                        Label("Add Agent", systemImage: "person.badge.plus")
-                            .font(.caption.bold())
-                    }
-                    .buttonStyle(.borderless)
                     agentRosterList
                 }
                 inspectorSection("Plan") {
                     taskList
                 }
                 inspectorSection("Workspace") {
+                    inspectorRow("Directories", value: "\(project.workspaces.count)")
+                    workspaceDirectoryList
                     inspectorRow("Workspace leases", value: "\(summary.workspaceLeaseCount)")
                     inspectorRow("Capability leases", value: "\(summary.capabilityLeaseCount)")
                     inspectorRow("Git", value: "status only")
@@ -272,6 +344,61 @@ public struct CoworkShell: View {
             .padding(16)
         }
         .background(threadStyle.cardSurface.opacity(0.38))
+    }
+
+    private var projectSection: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            inspectorRow("Session", value: project.sessionID.isEmpty ? "current" : project.sessionID)
+            inspectorRow("Main", value: "@\(project.mainAgentName)")
+            inspectorRow("Model", value: project.defaultModel)
+            inspectorRow("Permission", value: project.defaultPermission)
+            if let tokenBudget = project.tokenBudget {
+                inspectorRow("Token budget", value: tokenBudget)
+            }
+            if let onShowProjectSettings {
+                Button(action: onShowProjectSettings) {
+                    Label("Project Settings", systemImage: "slider.horizontal.3")
+                        .font(.caption.bold())
+                }
+                .buttonStyle(.borderless)
+                .disabled(isWorking)
+            }
+        }
+    }
+
+    @ViewBuilder private var workspaceDirectoryList: some View {
+        if project.workspaces.isEmpty {
+            Text("No workspace directories")
+                .font(.caption)
+                .foregroundStyle(threadStyle.tertiaryText)
+        } else {
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(project.workspaces.prefix(5)) { workspace in
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 6) {
+                            Image(systemName: workspace.isPrimary ? "house" : "folder")
+                                .font(.caption2)
+                                .foregroundStyle(workspace.isPrimary ? threadStyle.accent : threadStyle.secondaryText)
+                            Text(workspace.displayName)
+                                .font(.caption.bold())
+                                .foregroundStyle(threadStyle.primaryText)
+                                .lineLimit(1)
+                            Spacer(minLength: 6)
+                            if let agentName = workspace.agentName {
+                                Text("@\(agentName)")
+                                    .font(.caption2.bold())
+                                    .foregroundStyle(threadStyle.secondaryText)
+                            }
+                        }
+                        Text(workspace.path)
+                            .font(.caption2)
+                            .foregroundStyle(threadStyle.secondaryText)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                }
+            }
+        }
     }
 
     private var inspectorHeader: some View {
@@ -407,11 +534,13 @@ public struct CoworkShell: View {
                     ForEach(agents) { agent in
                         agentPill(agent)
                     }
-                    Button(action: onAddAgent) {
-                        Label("Add", systemImage: "plus")
-                            .font(.caption.bold())
+                    if let onAddAgent {
+                        Button(action: onAddAgent) {
+                            Label("Attach", systemImage: "plus")
+                                .font(.caption.bold())
+                        }
+                        .buttonStyle(.borderless)
                     }
-                    .buttonStyle(.borderless)
                 }
                 .padding(.vertical, 1)
             }
@@ -470,27 +599,50 @@ public struct CoworkShell: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
                 .textSelection(.enabled)
-            ViewThatFits(in: .horizontal) {
-                HStack(spacing: 12) {
-                    Text(agent.model)
-                    Text(agent.profile)
-                    Text("\(agent.pendingMessages + agent.pendingTasks) pending")
-                    Text("\(agent.completedTasks) completed")
-                }
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(agent.model)
-                    Text(agent.profile)
-                    Text("\(agent.pendingMessages + agent.pendingTasks) pending · \(agent.completedTasks) completed")
+            agentDetailRow("Role", value: agent.role)
+            agentDetailRow("Model", value: agent.model)
+            agentDetailRow("Permission", value: agent.profile)
+            agentDetailRow("Queued", value: "\(agent.pendingTasks) tasks / \(agent.pendingMessages) messages")
+            agentDetailRow("Completed", value: "\(agent.completedTasks) tasks")
+            if let workspaceLease = agent.workspaceLease {
+                agentDetailRow("Workspace lease", value: workspaceLease)
+            }
+            if let capabilityLease = agent.capabilityLease {
+                agentDetailRow("Capability lease", value: capabilityLease)
+            }
+            if agent.canRemove, let onRemoveAgent {
+                HStack {
+                    Spacer(minLength: 0)
+                    Button {
+                        onRemoveAgent(agent.name)
+                    } label: {
+                        Image(systemName: "trash")
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(isWorking)
+                    .help("Remove agent")
                 }
             }
-            .font(.caption2)
-            .foregroundStyle(threadStyle.tertiaryText)
         }
         .padding(11)
         .background(threadStyle.cardSurface, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .stroke(threadStyle.cardStroke, lineWidth: 1)
+        }
+    }
+
+    private func agentDetailRow(_ title: String, value: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(title)
+                .font(.caption2)
+                .foregroundStyle(threadStyle.secondaryText)
+            Spacer(minLength: 8)
+            Text(value)
+                .font(.caption2.bold())
+                .foregroundStyle(threadStyle.primaryText)
+                .lineLimit(1)
+                .truncationMode(.middle)
         }
     }
 
@@ -527,6 +679,9 @@ public struct CoworkShell: View {
                             CodeItemRow(item: item, style: threadStyle, layout: layout)
                                 .id(item.id)
                         }
+                        Color.clear
+                            .frame(height: 1)
+                            .id(Self.bottomAnchorID)
                     }
                     .frame(width: layout.contentWidth)
                     .frame(maxWidth: .infinity)
@@ -534,9 +689,35 @@ public struct CoworkShell: View {
                     .padding(.vertical, 16)
                 }
                 .scrollContentBackground(.hidden)
-                .onChange(of: items.count) { _ in
-                    if let last = items.last { withAnimation { proxy.scrollTo(last.id, anchor: .bottom) } }
+                .onAppear {
+                    scrollToBottom(proxy, animated: false)
                 }
+                .onChange(of: itemScrollSignature) { _ in
+                    scrollToBottom(proxy)
+                }
+            }
+        }
+    }
+
+    private var itemScrollSignature: String {
+        guard let last = items.last else { return "0" }
+        return [
+            "\(items.count)",
+            last.id,
+            "\(last.body.count)",
+            "\(last.complete)",
+            "\(isWorking)"
+        ].joined(separator: ":")
+    }
+
+    private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool = true) {
+        DispatchQueue.main.async {
+            if animated {
+                withAnimation(.easeOut(duration: 0.18)) {
+                    proxy.scrollTo(Self.bottomAnchorID, anchor: .bottom)
+                }
+            } else {
+                proxy.scrollTo(Self.bottomAnchorID, anchor: .bottom)
             }
         }
     }
@@ -562,7 +743,7 @@ public struct CoworkShell: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             IntatisThreadComposer(
-                placeholder: "Message agents...",
+                placeholder: "Give Main a project task...",
                 input: $input,
                 canSend: !isWorking
                     && !permissionBlocksComposer

@@ -27,6 +27,8 @@ struct IOSProviderAPIKeySource: Codable, Equatable {
             return "file"
         case "authfile", "auth_file", "auth-json", "authjson", "json":
             return "authFile"
+        case "providerconfig", "provider_config", "config", "configfile", "config_file":
+            return "providerConfig"
         default:
             return "authFile"
         }
@@ -41,6 +43,8 @@ struct IOSProviderAPIKeySource: Codable, Equatable {
             return trimmed.isEmpty ? defaultRef : .file(trimmed)
         case "authFile":
             return .authFile(providerID: providerID)
+        case "providerConfig":
+            return trimmed.isEmpty ? defaultRef : .providerConfig(path: trimmed, providerID: providerID)
         default:
             return defaultRef
         }

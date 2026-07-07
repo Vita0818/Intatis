@@ -55,11 +55,13 @@ Code composer -> GoalInputParser (/goal metadata) -> AgentLoop.send()
 ### Cowork 链路（多 agent 编排，macOS 全量）
 
 ```text
-CoworkViewModel -> GoalInputParser + CoworkMentionRouter -> Orchestrator (actor)
+Cowork session open/new -> CoworkProjectSettingsStore loads/saves per-session project settings
+  -> restore workspace bookmarks + bootstrap @main through agent.attach if needed
+  -> CoworkViewModel -> GoalInputParser + CoworkMentionRouter -> Orchestrator (actor)
   -> AgentRegistry / MessageBus(log:, mediator:) / PermissionEngine
   -> attach(agent) -> log agent_attached
   -> CLI /auto 可创建保留子 agent @permission-reviewer（read_only + no tools）
-  -> send(text, to:@mention, userMessage metadata) -> 路由到目标 agent
+  -> GUI send(text) 默认路由到 @main；显式 @mention 仅作高级定向入口
   -> 为每次 run 构建 AgentLoop + BusMessenger + OrchestratorManager
        coordinator(canCoordinate=true) -> ToolRegistry.standard + [AskAgent/Spawn/List/Remove]
        worker -> ToolRegistry.standard 仅
@@ -73,7 +75,7 @@ CoworkViewModel -> GoalInputParser + CoworkMentionRouter -> Orchestrator (actor)
        -> ToolObservation 回填 -> 重复直至无 tool call
   -> 每次状态变更 append 到 EventLog
   -> GUI folds CoworkProjection + TurnStatsProjection
-  -> macOS Cowork inspector shows structured metrics/roster/task/workspace/capability/turn state
+  -> macOS Cowork inspector shows structured project/workspace/agent/task/capability/turn state
 MessageBus.deliver -> Mediator.mediate
   -> SecretScanner.containsSecret -> block
   -> content.count > maxChars(4000) -> block "send a summary"
@@ -82,8 +84,11 @@ MessageBus.deliver -> Mediator.mediate
 ```
 
 关键不变量：
-- 两级层级，无递归 spawn；worker 默认无 coordinator 工具。
+- 用户默认只与 `@main` 对话；`@main` 是项目负责人 agent，持有 coordinator capability lease，可读写主 workspace 并通过工具自动创建、委派、移除子 agent。
+- 动态层级通过 scheduler/message bus/task graph 表达，不允许 `AgentLoop` 同步递归调用另一个 `AgentLoop`。子 agent 默认是 worker，无 coordinator 工具；只有 `spawn_agent(canCoordinate:true)` 或未来显式 capability lease 授予时，子 agent 才可继续创建/调度下级 agent。
+- Cowork session 可绑定一个或多个用户选择的工作目录；per-session settings 只保存路径/bookmark/model/profile/token-budget metadata，不保存 secret，真实访问仍依赖 workspace bookmark 与 `agent.attach` 权限流。
 - `@main` agent 不可被 remove。
+- Project Settings 新增目录只更新 project metadata；当前工具执行仍以 agent 单 `workspaceRoot` 为真实文件访问根。普通子 agent 可从右侧 inspector/settings 作为人工干预删除，`@main` 与 `@permission-reviewer` 不可删除。
 - `@permission-reviewer` 是自动权限审查保留身份：只能由 `/auto` 创建、`/default` 移除；不能作为普通 send/delegate/message/ask 目标，也不会暴露给 `list_agents` 工具。
 - MessageBus 是唯一投递路径；Mediator 默认转发摘要不转发原始字节。
 - 任何 model tool_call 到执行都必须过 PermissionEngine，无旁路。
@@ -109,6 +114,7 @@ MultimodalService.generateImage/transcribe/generateVideo(轮询 job)
 | `ProviderHealthReport` | 当前 provider/model 的连接测试结果 | 不写入 EventLog；由设置页临时显示 | status、role、endpoint/model/wire、elapsed、first token、usage、code/message、裁剪 response preview；不得包含 secret 或完整响应体 |
 | `ProviderRuntimePolicy` / `HTTPDataResponse` | provider 请求的 timeout / retry / backoff / rate-limit header 策略 | 不持久化；由 provider adapter 初始化默认值；HTTP headers 只用于当前请求诊断 | streaming 默认 2 attempts + request timeout；只在首个响应字节前失败时 retry。non-streaming image/transcription 对 retryable HTTP/网络/timeout 失败重试；`Retry-After` / rate-limit reset headers 可用数字秒、HTTP 日期或 `750ms` / `1m30s` 等 duration 字符串影响 retry delay 并进入错误说明；取消不 retry |
 | `SessionSummary` / `SessionHistoryStore` | 最近会话摘要与路径生成 | 扫描 app support root 下 `<session>/events.jsonl` | Chat/Code/Cowork 按 `sess_` / `code_` / `cowork_` 前缀区分；macOS/iOS 共用实现，平台层只传 root 与 `SessionID` |
+| `CoworkProjectSettings` / `CoworkProjectInfo` | Cowork project-mode session metadata 与右侧 inspector 投影 | UserDefaults `intatis.cowork.projectSettings.<sessionID>`；GUI 运行时投影 | 保存主 agent 名称、默认 provider/model、默认 permission profile、可选 token budget、workspace path/bookmark/agent 归属；不保存 secret；恢复时按 bookmark 恢复访问并通过既有 `agent.attach` 生成 `@main` workspace lease；project info 只读投影 agent/workspace 状态；direct multi-root tool context 尚未实现 |
 | `Agent` | agent 值类型 | 内存 | `coordinationDepth` 是当前 coordinator 工具兼容 fuse；默认 profile `.reviewed`；自动权限审查者固定 `read_only` + `coordinationDepth=0` |
 | `Capability` | provider 能力枚举 | 配置 | chat/tool_calling/vision/realtime/audio/image/video/embedding |
 | `PlatformProfile` | 平台能力信封 | launch-time | `.iOS`（最受限）/`.macAppStore`/`.macDeveloperID`；`current` 默认 `.iOS` |
@@ -127,7 +133,7 @@ MultimodalService.generateImage/transcribe/generateVideo(轮询 job)
 - **Provider health check**：`ProviderRegistry.healthCheck(role:options:)` 复用当前 provider catalog、chat selection、secret resolver 与 `OpenAIWireProvider`，发起最小 chat/agent 流式请求，输出 `ProviderHealthReport`。chat 与 agent health check 均请求 `stream_options.include_usage`，并使用共享 `Usage` 合并规则处理 split usage chunk。报告显式区分 ok、timeout、partial stream、unknown endpoint、非法 provider URL、provider/transport/config 错误，并带 endpoint/model/wire/耗时/首 token/usage 与裁剪预览；兼容缺 `[DONE]` 但有 `finish_reason` 的 provider，只有完成信号缺失才标记 partial stream，并保留已收到的裁剪预览；macOS 与 iOS 设置页共用该 provider 层 API，只做不同布局，不写入 EventLog 或持久状态。
 - **Goal 输入命令**：`GoalInputParser` 在 UI/ViewModel 层识别行首 `/goal`，要求后面有目标文本；解析成功后把命令前缀剥离，provider/agent 只收到清洗后的目标文本。事件层通过 `UserMessagePayload.tags = ["Goal"]` 与 `goal` 保存目标元数据，`ConversationProjection` / `CodeProjection` 将其投影到 `ChatMessageView` / `CodeItem`，SharedUI 与 macOS Chat bubble 显示 Goal 标签。Cowork 会在 mention 路由前后各解析一次，因此支持 `/goal @Agent ...` 与 `@Agent /goal ...`。
 - **工具执行反馈**：AgentLoop 对未知工具、权限拒绝、工具抛错分别写入结构化 `tool_result` observation，并在执行前追加 `agent_status(tool)`；已知工具在权限判断和执行前会校验参数必须是 JSON object，并满足 descriptor schema 的 required 字段、基础类型、数字 `minimum`/`maximum` 约束、字符串 `minLength`/`maxLength` 约束与 `additionalProperties:false` 未知字段规则，`read_file.maxBytes` 当前要求 `>= 1`，标准工具 path/query/command/diff 字符串当前要求非空，required 为空的无参工具可把空参数 / `null` 归一为 `{}`，坏 JSON、非对象、缺 required 字段、基础类型错误、数值越界、字符串过短/过长或未知字段会写入 `invalid tool input:` 的 `tool_result`，不生成 `permission_request`，也不执行工具。当前 shipped tools schema 默认声明 `additionalProperties:false`，因此模型给出的额外字段不能被 `try?` 默认值吞掉后进入权限或工具执行。`CodeProjection` 根据 `tool_call_id` 将结果标题回填为 `result · <toolName>`，把 `tool error:` / `permission denied:` / `unknown tool:` / `invalid tool input:` 标成失败项，并通过 `RuntimeRecoveryAdvice` 派生恢复建议。GUI 与 CLI 均消费事件投影/observation，不解析 assistant transcript。
-- **macOS UI information architecture**：`IntatisMacRootView` 是 macOS Chat/Code/Cowork 的 shell。左侧栏固定 `Intatis` 标题、横向 mode switch、mode-specific session history 与 Settings；New session 动作在 history 区域内。主 thread header 保持标题/副标题，不承载 New/session/model 控件。`IntatisThreadComposer` 支持 composer accessory，macOS Chat/Code/Cowork 把 provider/model menu、context label 与 turn stats 放在输入区旁。Thread content 使用共享 responsive layout 计算 horizontal padding、显式 `contentWidth`、message gutter 与 bubble max width；Chat/Code/Cowork 的 message list 均以 `contentWidth` 固定列宽后再在可用区域内居中；对话泡泡通过 `IntatisThreadBubbleRow` 在整行层面按 user trailing、assistant/agent leading 对齐，短消息也在自身 max-width 框内按角色对齐，而不是只靠 bubble 内部 spacer 推位置。Chat 默认无右 inspector；Code 使用右 inspector 展示 structured plan/workspace/Git-status-only/recent failure/last turn；Cowork 使用右 inspector 展示 metrics、agent roster、task plan、workspace leases、capability leases、Git-status-only 和 last turn。Git 在此层只读展示状态，不实现 commit/branch/PR/CI 工作流。
+- **macOS UI information architecture**：`IntatisMacRootView` 是 macOS Chat/Code/Cowork 的 shell。左侧栏固定 `Intatis` 标题、横向 mode switch、mode-specific session history 与 Settings；New session 动作在 history 区域内，Cowork New session 会先要求用户选择主 workspace 并初始化 per-session project settings。主 thread header 保持标题/副标题，不承载 New/session/model 控件。`IntatisThreadComposer` 支持 composer accessory，macOS Chat/Code/Cowork 把 provider/model menu、context label 与 turn stats 放在输入区旁；Cowork composer 默认把无 @mention 指令交给 `@main`。Thread content 使用共享 responsive layout 计算 horizontal padding、显式 `contentWidth`、message gutter 与 bubble max width；Chat/Code/Cowork 的 message list 均以 `contentWidth` 固定列宽后再在可用区域内居中；对话泡泡通过 `IntatisThreadBubbleRow` 在整行层面按 user trailing、assistant/agent leading 对齐，短消息也在自身 max-width 框内按角色对齐，而不是只靠 bubble 内部 spacer 推位置。Chat 默认无右 inspector；Code 使用右 inspector 展示 structured plan/workspace/Git-status-only/recent failure/last turn；Cowork 使用右 inspector 展示 project settings summary、workspace 目录、agent roster/name/role/model/permission/status/queue/completed、workspace leases、capability leases、Git-status-only 和 last turn，并保留删除普通子 agent 的干预入口，不把手动创建 agent 作为默认用户流程。Git 在此层只读展示状态，不实现 commit/branch/PR/CI 工作流。
 - **GUI token/turn stats**：ChatLoop 与 AgentLoop 每轮结束追加 `turn_stats`，包含 endpoint 返回的 prompt/completion/total token（若有）、可选 cached prompt tokens、可选 context window tokens、TTFT、总耗时和 model。OpenAI-compatible `prompt_tokens_details.cached_tokens` 会进入 `Usage.cachedPromptTokens`；未缓存 input 可由 prompt-cached 在 UI 层展示。ChatLoop、AgentLoop 与 ProviderHealthCheck 共用 `Usage` 规则：同一次响应内的 usage chunk 字段级合并，Agent 工具循环中多个模型请求再按请求累计。GUI 不解析消息文本计算 token，而是通过共享 `TurnStatsProjection` 折叠最近一轮统计；macOS Chat / Code / Cowork 与 iOS Chat 复用 `IntatisTurnStatsSummaryView` 显示单行低噪音统计。endpoint 不返回 cached/context usage 时，显示退化为 prompt/completion/total 或耗时信息。
 - **Chat/Code/Cowork session/history**：macOS `IntatisMacRootView` 通过 root-owned view models 和 `SessionHistoryStore.recentSessions(kind:)` 展示当前 mode 的最近 sessions；Chat 启动时优先恢复最近 Chat session，无历史时才使用 `sess_default`，Code/Cowork 在首次进入时创建对应 session。iOS `IOSAppEnvironment` 仍只恢复 Chat session，无历史时才使用 `sess_ios`。新建会话生成新的 `SessionID.new()`，打开独立 `EventLog` 与 artifact store，停止旧 view model 并重建当前 view model。恢复历史会话只切换到对应 `events.jsonl`，不会把新消息继续追加到旧的固定默认日志。路径规则在 `IntatisCore` 复用，macOS/iOS 只传不同 application-support root。
 - **GUI provider catalog**：macOS `AppConfig` 与 iOS `IOSConfig` 使用 UserDefaults 主键 `intatis.providerCatalog.v1` 保存两层配置。第一层 provider 存 `id` / 展示名 / `baseURL` / `chatEndpoint` / secret ref 元数据；第二层 model 存模型 id / 展示名。Chat 对话页提供 provider 分组的模型菜单；切换后写入 `intatis.providerSelection.v1`，重建 `ProviderRegistry` 并更新 `ChatViewModel`，下一条请求使用新 provider/model。设置页编辑 Base URL 时自动生成 Chat endpoint；编辑 Chat endpoint 时清洗 `/chat/completions` 后缀回填 Base URL。旧 `intatis.baseURL` / `intatis.model` 仍作为迁移来源与兼容镜像。

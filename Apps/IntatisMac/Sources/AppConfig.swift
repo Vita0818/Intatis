@@ -31,6 +31,10 @@ struct AppProviderAPIKeySource: Codable, Equatable {
         AppProviderAPIKeySource(type: "authFile", value: "")
     }
 
+    static func providerConfig(_ path: String) -> AppProviderAPIKeySource {
+        AppProviderAPIKeySource(type: "providerConfig", value: path)
+    }
+
     private var normalizedType: String {
         switch type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "env", "environment":
@@ -39,6 +43,8 @@ struct AppProviderAPIKeySource: Codable, Equatable {
             return "file"
         case "authfile", "auth_file", "auth-json", "authjson", "json":
             return "authFile"
+        case "providerconfig", "provider_config", "config", "configfile", "config_file":
+            return "providerConfig"
         default:
             return "authFile"
         }
@@ -53,6 +59,8 @@ struct AppProviderAPIKeySource: Codable, Equatable {
             return trimmed.isEmpty ? defaultRef : .file(trimmed)
         case "authFile":
             return .authFile(providerID: providerID)
+        case "providerConfig":
+            return trimmed.isEmpty ? defaultRef : .providerConfig(path: trimmed, providerID: providerID)
         default:
             return defaultRef
         }
@@ -667,7 +675,7 @@ enum AppConfig {
             return direct
         }
         return try? decoder.decode(AppProviderConfigFile.self, from: configData)
-            .catalog(configDirectory: url.deletingLastPathComponent())
+            .catalog(configFileURL: url)
     }
 
     private static func existingConfigFileURL() -> URL? {
@@ -1114,7 +1122,8 @@ private struct AppProviderConfigFile: Decodable {
     var providers: [AppProviderSettings]?
     var provider: [String: AppProviderConfigFileProvider]?
 
-    func catalog(configDirectory: URL?) -> AppProviderCatalog? {
+    func catalog(configFileURL: URL?) -> AppProviderCatalog? {
+        let configDirectory = configFileURL?.deletingLastPathComponent()
         var entries = providers ?? []
         let enabled = enabledProviders ?? enabled_providers
         let disabled = disabledProviders ?? disabled_providers
@@ -1133,7 +1142,8 @@ private struct AppProviderConfigFile: Decodable {
                 return provider[id]?.settings(
                     id: id,
                     selectedModelID: providerIDsMatch(split.providerID, id) ? split.modelID : nil,
-                    configDirectory: configDirectory)
+                    configDirectory: configDirectory,
+                    configFileURL: configFileURL)
             }
         }
         if entries.isEmpty,
@@ -1238,7 +1248,10 @@ private struct AppProviderConfigFileProvider: Decodable {
     var options: AppProviderConfigFileOptions?
     var models: [String: AppProviderConfigFileModel]?
 
-    func settings(id: String, selectedModelID: String?, configDirectory: URL?) -> AppProviderSettings? {
+    func settings(id: String,
+                  selectedModelID: String?,
+                  configDirectory: URL?,
+                  configFileURL: URL?) -> AppProviderSettings? {
         let base = options?.baseURL ?? baseURL ?? AppConfig.defaultBaseURL(forProviderID: id)
         guard let base, !base.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return nil
@@ -1247,7 +1260,9 @@ private struct AppProviderConfigFileProvider: Decodable {
         source = source ?? apiKeySource
         source = source ?? options?.apiKeySource
         source = source ?? parsedAPIKeySource(from: options?.apiKey, configDirectory: configDirectory)
+        source = source ?? providerConfigAPIKeySource(from: options?.apiKey, configFileURL: configFileURL)
         source = source ?? parsedAPIKeySource(from: apiKey, configDirectory: configDirectory)
+        source = source ?? providerConfigAPIKeySource(from: apiKey, configFileURL: configFileURL)
         if source == nil, let apiKeyEnv {
             source = AppProviderAPIKeySource.environment(apiKeyEnv)
         }
@@ -1357,6 +1372,17 @@ private func parsedAPIKeySource(from raw: String?, configDirectory: URL?) -> App
     default:
         return nil
     }
+}
+
+private func providerConfigAPIKeySource(from raw: String?, configFileURL: URL?) -> AppProviderAPIKeySource? {
+    guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+          !raw.isEmpty,
+          configVariable(in: raw) == nil,
+          let path = configFileURL?.path,
+          !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        return nil
+    }
+    return AppProviderAPIKeySource.providerConfig(path)
 }
 
 private func configVariable(in raw: String) -> (kind: String, value: String)? {

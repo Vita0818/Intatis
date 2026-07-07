@@ -101,18 +101,27 @@ public final class ChatViewModel: ObservableObject {
         errorText = nil
         Task { @MainActor [weak self] in
             guard let self else { return }
+            let startSeq = await self.log.replay().last?.seq ?? -1
             do {
                 let provider = try await self.registry.defaultChatProvider()
                 let model = await self.registry.chatModel()
                 let loop = ChatLoop(log: self.log, provider: provider, model: model)
                 try await loop.send(parsed.text, userMessage: parsed.userMessagePayload)
             } catch {
-                self.errorText = error.localizedDescription
-                if self.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    self.input = originalInput
-                }
+                let loggedError = await self.hasLoggedError(after: startSeq)
+                self.errorText = loggedError ? nil : error.localizedDescription
             }
             self.isStreaming = false
+        }
+    }
+
+    private func hasLoggedError(after seq: Int) async -> Bool {
+        await log.replay(from: seq).contains { envelope in
+            guard envelope.seq > seq else { return false }
+            if case .error = envelope.event {
+                return true
+            }
+            return false
         }
     }
 

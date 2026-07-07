@@ -126,6 +126,7 @@ final class IOSAppEnvironment: ObservableObject {
     }
 
     private func refreshProviderRegistry() {
+        secrets.clearCache()
         let updated = Self.makeProviderRegistry(resolver: secrets)
         registry = updated
         viewModel.updateProviderRegistry(updated)

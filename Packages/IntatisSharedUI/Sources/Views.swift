@@ -1,4 +1,5 @@
 #if canImport(SwiftUI)
+import Foundation
 import SwiftUI
 import IntatisCore
 import IntatisProtocol
@@ -89,6 +90,7 @@ struct SidebarView: View {
 struct ThreadView: View {
     @ObservedObject var model: ChatViewModel
     @Environment(\.colorScheme) private var scheme
+    private static let bottomAnchorID = "intatis-shared-chat-thread-bottom"
 
     var body: some View {
         VStack(spacing: 0) {
@@ -98,13 +100,17 @@ struct ThreadView: View {
                         ForEach(model.messages) { message in
                             MessageRow(message: message).id(message.id)
                         }
+                        Color.clear
+                            .frame(height: 1)
+                            .id(Self.bottomAnchorID)
                     }
                     .padding()
                 }
-                .onChange(of: model.messages.count) { _ in
-                    if let last = model.messages.last {
-                        withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
-                    }
+                .onAppear {
+                    scrollToBottom(proxy, animated: false)
+                }
+                .onChange(of: chatScrollSignature) { _ in
+                    scrollToBottom(proxy)
                 }
             }
             if let errorText = model.errorText {
@@ -122,6 +128,29 @@ struct ThreadView: View {
             }
             Divider()
             ComposerView(model: model)
+        }
+    }
+
+    private var chatScrollSignature: String {
+        guard let last = model.messages.last else { return "0" }
+        return [
+            "\(model.messages.count)",
+            last.id.rawValue,
+            "\(last.text.count)",
+            "\(last.isComplete)",
+            "\(model.isStreaming)"
+        ].joined(separator: ":")
+    }
+
+    private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool = true) {
+        DispatchQueue.main.async {
+            if animated {
+                withAnimation(.easeOut(duration: 0.18)) {
+                    proxy.scrollTo(Self.bottomAnchorID, anchor: .bottom)
+                }
+            } else {
+                proxy.scrollTo(Self.bottomAnchorID, anchor: .bottom)
+            }
         }
     }
 }
