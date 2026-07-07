@@ -41,6 +41,45 @@ private struct PartialThenFailingToolProvider: ToolCallingProvider {
 private struct NoShell: ShellRunner {
     func run(_ command: String, cwd: URL) async throws -> ShellResult { ShellResult(stdout: "", stderr: "", exitCode: 0) }
 }
+private struct StaticShell: ShellRunner {
+    let result: ShellResult
+    func run(_ command: String, cwd: URL) async throws -> ShellResult { result }
+}
+private actor ScriptedShellState {
+    private var results: [ShellResult]
+    private var commands: [String] = []
+
+    init(_ results: [ShellResult]) {
+        self.results = results
+    }
+
+    func next(command: String) -> ShellResult {
+        commands.append(command)
+        guard !results.isEmpty else {
+            return ShellResult(stdout: "", stderr: "no scripted shell result", exitCode: 1)
+        }
+        return results.removeFirst()
+    }
+
+    func recordedCommands() -> [String] {
+        commands
+    }
+}
+private final class ScriptedShell: ShellRunner, @unchecked Sendable {
+    private let state: ScriptedShellState
+
+    init(_ results: [ShellResult]) {
+        self.state = ScriptedShellState(results)
+    }
+
+    func run(_ command: String, cwd: URL) async throws -> ShellResult {
+        await state.next(command: command)
+    }
+
+    func commands() async -> [String] {
+        await state.recordedCommands()
+    }
+}
 private struct NoGit: GitService {
     func status(workspace: URL) async throws -> String { "" }
     func diff(workspace: URL) async throws -> String { "" }
@@ -64,7 +103,8 @@ final class IntatisAgentKernelTests: XCTestCase {
 
     private func makeLoop(ws: URL, log: EventLog, provider: ToolCallingProvider,
                           responder: PermissionResponder,
-                          includeUsage: Bool = false) -> AgentLoop {
+                          includeUsage: Bool = false,
+                          shell: ShellRunner = NoShell()) -> AgentLoop {
         AgentLoop(
             log: log,
             provider: provider,
@@ -74,7 +114,7 @@ final class IntatisAgentKernelTests: XCTestCase {
             agent: Agent(name: AgentID(rawValue: "Coder"), workspaceRoot: ws,
                          model: ModelID(rawValue: "m"), profile: .reviewed),
             allowsShell: true,
-            shell: NoShell(),
+            shell: shell,
             git: NoGit(),
             includeUsage: includeUsage
         )
@@ -173,6 +213,313 @@ final class IntatisAgentKernelTests: XCTestCase {
         let types = await log.replay().map { $0.event.type }
         XCTAssertTrue(types.contains(.toolResult))
         XCTAssertFalse(types.contains(.permissionRequest))   // reads are auto-allowed
+    }
+
+    func testAgentLoopRunsBrowserSearchThroughPermissionFlow() async throws {
+        let (ws, log) = try workspaceAndLog()
+        defer { try? FileManager.default.removeItem(at: ws) }
+
+        let searchArgs = """
+        {"query":"Intatis browser tools","engine":"duckduckgo","profile":"agent-web","channel":"msedge","waitMillis":0,"maxCharacters":2000}
+        """
+        let provider = ScriptedProvider([
+            [.toolCalls([ToolCall(id: "search",
+                                  name: "browser_search",
+                                  arguments: searchArgs)]),
+             .done(finishReason: "tool_calls")],
+            [.textDelta("I found browser tool results."), .done(finishReason: "stop")],
+        ])
+        let browserStdout = #"{"action":"search","profile":"agent-web","backend":"cdp","backendDetail":"edge","url":"https://duckduckgo.com/?q=Intatis%20browser%20tools","title":"Search Results","text":"Search results for Intatis browser tools","links":[{"text":"Intatis browser tool docs","href":"https://example.com/intatis-browser"}],"elements":[{"role":"textbox","name":"Search","selector":"input[name=q]","tag":"input","type":"search"}]}"#
+        let shell = StaticShell(result: ShellResult(stdout: browserStdout, stderr: "", exitCode: 0))
+        let loop = makeLoop(ws: ws,
+                            log: log,
+                            provider: provider,
+                            responder: FixedResponder(.allow),
+                            shell: shell)
+
+        let answer = try await loop.send("search the web for Intatis browser tools")
+        XCTAssertEqual(answer, "I found browser tool results.")
+
+        let events = await log.replay()
+        let types = events.map { $0.event.type }
+        XCTAssertTrue(types.contains(.permissionRequest))
+        XCTAssertTrue(types.contains(.permissionResolved))
+        XCTAssertTrue(types.contains(.toolResult))
+        XCTAssertTrue(types.contains(.messageCompleted))
+
+        let request = try XCTUnwrap(events.compactMap { envelope -> PermissionRequestPayload? in
+            guard case .permissionRequest(let payload) = envelope.event else { return nil }
+            return payload
+        }.first)
+        XCTAssertEqual(request.tool, "browser_search")
+        XCTAssertTrue(request.reason.contains("browser") || request.reason.contains("network"))
+
+        let browserResults = await toolResults(in: log)
+        let result = try XCTUnwrap(browserResults.first)
+        XCTAssertTrue(result.observation.contains("browser action: search"), result.observation)
+        XCTAssertTrue(result.observation.contains("Intatis browser tool docs - https://example.com/intatis-browser"), result.observation)
+        XCTAssertTrue(result.observation.contains(#"textbox "Search" selector=input[name=q] type=search"#), result.observation)
+
+        let stateURL = ws.appendingPathComponent(".intatis/browser/state/agent-web.json")
+        let state = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: stateURL)) as? [String: Any])
+        XCTAssertEqual(state["url"] as? String, "https://duckduckgo.com/?q=Intatis%20browser%20tools")
+
+        let historyURL = ws.appendingPathComponent(".intatis/browser/history.jsonl")
+        let history = try String(contentsOf: historyURL, encoding: .utf8)
+        XCTAssertTrue(history.contains(#""profile":"agent-web""#), history)
+        XCTAssertTrue(history.contains(#""action":"search""#), history)
+    }
+
+    func testAgentLoopCompletesBrowserFormTaskThroughPermissionFlow() async throws {
+        let (ws, log) = try workspaceAndLog()
+        defer { try? FileManager.default.removeItem(at: ws) }
+
+        let navigateArgs = """
+        {"url":"https://example.com/task","profile":"agent-task","channel":"msedge","waitMillis":0,"maxCharacters":2000}
+        """
+        let typeArgs = """
+        {"profile":"agent-task","selector":"input[name=name]","value":"Ada Lovelace","waitMillis":0,"maxCharacters":2000}
+        """
+        let submitArgs = """
+        {"profile":"agent-task","selector":"form","timeoutMillis":2000,"waitMillis":0,"maxCharacters":2000}
+        """
+        let provider = ScriptedProvider([
+            [.toolCalls([ToolCall(id: "nav", name: "browser_navigate", arguments: navigateArgs)]),
+             .done(finishReason: "tool_calls")],
+            [.toolCalls([ToolCall(id: "fill", name: "browser_type", arguments: typeArgs)]),
+             .done(finishReason: "tool_calls")],
+            [.toolCalls([ToolCall(id: "submit", name: "browser_submit", arguments: submitArgs)]),
+             .done(finishReason: "tool_calls")],
+            [.textDelta("Submitted the online task."), .done(finishReason: "stop")],
+        ])
+        let shell = ScriptedShell([
+            ShellResult(
+                stdout: #"{"action":"navigate","profile":"agent-task","backend":"cdp","url":"https://example.com/task","title":"Task Form","text":"Task form Name Continue","links":[],"elements":[{"role":"textbox","name":"Name","selector":"input[name=name]","tag":"input","type":"text"},{"role":"button","name":"Continue","selector":"button[type=submit]","tag":"button"}]}"#,
+                stderr: "",
+                exitCode: 0),
+            ShellResult(
+                stdout: #"{"action":"type","profile":"agent-task","backend":"cdp","url":"https://example.com/task","title":"Task Form","text":"Name field filled; Continue button ready","links":[],"elements":[{"role":"textbox","name":"Name","selector":"input[name=name]","tag":"input","type":"text"},{"role":"button","name":"Continue","selector":"button[type=submit]","tag":"button"}]}"#,
+                stderr: "",
+                exitCode: 0),
+            ShellResult(
+                stdout: #"{"action":"submit","profile":"agent-task","backend":"cdp","url":"https://example.com/done","title":"Done","text":"Submitted successfully. Confirmation 42.","links":[],"elements":[]}"#,
+                stderr: "",
+                exitCode: 0),
+        ])
+        let loop = makeLoop(ws: ws,
+                            log: log,
+                            provider: provider,
+                            responder: FixedResponder(.allow),
+                            shell: shell)
+
+        let answer = try await loop.send("open the task form, enter the requested name, and submit it")
+        XCTAssertEqual(answer, "Submitted the online task.")
+
+        let events = await log.replay()
+        let requests = events.compactMap { envelope -> PermissionRequestPayload? in
+            guard case .permissionRequest(let payload) = envelope.event else { return nil }
+            return payload
+        }
+        XCTAssertEqual(requests.map(\.tool), ["browser_navigate", "browser_type", "browser_submit"])
+        XCTAssertTrue(requests.allSatisfy { $0.reason.contains("network") || $0.reason.contains("browser") })
+        let commands = await shell.commands()
+        XCTAssertEqual(commands.count, 3)
+
+        let results = await toolResults(in: log)
+        XCTAssertEqual(results.map(\.toolCallId), ["nav", "fill", "submit"])
+        XCTAssertTrue(results[0].observation.contains("browser action: navigate"), results[0].observation)
+        XCTAssertTrue(results[0].observation.contains(#"textbox "Name" selector=input[name=name] type=text"#), results[0].observation)
+        XCTAssertTrue(results[1].observation.contains("browser action: type"), results[1].observation)
+        XCTAssertFalse(results[1].observation.contains("Ada Lovelace"), results[1].observation)
+        XCTAssertTrue(results[2].observation.contains("browser action: submit"), results[2].observation)
+        XCTAssertTrue(results[2].observation.contains("Submitted successfully. Confirmation 42."), results[2].observation)
+
+        let stateURL = ws.appendingPathComponent(".intatis/browser/state/agent-task.json")
+        let state = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: stateURL)) as? [String: Any])
+        XCTAssertEqual(state["url"] as? String, "https://example.com/done")
+
+        let historyURL = ws.appendingPathComponent(".intatis/browser/history.jsonl")
+        let history = try String(contentsOf: historyURL, encoding: .utf8)
+        XCTAssertTrue(history.contains(#""profile":"agent-task""#), history)
+        XCTAssertTrue(history.contains(#""action":"navigate""#), history)
+        XCTAssertTrue(history.contains(#""action":"type""#), history)
+        XCTAssertTrue(history.contains(#""action":"submit""#), history)
+        XCTAssertTrue(events.map { $0.event.type }.contains(.messageCompleted))
+    }
+
+    func testAgentLoopBrowsesDynamicFeedThroughPermissionFlow() async throws {
+        let (ws, log) = try workspaceAndLog()
+        defer { try? FileManager.default.removeItem(at: ws) }
+
+        let navigateArgs = """
+        {"url":"https://example.com/social","profile":"social-feed","channel":"msedge","waitMillis":0,"maxCharacters":2000}
+        """
+        let scrollArgs = """
+        {"profile":"social-feed","direction":"down","amount":900,"waitMillis":0,"maxCharacters":2000}
+        """
+        let waitArgs = """
+        {"profile":"social-feed","text":"New posts loaded","timeoutMillis":1000,"waitMillis":0,"maxCharacters":2000}
+        """
+        let provider = ScriptedProvider([
+            [.toolCalls([ToolCall(id: "feed-nav", name: "browser_navigate", arguments: navigateArgs)]),
+             .done(finishReason: "tool_calls")],
+            [.toolCalls([ToolCall(id: "feed-scroll", name: "browser_scroll", arguments: scrollArgs)]),
+             .done(finishReason: "tool_calls")],
+            [.toolCalls([ToolCall(id: "feed-wait", name: "browser_wait", arguments: waitArgs)]),
+             .done(finishReason: "tool_calls")],
+            [.textDelta("I reviewed the latest feed posts."), .done(finishReason: "stop")],
+        ])
+        let shell = ScriptedShell([
+            ShellResult(
+                stdout: #"{"action":"navigate","profile":"social-feed","backend":"cdp","url":"https://example.com/social","title":"Social Feed","text":"Timeline Alice posted Launch update Like Reply Load more","links":[{"text":"Alice","href":"https://example.com/u/alice"}],"elements":[{"role":"button","name":"Like","selector":"button[data-action=like]","tag":"button"},{"role":"button","name":"Load more","selector":"button.load-more","tag":"button"}]}"#,
+                stderr: "",
+                exitCode: 0),
+            ShellResult(
+                stdout: #"{"action":"scroll","profile":"social-feed","backend":"cdp","url":"https://example.com/social","title":"Social Feed","text":"Timeline Alice posted Launch update. Bob posted Release notes. New posts loading.","links":[{"text":"Bob","href":"https://example.com/u/bob"}],"elements":[{"role":"button","name":"Like","selector":"button[data-post=bob-like]","tag":"button"}]}"#,
+                stderr: "",
+                exitCode: 0),
+            ShellResult(
+                stdout: #"{"action":"wait","profile":"social-feed","backend":"cdp","url":"https://example.com/social","title":"Social Feed","text":"New posts loaded. Cara posted Incident review.","links":[{"text":"Cara","href":"https://example.com/u/cara"}],"elements":[{"role":"button","name":"Reply","selector":"button[data-post=cara-reply]","tag":"button"}]}"#,
+                stderr: "",
+                exitCode: 0),
+        ])
+        let loop = makeLoop(ws: ws,
+                            log: log,
+                            provider: provider,
+                            responder: FixedResponder(.allow),
+                            shell: shell)
+
+        let answer = try await loop.send("check the social feed for the latest visible posts")
+        XCTAssertEqual(answer, "I reviewed the latest feed posts.")
+
+        let events = await log.replay()
+        let requests = events.compactMap { envelope -> PermissionRequestPayload? in
+            guard case .permissionRequest(let payload) = envelope.event else { return nil }
+            return payload
+        }
+        XCTAssertEqual(requests.map(\.tool), ["browser_navigate", "browser_scroll", "browser_wait"])
+        XCTAssertTrue(requests.allSatisfy { $0.reason.contains("network") || $0.reason.contains("browser") })
+        let commands = await shell.commands()
+        XCTAssertEqual(commands.count, 3)
+
+        let results = await toolResults(in: log)
+        XCTAssertEqual(results.map(\.toolCallId), ["feed-nav", "feed-scroll", "feed-wait"])
+        XCTAssertTrue(results[0].observation.contains("browser action: navigate"), results[0].observation)
+        XCTAssertTrue(results[0].observation.contains(#"button "Load more" selector=button.load-more"#), results[0].observation)
+        XCTAssertTrue(results[1].observation.contains("browser action: scroll"), results[1].observation)
+        XCTAssertTrue(results[1].observation.contains("Bob posted Release notes"), results[1].observation)
+        XCTAssertTrue(results[2].observation.contains("browser action: wait"), results[2].observation)
+        XCTAssertTrue(results[2].observation.contains("Cara posted Incident review"), results[2].observation)
+        XCTAssertTrue(results[2].observation.contains(#"button "Reply" selector=button[data-post=cara-reply]"#), results[2].observation)
+
+        let stateURL = ws.appendingPathComponent(".intatis/browser/state/social-feed.json")
+        let state = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: stateURL)) as? [String: Any])
+        XCTAssertEqual(state["url"] as? String, "https://example.com/social")
+
+        let historyURL = ws.appendingPathComponent(".intatis/browser/history.jsonl")
+        let history = try String(contentsOf: historyURL, encoding: .utf8)
+        XCTAssertTrue(history.contains(#""profile":"social-feed""#), history)
+        XCTAssertTrue(history.contains(#""action":"navigate""#), history)
+        XCTAssertTrue(history.contains(#""action":"scroll""#), history)
+        XCTAssertTrue(history.contains(#""action":"wait""#), history)
+        XCTAssertTrue(events.map { $0.event.type }.contains(.messageCompleted))
+    }
+
+    func testAgentLoopRunsBrowserProfileDeleteThroughDestructivePermissionFlow() async throws {
+        let (ws, log) = try workspaceAndLog()
+        defer { try? FileManager.default.removeItem(at: ws) }
+
+        let workCookieFile = ws.appendingPathComponent(".intatis/browser/profiles/work/Default/Cookies")
+        let personalCookieFile = ws.appendingPathComponent(".intatis/browser/profiles/personal/Default/Cookies")
+        try FileManager.default.createDirectory(at: workCookieFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: personalCookieFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("secret-cookie-token".utf8).write(to: workCookieFile)
+        try Data("personal-cookie-token".utf8).write(to: personalCookieFile)
+
+        let activeMarkerFile = ws.appendingPathComponent(".intatis/browser/profiles/work/DevToolsActivePort")
+        let lockMarkerFile = ws.appendingPathComponent(".intatis/browser/profiles/work/SingletonLock")
+        try Data("active-marker-secret".utf8).write(to: activeMarkerFile)
+        try Data("lock-marker-secret".utf8).write(to: lockMarkerFile)
+
+        let workStateURL = ws.appendingPathComponent(".intatis/browser/state/work.json")
+        let personalStateURL = ws.appendingPathComponent(".intatis/browser/state/personal.json")
+        try FileManager.default.createDirectory(at: workStateURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data(#"{"profile":"work","url":"https://example.com/work"}"#.utf8).write(to: workStateURL)
+        try Data(#"{"profile":"personal","url":"https://example.com/personal"}"#.utf8).write(to: personalStateURL)
+
+        let workDownload = ws.appendingPathComponent(".intatis/browser/downloads/work/report.pdf")
+        let personalDownload = ws.appendingPathComponent(".intatis/browser/downloads/personal/keep.pdf")
+        try FileManager.default.createDirectory(at: workDownload.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: personalDownload.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("download-secret-body".utf8).write(to: workDownload)
+        try Data("personal-download-body".utf8).write(to: personalDownload)
+
+        let historyURL = ws.appendingPathComponent(".intatis/browser/history.jsonl")
+        try FileManager.default.createDirectory(at: historyURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let history = [
+            #"{"ts":"2026-07-07T01:00:00Z","profile":"work","action":"navigate","url":"https://example.com/work","title":"Work"}"#,
+            #"{"ts":"2026-07-07T02:00:00Z","profile":"personal","action":"navigate","url":"https://example.com/personal","title":"Personal"}"#,
+            #"{"ts":"2026-07-07T03:00:00Z","profile":"work","action":"download","url":"https://example.com/report","title":"Report"}"#,
+        ].joined(separator: "\n") + "\n"
+        try Data(history.utf8).write(to: historyURL)
+
+        let provider = ScriptedProvider([
+            [.toolCalls([ToolCall(id: "delete-profile",
+                                  name: "browser_profile_delete",
+                                  arguments: #"{"profile":"work","confirmProfile":"work"}"#)]),
+             .done(finishReason: "tool_calls")],
+            [.textDelta("Deleted the stale browser profile."), .done(finishReason: "stop")],
+        ])
+        let loop = makeLoop(ws: ws, log: log, provider: provider, responder: FixedResponder(.allow))
+
+        let answer = try await loop.send("delete the stale work browser profile")
+        XCTAssertEqual(answer, "Deleted the stale browser profile.")
+
+        let events = await log.replay()
+        let types = events.map { $0.event.type }
+        XCTAssertTrue(types.contains(.permissionRequest))
+        XCTAssertTrue(types.contains(.permissionResolved))
+        XCTAssertTrue(types.contains(.toolResult))
+        XCTAssertTrue(types.contains(.messageCompleted))
+
+        let request = try XCTUnwrap(events.compactMap { envelope -> PermissionRequestPayload? in
+            guard case .permissionRequest(let payload) = envelope.event else { return nil }
+            return payload
+        }.first)
+        XCTAssertEqual(request.tool, "browser_profile_delete")
+        XCTAssertEqual(request.risk, .high)
+        XCTAssertTrue(request.reason.contains("destructive operation"))
+        XCTAssertTrue(request.args.contains(#""profile":"work""#))
+        XCTAssertTrue(request.args.contains(#""confirmProfile":"work""#))
+
+        let results = await toolResults(in: log)
+        let result = try XCTUnwrap(results.first)
+        XCTAssertTrue(result.observation.contains("browser profile deleted: work"), result.observation)
+        XCTAssertTrue(result.observation.contains("profile runtime markers: present before delete"), result.observation)
+        XCTAssertTrue(result.observation.contains("removed profile data: yes (.intatis/browser/profiles/work)"), result.observation)
+        XCTAssertTrue(result.observation.contains("removed state file: yes (.intatis/browser/state/work.json)"), result.observation)
+        XCTAssertTrue(result.observation.contains("removed downloads: yes (.intatis/browser/downloads/work)"), result.observation)
+        XCTAssertTrue(result.observation.contains("removed history entries: 2"), result.observation)
+        XCTAssertTrue(result.observation.contains("kept history entries: 1"), result.observation)
+        XCTAssertFalse(result.observation.contains("secret-cookie-token"))
+        XCTAssertFalse(result.observation.contains("active-marker-secret"))
+        XCTAssertFalse(result.observation.contains("lock-marker-secret"))
+        XCTAssertFalse(result.observation.contains("DevToolsActivePort"))
+        XCTAssertFalse(result.observation.contains("SingletonLock"))
+        XCTAssertFalse(result.observation.contains("download-secret-body"))
+        XCTAssertFalse(result.observation.contains("Default/Cookies"))
+        XCTAssertFalse(result.observation.contains("report.pdf"))
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: workCookieFile.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: workStateURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: workDownload.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: personalCookieFile.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: personalStateURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: personalDownload.path))
+
+        let remainingHistory = try String(contentsOf: historyURL, encoding: .utf8)
+        XCTAssertFalse(remainingHistory.contains(#""profile":"work""#))
+        XCTAssertTrue(remainingHistory.contains(#""profile":"personal""#))
     }
 
     func testAgentLoopMergesResponseUsageThenAccumulatesAcrossToolIterations() async throws {

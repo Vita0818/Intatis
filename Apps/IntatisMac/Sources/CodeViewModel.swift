@@ -122,7 +122,8 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
                     engine: PermissionEngine(),
                     responder: self,
                     agent: agent,
-                    allowsShell: PlatformProfile.current.allowsShell
+                    allowsShell: PlatformProfile.current.allowsShell,
+                    imageGenerator: ProviderImageGenerationToolService(registry: self.registry)
                 )
                 didEnterAgentLoop = true
                 try await loop.send(parsed.text, userMessage: parsed.userMessagePayload)

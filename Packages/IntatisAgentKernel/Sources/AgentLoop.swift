@@ -23,6 +23,7 @@ public struct AgentLoop: Sendable {
     private let git: GitService
     private let messenger: AgentMessenger?
     private let agentManager: AgentManager?
+    private let imageGenerator: ImageGenerationToolService?
     private let reasoningEffort: ReasoningEffort?
     private let includeUsage: Bool
     private let maxIterations: Int
@@ -39,6 +40,7 @@ public struct AgentLoop: Sendable {
                 git: GitService = ProcessGitService(),
                 messenger: AgentMessenger? = nil,
                 agentManager: AgentManager? = nil,
+                imageGenerator: ImageGenerationToolService? = nil,
                 reasoningEffort: ReasoningEffort? = nil,
                 includeUsage: Bool = false,
                 maxIterations: Int = 50) {
@@ -54,6 +56,7 @@ public struct AgentLoop: Sendable {
         self.git = git
         self.messenger = messenger
         self.agentManager = agentManager
+        self.imageGenerator = imageGenerator
         self.reasoningEffort = reasoningEffort
         self.includeUsage = includeUsage
         self.maxIterations = maxIterations
@@ -202,7 +205,8 @@ public struct AgentLoop: Sendable {
                                           shell: shell,
                                           git: git,
                                           messenger: messenger,
-                                          agentManager: agentManager)
+                                          agentManager: agentManager,
+                                          imageGenerator: imageGenerator)
             let observation = try await tool.execute(args, in: toolContext)
             if let diff = observation.diff, let files = observation.changedFiles {
                 try? await log.append(.patchProposed(PatchProposedPayload(

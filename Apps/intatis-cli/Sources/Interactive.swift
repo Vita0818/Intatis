@@ -193,6 +193,7 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
                 _ = try await AgentLoop(log: log, provider: provider, registry: .standard(),
                                         engine: PermissionEngine(), responder: TerminalResponder(),
                                         agent: agent, allowsShell: true,
+                                        imageGenerator: ProviderImageGenerationToolService(registry: registry),
                                         reasoningEffort: reasoning, includeUsage: config.includeUsage,
                                         maxIterations: config.maxSteps)
                     .send(sendText, images: sendImages)
@@ -240,7 +241,8 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
     let orchestrator = Orchestrator(
         log: log, allowsShell: true, responder: TerminalResponder(),
         reasoningEffort: config.reasoningEffort, includeUsage: config.includeUsage,
-        maxSteps: config.maxSteps
+        maxSteps: config.maxSteps,
+        imageGeneratorFor: { _ in ProviderImageGenerationToolService(registry: registry) }
     ) { _ in try await registry.defaultAgentProvider() }
 
     // A default agent so you can just talk; add more with /agent add.

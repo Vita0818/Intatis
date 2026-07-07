@@ -50,6 +50,7 @@ public actor Orchestrator {
     private let includeUsage: Bool
     private let maxSteps: Int
     private let providerFor: @Sendable (Agent) async throws -> ToolCallingProvider
+    private let imageGeneratorFor: @Sendable (Agent) async -> ImageGenerationToolService?
 
     public init(log: EventLog,
                 mediator: Mediator = Mediator(),
@@ -60,6 +61,7 @@ public actor Orchestrator {
                 includeUsage: Bool = false,
                 maxSteps: Int = 50,
                 taskGraphPolicy: TaskGraphPolicy = .default,
+                imageGeneratorFor: @escaping @Sendable (Agent) async -> ImageGenerationToolService? = { _ in nil },
                 providerFor: @escaping @Sendable (Agent) async throws -> ToolCallingProvider) {
         self.log = log
         self.registry = AgentRegistry()
@@ -80,6 +82,7 @@ public actor Orchestrator {
         self.includeUsage = includeUsage
         self.maxSteps = maxSteps
         self.providerFor = providerFor
+        self.imageGeneratorFor = imageGeneratorFor
     }
 
     @discardableResult
@@ -764,6 +767,7 @@ public actor Orchestrator {
         let manager = OrchestratorManager(orchestrator: self, defaultModel: agent.model.rawValue)
         let capabilityLease = capabilityLease(for: agent, taskContract: taskContract)
         let toolRegistry = Self.toolRegistry(for: capabilityLease)
+        let imageGenerator = await imageGeneratorFor(agent)
         let allowedToolNames = toolRegistry.descriptors().map(\.name).sorted()
         let canCoordinate = Self.canCoordinate(capabilityLease)
         // Give the agent a prompt that matches its current task lease. A numeric
@@ -791,6 +795,7 @@ public actor Orchestrator {
             allowsShell: allowsShell,
             messenger: messenger,
             agentManager: manager,
+            imageGenerator: imageGenerator,
             reasoningEffort: reasoningEffort,
             includeUsage: includeUsage,
             maxIterations: maxSteps
@@ -1060,6 +1065,9 @@ public actor Orchestrator {
         if lease.tools.contains(.readWorkspace) {
             tools.append(ReadFileTool())
         }
+        if lease.tools.contains(.readPDF) {
+            tools.append(ReadPDFTool())
+        }
         if lease.tools.contains(.listWorkspace) {
             tools.append(ListFilesTool())
         }
@@ -1070,10 +1078,47 @@ public actor Orchestrator {
             tools.append(WriteFileTool())
             tools.append(ApplyPatchTool())
         }
+        if lease.tools.contains(.editPDF) {
+            tools.append(EditPDFPagesTool())
+        }
         if lease.tools.contains(.runShell) {
             tools.append(RunShellTool())
             tools.append(GitStatusTool())
             tools.append(GitDiffTool())
+        }
+        if lease.tools.contains(.reconstructDocument) {
+            tools.append(ReconstructDocumentImageTool())
+        }
+        if lease.tools.contains(.compileLaTeX) {
+            tools.append(CompileLaTeXTool())
+        }
+        if lease.tools.contains(.generateMedia) {
+            tools.append(GenerateImageTool())
+        }
+        if lease.tools.contains(.browseWeb) {
+            tools.append(WebFetchTool())
+            tools.append(BrowserDiagnosticsTool())
+            tools.append(BrowserProfilesTool())
+            tools.append(BrowserProfileDeleteTool())
+            tools.append(BrowserHistoryTool())
+            tools.append(BrowserNavigateTool())
+            tools.append(BrowserSnapshotTool())
+            tools.append(BrowserHandoffTool())
+            tools.append(BrowserReloadTool())
+            tools.append(BrowserBackTool())
+            tools.append(BrowserForwardTool())
+            tools.append(BrowserClickTool())
+            tools.append(BrowserTypeTool())
+            tools.append(BrowserSubmitTool())
+            tools.append(BrowserSelectOptionTool())
+            tools.append(BrowserPressKeyTool())
+            tools.append(BrowserScrollTool())
+            tools.append(BrowserWaitTool())
+            tools.append(BrowserScreenshotTool())
+            tools.append(BrowserUploadFileTool())
+            tools.append(BrowserDownloadTool())
+            tools.append(BrowserDownloadsTool())
+            tools.append(BrowserSearchTool())
         }
         if lease.tools.contains(.requestInformation) || lease.tools.contains(.delegateTask) {
             tools.append(RequestInformationTool())

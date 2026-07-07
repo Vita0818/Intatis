@@ -24,14 +24,21 @@ public struct DeterministicPolicyGate: Sendable {
             }
         }
 
-        // 2. Network: never silently; denied in read-only.
+        // 2. Shell-backed tools must be checked for shell availability before
+        // generic network handling, otherwise an exec tool that also touches the
+        // network could bypass App Store / read-only shell denial.
+        if call.sideEffect == .exec {
+            return evaluateShell(call, ctx)
+        }
+
+        // 3. Network: never silently; denied in read-only.
         if call.risksNetwork {
             return ctx.profile == .readOnly
                 ? .deny(reason: "network not allowed in read_only", risk: .medium)
                 : .ask(reason: "network access requested", risk: .medium)
         }
 
-        // 3. By side effect.
+        // 4. By side effect.
         switch call.sideEffect {
         case .readOnly:
             return .allow(reason: "read-only operation within workspace", risk: .low)
@@ -60,6 +67,9 @@ public struct DeterministicPolicyGate: Sendable {
         }
         if ctx.profile == .readOnly {
             return .deny(reason: "shell not allowed in read_only", risk: .high)
+        }
+        if call.risksNetwork {
+            return .ask(reason: "browser or shell-backed network access requested", risk: .high)
         }
         let command = Self.shellCommand(from: call.rawArgs)
         if ShellInspector.isDangerous(command) {

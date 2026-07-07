@@ -8,6 +8,12 @@ public enum ToolCapability: String, Codable, Sendable, Hashable {
     case runShell = "run_shell"
     case proposePatch = "propose_patch"
     case applyPatch = "apply_patch"
+    case readPDF = "read_pdf"
+    case editPDF = "edit_pdf"
+    case reconstructDocument = "reconstruct_document"
+    case compileLaTeX = "compile_latex"
+    case generateMedia = "generate_media"
+    case browseWeb = "browse_web"
     case sendMessage = "send_message"
     case requestInformation = "request_information"
     case replyMessage = "reply_message"
@@ -69,6 +75,7 @@ public struct CapabilityLease: Codable, Sendable, Hashable {
                 .readWorkspace,
                 .listWorkspace,
                 .searchWorkspace,
+                .readPDF,
                 .replyMessage,
                 .requestDelegation,
             ],
@@ -87,6 +94,12 @@ public struct CapabilityLease: Codable, Sendable, Hashable {
                 .runShell,
                 .proposePatch,
                 .applyPatch,
+                .readPDF,
+                .editPDF,
+                .reconstructDocument,
+                .compileLaTeX,
+                .generateMedia,
+                .browseWeb,
                 .sendMessage,
                 .requestInformation,
                 .replyMessage,

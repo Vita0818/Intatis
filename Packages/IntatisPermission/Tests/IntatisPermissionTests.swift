@@ -89,6 +89,27 @@ final class IntatisPermissionTests: XCTestCase {
         }
     }
 
+    func testGateShellBackedNetworkDeniedWhenShellDisabled() {
+        guard case .deny = gate.evaluate(call("browser_navigate", .exec, network: true, args: #"{"url":"https://example.com"}"#),
+                                         ctx(allowsShell: false)) else {
+            return XCTFail("shell-backed browser network should deny when shell is disabled")
+        }
+    }
+
+    func testGateShellBackedNetworkDeniedInReadOnly() {
+        guard case .deny = gate.evaluate(call("browser_navigate", .exec, network: true, args: #"{"url":"https://example.com"}"#),
+                                         ctx(profile: .readOnly, allowsShell: true)) else {
+            return XCTFail("shell-backed browser network should deny in read_only")
+        }
+    }
+
+    func testGateShellBackedNetworkAsksWhenShellAllowed() {
+        guard case .ask = gate.evaluate(call("browser_navigate", .exec, network: true, args: #"{"url":"https://example.com"}"#),
+                                        ctx(profile: .reviewed, allowsShell: true)) else {
+            return XCTFail("shell-backed browser network should ask when shell is allowed")
+        }
+    }
+
     func testGateShellSudoDenied() {
         guard case .deny = gate.evaluate(call("run_shell", .exec, args: #"{"command":"sudo rm -rf /"}"#),
                                          ctx(allowsShell: true)) else {

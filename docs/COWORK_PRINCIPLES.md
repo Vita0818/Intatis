@@ -76,7 +76,7 @@ workspace-relevant observations
 ```
 
 ### 2.4 Capability Lease
-工具应按 capability lease 暴露。普通 worker task 不应收到 coordinator 工具（`spawn_agent` / `remove_agent` / `delegate_task`）。若 task 需委派，经 `CapabilityLease.delegation` 显式授予。子 agent 不应仅因被 spawn 就获得 coordinator 能力。
+工具应按 capability lease 暴露。普通 worker task 不应收到 coordinator 工具（`spawn_agent` / `remove_agent` / `delegate_task`）。若 task 需委派，经 `CapabilityLease.delegation` 显式授予。子 agent 不应仅因被 spawn 就获得 coordinator 能力。文档/媒体与网络/浏览器工具同样按 lease 收窄：worker 默认只能获得安全的只读能力（当前为 `read_pdf`），页面编辑、OCR/版面重建、LaTeX 编译、生图、网络访问、浏览器 profile 操作等写入/执行/网络能力必须经 coordinator lease 或未来显式 lease 授予。
 
 ### 2.5 Task Graph + Scheduler
 协作经任务图与消息总线发生。`AgentLoop` 不得直接同步递归调用另一个 `AgentLoop`——用 mailbox / scheduler / event flow。
@@ -181,6 +181,7 @@ worker prompt does not advertise coordinator powers
 task contract appears in context
 context projection hides unrelated raw global transcript
 capability lease controls tool registry
+worker receives only read-only document/media tools and no browser/network tools by default
 delegation cycle is rejected
 workspace expansion requires permission
 agent-to-agent event records caller, target, task, and causal chain

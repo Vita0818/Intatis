@@ -9,9 +9,12 @@ final class CapabilityLeaseTests: XCTestCase {
         XCTAssertTrue(lease.tools.contains(.readWorkspace))
         XCTAssertTrue(lease.tools.contains(.listWorkspace))
         XCTAssertTrue(lease.tools.contains(.searchWorkspace))
+        XCTAssertTrue(lease.tools.contains(.readPDF))
         XCTAssertTrue(lease.tools.contains(.requestDelegation))
         XCTAssertFalse(lease.tools.contains(.delegateTask))
         XCTAssertFalse(lease.tools.contains(.attachWorkspace))
+        XCTAssertFalse(lease.tools.contains(.generateMedia))
+        XCTAssertFalse(lease.tools.contains(.browseWeb))
         XCTAssertEqual(lease.delegation, .requestOnly)
     }
 
@@ -21,6 +24,10 @@ final class CapabilityLeaseTests: XCTestCase {
         XCTAssertTrue(lease.tools.contains(.delegateTask))
         XCTAssertTrue(lease.tools.contains(.attachWorkspace))
         XCTAssertTrue(lease.tools.contains(.requestInformation))
+        XCTAssertTrue(lease.tools.contains(.editPDF))
+        XCTAssertTrue(lease.tools.contains(.compileLaTeX))
+        XCTAssertTrue(lease.tools.contains(.generateMedia))
+        XCTAssertTrue(lease.tools.contains(.browseWeb))
         guard case .granted(let budget) = lease.delegation else {
             return XCTFail("coordinator lease should grant delegation")
         }

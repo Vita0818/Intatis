@@ -48,6 +48,10 @@ private actor ProviderRegistryBox {
         return await registry.agentModel()
     }
 
+    func imageToolService() async -> ProviderImageGenerationToolService {
+        ProviderImageGenerationToolService(registry: registry)
+    }
+
     private func sessionAgentRef() async -> ModelRef? {
         guard let modelID = Self.normalized(defaultModelID) else { return nil }
         if let providerID = Self.normalized(defaultProviderID) {
@@ -124,7 +128,12 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
     func start() {
         guard orchestrator == nil else { return }
         let registryBox = registryBox
-        orchestrator = Orchestrator(log: log, allowsShell: PlatformProfile.current.allowsShell, responder: self) { _ in
+        orchestrator = Orchestrator(
+            log: log,
+            allowsShell: PlatformProfile.current.allowsShell,
+            responder: self,
+            imageGeneratorFor: { _ in await registryBox.imageToolService() }
+        ) { _ in
             try await registryBox.defaultAgentProvider()
         }
         subscription = Task { @MainActor [weak self] in
