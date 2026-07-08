@@ -138,19 +138,24 @@ no nested AgentLoop; reviewer receives no-tool provider judgement request
 hard deny remains final before the reviewer can see anything
 ```
 
-## 6. 当前已知 Cowork 问题（来自只读审计）
+## 6. 历史审计问题与当前回归点
 
 ```text
-first-level child agents may still get coordinator tools
-ask_agent allows self-call
-ask_agent creates nested AgentLoop execution
-priorHistory uses global conversation projection
-spawn_agent has been treated too much like read-only
-MessageBus payload is too thin
-there is no task contract / capability lease yet
+已消除或已有回归覆盖：
+- first-level child agents may still get coordinator tools
+- ask_agent allows self-call
+- ask_agent creates nested AgentLoop execution
+- spawn_agent has been treated too much like read-only
+- there is no task contract / capability lease yet
+
+仍需持续关注：
+- priorHistory/global context projection must stay scoped for task runs
+- MessageBus payload/report shape must stay structured enough for replay
+- delegate_task must return a mediated Task Report, not a queued ack
+- task-scoped tool-spawned children must be recycled only when idle
 ```
 
-处理 Cowork 时优先消除这些问题。
+处理 Cowork 时把上述条目当作回归清单；若源码与本清单冲突，以当前源码和 `docs/DO_NOT_BREAK.md` 的更具体禁区为准。
 
 ## 7. 实现顺序
 

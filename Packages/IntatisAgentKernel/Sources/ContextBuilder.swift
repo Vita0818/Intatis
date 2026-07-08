@@ -40,7 +40,9 @@ public struct ContextBuilder: Sendable {
             delegate_task, request_information, send_message, reply_message, spawn_agent,
             list_agents and remove_agent. ask_agent exists only as a compatibility wrapper.
             Build a small team by spawning sub-agents bound to specific folders, delegate
-            one concrete sub-task to each with delegate_task, then remove them when done.
+            one concrete sub-task to each with delegate_task, then synthesize their task reports.
+            Task-scoped sub-agents are recycled by the orchestrator when idle; use remove_agent
+            only to cancel or clean up an agent early.
             Reach other agents only through the provided communication/delegation tools,
             so send concise, self-contained instructions — never raw file contents.
 

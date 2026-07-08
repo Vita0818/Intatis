@@ -247,14 +247,14 @@ public struct ContextProjector: Sendable {
                     kind: "task_completed",
                     agent: agentID,
                     taskID: payload.taskID,
-                    content: truncate(payload.result, maxCharacters: 600))
+                    content: truncate(payload.report?.summary ?? payload.result, maxCharacters: 600))
             case .taskFailed(let payload) where payload.agent == agentID:
                 return ContextEventSummary(
                     seq: envelope.seq,
                     kind: "task_failed",
                     agent: agentID,
                     taskID: payload.taskID,
-                    content: truncate(payload.error, maxCharacters: 600))
+                    content: truncate(payload.report?.summary ?? payload.error, maxCharacters: 600))
             default:
                 return nil
             }

@@ -232,16 +232,54 @@ public struct TaskStartedPayload: Codable, Equatable, Sendable {
     }
 }
 
+public struct TaskReportPayload: Codable, Equatable, Sendable {
+    public var taskID: TaskID
+    public var agent: AgentID
+    public var status: TaskStatus
+    public var objective: String
+    public var expectedDeliverable: String
+    public var summary: String
+    public var detail: String?
+    public var error: String?
+    public var reportedAt: Date
+
+    public init(taskID: TaskID,
+                agent: AgentID,
+                status: TaskStatus,
+                objective: String,
+                expectedDeliverable: String,
+                summary: String,
+                detail: String? = nil,
+                error: String? = nil,
+                reportedAt: Date = Date()) {
+        self.taskID = taskID
+        self.agent = agent
+        self.status = status
+        self.objective = objective
+        self.expectedDeliverable = expectedDeliverable
+        self.summary = summary
+        self.detail = detail
+        self.error = error
+        self.reportedAt = reportedAt
+    }
+}
+
 public struct TaskCompletedPayload: Codable, Equatable, Sendable {
     public var taskID: TaskID
     public var agent: AgentID
     public var result: String
+    public var report: TaskReportPayload?
     public var metadata: CoworkEventMetadata?
 
-    public init(taskID: TaskID, agent: AgentID, result: String, metadata: CoworkEventMetadata? = nil) {
+    public init(taskID: TaskID,
+                agent: AgentID,
+                result: String,
+                report: TaskReportPayload? = nil,
+                metadata: CoworkEventMetadata? = nil) {
         self.taskID = taskID
         self.agent = agent
         self.result = result
+        self.report = report
         self.metadata = metadata
     }
 }
@@ -250,12 +288,18 @@ public struct TaskFailedPayload: Codable, Equatable, Sendable {
     public var taskID: TaskID
     public var agent: AgentID
     public var error: String
+    public var report: TaskReportPayload?
     public var metadata: CoworkEventMetadata?
 
-    public init(taskID: TaskID, agent: AgentID, error: String, metadata: CoworkEventMetadata? = nil) {
+    public init(taskID: TaskID,
+                agent: AgentID,
+                error: String,
+                report: TaskReportPayload? = nil,
+                metadata: CoworkEventMetadata? = nil) {
         self.taskID = taskID
         self.agent = agent
         self.error = error
+        self.report = report
         self.metadata = metadata
     }
 }

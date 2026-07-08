@@ -47,6 +47,17 @@ public struct CoworkAgentInfo: Identifiable, Equatable, Sendable {
         self.capabilityLease = capabilityLease
         self.canRemove = canRemove
     }
+
+    public var statusLine: String {
+        let queued = pendingTasks + pendingMessages
+        if queued > 0 {
+            return "\(status) · \(queued) queued"
+        }
+        if completedTasks > 0 {
+            return "\(status) · \(completedTasks) completed"
+        }
+        return status
+    }
 }
 
 public struct CoworkTaskLine: Identifiable, Equatable, Sendable {
@@ -85,6 +96,22 @@ public struct CoworkWorkspaceInfo: Identifiable, Equatable, Sendable {
         self.isPrimary = isPrimary
         self.access = access
         self.canRemove = canRemove
+    }
+}
+
+private enum CoworkInspectorTab: String, CaseIterable, Identifiable {
+    case agents
+    case tasks
+    case context
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .agents: return "Agents"
+        case .tasks: return "Tasks"
+        case .context: return "Context"
+        }
     }
 }
 
@@ -174,6 +201,7 @@ public struct CoworkShell: View {
     private let onRemoveAgent: ((String) -> Void)?
     private let onRetryTask: ((String) -> Void)?
     @State private var selectedAgentID: String?
+    @State private var inspectorTab: CoworkInspectorTab = .agents
 
     public init(items: [CodeItem],
                 agents: [CoworkAgentInfo],
@@ -224,23 +252,15 @@ public struct CoworkShell: View {
         return pending.state == .livePending || pending.state == .resolving
     }
 
+    private var selectedAgent: CoworkAgentInfo? {
+        guard let selectedAgentID else { return agents.first }
+        return agents.first { $0.id == selectedAgentID } ?? agents.first
+    }
+
     public var body: some View {
         GeometryReader { proxy in
             content(rawWidth: proxy.size.width)
         }
-        .onAppear { selectedAgentID = selectedAgentID ?? agents.first?.id }
-        .onChange(of: agents) { newAgents in
-            if let selectedAgentID,
-               newAgents.contains(where: { $0.id == selectedAgentID }) {
-                return
-            }
-            selectedAgentID = newAgents.first?.id
-        }
-    }
-
-    private var selectedAgent: CoworkAgentInfo? {
-        guard let selectedAgentID else { return nil }
-        return agents.first { $0.id == selectedAgentID }
     }
 
     @ViewBuilder private func content(rawWidth: CGFloat) -> some View {
@@ -306,44 +326,283 @@ public struct CoworkShell: View {
     private var inspectorColumn: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
-                inspectorHeader
-                inspectorSection("Project") {
-                    projectSection
-                }
-                inspectorSection("Agents") {
-                    HStack(spacing: 8) {
-                        metric("Active", summary.activeCount)
-                        metric("Running", summary.runningCount)
-                    }
-                    HStack(spacing: 8) {
-                        metric("Failed", summary.failedCount)
-                        metric("Mailbox", summary.pendingMailboxCount)
-                    }
-                    agentRosterList
-                }
-                inspectorSection("Plan") {
-                    taskList
-                }
-                inspectorSection("Workspace") {
-                    inspectorRow("Directories", value: "\(project.workspaces.count)")
-                    workspaceDirectoryList
-                    inspectorRow("Workspace leases", value: "\(summary.workspaceLeaseCount)")
-                    inspectorRow("Capability leases", value: "\(summary.capabilityLeaseCount)")
-                    inspectorRow("Git", value: "status only")
-                    Text("Commit, branch, PR, CI, and review workflows are deferred.")
-                        .font(.caption2)
-                        .foregroundStyle(threadStyle.tertiaryText)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                if let latestTurnStats {
-                    inspectorSection("Last Turn") {
-                        IntatisTurnStatsSummaryView(stats: latestTurnStats, style: threadStyle)
-                    }
-                }
+                gitStatusSection
+                agentStatusSection
+                goalTableSection
             }
             .padding(16)
         }
         .background(threadStyle.cardSurface.opacity(0.38))
+    }
+
+    private var gitStatusSection: some View {
+        rightRailSection("Git Status") {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    Image(systemName: "arrow.triangle.branch")
+                        .font(.caption.bold())
+                        .foregroundStyle(threadStyle.accent)
+                        .frame(width: 18)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(primaryWorkspaceName)
+                            .font(.caption.bold())
+                            .foregroundStyle(threadStyle.primaryText)
+                            .lineLimit(1)
+                        Text("status only")
+                            .font(.caption2)
+                            .foregroundStyle(threadStyle.secondaryText)
+                            .lineLimit(1)
+                    }
+                    Spacer(minLength: 8)
+                    Image(systemName: "circle")
+                        .font(.caption2)
+                        .foregroundStyle(threadStyle.tertiaryText)
+                }
+                Text(primaryWorkspacePath)
+                    .font(.caption2)
+                    .foregroundStyle(threadStyle.tertiaryText)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text("Branch, commit, PR, CI, and review controls stay out of this rail.")
+                    .font(.caption2)
+                    .foregroundStyle(threadStyle.tertiaryText)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var agentStatusSection: some View {
+        rightRailSection("Agents") {
+            agentStatusList
+        }
+    }
+
+    @ViewBuilder private var agentStatusList: some View {
+        if visibleAgents.isEmpty {
+            Text("No active agents")
+                .font(.caption)
+                .foregroundStyle(threadStyle.tertiaryText)
+        } else {
+            VStack(alignment: .leading, spacing: 7) {
+                ForEach(visibleAgents) { agent in
+                    agentStatusRow(agent)
+                }
+            }
+        }
+    }
+
+    private func agentStatusRow(_ agent: CoworkAgentInfo) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: statusIconName(for: agent.status))
+                .font(.caption)
+                .foregroundStyle(statusColor(for: agent.status))
+                .frame(width: 18)
+            Text("@\(agent.name)")
+                .font(.caption.bold())
+                .foregroundStyle(threadStyle.primaryText)
+                .lineLimit(1)
+            Spacer(minLength: 8)
+        }
+        .padding(.vertical, 2)
+        .help("\(agent.name): \(agent.status)")
+    }
+
+    private var goalTableSection: some View {
+        rightRailSection("Goals") {
+            goalTable
+        }
+    }
+
+    @ViewBuilder private var goalTable: some View {
+        if goalRows.isEmpty {
+            Text("No agent-declared goals yet")
+                .font(.caption)
+                .foregroundStyle(threadStyle.tertiaryText)
+        } else {
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(Array(goalRows.enumerated()), id: \.element.id) { index, task in
+                    goalRow(index: index + 1, task: task)
+                }
+            }
+        }
+    }
+
+    private func goalRow(index: Int, task: CoworkTaskLine) -> some View {
+        let completed = isCompleted(task)
+        return HStack(alignment: .top, spacing: 8) {
+            goalMarker(index: index, completed: completed)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(goalText(for: task))
+                    .font(.caption)
+                    .foregroundStyle(completed ? threadStyle.secondaryText : threadStyle.primaryText)
+                    .strikethrough(completed, color: threadStyle.secondaryText)
+                    .lineLimit(4)
+                    .fixedSize(horizontal: false, vertical: true)
+                if !task.title.isEmpty {
+                    Text(task.title)
+                        .font(.caption2)
+                        .foregroundStyle(threadStyle.tertiaryText)
+                        .lineLimit(1)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 2)
+    }
+
+    @ViewBuilder private func goalMarker(index: Int, completed: Bool) -> some View {
+        if completed {
+            Image(systemName: "checkmark.circle.fill")
+                .font(.system(size: 18, weight: .semibold))
+                .foregroundStyle(.green)
+                .frame(width: 22, height: 22)
+        } else {
+            ZStack {
+                Circle()
+                    .stroke(threadStyle.secondaryText, lineWidth: 1)
+                Text("\(index)")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(threadStyle.secondaryText)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.6)
+            }
+            .frame(width: 22, height: 22)
+        }
+    }
+
+    private func rightRailSection<Content: View>(_ title: String,
+                                                 @ViewBuilder content: () -> Content) -> some View {
+        inspectorSection(title) {
+            content()
+        }
+    }
+
+    private var inspectorOverview: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 8) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("@\(project.mainAgentName)")
+                        .font(.caption.bold())
+                        .foregroundStyle(threadStyle.primaryText)
+                        .lineLimit(1)
+                    Text(project.defaultModel)
+                        .font(.caption2)
+                        .foregroundStyle(threadStyle.secondaryText)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                Spacer(minLength: 8)
+                if let onShowProjectSettings {
+                    Button(action: onShowProjectSettings) {
+                        Label("Project Settings", systemImage: "slider.horizontal.3")
+                            .labelStyle(.iconOnly)
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(isWorking)
+                    .help("Project Settings")
+                }
+            }
+
+            Divider().opacity(0.35)
+
+            HStack(alignment: .top, spacing: 12) {
+                overviewMetric("Agents", "\(agents.count)")
+                overviewMetric("Running", "\(summary.runningCount)")
+                overviewMetric("Tasks", "\(summary.activeCount)")
+                overviewMetric("Inbox", "\(summary.pendingMailboxCount)")
+            }
+        }
+        .padding(11)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(threadStyle.cardSurface, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(threadStyle.cardStroke, lineWidth: 1)
+        }
+    }
+
+    private func overviewMetric(_ title: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title.uppercased())
+                .font(.caption2.bold())
+                .foregroundStyle(threadStyle.tertiaryText)
+                .lineLimit(1)
+            Text(value)
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(threadStyle.primaryText)
+                .lineLimit(1)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var inspectorTabs: some View {
+        Picker("Inspector view", selection: $inspectorTab) {
+            ForEach(CoworkInspectorTab.allCases) { tab in
+                Text(tab.title).tag(tab)
+            }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+    }
+
+    @ViewBuilder private var inspectorTabContent: some View {
+        switch inspectorTab {
+        case .agents:
+            agentsInspector
+        case .tasks:
+            tasksInspector
+        case .context:
+            contextInspector
+        }
+    }
+
+    @ViewBuilder private var agentsInspector: some View {
+        inspectorSection("Roster") {
+            agentRosterList
+        }
+        if let agent = selectedAgent {
+            inspectorSection("Selected Agent") {
+                selectedAgentDetails(agent)
+            }
+        }
+    }
+
+    private var tasksInspector: some View {
+        inspectorSection("Task Flow") {
+            VStack(alignment: .leading, spacing: 9) {
+                HStack(alignment: .top, spacing: 12) {
+                    overviewMetric("Active", "\(summary.activeCount)")
+                    overviewMetric("Running", "\(summary.runningCount)")
+                    overviewMetric("Failed", "\(summary.failedCount)")
+                }
+                Divider().opacity(0.35)
+                taskList
+            }
+        }
+    }
+
+    @ViewBuilder private var contextInspector: some View {
+        inspectorSection("Project") {
+            projectSection
+        }
+        inspectorSection("Workspaces") {
+            inspectorRow("Directories", value: "\(project.workspaces.count)")
+            workspaceDirectoryList
+        }
+        inspectorSection("Access") {
+            inspectorRow("Workspace leases", value: "\(summary.workspaceLeaseCount)")
+            inspectorRow("Capability leases", value: "\(summary.capabilityLeaseCount)")
+            inspectorRow("Git", value: "status only")
+            Text("Commit, branch, PR, CI, and review workflows are deferred.")
+                .font(.caption2)
+                .foregroundStyle(threadStyle.tertiaryText)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        if let latestTurnStats {
+            inspectorSection("Last Turn") {
+                IntatisTurnStatsSummaryView(stats: latestTurnStats, style: threadStyle)
+            }
+        }
     }
 
     private var projectSection: some View {
@@ -418,11 +677,10 @@ public struct CoworkShell: View {
                 .font(.caption)
                 .foregroundStyle(threadStyle.tertiaryText)
         } else {
-            ForEach(agents) { agent in
-                agentPill(agent)
-            }
-            if let agent = selectedAgent {
-                selectedAgentCard(agent)
+            VStack(alignment: .leading, spacing: 2) {
+                ForEach(agents) { agent in
+                    agentListRow(agent)
+                }
             }
         }
     }
@@ -435,16 +693,19 @@ public struct CoworkShell: View {
                 .foregroundStyle(threadStyle.tertiaryText)
                 .fixedSize(horizontal: false, vertical: true)
         } else {
-            ForEach(summary.runningTasks) { task in CoworkTaskLineRow(task: task, style: threadStyle) }
+            ForEach(summary.runningTasks) { task in
+                taskCompactRow(task: task)
+            }
             ForEach(summary.failedTasks) { task in
-                CoworkTaskLineRow(
+                taskCompactRow(
                     task: task,
-                    style: threadStyle,
                     actionTitle: onRetryTask == nil ? nil : "Retry",
                     actionDisabled: isWorking,
                     action: onRetryTask.map { retry in { retry(task.id) } })
             }
-            ForEach(summary.recentCompletedTasks) { task in CoworkTaskLineRow(task: task, style: threadStyle) }
+            ForEach(summary.recentCompletedTasks) { task in
+                taskCompactRow(task: task)
+            }
         }
     }
 
@@ -517,6 +778,189 @@ public struct CoworkShell: View {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .stroke(threadStyle.cardStroke, lineWidth: 1)
         }
+    }
+
+    private func agentListRow(_ agent: CoworkAgentInfo) -> some View {
+        let selected = selectedAgentID == agent.id
+        return Button {
+            selectedAgentID = agent.id
+        } label: {
+            HStack(alignment: .center, spacing: 8) {
+                Circle()
+                    .fill(statusColor(for: agent.status))
+                    .frame(width: 7, height: 7)
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 5) {
+                        Text("@\(agent.name)")
+                            .font(.caption.bold())
+                            .foregroundStyle(threadStyle.primaryText)
+                            .lineLimit(1)
+                        Text(agent.role)
+                            .font(.caption2.bold())
+                            .foregroundStyle(threadStyle.secondaryText)
+                            .lineLimit(1)
+                    }
+                    Text(agent.statusLine)
+                        .font(.caption2)
+                        .foregroundStyle(threadStyle.secondaryText)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 8)
+                if selected {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(threadStyle.accent)
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 7)
+            .background(selected ? threadStyle.accentSoft : Color.clear,
+                        in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func selectedAgentDetails(_ agent: CoworkAgentInfo) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text("@\(agent.name)")
+                    .font(.caption.bold())
+                    .foregroundStyle(threadStyle.primaryText)
+                    .lineLimit(1)
+                Spacer(minLength: 8)
+                Text(agent.status)
+                    .font(.caption2.bold())
+                    .foregroundStyle(statusColor(for: agent.status))
+                    .lineLimit(1)
+                if agent.canRemove, let onRemoveAgent {
+                    Button {
+                        onRemoveAgent(agent.name)
+                    } label: {
+                        Label("Remove agent", systemImage: "trash")
+                            .labelStyle(.iconOnly)
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(isWorking)
+                    .help("Remove agent")
+                }
+            }
+            Text(agent.workspace)
+                .font(.caption2)
+                .foregroundStyle(threadStyle.secondaryText)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .textSelection(.enabled)
+            Divider().opacity(0.35)
+            agentDetailRow("Role", value: agent.role)
+            agentDetailRow("Model", value: agent.model)
+            agentDetailRow("Permission", value: agent.profile)
+            agentDetailRow("Queued", value: "\(agent.pendingTasks) tasks / \(agent.pendingMessages) messages")
+            agentDetailRow("Completed", value: "\(agent.completedTasks) tasks")
+            if let workspaceLease = agent.workspaceLease {
+                agentDetailRow("Workspace lease", value: workspaceLease)
+            }
+            if let capabilityLease = agent.capabilityLease {
+                agentDetailRow("Capability lease", value: capabilityLease)
+            }
+        }
+    }
+
+    private func taskCompactRow(task: CoworkTaskLine,
+                                actionTitle: String? = nil,
+                                actionDisabled: Bool = false,
+                                action: (() -> Void)? = nil) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text(task.title)
+                    .font(.caption.bold())
+                    .foregroundStyle(threadStyle.primaryText)
+                    .lineLimit(1)
+                Spacer(minLength: 6)
+                if let actionTitle, let action {
+                    Button(actionTitle, action: action)
+                        .buttonStyle(.borderless)
+                        .disabled(actionDisabled)
+                }
+                Text(task.status)
+                    .font(.caption2.bold())
+                    .foregroundStyle(statusColor(for: task.status))
+                    .lineLimit(1)
+            }
+            if !task.detail.isEmpty {
+                Text(task.detail)
+                    .font(.caption2)
+                    .foregroundStyle(threadStyle.secondaryText)
+                    .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func statusColor(for status: String) -> Color {
+        switch status.lowercased() {
+        case "failed", "error", "rejected":
+            return threadStyle.error
+        case "running", "thinking", "tool":
+            return threadStyle.accent
+        case "assigned", "queued", "mailbox":
+            return .orange
+        case "completed", "complete", "done":
+            return .green
+        default:
+            return threadStyle.tertiaryText
+        }
+    }
+
+    private func statusIconName(for status: String) -> String {
+        switch status.lowercased() {
+        case "failed", "error", "rejected":
+            return "exclamationmark.triangle.fill"
+        case "running", "thinking", "tool":
+            return "play.circle.fill"
+        case "assigned", "queued", "mailbox":
+            return "clock.fill"
+        case "completed", "complete", "done":
+            return "checkmark.circle.fill"
+        default:
+            return "circle"
+        }
+    }
+
+    private var visibleAgents: [CoworkAgentInfo] {
+        agents.filter { agent in
+            let status = agent.status.lowercased()
+            return status != "cleaned" && status != "removed" && status != "detached"
+        }
+    }
+
+    private var goalRows: [CoworkTaskLine] {
+        summary.runningTasks + summary.failedTasks + summary.recentCompletedTasks
+    }
+
+    private var primaryWorkspace: CoworkWorkspaceInfo? {
+        project.workspaces.first { $0.isPrimary } ?? project.workspaces.first
+    }
+
+    private var primaryWorkspaceName: String {
+        primaryWorkspace?.displayName ?? "No workspace"
+    }
+
+    private var primaryWorkspacePath: String {
+        primaryWorkspace?.path ?? "Attach a workspace to inspect git state."
+    }
+
+    private func isCompleted(_ task: CoworkTaskLine) -> Bool {
+        switch task.status.lowercased() {
+        case "completed", "complete", "done":
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func goalText(for task: CoworkTaskLine) -> String {
+        task.detail.isEmpty ? task.title : task.detail
     }
 
     private func agentRoster(layout: IntatisThreadContentLayout) -> some View {

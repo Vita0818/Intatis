@@ -120,7 +120,11 @@ final class SpawnAgentPermissionTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: ws) }
         let orch = orchestrator(log: log, decision: .deny)
 
-        let message = await orch.spawnFromTool(name: "worker", path: ws.path, model: "m")
+        let message = await orch.spawnFromTool(
+            requestedBy: Orchestrator.mainAgentID,
+            name: "worker",
+            path: ws.path,
+            model: "m")
         let agents = await orch.agentList()
 
         XCTAssertTrue(message.contains("permission denied"))

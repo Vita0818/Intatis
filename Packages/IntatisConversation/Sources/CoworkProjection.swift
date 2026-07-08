@@ -12,6 +12,7 @@ public struct CoworkTaskView: Codable, Equatable, Sendable, Identifiable {
     public var assignee: AgentID?
     public var result: String?
     public var error: String?
+    public var report: TaskReportPayload?
 
     public init(id: TaskID,
                 contract: TaskContract? = nil,
@@ -21,7 +22,8 @@ public struct CoworkTaskView: Codable, Equatable, Sendable, Identifiable {
                 issuer: AgentID? = nil,
                 assignee: AgentID? = nil,
                 result: String? = nil,
-                error: String? = nil) {
+                error: String? = nil,
+                report: TaskReportPayload? = nil) {
         self.id = id
         self.contract = contract
         self.status = status
@@ -31,6 +33,7 @@ public struct CoworkTaskView: Codable, Equatable, Sendable, Identifiable {
         self.assignee = assignee
         self.result = result
         self.error = error
+        self.report = report
     }
 }
 
@@ -60,6 +63,7 @@ public struct CoworkProjection: Equatable, Sendable {
     public private(set) var capabilityLeaseAgents: [CapabilityLeaseID: AgentID] = [:]
     public private(set) var agentMessages: [AgentMessagePayload] = []
     public private(set) var agentStatuses: [AgentID: AgentState] = [:]
+    public private(set) var agentOwners: [AgentID: AgentID] = [:]
 
     public init() {}
 
@@ -95,9 +99,13 @@ public struct CoworkProjection: Equatable, Sendable {
                 model: payload.model,
                 profile: "reviewed",
                 metadata: payload.metadata)
+            if let requestedBy = payload.requestedBy ?? payload.metadata?.sender {
+                agentOwners[payload.agent] = requestedBy
+            }
         case .agentDetached(let payload):
             agentRoster.removeValue(forKey: payload.agent)
             agentStatuses.removeValue(forKey: payload.agent)
+            agentOwners.removeValue(forKey: payload.agent)
         case .agentStatus(let payload):
             if let agent = payload.agent {
                 agentStatuses[agent] = payload.state
@@ -140,11 +148,11 @@ public struct CoworkProjection: Equatable, Sendable {
             updateTask(payload.taskID, status: .running, assignee: payload.agent)
             mailboxes[payload.agent, default: CoworkMailboxView()].pendingTasks.removeAll { $0 == payload.taskID }
         case .taskCompleted(let payload):
-            updateTask(payload.taskID, status: .completed, assignee: payload.agent, result: payload.result)
+            updateTask(payload.taskID, status: .completed, assignee: payload.agent, result: payload.result, report: payload.report)
             mailboxes[payload.agent, default: CoworkMailboxView()].pendingTasks.removeAll { $0 == payload.taskID }
             mailboxes[payload.agent, default: CoworkMailboxView()].completedTasks.append(payload.taskID)
         case .taskFailed(let payload):
-            updateTask(payload.taskID, status: .failed, assignee: payload.agent, error: payload.error)
+            updateTask(payload.taskID, status: .failed, assignee: payload.agent, error: payload.error, report: payload.report)
             mailboxes[payload.agent, default: CoworkMailboxView()].pendingTasks.removeAll { $0 == payload.taskID }
         case .taskRejected(let payload):
             if let contract = payload.contract {
@@ -193,7 +201,8 @@ public struct CoworkProjection: Equatable, Sendable {
                                      issuer: AgentID? = nil,
                                      assignee: AgentID? = nil,
                                      result: String? = nil,
-                                     error: String? = nil) {
+                                     error: String? = nil,
+                                     report: TaskReportPayload? = nil) {
         var view = tasks[contract.id] ?? CoworkTaskView(
             id: contract.id,
             contract: contract,
@@ -210,6 +219,7 @@ public struct CoworkProjection: Equatable, Sendable {
         view.assignee = assignee ?? view.assignee ?? contract.assignee
         view.result = result ?? view.result
         view.error = error ?? view.error
+        view.report = report ?? view.report
         tasks[contract.id] = view
     }
 
@@ -217,12 +227,14 @@ public struct CoworkProjection: Equatable, Sendable {
                                      status: TaskStatus,
                                      assignee: AgentID? = nil,
                                      result: String? = nil,
-                                     error: String? = nil) {
+                                     error: String? = nil,
+                                     report: TaskReportPayload? = nil) {
         var view = tasks[taskID] ?? CoworkTaskView(id: taskID, status: status, assignee: assignee)
         view.status = status
         view.assignee = assignee ?? view.assignee
         view.result = result ?? view.result
         view.error = error ?? view.error
+        view.report = report ?? view.report
         tasks[taskID] = view
     }
 }

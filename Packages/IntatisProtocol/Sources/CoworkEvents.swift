@@ -110,9 +110,11 @@ public struct AgentAttachedPayload: Codable, Equatable, Sendable {
 
 public struct AgentDetachedPayload: Codable, Equatable, Sendable {
     public var agent: AgentID
+    public var reason: String?
     public var metadata: CoworkEventMetadata?
-    public init(agent: AgentID, metadata: CoworkEventMetadata? = nil) {
+    public init(agent: AgentID, reason: String? = nil, metadata: CoworkEventMetadata? = nil) {
         self.agent = agent
+        self.reason = reason
         self.metadata = metadata
     }
 }
@@ -138,15 +140,18 @@ public struct AgentSpawnRequestedPayload: Codable, Equatable, Sendable {
 }
 
 public struct AgentSpawnedPayload: Codable, Equatable, Sendable {
+    public var requestedBy: AgentID?
     public var agent: AgentID
     public var path: String
     public var model: ModelID
     public var metadata: CoworkEventMetadata?
 
-    public init(agent: AgentID,
+    public init(requestedBy: AgentID? = nil,
+                agent: AgentID,
                 path: String,
                 model: ModelID,
                 metadata: CoworkEventMetadata? = nil) {
+        self.requestedBy = requestedBy
         self.agent = agent
         self.path = path
         self.model = model

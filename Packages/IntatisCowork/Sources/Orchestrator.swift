@@ -23,6 +23,11 @@ public enum AutomaticPermissionReviewResult: Equatable, Sendable {
     case failed(String)
 }
 
+private enum ScheduledReplyFormat: Sendable {
+    case answer
+    case taskReport
+}
+
 /// Coordinates multiple agents over one shared event log (ARCHITECTURE.md §7).
 /// Routes `@mentioned` user messages to the right agent, and mediates every
 /// agent-to-agent exchange through the Message Bus. An `actor`, so concurrent /
@@ -46,6 +51,9 @@ public actor Orchestrator {
     private var scheduler: AgentScheduler
     private var taskGraph: TaskGraph
     private var scheduledReplyTargets: [TaskID: AgentID]
+    private var scheduledReplyFormats: [TaskID: ScheduledReplyFormat]
+    private var scheduledReplyResults: [TaskID: String]
+    private var spawnedAgentOwners: [AgentID: AgentID]
     private let reasoningEffort: ReasoningEffort?
     private let includeUsage: Bool
     private let maxSteps: Int
@@ -78,6 +86,9 @@ public actor Orchestrator {
         self.scheduler = AgentScheduler()
         self.taskGraph = TaskGraph(policy: taskGraphPolicy)
         self.scheduledReplyTargets = [:]
+        self.scheduledReplyFormats = [:]
+        self.scheduledReplyResults = [:]
+        self.spawnedAgentOwners = [:]
         self.reasoningEffort = reasoningEffort
         self.includeUsage = includeUsage
         self.maxSteps = maxSteps
@@ -183,18 +194,19 @@ public actor Orchestrator {
         return true
     }
 
-    public func detach(_ name: AgentID) async {
+    public func detach(_ name: AgentID, reason: String = "agent detached") async {
         if name == automaticPermissionReviewerAgentID {
             automaticPermissionResponder = nil
             automaticPermissionReviewerAgentID = nil
         }
         registry.remove(name)
+        spawnedAgentOwners.removeValue(forKey: name)
         if let capabilityLeaseID = defaultCapabilityLeaseIDs.removeValue(forKey: name) {
             capabilityLeases.removeValue(forKey: capabilityLeaseID)
             try? await log.append(.capabilityLeaseRevoked(CapabilityLeaseRevokedPayload(
                 agent: name,
                 leaseID: capabilityLeaseID,
-                reason: "agent detached",
+                reason: reason,
                 metadata: CoworkEventMetadata(agentID: name, capabilityLeaseID: capabilityLeaseID, scope: .capability))))
         }
         if let workspaceLeaseID = defaultWorkspaceLeaseIDs.removeValue(forKey: name) {
@@ -202,6 +214,7 @@ public actor Orchestrator {
         }
         try? await log.append(.agentDetached(AgentDetachedPayload(
             agent: name,
+            reason: reason,
             metadata: CoworkEventMetadata(agentID: name, scope: .agent))))
     }
 
@@ -319,6 +332,7 @@ public actor Orchestrator {
         }
         try? await log.append(.agentDetached(AgentDetachedPayload(
             agent: reviewerID,
+            reason: "automatic permission review disabled",
             metadata: CoworkEventMetadata(agentID: reviewerID, scope: .agent))))
         return true
     }
@@ -338,6 +352,7 @@ public actor Orchestrator {
         capabilityLeases = projection.capabilityLeases
         defaultWorkspaceLeaseIDs = reverseLeaseAgents(projection.workspaceLeaseAgents)
         defaultCapabilityLeaseIDs = reverseLeaseAgents(projection.capabilityLeaseAgents)
+        spawnedAgentOwners = projection.agentOwners.filter { registry.agent($0.key) != nil }
     }
 
     /// Route a user message to the explicit target, or to the first attached agent
@@ -433,8 +448,8 @@ public actor Orchestrator {
     }
 
     /// Called by `BusMessenger` when `from` asks the agent named `toName`.
-    func ask(from: AgentID, to toName: String, question: String) async -> String {
-        let queued = await enqueueAsk(from: from, to: toName, question: question, parentTaskID: nil)
+    func ask(from: AgentID, to toName: String, question: String, parentTaskID: TaskID? = nil) async -> String {
+        let queued = await enqueueAsk(from: from, to: toName, question: question, parentTaskID: parentTaskID)
         guard let taskID = queued.taskID else { return queued.message }
         return await awaitSchedulerResult(taskID) ?? queued.message
     }
@@ -463,6 +478,7 @@ public actor Orchestrator {
             parentTaskID: parentTaskID)
         if let taskID = queued.taskID {
             scheduledReplyTargets[taskID] = from
+            scheduledReplyFormats[taskID] = .answer
         }
         return queued
     }
@@ -589,6 +605,8 @@ public actor Orchestrator {
             expectedDeliverable: expectedDeliverable,
             parentTaskID: parentTaskID)
         guard let taskID = queued.taskID else { return queued.message }
+        scheduledReplyTargets[taskID] = from
+        scheduledReplyFormats[taskID] = .taskReport
         return await awaitSchedulerResult(taskID) ?? queued.message
     }
 
@@ -703,7 +721,11 @@ public actor Orchestrator {
 
     /// Create and attach a new sub-agent bound to `path`. Returns a status line
     /// the calling (coordinator) agent can read back.
-    func spawnFromTool(name: String, path: String, model: String, canCoordinate: Bool = false) async -> String {
+    func spawnFromTool(requestedBy: AgentID,
+                       name: String,
+                       path: String,
+                       model: String,
+                       canCoordinate: Bool = false) async -> String {
         let trimmed = name.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else { return "error: an agent name is required" }
         let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardizedFileURL
@@ -717,20 +739,29 @@ public actor Orchestrator {
         }
         if registry.agent(id) != nil { return "error: an agent named @\(trimmed) already exists" }
         try? await log.append(.agentSpawnRequested(AgentSpawnRequestedPayload(
+            requestedBy: requestedBy,
             agent: id,
             path: url.path,
             model: ModelID(rawValue: model),
-            metadata: CoworkEventMetadata(agentID: id, scope: .agent))))
+            metadata: CoworkEventMetadata(
+                sender: requestedBy,
+                agentID: id,
+                scope: .agent))))
         let coordinationDepth = canCoordinate ? Agent.defaultCoordinationDepth : 0
         let attached = await attach(Agent(name: id, workspaceRoot: url,
                                           model: ModelID(rawValue: model), profile: .reviewed,
                                           coordinationDepth: coordinationDepth))
         if attached {
+            spawnedAgentOwners[id] = requestedBy
             try? await log.append(.agentSpawned(AgentSpawnedPayload(
+                requestedBy: requestedBy,
                 agent: id,
                 path: url.path,
                 model: ModelID(rawValue: model),
-                metadata: CoworkEventMetadata(agentID: id, scope: .agent))))
+                metadata: CoworkEventMetadata(
+                    sender: requestedBy,
+                    agentID: id,
+                    scope: .agent))))
         }
         return attached
             ? "spawned @\(trimmed) · model \(model) · \(canCoordinate ? "coordinator" : "worker") · \(url.path)"
@@ -764,7 +795,7 @@ public actor Orchestrator {
                      taskContract: TaskContract? = nil) async throws -> String {
         let provider = try await providerFor(agent)
         let messenger = BusMessenger(from: agent.name, currentTaskID: taskContract?.id, orchestrator: self)
-        let manager = OrchestratorManager(orchestrator: self, defaultModel: agent.model.rawValue)
+        let manager = OrchestratorManager(orchestrator: self, requester: agent.name, defaultModel: agent.model.rawValue)
         let capabilityLease = capabilityLease(for: agent, taskContract: taskContract)
         let toolRegistry = Self.toolRegistry(for: capabilityLease)
         let imageGenerator = await imageGeneratorFor(agent)
@@ -953,44 +984,143 @@ public actor Orchestrator {
 
         guard let agent = registry.agent(task.assignee) else {
             let message = "scheduled task assignee is not attached: @\(task.assignee.rawValue)"
+            let report = Self.makeTaskReport(task: task, status: .failed, error: message)
+            if let replyTarget = scheduledReplyTargets.removeValue(forKey: task.contract.id) {
+                let format = scheduledReplyFormats.removeValue(forKey: task.contract.id) ?? .answer
+                scheduledReplyResults[task.contract.id] = await deliverScheduledReply(
+                    format: format,
+                    from: task.assignee,
+                    to: replyTarget,
+                    result: nil,
+                    report: report,
+                    error: message)
+            } else {
+                scheduledReplyFormats.removeValue(forKey: task.contract.id)
+            }
             scheduler.recordFailed(task: task, error: message)
             taskGraph.updateStatus(taskID: task.contract.id, status: .failed)
             try? await log.append(.taskFailed(TaskFailedPayload(
                 taskID: task.contract.id,
                 agent: task.assignee,
                 error: message,
+                report: report,
                 metadata: metadata)))
             return true
         }
 
         do {
             let result = try await run(agent, input: task.input, taskContract: task.contract)
+            let report = Self.makeTaskReport(task: task, status: .completed, result: result)
             scheduler.recordCompleted(task: task, result: result)
             taskGraph.updateStatus(taskID: task.contract.id, status: .completed)
             try? await log.append(.taskCompleted(TaskCompletedPayload(
                 taskID: task.contract.id,
                 agent: task.assignee,
                 result: result,
+                report: report,
                 metadata: metadata)))
             if let replyTarget = scheduledReplyTargets.removeValue(forKey: task.contract.id) {
-                _ = await bus.deliver(from: task.assignee, to: replyTarget, content: result)
+                let format = scheduledReplyFormats.removeValue(forKey: task.contract.id) ?? .answer
+                scheduledReplyResults[task.contract.id] = await deliverScheduledReply(
+                    format: format,
+                    from: task.assignee,
+                    to: replyTarget,
+                    result: result,
+                    report: report,
+                    error: nil)
+            } else {
+                scheduledReplyFormats.removeValue(forKey: task.contract.id)
             }
+            await recycleToolSpawnedAgentIfIdle(
+                task.assignee,
+                reason: "task \(task.contract.id.rawValue) completed; auto-recycled tool-spawned agent")
         } catch {
             let message = error.localizedDescription
-            scheduledReplyTargets.removeValue(forKey: task.contract.id)
+            let report = Self.makeTaskReport(task: task, status: .failed, error: message)
+            if let replyTarget = scheduledReplyTargets.removeValue(forKey: task.contract.id) {
+                let format = scheduledReplyFormats.removeValue(forKey: task.contract.id) ?? .answer
+                scheduledReplyResults[task.contract.id] = await deliverScheduledReply(
+                    format: format,
+                    from: task.assignee,
+                    to: replyTarget,
+                    result: nil,
+                    report: report,
+                    error: message)
+            } else {
+                scheduledReplyFormats.removeValue(forKey: task.contract.id)
+            }
             scheduler.recordFailed(task: task, error: message)
             taskGraph.updateStatus(taskID: task.contract.id, status: .failed)
             try? await log.append(.taskFailed(TaskFailedPayload(
                 taskID: task.contract.id,
                 agent: task.assignee,
                 error: message,
+                report: report,
                 metadata: metadata)))
+            await recycleToolSpawnedAgentIfIdle(
+                task.assignee,
+                reason: "task \(task.contract.id.rawValue) failed; auto-recycled tool-spawned agent")
         }
         return true
     }
 
     func runSchedulerUntilIdle() async {
         while await runNextScheduledTask() {}
+        await recycleIdleToolSpawnedAgents(reason: "scheduled tasks drained; auto-recycled idle tool-spawned agent")
+    }
+
+    private func deliverScheduledReply(format: ScheduledReplyFormat,
+                                       from: AgentID,
+                                       to: AgentID,
+                                       result: String?,
+                                       report: TaskReportPayload,
+                                       error: String?) async -> String {
+        switch format {
+        case .answer:
+            let content = result ?? error.map { "error: \($0)" } ?? Self.formattedTaskReport(report)
+            if let forwarded = await bus.deliver(from: from, to: to, content: content) {
+                return forwarded
+            }
+            return error.map { "error: \($0)" }
+                ?? "delegated task completed, but the result was blocked by the mediator; ask @\(from.rawValue) for a shorter summary"
+        case .taskReport:
+            let content = Self.formattedTaskReport(report)
+            if let forwarded = await bus.deliver(from: from, to: to, content: content) {
+                return forwarded
+            }
+            return "delegated task finished, but the task report was blocked by the mediator; ask @\(from.rawValue) for a shorter summary"
+        }
+    }
+
+    private func recycleIdleToolSpawnedAgents(reason: String) async {
+        let candidates = spawnedAgentOwners.keys.sorted { $0.rawValue < $1.rawValue }
+        for agentID in candidates {
+            await recycleToolSpawnedAgentIfIdle(agentID, reason: reason)
+        }
+    }
+
+    private func recycleToolSpawnedAgentIfIdle(_ agentID: AgentID, reason: String) async {
+        guard agentID != Self.mainAgentID,
+              agentID != Self.automaticPermissionReviewerID,
+              spawnedAgentOwners[agentID] != nil,
+              registry.agent(agentID) != nil,
+              isAgentIdleForRecycle(agentID) else {
+            return
+        }
+        await detach(agentID, reason: reason)
+    }
+
+    private func isAgentIdleForRecycle(_ agentID: AgentID) -> Bool {
+        let mailbox = scheduler.mailbox(for: agentID)
+        guard mailbox.pendingTasks.isEmpty, mailbox.pendingMessages.isEmpty else {
+            return false
+        }
+        if scheduler.queuedTasks().contains(where: { $0.assignee == agentID || $0.issuer == agentID }) {
+            return false
+        }
+        return !taskGraph.nodes.values.contains { node in
+            Self.isActiveTaskStatus(node.status) && (node.assignee == agentID || node.issuer == agentID)
+        }
     }
 
     func awaitSchedulerResult(_ taskID: TaskID) async -> String? {
@@ -998,9 +1128,9 @@ public actor Orchestrator {
             if let record = scheduler.record(for: taskID) {
                 switch record.status {
                 case .completed:
-                    return record.result
+                    return scheduledReplyResults[taskID] ?? record.result
                 case .failed:
-                    return record.error.map { "error: \($0)" }
+                    return scheduledReplyResults[taskID] ?? record.error.map { "error: \($0)" }
                 case .created, .assigned, .queued, .running, .cancelled:
                     break
                 }
@@ -1034,6 +1164,87 @@ public actor Orchestrator {
             result.append(agent)
         }
         return result
+    }
+
+    private static func makeTaskReport(task: ScheduledTask,
+                                       status: TaskStatus,
+                                       result: String? = nil,
+                                       error: String? = nil) -> TaskReportPayload {
+        let detail = nonEmptyTrimmed(result).map { truncate($0, maxCharacters: 2_000) }
+        let errorText = nonEmptyTrimmed(error).map { truncate($0, maxCharacters: 1_000) }
+        let summarySource = detail ?? errorText ?? defaultSummary(status: status, agent: task.assignee)
+        return TaskReportPayload(
+            taskID: task.contract.id,
+            agent: task.assignee,
+            status: status,
+            objective: task.contract.objective,
+            expectedDeliverable: task.contract.expectedDeliverable,
+            summary: summaryLine(from: summarySource, status: status),
+            detail: detail,
+            error: errorText)
+    }
+
+    private static func formattedTaskReport(_ report: TaskReportPayload) -> String {
+        var lines: [String] = [
+            "Task Report",
+            "task: \(report.taskID.rawValue)",
+            "status: \(report.status.rawValue)",
+            "agent: @\(report.agent.rawValue)",
+            "objective: \(report.objective)",
+            "expected deliverable: \(report.expectedDeliverable)",
+            "summary: \(report.summary)",
+        ]
+        if let error = report.error {
+            lines.append("error: \(error)")
+        }
+        if let detail = report.detail, detail != report.summary {
+            lines.append("detail:")
+            lines.append(detail)
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private static func summaryLine(from text: String, status: TaskStatus) -> String {
+        let firstLine = text
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty }
+        return truncate(firstLine ?? defaultSummary(status: status, agent: nil), maxCharacters: 500)
+    }
+
+    private static func defaultSummary(status: TaskStatus, agent: AgentID?) -> String {
+        let actor = agent.map { " by @\($0.rawValue)" } ?? ""
+        switch status {
+        case .completed:
+            return "Task completed\(actor)."
+        case .failed:
+            return "Task failed\(actor)."
+        case .created, .assigned, .queued, .running, .cancelled:
+            return "Task status is \(status.rawValue)\(actor)."
+        }
+    }
+
+    private static func nonEmptyTrimmed(_ text: String?) -> String? {
+        guard let trimmed = text?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty else {
+            return nil
+        }
+        return trimmed
+    }
+
+    private static func truncate(_ text: String, maxCharacters: Int) -> String {
+        guard text.count > maxCharacters else { return text }
+        let index = text.index(text.startIndex, offsetBy: maxCharacters)
+        return String(text[..<index]) + "..."
+    }
+
+    private static func isActiveTaskStatus(_ status: TaskStatus) -> Bool {
+        switch status {
+        case .created, .assigned, .queued, .running:
+            return true
+        case .completed, .failed, .cancelled:
+            return false
+        }
     }
 
     private static func delegationRejectionMessage(for violation: TaskGraphViolation) -> String {
@@ -1256,7 +1467,7 @@ struct BusMessenger: AgentMessenger {
     let orchestrator: Orchestrator
 
     func ask(to agent: String, question: String) async -> String {
-        await orchestrator.enqueueAsk(from: from, to: agent, question: question, parentTaskID: currentTaskID).message
+        await orchestrator.ask(from: from, to: agent, question: question, parentTaskID: currentTaskID)
     }
 
     func sendMessage(to agent: String, content: String) async -> String {
@@ -1279,13 +1490,13 @@ struct BusMessenger: AgentMessenger {
                       objective: String,
                       roleHint: String?,
                       expectedDeliverable: String?) async -> String {
-        await orchestrator.enqueueDelegatedTask(
+        await orchestrator.delegateTask(
             from: from,
             to: agent,
             objective: objective,
             roleHint: roleHint,
             expectedDeliverable: expectedDeliverable,
-            parentTaskID: currentTaskID).message
+            parentTaskID: currentTaskID)
     }
 }
 
@@ -1294,10 +1505,12 @@ struct BusMessenger: AgentMessenger {
 /// the spawning agent's model, used when the tool call omits one.
 struct OrchestratorManager: AgentManager {
     let orchestrator: Orchestrator
+    let requester: AgentID
     let defaultModel: String
 
     func spawnAgent(name: String, path: String, model: String?, canCoordinate: Bool) async -> String {
         await orchestrator.spawnFromTool(
+            requestedBy: requester,
             name: name,
             path: path,
             model: model ?? defaultModel,

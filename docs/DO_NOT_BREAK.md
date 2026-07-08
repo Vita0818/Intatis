@@ -32,11 +32,12 @@
 
 ## 协议禁区
 
-- **Cowork 投递协议**：`MessageBus.deliver` 是唯一 agent 间投递路径。`Mediator.mediate` 必须先于转发运行。不得新增绕过 Mediator 的直投路径。
+- **Cowork 投递协议**：`MessageBus.deliver` 是唯一 agent 间投递路径。`Mediator.mediate` 必须先于转发运行。不得新增绕过 Mediator 的直投路径。`ask_agent` / `delegate_task` 工具路径必须通过 scheduler 运行目标 agent，并把 mediated 结果作为上级 agent 的 tool observation 回填；不得退化为只返回 queued ack，也不得为了拿结果而让 `AgentLoop` 直接同步嵌套调用另一个 `AgentLoop`。
+- **Cowork 任务回报与回收**：`delegate_task` 完成后必须把结构化 Task Report 作为 mediated tool observation 回填给上级 agent，并在 `task_completed` / `task_failed` payload 中保留可选 `report` 字段；`ask_agent` 的直接答案兼容不得被无意改成报告格式。tool-spawned、任务域内的子 agent 只有在无 pending/running/issued task 且 mailbox 无待处理消息时才能自动 detach；用户/GUI 手动 attach 的 agent 不得被该自动回收规则移除。
 - **Coordinator 工具**：`spawn_agent` / `list_agents` / `remove_agent` / `ask_agent` 只对 `canCoordinate==true` 的 agent 暴露；worker 默认不得获得 coordinator 能力。`@main` agent 不可被 remove。
 - **Cowork 文档/媒体工具 lease**：worker 默认只能获得安全的只读文档能力（当前为 `read_pdf`）；`edit_pdf_pages`、`reconstruct_document_image`、`compile_latex`、`generate_image` 等写入/执行/网络相关工具必须只通过 coordinator lease 或未来显式 `CapabilityLease` 授予，不能因调用 `ToolRegistry.standard()` 而泄漏给普通 worker。
 - **Cowork 网络/浏览器工具 lease**：worker 默认不得获得 `browse_web`，也不得暴露 `web_fetch` 或任何 `browser_*`。网络/浏览器能力只能通过 coordinator lease 或未来显式 `CapabilityLease` 授予，且执行时仍必须通过 `PermissionEngine`。
-- **Cowork project-mode agent 管理**：GUI 无 @mention 的用户消息必须默认发送给项目 `@main`，不得在已有多个 agent 时强迫用户手动选择目标。子 agent 应由 `@main` 通过 `spawn_agent` / `delegate_task` 等工具按任务需要创建和管理；`spawn_agent` 默认创建 worker（`coordinationDepth=0`），只有显式 `canCoordinate:true` 或未来明确 capability lease/任务契约授予时，子 agent 才可获得 coordinator 工具并继续管理下级 agent。右侧 inspector/settings 可以删除普通子 agent 作为人工干预，但不得删除 `@main` 或 `@permission-reviewer`；删除 agent 不得删除用户文件或清理未提交工作区，只能更新 Orchestrator roster 与非主 workspace metadata。
+- **Cowork project-mode agent 管理**：GUI 无 @mention 的用户消息必须默认发送给项目 `@main`，不得在已有多个 agent 时强迫用户手动选择目标。子 agent 应由 `@main` 通过 `spawn_agent` / `delegate_task` 等工具按任务需要创建和管理；`spawn_agent` 默认创建 worker（`coordinationDepth=0`），只有显式 `canCoordinate:true` 或未来明确 capability lease/任务契约授予时，子 agent 才可获得 coordinator 工具并继续管理下级 agent。右侧 inspector 不提供 agent 删除或详情管理；如未来在 settings/专门管理面板恢复人工删除普通子 agent，也不得删除 `@main` 或 `@permission-reviewer`，且不得删除用户文件或清理未提交工作区，只能更新 Orchestrator roster 与非主 workspace metadata。
 - **自动权限审查保留身份**：`@permission-reviewer` 只能由 CLI Cowork `/auto` 创建、`/default` 移除；它是 read_only、无工具 capability lease 的特殊子 agent，不得作为普通 send/delegate/message/ask 目标，不得暴露给 `list_agents` 工具，也不得由其他 agent 用 `spawn_agent` / `remove_agent` 管理。
 - **权限协议**：硬 DENY 终局；`ModelPermissionReviewer` 只能收窄不能放行；CLI `/auto` 的 `AgentPermissionResponder` 只能回答已经产生的 `ask_user` 请求，不能覆盖 `DeterministicPolicyGate` hard deny；任何 model tool_call 到执行都必须过 `PermissionEngine`，无旁路。
 - **JSON-RPC 词汇**：`Command`→request、`Envelope`→event notification 映射已定义，传输未挂。不得在未确认 out-of-process 传输设计前随意改词汇结构。
@@ -50,7 +51,7 @@
 ## 回归要求
 
 - iOS 必须保持 macOS 真子集：**不得**链接 Tools/Permission/AgentKernel/Cowork 或 shell/git/patch 模块。
-- macOS UI 信息架构不得回退为三套 demo screen：mode selection 和 session history 属于左侧栏；model/context/token 控制属于 composer cluster；Chat 默认不显示右 inspector；Code/Cowork 右 inspector 只能消费 structured projections/view-model state，不能解析 assistant transcript；Cowork 右侧 Agent panel 应继续显示 project/workspace/agent name/role/model/permission/status/lease 等结构化状态；Chat/Code/Cowork 对话泡泡应保持整行 leading/trailing alignment 和响应式最大宽度约束，不得回退到只靠内部 spacer 推位置；Git 在当前 slice 只能显示状态，不得偷偷加入 commit/branch/PR/CI 工作流。
+- macOS UI 信息架构不得回退为三套 demo screen：mode selection 和 session history 属于左侧栏；model/context/token 控制属于 composer cluster；Chat 默认不显示右 inspector；Code/Cowork 右 inspector 只能消费 structured projections/view-model state，不能解析 assistant transcript；Cowork 右栏只能保留 `Git Status`、未清理 agent 名字+状态图标、以及 agent 自动生成/声明完成的 `Goals` 表，不得重新塞入 project summary、选中 agent 详情、workspace/lease 列表或 Last Turn；Chat/Code/Cowork 对话泡泡应保持整行 leading/trailing alignment 和响应式最大宽度约束，不得回退到只靠内部 spacer 推位置；Git 在当前 slice 只能显示状态，不得偷偷加入 commit/branch/PR/CI 工作流。
 - `PlatformProfile.current` 默认 `.iOS`（最受限）：忘记设置的 target 不得意外启用 shell/workspace。
 - `IntatisSharedUI` 用 `#if canImport(SwiftUI)`，不得引入 macOS 专属 API 而破坏 Linux/无头构建。
 - `swift test` 无头：不得让测试 target 依赖 UI/app target。

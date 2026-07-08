@@ -221,7 +221,7 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             capabilityLeaseCount: projection.capabilityLeases.count,
             runningTasks: projection.runningTasks.map(taskLine),
             failedTasks: projection.failedTasks.map(taskLine),
-            recentCompletedTasks: Array(projection.completedTasks.suffix(3)).map(taskLine))
+            recentCompletedTasks: projection.completedTasks.map(taskLine))
         project = Self.makeProjectInfo(
             sessionID: sessionID,
             settings: projectSettings,
@@ -253,7 +253,7 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
     private func taskLine(_ task: CoworkTaskView) -> CoworkTaskLine {
         let assignee = task.assignee.map { "@\($0.rawValue)" } ?? "Unassigned"
         let title = task.contract.map { "\(assignee) · \($0.roleHint)" } ?? assignee
-        let detail = task.error ?? task.result ?? task.contract?.objective ?? ""
+        let detail = task.contract?.objective ?? task.report?.summary ?? task.error ?? task.result ?? ""
         return CoworkTaskLine(id: task.id.rawValue, title: title, detail: detail, status: task.status.rawValue)
     }
 

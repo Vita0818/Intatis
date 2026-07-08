@@ -16,7 +16,7 @@ public struct SpawnAgentTool: Tool {
         description: "Create a new sub-agent bound to a folder so you can delegate work to it. "
             + "Give it a short name and an absolute folder path; model is optional (defaults to "
             + "yours). Set canCoordinate only when this sub-agent must manage lower-level agents. "
-            + "After spawning, assign work with delegate_task.",
+            + "After spawning, assign work with delegate_task; the orchestrator recycles task-scoped agents when idle.",
         sideEffect: .write,
         parameters: .object([
             "type": .string("object"),
@@ -79,7 +79,7 @@ public struct RemoveAgentTool: Tool {
 
     public static let descriptor = ToolDescriptor(
         name: "remove_agent",
-        description: "Remove a sub-agent you no longer need. You cannot remove @main.",
+        description: "Remove a sub-agent early. Completed task-scoped sub-agents are recycled automatically. You cannot remove @main.",
         sideEffect: .readOnly,
         parameters: .object([
             "type": .string("object"),
