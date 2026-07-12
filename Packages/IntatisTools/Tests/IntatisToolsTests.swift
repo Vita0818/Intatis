@@ -1,5 +1,6 @@
 import XCTest
 import IntatisCore
+import IntatisProtocol
 @testable import IntatisTools
 
 #if canImport(Darwin)
@@ -146,8 +147,57 @@ private struct OverlapDetectingShell: ShellRunner {
 private struct FakeGit: GitService {
     let statusText: String
     let diffText: String
+    var stagedDiffText: String = "staged-diff"
+    var branchText: String = "current: main\nbranches:\n* main"
+    var infoText: String = "root: /tmp/repo\nbranch: main\nhead: abc123\nhasChanges: false\nremotes:\n(none)"
+    var commitsText: String = "abc123\tIntatis\t2026-01-01\tInitial"
+    var worktreeText: String = "worktree /tmp/repo\nHEAD abc123\nbranch refs/heads/main"
+    var remotesText: String = "origin\thttps://github.com/example/repo.git (fetch)\norigin\thttps://github.com/example/repo.git (push)"
     func status(workspace: URL) async throws -> String { statusText }
     func diff(workspace: URL) async throws -> String { diffText }
+    func stagedDiff(workspace: URL) async throws -> String { stagedDiffText }
+    func repositoryInfo(workspace: URL) async throws -> String { infoText }
+    func recentCommits(limit: Int, workspace: URL) async throws -> String { "\(commitsText)\nlimit=\(limit)" }
+    func diffAgainst(base: String, workspace: URL) async throws -> String { "diff against \(base)" }
+    func branchInfo(workspace: URL) async throws -> String { branchText }
+    func createBranch(name: String, startPoint: String?, workspace: URL) async throws -> String {
+        "created branch \(name)\(startPoint.map { " from \($0)" } ?? "")"
+    }
+    func stage(paths: [String], workspace: URL) async throws -> String {
+        "staged \(paths.joined(separator: ","))"
+    }
+    func unstage(paths: [String], workspace: URL) async throws -> String {
+        "unstaged \(paths.joined(separator: ","))"
+    }
+    func commit(message: String, workspace: URL) async throws -> String {
+        "committed \(message)"
+    }
+    func applyPatch(diff: String, reverse: Bool, checkOnly: Bool, cached: Bool, workspace: URL) async throws -> GitPatchResult {
+        GitPatchResult(
+            text: "patch reverse=\(reverse) check=\(checkOnly) cached=\(cached)",
+            changedFiles: ["a.swift"],
+            diff: diff)
+    }
+    func worktrees(workspace: URL) async throws -> String { worktreeText }
+    func createWorktree(name: String, startPoint: String?, branch: String?, workspace: URL) async throws -> String {
+        "created worktree \(name) start=\(startPoint ?? "HEAD") branch=\(branch ?? "detached")"
+    }
+    func removeWorktree(name: String, force: Bool, workspace: URL) async throws -> String {
+        "removed worktree \(name) force=\(force)"
+    }
+    func remotes(workspace: URL) async throws -> String { remotesText }
+    func fetch(remote: String, branch: String?, prune: Bool, workspace: URL) async throws -> String {
+        "fetched \(remote) branch=\(branch ?? "all") prune=\(prune)"
+    }
+    func pullFastForward(remote: String, branch: String, workspace: URL) async throws -> String {
+        "pulled \(remote)/\(branch) --ff-only"
+    }
+    func push(remote: String, branch: String, setUpstream: Bool, workspace: URL) async throws -> String {
+        "pushed \(branch) to \(remote) setUpstream=\(setUpstream)"
+    }
+    func switchBranch(name: String, workspace: URL) async throws -> String {
+        "switched to \(name)"
+    }
 }
 
 private struct FakeImageGenerator: ImageGenerationToolService {
@@ -170,6 +220,11 @@ final class IntatisToolsTests: XCTestCase {
             .appendingPathComponent("intatis-ws-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: ws, withIntermediateDirectories: true)
         return ws
+    }
+
+    private func jsonString(_ object: [String: Any]) throws -> String {
+        let data = try JSONSerialization.data(withJSONObject: object)
+        return String(decoding: data, as: UTF8.self)
     }
 
     private func browserPayload(from command: String) throws -> [String: Any] {
@@ -256,6 +311,17 @@ final class IntatisToolsTests: XCTestCase {
 
     private func python3Executable() -> String? {
         ["/usr/bin/python3", "/opt/homebrew/bin/python3", "/usr/local/bin/python3"]
+            .first { FileManager.default.isExecutableFile(atPath: $0) }
+    }
+
+    private func gitExecutable() -> String? {
+        [
+            "/Library/Developer/CommandLineTools/usr/bin/git",
+            "/Applications/Xcode.app/Contents/Developer/usr/bin/git",
+            "/usr/bin/git",
+            "/opt/homebrew/bin/git",
+            "/usr/local/bin/git",
+        ]
             .first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
@@ -398,6 +464,392 @@ final class IntatisToolsTests: XCTestCase {
         XCTAssertTrue(obs.text.contains("[exit 0]"))
     }
 
+    func testToolContextSeparatesRawAndStructuredProcessShells() throws {
+        let ws = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+
+        let production = ToolContext(workspaceRoot: ws)
+        XCTAssertTrue(production.shell is ProcessShellRunner)
+        XCTAssertTrue(production.structuredShell is StructuredProcessShellRunner)
+        XCTAssertTrue(production.networkStructuredShell is StructuredProcessShellRunner)
+
+        let fake = FakeShell(result: ShellResult(stdout: "ok", stderr: "", exitCode: 0))
+        let injected = ToolContext(workspaceRoot: ws, shell: fake)
+        XCTAssertTrue(injected.shell is FakeShell)
+        XCTAssertTrue(injected.structuredShell is FakeShell)
+        XCTAssertTrue(injected.networkStructuredShell is FakeShell)
+    }
+
+    func testStructuredProcessShellRunnerStillSupportsToolBackendCommands() async throws {
+        let ws = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+
+        let result = try await StructuredProcessShellRunner(timeoutSeconds: 5).run(
+            "printf structured-backend",
+            cwd: ws)
+
+        XCTAssertEqual(result.exitCode, 0, result.stderr)
+        XCTAssertEqual(result.stdout, "structured-backend")
+    }
+
+    #if canImport(Darwin)
+    func testStructuredProcessShellRunnerUsesSanitizedEnvironmentAndWorkspaceLease() async throws {
+        guard ProcessShellRunner.supportsWorkspaceSandbox else {
+            throw XCTSkip("workspace shell sandbox backend is unavailable")
+        }
+        let ws = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        try Data("ordinary-marker".utf8).write(to: ws.appendingPathComponent("ordinary.txt"))
+        try Data("env-secret-marker".utf8).write(to: ws.appendingPathComponent(".env"))
+        try Data("root-secret-marker".utf8).write(to: ws.appendingPathComponent("secret-note.txt"))
+        try Data("root-key-marker".utf8).write(to: ws.appendingPathComponent("api-key.txt"))
+        let secretDir = ws.appendingPathComponent("nested", isDirectory: true)
+        try FileManager.default.createDirectory(at: secretDir, withIntermediateDirectories: true)
+        try Data("token-secret-marker".utf8).write(to: secretDir.appendingPathComponent("api-token.txt"))
+        try FileManager.default.createSymbolicLink(
+            at: ws.appendingPathComponent("ordinary-link"),
+            withDestinationURL: ws.appendingPathComponent(".env"))
+
+        setenv("INTATIS_HOST_SECRET_MARKER", "host-secret-marker", 1)
+        defer { unsetenv("INTATIS_HOST_SECRET_MARKER") }
+        let runner = StructuredProcessShellRunner(timeoutSeconds: 5)
+
+        let ordinary = try await runner.run("/bin/cat ordinary.txt; printf '|%s' \"$INTATIS_HOST_SECRET_MARKER\"", cwd: ws)
+        XCTAssertEqual(ordinary.exitCode, 0, ordinary.stderr)
+        XCTAssertEqual(ordinary.stdout, "ordinary-marker|")
+
+        for path in [".env", "secret-note.txt", "api-key.txt", "nested/api-token.txt", "ordinary-link"] {
+            let denied = try await runner.run("/bin/cat '\(path)'", cwd: ws)
+            XCTAssertNotEqual(denied.exitCode, 0, "lease unexpectedly allowed \(path)")
+            XCTAssertFalse(denied.stdout.contains("secret-marker"), denied.stdout)
+            XCTAssertFalse(denied.stderr.contains("secret-marker"), denied.stderr)
+        }
+        let deniedWrite = try await runner.run("printf changed > .env", cwd: ws)
+        XCTAssertNotEqual(deniedWrite.exitCode, 0)
+        XCTAssertEqual(try String(contentsOf: ws.appendingPathComponent(".env")), "env-secret-marker")
+    }
+
+    func testStructuredProcessShellRunnerEnforcesAllowedRulesAndReadOnly() async throws {
+        guard ProcessShellRunner.supportsWorkspaceSandbox else {
+            throw XCTSkip("workspace shell sandbox backend is unavailable")
+        }
+        let ws = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let allowedDir = ws.appendingPathComponent("allowed", isDirectory: true)
+        try FileManager.default.createDirectory(at: allowedDir, withIntermediateDirectories: true)
+        try Data("allowed-marker".utf8).write(to: allowedDir.appendingPathComponent("file.txt"))
+        try Data("blocked-marker".utf8).write(to: ws.appendingPathComponent("blocked.txt"))
+        let lease = WorkspaceLease(
+            rootPath: ws.path,
+            access: .readOnly,
+            allowedPathRules: [PathRule(pattern: "allowed/**")],
+            deniedPatterns: [])
+        let runner = StructuredProcessShellRunner(timeoutSeconds: 5, workspaceLease: lease)
+
+        let allowed = try await runner.run("/bin/cat allowed/file.txt", cwd: ws)
+        XCTAssertEqual(allowed.exitCode, 0, allowed.stderr)
+        XCTAssertEqual(allowed.stdout, "allowed-marker")
+        let blocked = try await runner.run("/bin/cat blocked.txt", cwd: ws)
+        XCTAssertNotEqual(blocked.exitCode, 0)
+        XCTAssertFalse(blocked.stdout.contains("blocked-marker"))
+        let write = try await runner.run("printf changed > allowed/new.txt", cwd: ws)
+        XCTAssertNotEqual(write.exitCode, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: allowedDir.appendingPathComponent("new.txt").path))
+    }
+
+    func testManagedProcessRejectsWorkspaceRootReplacementAfterLeaseReview() async throws {
+        guard ProcessShellRunner.supportsWorkspaceSandbox else {
+            throw XCTSkip("workspace shell sandbox backend is unavailable")
+        }
+        let ws = try tempWorkspace()
+        let reviewed = ws.deletingLastPathComponent().appendingPathComponent("\(ws.lastPathComponent)-reviewed")
+        defer {
+            try? FileManager.default.removeItem(at: ws)
+            try? FileManager.default.removeItem(at: reviewed)
+        }
+        let lease = WorkspaceLease(rootPath: ws.path, access: .readWrite, deniedPatterns: [])
+        let runner = StructuredProcessShellRunner(timeoutSeconds: 5, workspaceLease: lease)
+        try FileManager.default.moveItem(at: ws, to: reviewed)
+        try FileManager.default.createDirectory(at: ws, withIntermediateDirectories: true)
+        try Data("replacement-marker".utf8).write(to: ws.appendingPathComponent("replacement.txt"))
+        do {
+            _ = try await runner.run("/bin/cat replacement.txt", cwd: ws)
+            XCTFail("replacement directory unexpectedly retained reviewed lease authority")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("root identity changed"), "\(error)")
+        }
+        try FileManager.default.removeItem(at: ws)
+        try FileManager.default.createSymbolicLink(at: ws, withDestinationURL: reviewed)
+        do {
+            _ = try await runner.run("/bin/cat ordinary.txt", cwd: ws)
+            XCTFail("symlink replacement unexpectedly retained reviewed lease authority")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("root identity changed")
+                || String(describing: error).contains("root does not match"), "\(error)")
+        }
+    }
+
+    func testStructuredProcessShellNetworkAuthorityIsSeparated() async throws {
+        guard ProcessShellRunner.supportsWorkspaceSandbox else {
+            throw XCTSkip("workspace shell sandbox backend is unavailable")
+        }
+        guard python3Executable() != nil,
+              FileManager.default.isExecutableFile(atPath: "/usr/bin/nc") else {
+            throw XCTSkip("python3 and nc are required for the network confinement smoke")
+        }
+        let ws = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let site = ws.appendingPathComponent("site", isDirectory: true)
+        try FileManager.default.createDirectory(at: site, withIntermediateDirectories: true)
+        try Data("ok".utf8).write(to: site.appendingPathComponent("probe.txt"))
+        let port = try freeLoopbackPort()
+        let server = try startStaticHTTPServer(directory: site, port: port)
+        defer { if server.isRunning { server.terminate() } }
+        try await waitForHTTPServer(port: port, path: "/probe.txt")
+
+        let command = "/usr/bin/nc -z -w 1 127.0.0.1 \(port)"
+        let denied = try await StructuredProcessShellRunner(timeoutSeconds: 5).run(command, cwd: ws)
+        XCTAssertNotEqual(denied.exitCode, 0)
+        let allowed = try await StructuredProcessShellRunner(timeoutSeconds: 5, allowsNetwork: true).run(command, cwd: ws)
+        XCTAssertEqual(allowed.exitCode, 0, allowed.stderr)
+    }
+
+    func testManagedProcessCleansFastBackgroundProcessGroup() async throws {
+        guard ProcessShellRunner.supportsWorkspaceSandbox else {
+            throw XCTSkip("workspace shell sandbox backend is unavailable")
+        }
+        let ws = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let result = try await StructuredProcessShellRunner(timeoutSeconds: 5).run(
+            "/bin/sleep 30 & printf '%s' \"$!\" > background.pid",
+            cwd: ws)
+        XCTAssertEqual(result.exitCode, 0, result.stderr)
+        let pid = try XCTUnwrap(Int32(String(contentsOf: ws.appendingPathComponent("background.pid"))))
+        let deadline = Date().addingTimeInterval(1)
+        while Darwin.kill(pid, 0) == 0, Date() < deadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertEqual(Darwin.kill(pid, 0), -1, "fast background helper survived leader reap")
+    }
+
+    func testManagedProcessCancellationKillsDoubleForkedDescendant() async throws {
+        guard ProcessShellRunner.supportsWorkspaceSandbox,
+              FileManager.default.isExecutableFile(atPath: "/usr/bin/perl") else {
+            throw XCTSkip("Perl and the workspace sandbox are required")
+        }
+        let ws = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let program = """
+        use strict;
+        use warnings;
+        use POSIX qw(setsid);
+        my $first = fork();
+        die "first fork failed" unless defined $first;
+        if ($first > 0) { waitpid($first, 0); exit 0; }
+        setsid() or die "setsid failed";
+        my $second = fork();
+        die "second fork failed" unless defined $second;
+        if ($second > 0) { select(undef, undef, undef, 0.20); exit 0; }
+        open(my $handle, '>', 'daemon.pid') or die "pid file failed";
+        print $handle $$;
+        close($handle);
+        sleep 30;
+        """
+        try Data(program.utf8).write(to: ws.appendingPathComponent("daemon.pl"))
+        let task = Task {
+            try await StructuredProcessShellRunner(
+                timeoutSeconds: 30,
+                terminationGraceSeconds: 0.1).run("/usr/bin/perl daemon.pl; /bin/sleep 30", cwd: ws)
+        }
+        let pidFile = ws.appendingPathComponent("daemon.pid")
+        let createdDeadline = Date().addingTimeInterval(3)
+        while FileManager.default.fileExists(atPath: pidFile.path) == false, Date() < createdDeadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        let daemonPID = try XCTUnwrap(Int32((try? String(contentsOf: pidFile)) ?? ""))
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("cancelled managed process unexpectedly completed")
+        } catch is CancellationError {
+            // expected
+        }
+        let deadline = Date().addingTimeInterval(1)
+        while Darwin.kill(daemonPID, 0) == 0, Date() < deadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertEqual(Darwin.kill(daemonPID, 0), -1, "double-forked descendant survived cancellation")
+    }
+    #endif
+
+    func testProcessShellRunnerAllowsWorkspaceReadWrite() async throws {
+        guard ProcessShellRunner.supportsWorkspaceSandbox else {
+            throw XCTSkip("workspace shell sandbox backend is unavailable")
+        }
+        let ws = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+
+        let result = try await ProcessShellRunner(timeoutSeconds: 5).run(
+            "printf 'inside-marker' > result.txt; /bin/cat result.txt",
+            cwd: ws)
+
+        XCTAssertEqual(result.exitCode, 0, result.stderr)
+        XCTAssertEqual(result.stdout, "inside-marker")
+        XCTAssertEqual(try String(contentsOf: ws.appendingPathComponent("result.txt")), "inside-marker")
+    }
+
+    func testProcessShellRunnerDeniesWorkspaceExternalFile() async throws {
+        guard ProcessShellRunner.supportsWorkspaceSandbox else {
+            throw XCTSkip("workspace shell sandbox backend is unavailable")
+        }
+        let ws = try tempWorkspace()
+        let outside = ws.deletingLastPathComponent()
+            .appendingPathComponent("intatis-outside-\(UUID().uuidString).txt")
+        defer {
+            try? FileManager.default.removeItem(at: ws)
+            try? FileManager.default.removeItem(at: outside)
+        }
+        try Data("outside-secret-marker".utf8).write(to: outside)
+
+        let result = try await ProcessShellRunner(timeoutSeconds: 5).run(
+            "/bin/cat '\(outside.path)'",
+            cwd: ws)
+
+        XCTAssertNotEqual(result.exitCode, 0)
+        XCTAssertFalse(result.stdout.contains("outside-secret-marker"), result.stdout)
+        XCTAssertFalse(result.stderr.contains("outside-secret-marker"), result.stderr)
+
+        let symlink = ws.appendingPathComponent("outside-link")
+        try FileManager.default.createSymbolicLink(at: symlink, withDestinationURL: outside)
+        let symlinkResult = try await ProcessShellRunner(timeoutSeconds: 5).run(
+            "/bin/cat outside-link",
+            cwd: ws)
+        XCTAssertNotEqual(symlinkResult.exitCode, 0)
+        XCTAssertFalse(symlinkResult.stdout.contains("outside-secret-marker"), symlinkResult.stdout)
+
+        let escapedWrite = ws.deletingLastPathComponent()
+            .appendingPathComponent("intatis-escaped-write-\(UUID().uuidString).txt")
+        defer { try? FileManager.default.removeItem(at: escapedWrite) }
+        let writeResult = try await ProcessShellRunner(timeoutSeconds: 5).run(
+            "printf escaped > '\(escapedWrite.path)'",
+            cwd: ws)
+        XCTAssertNotEqual(writeResult.exitCode, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: escapedWrite.path))
+    }
+
+    #if canImport(Darwin)
+    func testProcessShellRunnerDeniesNetworkByDefault() async throws {
+        guard ProcessShellRunner.supportsWorkspaceSandbox else {
+            throw XCTSkip("workspace shell sandbox backend is unavailable")
+        }
+        guard python3Executable() != nil,
+              FileManager.default.isExecutableFile(atPath: "/usr/bin/nc") else {
+            throw XCTSkip("python3 and nc are required for the network confinement smoke")
+        }
+        let ws = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let site = ws.appendingPathComponent("site", isDirectory: true)
+        try FileManager.default.createDirectory(at: site, withIntermediateDirectories: true)
+        try Data("ok".utf8).write(to: site.appendingPathComponent("probe.txt"))
+        let port = try freeLoopbackPort()
+        let server = try startStaticHTTPServer(directory: site, port: port)
+        defer {
+            if server.isRunning { server.terminate() }
+        }
+        try await waitForHTTPServer(port: port, path: "/probe.txt")
+
+        let result = try await ProcessShellRunner(timeoutSeconds: 5).run(
+            "/usr/bin/nc -z -w 1 127.0.0.1 \(port)",
+            cwd: ws)
+
+        XCTAssertNotEqual(result.exitCode, 0, "sandboxed raw shell unexpectedly reached loopback")
+    }
+    #endif
+
+    func testProcessShellRunnerCancellationKillsProcessGroupPromptly() async throws {
+        guard ProcessShellRunner.supportsWorkspaceSandbox else {
+            throw XCTSkip("workspace shell sandbox backend is unavailable")
+        }
+        let ws = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let runner = ProcessShellRunner(timeoutSeconds: 30, terminationGraceSeconds: 0.1)
+        let task = Task {
+            try await runner.run(
+                "/bin/sleep 30 & child=$!; printf '%s' \"$child\" > child.pid; wait",
+                cwd: ws)
+        }
+        let pidFile = ws.appendingPathComponent("child.pid")
+        let pidDeadline = Date().addingTimeInterval(2)
+        while !FileManager.default.fileExists(atPath: pidFile.path), Date() < pidDeadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: pidFile.path))
+        let childPID = Int32((try? String(contentsOf: pidFile)) ?? "")
+
+        let cancelledAt = Date()
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("cancelled raw shell unexpectedly completed")
+        } catch is CancellationError {
+            // expected
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(cancelledAt), 2.5)
+
+        #if canImport(Darwin)
+        if let childPID {
+            let deadline = Date().addingTimeInterval(1)
+            while Darwin.kill(childPID, 0) == 0, Date() < deadline {
+                try await Task.sleep(nanoseconds: 20_000_000)
+            }
+            XCTAssertEqual(Darwin.kill(childPID, 0), -1, "child process survived cancellation")
+        }
+        #endif
+    }
+
+    func testProcessShellRunnerTimeoutIsBounded() async throws {
+        guard ProcessShellRunner.supportsWorkspaceSandbox else {
+            throw XCTSkip("workspace shell sandbox backend is unavailable")
+        }
+        let ws = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let started = Date()
+
+        do {
+            _ = try await ProcessShellRunner(
+                timeoutSeconds: 0.2,
+                terminationGraceSeconds: 0.1).run("/bin/sleep 30", cwd: ws)
+            XCTFail("timed out raw shell unexpectedly completed")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("timed out"), "\(error)")
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(started), 2.5)
+    }
+
+    func testProcessShellRunnerLargeStdoutAndStderrDoNotDeadlock() async throws {
+        guard ProcessShellRunner.supportsWorkspaceSandbox else {
+            throw XCTSkip("workspace shell sandbox backend is unavailable")
+        }
+        let ws = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let command = """
+        i=0
+        while [ "$i" -lt 12000 ]; do
+          printf 'stdout-0123456789012345678901234567890123456789\\n'
+          printf 'stderr-0123456789012345678901234567890123456789\\n' >&2
+          i=$((i + 1))
+        done
+        """
+
+        let result = try await ProcessShellRunner(timeoutSeconds: 10).run(command, cwd: ws)
+
+        XCTAssertEqual(result.exitCode, 0, String(result.stderr.suffix(500)))
+        XCTAssertGreaterThan(result.stdout.utf8.count, 500_000)
+        XCTAssertGreaterThan(result.stderr.utf8.count, 500_000)
+        XCTAssertTrue(result.stdout.contains("stdout-0123456789"))
+        XCTAssertTrue(result.stderr.contains("stderr-0123456789"))
+    }
+
     func testWebFetchLocalHTTPAndTruncation() async throws {
         #if canImport(Darwin)
         guard python3Executable() != nil else {
@@ -457,6 +909,433 @@ final class IntatisToolsTests: XCTestCase {
         XCTAssertTrue(status.text.contains("a.swift"))
         let diff = try await GitDiffTool().execute(ToolArgs(raw: "{}"), in: ctx)
         XCTAssertEqual(diff.text, "diffbody")
+        let staged = try await GitStagedDiffTool().execute(ToolArgs(raw: "{}"), in: ctx)
+        XCTAssertEqual(staged.text, "staged-diff")
+        let info = try await GitInfoTool().execute(ToolArgs(raw: "{}"), in: ctx)
+        XCTAssertTrue(info.text.contains("branch: main"))
+        let commits = try await GitRecentCommitsTool().execute(ToolArgs(raw: #"{"limit":3}"#), in: ctx)
+        XCTAssertTrue(commits.text.contains("limit=3"))
+        let baseDiff = try await GitDiffBaseTool().execute(ToolArgs(raw: #"{"base":"main"}"#), in: ctx)
+        XCTAssertEqual(baseDiff.text, "diff against main")
+        let branch = try await GitBranchTool().execute(ToolArgs(raw: "{}"), in: ctx)
+        XCTAssertTrue(branch.text.contains("current: main"))
+        let create = try await GitCreateBranchTool().execute(ToolArgs(raw: #"{"name":"feature/git-control","startPoint":"HEAD"}"#), in: ctx)
+        XCTAssertTrue(create.text.contains("feature/git-control"))
+        let stage = try await GitStageTool().execute(ToolArgs(raw: #"{"paths":["a.swift","sub/b.txt"]}"#), in: ctx)
+        XCTAssertEqual(stage.changedFiles, ["a.swift", "sub/b.txt"])
+        XCTAssertTrue(stage.text.contains("staged a.swift,sub/b.txt"))
+        let unstage = try await GitUnstageTool().execute(ToolArgs(raw: #"{"paths":["a.swift"]}"#), in: ctx)
+        XCTAssertEqual(unstage.changedFiles, ["a.swift"])
+        let commit = try await GitCommitTool().execute(ToolArgs(raw: #"{"message":"Add git controls"}"#), in: ctx)
+        XCTAssertTrue(commit.text.contains("Add git controls"))
+        let patch = """
+        diff --git a/a.swift b/a.swift
+        --- a/a.swift
+        +++ b/a.swift
+        @@ -1 +1 @@
+        -old
+        +new
+        """
+        let checkArgs = ToolArgs(raw: try jsonString(["diff": patch, "reverse": true]))
+        let check = try await GitApplyPatchCheckTool().execute(checkArgs, in: ctx)
+        XCTAssertTrue(check.text.contains("check=true"))
+        let apply = try await GitApplyPatchTool().execute(ToolArgs(raw: try jsonString(["diff": patch])), in: ctx)
+        XCTAssertEqual(apply.changedFiles, ["a.swift"])
+        XCTAssertEqual(apply.diff, patch)
+        let stagePatch = try await GitStagePatchTool().execute(ToolArgs(raw: try jsonString(["diff": patch])), in: ctx)
+        XCTAssertEqual(stagePatch.changedFiles, ["a.swift"])
+        XCTAssertNil(stagePatch.diff)
+        let unstagePatch = try await GitUnstagePatchTool().execute(ToolArgs(raw: try jsonString(["diff": patch])), in: ctx)
+        XCTAssertEqual(unstagePatch.changedFiles, ["a.swift"])
+        let revertPatch = try await GitRevertPatchTool().execute(
+            ToolArgs(raw: try jsonString(["diff": patch, "confirmRevert": true])),
+            in: ctx)
+        XCTAssertEqual(revertPatch.changedFiles, ["a.swift"])
+        XCTAssertEqual(revertPatch.diff, patch)
+        let worktrees = try await GitWorktreeListTool().execute(ToolArgs(raw: "{}"), in: ctx)
+        XCTAssertTrue(worktrees.text.contains("worktree"))
+        let createdWorktree = try await GitWorktreeCreateTool().execute(
+            ToolArgs(raw: #"{"name":"task-1","startPoint":"HEAD"}"#),
+            in: ctx)
+        XCTAssertTrue(createdWorktree.text.contains("task-1"))
+        let removedWorktree = try await GitWorktreeRemoveTool().execute(
+            ToolArgs(raw: #"{"name":"task-1","confirmName":"task-1","force":true}"#),
+            in: ctx)
+        XCTAssertTrue(removedWorktree.text.contains("force=true"))
+        let remotes = try await GitRemotesTool().execute(ToolArgs(raw: "{}"), in: ctx)
+        XCTAssertTrue(remotes.text.contains("origin"))
+        let fetched = try await GitFetchTool().execute(
+            ToolArgs(raw: #"{"remote":"origin","branch":"main","prune":true}"#),
+            in: ctx)
+        XCTAssertTrue(fetched.text.contains("prune=true"))
+        let pulled = try await GitPullFastForwardTool().execute(
+            ToolArgs(raw: #"{"remote":"origin","branch":"main","confirmRemote":"origin","confirmBranch":"main"}"#),
+            in: ctx)
+        XCTAssertTrue(pulled.text.contains("--ff-only"))
+        let pushed = try await GitPushTool().execute(
+            ToolArgs(raw: #"{"remote":"origin","branch":"main","confirmRemote":"origin","confirmBranch":"main","setUpstream":true}"#),
+            in: ctx)
+        XCTAssertTrue(pushed.text.contains("setUpstream=true"))
+        let switched = try await GitSwitchBranchTool().execute(
+            ToolArgs(raw: #"{"branch":"feature/git-control","confirmBranch":"feature/git-control"}"#),
+            in: ctx)
+        XCTAssertTrue(switched.text.contains("feature/git-control"))
+    }
+
+    func testGitStageRejectsEscapingPathBeforeBackend() async throws {
+        let ws = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let ctx = ToolContext(workspaceRoot: ws,
+                              shell: FakeShell(result: ShellResult(stdout: "", stderr: "", exitCode: 0)),
+                              git: FakeGit(statusText: "", diffText: ""))
+
+        do {
+            _ = try await GitStageTool().execute(ToolArgs(raw: #"{"paths":["../outside.txt"]}"#), in: ctx)
+            XCTFail("escaping git stage path should be rejected")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("path escapes workspace"), "\(error)")
+        }
+    }
+
+    func testGitCreateBranchRejectsUnsafeBranchName() async throws {
+        let ws = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let ctx = ToolContext(workspaceRoot: ws,
+                              shell: FakeShell(result: ShellResult(stdout: "", stderr: "", exitCode: 0)),
+                              git: FakeGit(statusText: "", diffText: ""))
+
+        do {
+            _ = try await GitCreateBranchTool().execute(ToolArgs(raw: #"{"name":"bad..branch"}"#), in: ctx)
+            XCTFail("unsafe branch name should be rejected")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("branch name"), "\(error)")
+        }
+    }
+
+    func testGitPatchRejectsEscapingPathBeforeBackend() async throws {
+        let ws = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let ctx = ToolContext(workspaceRoot: ws,
+                              shell: FakeShell(result: ShellResult(stdout: "", stderr: "", exitCode: 0)),
+                              git: FakeGit(statusText: "", diffText: ""))
+        let patch = """
+        diff --git a/../outside.txt b/../outside.txt
+        --- a/../outside.txt
+        +++ b/../outside.txt
+        @@ -1 +1 @@
+        -old
+        +new
+        """
+
+        do {
+            _ = try await GitApplyPatchTool().execute(ToolArgs(raw: try jsonString(["diff": patch])), in: ctx)
+            XCTFail("escaping git patch path should be rejected")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("path escapes workspace"), "\(error)")
+        }
+    }
+
+    func testGitPatchPermissionPathsHandleQuotedDiffGitHeaders() throws {
+        let patch = """
+        diff --git "a/hello world.txt" "b/hello world.txt"
+        new file mode 100644
+        """
+
+        let paths = GitApplyPatchTool().touchedPaths(ToolArgs(raw: try jsonString(["diff": patch])))
+        XCTAssertEqual(paths, ["hello world.txt"])
+    }
+
+    func testGitRevertPatchRequiresExplicitConfirmation() async throws {
+        let ws = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let ctx = ToolContext(workspaceRoot: ws,
+                              shell: FakeShell(result: ShellResult(stdout: "", stderr: "", exitCode: 0)),
+                              git: FakeGit(statusText: "", diffText: ""))
+        let patch = """
+        diff --git a/a.swift b/a.swift
+        --- a/a.swift
+        +++ b/a.swift
+        @@ -1 +1 @@
+        -old
+        +new
+        """
+
+        do {
+            _ = try await GitRevertPatchTool().execute(
+                ToolArgs(raw: try jsonString(["diff": patch, "confirmRevert": false])),
+                in: ctx)
+            XCTFail("git_revert_patch should require confirmation")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("confirmRevert"), "\(error)")
+        }
+    }
+
+    func testGitWorktreeToolsRejectUnsafeNameAndMismatchedConfirmation() async throws {
+        let ws = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let ctx = ToolContext(workspaceRoot: ws,
+                              shell: FakeShell(result: ShellResult(stdout: "", stderr: "", exitCode: 0)),
+                              git: FakeGit(statusText: "", diffText: ""))
+
+        do {
+            _ = try await GitWorktreeCreateTool().execute(ToolArgs(raw: #"{"name":"../bad"}"#), in: ctx)
+            XCTFail("unsafe worktree name should be rejected")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("worktree name"), "\(error)")
+        }
+
+        do {
+            _ = try await GitWorktreeRemoveTool().execute(
+                ToolArgs(raw: #"{"name":"task-1","confirmName":"task-2"}"#),
+                in: ctx)
+            XCTFail("worktree removal should require exact confirmation")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("confirmName"), "\(error)")
+        }
+    }
+
+    func testGitRemoteToolsRejectUnsafeRemoteAndMismatchedConfirmation() async throws {
+        let ws = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let ctx = ToolContext(workspaceRoot: ws,
+                              shell: FakeShell(result: ShellResult(stdout: "", stderr: "", exitCode: 0)),
+                              git: FakeGit(statusText: "", diffText: ""))
+
+        do {
+            _ = try await GitFetchTool().execute(ToolArgs(raw: #"{"remote":"https://github.com/example/repo.git"}"#), in: ctx)
+            XCTFail("git_fetch should reject URL remotes")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("remote"), "\(error)")
+        }
+
+        do {
+            _ = try await GitPushTool().execute(
+                ToolArgs(raw: #"{"remote":"origin","branch":"main","confirmRemote":"upstream","confirmBranch":"main"}"#),
+                in: ctx)
+            XCTFail("git_push should require exact remote confirmation")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("confirmation"), "\(error)")
+        }
+
+        do {
+            _ = try await GitSwitchBranchTool().execute(
+                ToolArgs(raw: #"{"branch":"main","confirmBranch":"feature"}"#),
+                in: ctx)
+            XCTFail("git_switch should require exact branch confirmation")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("confirmBranch"), "\(error)")
+        }
+    }
+
+    func testGitCommitRejectsStagedSensitivePath() async throws {
+        let ws = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let ctx = ToolContext(workspaceRoot: ws,
+                              shell: FakeShell(result: ShellResult(stdout: "", stderr: "", exitCode: 0)),
+                              git: FakeGit(statusText: "A  .env\n", diffText: ""))
+
+        do {
+            _ = try await GitCommitTool().execute(ToolArgs(raw: #"{"message":"Commit secret"}"#), in: ctx)
+            XCTFail("commit should reject staged sensitive paths")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("staged sensitive path"), "\(error)")
+        }
+    }
+
+    #if canImport(Darwin)
+    func testProcessGitServiceRejectsExternalDiffWithoutExecutingIt() async throws {
+        guard ProcessShellRunner.supportsWorkspaceSandbox, let git = gitExecutable() else {
+            throw XCTSkip("git and the workspace sandbox are required")
+        }
+        let ws = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let setupLease = WorkspaceLease(rootPath: ws.path, access: .readWrite, deniedPatterns: [])
+        let shell = StructuredProcessShellRunner(timeoutSeconds: 10, workspaceLease: setupLease)
+        let initialized = try await shell.run(
+            "'\(git)' init; '\(git)' config diff.external ./external-diff.sh",
+            cwd: ws)
+        XCTAssertEqual(initialized.exitCode, 0, initialized.stderr)
+        let script = ws.appendingPathComponent("external-diff.sh")
+        try Data("#!/bin/sh\nprintf executed > external-diff-ran\nexit 0\n".utf8).write(to: script)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+
+        do {
+            _ = try await ProcessGitService(workspaceLease: setupLease).diff(workspace: ws)
+            XCTFail("unsafe external diff config should be rejected")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("disabled executable hooks/filters"), "\(error)")
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: ws.appendingPathComponent("external-diff-ran").path))
+
+        let outsideConfig = ws.deletingLastPathComponent().appendingPathComponent("intatis-included-\(UUID().uuidString).gitconfig")
+        defer { try? FileManager.default.removeItem(at: outsideConfig) }
+        try Data("[diff]\n\texternal = ./external-diff.sh\n".utf8).write(to: outsideConfig)
+        let includeSetup = try await shell.run(
+            "'\(git)' config --unset diff.external; '\(git)' config 'includeIf.gitdir:/**.path' '\(outsideConfig.path)'",
+            cwd: ws)
+        XCTAssertEqual(includeSetup.exitCode, 0, includeSetup.stderr)
+        do {
+            _ = try await ProcessGitService(workspaceLease: setupLease).status(workspace: ws)
+            XCTFail("includeIf config should be rejected before Git reads an external config")
+        } catch {
+            let rendered = String(describing: error)
+            XCTAssertTrue(rendered.lowercased().contains("includeif"), rendered)
+            XCTAssertFalse(rendered.contains(outsideConfig.path), rendered)
+        }
+    }
+
+    func testProcessGitServiceAuditsWorktreeConfigAndRejectsSymlink() async throws {
+        guard ProcessShellRunner.supportsWorkspaceSandbox, let git = gitExecutable() else {
+            throw XCTSkip("git and the workspace sandbox are required")
+        }
+        let ws = try tempWorkspace()
+        let outside = ws.deletingLastPathComponent().appendingPathComponent("intatis-config-worktree-\(UUID().uuidString)")
+        defer {
+            try? FileManager.default.removeItem(at: ws)
+            try? FileManager.default.removeItem(at: outside)
+        }
+        let lease = WorkspaceLease(rootPath: ws.path, access: .readWrite, deniedPatterns: [])
+        let shell = StructuredProcessShellRunner(timeoutSeconds: 10, workspaceLease: lease)
+        let setup = try await shell.run("'\(git)' init", cwd: ws)
+        XCTAssertEqual(setup.exitCode, 0, setup.stderr)
+        let worktreeConfig = ws.appendingPathComponent(".git/config.worktree")
+        try Data("[filter \"owned\"]\n\tprocess = ./untrusted-filter\n".utf8).write(to: worktreeConfig)
+        do {
+            _ = try await ProcessGitService(workspaceLease: lease).status(workspace: ws)
+            XCTFail("dangerous config.worktree should be rejected")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("filter.owned.process"), "\(error)")
+        }
+        try FileManager.default.removeItem(at: worktreeConfig)
+        try Data("[core]\n\tbare = false\n".utf8).write(to: outside)
+        try FileManager.default.createSymbolicLink(at: worktreeConfig, withDestinationURL: outside)
+        do {
+            _ = try await ProcessGitService(workspaceLease: lease).status(workspace: ws)
+            XCTFail("config.worktree symlink should be rejected")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("symlinks are not allowed"), "\(error)")
+        }
+    }
+
+    func testProcessGitServiceHonorsReadOnlyAndDeniedLeaseData() async throws {
+        guard ProcessShellRunner.supportsWorkspaceSandbox, let git = gitExecutable() else {
+            throw XCTSkip("git and the workspace sandbox are required")
+        }
+        let ws = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let setupLease = WorkspaceLease(rootPath: ws.path, access: .readWrite, deniedPatterns: [])
+        let shell = StructuredProcessShellRunner(timeoutSeconds: 10, workspaceLease: setupLease)
+        try Data("base\n".utf8).write(to: ws.appendingPathComponent("ordinary.txt"))
+        try Data("initial-secret\n".utf8).write(to: ws.appendingPathComponent(".env"))
+        let setup = try await shell.run(
+            "'\(git)' init; '\(git)' config user.email intatis@example.invalid; '\(git)' config user.name Intatis; '\(git)' add ordinary.txt .env; '\(git)' commit -m base",
+            cwd: ws)
+        XCTAssertEqual(setup.exitCode, 0, setup.stderr)
+
+        try Data("ordinary change\n".utf8).write(to: ws.appendingPathComponent("ordinary.txt"))
+        let readOnly = WorkspaceLease(rootPath: ws.path, access: .readOnly, deniedPatterns: [])
+        do {
+            _ = try await ProcessGitService(workspaceLease: readOnly).stage(paths: ["ordinary.txt"], workspace: ws)
+            XCTFail("read-only Git service unexpectedly wrote the index")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("failed") || String(describing: error).contains("denied"), "\(error)")
+        }
+
+        try Data("new-secret-marker\n".utf8).write(to: ws.appendingPathComponent(".env"))
+        let deniedLease = WorkspaceLease(rootPath: ws.path, access: .readOnly)
+        do {
+            let output = try await ProcessGitService(workspaceLease: deniedLease).diff(workspace: ws)
+            XCTAssertFalse(output.contains("new-secret-marker"), output)
+        } catch {
+            XCTAssertFalse(String(describing: error).contains("new-secret-marker"), "\(error)")
+        }
+    }
+    #endif
+
+    func testProcessGitServiceStagesAndCommitsTempRepoWhenGitAvailable() async throws {
+        #if canImport(Darwin)
+        guard ProcessInfo.processInfo.environment["INTATIS_REAL_GIT_SMOKE"] == "1" else {
+            throw XCTSkip("set INTATIS_REAL_GIT_SMOKE=1 to run the real ProcessGitService smoke")
+        }
+        guard gitExecutable() != nil else {
+            throw XCTSkip("git is required for the ProcessGitService smoke")
+        }
+        let ws = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let shell = StructuredProcessShellRunner()
+        _ = try await shell.run("git init", cwd: ws)
+        _ = try await shell.run("git config user.email intatis@example.invalid", cwd: ws)
+        _ = try await shell.run("git config user.name 'Intatis Test'", cwd: ws)
+        try Data("hello\n".utf8).write(to: ws.appendingPathComponent("hello.txt"))
+
+        let git = ProcessGitService()
+        let status = try await git.status(workspace: ws)
+        XCTAssertTrue(status.contains("?? hello.txt"), status)
+        _ = try await git.stage(paths: ["hello.txt"], workspace: ws)
+        let staged = try await git.stagedDiff(workspace: ws)
+        XCTAssertTrue(staged.contains("+hello"), staged)
+        let commitOutput = try await git.commit(message: "Add hello", workspace: ws)
+        XCTAssertTrue(commitOutput.contains("Add hello") || commitOutput.contains("files changed"), commitOutput)
+        let info = try await git.repositoryInfo(workspace: ws)
+        XCTAssertTrue(info.contains("branch:"), info)
+        let commits = try await git.recentCommits(limit: 1, workspace: ws)
+        XCTAssertTrue(commits.contains("Add hello"), commits)
+        let clean = try await GitStatusTool().execute(
+            ToolArgs(raw: "{}"),
+            in: ToolContext(workspaceRoot: ws, git: git))
+        XCTAssertEqual(clean.text, "clean")
+
+        let patchSource = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: patchSource) }
+        _ = try await shell.run("git init", cwd: patchSource)
+        _ = try await shell.run("git config user.email intatis@example.invalid", cwd: patchSource)
+        _ = try await shell.run("git config user.name 'Intatis Test'", cwd: patchSource)
+        try Data("hello\n".utf8).write(to: patchSource.appendingPathComponent("hello.txt"))
+        _ = try await shell.run("git add hello.txt", cwd: patchSource)
+        _ = try await shell.run("git commit -m base", cwd: patchSource)
+        try Data("hello\nfrom patch\n".utf8).write(to: patchSource.appendingPathComponent("hello.txt"))
+        let patch = try await git.diff(workspace: patchSource)
+        XCTAssertTrue(patch.contains("+from patch"), patch)
+        let patchCheck = try await git.applyPatch(diff: patch,
+                                                  reverse: false,
+                                                  checkOnly: true,
+                                                  cached: false,
+                                                  workspace: ws)
+        XCTAssertTrue(patchCheck.text.contains("patch applies cleanly"), patchCheck.text)
+        _ = try await git.applyPatch(diff: patch,
+                                     reverse: false,
+                                     checkOnly: false,
+                                     cached: false,
+                                     workspace: ws)
+        XCTAssertEqual(try String(contentsOf: ws.appendingPathComponent("hello.txt")), "hello\nfrom patch\n")
+        _ = try await git.applyPatch(diff: patch,
+                                     reverse: true,
+                                     checkOnly: false,
+                                     cached: false,
+                                     workspace: ws)
+        XCTAssertEqual(try String(contentsOf: ws.appendingPathComponent("hello.txt")), "hello\n")
+        let cleanAfterRevert = try await git.status(workspace: ws)
+        XCTAssertTrue(cleanAfterRevert.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, cleanAfterRevert)
+
+        let worktrees = try await git.worktrees(workspace: ws)
+        XCTAssertTrue(worktrees.contains(ws.path), worktrees)
+        let createWorktree = try await git.createWorktree(name: "task-1",
+                                                          startPoint: "HEAD",
+                                                          branch: nil,
+                                                          workspace: ws)
+        XCTAssertTrue(createWorktree.contains("task-1") || createWorktree.contains("HEAD"), createWorktree)
+        let worktreeURL = ws.appendingPathComponent(".intatis/git-worktrees/task-1", isDirectory: true)
+        var isDirectory: ObjCBool = false
+        XCTAssertTrue(FileManager.default.fileExists(atPath: worktreeURL.path, isDirectory: &isDirectory))
+        XCTAssertTrue(isDirectory.boolValue)
+        let worktreeInfo = try await git.repositoryInfo(workspace: worktreeURL)
+        XCTAssertTrue(worktreeInfo.contains("/.intatis/git-worktrees/task-1"), worktreeInfo)
+        let removeWorktree = try await git.removeWorktree(name: "task-1", force: false, workspace: ws)
+        XCTAssertTrue(removeWorktree.contains("task-1") || removeWorktree.contains("removed"), removeWorktree)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: worktreeURL.path))
+        #else
+        throw XCTSkip("ProcessGitService smoke requires Darwin")
+        #endif
     }
 
     // MARK: Document/media tools
@@ -507,6 +1386,66 @@ final class IntatisToolsTests: XCTestCase {
         XCTAssertEqual(obs.changedFiles, ["build/main.pdf"])
         XCTAssertTrue(obs.text.contains("compiled main.tex"))
     }
+
+    #if canImport(Darwin)
+    func testCompileLatexIgnoresWorkspaceRCAndDisablesShellEscape() async throws {
+        guard ProcessShellRunner.supportsWorkspaceSandbox,
+              FileManager.default.isExecutableFile(atPath: "/Library/TeX/texbin/latexmk"),
+              FileManager.default.isExecutableFile(atPath: "/Library/TeX/texbin/pdflatex") else {
+            throw XCTSkip("latexmk/pdflatex and the workspace sandbox are required")
+        }
+        let ws = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        try Data(#"system("printf rc > latexmkrc-ran");"#.utf8)
+            .write(to: ws.appendingPathComponent(".latexmkrc"))
+        let source = #"""
+        \documentclass{article}
+        \begin{document}
+        \immediate\write18{touch shell-escape-ran}
+        Hardened compile
+        \end{document}
+        """#
+        try Data(source.utf8).write(to: ws.appendingPathComponent("main.tex"))
+
+        let observation = try await CompileLaTeXTool().execute(
+            ToolArgs(raw: #"{"inputPath":"main.tex","outputDir":"build","engine":"latexmk"}"#),
+            in: ToolContext(workspaceRoot: ws))
+
+        XCTAssertEqual(observation.changedFiles, ["build/main.pdf"])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: ws.appendingPathComponent("latexmkrc-ran").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: ws.appendingPathComponent("shell-escape-ran").path))
+    }
+
+    func testCompileLatexCannotReadOutsideWorkspace() async throws {
+        guard ProcessShellRunner.supportsWorkspaceSandbox,
+              FileManager.default.isExecutableFile(atPath: "/Library/TeX/texbin/pdflatex") else {
+            throw XCTSkip("pdflatex and the workspace sandbox are required")
+        }
+        let ws = try tempWorkspace()
+        let outside = ws.deletingLastPathComponent().appendingPathComponent("intatis-tex-outside-\(UUID().uuidString).tex")
+        defer {
+            try? FileManager.default.removeItem(at: ws)
+            try? FileManager.default.removeItem(at: outside)
+        }
+        try Data("\\typeout{OUTSIDE-DATA-MARKER}\nOutside data\n".utf8).write(to: outside)
+        let source = """
+        \\documentclass{article}
+        \\begin{document}
+        \\input{\(outside.path)}
+        \\end{document}
+        """
+        try Data(source.utf8).write(to: ws.appendingPathComponent("main.tex"))
+
+        do {
+            _ = try await CompileLaTeXTool().execute(
+                ToolArgs(raw: #"{"inputPath":"main.tex","outputDir":"build","engine":"pdflatex"}"#),
+                in: ToolContext(workspaceRoot: ws))
+            XCTFail("TeX unexpectedly read an outside-workspace input")
+        } catch {
+            XCTAssertFalse(String(describing: error).contains("OUTSIDE-DATA-MARKER"), "\(error)")
+        }
+    }
+    #endif
 
     func testReconstructDocumentImageUsesInjectedShellAndReportsOutput() async throws {
         let ws = try tempWorkspace()
@@ -1894,6 +2833,72 @@ final class IntatisToolsTests: XCTestCase {
         XCTAssertTrue(obs.text.contains("/opt/homebrew/lib/node_modules/playwright"))
     }
 
+    func testBrowserNetworkActionsUseDedicatedNetworkStructuredRunner() async throws {
+        let ws = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let offline = FakeShell(result: ShellResult(stdout: "", stderr: "offline runner used", exitCode: 91))
+        let online = FakeShell(result: ShellResult(
+            stdout: #"{"action":"navigate","profile":"work","backend":"fake","url":"https://example.com","title":"Example","text":"network runner marker","links":[]}"#,
+            stderr: "",
+            exitCode: 0))
+        let ctx = ToolContext(
+            workspaceRoot: ws,
+            shell: offline,
+            structuredShell: offline,
+            networkStructuredShell: online,
+            git: FakeGit(statusText: "", diffText: ""))
+
+        let observation = try await BrowserNavigateTool().execute(
+            ToolArgs(raw: #"{"url":"https://example.com","profile":"work","waitMillis":0}"#),
+            in: ctx)
+
+        XCTAssertTrue(observation.text.contains("network runner marker"), observation.text)
+        XCTAssertFalse(observation.text.contains("offline runner used"), observation.text)
+    }
+
+    #if canImport(Darwin)
+    func testBrowserDiagnosticsIgnoresWorkspacePlaywrightModule() async throws {
+        guard ProcessShellRunner.supportsWorkspaceSandbox else {
+            throw XCTSkip("workspace shell sandbox backend is unavailable")
+        }
+        guard FileManager.default.isExecutableFile(atPath: "/opt/homebrew/bin/node")
+                || FileManager.default.isExecutableFile(atPath: "/usr/local/bin/node")
+                || FileManager.default.isExecutableFile(atPath: "/usr/bin/node") else {
+            throw XCTSkip("Node.js is required for the browser module confinement smoke")
+        }
+        let ws = try tempWorkspace()
+        let outside = ws.deletingLastPathComponent().appendingPathComponent("intatis-node-outside-\(UUID().uuidString).txt")
+        defer {
+            try? FileManager.default.removeItem(at: ws)
+            try? FileManager.default.removeItem(at: outside)
+            unsetenv("INTATIS_NODE_HOST_MARKER")
+        }
+        try Data("outside-node-marker".utf8).write(to: outside)
+        setenv("INTATIS_NODE_HOST_MARKER", "host-node-marker", 1)
+        let module = ws.appendingPathComponent("node_modules/playwright", isDirectory: true)
+        try FileManager.default.createDirectory(at: module, withIntermediateDirectories: true)
+        let maliciousModule = """
+        const fs = require('fs');
+        let outside = 'unreadable';
+        try { outside = fs.readFileSync('\(outside.path)', 'utf8'); } catch (_) {}
+        fs.writeFileSync('workspace-playwright-loaded', `${process.env.INTATIS_NODE_HOST_MARKER || ''}|${outside}`);
+        module.exports = { chromium: {} };
+        """
+        try Data(maliciousModule.utf8)
+            .write(to: module.appendingPathComponent("index.js"))
+        try Data(#"{"name":"playwright","main":"index.js"}"#.utf8)
+            .write(to: module.appendingPathComponent("package.json"))
+
+        let observation = try await BrowserDiagnosticsTool().execute(
+            ToolArgs(raw: #"{"profile":"work","channel":"chromium"}"#),
+            in: ToolContext(workspaceRoot: ws))
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: ws.appendingPathComponent("workspace-playwright-loaded").path))
+        XCTAssertFalse(observation.text.contains(ws.appendingPathComponent("node_modules").path), observation.text)
+        XCTAssertTrue(observation.text.contains("/opt/homebrew/lib/node_modules/playwright"), observation.text)
+    }
+    #endif
+
     func testBrowserProfilesListsMetadataWithoutReadingProfileDatabaseContents() async throws {
         let ws = try tempWorkspace()
         defer { try? FileManager.default.removeItem(at: ws) }
@@ -2173,9 +3178,34 @@ final class IntatisToolsTests: XCTestCase {
 
     func testStandardRegistry() {
         let reg = ToolRegistry.standard()
-        XCTAssertEqual(reg.descriptors().count, 36)
+        XCTAssertEqual(reg.descriptors().count, 57)
         XCTAssertNotNil(reg.tool(named: "read_file"))
         XCTAssertNotNil(reg.tool(named: "apply_patch"))
+        XCTAssertNil(reg.tool(named: "run_shell"))
+        XCTAssertNotNil(reg.tool(named: "git_status"))
+        XCTAssertNotNil(reg.tool(named: "git_diff"))
+        XCTAssertNotNil(reg.tool(named: "git_diff_staged"))
+        XCTAssertNotNil(reg.tool(named: "git_info"))
+        XCTAssertNotNil(reg.tool(named: "git_recent_commits"))
+        XCTAssertNotNil(reg.tool(named: "git_diff_base"))
+        XCTAssertNotNil(reg.tool(named: "git_branch"))
+        XCTAssertNotNil(reg.tool(named: "git_create_branch"))
+        XCTAssertNotNil(reg.tool(named: "git_stage"))
+        XCTAssertNotNil(reg.tool(named: "git_unstage"))
+        XCTAssertNotNil(reg.tool(named: "git_commit"))
+        XCTAssertNotNil(reg.tool(named: "git_apply_patch_check"))
+        XCTAssertNotNil(reg.tool(named: "git_apply_patch"))
+        XCTAssertNotNil(reg.tool(named: "git_stage_patch"))
+        XCTAssertNotNil(reg.tool(named: "git_unstage_patch"))
+        XCTAssertNotNil(reg.tool(named: "git_revert_patch"))
+        XCTAssertNotNil(reg.tool(named: "git_worktree_list"))
+        XCTAssertNotNil(reg.tool(named: "git_worktree_create"))
+        XCTAssertNotNil(reg.tool(named: "git_worktree_remove"))
+        XCTAssertNotNil(reg.tool(named: "git_remotes"))
+        XCTAssertNotNil(reg.tool(named: "git_fetch"))
+        XCTAssertNotNil(reg.tool(named: "git_pull_ff"))
+        XCTAssertNotNil(reg.tool(named: "git_push"))
+        XCTAssertNotNil(reg.tool(named: "git_switch"))
         XCTAssertNotNil(reg.tool(named: "read_pdf"))
         XCTAssertNotNil(reg.tool(named: "edit_pdf_pages"))
         XCTAssertNotNil(reg.tool(named: "reconstruct_document_image"))
@@ -2208,6 +3238,23 @@ final class IntatisToolsTests: XCTestCase {
         XCTAssertEqual(ReadFileTool.descriptor.sideEffect, .readOnly)
         XCTAssertEqual(WriteFileTool.descriptor.sideEffect, .write)
         XCTAssertEqual(RunShellTool.descriptor.sideEffect, .exec)
+        XCTAssertEqual(GitStageTool.descriptor.sideEffect, .write)
+        XCTAssertEqual(GitCommitTool.descriptor.sideEffect, .write)
+        XCTAssertEqual(GitApplyPatchCheckTool.descriptor.sideEffect, .readOnly)
+        XCTAssertEqual(GitApplyPatchTool.descriptor.sideEffect, .write)
+        XCTAssertEqual(GitStagePatchTool.descriptor.sideEffect, .write)
+        XCTAssertEqual(GitUnstagePatchTool.descriptor.sideEffect, .write)
+        XCTAssertEqual(GitRevertPatchTool.descriptor.sideEffect, .destructive)
+        XCTAssertEqual(GitWorktreeCreateTool.descriptor.sideEffect, .write)
+        XCTAssertEqual(GitWorktreeRemoveTool.descriptor.sideEffect, .destructive)
+        XCTAssertEqual(GitRemotesTool.descriptor.sideEffect, .readOnly)
+        XCTAssertEqual(GitFetchTool.descriptor.sideEffect, .write)
+        XCTAssertTrue(GitFetchTool().risksNetwork(ToolArgs(raw: "{}")))
+        XCTAssertEqual(GitPullFastForwardTool.descriptor.sideEffect, .write)
+        XCTAssertTrue(GitPullFastForwardTool().risksNetwork(ToolArgs(raw: "{}")))
+        XCTAssertEqual(GitPushTool.descriptor.sideEffect, .destructive)
+        XCTAssertTrue(GitPushTool().risksNetwork(ToolArgs(raw: "{}")))
+        XCTAssertEqual(GitSwitchBranchTool.descriptor.sideEffect, .destructive)
         XCTAssertEqual(GenerateImageTool.descriptor.sideEffect, .write)
         XCTAssertEqual(WebFetchTool.descriptor.sideEffect, .network)
         XCTAssertEqual(BrowserNavigateTool.descriptor.sideEffect, .exec)

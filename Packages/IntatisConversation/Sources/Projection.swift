@@ -88,14 +88,16 @@ public struct ConversationProjection: Equatable, Sendable {
                                             text: "📎 \(p.kind) artifact" + (p.prompt.map { ": \($0)" } ?? ""),
                                             isComplete: true))
 
-        case .toolCall, .toolResult, .permissionRequest, .permissionResolved, .patchProposed, .agentStatus,
+        case .toolCall, .toolResult, .toolExecutionPrepared, .toolExecutionSettled,
+             .permissionRequest, .permissionResolved, .patchProposed, .agentStatus,
              .agentAttached, .agentAttachRequested, .agentDetached, .agentSpawnRequested, .agentSpawned,
-             .agentMessage, .agentToAgentMessage, .permissionReview,
+             .agentMessage, .agentMessageConsumed, .agentToAgentMessage, .permissionReview,
+             .permissionReviewRequested, .permissionReviewSettled,
              .informationRequested, .informationReplied,
              .delegationRequested, .delegationApproved, .delegationRejected, .taskDelegated,
-             .workspaceLeaseRequested, .workspaceLeaseGranted, .workspaceLeaseDenied,
+             .workspaceLeaseRequested, .workspaceLeaseGranted, .workspaceLeaseDenied, .workspaceLeaseRevoked,
              .capabilityLeaseCreated, .capabilityLeaseRevoked,
-             .taskCreated, .taskAssigned, .taskQueued, .taskStarted, .taskCompleted, .taskFailed, .taskRejected,
+             .taskCreated, .taskAssigned, .taskQueued, .taskStarted, .taskCompleted, .taskFailed, .taskCancelled, .taskRejected,
              .artifactProgress, .turnStats:
             break   // tool/permission/agent/task/progress/stats events are not shown in the chat text view
         }

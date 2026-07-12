@@ -33,6 +33,11 @@ public struct DeterministicPolicyGate: Sendable {
 
         // 3. Network: never silently; denied in read-only.
         if call.risksNetwork {
+            if call.sideEffect == .destructive {
+                return ctx.profile == .readOnly
+                    ? .deny(reason: "network not allowed in read_only", risk: .high)
+                    : .ask(reason: "destructive network operation requested", risk: .high)
+            }
             return ctx.profile == .readOnly
                 ? .deny(reason: "network not allowed in read_only", risk: .medium)
                 : .ask(reason: "network access requested", risk: .medium)
@@ -97,10 +102,8 @@ public struct DeterministicPolicyGate: Sendable {
             return .ask(reason: "modifies lockfile / CI / build config", risk: .high)
         }
         switch ctx.profile {
-        case .manual:
+        case .manual, .reviewed, .autopilot:
             return .ask(reason: "write to workspace", risk: .medium)
-        case .reviewed, .autopilot:
-            return .pass(reason: "write within workspace", risk: .low)
         case .readOnly, .locked:
             return .deny(reason: "writes not allowed", risk: .medium)
         }

@@ -631,7 +631,7 @@ struct IntatisSettingsPanel: View {
 
     private var openJSONButton: some View {
         Button(action: openJSONConfig) {
-            Label("Open JSON", systemImage: "curlybraces")
+            Label("Open Intatis Config", systemImage: "curlybraces")
                 .font(IntatisType.body(14, .semibold))
                 .foregroundStyle(IntatisTheme.deepText(scheme))
                 .padding(.horizontal, 14)
@@ -639,7 +639,7 @@ struct IntatisSettingsPanel: View {
                 .background(inputBackground)
         }
         .buttonStyle(.plain)
-        .help("Open provider JSON config")
+        .help("Open the Intatis provider config")
     }
 
     private func testProviderButton(layout: IntatisMacScreenLayout) -> some View {

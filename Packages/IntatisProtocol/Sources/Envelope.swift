@@ -49,6 +49,10 @@ public struct Envelope: Codable, Equatable, Sendable {
             event = .toolCall(try c.decode(ToolCallPayload.self, forKey: .payload))
         case .toolResult:
             event = .toolResult(try c.decode(ToolResultPayload.self, forKey: .payload))
+        case .toolExecutionPrepared:
+            event = .toolExecutionPrepared(try c.decode(ToolExecutionPreparedPayload.self, forKey: .payload))
+        case .toolExecutionSettled:
+            event = .toolExecutionSettled(try c.decode(ToolExecutionSettledPayload.self, forKey: .payload))
         case .permissionRequest:
             event = .permissionRequest(try c.decode(PermissionRequestPayload.self, forKey: .payload))
         case .permissionResolved:
@@ -69,6 +73,8 @@ public struct Envelope: Codable, Equatable, Sendable {
             event = .agentSpawned(try c.decode(AgentSpawnedPayload.self, forKey: .payload))
         case .agentMessage:
             event = .agentMessage(try c.decode(AgentMessagePayload.self, forKey: .payload))
+        case .agentMessageConsumed:
+            event = .agentMessageConsumed(try c.decode(AgentMessageConsumedPayload.self, forKey: .payload))
         case .agentToAgentMessage:
             event = .agentToAgentMessage(try c.decode(AgentToAgentMessagePayload.self, forKey: .payload))
         case .informationRequested:
@@ -89,12 +95,18 @@ public struct Envelope: Codable, Equatable, Sendable {
             event = .workspaceLeaseGranted(try c.decode(WorkspaceLeaseGrantedPayload.self, forKey: .payload))
         case .workspaceLeaseDenied:
             event = .workspaceLeaseDenied(try c.decode(WorkspaceLeaseDeniedPayload.self, forKey: .payload))
+        case .workspaceLeaseRevoked:
+            event = .workspaceLeaseRevoked(try c.decode(WorkspaceLeaseRevokedPayload.self, forKey: .payload))
         case .capabilityLeaseCreated:
             event = .capabilityLeaseCreated(try c.decode(CapabilityLeaseCreatedPayload.self, forKey: .payload))
         case .capabilityLeaseRevoked:
             event = .capabilityLeaseRevoked(try c.decode(CapabilityLeaseRevokedPayload.self, forKey: .payload))
         case .permissionReview:
             event = .permissionReview(try c.decode(PermissionReviewPayload.self, forKey: .payload))
+        case .permissionReviewRequested:
+            event = .permissionReviewRequested(try c.decode(PermissionReviewRequestedPayload.self, forKey: .payload))
+        case .permissionReviewSettled:
+            event = .permissionReviewSettled(try c.decode(PermissionReviewSettledPayload.self, forKey: .payload))
         case .taskCreated:
             event = .taskCreated(try c.decode(TaskCreatedPayload.self, forKey: .payload))
         case .taskAssigned:
@@ -107,6 +119,8 @@ public struct Envelope: Codable, Equatable, Sendable {
             event = .taskCompleted(try c.decode(TaskCompletedPayload.self, forKey: .payload))
         case .taskFailed:
             event = .taskFailed(try c.decode(TaskFailedPayload.self, forKey: .payload))
+        case .taskCancelled:
+            event = .taskCancelled(try c.decode(TaskCancelledPayload.self, forKey: .payload))
         case .taskRejected:
             event = .taskRejected(try c.decode(TaskRejectedPayload.self, forKey: .payload))
         case .artifactAdded:
@@ -132,6 +146,8 @@ public struct Envelope: Codable, Equatable, Sendable {
         case .error(let p):              try c.encode(p, forKey: .payload)
         case .toolCall(let p):           try c.encode(p, forKey: .payload)
         case .toolResult(let p):         try c.encode(p, forKey: .payload)
+        case .toolExecutionPrepared(let p): try c.encode(p, forKey: .payload)
+        case .toolExecutionSettled(let p): try c.encode(p, forKey: .payload)
         case .permissionRequest(let p):  try c.encode(p, forKey: .payload)
         case .permissionResolved(let p): try c.encode(p, forKey: .payload)
         case .patchProposed(let p):      try c.encode(p, forKey: .payload)
@@ -142,6 +158,7 @@ public struct Envelope: Codable, Equatable, Sendable {
         case .agentSpawnRequested(let p): try c.encode(p, forKey: .payload)
         case .agentSpawned(let p):        try c.encode(p, forKey: .payload)
         case .agentMessage(let p):        try c.encode(p, forKey: .payload)
+        case .agentMessageConsumed(let p): try c.encode(p, forKey: .payload)
         case .agentToAgentMessage(let p): try c.encode(p, forKey: .payload)
         case .informationRequested(let p): try c.encode(p, forKey: .payload)
         case .informationReplied(let p):   try c.encode(p, forKey: .payload)
@@ -152,15 +169,19 @@ public struct Envelope: Codable, Equatable, Sendable {
         case .workspaceLeaseRequested(let p): try c.encode(p, forKey: .payload)
         case .workspaceLeaseGranted(let p):   try c.encode(p, forKey: .payload)
         case .workspaceLeaseDenied(let p):    try c.encode(p, forKey: .payload)
+        case .workspaceLeaseRevoked(let p):   try c.encode(p, forKey: .payload)
         case .capabilityLeaseCreated(let p):  try c.encode(p, forKey: .payload)
         case .capabilityLeaseRevoked(let p):  try c.encode(p, forKey: .payload)
         case .permissionReview(let p):    try c.encode(p, forKey: .payload)
+        case .permissionReviewRequested(let p): try c.encode(p, forKey: .payload)
+        case .permissionReviewSettled(let p): try c.encode(p, forKey: .payload)
         case .taskCreated(let p):          try c.encode(p, forKey: .payload)
         case .taskAssigned(let p):         try c.encode(p, forKey: .payload)
         case .taskQueued(let p):           try c.encode(p, forKey: .payload)
         case .taskStarted(let p):          try c.encode(p, forKey: .payload)
         case .taskCompleted(let p):        try c.encode(p, forKey: .payload)
         case .taskFailed(let p):           try c.encode(p, forKey: .payload)
+        case .taskCancelled(let p):        try c.encode(p, forKey: .payload)
         case .taskRejected(let p):         try c.encode(p, forKey: .payload)
         case .artifactAdded(let p):       try c.encode(p, forKey: .payload)
         case .artifactProgress(let p):    try c.encode(p, forKey: .payload)

@@ -265,6 +265,26 @@ public struct InformationRepliedPayload: Codable, Equatable, Sendable {
     }
 }
 
+/// Durable acknowledgement that a mailbox item was projected into an agent
+/// invocation. The original message remains append-only; replay removes only
+/// its pending marker.
+public struct AgentMessageConsumedPayload: Codable, Equatable, Sendable {
+    public var messageID: MessageID
+    public var agent: AgentID
+    public var taskID: TaskID?
+    public var metadata: CoworkEventMetadata?
+
+    public init(messageID: MessageID,
+                agent: AgentID,
+                taskID: TaskID? = nil,
+                metadata: CoworkEventMetadata? = nil) {
+        self.messageID = messageID
+        self.agent = agent
+        self.taskID = taskID
+        self.metadata = metadata
+    }
+}
+
 public struct DelegationRequestedPayload: Codable, Equatable, Sendable {
     public var requestID: RequestID
     public var requester: AgentID
@@ -406,6 +426,23 @@ public struct WorkspaceLeaseDeniedPayload: Codable, Equatable, Sendable {
         self.workspaceID = workspaceID
         self.workspaceLeaseID = workspaceLeaseID
         self.rootPath = rootPath
+        self.reason = reason
+        self.metadata = metadata
+    }
+}
+
+public struct WorkspaceLeaseRevokedPayload: Codable, Equatable, Sendable {
+    public var agent: AgentID?
+    public var leaseID: WorkspaceLeaseID
+    public var reason: String
+    public var metadata: CoworkEventMetadata?
+
+    public init(agent: AgentID? = nil,
+                leaseID: WorkspaceLeaseID,
+                reason: String,
+                metadata: CoworkEventMetadata? = nil) {
+        self.agent = agent
+        self.leaseID = leaseID
         self.reason = reason
         self.metadata = metadata
     }

@@ -15,6 +15,9 @@ Intatis.xcodeproj/
 # macOS
 .DS_Store
 
+# Intatis local runtime/worktree state
+.intatis/
+
 # Secrets / local config (never commit)
 *.env
 .env

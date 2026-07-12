@@ -143,6 +143,18 @@ public struct TaskGraph: Codable, Sendable, Hashable {
     }
 
     @discardableResult
+    public mutating func replaceContract(_ contract: TaskContract) -> Bool {
+        guard var node = nodes[contract.id],
+              node.assignee == contract.assignee,
+              node.parentTaskID == contract.parentTaskID else {
+            return false
+        }
+        node.contract = contract
+        nodes[contract.id] = node
+        return true
+    }
+
+    @discardableResult
     public mutating func addRootTask(_ contract: TaskContract,
                                      createdAt: Date = Date()) -> Result<TaskGraphAdmission, TaskGraphViolation> {
         guard nodes[contract.id] == nil else {
@@ -151,6 +163,14 @@ public struct TaskGraph: Codable, Sendable, Hashable {
                 message: "task id already exists: \(contract.id.rawValue)",
                 taskID: contract.id,
                 existingTaskID: contract.id))
+        }
+        var activeAgents = Set(nodes.values.filter { Self.isActive($0.status) }.map(\.assignee))
+        activeAgents.insert(contract.assignee)
+        guard activeAgents.count <= policy.maxActiveAgentsPerThread else {
+            return .failure(TaskGraphViolation(
+                kind: .maxActiveAgentsExceeded,
+                message: "active agent count \(activeAgents.count) exceeds limit \(policy.maxActiveAgentsPerThread)",
+                taskID: contract.id))
         }
         let node = TaskNode(
             id: contract.id,
@@ -299,10 +319,17 @@ public struct TaskGraph: Codable, Sendable, Hashable {
         return result
     }
 
-    public mutating func updateStatus(taskID: TaskID, status: TaskStatus) {
-        guard var node = nodes[taskID] else { return }
+    @discardableResult
+    public mutating func updateStatus(taskID: TaskID,
+                                      status: TaskStatus,
+                                      isRetry: Bool = false) -> Bool {
+        guard var node = nodes[taskID],
+              node.status.canTransition(to: status, isRetry: isRetry) else {
+            return false
+        }
         node.status = status
         nodes[taskID] = node
+        return true
     }
 
     public func causalAgentChain(to taskID: TaskID) -> [AgentID] {

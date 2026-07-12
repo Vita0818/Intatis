@@ -1,5 +1,6 @@
 import Foundation
 import IntatisCore
+import IntatisProtocol
 import IntatisProviders
 import IntatisConversation
 import IntatisTools
@@ -11,7 +12,7 @@ enum REPLExit { case quit; case switchTo(Mode) }
 
 private enum S {
     static let reset = "\u{001B}[0m", bold = "\u{001B}[1m", dim = "\u{001B}[2m"
-    static let green = "\u{001B}[32m", cyan = "\u{001B}[36m"
+    static let green = "\u{001B}[32m", yellow = "\u{001B}[33m", cyan = "\u{001B}[36m"
 }
 
 private func banner(mode: Mode, model: String, host: String) {
@@ -40,6 +41,28 @@ func sessionLog() throws -> EventLog {
     let dir = FileManager.default.temporaryDirectory
         .appendingPathComponent("intatis-cli-\(UUID().uuidString)", isDirectory: true)
     return try EventLog(session: SessionID.new(), fileURL: dir.appendingPathComponent("events.jsonl"))
+}
+
+private func coworkSessionLog(workspace: URL) throws -> EventLog {
+    let canonicalPath = workspace.standardizedFileURL.path
+    var hash: UInt64 = 14_695_981_039_346_656_037
+    for byte in canonicalPath.utf8 {
+        hash ^= UInt64(byte)
+        hash = hash &* 1_099_511_628_211
+    }
+    let key = String(hash, radix: 16)
+    let support = try FileManager.default.url(
+        for: .applicationSupportDirectory,
+        in: .userDomainMask,
+        appropriateFor: nil,
+        create: true)
+    let directory = support
+        .appendingPathComponent("Intatis", isDirectory: true)
+        .appendingPathComponent("cli", isDirectory: true)
+        .appendingPathComponent("cowork_\(key)", isDirectory: true)
+    return try EventLog(
+        session: SessionID(rawValue: "cowork_cli_\(key)"),
+        fileURL: directory.appendingPathComponent("events.jsonl"))
 }
 
 /// Top-level mode driver: runs the current mode's REPL and relaunches when a
@@ -212,7 +235,7 @@ private let coworkHelp = """
   /agent add <name> <path> [model]   manually attach an agent (optional model)
   /agent remove <name>               detach an agent
   /agents                            list attached agents
-  /auto                              enable automatic permission review
+  /auto                              re-enable automatic permission review
   /default                           disable automatic permission review
   /model [name]                      default model for newly added agents
   /verbose [on|off]                  expand tool calls & terminal output
@@ -231,41 +254,94 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
     let registry = ProviderRegistry(config: config.providerConfig(), resolver: StaticSecretResolver(key: config.apiKey))
     var defaultModel = config.model
     var pending = PendingAttachments()
-    let log = try sessionLog()
+    let log = try coworkSessionLog(workspace: workspace)
     let spinner = TurnSpinner()
     let editor = LineEditor()
     let options = RenderOptions()
     let render = Task { await renderLoop(log, showAgentLabels: true, spinner: spinner, options: options) }
     defer { render.cancel(); spinner.stop() }
 
-    let orchestrator = Orchestrator(
+    let orchestrator = try Orchestrator.runtime(
         log: log, allowsShell: true, responder: TerminalResponder(),
         reasoningEffort: config.reasoningEffort, includeUsage: config.includeUsage,
         maxSteps: config.maxSteps,
         imageGeneratorFor: { _ in ProviderImageGenerationToolService(registry: registry) }
     ) { _ in try await registry.defaultAgentProvider() }
 
+    func finishCowork(_ exit: REPLExit) async -> REPLExit {
+        await orchestrator.cancelAll(reason: "CLI Cowork session ended")
+        return exit
+    }
+
+    let replayed = await log.replay()
+    let restoredProjection = CoworkProjection.build(from: replayed)
+    await orchestrator.restore(from: restoredProjection)
+
+    let autoReviewResult = await orchestrator.enableAutomaticPermissionReview(
+        model: ModelID(rawValue: defaultModel),
+        workspaceRoot: workspace)
+
     // A default agent so you can just talk; add more with /agent add.
-    let mainAttached = await orchestrator.attach(Agent(name: AgentID(rawValue: "main"), workspaceRoot: workspace,
-                                                       model: ModelID(rawValue: defaultModel), profile: .reviewed,
-                                                       coordinationDepth: Agent.defaultCoordinationDepth))
+    let mainAttached: Bool
+    if restoredProjection.agentRoster[Orchestrator.mainAgentID] != nil {
+        mainAttached = true
+    } else {
+        mainAttached = await orchestrator.attach(Agent(
+            name: Orchestrator.mainAgentID,
+            workspaceRoot: workspace,
+            model: ModelID(rawValue: defaultModel),
+            profile: .reviewed,
+            coordinationDepth: Agent.defaultCoordinationDepth))
+    }
+    await orchestrator.resumePendingTasks()
 
     banner(mode: .cowork, model: defaultModel, host: config.baseURL.host ?? config.baseURL.absoluteString)
+    switch autoReviewResult {
+    case .enabled(let id):
+        if case .some(.degraded(let reason)) = await orchestrator.automaticPermissionReviewHealth() {
+            out("\(S.yellow)automatic permission review is quarantined (@\(id.rawValue)): \(reason)\(S.reset)\n")
+        } else {
+            out("\(S.dim)automatic permission review is on (@\(id.rawValue), model \(defaultModel)); ambiguous requests still fall back to you.\(S.reset)\n")
+        }
+    case .alreadyEnabled(let id):
+        if case .some(.degraded(let reason)) = await orchestrator.automaticPermissionReviewHealth() {
+            out("\(S.yellow)automatic permission review is quarantined (@\(id.rawValue)): \(reason)\(S.reset)\n")
+        } else {
+            out("\(S.dim)automatic permission review already on (@\(id.rawValue)).\(S.reset)\n")
+        }
+    case .failed(let message):
+        out("\(S.dim)automatic permission review was not enabled: \(message). Permissions will ask you directly.\(S.reset)\n")
+    }
     if mainAttached {
         out("\(S.dim)@main is ready in \(workspace.lastPathComponent) — just describe the task; it can spawn its own helper agents. /agents to list · /help\(S.reset)\n")
     } else {
         out("\(S.dim)@main was not attached. Use /agent add <name> <path> after approving a workspace. /help\(S.reset)\n")
     }
 
+    var lastPermissionReviewHealth = await orchestrator.automaticPermissionReviewHealth()
     while true {
+        let currentPermissionReviewHealth = await orchestrator.automaticPermissionReviewHealth()
+        if currentPermissionReviewHealth != lastPermissionReviewHealth {
+            switch currentPermissionReviewHealth {
+            case .some(.degraded(let reason)):
+                out("\(S.yellow)automatic permission review is quarantined: \(reason)\(S.reset)\n")
+            case .some(.shuttingDown):
+                out("\(S.dim)automatic permission review is stopping; permissions require user approval.\(S.reset)\n")
+            case .some(.healthy):
+                out("\(S.dim)automatic permission review is healthy.\(S.reset)\n")
+            case .none:
+                out("\(S.dim)automatic permission review is off; permissions require user approval.\(S.reset)\n")
+            }
+            lastPermissionReviewHealth = currentPermissionReviewHealth
+        }
         if !pending.isEmpty {
             out("\(S.dim)  \(pending.count) attachment(s) queued for your next message\(S.reset)\n")
         }
         let line: String
         switch editor.readLine(prompt: prompt(.cowork)) {
-        case .eof: return .quit
-        case .shortcut(.exit): return .quit
-        case .shortcut(.cycleMode): return .switchTo(nextMode(.cowork))
+        case .eof: return await finishCowork(.quit)
+        case .shortcut(.exit): return await finishCowork(.quit)
+        case .shortcut(.cycleMode): return await finishCowork(.switchTo(nextMode(.cowork)))
         case .shortcut(.switchModel):
             if case .text(let m) = editor.readLine(prompt: "\(S.green)model ❯\(S.reset) ") {
                 let name = unbracket(m.trimmingCharacters(in: .whitespaces))
@@ -273,7 +349,13 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
             }
             continue
         case .shortcut(.settings):
-            try runSettings(); out("(settings saved — restart to apply)\n")
+            do {
+                try runSettings()
+            } catch {
+                await orchestrator.cancelAll(reason: "CLI Cowork session failed")
+                throw error
+            }
+            out("(settings saved — restart to apply)\n")
             continue
         case .text(let l): line = l
         }
@@ -287,9 +369,11 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
             case "help":
                 out(coworkHelp)
             case "exit", "quit":
-                return .quit
+                return await finishCowork(.quit)
             case "mode":
-                if parts.count > 1, let m = Mode(rawValue: parts[1].lowercased()) { return .switchTo(m) }
+                if parts.count > 1, let m = Mode(rawValue: parts[1].lowercased()) {
+                    return await finishCowork(.switchTo(m))
+                }
                 else { out("usage: /mode chat|code|cowork\n") }
             case "model":
                 if parts.count > 1 { defaultModel = parts[1]; out("default model for new agents → \(defaultModel)\n") }
@@ -309,17 +393,29 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
                     workspaceRoot: workspace)
                 switch result {
                 case .enabled(let id):
-                    out("automatic permission review → on (@\(id.rawValue), model \(defaultModel))\n")
+                    if case .some(.degraded(let reason)) = await orchestrator.automaticPermissionReviewHealth() {
+                        out("automatic permission review is quarantined (@\(id.rawValue)): \(reason)\n")
+                    } else {
+                        out("automatic permission review → on (@\(id.rawValue), model \(defaultModel))\n")
+                    }
                 case .alreadyEnabled(let id):
-                    out("automatic permission review already on (@\(id.rawValue))\n")
+                    if case .some(.degraded(let reason)) = await orchestrator.automaticPermissionReviewHealth() {
+                        out("automatic permission review is quarantined (@\(id.rawValue)): \(reason)\n")
+                    } else {
+                        out("automatic permission review already on (@\(id.rawValue))\n")
+                    }
                 case .failed(let message):
                     out("automatic permission review not enabled: \(message)\n")
                 }
             case "default":
-                let disabled = await orchestrator.disableAutomaticPermissionReview()
-                out(disabled
-                    ? "automatic permission review → off\n"
-                    : "automatic permission review already off\n")
+                switch await orchestrator.disableAutomaticPermissionReview() {
+                case .disabled:
+                    out("automatic permission review → off\n")
+                case .alreadyDisabled:
+                    out("automatic permission review already off\n")
+                case .failed(let message):
+                    out("automatic permission review could not be disabled: \(message)\n")
+                }
             case "attach":
                 if parts.count < 2 || parts[1] == "list" {
                     out(pending.isEmpty ? "no attachments queued. usage: /attach <path>\n" : "\(pending.count) queued\n")
@@ -340,13 +436,15 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
                     let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardizedFileURL
                     let attached = await orchestrator.attach(Agent(name: AgentID(rawValue: name), workspaceRoot: url,
                                                                    model: ModelID(rawValue: model), profile: .reviewed,
-                                                                   coordinationDepth: Agent.defaultCoordinationDepth))
+                                                                   coordinationDepth: 0))
                     out(attached
                         ? "attached @\(name) · \(model) · \(url.path)\n"
                         : "not attached @\(name) · \(url.path)\n")
                 } else if parts.count >= 3, parts[1] == "remove" {
-                    await orchestrator.detach(AgentID(rawValue: parts[2]))
-                    out("removed @\(parts[2])\n")
+                    let removed = await orchestrator.detach(AgentID(rawValue: parts[2]))
+                    out(removed
+                        ? "removed @\(parts[2])\n"
+                        : "not removed @\(parts[2]) (reserved, missing, or busy)\n")
                 } else {
                     out("usage: /agent add <name> <path> [model]  |  /agent remove <name>\n")
                 }
@@ -365,11 +463,28 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
             target = AgentID(rawValue: bits.first ?? "")
             message = bits.count > 1 ? bits[1] : ""
         }
+        let parsedInput: ParsedUserInput
+        switch GoalInputParser.parse(message) {
+        case .success(let parsed):
+            parsedInput = parsed
+            message = parsed.text
+        case .failure(let error):
+            errOut(error.message + "\n")
+            continue
+        }
         for file in pending.textFiles { message += "\n\n[attached file: \(file.name)]\n\(file.content)" }
         let images = pending.images
         pending.clear()
         spinner.start()
-        await orchestrator.send(message, to: target, images: images)
+        _ = await orchestrator.send(
+            message,
+            to: target,
+            images: images,
+            userMessage: UserMessagePayload(
+                text: message,
+                to: target,
+                tags: parsedInput.tags.isEmpty ? nil : parsedInput.tags,
+                goal: parsedInput.goal))
         spinner.stop()
     }
 }

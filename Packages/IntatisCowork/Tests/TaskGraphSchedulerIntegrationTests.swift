@@ -116,7 +116,7 @@ final class TaskGraphSchedulerIntegrationTests: XCTestCase {
         XCTAssertEqual(recordStatus, .completed)
     }
 
-    func testMissingAssigneeExecutionMarksTaskFailed() async throws {
+    func testBusyAssigneeCannotBeDetachedBeforeQueuedTaskCompletes() async throws {
         let log = try graphSchedulerLog()
         let (orch, wsMain, wsWorker) = try await makeOrchestrator(log: log)
         defer {
@@ -125,17 +125,22 @@ final class TaskGraphSchedulerIntegrationTests: XCTestCase {
         }
         let queued = await orch.enqueueDelegatedTask(from: main, to: worker.rawValue, objective: "Will fail.")
         let taskID = try XCTUnwrap(queued.taskID)
-        await orch.detach(worker)
+        let detached = await orch.detach(worker)
 
         let ran = await orch.runNextScheduledTask()
 
+        XCTAssertFalse(detached)
         XCTAssertTrue(ran)
         let graphStatus = await orch.taskGraphNode(taskID)?.status
         let recordStatus = await orch.executionRecord(taskID: taskID)?.status
-        XCTAssertEqual(graphStatus, .failed)
-        XCTAssertEqual(recordStatus, .failed)
+        XCTAssertEqual(graphStatus, .completed)
+        XCTAssertEqual(recordStatus, .completed)
         let events = await log.replay()
-        XCTAssertTrue(events.contains { if case .taskFailed(let payload) = $0.event { return payload.taskID == taskID } else { return false } })
+        XCTAssertTrue(events.contains {
+            if case .error(let payload) = $0.event { return payload.code == "agent_busy" }
+            return false
+        })
+        XCTAssertFalse(events.contains { if case .agentDetached = $0.event { return true } else { return false } })
     }
 
     func testMainCanDelegateMacOSAndIOSSiblingsUnderSameRoot() async throws {

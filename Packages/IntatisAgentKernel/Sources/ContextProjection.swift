@@ -13,6 +13,7 @@ public struct LineageItem: Codable, Sendable, Hashable {
 public struct ContextEventSummary: Codable, Sendable, Hashable {
     public var seq: Int
     public var kind: String
+    public var messageID: MessageID?
     public var sender: AgentID?
     public var recipient: AgentID?
     public var agent: AgentID?
@@ -21,6 +22,7 @@ public struct ContextEventSummary: Codable, Sendable, Hashable {
 
     public init(seq: Int,
                 kind: String,
+                messageID: MessageID? = nil,
                 sender: AgentID? = nil,
                 recipient: AgentID? = nil,
                 agent: AgentID? = nil,
@@ -28,6 +30,7 @@ public struct ContextEventSummary: Codable, Sendable, Hashable {
                 content: String) {
         self.seq = seq
         self.kind = kind
+        self.messageID = messageID
         self.sender = sender
         self.recipient = recipient
         self.agent = agent
@@ -41,6 +44,7 @@ public struct ContextBundle: Codable, Sendable, Hashable {
     public var safetyPolicy: String
     public var taskContract: TaskContract?
     public var lineage: [LineageItem]
+    public var taskGroupEvents: [ContextEventSummary]
     public var directMessages: [ContextEventSummary]
     public var agentLocalEvents: [ContextEventSummary]
     public var explicitlySharedArtifacts: [ArtifactID]
@@ -51,6 +55,7 @@ public struct ContextBundle: Codable, Sendable, Hashable {
                 safetyPolicy: String,
                 taskContract: TaskContract? = nil,
                 lineage: [LineageItem] = [],
+                taskGroupEvents: [ContextEventSummary] = [],
                 directMessages: [ContextEventSummary] = [],
                 agentLocalEvents: [ContextEventSummary] = [],
                 explicitlySharedArtifacts: [ArtifactID] = [],
@@ -60,6 +65,7 @@ public struct ContextBundle: Codable, Sendable, Hashable {
         self.safetyPolicy = safetyPolicy
         self.taskContract = taskContract
         self.lineage = lineage
+        self.taskGroupEvents = taskGroupEvents
         self.directMessages = directMessages
         self.agentLocalEvents = agentLocalEvents
         self.explicitlySharedArtifacts = explicitlySharedArtifacts
@@ -68,173 +74,600 @@ public struct ContextBundle: Codable, Sendable, Hashable {
     }
 }
 
+/// Hard limits for the event-derived context placed in one model request.
+/// Counts and character budgets are enforced independently so a long-running
+/// Cowork session cannot grow a prompt without bound.
+public struct ContextProjectionBudget: Sendable, Hashable {
+    public var maxGlobalBriefCharacters: Int
+    public var maxLineageItems: Int
+    public var maxLineageCharacters: Int
+    public var maxTaskGroupEvents: Int
+    public var maxTaskGroupCharacters: Int
+    public var maxDirectMessages: Int
+    public var maxDirectMessageCharacters: Int
+    public var maxAgentLocalEvents: Int
+    public var maxAgentLocalCharacters: Int
+    public var maxArtifacts: Int
+    public var maxArtifactIDCharacters: Int
+    public var maxEventCharacters: Int
+
+    public init(maxGlobalBriefCharacters: Int = 600,
+                maxLineageItems: Int = 8,
+                maxLineageCharacters: Int = 1_600,
+                maxTaskGroupEvents: Int = 12,
+                maxTaskGroupCharacters: Int = 2_400,
+                maxDirectMessages: Int = 8,
+                maxDirectMessageCharacters: Int = 3_200,
+                maxAgentLocalEvents: Int = 12,
+                maxAgentLocalCharacters: Int = 4_000,
+                maxArtifacts: Int = 8,
+                maxArtifactIDCharacters: Int = 800,
+                maxEventCharacters: Int = 600) {
+        self.maxGlobalBriefCharacters = max(0, maxGlobalBriefCharacters)
+        self.maxLineageItems = max(0, maxLineageItems)
+        self.maxLineageCharacters = max(0, maxLineageCharacters)
+        self.maxTaskGroupEvents = max(0, maxTaskGroupEvents)
+        self.maxTaskGroupCharacters = max(0, maxTaskGroupCharacters)
+        self.maxDirectMessages = max(0, maxDirectMessages)
+        self.maxDirectMessageCharacters = max(0, maxDirectMessageCharacters)
+        self.maxAgentLocalEvents = max(0, maxAgentLocalEvents)
+        self.maxAgentLocalCharacters = max(0, maxAgentLocalCharacters)
+        self.maxArtifacts = max(0, maxArtifacts)
+        self.maxArtifactIDCharacters = max(0, maxArtifactIDCharacters)
+        self.maxEventCharacters = max(0, maxEventCharacters)
+    }
+
+    public static let `default` = ContextProjectionBudget()
+}
+
 public struct ContextProjector: Sendable {
-    public init() {}
+    private let budget: ContextProjectionBudget
+
+    public init(budget: ContextProjectionBudget = .default) {
+        self.budget = budget
+    }
 
     public func project(agentID: AgentID,
                         taskContract: TaskContract?,
                         events: [Envelope],
                         allowedToolNames: [String],
                         workspaceRoot: URL?) -> ContextBundle {
-        let globalBrief = Self.globalBrief(from: events)
-        let lineage = Self.lineage(for: agentID, taskContract: taskContract, globalBrief: globalBrief)
-        let directMessages = Self.directMessages(for: agentID, events: events)
-        let agentLocalEvents = Self.agentLocalEvents(for: agentID, events: events)
-        let artifacts = Self.sharedArtifacts(from: events)
+        let globalBrief = Self.globalBrief(
+            for: agentID,
+            taskContract: taskContract,
+            events: events,
+            maxCharacters: budget.maxGlobalBriefCharacters)
+        let lineage = Self.boundedLineage(
+            Self.lineage(for: agentID, taskContract: taskContract),
+            budget: budget)
+        let relevantTaskIDs = taskContract.map { Self.taskGroupTaskIDs(for: $0, events: events) } ?? []
+        let taskAnchor = taskContract.flatMap { Self.firstTaskEventSequence(for: $0.id, events: events) }
+        let taskGroupEvents = Self.taskGroupEvents(
+            taskContract: taskContract,
+            events: events,
+            budget: budget)
+        let duplicateTexts = Self.duplicateContextTexts(taskContract: taskContract, globalBrief: globalBrief)
+        let directMessages = Self.directMessages(
+            for: agentID,
+            taskContract: taskContract,
+            relevantTaskIDs: relevantTaskIDs,
+            taskAnchor: taskAnchor,
+            events: events,
+            duplicateTexts: duplicateTexts,
+            budget: budget)
+        let agentLocalEvents = Self.agentLocalEvents(
+            for: agentID,
+            taskContract: taskContract,
+            relevantTaskIDs: relevantTaskIDs,
+            taskAnchor: taskAnchor,
+            events: events,
+            duplicateTexts: duplicateTexts,
+            budget: budget)
         return ContextBundle(
             globalBrief: globalBrief,
             safetyPolicy: "Follow workspace confinement, permission policy, and the current task constraints.",
             taskContract: taskContract,
             lineage: lineage,
+            taskGroupEvents: taskGroupEvents,
             directMessages: directMessages,
             agentLocalEvents: agentLocalEvents,
-            explicitlySharedArtifacts: artifacts,
+            // `artifact_added` has no task, recipient, or visibility metadata.
+            // Until the event schema can prove an explicit share, fail closed.
+            explicitlySharedArtifacts: [],
             workspaceBrief: workspaceRoot.map { "Workspace root: \($0.path)" },
             allowedToolNames: allowedToolNames.sorted())
     }
 
-    private static func globalBrief(from events: [Envelope]) -> String {
-        for envelope in events {
-            if case .userMessage(let payload) = envelope.event {
-                let text = payload.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !text.isEmpty {
-                    return truncate(text, maxCharacters: 280)
+    private static func globalBrief(for agentID: AgentID,
+                                    taskContract: TaskContract?,
+                                    events: [Envelope],
+                                    maxCharacters: Int) -> String {
+        guard let taskContract else {
+            let latest = events.reversed().compactMap { envelope -> String? in
+                guard case .userMessage(let payload) = envelope.event,
+                      payload.to == nil || payload.to == agentID else {
+                    return nil
                 }
-            }
+                return validUserObjective(payload)
+            }.first
+            return truncate(
+                latest ?? "No global user objective was recorded before this turn.",
+                maxCharacters: maxCharacters)
         }
-        return "No global user objective was recorded before this task."
+
+        let contracts = taskContractsByID(from: events)
+        let rootContract = rootContract(for: taskContract, contracts: contracts)
+        let anchorSequence = firstTaskEventSequence(for: rootContract.id, events: events)
+            ?? firstTaskEventSequence(for: taskContract.id, events: events)
+            ?? Int.max
+        var intendedRecipients = Set([rootContract.assignee])
+        if let issuer = rootContract.issuer { intendedRecipients.insert(issuer) }
+        if let issuer = taskContract.issuer { intendedRecipients.insert(issuer) }
+
+        // `/goal` is explicit structured user intent. Prefer the latest such goal
+        // before the root task was created; never use a later unrelated turn.
+        let explicitGoal = events.reversed().compactMap { envelope -> String? in
+            guard envelope.seq <= anchorSequence,
+                  case .userMessage(let payload) = envelope.event,
+                  let goal = payload.goal?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !goal.isEmpty else {
+                return nil
+            }
+            if let recipient = payload.to, !intendedRecipients.contains(recipient) { return nil }
+            return goal
+        }.first
+
+        // An explicitly addressed non-/goal turn is also a reliable causal hint.
+        let addressedObjective = events.reversed().compactMap { envelope -> String? in
+            guard envelope.seq <= anchorSequence,
+                  case .userMessage(let payload) = envelope.event,
+                  let recipient = payload.to,
+                  intendedRecipients.contains(recipient) else {
+                return nil
+            }
+            return validUserObjective(payload)
+        }.first
+
+        let fallback = rootContract.objective.trimmingCharacters(in: .whitespacesAndNewlines)
+        let selected = explicitGoal ?? addressedObjective
+            ?? (fallback.isEmpty ? taskContract.objective : fallback)
+        return truncate(selected, maxCharacters: maxCharacters)
     }
 
     private static func lineage(for agentID: AgentID,
-                                taskContract: TaskContract?,
-                                globalBrief: String) -> [LineageItem] {
+                                taskContract: TaskContract?) -> [LineageItem] {
         guard let contract = taskContract else {
             return [
-                LineageItem(text: "Global objective brief: \(globalBrief)"),
                 LineageItem(text: "@\(agentID.rawValue) is handling the current user-directed turn."),
             ]
         }
 
         var items: [LineageItem] = [
-            LineageItem(text: "User objective brief: \(globalBrief)"),
             LineageItem(text: "\(contract.issuer.map { "@\($0.rawValue)" } ?? "The user") assigned task \(contract.id.rawValue) to @\(contract.assignee.rawValue)."),
-            LineageItem(text: "@\(contract.assignee.rawValue) is responsible only for: \(contract.objective)"),
-            LineageItem(text: "Task role hint: \(contract.roleHint)."),
-            LineageItem(text: "Expected deliverable: \(contract.expectedDeliverable)."),
         ]
 
+        if let parentTaskID = contract.parentTaskID {
+            items.append(LineageItem(text: "Parent task: \(parentTaskID.rawValue)."))
+        }
         if !contract.relatedAgents.isEmpty {
             let related = contract.relatedAgents.map { "@\($0.rawValue)" }.joined(separator: ", ")
             items.append(LineageItem(text: "Related agents in the task group: \(related)."))
         }
-        if let parentTaskID = contract.parentTaskID {
-            items.append(LineageItem(text: "Parent task: \(parentTaskID.rawValue)."))
-        }
         return items
     }
 
-    private static func directMessages(for agentID: AgentID, events: [Envelope]) -> [ContextEventSummary] {
-        events.compactMap { envelope in
+    private static func boundedLineage(_ items: [LineageItem],
+                                       budget: ContextProjectionBudget) -> [LineageItem] {
+        var remainingCharacters = budget.maxLineageCharacters
+        var selected: [LineageItem] = []
+        for item in items.prefix(budget.maxLineageItems) where remainingCharacters > 0 {
+            let text = truncate(
+                item.text,
+                maxCharacters: min(budget.maxEventCharacters, remainingCharacters))
+            guard !text.isEmpty else { continue }
+            selected.append(LineageItem(text: text))
+            remainingCharacters -= text.count
+        }
+        return selected
+    }
+
+    private static func taskGroupEvents(taskContract: TaskContract?,
+                                        events: [Envelope],
+                                        budget: ContextProjectionBudget) -> [ContextEventSummary] {
+        guard let contract = taskContract else { return [] }
+        let relevantTaskIDs = taskGroupTaskIDs(for: contract, events: events)
+
+        let candidates = events.compactMap { envelope in
+            switch envelope.event {
+            case .taskCreated(let payload) where relevantTaskIDs.contains(payload.contract.id):
+                return taskGroupSummary(
+                    envelope: envelope,
+                    kind: "task_created",
+                    status: .created,
+                    taskID: payload.contract.id,
+                    agent: payload.contract.assignee,
+                    relation: taskRelation(taskID: payload.contract.id, agent: payload.contract.assignee, current: contract))
+            case .taskAssigned(let payload) where relevantTaskIDs.contains(payload.contract.id):
+                return taskGroupSummary(
+                    envelope: envelope,
+                    kind: "task_assigned",
+                    status: .assigned,
+                    taskID: payload.contract.id,
+                    agent: payload.contract.assignee,
+                    relation: taskRelation(taskID: payload.contract.id, agent: payload.contract.assignee, current: contract))
+            case .taskQueued(let payload) where relevantTaskIDs.contains(payload.contract.id):
+                return taskGroupSummary(
+                    envelope: envelope,
+                    kind: "task_queued",
+                    status: .queued,
+                    taskID: payload.contract.id,
+                    agent: payload.contract.assignee,
+                    relation: taskRelation(taskID: payload.contract.id, agent: payload.contract.assignee, current: contract))
+            case .taskStarted(let payload) where relevantTaskIDs.contains(payload.taskID):
+                return taskGroupSummary(
+                    envelope: envelope,
+                    kind: "task_started",
+                    status: .running,
+                    taskID: payload.taskID,
+                    agent: payload.agent,
+                    relation: taskRelation(taskID: payload.taskID, agent: payload.agent, current: contract))
+            case .taskCompleted(let payload) where relevantTaskIDs.contains(payload.taskID):
+                return taskGroupSummary(
+                    envelope: envelope,
+                    kind: "task_completed",
+                    status: .completed,
+                    taskID: payload.taskID,
+                    agent: payload.agent,
+                    relation: taskRelation(taskID: payload.taskID, agent: payload.agent, current: contract))
+            case .taskFailed(let payload) where relevantTaskIDs.contains(payload.taskID):
+                return taskGroupSummary(
+                    envelope: envelope,
+                    kind: "task_failed",
+                    status: .failed,
+                    taskID: payload.taskID,
+                    agent: payload.agent,
+                    relation: taskRelation(taskID: payload.taskID, agent: payload.agent, current: contract))
+            case .taskCancelled(let payload) where relevantTaskIDs.contains(payload.taskID):
+                return taskGroupSummary(
+                    envelope: envelope,
+                    kind: "task_cancelled",
+                    status: .cancelled,
+                    taskID: payload.taskID,
+                    agent: payload.agent,
+                    relation: taskRelation(taskID: payload.taskID, agent: payload.agent, current: contract))
+            case .taskRejected(let payload):
+                guard let rejectedContract = payload.contract,
+                      relevantTaskIDs.contains(rejectedContract.id) else {
+                    return nil
+                }
+                let relation = taskRelation(
+                    taskID: rejectedContract.id,
+                    agent: rejectedContract.assignee,
+                    current: contract)
+                return ContextEventSummary(
+                    seq: envelope.seq,
+                    kind: "task_rejected",
+                    agent: rejectedContract.assignee,
+                    taskID: rejectedContract.id,
+                    content: "\(relation) task \(rejectedContract.id.rawValue) rejected for @\(rejectedContract.assignee.rawValue)\(payload.violationKind.map { " (\($0))" } ?? "").")
+            default:
+                return nil
+            }
+        }
+        var latestByTask: [TaskID: ContextEventSummary] = [:]
+        for candidate in candidates {
+            guard let taskID = candidate.taskID else { continue }
+            if latestByTask[taskID].map({ $0.seq < candidate.seq }) ?? true {
+                latestByTask[taskID] = candidate
+            }
+        }
+        let ranked = latestByTask.values.sorted { lhs, rhs in
+            let lhsPriority = taskGroupPriority(lhs.taskID, current: contract)
+            let rhsPriority = taskGroupPriority(rhs.taskID, current: contract)
+            if lhsPriority != rhsPriority { return lhsPriority < rhsPriority }
+            return lhs.seq > rhs.seq
+        }
+        return boundedSummaries(
+            ranked,
+            maxCount: budget.maxTaskGroupEvents,
+            maxCharacters: budget.maxTaskGroupCharacters,
+            maxEventCharacters: budget.maxEventCharacters)
+            .sorted { $0.seq < $1.seq }
+    }
+
+    private static func taskGroupPriority(_ taskID: TaskID?, current: TaskContract) -> Int {
+        guard let taskID else { return 4 }
+        if taskID == current.id { return 0 }
+        if taskID == current.parentTaskID { return 1 }
+        if current.relatedTasks.contains(taskID) { return 2 }
+        return 3
+    }
+
+    private static func taskGroupTaskIDs(for current: TaskContract, events: [Envelope]) -> Set<TaskID> {
+        var result = Set([current.id])
+        if let parentTaskID = current.parentTaskID {
+            result.insert(parentTaskID)
+        }
+        result.formUnion(current.relatedTasks)
+
+        for envelope in events {
+            guard let contract = taskContract(from: envelope.event),
+                  belongsToTaskGroup(contract, current: current) else {
+                continue
+            }
+            result.insert(contract.id)
+        }
+        return result
+    }
+
+    private static func taskContract(from event: Event) -> TaskContract? {
+        switch event {
+        case .taskCreated(let payload):
+            return payload.contract
+        case .taskAssigned(let payload):
+            return payload.contract
+        case .taskQueued(let payload):
+            return payload.contract
+        case .taskDelegated(let payload):
+            return payload.contract
+        case .delegationApproved(let payload):
+            return payload.contract
+        case .taskRejected(let payload):
+            return payload.contract
+        default:
+            return nil
+        }
+    }
+
+    private static func belongsToTaskGroup(_ contract: TaskContract, current: TaskContract) -> Bool {
+        if contract.id == current.id { return true }
+        if contract.id == current.parentTaskID { return true }
+        if current.relatedTasks.contains(contract.id) { return true }
+        if current.kind == .root, contract.parentTaskID == current.id { return true }
+        if let parentTaskID = current.parentTaskID {
+            return contract.parentTaskID == parentTaskID
+        }
+        return false
+    }
+
+    private static func taskGroupSummary(envelope: Envelope,
+                                         kind: String,
+                                         status: TaskStatus,
+                                         taskID: TaskID,
+                                         agent: AgentID,
+                                         relation: String) -> ContextEventSummary {
+        ContextEventSummary(
+            seq: envelope.seq,
+            kind: kind,
+            agent: agent,
+            taskID: taskID,
+            content: "\(relation) task \(taskID.rawValue) is \(status.rawValue) for @\(agent.rawValue).")
+    }
+
+    private static func taskRelation(taskID: TaskID, agent: AgentID, current: TaskContract) -> String {
+        if taskID == current.id { return "current" }
+        if taskID == current.parentTaskID { return "parent" }
+        if current.relatedTasks.contains(taskID) { return "related" }
+        if let parentTaskID = current.parentTaskID, taskID != parentTaskID { return "sibling" }
+        if current.kind == .root { return "child" }
+        if current.relatedAgents.contains(agent) { return "related" }
+        return "task-group"
+    }
+
+    private static func directMessages(for agentID: AgentID,
+                                       taskContract: TaskContract?,
+                                       relevantTaskIDs: Set<TaskID>,
+                                       taskAnchor: Int?,
+                                       events: [Envelope],
+                                       duplicateTexts: Set<String>,
+                                       budget: ContextProjectionBudget) -> [ContextEventSummary] {
+        let consumedAt = events.reduce(into: [MessageID: Int]()) { result, envelope in
+            guard case .agentMessageConsumed(let payload) = envelope.event,
+                  payload.agent == agentID else { return }
+            result[payload.messageID] = max(result[payload.messageID] ?? Int.min, envelope.seq)
+        }
+        let candidates = events.compactMap { envelope -> ContextEventSummary? in
             switch envelope.event {
             case .agentToAgentMessage(let payload) where payload.to == agentID:
+                guard isWithinTaskWindow(
+                    sequence: envelope.seq,
+                    taskID: nil,
+                    taskContract: taskContract,
+                    taskAnchor: taskAnchor) else {
+                    return nil
+                }
                 return ContextEventSummary(
                     seq: envelope.seq,
                     kind: "agent_to_agent_message",
                     sender: payload.from,
                     recipient: payload.to,
-                    content: truncate(payload.content, maxCharacters: 600))
+                    content: payload.content)
             case .agentMessage(let payload) where payload.to == agentID:
+                guard consumedAt[payload.messageId].map({ $0 > envelope.seq }) != true else { return nil }
+                guard isRelevant(payload.taskID, taskContract: taskContract, relevantTaskIDs: relevantTaskIDs) else {
+                    return nil
+                }
                 return ContextEventSummary(
                     seq: envelope.seq,
                     kind: payload.kind?.rawValue ?? "agent_message",
+                    messageID: payload.messageId,
                     sender: payload.from,
                     recipient: payload.to,
                     taskID: payload.taskID,
-                    content: truncate(payload.content, maxCharacters: 600))
+                    content: payload.content)
             case .informationRequested(let payload) where payload.to == agentID:
+                guard consumedAt[payload.requestID].map({ $0 > envelope.seq }) != true else { return nil }
+                guard isRelevant(payload.taskID, taskContract: taskContract, relevantTaskIDs: relevantTaskIDs) else {
+                    return nil
+                }
                 return ContextEventSummary(
                     seq: envelope.seq,
                     kind: "information_requested",
+                    messageID: payload.requestID,
                     sender: payload.from,
                     recipient: payload.to,
                     taskID: payload.taskID,
-                    content: truncate(payload.question, maxCharacters: 600))
+                    content: payload.question)
             case .informationReplied(let payload) where payload.to == agentID:
+                guard consumedAt[payload.replyID].map({ $0 > envelope.seq }) != true else { return nil }
+                guard isRelevant(payload.taskID, taskContract: taskContract, relevantTaskIDs: relevantTaskIDs) else {
+                    return nil
+                }
                 return ContextEventSummary(
                     seq: envelope.seq,
                     kind: "information_replied",
+                    messageID: payload.replyID,
                     sender: payload.from,
                     recipient: payload.to,
                     taskID: payload.taskID,
-                    content: truncate(payload.content, maxCharacters: 600))
+                    content: payload.content)
             default:
                 return nil
             }
         }
+        return boundedNewestUniqueSummaries(
+            candidates,
+            excludingNormalizedTexts: duplicateTexts,
+            maxCount: budget.maxDirectMessages,
+            maxCharacters: budget.maxDirectMessageCharacters,
+            maxEventCharacters: budget.maxEventCharacters)
     }
 
-    private static func agentLocalEvents(for agentID: AgentID, events: [Envelope]) -> [ContextEventSummary] {
-        events.compactMap { envelope in
+    private static func agentLocalEvents(for agentID: AgentID,
+                                         taskContract: TaskContract?,
+                                         relevantTaskIDs: Set<TaskID>,
+                                         taskAnchor: Int?,
+                                         events: [Envelope],
+                                         duplicateTexts: Set<String>,
+                                         budget: ContextProjectionBudget) -> [ContextEventSummary] {
+        let candidates = events.compactMap { envelope -> ContextEventSummary? in
             switch envelope.event {
             case .agentToAgentMessage(let payload) where payload.from == agentID:
+                guard isWithinTaskWindow(
+                    sequence: envelope.seq,
+                    taskID: nil,
+                    taskContract: taskContract,
+                    taskAnchor: taskAnchor) else {
+                    return nil
+                }
                 return ContextEventSummary(
                     seq: envelope.seq,
                     kind: "agent_to_agent_message_sent",
                     sender: payload.from,
                     recipient: payload.to,
-                    content: truncate(payload.content, maxCharacters: 600))
+                    content: payload.content)
             case .agentMessage(let payload) where payload.from == agentID:
+                guard isRelevant(payload.taskID, taskContract: taskContract, relevantTaskIDs: relevantTaskIDs) else {
+                    return nil
+                }
+                guard isWithinTaskWindow(
+                    sequence: envelope.seq,
+                    taskID: payload.taskID,
+                    taskContract: taskContract,
+                    taskAnchor: taskAnchor) else {
+                    return nil
+                }
                 return ContextEventSummary(
                     seq: envelope.seq,
                     kind: payload.kind?.rawValue ?? "agent_message_sent",
                     sender: payload.from,
                     recipient: payload.to,
                     taskID: payload.taskID,
-                    content: truncate(payload.content, maxCharacters: 600))
+                    content: payload.content)
             case .informationRequested(let payload) where payload.from == agentID:
+                guard isRelevant(payload.taskID, taskContract: taskContract, relevantTaskIDs: relevantTaskIDs) else {
+                    return nil
+                }
+                guard isWithinTaskWindow(
+                    sequence: envelope.seq,
+                    taskID: payload.taskID,
+                    taskContract: taskContract,
+                    taskAnchor: taskAnchor) else {
+                    return nil
+                }
                 return ContextEventSummary(
                     seq: envelope.seq,
                     kind: "information_requested_sent",
                     sender: payload.from,
                     recipient: payload.to,
                     taskID: payload.taskID,
-                    content: truncate(payload.question, maxCharacters: 600))
+                    content: payload.question)
             case .informationReplied(let payload) where payload.from == agentID:
+                guard isRelevant(payload.taskID, taskContract: taskContract, relevantTaskIDs: relevantTaskIDs) else {
+                    return nil
+                }
+                guard isWithinTaskWindow(
+                    sequence: envelope.seq,
+                    taskID: payload.taskID,
+                    taskContract: taskContract,
+                    taskAnchor: taskAnchor) else {
+                    return nil
+                }
                 return ContextEventSummary(
                     seq: envelope.seq,
                     kind: "information_replied_sent",
                     sender: payload.from,
                     recipient: payload.to,
                     taskID: payload.taskID,
-                    content: truncate(payload.content, maxCharacters: 600))
+                    content: payload.content)
             case .delegationRequested(let payload) where payload.requester == agentID:
+                guard isRelevant(payload.parentTaskID, taskContract: taskContract, relevantTaskIDs: relevantTaskIDs) else {
+                    return nil
+                }
+                guard isWithinTaskWindow(
+                    sequence: envelope.seq,
+                    taskID: payload.parentTaskID,
+                    taskContract: taskContract,
+                    taskAnchor: taskAnchor) else {
+                    return nil
+                }
                 return ContextEventSummary(
                     seq: envelope.seq,
                     kind: "delegation_requested",
                     sender: payload.requester,
                     recipient: payload.recipient,
                     taskID: payload.parentTaskID,
-                    content: "\(truncate(payload.objective, maxCharacters: 300)) — \(truncate(payload.reason, maxCharacters: 300))")
+                    content: "\(payload.objective) — \(payload.reason)")
             case .messageCompleted(let payload) where payload.agent == agentID:
+                guard isWithinTaskWindow(
+                    sequence: envelope.seq,
+                    taskID: nil,
+                    taskContract: taskContract,
+                    taskAnchor: taskAnchor) else {
+                    return nil
+                }
                 return ContextEventSummary(
                     seq: envelope.seq,
                     kind: "agent_message_completed",
                     agent: payload.agent,
-                    content: truncate(payload.text, maxCharacters: 600))
+                    content: payload.text)
             case .toolCall(let payload) where payload.agent == agentID:
+                guard isWithinTaskWindow(
+                    sequence: envelope.seq,
+                    taskID: nil,
+                    taskContract: taskContract,
+                    taskAnchor: taskAnchor) else {
+                    return nil
+                }
                 return ContextEventSummary(
                     seq: envelope.seq,
                     kind: "tool_call",
                     agent: payload.agent,
-                    content: "\(payload.name): \(truncate(payload.args, maxCharacters: 300))")
+                    content: "\(payload.name): \(payload.args)")
             case .taskAssigned(let payload) where payload.contract.assignee == agentID:
+                guard isRelevant(payload.contract.id, taskContract: taskContract, relevantTaskIDs: relevantTaskIDs) else {
+                    return nil
+                }
                 return ContextEventSummary(
                     seq: envelope.seq,
                     kind: "task_assigned",
                     agent: agentID,
                     taskID: payload.contract.id,
-                    content: truncate(payload.contract.objective, maxCharacters: 600))
+                    content: payload.contract.objective)
             case .taskStarted(let payload) where payload.agent == agentID:
+                guard isRelevant(payload.taskID, taskContract: taskContract, relevantTaskIDs: relevantTaskIDs) else {
+                    return nil
+                }
                 return ContextEventSummary(
                     seq: envelope.seq,
                     kind: "task_started",
@@ -242,37 +675,192 @@ public struct ContextProjector: Sendable {
                     taskID: payload.taskID,
                     content: "Task started.")
             case .taskCompleted(let payload) where payload.agent == agentID:
+                guard isRelevant(payload.taskID, taskContract: taskContract, relevantTaskIDs: relevantTaskIDs) else {
+                    return nil
+                }
                 return ContextEventSummary(
                     seq: envelope.seq,
                     kind: "task_completed",
                     agent: agentID,
                     taskID: payload.taskID,
-                    content: truncate(payload.report?.summary ?? payload.result, maxCharacters: 600))
+                    content: payload.report?.summary ?? payload.result)
             case .taskFailed(let payload) where payload.agent == agentID:
+                guard isRelevant(payload.taskID, taskContract: taskContract, relevantTaskIDs: relevantTaskIDs) else {
+                    return nil
+                }
                 return ContextEventSummary(
                     seq: envelope.seq,
                     kind: "task_failed",
                     agent: agentID,
                     taskID: payload.taskID,
-                    content: truncate(payload.report?.summary ?? payload.error, maxCharacters: 600))
+                    content: payload.report?.summary ?? payload.error)
+            case .taskCancelled(let payload) where payload.agent == agentID:
+                guard isRelevant(payload.taskID, taskContract: taskContract, relevantTaskIDs: relevantTaskIDs) else {
+                    return nil
+                }
+                return ContextEventSummary(
+                    seq: envelope.seq,
+                    kind: "task_cancelled",
+                    agent: agentID,
+                    taskID: payload.taskID,
+                    content: payload.report?.summary ?? payload.reason)
             default:
                 return nil
             }
         }
+        return boundedNewestUniqueSummaries(
+            candidates,
+            excludingNormalizedTexts: duplicateTexts,
+            maxCount: budget.maxAgentLocalEvents,
+            maxCharacters: budget.maxAgentLocalCharacters,
+            maxEventCharacters: budget.maxEventCharacters)
     }
 
-    private static func sharedArtifacts(from events: [Envelope]) -> [ArtifactID] {
-        events.compactMap { envelope in
-            if case .artifactAdded(let payload) = envelope.event {
-                return payload.artifactId
+    private static func validUserObjective(_ payload: UserMessagePayload) -> String? {
+        let goal = payload.goal?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let goal, !goal.isEmpty { return goal }
+        let text = payload.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return text.isEmpty ? nil : text
+    }
+
+    private static func taskContractsByID(from events: [Envelope]) -> [TaskID: TaskContract] {
+        var result: [TaskID: TaskContract] = [:]
+        for envelope in events {
+            if let contract = taskContract(from: envelope.event) {
+                result[contract.id] = contract
             }
-            return nil
         }
+        return result
+    }
+
+    private static func rootContract(for current: TaskContract,
+                                     contracts: [TaskID: TaskContract]) -> TaskContract {
+        var root = current
+        var visited = Set([current.id])
+        while let parentID = root.parentTaskID,
+              !visited.contains(parentID),
+              let parent = contracts[parentID] {
+            visited.insert(parentID)
+            root = parent
+        }
+        return root
+    }
+
+    private static func firstTaskEventSequence(for taskID: TaskID,
+                                               events: [Envelope]) -> Int? {
+        events.first { envelope in
+            switch envelope.event {
+            case .taskCreated(let payload): return payload.contract.id == taskID
+            case .taskAssigned(let payload): return payload.contract.id == taskID
+            case .taskQueued(let payload): return payload.contract.id == taskID
+            case .taskDelegated(let payload): return payload.contract.id == taskID
+            case .delegationApproved(let payload): return payload.contract.id == taskID
+            case .taskStarted(let payload): return payload.taskID == taskID
+            case .taskCompleted(let payload): return payload.taskID == taskID
+            case .taskFailed(let payload): return payload.taskID == taskID
+            case .taskCancelled(let payload): return payload.taskID == taskID
+            case .taskRejected(let payload): return payload.contract?.id == taskID
+            default: return false
+            }
+        }?.seq
+    }
+
+    private static func duplicateContextTexts(taskContract: TaskContract?,
+                                              globalBrief: String) -> Set<String> {
+        var values = Set([normalizedText(globalBrief)])
+        if let taskContract {
+            values.insert(normalizedText(taskContract.objective))
+            values.insert(normalizedText(taskContract.expectedDeliverable))
+        }
+        values.remove("")
+        return values
+    }
+
+    private static func isRelevant(_ taskID: TaskID?,
+                                   taskContract: TaskContract?,
+                                   relevantTaskIDs: Set<TaskID>) -> Bool {
+        guard taskContract != nil else { return true }
+        guard let taskID else { return true } // legacy message without task metadata
+        return relevantTaskIDs.contains(taskID)
+    }
+
+    /// Events written before task metadata existed have no task ID. Preserve
+    /// those events for compatibility, but only inside the current task's time
+    /// window so a later task assigned to the same agent does not inherit stale
+    /// private messages or local execution history.
+    private static func isWithinTaskWindow(sequence: Int,
+                                           taskID: TaskID?,
+                                           taskContract: TaskContract?,
+                                           taskAnchor: Int?) -> Bool {
+        guard taskContract != nil, taskID == nil, let taskAnchor else { return true }
+        return sequence >= taskAnchor
+    }
+
+    private static func boundedNewestUniqueSummaries(_ summaries: [ContextEventSummary],
+                                                     excludingNormalizedTexts excluded: Set<String>,
+                                                     maxCount: Int,
+                                                     maxCharacters: Int,
+                                                     maxEventCharacters: Int) -> [ContextEventSummary] {
+        var seenTexts = Set<String>()
+        var seenMessageIDs = Set<MessageID>()
+        let newestUnique = summaries.sorted { $0.seq > $1.seq }.filter { summary in
+            let normalized = normalizedText(summary.content)
+            guard !normalized.isEmpty else {
+                return false
+            }
+
+            // A typed mailbox item remains actionable until its message ID is
+            // consumed. Its text may intentionally repeat the task contract,
+            // global brief, or another pending message, so content-based
+            // deduplication must never make that ID disappear permanently.
+            if let messageID = summary.messageID {
+                return seenMessageIDs.insert(messageID).inserted
+            }
+
+            guard !excluded.contains(normalized),
+                  !seenTexts.contains(normalized) else {
+                return false
+            }
+            seenTexts.insert(normalized)
+            return true
+        }
+        return boundedSummaries(
+            newestUnique,
+            maxCount: maxCount,
+            maxCharacters: maxCharacters,
+            maxEventCharacters: maxEventCharacters)
+            .sorted { $0.seq < $1.seq }
+    }
+
+    private static func boundedSummaries(_ summaries: [ContextEventSummary],
+                                         maxCount: Int,
+                                         maxCharacters: Int,
+                                         maxEventCharacters: Int) -> [ContextEventSummary] {
+        var remainingCharacters = maxCharacters
+        var selected: [ContextEventSummary] = []
+        for var summary in summaries where selected.count < maxCount && remainingCharacters > 0 {
+            summary.content = truncate(
+                summary.content,
+                maxCharacters: min(maxEventCharacters, remainingCharacters))
+            guard !summary.content.isEmpty else { continue }
+            remainingCharacters -= summary.content.count
+            selected.append(summary)
+        }
+        return selected
+    }
+
+    private static func normalizedText(_ text: String) -> String {
+        text
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
     }
 
     private static func truncate(_ text: String, maxCharacters: Int) -> String {
+        guard maxCharacters > 0 else { return "" }
         guard text.count > maxCharacters else { return text }
-        let index = text.index(text.startIndex, offsetBy: maxCharacters)
-        return String(text[..<index]) + "..."
+        guard maxCharacters > 3 else { return String(text.prefix(maxCharacters)) }
+        return String(text.prefix(maxCharacters - 3)) + "..."
     }
 }

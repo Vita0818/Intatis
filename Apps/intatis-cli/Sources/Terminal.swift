@@ -114,7 +114,18 @@ func renderLoop(_ log: EventLog, showAgentLabels: Bool = false, spinner: TurnSpi
 /// Terminal approval for `ask_user` decisions (Code mode).
 struct TerminalResponder: PermissionResponder {
     func requestApproval(_ request: PermissionRequestPayload) async -> PermissionDecision {
-        out("\n  \(yellow)⚠ \(request.tool) (\(request.risk.rawValue)) — \(request.reason)\(reset)\n  approve? [y/N] ")
+        await TerminalPermissionPromptQueue.shared.requestApproval(request)
+    }
+}
+
+/// `readLine()` is process-global and cannot safely serve two permission
+/// continuations concurrently. The control-plane fallback is FIFO, and this
+/// queue also protects direct manual approvals after `/default`.
+private actor TerminalPermissionPromptQueue {
+    static let shared = TerminalPermissionPromptQueue()
+
+    func requestApproval(_ request: PermissionRequestPayload) -> PermissionDecision {
+        out("\n  \(yellow)⚠ [\(request.requestId.rawValue)] \(request.tool) (\(request.risk.rawValue)) — \(request.reason)\(reset)\n  approve this request? [y/N] ")
         guard let line = readLine() else { return .deny }
         let answer = line.trimmingCharacters(in: .whitespaces).lowercased()
         return (answer == "y" || answer == "yes") ? .allow : .deny

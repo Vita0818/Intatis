@@ -274,10 +274,16 @@ struct CoworkProjectSettingsSheet: View {
                 .pickerStyle(.menu)
                 .frame(maxWidth: 180, alignment: .leading)
             }
-            formRow("Token budget") {
-                TextField("Unlimited", text: $tokenBudgetText)
-                    .textFieldStyle(.roundedBorder)
-                    .frame(width: 150)
+            formRow("Soft token budget") {
+                VStack(alignment: .leading, spacing: 4) {
+                    TextField("Unlimited", text: $tokenBudgetText)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 150)
+                    Text("Reserved before each request; provider tokenization and output-limit support may vary.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
         }
         .padding(12)
@@ -396,7 +402,7 @@ struct CoworkProjectSettingsSheet: View {
         } else if let value = Int(trimmed), value > 0 {
             draft.tokenBudget = value
         } else {
-            settingsError = "Token budget must be empty or a positive integer."
+            settingsError = "Soft token budget must be empty or a positive integer."
             return
         }
         settingsError = nil

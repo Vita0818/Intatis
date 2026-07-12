@@ -59,6 +59,59 @@ final class IntatisProtocolTests: XCTestCase {
         XCTAssertNil(payload.goal)
     }
 
+    func testNewCoworkLifecycleEventsRoundTripThroughEnvelope() throws {
+        let session = SessionID(rawValue: "sess_cowork_lifecycle")
+        let agent = AgentID(rawValue: "worker")
+        let taskID = TaskID(rawValue: "task_1")
+        let messageID = MessageID(rawValue: "msg_1")
+        let metadata = CoworkEventMetadata(
+            taskID: taskID,
+            agentID: agent,
+            scope: .task,
+            visibility: .task,
+            createdAt: Date(timeIntervalSince1970: 1_700_000_000))
+        let cases: [(event: Event, wireType: String)] = [
+            (
+                .agentMessageConsumed(.init(
+                    messageID: messageID,
+                    agent: agent,
+                    taskID: taskID,
+                    metadata: metadata)),
+                "agent_message_consumed"
+            ),
+            (
+                .workspaceLeaseRevoked(.init(
+                    agent: agent,
+                    leaseID: WorkspaceLeaseID(rawValue: "wlease_1"),
+                    reason: "task completed",
+                    metadata: metadata)),
+                "workspace_lease_revoked"
+            ),
+            (
+                .taskCancelled(.init(
+                    taskID: taskID,
+                    agent: agent,
+                    reason: "cancelled by user",
+                    attempt: 2,
+                    metadata: metadata)),
+                "task_cancelled"
+            ),
+        ]
+
+        for (index, testCase) in cases.enumerated() {
+            let envelope = Envelope(
+                seq: index,
+                ts: Date(timeIntervalSince1970: 1_700_000_100 + Double(index)),
+                session: session,
+                event: testCase.event)
+            let data = try enc.encode(envelope)
+            let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+
+            XCTAssertEqual(json["type"] as? String, testCase.wireType)
+            XCTAssertEqual(try dec.decode(Envelope.self, from: data), envelope)
+        }
+    }
+
     func testCommandRoundTrip() throws {
         let cmds: [Command] = [
             .sessionCreate(.init(kind: .chat, title: "Hello")),

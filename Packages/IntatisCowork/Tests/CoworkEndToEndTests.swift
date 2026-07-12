@@ -154,9 +154,6 @@ final class CoworkEndToEndTests: XCTestCase {
             roleHint: "Swift count coordinator",
             expectedDeliverable: "Combined macOS and iOS Swift file count summary.")
         let rootTaskID = try XCTUnwrap(rootTaskIDOptional)
-        _ = await orch.sendMessage(from: main, to: macOS.rawValue,
-                                   content: "Report only the macOS count and path list.",
-                                   taskID: rootTaskID)
 
         let macOSObjective = "Recursively count Swift files in Apps/IntatisMac only. Do not count iOS files."
         let iOSObjective = "Recursively count Swift files in Apps/IntatisiOS only. Do not count macOS files."
@@ -179,7 +176,6 @@ final class CoworkEndToEndTests: XCTestCase {
 
         let queuedProjection = CoworkProjection.build(from: await log.replay())
         XCTAssertEqual(Set(queuedProjection.queuedTasks.map(\.id)), Set([macOSTaskID, iOSTaskID]))
-        XCTAssertTrue(queuedProjection.agentMessages.contains { $0.from == main && $0.to == macOS && $0.taskID == rootTaskID })
 
         let contractEvents = await log.replay()
         let macOSContract = try XCTUnwrap(taskContracts(contractEvents, assignee: macOS).last)
@@ -212,11 +208,15 @@ final class CoworkEndToEndTests: XCTestCase {
         assertWorkerToolSurface(macOSRequest)
         assertWorkerToolSurface(iOSRequest)
 
-        let macOSPrompt = try XCTUnwrap(macOSRequest.messages.first?.content)
-        XCTAssertTrue(macOSPrompt.contains("Current task:"))
-        XCTAssertTrue(macOSPrompt.contains("Your role in this task: macOS Swift file counter"))
+        let macOSSystemPrompt = try XCTUnwrap(macOSRequest.messages.first?.content)
+        let macOSPrompt = macOSRequest.messages.compactMap(\.content).joined(separator: "\n")
+        XCTAssertFalse(macOSSystemPrompt.contains(macOSObjective))
+        XCTAssertTrue(macOSPrompt.contains("Current task data:"))
+        XCTAssertTrue(macOSPrompt.contains("Your role in this task:"))
+        XCTAssertTrue(macOSPrompt.contains("macOS Swift file counter"))
         XCTAssertTrue(macOSPrompt.contains(macOSObjective))
-        XCTAssertTrue(macOSPrompt.contains("Expected deliverable: macOS Swift file count plus relative path list."))
+        XCTAssertTrue(macOSPrompt.contains("Expected deliverable:"))
+        XCTAssertTrue(macOSPrompt.contains("macOS Swift file count plus relative path list."))
         XCTAssertTrue(macOSPrompt.contains("@ios-counter"))
         XCTAssertTrue(macOSPrompt.contains("Do not re-run the global task decomposition."))
         XCTAssertTrue(macOSPrompt.contains("Do not create, remove, or coordinate other agents."))
@@ -226,15 +226,19 @@ final class CoworkEndToEndTests: XCTestCase {
         XCTAssertFalse(macOSPrompt.contains("spawn_agent"))
         XCTAssertFalse(macOSPrompt.contains("delegate_task"))
 
-        let iOSPrompt = try XCTUnwrap(iOSRequest.messages.first?.content)
-        XCTAssertTrue(iOSPrompt.contains("Your role in this task: iOS Swift file counter"))
+        let iOSSystemPrompt = try XCTUnwrap(iOSRequest.messages.first?.content)
+        let iOSPrompt = iOSRequest.messages.compactMap(\.content).joined(separator: "\n")
+        XCTAssertFalse(iOSSystemPrompt.contains(iOSObjective))
+        XCTAssertTrue(iOSPrompt.contains("Your role in this task:"))
+        XCTAssertTrue(iOSPrompt.contains("iOS Swift file counter"))
         XCTAssertTrue(iOSPrompt.contains(iOSObjective))
         XCTAssertTrue(iOSPrompt.contains("@macos-counter"))
         XCTAssertFalse(iOSPrompt.contains(fixture.macOSRoot.path))
         XCTAssertFalse(iOSPrompt.contains(macOSObjective))
 
         let macOSUserMessages = macOSRequest.messages.filter { $0.role == .user }.compactMap(\.content)
-        XCTAssertEqual(macOSUserMessages, [macOSObjective])
+        XCTAssertEqual(macOSUserMessages.last, macOSObjective)
+        XCTAssertTrue(macOSUserMessages.contains { $0.contains("<<<UNTRUSTED_CONTEXT_DATA>>>") })
         XCTAssertFalse(macOSUserMessages.contains { $0.contains(globalRequest) })
 
         let events = await log.replay()
@@ -358,17 +362,10 @@ final class CoworkEndToEndTests: XCTestCase {
 
         let events = await log.replay()
         XCTAssertTrue(events.contains {
-            if case .delegationRejected(let payload) = $0.event {
-                return payload.violationKind == TaskGraphViolation.Kind.selfDelegation.rawValue
-            }
+            if case .error(let payload) = $0.event { return payload.code == "agent_self_call" }
             return false
         })
-        XCTAssertTrue(events.contains {
-            if case .taskRejected(let payload) = $0.event {
-                return payload.violationKind == TaskGraphViolation.Kind.selfDelegation.rawValue
-            }
-            return false
-        })
+        XCTAssertFalse(events.contains { if case .taskCreated = $0.event { return true } else { return false } })
     }
 
     private func assertWorkerToolSurface(_ request: AgentRequest,

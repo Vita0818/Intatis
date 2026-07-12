@@ -32,6 +32,9 @@ public final class ConfigSecretResolver: SecretResolver, @unchecked Sendable {
         case .authFile:
             secret = try Self.readAuthFileSecret(providerID: ref.account)
         case .providerConfig:
+            guard Self.isAllowedProviderConfigPath(ref.service) else {
+                throw IntatisError.notFound("provider config is not an Intatis-owned or explicitly selected config")
+            }
             secret = try Self.readProviderConfigSecret(providerID: ref.account, path: ref.service)
         }
         cache(secret, for: ref)
@@ -80,6 +83,7 @@ public final class ConfigSecretResolver: SecretResolver, @unchecked Sendable {
                     && Self.authFileContainsSecret(providerID: ref.account, url: $0)
             }
         case .providerConfig:
+            guard Self.isAllowedProviderConfigPath(ref.service) else { return false }
             let url = URL(fileURLWithPath: expandedPath(ref.service))
             return FileManager.default.fileExists(atPath: url.path)
                 && Self.authFileContainsSecret(providerID: ref.account, url: url)
@@ -297,31 +301,37 @@ public final class ConfigSecretResolver: SecretResolver, @unchecked Sendable {
             return [URL(fileURLWithPath: expandedPath(override))]
         }
         let home = FileManager.default.homeDirectoryForCurrentUser
-        var urls: [URL] = []
-        if let configOverride = ProcessInfo.processInfo.environment["INTATIS_CONFIG"],
-           !configOverride.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            urls.append(URL(fileURLWithPath: expandedPath(configOverride)))
-        }
-        urls.append(contentsOf: [
+        var urls: [URL] = [
             writableAuthFileURL(),
             home.appendingPathComponent(".local/share/intatis/auth.json"),
-            home.appendingPathComponent(".local/share/opencode/auth.json"),
-            home.appendingPathComponent(".config/intatis/opencode.json"),
-            home.appendingPathComponent(".config/intatis/opencode.jsonc"),
+        ]
+        urls.append(contentsOf: providerConfigURLs())
+        return urls
+    }
+
+    private static func providerConfigURLs() -> [URL] {
+        if let configOverride = ProcessInfo.processInfo.environment["INTATIS_CONFIG"],
+           !configOverride.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return [URL(fileURLWithPath: expandedPath(configOverride))]
+        }
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        return [
             home.appendingPathComponent(".config/intatis/intatis.json"),
             home.appendingPathComponent(".config/intatis/intatis.jsonc"),
-            home.appendingPathComponent(".config/opencode/opencode.json"),
-            home.appendingPathComponent(".config/opencode/opencode.jsonc"),
             home.appendingPathComponent(".config/intatis/config.json"),
             home.appendingPathComponent(".config/intatis/config.jsonc"),
-            appSupportDir().appendingPathComponent("opencode.json"),
-            appSupportDir().appendingPathComponent("opencode.jsonc"),
             appSupportDir().appendingPathComponent("intatis.json"),
             appSupportDir().appendingPathComponent("intatis.jsonc"),
             appSupportDir().appendingPathComponent("config.json"),
             appSupportDir().appendingPathComponent("config.jsonc"),
-        ])
-        return urls
+        ]
+    }
+
+    private static func isAllowedProviderConfigPath(_ path: String) -> Bool {
+        let candidate = URL(fileURLWithPath: expandedPath(path)).standardizedFileURL.path
+        return providerConfigURLs().contains {
+            $0.standardizedFileURL.path == candidate
+        }
     }
 
     private static func authProviderID(from legacyAccount: String) -> String? {

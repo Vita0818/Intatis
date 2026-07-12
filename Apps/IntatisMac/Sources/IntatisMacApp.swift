@@ -450,32 +450,124 @@ struct CoworkSessionView: View {
     @Environment(\.colorScheme) private var scheme
 
     var body: some View {
-        CoworkShell(items: vm.items,
-                    agents: vm.agents,
-                    pending: vm.pendingPermission,
-                    permissionNotice: vm.permissionNotice,
-                    latestTurnStats: vm.latestTurnStats,
-                    summary: vm.summary,
-                    project: vm.project,
-                    composerError: vm.composerError,
-                    isWorking: vm.isWorking,
-                    threadStyle: .intatisMac(scheme),
-                    onShowSessions: onShowSessions,
-                    onNewSession: onNewSession,
-                    onShowProjectSettings: { showProjectSettings = true },
-                    composerAccessory: AnyView(IntatisComposerAccessory(
-                        catalog: catalog,
-                        isBusy: vm.isWorking,
+        VStack(spacing: 0) {
+            permissionReviewerBanner
+            CoworkShell(items: vm.items,
+                        agents: vm.agents,
+                        pending: vm.pendingPermission,
+                        permissionNotice: vm.permissionNotice,
                         latestTurnStats: vm.latestTurnStats,
-                        contextLabel: contextLabel,
-                        onSelectModel: onSelectModel)),
-                    input: $vm.input,
-                    onSend: { vm.send() },
-                    onResolve: { vm.resolvePermission($0) },
-                    onRemoveAgent: { vm.removeAgent(name: $0) },
-                    onRetryTask: { vm.retryFailedTask(id: $0) })
-            .task { vm.start() }
-            .sheet(isPresented: $showProjectSettings) { projectSettingsSheet }
+                        summary: vm.summary,
+                        project: vm.project,
+                        composerError: vm.composerError,
+                        isWorking: vm.isWorking,
+                        threadStyle: .intatisMac(scheme),
+                        onShowSessions: onShowSessions,
+                        onNewSession: onNewSession,
+                        onShowProjectSettings: { showProjectSettings = true },
+                        composerAccessory: AnyView(IntatisComposerAccessory(
+                            catalog: catalog,
+                            isBusy: vm.isWorking,
+                            latestTurnStats: vm.latestTurnStats,
+                            contextLabel: contextLabel,
+                            onSelectModel: onSelectModel)),
+                        input: $vm.input,
+                        onSend: { vm.send() },
+                        onResolve: { vm.resolvePermission($0) },
+                        onRemoveAgent: { vm.removeAgent(name: $0) },
+                        onRetryTask: { vm.retryFailedTask(id: $0) })
+        }
+        .task { vm.start() }
+        .sheet(isPresented: $showProjectSettings) { projectSettingsSheet }
+    }
+
+    private var permissionReviewerBanner: some View {
+        let presentation = permissionReviewerPresentation
+        return HStack(spacing: 9) {
+            if presentation.isBusy {
+                ProgressView()
+                    .controlSize(.small)
+                    .frame(width: 16, height: 16)
+                    .accessibilityLabel("Starting permission reviewer")
+            } else {
+                Image(systemName: presentation.systemImage)
+                    .foregroundStyle(presentation.tint)
+                    .frame(width: 16)
+                    .accessibilityHidden(true)
+            }
+            Text(presentation.title)
+                .font(.caption.bold())
+                .foregroundStyle(presentation.tint)
+            Text(presentation.detail)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+            Spacer(minLength: 8)
+            if vm.permissionReviewerStatus.canRetry {
+                Button("Retry") { vm.retryAutomaticPermissionReview() }
+                    .buttonStyle(.borderless)
+                    .font(.caption.bold())
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(presentation.tint.opacity(scheme == .dark ? 0.10 : 0.07))
+        .overlay(alignment: .bottom) { Divider().opacity(0.45) }
+        .help("\(presentation.title): \(presentation.detail)")
+    }
+
+    private var permissionReviewerPresentation: (
+        title: String,
+        detail: String,
+        systemImage: String,
+        tint: Color,
+        isBusy: Bool
+    ) {
+        switch vm.permissionReviewerStatus {
+        case .disabled:
+            return (
+                "Permission reviewer disabled",
+                "Automatic review is not active; permission requests require user approval.",
+                "shield.slash",
+                .secondary,
+                false)
+        case .enabling:
+            return (
+                "Starting permission reviewer…",
+                "Automatic review is not active until startup succeeds.",
+                "shield",
+                .secondary,
+                true)
+        case .enabled(let reviewer):
+            return (
+                "@\(reviewer.rawValue) enabled",
+                "Eligible requests are reviewed automatically; hard policy denials remain final.",
+                "checkmark.shield.fill",
+                .green,
+                false)
+        case .fallback(let reason):
+            return (
+                "Manual permission fallback",
+                reason,
+                "person.crop.circle.badge.questionmark",
+                .orange,
+                false)
+        case .degraded(let reason):
+            return (
+                "Permission reviewer degraded",
+                reason,
+                "exclamationmark.shield.fill",
+                .orange,
+                false)
+        case .failed(let reason):
+            return (
+                "Permission reviewer failed",
+                "\(reason) Permission requests will fall back to user approval.",
+                "exclamationmark.shield.fill",
+                .red,
+                false)
+        }
     }
 
     private var contextLabel: String? {

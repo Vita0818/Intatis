@@ -68,6 +68,7 @@ struct IntatisMacRootView: View {
     @State private var recentCoworkSessions: [AppSessionSummary] = []
     @State private var codeVM: CodeViewModel?
     @State private var coworkVM: CoworkViewModel?
+    @State private var coworkTransitionID: UUID?
     @State private var codeSessionError: String?
     @State private var coworkSessionError: String?
 
@@ -324,32 +325,50 @@ struct IntatisMacRootView: View {
         guard let workspace = WorkspaceAccess.choose(prompt: "Choose Cowork Workspace") else { return }
         selection = .cowork
         isSettings = false
-        coworkVM?.stop()
-        do {
-            coworkVM = try env.makeCoworkViewModel(primaryWorkspace: workspace)
-            coworkSessionError = nil
-            refreshCoworkSessions()
-        } catch {
-            coworkSessionError = "Could not start Cowork session: \(error.localizedDescription)"
+        let transitionID = UUID()
+        coworkTransitionID = transitionID
+        let previous = coworkVM
+        Task { @MainActor in
+            await previous?.stop()
+            guard coworkTransitionID == transitionID else { return }
+            do {
+                coworkVM = try env.makeCoworkViewModel(primaryWorkspace: workspace)
+                coworkSessionError = nil
+                refreshCoworkSessions()
+            } catch {
+                coworkSessionError = "Could not start Cowork session: \(error.localizedDescription)"
+            }
         }
     }
 
     private func showCoworkSessions() {
-        coworkVM?.stop()
-        coworkVM = nil
-        refreshCoworkSessions()
+        let transitionID = UUID()
+        coworkTransitionID = transitionID
+        let previous = coworkVM
+        Task { @MainActor in
+            await previous?.stop()
+            guard coworkTransitionID == transitionID else { return }
+            coworkVM = nil
+            refreshCoworkSessions()
+        }
     }
 
     private func resumeCoworkSession(_ sessionID: SessionID) {
         selection = .cowork
         isSettings = false
-        coworkVM?.stop()
-        do {
-            coworkVM = try env.makeCoworkViewModel(session: sessionID)
-            coworkSessionError = nil
-            refreshCoworkSessions()
-        } catch {
-            coworkSessionError = "Could not resume Cowork session: \(error.localizedDescription)"
+        let transitionID = UUID()
+        coworkTransitionID = transitionID
+        let previous = coworkVM
+        Task { @MainActor in
+            await previous?.stop()
+            guard coworkTransitionID == transitionID else { return }
+            do {
+                coworkVM = try env.makeCoworkViewModel(session: sessionID)
+                coworkSessionError = nil
+                refreshCoworkSessions()
+            } catch {
+                coworkSessionError = "Could not resume Cowork session: \(error.localizedDescription)"
+            }
         }
     }
 }

@@ -116,14 +116,16 @@ public struct PermissionRequestPayload: Codable, Equatable, Sendable {
     public var args: String
     public var risk: RiskLevel
     public var reason: String
+    public var context: PermissionRequestContext?
     public init(requestId: RequestID, agent: AgentID? = nil, tool: String, args: String,
-                risk: RiskLevel, reason: String) {
+                risk: RiskLevel, reason: String, context: PermissionRequestContext? = nil) {
         self.requestId = requestId
         self.agent = agent
         self.tool = tool
         self.args = args
         self.risk = risk
         self.reason = reason
+        self.context = context
     }
 }
 
@@ -197,6 +199,8 @@ public struct TaskQueuedPayload: Codable, Equatable, Sendable {
     public var causalParentID: TaskID?
     public var hopCount: Int
     public var visitedAgents: [AgentID]
+    public var attempt: Int?
+    public var reason: String?
     public var metadata: CoworkEventMetadata?
 
     public init(contract: TaskContract,
@@ -207,6 +211,8 @@ public struct TaskQueuedPayload: Codable, Equatable, Sendable {
                 causalParentID: TaskID? = nil,
                 hopCount: Int,
                 visitedAgents: [AgentID],
+                attempt: Int? = nil,
+                reason: String? = nil,
                 metadata: CoworkEventMetadata? = nil) {
         self.contract = contract
         self.rootTaskID = rootTaskID
@@ -216,6 +222,8 @@ public struct TaskQueuedPayload: Codable, Equatable, Sendable {
         self.causalParentID = causalParentID
         self.hopCount = hopCount
         self.visitedAgents = visitedAgents
+        self.attempt = attempt
+        self.reason = reason
         self.metadata = metadata
     }
 }
@@ -223,11 +231,16 @@ public struct TaskQueuedPayload: Codable, Equatable, Sendable {
 public struct TaskStartedPayload: Codable, Equatable, Sendable {
     public var taskID: TaskID
     public var agent: AgentID
+    public var attempt: Int?
     public var metadata: CoworkEventMetadata?
 
-    public init(taskID: TaskID, agent: AgentID, metadata: CoworkEventMetadata? = nil) {
+    public init(taskID: TaskID,
+                agent: AgentID,
+                attempt: Int? = nil,
+                metadata: CoworkEventMetadata? = nil) {
         self.taskID = taskID
         self.agent = agent
+        self.attempt = attempt
         self.metadata = metadata
     }
 }
@@ -241,6 +254,7 @@ public struct TaskReportPayload: Codable, Equatable, Sendable {
     public var summary: String
     public var detail: String?
     public var error: String?
+    public var attempt: Int?
     public var reportedAt: Date
 
     public init(taskID: TaskID,
@@ -251,6 +265,7 @@ public struct TaskReportPayload: Codable, Equatable, Sendable {
                 summary: String,
                 detail: String? = nil,
                 error: String? = nil,
+                attempt: Int? = nil,
                 reportedAt: Date = Date()) {
         self.taskID = taskID
         self.agent = agent
@@ -260,6 +275,7 @@ public struct TaskReportPayload: Codable, Equatable, Sendable {
         self.summary = summary
         self.detail = detail
         self.error = error
+        self.attempt = attempt
         self.reportedAt = reportedAt
     }
 }
@@ -269,17 +285,20 @@ public struct TaskCompletedPayload: Codable, Equatable, Sendable {
     public var agent: AgentID
     public var result: String
     public var report: TaskReportPayload?
+    public var attempt: Int?
     public var metadata: CoworkEventMetadata?
 
     public init(taskID: TaskID,
                 agent: AgentID,
                 result: String,
                 report: TaskReportPayload? = nil,
+                attempt: Int? = nil,
                 metadata: CoworkEventMetadata? = nil) {
         self.taskID = taskID
         self.agent = agent
         self.result = result
         self.report = report
+        self.attempt = attempt
         self.metadata = metadata
     }
 }
@@ -289,17 +308,43 @@ public struct TaskFailedPayload: Codable, Equatable, Sendable {
     public var agent: AgentID
     public var error: String
     public var report: TaskReportPayload?
+    public var attempt: Int?
     public var metadata: CoworkEventMetadata?
 
     public init(taskID: TaskID,
                 agent: AgentID,
                 error: String,
                 report: TaskReportPayload? = nil,
+                attempt: Int? = nil,
                 metadata: CoworkEventMetadata? = nil) {
         self.taskID = taskID
         self.agent = agent
         self.error = error
         self.report = report
+        self.attempt = attempt
+        self.metadata = metadata
+    }
+}
+
+public struct TaskCancelledPayload: Codable, Equatable, Sendable {
+    public var taskID: TaskID
+    public var agent: AgentID
+    public var reason: String
+    public var report: TaskReportPayload?
+    public var attempt: Int?
+    public var metadata: CoworkEventMetadata?
+
+    public init(taskID: TaskID,
+                agent: AgentID,
+                reason: String,
+                report: TaskReportPayload? = nil,
+                attempt: Int? = nil,
+                metadata: CoworkEventMetadata? = nil) {
+        self.taskID = taskID
+        self.agent = agent
+        self.reason = reason
+        self.report = report
+        self.attempt = attempt
         self.metadata = metadata
     }
 }
@@ -343,6 +388,8 @@ public enum Event: Equatable, Sendable {
     // v0.2
     case toolCall(ToolCallPayload)
     case toolResult(ToolResultPayload)
+    case toolExecutionPrepared(ToolExecutionPreparedPayload)
+    case toolExecutionSettled(ToolExecutionSettledPayload)
     case permissionRequest(PermissionRequestPayload)
     case permissionResolved(PermissionResolvedPayload)
     case patchProposed(PatchProposedPayload)
@@ -354,6 +401,7 @@ public enum Event: Equatable, Sendable {
     case agentSpawnRequested(AgentSpawnRequestedPayload)
     case agentSpawned(AgentSpawnedPayload)
     case agentMessage(AgentMessagePayload)
+    case agentMessageConsumed(AgentMessageConsumedPayload)
     case agentToAgentMessage(AgentToAgentMessagePayload)
     case informationRequested(InformationRequestedPayload)
     case informationReplied(InformationRepliedPayload)
@@ -364,9 +412,12 @@ public enum Event: Equatable, Sendable {
     case workspaceLeaseRequested(WorkspaceLeaseRequestedPayload)
     case workspaceLeaseGranted(WorkspaceLeaseGrantedPayload)
     case workspaceLeaseDenied(WorkspaceLeaseDeniedPayload)
+    case workspaceLeaseRevoked(WorkspaceLeaseRevokedPayload)
     case capabilityLeaseCreated(CapabilityLeaseCreatedPayload)
     case capabilityLeaseRevoked(CapabilityLeaseRevokedPayload)
     case permissionReview(PermissionReviewPayload)
+    case permissionReviewRequested(PermissionReviewRequestedPayload)
+    case permissionReviewSettled(PermissionReviewSettledPayload)
     // v0.10 (Cowork task contracts)
     case taskCreated(TaskCreatedPayload)
     case taskAssigned(TaskAssignedPayload)
@@ -374,6 +425,7 @@ public enum Event: Equatable, Sendable {
     case taskStarted(TaskStartedPayload)
     case taskCompleted(TaskCompletedPayload)
     case taskFailed(TaskFailedPayload)
+    case taskCancelled(TaskCancelledPayload)
     case taskRejected(TaskRejectedPayload)
     // v0.4 (Multimodal)
     case artifactAdded(ArtifactAddedPayload)
@@ -389,6 +441,8 @@ public enum Event: Equatable, Sendable {
         case error = "error"
         case toolCall = "tool_call"
         case toolResult = "tool_result"
+        case toolExecutionPrepared = "tool_execution_prepared"
+        case toolExecutionSettled = "tool_execution_settled"
         case permissionRequest = "permission_request"
         case permissionResolved = "permission_resolved"
         case patchProposed = "patch_proposed"
@@ -399,6 +453,7 @@ public enum Event: Equatable, Sendable {
         case agentSpawnRequested = "agent_spawn_requested"
         case agentSpawned = "agent_spawned"
         case agentMessage = "agent_message"
+        case agentMessageConsumed = "agent_message_consumed"
         case agentToAgentMessage = "agent_to_agent_message"
         case informationRequested = "information_requested"
         case informationReplied = "information_replied"
@@ -409,15 +464,19 @@ public enum Event: Equatable, Sendable {
         case workspaceLeaseRequested = "workspace_lease_requested"
         case workspaceLeaseGranted = "workspace_lease_granted"
         case workspaceLeaseDenied = "workspace_lease_denied"
+        case workspaceLeaseRevoked = "workspace_lease_revoked"
         case capabilityLeaseCreated = "capability_lease_created"
         case capabilityLeaseRevoked = "capability_lease_revoked"
         case permissionReview = "permission_review"
+        case permissionReviewRequested = "permission_review_requested"
+        case permissionReviewSettled = "permission_review_settled"
         case taskCreated = "task_created"
         case taskAssigned = "task_assigned"
         case taskQueued = "task_queued"
         case taskStarted = "task_started"
         case taskCompleted = "task_completed"
         case taskFailed = "task_failed"
+        case taskCancelled = "task_cancelled"
         case taskRejected = "task_rejected"
         case artifactAdded = "artifact_added"
         case artifactProgress = "artifact_progress"
@@ -432,6 +491,8 @@ public enum Event: Equatable, Sendable {
         case .error:              return .error
         case .toolCall:           return .toolCall
         case .toolResult:         return .toolResult
+        case .toolExecutionPrepared: return .toolExecutionPrepared
+        case .toolExecutionSettled: return .toolExecutionSettled
         case .permissionRequest:  return .permissionRequest
         case .permissionResolved: return .permissionResolved
         case .patchProposed:      return .patchProposed
@@ -442,6 +503,7 @@ public enum Event: Equatable, Sendable {
         case .agentSpawnRequested: return .agentSpawnRequested
         case .agentSpawned:        return .agentSpawned
         case .agentMessage:        return .agentMessage
+        case .agentMessageConsumed: return .agentMessageConsumed
         case .agentToAgentMessage: return .agentToAgentMessage
         case .informationRequested: return .informationRequested
         case .informationReplied:   return .informationReplied
@@ -452,15 +514,19 @@ public enum Event: Equatable, Sendable {
         case .workspaceLeaseRequested: return .workspaceLeaseRequested
         case .workspaceLeaseGranted:   return .workspaceLeaseGranted
         case .workspaceLeaseDenied:    return .workspaceLeaseDenied
+        case .workspaceLeaseRevoked:   return .workspaceLeaseRevoked
         case .capabilityLeaseCreated:  return .capabilityLeaseCreated
         case .capabilityLeaseRevoked:  return .capabilityLeaseRevoked
         case .permissionReview:    return .permissionReview
+        case .permissionReviewRequested: return .permissionReviewRequested
+        case .permissionReviewSettled: return .permissionReviewSettled
         case .taskCreated:         return .taskCreated
         case .taskAssigned:        return .taskAssigned
         case .taskQueued:          return .taskQueued
         case .taskStarted:         return .taskStarted
         case .taskCompleted:       return .taskCompleted
         case .taskFailed:          return .taskFailed
+        case .taskCancelled:       return .taskCancelled
         case .taskRejected:        return .taskRejected
         case .artifactAdded:       return .artifactAdded
         case .artifactProgress:    return .artifactProgress

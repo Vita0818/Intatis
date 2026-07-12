@@ -317,6 +317,9 @@ extension OpenAIWireProvider: ToolCallingProvider {
         if let r = request.reasoningEffort {
             root["reasoning_effort"] = .string(r.rawValue)
         }
+        if let maxOutputTokens = request.maxOutputTokens {
+            root["max_tokens"] = .number(Double(maxOutputTokens))
+        }
         if request.includeUsage {
             root["stream_options"] = .object(["include_usage": .bool(true)])
         }

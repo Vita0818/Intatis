@@ -20,8 +20,12 @@ public struct MessageBus: Sendable {
     public func deliver(from: AgentID, to: AgentID, content: String) async -> String? {
         switch await mediator.mediate(from: from, to: to, content: content) {
         case .forward(let forwarded):
-            try? await log.append(.agentToAgentMessage(
-                AgentToAgentMessagePayload(from: from, to: to, content: forwarded, mediated: true)))
+            do {
+                try await log.append(.agentToAgentMessage(
+                    AgentToAgentMessagePayload(from: from, to: to, content: forwarded, mediated: true)))
+            } catch {
+                return nil
+            }
             try? await log.append(.permissionReview(
                 PermissionReviewPayload(agent: from, tool: "agent_forward", reviewerModel: "mediator",
                                         decision: .allow, risk: .low, reason: "forwarded after mediation")))
@@ -34,20 +38,30 @@ public struct MessageBus: Sendable {
         }
     }
 
-    public func sendMessage(from: AgentID, to: AgentID, content: String, taskID: TaskID? = nil) async -> String? {
+    public func sendMessage(from: AgentID,
+                            to: AgentID,
+                            content: String,
+                            taskID: TaskID? = nil,
+                            messageID: MessageID = MessageID.new()) async -> AgentMessagePayload? {
         switch await mediator.mediate(from: from, to: to, content: content) {
         case .forward(let forwarded):
-            try? await log.append(.agentMessage(AgentMessagePayload(
+            let payload = AgentMessagePayload(
                 from: from,
                 to: to,
                 content: forwarded,
                 kind: .sendMessage,
+                messageId: messageID,
                 taskID: taskID,
-                mediated: true)))
+                mediated: true)
+            do {
+                try await log.append(.agentMessage(payload))
+            } catch {
+                return nil
+            }
             try? await log.append(.permissionReview(
                 PermissionReviewPayload(agent: from, tool: "send_message", reviewerModel: "mediator",
                                         decision: .allow, risk: .low, reason: "forwarded after mediation")))
-            return forwarded
+            return payload
         case .block(let reason):
             try? await log.append(.permissionReview(
                 PermissionReviewPayload(agent: from, tool: "send_message", reviewerModel: "mediator",
@@ -56,19 +70,29 @@ public struct MessageBus: Sendable {
         }
     }
 
-    public func requestInformation(from: AgentID, to: AgentID, question: String, taskID: TaskID? = nil) async -> String? {
+    public func requestInformation(from: AgentID,
+                                   to: AgentID,
+                                   question: String,
+                                   taskID: TaskID? = nil,
+                                   requestID: MessageID = MessageID.new()) async -> InformationRequestedPayload? {
         switch await mediator.mediate(from: from, to: to, content: question) {
         case .forward(let forwarded):
-            try? await log.append(.informationRequested(InformationRequestedPayload(
+            let payload = InformationRequestedPayload(
+                requestID: requestID,
                 from: from,
                 to: to,
                 question: forwarded,
                 mediated: true,
-                taskID: taskID)))
+                taskID: taskID)
+            do {
+                try await log.append(.informationRequested(payload))
+            } catch {
+                return nil
+            }
             try? await log.append(.permissionReview(
                 PermissionReviewPayload(agent: from, tool: "request_information", reviewerModel: "mediator",
                                         decision: .allow, risk: .low, reason: "forwarded after mediation")))
-            return forwarded
+            return payload
         case .block(let reason):
             try? await log.append(.permissionReview(
                 PermissionReviewPayload(agent: from, tool: "request_information", reviewerModel: "mediator",
@@ -77,20 +101,31 @@ public struct MessageBus: Sendable {
         }
     }
 
-    public func replyMessage(from: AgentID, to: AgentID, content: String, inReplyTo: MessageID?, taskID: TaskID? = nil) async -> String? {
+    public func replyMessage(from: AgentID,
+                             to: AgentID,
+                             content: String,
+                             inReplyTo: MessageID?,
+                             taskID: TaskID? = nil,
+                             replyID: MessageID = MessageID.new()) async -> InformationRepliedPayload? {
         switch await mediator.mediate(from: from, to: to, content: content) {
         case .forward(let forwarded):
-            try? await log.append(.informationReplied(InformationRepliedPayload(
+            let payload = InformationRepliedPayload(
+                replyID: replyID,
                 inReplyTo: inReplyTo,
                 from: from,
                 to: to,
                 content: forwarded,
                 mediated: true,
-                taskID: taskID)))
+                taskID: taskID)
+            do {
+                try await log.append(.informationReplied(payload))
+            } catch {
+                return nil
+            }
             try? await log.append(.permissionReview(
                 PermissionReviewPayload(agent: from, tool: "reply_message", reviewerModel: "mediator",
                                         decision: .allow, risk: .low, reason: "forwarded after mediation")))
-            return forwarded
+            return payload
         case .block(let reason):
             try? await log.append(.permissionReview(
                 PermissionReviewPayload(agent: from, tool: "reply_message", reviewerModel: "mediator",

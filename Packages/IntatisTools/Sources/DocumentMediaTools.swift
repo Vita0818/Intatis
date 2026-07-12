@@ -140,7 +140,7 @@ public struct ReadPDFTool: Tool {
         }
         return ToolObservation(text: text, truncated: truncated)
         #else
-        throw IntatisError.config("read_pdf requires PDFKit on Apple platforms; install and call mature CLI tools such as Poppler pdftotext through run_shell on this platform.")
+        throw IntatisError.config("read_pdf requires PDFKit on Apple platforms; use an explicitly integrated, workspace-confined PDF backend on this platform.")
         #endif
     }
 }
@@ -246,7 +246,7 @@ public struct EditPDFPagesTool: Tool {
             throw IntatisError.decoding("unsupported edit_pdf_pages mode '\(a.mode)'; use 'extract' or 'split'")
         }
         #else
-        throw IntatisError.config("edit_pdf_pages requires PDFKit on Apple platforms; use mature CLI tools such as qpdf/pdfseparate through run_shell on this platform.")
+        throw IntatisError.config("edit_pdf_pages requires PDFKit on Apple platforms; use an explicitly integrated, workspace-confined PDF backend on this platform.")
         #endif
     }
 }
@@ -369,7 +369,7 @@ public struct ReconstructDocumentImageTool: Tool {
         esac
         """
 
-        let result = try await context.shell.run(command, cwd: context.workspaceRoot)
+        let result = try await context.structuredShell.run(command, cwd: context.workspaceRoot)
         let transcript = outputText(stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode)
         guard result.exitCode == 0 else {
             throw IntatisError.io("document reconstruction failed. \(transcript)")
@@ -444,18 +444,23 @@ public struct CompileLaTeXTool: Tool {
         let outputPDF = outputDirURL.appendingPathComponent(inputURL.deletingPathExtension().lastPathComponent + ".pdf")
         let command = """
         set -e
+        # Keep TeX's own path policy restrictive in addition to the OS-level
+        # workspace sandbox, and never permit shell escape from document input.
+        export openin_any=p
+        export openout_any=p
         INPUT=\(shellQuote(inputURL.path))
         OUTDIR=\(shellQuote(outputDirURL.path))
         ENGINE=\(shellQuote(engine))
         run_auto() {
           if command -v tectonic >/dev/null 2>&1; then
-            tectonic --keep-logs --keep-intermediates --outdir "$OUTDIR" "$INPUT"
+            tectonic --untrusted --keep-logs --keep-intermediates --outdir "$OUTDIR" "$INPUT"
           elif command -v latexmk >/dev/null 2>&1; then
-            latexmk -pdf -interaction=nonstopmode -halt-on-error -outdir="$OUTDIR" "$INPUT"
+            latexmk -norc -pdf -interaction=nonstopmode -halt-on-error \
+              -pdflatex="pdflatex -no-shell-escape %O %S" -outdir="$OUTDIR" "$INPUT"
           elif command -v xelatex >/dev/null 2>&1; then
-            xelatex -interaction=nonstopmode -halt-on-error -output-directory="$OUTDIR" "$INPUT"
+            xelatex -no-shell-escape -interaction=nonstopmode -halt-on-error -output-directory="$OUTDIR" "$INPUT"
           elif command -v pdflatex >/dev/null 2>&1; then
-            pdflatex -interaction=nonstopmode -halt-on-error -output-directory="$OUTDIR" "$INPUT"
+            pdflatex -no-shell-escape -interaction=nonstopmode -halt-on-error -output-directory="$OUTDIR" "$INPUT"
           else
             echo "No LaTeX engine found. Install tectonic, TeX Live latexmk, xelatex, or pdflatex." >&2
             exit 127
@@ -465,15 +470,16 @@ public struct CompileLaTeXTool: Tool {
           auto) run_auto ;;
           tectonic)
             command -v tectonic >/dev/null 2>&1 || { echo "tectonic is not installed" >&2; exit 127; }
-            tectonic --keep-logs --keep-intermediates --outdir "$OUTDIR" "$INPUT"
+            tectonic --untrusted --keep-logs --keep-intermediates --outdir "$OUTDIR" "$INPUT"
             ;;
           latexmk)
             command -v latexmk >/dev/null 2>&1 || { echo "latexmk is not installed" >&2; exit 127; }
-            latexmk -pdf -interaction=nonstopmode -halt-on-error -outdir="$OUTDIR" "$INPUT"
+            latexmk -norc -pdf -interaction=nonstopmode -halt-on-error \
+              -pdflatex="pdflatex -no-shell-escape %O %S" -outdir="$OUTDIR" "$INPUT"
             ;;
           xelatex|pdflatex)
             command -v "$ENGINE" >/dev/null 2>&1 || { echo "$ENGINE is not installed" >&2; exit 127; }
-            "$ENGINE" -interaction=nonstopmode -halt-on-error -output-directory="$OUTDIR" "$INPUT"
+            "$ENGINE" -no-shell-escape -interaction=nonstopmode -halt-on-error -output-directory="$OUTDIR" "$INPUT"
             ;;
           *)
             echo "unsupported LaTeX engine: $ENGINE" >&2
@@ -481,7 +487,7 @@ public struct CompileLaTeXTool: Tool {
             ;;
         esac
         """
-        let result = try await context.shell.run(command, cwd: context.workspaceRoot)
+        let result = try await context.structuredShell.run(command, cwd: context.workspaceRoot)
         let transcript = outputText(stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode)
         guard result.exitCode == 0 else {
             throw IntatisError.io("LaTeX compile failed. \(transcript)")

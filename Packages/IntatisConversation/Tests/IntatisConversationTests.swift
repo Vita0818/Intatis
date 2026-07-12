@@ -61,6 +61,187 @@ final class IntatisConversationTests: XCTestCase {
         XCTAssertEqual(next.seq, 2)
     }
 
+    func testConcurrentEventLogInstancesAssignUniqueMonotonicSequences() async throws {
+        let url = tmpFile()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let session = SessionID(rawValue: "sess_multi_writer")
+        let first = try EventLog(session: session, fileURL: url)
+        let second = try EventLog(session: session, fileURL: url)
+        let count = 80
+
+        let persisted = try await withThrowingTaskGroup(of: Envelope.self) { group in
+            for index in 0..<count {
+                let log = index.isMultiple(of: 2) ? first : second
+                group.addTask {
+                    try await log.append(.userMessage(.init(text: "event-\(index)")))
+                }
+            }
+            var envelopes: [Envelope] = []
+            for try await envelope in group {
+                envelopes.append(envelope)
+            }
+            return envelopes
+        }
+
+        XCTAssertEqual(persisted.map(\.seq).sorted(), Array(0..<count))
+        let replayed = await first.replay()
+        XCTAssertEqual(replayed.map(\.seq), Array(0..<count))
+        XCTAssertEqual(Set(replayed.map(\.seq)).count, count)
+        XCTAssertEqual(replayed.count, count)
+
+        // A fresh instance must recover the sequence written by both actors.
+        let reopened = try EventLog(session: session, fileURL: url)
+        let next = try await reopened.append(.userMessage(.init(text: "after-reopen")))
+        XCTAssertEqual(next.seq, count)
+    }
+
+    func testWriterLeaseRejectsSecondRuntimeButAllowsReadOnlyReplay() async throws {
+        let url = tmpFile()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let session = SessionID(rawValue: "sess_writer_lease")
+        let first = try EventLog(session: session, fileURL: url)
+        let second = try EventLog(session: session, fileURL: url)
+        _ = try await first.append(.userMessage(.init(text: "persisted")))
+
+        let lease = try first.acquireWriterLease()
+        do {
+            _ = try second.acquireWriterLease()
+            XCTFail("a second task-executing runtime must not acquire the same session")
+        } catch let error as EventLogError {
+            XCTAssertEqual(error, .writerAlreadyActive)
+            XCTAssertFalse(error.localizedDescription.contains(url.path))
+            XCTAssertNotNil(error.recoverySuggestion)
+        }
+
+        // The lifetime writer lease is distinct from the short I/O lock, so
+        // history/projection reads may coexist with the active runtime.
+        let concurrentReplay = await second.replay()
+        XCTAssertEqual(concurrentReplay.map(\.seq), [0])
+
+        lease.release()
+        let replacementLease = try second.acquireWriterLease()
+        replacementLease.release()
+    }
+
+    func testAppendBatchPersistsContiguousSequenceGroup() async throws {
+        let url = tmpFile()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let log = try EventLog(
+            session: SessionID(rawValue: "sess_batch"),
+            fileURL: url)
+
+        let envelopes = try await log.append([
+            .userMessage(.init(text: "one")),
+            .userMessage(.init(text: "two")),
+            .userMessage(.init(text: "three")),
+        ], ts: Date(timeIntervalSince1970: 123))
+
+        XCTAssertEqual(envelopes.map(\.seq), [0, 1, 2])
+        XCTAssertEqual(envelopes.map(\.ts), Array(repeating: Date(timeIntervalSince1970: 123), count: 3))
+        let replayed = await log.replay()
+        XCTAssertEqual(replayed.map(\.seq), [0, 1, 2])
+    }
+
+    func testUnknownFutureEventReservesItsSequenceForConcurrentSafeAppend() async throws {
+        let url = tmpFile()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true)
+        let session = SessionID(rawValue: "sess_future_sequence")
+        let encoder = Envelope.makeEncoder()
+        let known = try encoder.encode(Envelope(
+            seq: 0,
+            ts: Date(timeIntervalSince1970: 0),
+            session: session,
+            event: .userMessage(.init(text: "known"))))
+        let futureBase = try encoder.encode(Envelope(
+            seq: 7,
+            ts: Date(timeIntervalSince1970: 7),
+            session: session,
+            event: .userMessage(.init(text: "placeholder"))))
+        var futureObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: futureBase) as? [String: Any])
+        futureObject["type"] = "future_event_type"
+        futureObject["payload"] = ["futureField": true]
+        let future = try JSONSerialization.data(withJSONObject: futureObject, options: [.sortedKeys])
+        var initialData = known
+        initialData.append(0x0A)
+        initialData.append(future)
+        initialData.append(0x0A)
+        try initialData.write(to: url)
+
+        let log = try EventLog(session: session, fileURL: url)
+        let appended = try await log.append(.userMessage(.init(text: "current")))
+
+        XCTAssertEqual(appended.seq, 8)
+        // The future event is intentionally skipped by this binary, but its
+        // occupied sequence remains reserved.
+        let replayed = await log.replay()
+        XCTAssertEqual(replayed.map(\.seq), [0, 8])
+    }
+
+    func testInitializationRejectsNonMonotonicValidEnvelopeHeadersWithoutPathLeak() throws {
+        let url = tmpFile()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true)
+        let session = SessionID(rawValue: "sess_bad_sequence")
+        let encoder = Envelope.makeEncoder()
+        var data = try encoder.encode(Envelope(
+            seq: 2,
+            ts: Date(timeIntervalSince1970: 0),
+            session: session,
+            event: .userMessage(.init(text: "first"))))
+        data.append(0x0A)
+        data.append(try encoder.encode(Envelope(
+            seq: 2,
+            ts: Date(timeIntervalSince1970: 1),
+            session: session,
+            event: .userMessage(.init(text: "duplicate")))))
+        data.append(0x0A)
+        try data.write(to: url)
+
+        do {
+            _ = try EventLog(session: session, fileURL: url)
+            XCTFail("duplicate valid sequence headers must fail closed")
+        } catch let error as EventLogError {
+            XCTAssertEqual(error, .nonMonotonicSequence(previous: 2, current: 2))
+            XCTAssertFalse(error.localizedDescription.contains(url.path))
+            XCTAssertNotNil(error.recoverySuggestion)
+        }
+    }
+
+    func testAppendAfterCrashTailKeepsNewEnvelopeReplayable() async throws {
+        let url = tmpFile()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let session = SessionID(rawValue: "sess_crash_tail")
+        let initialLog = try EventLog(session: session, fileURL: url)
+        _ = try await initialLog.append(.userMessage(.init(text: "before crash")))
+
+        let corruptTail = Data(#"{"seq":999,"type":"user_message","payload":{"text":"partial""#.utf8)
+        let handle = try FileHandle(forWritingTo: url)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: corruptTail)
+        try handle.close()
+
+        let reloaded = try EventLog(session: session, fileURL: url)
+        let appended = try await reloaded.append(.userMessage(.init(text: "after restart")))
+        let replayed = await reloaded.replay()
+
+        XCTAssertEqual(appended.seq, 1)
+        XCTAssertEqual(replayed.map(\.seq), [0, 1])
+        XCTAssertEqual(replayed.compactMap { envelope -> String? in
+            guard case .userMessage(let payload) = envelope.event else { return nil }
+            return payload.text
+        }, ["before crash", "after restart"])
+
+        let persistedLines = try Data(contentsOf: url).split(separator: 0x0A)
+        XCTAssertEqual(persistedLines.count, 3)
+        XCTAssertEqual(Data(persistedLines[1]), corruptTail)
+    }
+
     func testReplayFromSeqFiltersEarlier() async throws {
         let url = tmpFile()
         defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }

@@ -70,6 +70,53 @@ private actor ProviderRegistryBox {
     }
 }
 
+/// Bridges a nonisolated permission request into the MainActor UI without
+/// leaving a continuation behind when the requesting task is cancelled before
+/// registration finishes. Resolution is lock-protected because cancellation
+/// may race the MainActor approval action.
+private final class CoworkPermissionWaiter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<PermissionDecision, Never>?
+    private var resolution: PermissionDecision?
+
+    var isPending: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return resolution == nil
+    }
+
+    func install(_ continuation: CheckedContinuation<PermissionDecision, Never>) {
+        let decision: PermissionDecision?
+        lock.lock()
+        if let resolution {
+            decision = resolution
+        } else {
+            self.continuation = continuation
+            decision = nil
+        }
+        lock.unlock()
+        if let decision {
+            continuation.resume(returning: decision)
+        }
+    }
+
+    @discardableResult
+    func resolve(_ decision: PermissionDecision) -> Bool {
+        let continuation: CheckedContinuation<PermissionDecision, Never>?
+        lock.lock()
+        guard resolution == nil else {
+            lock.unlock()
+            return false
+        }
+        resolution = decision
+        continuation = self.continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume(returning: decision)
+        return true
+    }
+}
+
 /// Drives a Cowork project session: user input defaults to the project `Main`
 /// agent, while the orchestrator and scheduler handle sub-agent work behind it.
 /// The view model folds the shared event log into the visible thread, project
@@ -89,15 +136,21 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
     @Published private(set) var composerError: String?
     @Published private(set) var projectionError: String?
     @Published private(set) var addAgentStatus: CoworkAddAgentStatus = .idle
+    @Published private(set) var permissionReviewerStatus: CoworkPermissionReviewerStatus = .disabled
 
     private let log: EventLog
     private let registryBox: ProviderRegistryBox
     private var orchestrator: Orchestrator?
     private var subscription: Task<Void, Never>?
-    private var permissionContinuation: CheckedContinuation<PermissionDecision, Never>?
+    private var shutdownTask: Task<Void, Never>?
+    private var permissionWaiters: [RequestID: CoworkPermissionWaiter] = [:]
+    private var permissionQueue: [PendingPermission] = []
+    private var suppressedPermissionRequestIDs: Set<RequestID> = []
+    private var activeOperations: [UUID: Task<Void, Never>] = [:]
     private var retryableTasks: [String: CoworkTaskView] = [:]
     private var latestCoworkProjection = CoworkProjection()
     private var didRequestMainAgentAttach = false
+    private var steadyPermissionReviewerStatus: CoworkPermissionReviewerStatus = .disabled
     let sessionID: SessionID
 
     init(sessionID: SessionID,
@@ -126,15 +179,24 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
     }
 
     func start() {
-        guard orchestrator == nil else { return }
+        guard orchestrator == nil, shutdownTask == nil else { return }
+        setPermissionReviewerStatus(.enabling)
         let registryBox = registryBox
-        orchestrator = Orchestrator(
-            log: log,
-            allowsShell: PlatformProfile.current.allowsShell,
-            responder: self,
-            imageGeneratorFor: { _ in await registryBox.imageToolService() }
-        ) { _ in
-            try await registryBox.defaultAgentProvider()
+        do {
+            orchestrator = try Orchestrator.runtime(
+                log: log,
+                allowsShell: PlatformProfile.current.allowsShell,
+                responder: self,
+                executionPolicy: CoworkExecutionPolicy(tokenBudget: projectSettings.tokenBudget),
+                imageGeneratorFor: { _ in await registryBox.imageToolService() }
+            ) { _ in
+                try await registryBox.defaultAgentProvider()
+            }
+        } catch {
+            let message = RuntimeErrorPresentation.message(for: error)
+            projectionError = "Cowork session could not start: \(message)"
+            setPermissionReviewerStatus(.failed(message))
+            return
         }
         subscription = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -146,19 +208,25 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             self.restoreWorkspaceAccess(for: coworkProjection)
             await self.orchestrator?.restore(from: coworkProjection)
             self.items = codeProjection.items
-            self.pendingPermission = permissions.latest
+            self.pendingPermission = self.presentedPermission(projected: permissions.latest)
             self.permissionNotice = permissions.latestResolved
             self.latestTurnStats = turnStats.latest
             self.applyCoworkProjection(coworkProjection)
+            await self.ensureAutomaticPermissionReview(existingProjection: coworkProjection)
             await self.bootstrapMainAgentIfNeeded(existingProjection: coworkProjection)
+            await self.orchestrator?.resumePendingTasks()
             let stream = await self.log.stream(from: (replayed.last?.seq ?? -1) + 1)
             for await envelope in stream {
                 codeProjection.apply(envelope)
                 coworkProjection.apply(envelope)
                 permissions.apply(envelope)
                 turnStats.apply(envelope)
+                if case .permissionResolved(let payload) = envelope.event,
+                   let requestID = payload.requestId {
+                    self.suppressedPermissionRequestIDs.remove(requestID)
+                }
                 self.items = codeProjection.items
-                self.pendingPermission = permissions.latest
+                self.pendingPermission = self.presentedPermission(projected: permissions.latest)
                 self.permissionNotice = permissions.latestResolved
                 self.latestTurnStats = turnStats.latest
                 self.applyCoworkProjection(coworkProjection)
@@ -166,20 +234,38 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         }
     }
 
-    func stop() {
+    func stop() async {
+        if let shutdownTask {
+            await shutdownTask.value
+            return
+        }
         subscription?.cancel()
         subscription = nil
-        if let continuation = permissionContinuation {
-            continuation.resume(returning: .deny)
-            permissionContinuation = nil
+        let runningOrchestrator = orchestrator
+        orchestrator = nil
+        for operation in activeOperations.values { operation.cancel() }
+        activeOperations.removeAll()
+        for (requestID, waiter) in permissionWaiters {
+            suppressedPermissionRequestIDs.insert(requestID)
+            waiter.resolve(.deny)
         }
+        permissionWaiters.removeAll()
+        permissionQueue.removeAll()
         if var pending = pendingPermission, pending.state.isActionable {
             pending.state = .expired
             pendingPermission = pending
         }
-        orchestrator = nil
         isWorking = false
         addAgentStatus = .idle
+        setPermissionReviewerStatus(.disabled)
+        let task = Task<Void, Never> {
+            if let runningOrchestrator {
+                await runningOrchestrator.cancelAll(reason: "cowork view stopped")
+            }
+        }
+        shutdownTask = task
+        await task.value
+        shutdownTask = nil
     }
 
     private func applyCoworkProjection(_ projection: CoworkProjection) {
@@ -226,7 +312,8 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             sessionID: sessionID,
             settings: projectSettings,
             projection: projection)
-        retryableTasks = Dictionary(uniqueKeysWithValues: projection.failedTasks.map { ($0.id.rawValue, $0) })
+        let retryable = projection.failedTasks + projection.cancelledTasks
+        retryableTasks = Dictionary(uniqueKeysWithValues: retryable.map { ($0.id.rawValue, $0) })
         projectionError = nil
     }
 
@@ -266,6 +353,88 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         }
     }
 
+    private func ensureAutomaticPermissionReview(existingProjection projection: CoworkProjection) async {
+        guard let orchestrator else {
+            setPermissionReviewerStatus(.failed("Cowork session is not ready."))
+            return
+        }
+        setPermissionReviewerStatus(.enabling)
+        let mainID = AgentID(rawValue: projectSettings.mainAgentName)
+        let model: ModelID
+        let workspaceURL: URL
+
+        if let main = projection.agentRoster[mainID] {
+            model = main.model
+            workspaceURL = WorkspaceAccess.restoreAccess(forPath: main.path)
+                ?? URL(fileURLWithPath: main.path)
+        } else if let workspace = projectSettings.primaryWorkspace {
+            model = await defaultAgentModel()
+            workspaceURL = WorkspaceAccess.restoreAccess(forPath: workspace.path)
+                ?? URL(fileURLWithPath: workspace.path)
+        } else {
+            setPermissionReviewerStatus(.failed(
+                "No primary workspace is available for @\(Orchestrator.automaticPermissionReviewerID.rawValue)."))
+            return
+        }
+
+        let result = await orchestrator.enableAutomaticPermissionReview(
+            model: model,
+            workspaceRoot: workspaceURL)
+        guard !Task.isCancelled, self.orchestrator != nil else {
+            setPermissionReviewerStatus(.disabled)
+            return
+        }
+        switch result {
+        case .enabled(let reviewer), .alreadyEnabled(let reviewer):
+            await synchronizePermissionReviewerHealth(
+                using: orchestrator,
+                reviewer: reviewer)
+        case .failed(let message):
+            setPermissionReviewerStatus(.failed(message))
+        }
+    }
+
+    private func synchronizePermissionReviewerHealth(
+        using orchestrator: Orchestrator,
+        reviewer: AgentID = Orchestrator.automaticPermissionReviewerID
+    ) async {
+        guard self.orchestrator != nil else { return }
+        guard let health = await orchestrator.automaticPermissionReviewHealth() else {
+            setPermissionReviewerStatus(.disabled)
+            return
+        }
+        switch health {
+        case .healthy:
+            setPermissionReviewerStatus(.enabled(reviewer))
+        case .degraded(let reason):
+            setPermissionReviewerStatus(.degraded(reason))
+        case .shuttingDown:
+            setPermissionReviewerStatus(.disabled)
+        }
+    }
+
+    private func schedulePermissionReviewerHealthRefresh() {
+        guard let orchestrator else { return }
+        let operationID = UUID()
+        let operation = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.activeOperations.removeValue(forKey: operationID) }
+            await self.synchronizePermissionReviewerHealth(using: orchestrator)
+        }
+        activeOperations[operationID] = operation
+    }
+
+    func retryAutomaticPermissionReview() {
+        guard permissionReviewerStatus.canRetry, orchestrator != nil else { return }
+        let operationID = UUID()
+        let operation = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.activeOperations.removeValue(forKey: operationID) }
+            await self.ensureAutomaticPermissionReview(existingProjection: self.latestCoworkProjection)
+        }
+        activeOperations[operationID] = operation
+    }
+
     private func bootstrapMainAgentIfNeeded(existingProjection projection: CoworkProjection) async {
         guard !didRequestMainAgentAttach else { return }
         guard let orchestrator else { return }
@@ -282,6 +451,7 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             model: model,
             profile: projectSettings.defaultProfile,
             coordinationDepth: Agent.defaultCoordinationDepth))
+        await synchronizePermissionReviewerHealth(using: orchestrator)
         if attached {
             rememberWorkspace(url, agentName: mainID.rawValue, isPrimary: true)
         }
@@ -319,6 +489,8 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             await registryBox.updateSessionDefaults(
                 providerID: normalized.defaultProviderID,
                 modelID: normalized.defaultModelID)
+            await orchestrator?.updateExecutionPolicy(
+                CoworkExecutionPolicy(tokenBudget: normalized.tokenBudget))
         }
         CoworkProjectSettingsStore.save(normalized)
         project = Self.makeProjectInfo(
@@ -340,9 +512,17 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             return
         }
         isWorking = true
-        Task { @MainActor [weak self] in
+        let operationID = UUID()
+        let operation = Task { @MainActor [weak self] in
             guard let self else { return }
-            await orchestrator.detach(AgentID(rawValue: name))
+            defer { self.activeOperations.removeValue(forKey: operationID) }
+            let detached = await orchestrator.detach(AgentID(rawValue: name))
+            await self.synchronizePermissionReviewerHealth(using: orchestrator)
+            guard detached else {
+                self.composerError = "@\(name) could not be removed; it may still have active tasks."
+                self.isWorking = false
+                return
+            }
             var settings = self.projectSettings
             settings.removeWorkspaces(forAgent: name)
             self.projectSettings = settings
@@ -353,6 +533,7 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                 projection: self.latestCoworkProjection)
             self.isWorking = false
         }
+        activeOperations[operationID] = operation
     }
 
     func removeWorkspace(path: String) {
@@ -393,6 +574,7 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             let attached = await orchestrator.attach(Agent(name: AgentID(rawValue: normalizedName), workspaceRoot: workspace,
                                             model: model, profile: self.projectSettings.defaultProfile,
                                             coordinationDepth: 0))
+            await self.synchronizePermissionReviewerHealth(using: orchestrator)
             if attached {
                 self.rememberWorkspace(workspace, agentName: normalizedName, isPrimary: false)
                 self.addAgentStatus = .attached(normalizedName)
@@ -444,14 +626,18 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             input = ""
             composerError = nil
             isWorking = true
-            Task { @MainActor [weak self] in
+            let operationID = UUID()
+            let operation = Task { @MainActor [weak self] in
                 guard let self else { return }
+                defer { self.activeOperations.removeValue(forKey: operationID) }
                 let result = await orchestrator.send(finalParsed.text, to: target, userMessage: payload)
+                await self.synchronizePermissionReviewerHealth(using: orchestrator)
                 if let message = result.errorMessage {
                     self.composerError = message
                 }
                 self.isWorking = false
             }
+            activeOperations[operationID] = operation
         }
     }
 
@@ -481,30 +667,50 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         }
         composerError = nil
         isWorking = true
-        Task { @MainActor [weak self] in
+        let operationID = UUID()
+        let operation = Task { @MainActor [weak self] in
             guard let self else { return }
+            defer { self.activeOperations.removeValue(forKey: operationID) }
             let result = await orchestrator.retry(task)
+            await self.synchronizePermissionReviewerHealth(using: orchestrator)
             if let message = result.errorMessage {
                 self.composerError = message
             }
             self.isWorking = false
         }
+        activeOperations[operationID] = operation
     }
 
     // MARK: PermissionResponder
 
     nonisolated func requestApproval(_ request: PermissionRequestPayload) async -> PermissionDecision {
-        await withCheckedContinuation { (continuation: CheckedContinuation<PermissionDecision, Never>) in
-            Task { @MainActor in
-                self.pendingPermission = PendingPermission(request: request, state: .livePending, requestedSeq: -1)
-                self.permissionContinuation = continuation
+        let waiter = CoworkPermissionWaiter()
+        return await withTaskCancellationHandler(operation: {
+            if Task.isCancelled {
+                waiter.resolve(.deny)
             }
-        }
+            return await withCheckedContinuation { continuation in
+                waiter.install(continuation)
+                Task { @MainActor [weak self] in
+                    guard let self else {
+                        waiter.resolve(.deny)
+                        return
+                    }
+                    self.registerPermission(request, waiter: waiter)
+                }
+            }
+        }, onCancel: {
+            waiter.resolve(.deny)
+            Task { @MainActor [weak self] in
+                self?.cancelPermission(request.requestId, waiter: waiter)
+            }
+        })
     }
 
     func resolvePermission(_ decision: PermissionDecision) {
         guard pendingPermission?.state.isActionable == true else { return }
-        guard let continuation = permissionContinuation else {
+        guard let requestID = pendingPermission?.request.requestId,
+              let waiter = permissionWaiters.removeValue(forKey: requestID) else {
             if pendingPermission?.state == .needsRerun {
                 return
             }
@@ -518,8 +724,91 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             pending.state = .resolving
             pendingPermission = pending
         }
-        continuation.resume(returning: decision)
-        permissionContinuation = nil
+        suppressedPermissionRequestIDs.insert(requestID)
+        waiter.resolve(decision)
+        permissionQueue.removeAll { $0.request.requestId == requestID }
+        pendingPermission = permissionQueue.first
+        restoreSteadyPermissionReviewerStatusIfPossible()
+    }
+
+    private func registerPermission(_ request: PermissionRequestPayload,
+                                    waiter: CoworkPermissionWaiter) {
+        guard waiter.isPending else { return }
+        let requestID = request.requestId
+        if let previous = permissionWaiters.removeValue(forKey: requestID), previous !== waiter {
+            previous.resolve(.deny)
+        }
+        permissionQueue.removeAll { $0.request.requestId == requestID }
+        guard waiter.isPending else { return }
+
+        suppressedPermissionRequestIDs.remove(requestID)
+        permissionWaiters[requestID] = waiter
+        permissionQueue.append(PendingPermission(
+            request: request,
+            state: .livePending,
+            requestedSeq: -1))
+        permissionReviewerStatus = .fallback(permissionFallbackReason)
+        schedulePermissionReviewerHealthRefresh()
+
+        // Cancellation can resolve the waiter from a non-MainActor thread
+        // between the first guard and registration. Remove it immediately if so;
+        // the scheduled cancellation cleanup remains an idempotent fallback.
+        guard waiter.isPending else {
+            cancelPermission(requestID, waiter: waiter)
+            return
+        }
+        pendingPermission = permissionQueue.first
+    }
+
+    private func cancelPermission(_ requestID: RequestID,
+                                  waiter: CoworkPermissionWaiter) {
+        suppressedPermissionRequestIDs.insert(requestID)
+        if permissionWaiters[requestID] === waiter {
+            permissionWaiters.removeValue(forKey: requestID)
+        }
+        permissionQueue.removeAll { $0.request.requestId == requestID }
+        pendingPermission = permissionQueue.first
+        restoreSteadyPermissionReviewerStatusIfPossible()
+    }
+
+    private func presentedPermission(projected: PendingPermission?) -> PendingPermission? {
+        if let queued = permissionQueue.first {
+            return queued
+        }
+        guard let projected,
+              !suppressedPermissionRequestIDs.contains(projected.request.requestId) else {
+            return nil
+        }
+        return projected
+    }
+
+    private func setPermissionReviewerStatus(_ status: CoworkPermissionReviewerStatus) {
+        steadyPermissionReviewerStatus = status
+        if permissionQueue.isEmpty {
+            permissionReviewerStatus = status
+        }
+    }
+
+    private var permissionFallbackReason: String {
+        switch steadyPermissionReviewerStatus {
+        case .enabled:
+            return "Automatic review requested a user decision."
+        case .failed(let reason):
+            return "Automatic review is unavailable (\(reason)); user approval is required."
+        case .disabled:
+            return "Automatic review is disabled; user approval is required."
+        case .enabling:
+            return "Automatic review is still starting; user approval is required."
+        case .degraded(let reason):
+            return reason
+        case .fallback(let reason):
+            return reason
+        }
+    }
+
+    private func restoreSteadyPermissionReviewerStatusIfPossible() {
+        guard permissionQueue.isEmpty else { return }
+        permissionReviewerStatus = steadyPermissionReviewerStatus
     }
 
     private func validateNewAgentName(_ rawName: String) -> AgentNameValidation {
@@ -697,6 +986,20 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         formatter.numberStyle = .decimal
         return formatter
     }()
+}
+
+enum CoworkPermissionReviewerStatus: Equatable {
+    case disabled
+    case enabling
+    case enabled(AgentID)
+    case fallback(String)
+    case degraded(String)
+    case failed(String)
+
+    var canRetry: Bool {
+        if case .failed = self { return true }
+        return false
+    }
 }
 
 enum CoworkAddAgentStatus: Equatable {

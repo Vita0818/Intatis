@@ -84,7 +84,10 @@ final class TaskGraphPolicyTests: XCTestCase {
         try graph.requireRootSuccess(root)
         let first = task(issuer: main, assignee: a, parent: root.id, objective: "Count files")
         try graph.requireSuccess(first)
-        graph.updateStatus(taskID: first.id, status: .completed)
+        XCTAssertTrue(graph.updateStatus(taskID: first.id, status: .assigned))
+        XCTAssertTrue(graph.updateStatus(taskID: first.id, status: .queued))
+        XCTAssertTrue(graph.updateStatus(taskID: first.id, status: .running))
+        XCTAssertTrue(graph.updateStatus(taskID: first.id, status: .completed))
         let retry = task(issuer: main, assignee: a, parent: root.id, objective: "count files")
 
         try graph.requireSuccess(retry)

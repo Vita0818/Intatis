@@ -230,6 +230,9 @@ public struct CodeProjection: Equatable, Sendable {
             items.append(CodeItem(id: p.messageId.rawValue, kind: .agent,
                                   title: title, body: p.content))
 
+        case .agentMessageConsumed:
+            break
+
         case .agentToAgentMessage(let p):
             items.append(CodeItem(id: stableID(envelope, "agent_to_agent"), kind: .agentToAgent,
                                   title: "\(p.from.rawValue) → \(p.to.rawValue)", body: p.content))
@@ -276,6 +279,10 @@ public struct CodeProjection: Equatable, Sendable {
                                     code: "permission_denied",
                                     message: p.reason)))
 
+        case .workspaceLeaseRevoked(let p):
+            items.append(CodeItem(id: p.leaseID.rawValue + ":revoked", kind: .note,
+                                  title: "workspace lease revoked", body: p.reason))
+
         case .capabilityLeaseCreated(let p):
             items.append(CodeItem(id: p.lease.id.rawValue, kind: .note, title: "capability lease",
                                   body: p.lease.tools.map(\.rawValue).sorted().joined(separator: ", ")))
@@ -316,6 +323,10 @@ public struct CodeProjection: Equatable, Sendable {
                                     code: "task_failed",
                                     message: p.error)))
 
+        case .taskCancelled(let p):
+            items.append(CodeItem(id: p.taskID.rawValue + ":cancelled", kind: .note,
+                                  title: "task cancelled · (p.agent.rawValue)", body: p.reason))
+
         case .taskRejected(let p):
             items.append(CodeItem(id: p.contract?.id.rawValue ?? stableID(envelope, "task_rejected"), kind: .error,
                                   title: "task rejected",
@@ -328,7 +339,9 @@ public struct CodeProjection: Equatable, Sendable {
             items.append(CodeItem(id: p.artifactId.rawValue, kind: .note, title: "artifact",
                                   body: "📎 \(p.kind)" + (p.prompt.map { ": \($0)" } ?? "")))
 
-        case .permissionRequest, .agentStatus, .artifactProgress, .turnStats:
+        case .toolExecutionPrepared, .toolExecutionSettled,
+             .permissionRequest, .permissionReviewRequested, .permissionReviewSettled,
+             .agentStatus, .artifactProgress, .turnStats:
             break
         }
     }

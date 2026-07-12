@@ -54,12 +54,41 @@ private func schedulerTaskCompleted(_ events: [Envelope]) -> [TaskCompletedPaylo
     }
 }
 
+private func schedulerUnitTask(_ id: String,
+                               assignee: AgentID,
+                               issuer: AgentID = AgentID(rawValue: "main"),
+                               parentTaskID: TaskID? = nil,
+                               input: String? = nil,
+                               attempt: Int? = 1) -> ScheduledTask {
+    let taskID = TaskID(rawValue: id)
+    let contract = TaskContract(
+        id: taskID,
+        issuer: issuer,
+        assignee: assignee,
+        parentTaskID: parentTaskID,
+        objective: "Objective for \(id)",
+        roleHint: "scheduler test worker",
+        expectedDeliverable: "scheduler test result")
+    return ScheduledTask(
+        contract: contract,
+        input: input ?? contract.objective,
+        rootTaskID: parentTaskID ?? taskID,
+        parentTaskID: parentTaskID,
+        issuer: issuer,
+        assignee: assignee,
+        causalParentID: parentTaskID,
+        hopCount: 1,
+        visitedAgents: [issuer, assignee],
+        attempt: attempt)
+}
+
 final class SchedulerMailboxTests: XCTestCase {
     private let main = AgentID(rawValue: "main")
     private let worker = AgentID(rawValue: "worker")
 
     private func makeOrchestrator(log: EventLog,
-                                  workerProvider: SchedulerProvider = SchedulerProvider()) async throws -> (Orchestrator, URL, URL) {
+                                  workerProvider: SchedulerProvider = SchedulerProvider(),
+                                  workerCoordinationDepth: Int = 0) async throws -> (Orchestrator, URL, URL) {
         let wsMain = try schedulerWorkspace()
         let wsWorker = try schedulerWorkspace()
         let worker = self.worker
@@ -70,7 +99,8 @@ final class SchedulerMailboxTests: XCTestCase {
                                                    profile: .reviewed,
                                                    coordinationDepth: Agent.defaultCoordinationDepth))
         let workerAttached = await orch.attach(Agent(name: worker, workspaceRoot: wsWorker, model: ModelID(rawValue: "m"),
-                                                     profile: .reviewed))
+                                                     profile: .reviewed,
+                                                     coordinationDepth: workerCoordinationDepth))
         XCTAssertTrue(mainAttached)
         XCTAssertTrue(workerAttached)
         return (orch, wsMain, wsWorker)
@@ -93,6 +123,32 @@ final class SchedulerMailboxTests: XCTestCase {
         XCTAssertEqual(queuedIDs, [taskID])
         XCTAssertEqual(pendingTasks, [taskID])
         XCTAssertTrue(events.contains { if case .taskQueued = $0.event { return true } else { return false } })
+    }
+
+    func testListAgentsIncludesLeaseRolesAndCompactTaskStateWithoutTaskContent() async throws {
+        let log = try schedulerLog()
+        let (orch, wsMain, wsWorker) = try await makeOrchestrator(log: log)
+        defer {
+            try? FileManager.default.removeItem(at: wsMain)
+            try? FileManager.default.removeItem(at: wsWorker)
+        }
+
+        let queued = await orch.enqueueDelegatedTask(
+            from: main,
+            to: worker.rawValue,
+            objective: "Inspect /private/secret.swift.",
+            roleHint: "sensitive worker",
+            expectedDeliverable: "Return secret implementation details.")
+        let taskID = try XCTUnwrap(queued.taskID)
+
+        let listing = await orch.listForTool()
+        XCTAssertTrue(listing.contains("@main · m · coordinator"))
+        XCTAssertTrue(listing.contains("@worker · m · worker"))
+        XCTAssertTrue(listing.contains("issued active \(taskID.rawValue):queued"))
+        XCTAssertTrue(listing.contains("tasks \(taskID.rawValue):queued"))
+        XCTAssertFalse(listing.contains("Inspect /private/secret.swift"))
+        XCTAssertFalse(listing.contains("sensitive worker"))
+        XCTAssertFalse(listing.contains("Return secret implementation details"))
     }
 
     func testSchedulerRunsTargetAgentIndependentlyAndRecordsResult() async throws {
@@ -139,7 +195,9 @@ final class SchedulerMailboxTests: XCTestCase {
 
     func testImmediateABACycleIsRejected() async throws {
         let log = try schedulerLog()
-        let (orch, wsMain, wsWorker) = try await makeOrchestrator(log: log)
+        let (orch, wsMain, wsWorker) = try await makeOrchestrator(
+            log: log,
+            workerCoordinationDepth: Agent.defaultCoordinationDepth)
         defer {
             try? FileManager.default.removeItem(at: wsMain)
             try? FileManager.default.removeItem(at: wsWorker)
@@ -156,7 +214,7 @@ final class SchedulerMailboxTests: XCTestCase {
         XCTAssertEqual(queued.first?.contract.id, parentTaskID)
     }
 
-    func testCompatibilityDelegateTaskCanAwaitSchedulerResult() async throws {
+    func testDelegateTaskReturnsTaskReportAfterAwaitingSchedulerResult() async throws {
         let log = try schedulerLog()
         let workerProvider = SchedulerProvider([.textDelta("awaited result"), .done(finishReason: "stop")])
         let (orch, wsMain, wsWorker) = try await makeOrchestrator(log: log, workerProvider: workerProvider)
@@ -167,7 +225,10 @@ final class SchedulerMailboxTests: XCTestCase {
 
         let result = await orch.delegateTask(from: main, to: worker.rawValue, objective: "Await this worker task.")
 
-        XCTAssertEqual(result, "awaited result")
+        XCTAssertTrue(result.contains("Task Report"))
+        XCTAssertTrue(result.contains("status: completed"))
+        XCTAssertTrue(result.contains("agent: @worker"))
+        XCTAssertTrue(result.contains("summary: awaited result"))
         XCTAssertEqual(workerProvider.requests.count, 1)
         let remainingTasks = await orch.queuedTasks()
         let events = await log.replay()
@@ -219,5 +280,186 @@ final class SchedulerMailboxTests: XCTestCase {
         XCTAssertTrue(completions.contains { $0.agent == ios && $0.result == "iOS count: 7" })
         XCTAssertEqual(macosProvider.requests.count, 1)
         XCTAssertEqual(iosProvider.requests.count, 1)
+    }
+
+    func testSchedulerRejectsDuplicateTaskIDAndAllowsOnlyExactTerminalRetry() {
+        let worker = AgentID(rawValue: "worker")
+        let task = schedulerUnitTask("task_dedup", assignee: worker)
+        var scheduler = AgentScheduler()
+
+        XCTAssertEqual(scheduler.enqueue(task, mode: .newTask), .enqueued(task.contract.id))
+        XCTAssertEqual(
+            scheduler.enqueue(task, mode: .newTask),
+            .rejected(task.contract.id, .duplicateQueued))
+        XCTAssertEqual(scheduler.queuedTasks().map(\.contract.id), [task.contract.id])
+
+        let claimed = scheduler.claimNext()
+        XCTAssertEqual(claimed, task)
+        XCTAssertTrue(scheduler.recordStarted(task: task))
+        scheduler.recordFailed(task: task, error: "retry me")
+
+        var changedTask = task
+        changedTask.input = "changed input under the same task id"
+        XCTAssertEqual(
+            scheduler.enqueue(changedTask, mode: .retry),
+            .rejected(task.contract.id, .retryTaskMismatch))
+        XCTAssertEqual(
+            scheduler.enqueue(task, mode: .retry),
+            .rejected(task.contract.id, .retryAttemptMismatch))
+        var retry = task
+        retry.attempt = 2
+        XCTAssertEqual(scheduler.enqueue(retry, mode: .retry), .retryReplaced(task.contract.id))
+        XCTAssertEqual(scheduler.queuedTasks(), [retry])
+    }
+
+    func testSchedulerRetryAttemptMustBeMonotonicAndWithinContractLimit() {
+        let worker = AgentID(rawValue: "worker")
+        var task = schedulerUnitTask("task_retry_limit", assignee: worker)
+        task.contract.maxAttempts = 2
+        var scheduler = AgentScheduler()
+        XCTAssertTrue(scheduler.enqueue(task, mode: .newTask).accepted)
+        XCTAssertEqual(scheduler.claimNext(), task)
+        XCTAssertTrue(scheduler.recordStarted(task: task))
+        scheduler.recordFailed(task: task, error: "retry me")
+
+        var skippedAttempt = task
+        skippedAttempt.attempt = 3
+        XCTAssertEqual(
+            scheduler.enqueue(skippedAttempt, mode: .retry),
+            .rejected(task.contract.id, .retryAttemptMismatch))
+        var nextAttempt = task
+        nextAttempt.attempt = 2
+        XCTAssertEqual(scheduler.enqueue(nextAttempt, mode: .retry), .retryReplaced(task.contract.id))
+        XCTAssertEqual(scheduler.claimNext(), nextAttempt)
+        XCTAssertTrue(scheduler.recordStarted(task: nextAttempt))
+        scheduler.recordFailed(task: nextAttempt, error: "still failing")
+        var overLimit = nextAttempt
+        overLimit.attempt = 3
+        XCTAssertEqual(
+            scheduler.enqueue(overLimit, mode: .retry),
+            .rejected(task.contract.id, .retryAttemptLimitExceeded))
+    }
+
+    func testSchedulerClaimsAtMostOneTaskPerAgentButDifferentAgentsCanRunTogether() {
+        let workerA = AgentID(rawValue: "worker-a")
+        let workerB = AgentID(rawValue: "worker-b")
+        let a1 = schedulerUnitTask("task_a1", assignee: workerA)
+        let a2 = schedulerUnitTask("task_a2", assignee: workerA)
+        let b1 = schedulerUnitTask("task_b1", assignee: workerB)
+        var scheduler = AgentScheduler()
+        scheduler.enqueue(a1)
+        scheduler.enqueue(a2)
+        scheduler.enqueue(b1)
+
+        XCTAssertEqual(scheduler.claimNext(), a1)
+        XCTAssertEqual(scheduler.claimNext(), b1, "busy worker-a must not block an idle worker-b")
+        XCTAssertNil(scheduler.claimNext(), "worker-a's second task stays queued while worker-a is busy")
+        XCTAssertTrue(scheduler.isAgentBusy(workerA))
+        XCTAssertTrue(scheduler.isAgentBusy(workerB))
+        XCTAssertEqual(scheduler.queuedTasks(), [a2])
+
+        XCTAssertTrue(scheduler.recordStarted(task: a1))
+        scheduler.recordCompleted(task: a1, result: "a1 done")
+        XCTAssertFalse(scheduler.isAgentBusy(workerA))
+        XCTAssertEqual(scheduler.claimNext(), a2)
+        XCTAssertTrue(scheduler.isAgentBusy(workerA))
+    }
+
+    func testCancelAndRemoveOperateOnlyOnQueuedTasks() {
+        let worker = AgentID(rawValue: "worker")
+        let cancelled = schedulerUnitTask("task_cancelled", assignee: worker)
+        let removed = schedulerUnitTask("task_removed", assignee: worker)
+        var scheduler = AgentScheduler()
+        scheduler.enqueue(cancelled)
+        scheduler.enqueue(removed)
+
+        XCTAssertEqual(scheduler.cancelQueuedTask(taskID: cancelled.contract.id), cancelled)
+        XCTAssertEqual(scheduler.record(for: cancelled.contract.id)?.status, .cancelled)
+        XCTAssertFalse(scheduler.mailbox(for: worker).pendingTasks.contains(cancelled.contract.id))
+        XCTAssertEqual(scheduler.removeQueuedTask(taskID: removed.contract.id), removed)
+        XCTAssertNil(scheduler.record(for: removed.contract.id))
+        XCTAssertTrue(scheduler.queuedTasks().isEmpty)
+
+        var retried = cancelled
+        retried.attempt = 2
+        XCTAssertEqual(scheduler.enqueue(retried, mode: .retry), .retryReplaced(cancelled.contract.id))
+        let claimed = scheduler.claimNext()
+        XCTAssertEqual(claimed, retried)
+        XCTAssertNil(scheduler.cancelQueuedTask(taskID: cancelled.contract.id),
+                     "claimed work needs cooperative executor cancellation")
+        scheduler.recordCancelled(task: retried)
+        XCTAssertFalse(scheduler.recordStarted(task: retried),
+                       "a claimed task cancelled before start must not be resurrected")
+        XCTAssertFalse(scheduler.isAgentBusy(worker))
+    }
+
+    func testSchedulerSnapshotRestoreRequeuesClaimedWorkAndPreservesMailbox() throws {
+        let workerA = AgentID(rawValue: "worker-a")
+        let workerB = AgentID(rawValue: "worker-b")
+        let running = schedulerUnitTask("task_running", assignee: workerA)
+        let queued = schedulerUnitTask("task_queued", assignee: workerB)
+        let message = PendingAgentMessage(
+            id: MessageID(rawValue: "msg_snapshot"),
+            sender: workerB,
+            recipient: workerA,
+            content: "snapshot payload",
+            kind: "request_information",
+            taskID: running.contract.id,
+            causalParentID: running.parentTaskID)
+        var scheduler = AgentScheduler()
+        scheduler.enqueue(running)
+        scheduler.enqueue(queued)
+        XCTAssertEqual(scheduler.claimNext(), running)
+        XCTAssertTrue(scheduler.recordStarted(task: running))
+        XCTAssertTrue(scheduler.enqueueMessage(message))
+
+        let encoded = try JSONEncoder().encode(scheduler.snapshot())
+        let decoded = try JSONDecoder().decode(AgentSchedulerSnapshot.self, from: encoded)
+        var restored = AgentScheduler(snapshot: decoded)
+
+        XCTAssertFalse(restored.isAgentBusy(workerA))
+        XCTAssertEqual(restored.queuedTasks(), [running, queued])
+        XCTAssertEqual(restored.record(for: running.contract.id)?.status, .queued)
+        XCTAssertEqual(restored.mailbox(for: workerA).pendingTasks, [running.contract.id])
+        XCTAssertEqual(restored.peekMessage(for: workerA), message)
+        XCTAssertEqual(restored.claimNext(), running)
+    }
+
+    func testMailboxPeekConsumeAcknowledgeAndDrainPreserveCausalMetadata() {
+        let sender = AgentID(rawValue: "main")
+        let recipient = AgentID(rawValue: "worker")
+        let taskID = TaskID(rawValue: "task_mailbox")
+        let first = PendingAgentMessage(
+            id: MessageID(rawValue: "msg_1"),
+            sender: sender,
+            recipient: recipient,
+            content: "first",
+            kind: "send_message",
+            taskID: taskID,
+            causalParentID: TaskID(rawValue: "task_parent"))
+        let second = PendingAgentMessage(
+            id: MessageID(rawValue: "msg_2"),
+            sender: sender,
+            recipient: recipient,
+            content: "second",
+            kind: "reply_message",
+            taskID: taskID,
+            inReplyTo: first.id)
+        var scheduler = AgentScheduler()
+
+        XCTAssertTrue(scheduler.enqueueMessage(first))
+        XCTAssertFalse(scheduler.enqueueMessage(first), "message identity is globally deduplicated")
+        XCTAssertTrue(scheduler.enqueueMessage(second))
+        XCTAssertEqual(scheduler.peekMessages(for: recipient), [first, second])
+        XCTAssertEqual(scheduler.consumeNextMessage(for: recipient), first)
+        XCTAssertEqual(scheduler.mailbox(for: recipient).pendingMessages, [second.id])
+        XCTAssertTrue(scheduler.acknowledgeMessage(second.id, recipient: recipient))
+        XCTAssertFalse(scheduler.acknowledgeMessage(second.id, recipient: recipient))
+        XCTAssertTrue(scheduler.drainMessages(for: recipient).isEmpty)
+
+        XCTAssertTrue(scheduler.enqueueMessage(first))
+        XCTAssertTrue(scheduler.enqueueMessage(second))
+        XCTAssertEqual(scheduler.drainMessages(for: recipient), [first, second])
+        XCTAssertTrue(scheduler.mailbox(for: recipient).pendingMessages.isEmpty)
     }
 }

@@ -70,6 +70,20 @@ final class PathConfinementTests: XCTestCase {
         XCTAssertThrowsError(try PathConfinement.resolve("~/.local/share/opencode/auth.json", within: root))
     }
 
+    func testGenericToolsCannotReadOrRewriteExecutableGitConfig() throws {
+        let root = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent(".git/worktrees/worker", isDirectory: true),
+            withIntermediateDirectories: true)
+
+        XCTAssertThrowsError(try PathConfinement.resolve(".git/config", within: root))
+        XCTAssertThrowsError(try PathConfinement.resolve(".git/config.worktree", within: root))
+        XCTAssertThrowsError(try PathConfinement.resolve(
+            ".git/worktrees/worker/config.worktree",
+            within: root))
+    }
+
     func testNonExistingChildUnderWorkspaceAllowedWhenParentConfined() throws {
         let root = try tempWorkspace()
         defer { try? FileManager.default.removeItem(at: root) }

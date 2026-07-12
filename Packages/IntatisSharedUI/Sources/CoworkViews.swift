@@ -612,7 +612,7 @@ public struct CoworkShell: View {
             inspectorRow("Model", value: project.defaultModel)
             inspectorRow("Permission", value: project.defaultPermission)
             if let tokenBudget = project.tokenBudget {
-                inspectorRow("Token budget", value: tokenBudget)
+                inspectorRow("Soft token budget", value: tokenBudget)
             }
             if let onShowProjectSettings {
                 Button(action: onShowProjectSettings) {

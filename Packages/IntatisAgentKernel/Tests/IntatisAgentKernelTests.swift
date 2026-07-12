@@ -83,6 +83,26 @@ private final class ScriptedShell: ShellRunner, @unchecked Sendable {
 private struct NoGit: GitService {
     func status(workspace: URL) async throws -> String { "" }
     func diff(workspace: URL) async throws -> String { "" }
+    func stagedDiff(workspace: URL) async throws -> String { "" }
+    func repositoryInfo(workspace: URL) async throws -> String { "root: \(workspace.path)\nbranch: main" }
+    func recentCommits(limit: Int, workspace: URL) async throws -> String { "(no commits)" }
+    func diffAgainst(base: String, workspace: URL) async throws -> String { "" }
+    func branchInfo(workspace: URL) async throws -> String { "current: main\nbranches:\n* main" }
+    func createBranch(name: String, startPoint: String?, workspace: URL) async throws -> String { "created branch \(name)" }
+    func stage(paths: [String], workspace: URL) async throws -> String { "staged \(paths.joined(separator: ","))" }
+    func unstage(paths: [String], workspace: URL) async throws -> String { "unstaged \(paths.joined(separator: ","))" }
+    func commit(message: String, workspace: URL) async throws -> String { "committed \(message)" }
+    func applyPatch(diff: String, reverse: Bool, checkOnly: Bool, cached: Bool, workspace: URL) async throws -> GitPatchResult {
+        GitPatchResult(text: "patch", changedFiles: ["file.txt"], diff: diff)
+    }
+    func worktrees(workspace: URL) async throws -> String { "(no worktrees)" }
+    func createWorktree(name: String, startPoint: String?, branch: String?, workspace: URL) async throws -> String { "created worktree \(name)" }
+    func removeWorktree(name: String, force: Bool, workspace: URL) async throws -> String { "removed worktree \(name)" }
+    func remotes(workspace: URL) async throws -> String { "(no remotes)" }
+    func fetch(remote: String, branch: String?, prune: Bool, workspace: URL) async throws -> String { "fetched \(remote)" }
+    func pullFastForward(remote: String, branch: String, workspace: URL) async throws -> String { "pulled \(remote)/\(branch)" }
+    func push(remote: String, branch: String, setUpstream: Bool, workspace: URL) async throws -> String { "pushed \(branch)" }
+    func switchBranch(name: String, workspace: URL) async throws -> String { "switched \(name)" }
 }
 
 final class IntatisAgentKernelTests: XCTestCase {
@@ -194,7 +214,7 @@ final class IntatisAgentKernelTests: XCTestCase {
             if case .toolResult(let payload) = envelope.event { return payload }
             return nil
         }.first
-        XCTAssertTrue(result?.observation.contains("user denied") == true)
+        XCTAssertTrue(result?.observation.contains("permission denied") == true)
     }
 
     func testReadOnlyToolNeedsNoApproval() async throws {
@@ -682,21 +702,21 @@ final class IntatisAgentKernelTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: ws) }
 
         let provider = ScriptedProvider([
-            [.toolCalls([ToolCall(id: "empty_command",
-                                  name: "run_shell",
-                                  arguments: #"{"command":""}"#)]),
+            [.toolCalls([ToolCall(id: "empty_path",
+                                  name: "read_file",
+                                  arguments: #"{"path":""}"#)]),
              .done(finishReason: "tool_calls")],
-            [.textDelta("I need a command."), .done(finishReason: "stop")],
+            [.textDelta("I need a path."), .done(finishReason: "stop")],
         ])
         let loop = makeLoop(ws: ws, log: log, provider: provider, responder: FixedResponder(.allow))
 
-        try await loop.send("run an empty command")
+        try await loop.send("read an empty path")
 
         let events = await log.replay()
         let types = events.map { $0.event.type }
         XCTAssertFalse(types.contains(.permissionRequest))
         let result = await toolResults(in: log).first
-        XCTAssertEqual(result?.observation, "invalid tool input: argument command for run_shell must have at least 1 character.")
+        XCTAssertEqual(result?.observation, "invalid tool input: argument path for read_file must have at least 1 character.")
     }
 
     func testUnknownToolArgumentsDoNotRequestPermissionOrExecuteTool() async throws {
@@ -743,6 +763,33 @@ final class IntatisAgentKernelTests: XCTestCase {
         XCTAssertEqual(result?.observation, "clean")
     }
 
+    func testGitWriteToolRequestsPermissionBeforeExecution() async throws {
+        let (ws, log) = try workspaceAndLog()
+        defer { try? FileManager.default.removeItem(at: ws) }
+
+        let provider = ScriptedProvider([
+            [.toolCalls([ToolCall(id: "stage",
+                                  name: "git_stage",
+                                  arguments: #"{"paths":["Sources/App.swift"]}"#)]),
+             .done(finishReason: "tool_calls")],
+            [.textDelta("Permission denied."), .done(finishReason: "stop")],
+        ])
+        let loop = makeLoop(ws: ws, log: log, provider: provider, responder: FixedResponder(.deny))
+
+        try await loop.send("stage a file")
+
+        let events = await log.replay()
+        XCTAssertTrue(events.contains {
+            if case .permissionRequest(let payload) = $0.event {
+                return payload.tool == "git_stage"
+            }
+            return false
+        })
+        let result = await toolResults(in: log).first
+        XCTAssertEqual(result?.observation,
+                       "permission denied: permission denied: write to workspace")
+    }
+
     func testNoArgumentToolsRejectUnknownArguments() async throws {
         let (ws, log) = try workspaceAndLog()
         defer { try? FileManager.default.removeItem(at: ws) }
@@ -763,5 +810,26 @@ final class IntatisAgentKernelTests: XCTestCase {
         XCTAssertFalse(events.map { $0.event.type }.contains(.permissionRequest))
         XCTAssertEqual(result?.observation,
                        "invalid tool input: arguments for git_status contain unknown field(s): path. Allowed fields: no fields.")
+    }
+
+    func testGitPushRejectsForceArgumentBeforePermission() async throws {
+        let (ws, log) = try workspaceAndLog()
+        defer { try? FileManager.default.removeItem(at: ws) }
+
+        let provider = ScriptedProvider([
+            [.toolCalls([ToolCall(id: "push",
+                                  name: "git_push",
+                                  arguments: #"{"remote":"origin","branch":"main","confirmRemote":"origin","confirmBranch":"main","force":true}"#)]),
+             .done(finishReason: "tool_calls")],
+            [.textDelta("Force rejected."), .done(finishReason: "stop")],
+        ])
+        let loop = makeLoop(ws: ws, log: log, provider: provider, responder: FixedResponder(.allow))
+
+        try await loop.send("push forcefully")
+
+        let events = await log.replay()
+        let result = await toolResults(in: log).first
+        XCTAssertFalse(events.map { $0.event.type }.contains(.permissionRequest))
+        XCTAssertTrue(result?.observation.contains("unknown field(s): force") == true, result?.observation ?? "")
     }
 }

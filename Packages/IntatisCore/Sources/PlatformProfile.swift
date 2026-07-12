@@ -8,7 +8,8 @@ import Foundation
 /// - macOS App Store (sandboxed): all surfaces, workspace yes, **shell no**.
 /// - macOS Developer-ID (notarized): all surfaces, workspace yes, shell yes.
 ///
-/// `run_shell` is the single capability gated by `allowsShell`.
+/// `allowsShell` gates process-backed exec tools such as browser/document
+/// backends. Production registries do not model-expose raw `run_shell`.
 public struct PlatformProfile: Sendable, Equatable {
     public let surfaces: Set<SessionKind>
     public let allowsWorkspace: Bool

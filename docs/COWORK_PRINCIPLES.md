@@ -76,10 +76,23 @@ workspace-relevant observations
 ```
 
 ### 2.4 Capability Lease
-工具应按 capability lease 暴露。普通 worker task 不应收到 coordinator 工具（`spawn_agent` / `remove_agent` / `delegate_task`）。若 task 需委派，经 `CapabilityLease.delegation` 显式授予。子 agent 不应仅因被 spawn 就获得 coordinator 能力。文档/媒体与网络/浏览器工具同样按 lease 收窄：worker 默认只能获得安全的只读能力（当前为 `read_pdf`），页面编辑、OCR/版面重建、LaTeX 编译、生图、网络访问、浏览器 profile 操作等写入/执行/网络能力必须经 coordinator lease 或未来显式 lease 授予。
+工具应按 capability lease 暴露。普通 worker task 不应收到 coordinator 工具（`spawn_agent` / `remove_agent` / `delegate_task`）。若 task 需委派，经 `CapabilityLease.delegation` 显式授予。子 agent 不应仅因被 spawn 就获得 coordinator 能力。Git、文档/媒体与网络/浏览器工具同样按 lease 收窄：worker 默认只能获得安全的只读能力（当前为 `read_pdf`），Git stage/commit/branch、remote fetch/pull/push/switch、页面编辑、OCR/版面重建、LaTeX 编译、生图、网络访问、浏览器 profile 操作等写入/执行/网络能力必须经 coordinator lease 或未来显式 lease 授予。
+
+Lease 不只是工具列表：task-scoped lease 必须核对 task ID、communication/delegation grant，并在终态撤销；WorkspaceLease 必须执行 root、read-only/read-write、allow/deny path，并固定 canonical root 的文件系统 identity。任何可能跨 await 的授权都不能只在入口校验：attach commit、权限等待后、durable prepare 后紧邻 executor、派生/retry 与 process 启动前必须复核 identity；同路径目录被替换或 legacy lease 无 identity 时 fail closed。retry 只可从原 lease 的持久审计记录克隆，缺失历史时收窄到 worker，禁止按 agent 默认角色扩大权限。
 
 ### 2.5 Task Graph + Scheduler
 协作经任务图与消息总线发生。`AgentLoop` 不得直接同步递归调用另一个 `AgentLoop`——用 mailbox / scheduler / event flow。
+
+Scheduler 必须把“claim”和“执行”分开：claim 是短状态转换，同一 agent 只允许一个 running task；不同 agent 只能在显式并发上限内并行。用户输入也必须先成为 root task，不能绕开 task graph 直接跑一个不可恢复的 AgentLoop。
+
+Task lifecycle 是 durable state machine：
+```text
+created -> assigned -> queued -> running -> completed | failed | cancelled
+failed | cancelled -> queued  only through an explicit bounded retry attempt
+```
+恢复时不能默认把所有 running 任务整段重放。每个实际 tool executor 调用前必须先持久化 execution ticket，结果持久化后再 settle；只有普通 read-only 调用可自动重放。write/exec/network/destructive 与通信、委派、spawn/remove 等协作副作用处于“prepared 但未 settled”时，任务必须进入人工对账失败态，不能自动增加 attempt。没有未决非幂等副作用的 running 任务才可在新 attempt 的 queue 事件成功落盘后重排；半完成 admission、耗尽 attempts 或缺失关键 lease 也必须明确失败。执行应有 bounded timeout/cancel、attempt 和明确标为 soft 的 session token budget；模型缺完成标记、迭代耗尽或不完整 finish reason 都是失败。
+
+Permission Reviewer 是独立控制面，不是普通 worker：使用结构化 `PermissionReviewTask`、有界 FIFO/single-flight、独立 timeout/cancellation/session-lifetime budget，不占数据面 scheduler 槽，也不得递归运行 `AgentLoop`。deadline 从 submit 计时，queue full/timeout fail closed，人工 fallback 也必须遵守同一串行生命周期。review request 与 verdict 都必须 durable-first；`allow` 只有 settled audit 成功后才可返回，持久化失败、超时、取消、自审或 hard deny 都不得放行，恢复时 orphan request 必须显式关闭。停用 reviewer 先 quiesce，再持久化 revoke/detach，迟到 allow 或落盘失败不得被误报成成功停用。reviewer 只可在 deterministic gate 的最大权限边界内收窄，不能批准真正越权。
 
 ## 3. 通信 vs 委派
 
@@ -93,6 +106,8 @@ reply_message
 ```
 
 **不要**长期用一个模糊的 `ask_agent` 操作覆盖所有用途。
+
+MessageBus 投递采用持久化的至少一次语义：先通过 Mediator，再持久化 typed message，然后进入 mailbox。只有确实投影给 agent 且该轮成功完成的 message ID 才能写 consumed event；消费确认必须先持久化再从运行时 mailbox 移除。恢复后未消费消息必须重新触发 wake task，单轮批量应有上限。
 
 ## 4. 递归与循环规则
 
@@ -131,10 +146,12 @@ secret/token/key directories
 
 自动权限审查若启用，审查者也必须是受控子 agent：
 ```text
-created only by explicit user mode switch (/auto in CLI)
+created automatically on GUI/CLI Cowork session startup when possible
+/auto only re-enables it; /default disables it
 reserved identity, not a normal task/message/delegation target
 read-only profile and no tool capability lease
 no nested AgentLoop; reviewer receives no-tool provider judgement request
+reviewer sees global context plus requesting-agent scoped context
 hard deny remains final before the reviewer can see anything
 ```
 
@@ -147,12 +164,22 @@ hard deny remains final before the reviewer can see anything
 - ask_agent creates nested AgentLoop execution
 - spawn_agent has been treated too much like read-only
 - there is no task contract / capability lease yet
+- production user turns bypass the task graph instead of creating root tasks
+- actor reentrancy allows uncontrolled same-agent or cross-agent execution
+- no durable running-task recovery, cancellation, timeout, attempt, retry, or token accounting
+- MessageBus events are disconnected from a consumable/recoverable mailbox
+- task-scoped lease fields are descriptive but unenforced or leak after terminal state
+- task context grows without request budgets or places dynamic event data in system role
+- max-iteration/incomplete provider responses can be reported as completed
 
 仍需持续关注：
 - priorHistory/global context projection must stay scoped for task runs
 - MessageBus payload/report shape must stay structured enough for replay
 - delegate_task must return a mediated Task Report, not a queued ack
 - task-scoped tool-spawned children must be recycled only when idle
+- cancellation is cooperative; provider/tool implementations need their own bounded cancellation/watchdog behavior
+- real-provider crash/restart and long-running multi-agent GUI/CLI matrices remain device-level validation work
+- EventLog-derived context/recovery index remains a future long-session performance optimization; request context itself must remain bounded even before such an index exists
 ```
 
 处理 Cowork 时把上述条目当作回归清单；若源码与本清单冲突，以当前源码和 `docs/DO_NOT_BREAK.md` 的更具体禁区为准。
@@ -186,12 +213,20 @@ worker prompt does not advertise coordinator powers
 task contract appears in context
 context projection hides unrelated raw global transcript
 capability lease controls tool registry
-worker receives only read-only document/media tools and no browser/network tools by default
+worker receives only read-only document/media tools and no git-control/git-remote/browser/network tools by default
 delegation cycle is rejected
 workspace expansion requires permission
 agent-to-agent event records caller, target, task, and causal chain
 automatic permission reviewer cannot override hard deny
 automatic permission reviewer can be enabled/disabled without becoming a normal worker
+user turn creates a root task and waits for one terminal event
+same agent is single-flight while different agents respect the concurrency limit
+running task recovery increments attempt; exhausted/interrupted admission fails explicitly
+cancel, timeout, maxIterations, missing completion marker, and incomplete finish reason never complete
+only actually presented mailbox messages are consumed; remaining batches survive replay
+task-scoped capability/workspace leases are enforced, revoked, and safely renewed on retry
+dynamic task/message/event text stays in a bounded, escaped user-role context block
+unknown future events do not cause EventLog sequence reuse
 ```
 
 ## 9. 平台边界

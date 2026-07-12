@@ -33,7 +33,7 @@ final class EventCompatibilityTests: XCTestCase {
         XCTAssertNil(payload.metadata)
     }
 
-    func testUnknownFutureEventDoesNotCrashReplay() async throws {
+    func testUnknownFutureEventDoesNotCrashReplayOrReuseSequence() async throws {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("intatis-unknown-event-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -48,9 +48,12 @@ final class EventCompatibilityTests: XCTestCase {
         try (known + "\n" + unknown + "\n").data(using: .utf8)!.write(to: url)
         let log = try EventLog(session: SessionID(rawValue: "sess_future"), fileURL: url)
 
+        let appended = try await log.append(.userMessage(.init(text: "after future event")))
         let replay = await log.replay()
 
-        XCTAssertEqual(replay.count, 1)
+        XCTAssertEqual(appended.seq, 2)
+        XCTAssertEqual(replay.map(\.seq), [0, 2])
+        XCTAssertEqual(replay.count, 2)
         XCTAssertEqual(replay.first?.event.type, .userMessage)
     }
 }

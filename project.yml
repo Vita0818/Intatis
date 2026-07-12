@@ -48,10 +48,10 @@ targets:
         INFOPLIST_KEY_CFBundleDisplayName: Intatis
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
         INFOPLIST_KEY_NSHumanReadableCopyright: "Intatis — clean-room. See NOTICE.md."
-        CODE_SIGN_ENTITLEMENTS: Apps/IntatisMac/IntatisMac.AppStore.entitlements
-        # For full Code/Cowork with shell + git, use the non-sandboxed build:
-        #   CODE_SIGN_ENTITLEMENTS: Apps/IntatisMac/IntatisMac.DeveloperID.entitlements
-        #   and set AppConfig.platformProfile = .macDeveloperID
+        CODE_SIGN_ENTITLEMENTS: Apps/IntatisMac/IntatisMac.DeveloperID.entitlements
+        # AppStore/chat-only builds can still switch back to:
+        #   CODE_SIGN_ENTITLEMENTS: Apps/IntatisMac/IntatisMac.AppStore.entitlements
+        #   and set AppConfig.platformProfile = .macAppStore
     dependencies:
       - package: Intatis
         product: IntatisCore

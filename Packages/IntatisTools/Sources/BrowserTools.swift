@@ -1059,51 +1059,55 @@ private func playwrightCommand(arguments: [String: Any]) throws -> String {
       return base ? path.join(base, path.basename(outputPath)) : outputPath;
     }
 
-    function candidatePlaywrightModules() {
-      const candidates = [];
-      if (process.env.INTATIS_PLAYWRIGHT_PATH) candidates.push(process.env.INTATIS_PLAYWRIGHT_PATH);
-      if (process.env.INTATIS_NODE_MODULES) candidates.push(path.join(process.env.INTATIS_NODE_MODULES, 'playwright'));
-      candidates.push(path.join(process.cwd(), 'node_modules', 'playwright'));
-      try {
-        const globalRoot = childProcess.execFileSync('npm', ['root', '-g'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
-        if (globalRoot) candidates.push(path.join(globalRoot, 'playwright'));
-      } catch (_) {}
-      return unique(candidates);
+    function trustedPlaywrightModules() {
+      // Never resolve from cwd, NODE_PATH, npm's dynamic global root, or a
+      // caller-provided environment variable. The workspace is model-writable,
+      // so loading workspace/node_modules would turn a browser action into
+      // arbitrary native-code execution outside the tool contract.
+      return unique([
+        '/opt/homebrew/lib/node_modules/playwright',
+        '/usr/local/lib/node_modules/playwright',
+        '/usr/lib/node_modules/playwright'
+      ]);
+    }
+
+    function trustedModuleInfo(candidate) {
+      const moduleRoot = fs.realpathSync(candidate);
+      const trustedParent = fs.realpathSync(path.dirname(candidate));
+      if (moduleRoot !== candidate && !moduleRoot.startsWith(trustedParent + path.sep)) {
+        throw new Error('trusted Playwright module resolves outside its fixed runtime root');
+      }
+      const entry = fs.realpathSync(require.resolve(moduleRoot));
+      if (entry !== moduleRoot && !entry.startsWith(moduleRoot + path.sep)) {
+        throw new Error('Playwright entry resolves outside its fixed module root');
+      }
+      return { moduleRoot, entry };
     }
 
     function loadPlaywright() {
-      const checked = ['node resolution: playwright'];
-      try {
-        const mod = require('playwright');
-        return { mod, resolvedFrom: require.resolve('playwright'), checked };
-      } catch (error) {
-        checked.push(`node resolution failed: ${error.message}`);
-      }
-      for (const candidate of candidatePlaywrightModules()) {
+      const checked = [];
+      for (const candidate of trustedPlaywrightModules()) {
         checked.push(candidate);
         try {
-          const mod = require(candidate);
-          return { mod, resolvedFrom: candidate, checked };
+          const trusted = trustedModuleInfo(candidate);
+          const mod = require(trusted.entry);
+          return { mod, resolvedFrom: trusted.entry, moduleRoot: trusted.moduleRoot, checked };
         } catch (error) {
           checked.push(`${candidate} failed: ${error.message}`);
         }
       }
       const error = new Error([
         'playwright is not installed or not resolvable by Node.',
-        'Install project-local support with: npm install --save-dev playwright && npx playwright install chromium',
-        'Or install global support with: npm install -g playwright && npx playwright install chromium',
-        'Set INTATIS_PLAYWRIGHT_PATH or INTATIS_NODE_MODULES if Playwright is installed in a custom location.'
+        'Install Playwright in a trusted fixed global runtime root (/opt/homebrew, /usr/local, or /usr).',
+        'Workspace-local node_modules and environment-selected module paths are intentionally ignored.'
       ].join(' '));
       error.checked = checked;
       throw error;
     }
 
-    function playwrightVersion(resolvedFrom) {
-      const candidates = [];
-      if (resolvedFrom) candidates.push(path.join(resolvedFrom, 'package.json'));
-      try { candidates.push(require.resolve('playwright/package.json')); } catch (_) {}
-      for (const candidate of unique(candidates)) {
-        try { return JSON.parse(fs.readFileSync(candidate, 'utf8')).version || ''; } catch (_) {}
+    function playwrightVersion(moduleRoot) {
+      if (moduleRoot) {
+        try { return JSON.parse(fs.readFileSync(path.join(moduleRoot, 'package.json'), 'utf8')).version || ''; } catch (_) {}
       }
       return '';
     }
@@ -1120,7 +1124,6 @@ private func playwrightCommand(arguments: [String: Any]) throws -> String {
     function cdpExecutableForChannel(channel) {
       const value = (channel || 'chromium').toLowerCase();
       const candidates = [];
-      if (process.env.INTATIS_BROWSER_EXECUTABLE) candidates.push(process.env.INTATIS_BROWSER_EXECUTABLE);
       if (process.platform === 'darwin') {
         if (value.startsWith('msedge')) candidates.push('/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge');
         if (value.startsWith('chrome')) candidates.push('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome');
@@ -1150,12 +1153,12 @@ private func playwrightCommand(arguments: [String: Any]) throws -> String {
       let available = false;
       let resolvedFrom = '';
       let version = '';
-      let checked = ['node resolution: playwright'];
+      let checked = trustedPlaywrightModules();
       try {
         const info = loadPlaywright();
         available = true;
         resolvedFrom = info.resolvedFrom || '';
-        version = playwrightVersion(resolvedFrom);
+        version = playwrightVersion(info.moduleRoot);
         checked = info.checked || checked;
       } catch (error) {
         checked = error.checked || checked.concat([String(error && error.message ? error.message : error)]);
@@ -1741,7 +1744,6 @@ private func cdpCommand(arguments: [String: Any]) throws -> String {
     function cdpExecutableForChannel(channel) {
       const value = (channel || 'chromium').toLowerCase();
       const candidates = [];
-      if (process.env.INTATIS_BROWSER_EXECUTABLE) candidates.push(process.env.INTATIS_BROWSER_EXECUTABLE);
       if (process.platform === 'darwin') {
         if (value.startsWith('msedge')) candidates.push('/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge');
         if (value.startsWith('chrome')) candidates.push('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome');
@@ -2879,10 +2881,10 @@ private func runPlaywrightUnlocked(arguments: [String: Any],
                                    redactions: [String] = [],
                                    changedFiles: [String]? = nil) async throws -> ToolObservation {
     let command = try playwrightCommand(arguments: arguments)
-    var shellResult = try await context.shell.run(command, cwd: context.workspaceRoot)
+    var shellResult = try await context.networkStructuredShell.run(command, cwd: context.workspaceRoot)
     if shellResult.exitCode != 0 && browserBackendMissing(shellResult) {
         let fallbackCommand = try cdpCommand(arguments: arguments)
-        shellResult = try await context.shell.run(fallbackCommand, cwd: context.workspaceRoot)
+        shellResult = try await context.networkStructuredShell.run(fallbackCommand, cwd: context.workspaceRoot)
     }
     guard shellResult.exitCode == 0 else {
         var message = shellResult.stderr.isEmpty ? shellResult.stdout : shellResult.stderr
@@ -3118,7 +3120,7 @@ public struct BrowserDiagnosticsTool: Tool {
             "historyFile": historyURL.path,
         ]
         let command = try playwrightCommand(arguments: payload)
-        let shellResult = try await context.shell.run(command, cwd: context.workspaceRoot)
+        let shellResult = try await context.structuredShell.run(command, cwd: context.workspaceRoot)
         guard shellResult.exitCode == 0 else {
             var message = shellResult.stderr.isEmpty ? shellResult.stdout : shellResult.stderr
             if message.count > 10_000 { message = String(message.prefix(10_000)) + "\n[truncated]" }

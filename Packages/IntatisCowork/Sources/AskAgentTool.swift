@@ -5,8 +5,8 @@ import IntatisTools
 
 /// The only way one agent can reach another. It carries a question (a summary,
 /// not raw files) through the injected `AgentMessenger`, which routes via the
-/// mediated Message Bus. Declared `readOnly` because it has no local side effects
-/// — content safety is the Mediator's job, not the permission gate's.
+/// mediated Message Bus. It creates and executes a durable task, so it is a
+/// write operation even though it does not directly mutate workspace files.
 public struct AskAgentTool: Tool {
     public init() {}
 
@@ -14,7 +14,7 @@ public struct AskAgentTool: Tool {
         name: "ask_agent",
         description: "Ask another attached agent a question. Provide a concise summary or interface "
             + "question, never raw file contents. Returns their answer.",
-        sideEffect: .readOnly,
+        sideEffect: .write,
         parameters: .object([
             "type": .string("object"),
             "properties": .object([

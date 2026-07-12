@@ -21,7 +21,10 @@ final class TaskContractTests: XCTestCase {
             capabilityLeaseID: CapabilityLeaseID(rawValue: "clease_macos"),
             relatedAgents: [AgentID(rawValue: "ios-counter")],
             relatedTasks: [TaskID(rawValue: "task_count_ios")],
-            constraints: ["Complete only the assigned task."])
+            constraints: ["Complete only the assigned task."],
+            replyMode: .taskReport,
+            executionTimeoutSeconds: 45,
+            maxAttempts: 3)
 
         let data = try JSONEncoder().encode(contract)
         let decoded = try JSONDecoder().decode(TaskContract.self, from: data)
@@ -29,6 +32,59 @@ final class TaskContractTests: XCTestCase {
         XCTAssertEqual(decoded, contract)
         XCTAssertEqual(decoded.workspaceLeaseID, WorkspaceLeaseID(rawValue: "wlease_macos"))
         XCTAssertEqual(decoded.capabilityLeaseID, CapabilityLeaseID(rawValue: "clease_macos"))
+        XCTAssertEqual(decoded.replyMode, .taskReport)
+        XCTAssertEqual(decoded.executionTimeoutSeconds, 45)
+        XCTAssertEqual(decoded.maxAttempts, 3)
+    }
+
+    func testLegacyTaskContractWithoutExecutionFieldsDecodes() throws {
+        let json = """
+        {
+          "id": "task_legacy",
+          "kind": "agent_invocation",
+          "issuer": "main",
+          "assignee": "worker",
+          "parentTaskID": "task_root",
+          "objective": "Inspect the legacy workspace.",
+          "roleHint": "workspace inspector",
+          "expectedDeliverable": "A concise report.",
+          "workspaceID": "workspace_legacy",
+          "workspaceLeaseID": "wlease_legacy",
+          "capabilityLeaseID": "clease_legacy",
+          "relatedAgents": [],
+          "relatedTasks": [],
+          "constraints": ["Read only."]
+        }
+        """
+
+        let decoded = try JSONDecoder().decode(TaskContract.self, from: Data(json.utf8))
+
+        XCTAssertEqual(decoded.id, TaskID(rawValue: "task_legacy"))
+        XCTAssertEqual(decoded.kind, .agentInvocation)
+        XCTAssertEqual(decoded.assignee, AgentID(rawValue: "worker"))
+        XCTAssertNil(decoded.replyMode)
+        XCTAssertNil(decoded.executionTimeoutSeconds)
+        XCTAssertNil(decoded.maxAttempts)
+    }
+
+    func testAgentAdmissionTaskKindRoundTrips() throws {
+        let contract = TaskContract(
+            id: TaskID(rawValue: "task_admission"),
+            kind: .agentAdmission,
+            issuer: AgentID(rawValue: "main"),
+            assignee: AgentID(rawValue: "worker"),
+            objective: "Attach the worker with reviewed leases.",
+            roleHint: "agent workspace admission",
+            expectedDeliverable: "A durable admission record.",
+            replyMode: TaskReplyMode.none,
+            maxAttempts: 1)
+
+        let data = try JSONEncoder().encode(contract)
+        let decoded = try JSONDecoder().decode(TaskContract.self, from: data)
+
+        XCTAssertEqual(decoded, contract)
+        XCTAssertEqual(decoded.kind, .agentAdmission)
+        XCTAssertEqual(decoded.replyMode, TaskReplyMode.none)
     }
 
     func testTaskEventsRoundTripThroughEnvelope() throws {

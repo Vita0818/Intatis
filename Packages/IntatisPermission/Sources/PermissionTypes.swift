@@ -53,7 +53,8 @@ public struct PermissionContext: Sendable {
 /// Result of the deterministic gate (layer A).
 /// - `deny` is final and can never be overridden by a reviewer.
 /// - `allow` is explicitly safe (skip reviewer).
-/// - `ask` must go to the user.
+/// - `ask` must go to the active `PermissionResponder` (automatic reviewer
+///   first in Cowork, then user fallback).
 /// - `pass` means "gate has no objection" → reviewer (v0.3) or, with no reviewer
 ///   configured, the engine degrades it to `ask`.
 public enum GateResult: Equatable, Sendable {

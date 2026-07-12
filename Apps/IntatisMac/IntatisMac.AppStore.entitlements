@@ -2,10 +2,10 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <!-- Mac App Store build: sandboxed. Covers Chat (v0.1) and, with libgit2
-         in-process, Code/Cowork read/search/diff/patch. run_shell is NOT
-         possible here (no entitlement exists) — that is the only capability
-         deferred to the Developer-ID build. See ARCHITECTURE.md §9.1. -->
+    <!-- Mac App Store build: sandboxed. Covers Chat (v0.1) and, with in-process
+         implementations, Code/Cowork read/search/diff/patch. Raw run_shell is
+         not model-exposed in any production profile; subprocess-backed tools
+         are unavailable here. See ARCHITECTURE.md §9.1. -->
     <key>com.apple.security.app-sandbox</key>
     <true/>
 

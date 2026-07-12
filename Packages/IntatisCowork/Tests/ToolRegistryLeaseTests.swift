@@ -85,6 +85,30 @@ final class ToolRegistryLeaseTests: XCTestCase {
         XCTAssertFalse(toolNames.contains("browser_download"))
         XCTAssertFalse(toolNames.contains("browser_downloads"))
         XCTAssertFalse(toolNames.contains("browser_search"))
+        XCTAssertFalse(toolNames.contains("git_status"))
+        XCTAssertFalse(toolNames.contains("git_diff"))
+        XCTAssertFalse(toolNames.contains("git_diff_staged"))
+        XCTAssertFalse(toolNames.contains("git_info"))
+        XCTAssertFalse(toolNames.contains("git_recent_commits"))
+        XCTAssertFalse(toolNames.contains("git_diff_base"))
+        XCTAssertFalse(toolNames.contains("git_branch"))
+        XCTAssertFalse(toolNames.contains("git_create_branch"))
+        XCTAssertFalse(toolNames.contains("git_stage"))
+        XCTAssertFalse(toolNames.contains("git_unstage"))
+        XCTAssertFalse(toolNames.contains("git_commit"))
+        XCTAssertFalse(toolNames.contains("git_apply_patch_check"))
+        XCTAssertFalse(toolNames.contains("git_apply_patch"))
+        XCTAssertFalse(toolNames.contains("git_stage_patch"))
+        XCTAssertFalse(toolNames.contains("git_unstage_patch"))
+        XCTAssertFalse(toolNames.contains("git_revert_patch"))
+        XCTAssertFalse(toolNames.contains("git_worktree_list"))
+        XCTAssertFalse(toolNames.contains("git_worktree_create"))
+        XCTAssertFalse(toolNames.contains("git_worktree_remove"))
+        XCTAssertFalse(toolNames.contains("git_remotes"))
+        XCTAssertFalse(toolNames.contains("git_fetch"))
+        XCTAssertFalse(toolNames.contains("git_pull_ff"))
+        XCTAssertFalse(toolNames.contains("git_push"))
+        XCTAssertFalse(toolNames.contains("git_switch"))
         XCTAssertFalse(toolNames.contains("spawn_agent"))
         XCTAssertFalse(toolNames.contains("remove_agent"))
         XCTAssertFalse(toolNames.contains("ask_agent"))
@@ -126,52 +150,118 @@ final class ToolRegistryLeaseTests: XCTestCase {
         XCTAssertTrue(toolNames.contains("browser_download"))
         XCTAssertTrue(toolNames.contains("browser_downloads"))
         XCTAssertTrue(toolNames.contains("browser_search"))
+        XCTAssertFalse(toolNames.contains("run_shell"))
+        XCTAssertTrue(toolNames.contains("git_status"))
+        XCTAssertTrue(toolNames.contains("git_diff"))
+        XCTAssertTrue(toolNames.contains("git_diff_staged"))
+        XCTAssertTrue(toolNames.contains("git_info"))
+        XCTAssertTrue(toolNames.contains("git_recent_commits"))
+        XCTAssertTrue(toolNames.contains("git_diff_base"))
+        XCTAssertTrue(toolNames.contains("git_branch"))
+        XCTAssertTrue(toolNames.contains("git_create_branch"))
+        XCTAssertTrue(toolNames.contains("git_stage"))
+        XCTAssertTrue(toolNames.contains("git_unstage"))
+        XCTAssertTrue(toolNames.contains("git_commit"))
+        XCTAssertTrue(toolNames.contains("git_apply_patch_check"))
+        XCTAssertTrue(toolNames.contains("git_apply_patch"))
+        XCTAssertTrue(toolNames.contains("git_stage_patch"))
+        XCTAssertTrue(toolNames.contains("git_unstage_patch"))
+        XCTAssertTrue(toolNames.contains("git_revert_patch"))
+        XCTAssertTrue(toolNames.contains("git_worktree_list"))
+        XCTAssertTrue(toolNames.contains("git_worktree_create"))
+        XCTAssertTrue(toolNames.contains("git_worktree_remove"))
+        XCTAssertTrue(toolNames.contains("git_remotes"))
+        XCTAssertTrue(toolNames.contains("git_fetch"))
+        XCTAssertTrue(toolNames.contains("git_pull_ff"))
+        XCTAssertTrue(toolNames.contains("git_push"))
+        XCTAssertTrue(toolNames.contains("git_switch"))
     }
 
-    func testTaskLeaseOverridesCoordinationDepthForToolRegistryAndPrompt() async throws {
+    func testTaskLeasePreservesCoordinatorCapabilityAndPrompt() async throws {
         let log = try leaseTempLog()
+        let main = AgentID(rawValue: "main")
         let worker = AgentID(rawValue: "legacy-depth-worker")
+        let wsMain = try leaseTempWorkspace()
         let ws = try leaseTempWorkspace()
-        defer { try? FileManager.default.removeItem(at: ws) }
+        defer {
+            try? FileManager.default.removeItem(at: wsMain)
+            try? FileManager.default.removeItem(at: ws)
+        }
         let provider = LeaseCapturingProvider()
         let orch = Orchestrator(log: log, allowsShell: true, responder: FixedResponder(.allow)) { _ in provider }
 
+        let mainAttached = await orch.attach(Agent(name: main,
+                                                   workspaceRoot: wsMain,
+                                                   model: ModelID(rawValue: "m"),
+                                                   profile: .reviewed,
+                                                   coordinationDepth: Agent.defaultCoordinationDepth))
         let attached = await orch.attach(Agent(name: worker,
                                                workspaceRoot: ws,
                                                model: ModelID(rawValue: "m"),
                                                profile: .reviewed,
                                                coordinationDepth: Agent.defaultCoordinationDepth))
+        XCTAssertTrue(mainAttached)
         XCTAssertTrue(attached)
-        _ = await orch.ask(from: AgentID(rawValue: "main"),
+        _ = await orch.ask(from: main,
                            to: worker.rawValue,
-                           question: "Inspect the assigned worker task only.")
+                           question: "Coordinate the assigned task within the lease budget.")
 
         let request = try XCTUnwrap(provider.requests.first)
         let toolNames = Set(request.tools.map(\.name))
-        XCTAssertFalse(toolNames.contains("spawn_agent"))
-        XCTAssertFalse(toolNames.contains("remove_agent"))
-        XCTAssertFalse(toolNames.contains("list_agents"))
-        XCTAssertFalse(toolNames.contains("ask_agent"))
+        XCTAssertTrue(toolNames.contains("spawn_agent"))
+        XCTAssertTrue(toolNames.contains("remove_agent"))
+        XCTAssertTrue(toolNames.contains("list_agents"))
+        XCTAssertTrue(toolNames.contains("ask_agent"))
 
         let systemPrompt = try XCTUnwrap(request.messages.first?.content)
-        XCTAssertTrue(systemPrompt.contains("You are executing the assigned task as a worker agent."))
-        XCTAssertFalse(systemPrompt.contains("You may also act as a COORDINATOR"))
+        XCTAssertTrue(systemPrompt.contains("You may also act as a COORDINATOR"))
+        XCTAssertFalse(systemPrompt.contains("You are executing the assigned task as a worker agent."))
+
+        let events = await log.replay()
+        let contract = try XCTUnwrap(leaseTaskCreatedContracts(events).first { $0.assignee == worker })
+        let capabilityLeaseID = try XCTUnwrap(contract.capabilityLeaseID)
+        let taskLease = try XCTUnwrap(events.compactMap { envelope -> CapabilityLeaseCreatedPayload? in
+            if case .capabilityLeaseCreated(let payload) = envelope.event,
+               payload.lease.id == capabilityLeaseID {
+                return payload
+            }
+            return nil
+        }.first?.lease)
+        XCTAssertEqual(taskLease.taskID, contract.id)
+        XCTAssertTrue(taskLease.tools.contains(.delegateTask))
+        XCTAssertTrue(taskLease.tools.contains(.attachWorkspace))
+        if case .granted = taskLease.delegation {
+            // Expected coordinator delegation grant.
+        } else {
+            XCTFail("coordinator task lease must retain a delegation grant")
+        }
     }
 
     func testAskTaskContractReferencesCapabilityAndWorkspaceLeases() async throws {
         let log = try leaseTempLog()
+        let main = AgentID(rawValue: "main")
         let worker = AgentID(rawValue: "worker")
+        let wsMain = try leaseTempWorkspace()
         let ws = try leaseTempWorkspace()
-        defer { try? FileManager.default.removeItem(at: ws) }
+        defer {
+            try? FileManager.default.removeItem(at: wsMain)
+            try? FileManager.default.removeItem(at: ws)
+        }
         let provider = LeaseCapturingProvider()
         let orch = Orchestrator(log: log, allowsShell: true, responder: FixedResponder(.allow)) { _ in provider }
 
+        let mainAttached = await orch.attach(Agent(name: main,
+                                                   workspaceRoot: wsMain,
+                                                   model: ModelID(rawValue: "m"),
+                                                   profile: .reviewed,
+                                                   coordinationDepth: Agent.defaultCoordinationDepth))
         let attached = await orch.attach(Agent(name: worker,
                                                workspaceRoot: ws,
                                                model: ModelID(rawValue: "m"),
                                                profile: .reviewed))
+        XCTAssertTrue(mainAttached)
         XCTAssertTrue(attached)
-        _ = await orch.ask(from: AgentID(rawValue: "main"),
+        _ = await orch.ask(from: main,
                            to: worker.rawValue,
                            question: "Count assigned Swift files.")
 
@@ -179,17 +269,46 @@ final class ToolRegistryLeaseTests: XCTestCase {
         let contract = try XCTUnwrap(leaseTaskCreatedContracts(events).first)
         let capabilityLeaseID = try XCTUnwrap(contract.capabilityLeaseID)
         let workspaceLeaseID = try XCTUnwrap(contract.workspaceLeaseID)
-        let capabilityLeaseOptional = await orch.capabilityLease(id: capabilityLeaseID)
-        let workspaceLeaseOptional = await orch.workspaceLease(id: workspaceLeaseID)
-        let capabilityLease = try XCTUnwrap(capabilityLeaseOptional)
-        let workspaceLease = try XCTUnwrap(workspaceLeaseOptional)
+        let capabilityLease = try XCTUnwrap(events.compactMap { envelope -> CapabilityLeaseCreatedPayload? in
+            if case .capabilityLeaseCreated(let payload) = envelope.event,
+               payload.lease.id == capabilityLeaseID {
+                return payload
+            }
+            return nil
+        }.first?.lease)
+        let workspaceLease = try XCTUnwrap(events.compactMap { envelope -> WorkspaceLeaseGrantedPayload? in
+            if case .workspaceLeaseGranted(let payload) = envelope.event,
+               payload.lease.id == workspaceLeaseID {
+                return payload
+            }
+            return nil
+        }.first?.lease)
 
         XCTAssertEqual(capabilityLease.taskID, contract.id)
+        XCTAssertTrue(capabilityLease.expiresAtTaskCompletion)
         XCTAssertFalse(capabilityLease.tools.contains(.delegateTask))
         XCTAssertFalse(capabilityLease.tools.contains(.attachWorkspace))
+        XCTAssertEqual(workspaceLease.taskID, contract.id)
+        XCTAssertTrue(workspaceLease.expiresAtTaskCompletion)
         XCTAssertEqual(workspaceLease.access, .readOnly)
         XCTAssertEqual(workspaceLease.rootPath, ws.standardizedFileURL.path)
         XCTAssertEqual(contract.workspaceID, workspaceLease.workspaceID)
+        let liveCapabilityLease = await orch.capabilityLease(id: capabilityLeaseID)
+        let liveWorkspaceLease = await orch.workspaceLease(id: workspaceLeaseID)
+        XCTAssertNil(liveCapabilityLease)
+        XCTAssertNil(liveWorkspaceLease)
+        XCTAssertTrue(events.contains {
+            if case .capabilityLeaseRevoked(let payload) = $0.event {
+                return payload.leaseID == capabilityLeaseID && payload.agent == worker
+            }
+            return false
+        })
+        XCTAssertTrue(events.contains {
+            if case .workspaceLeaseRevoked(let payload) = $0.event {
+                return payload.leaseID == workspaceLeaseID && payload.agent == worker
+            }
+            return false
+        })
     }
 
     func testWorkspaceAttachCreatesLeaseOnlyAfterPermission() async throws {
@@ -264,20 +383,40 @@ final class ToolRegistryLeaseTests: XCTestCase {
         _ = await orch.ask(from: main, to: ios.rawValue,
                            question: "Recursively count iOS Swift files only.")
 
-        let contracts = leaseTaskCreatedContracts(await log.replay())
+        let events = await log.replay()
+        let contracts = leaseTaskCreatedContracts(events)
         let macosContract = try XCTUnwrap(contracts.first { $0.assignee == macos })
         let iosContract = try XCTUnwrap(contracts.first { $0.assignee == ios })
         let macosCapabilityLeaseID = try XCTUnwrap(macosContract.capabilityLeaseID)
         let iosCapabilityLeaseID = try XCTUnwrap(iosContract.capabilityLeaseID)
-        let macosLeaseOptional = await orch.capabilityLease(id: macosCapabilityLeaseID)
-        let iosLeaseOptional = await orch.capabilityLease(id: iosCapabilityLeaseID)
-        let macosLease = try XCTUnwrap(macosLeaseOptional)
-        let iosLease = try XCTUnwrap(iosLeaseOptional)
+        let createdTaskLeases = events.compactMap { envelope -> CapabilityLease? in
+            if case .capabilityLeaseCreated(let payload) = envelope.event,
+               payload.lease.taskID != nil {
+                return payload.lease
+            }
+            return nil
+        }
+        let macosLease = try XCTUnwrap(createdTaskLeases.first { $0.id == macosCapabilityLeaseID })
+        let iosLease = try XCTUnwrap(createdTaskLeases.first { $0.id == iosCapabilityLeaseID })
 
+        XCTAssertEqual(macosLease.taskID, macosContract.id)
+        XCTAssertEqual(iosLease.taskID, iosContract.id)
         XCTAssertFalse(macosLease.tools.contains(.delegateTask))
         XCTAssertFalse(iosLease.tools.contains(.delegateTask))
         XCTAssertFalse(macosLease.tools.contains(.attachWorkspace))
         XCTAssertFalse(iosLease.tools.contains(.attachWorkspace))
+        XCTAssertTrue(events.contains {
+            if case .capabilityLeaseRevoked(let payload) = $0.event {
+                return payload.leaseID == macosCapabilityLeaseID
+            }
+            return false
+        })
+        XCTAssertTrue(events.contains {
+            if case .capabilityLeaseRevoked(let payload) = $0.event {
+                return payload.leaseID == iosCapabilityLeaseID
+            }
+            return false
+        })
 
         let macosToolNames = Set(try XCTUnwrap(macosProvider.requests.first).tools.map(\.name))
         let iosToolNames = Set(try XCTUnwrap(iosProvider.requests.first).tools.map(\.name))

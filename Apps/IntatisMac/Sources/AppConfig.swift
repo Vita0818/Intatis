@@ -188,12 +188,12 @@ private struct AppProviderSelection: Codable, Equatable {
 
 /// App configuration. Defaults to an OpenAI-compatible endpoint; provider
 /// secrets are resolved from config/auth files, env vars, or explicit files.
-/// The macOS build runs as the sandboxed App Store profile by default (no shell).
+/// The macOS build runs as the local DeveloperID workbench profile by default.
 enum AppConfig {
     static let legacyAPIKeyAccount = "default-openai"
 
-    /// Switch to `.macDeveloperID` for the notarized, shell-enabled build.
-    static let platformProfile: PlatformProfile = .macAppStore
+    /// Use `.macAppStore` only for a future sandboxed AppStore/chat-only build.
+    static let platformProfile: PlatformProfile = .macDeveloperID
 
     static let defaultSession = SessionID(rawValue: "sess_default")
 
@@ -333,7 +333,7 @@ enum AppConfig {
             if configOverridePath() != nil {
                 throw error
             }
-            let fallback = appSupportDir().appendingPathComponent("opencode.json")
+            let fallback = appSupportDir().appendingPathComponent("intatis.json")
             try writeConfigTemplate(to: fallback)
             return fallback
         }
@@ -354,7 +354,7 @@ enum AppConfig {
             if configOverridePath() != nil {
                 throw error
             }
-            let fallback = appSupportDir().appendingPathComponent("opencode.json")
+            let fallback = appSupportDir().appendingPathComponent("intatis.json")
             try writeProviderConfig(to: fallback,
                                     catalog: catalog,
                                     apiKeysByProviderID: apiKeys)
@@ -692,17 +692,9 @@ enum AppConfig {
         let home = FileManager.default.homeDirectoryForCurrentUser
         let userConfigDir = home
             .appendingPathComponent(".config/intatis", isDirectory: true)
-        let openCodeConfigDir = home
-            .appendingPathComponent(".config/opencode", isDirectory: true)
         return [
-            userConfigDir.appendingPathComponent("opencode.json"),
-            userConfigDir.appendingPathComponent("opencode.jsonc"),
             userConfigDir.appendingPathComponent("intatis.json"),
             userConfigDir.appendingPathComponent("intatis.jsonc"),
-            openCodeConfigDir.appendingPathComponent("opencode.json"),
-            openCodeConfigDir.appendingPathComponent("opencode.jsonc"),
-            appSupportDir().appendingPathComponent("opencode.json"),
-            appSupportDir().appendingPathComponent("opencode.jsonc"),
             appSupportDir().appendingPathComponent("intatis.json"),
             appSupportDir().appendingPathComponent("intatis.jsonc"),
             userConfigDir.appendingPathComponent("config.json"),
@@ -717,12 +709,12 @@ enum AppConfig {
             return URL(fileURLWithPath: expandedPath(override))
         }
         return FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".config/intatis/opencode.json")
+            .appendingPathComponent(".config/intatis/intatis.json")
     }
 
     private static func isModernConfigFile(_ url: URL) -> Bool {
         switch url.lastPathComponent {
-        case "opencode.json", "opencode.jsonc", "intatis.json", "intatis.jsonc":
+        case "intatis.json", "intatis.jsonc":
             return true
         default:
             return false

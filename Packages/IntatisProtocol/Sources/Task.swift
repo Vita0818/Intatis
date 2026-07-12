@@ -4,6 +4,10 @@ import IntatisCore
 public enum TaskKind: String, Codable, Sendable, Hashable {
     case root
     case agentInvocation = "agent_invocation"
+    case mailboxDelivery = "mailbox_delivery"
+    /// Synthetic control-plane contract used to audit an agent/workspace
+    /// admission without scheduling it on the ordinary task data plane.
+    case agentAdmission = "agent_admission"
 }
 
 public enum TaskStatus: String, Codable, Sendable, Hashable {
@@ -14,6 +18,47 @@ public enum TaskStatus: String, Codable, Sendable, Hashable {
     case completed
     case failed
     case cancelled
+
+    public var isTerminal: Bool {
+        switch self {
+        case .completed, .failed, .cancelled:
+            return true
+        case .created, .assigned, .queued, .running:
+            return false
+        }
+    }
+
+    /// The durable task state machine. A terminal task can only re-enter the
+    /// queue through an explicit retry attempt; arbitrary projection rewrites
+    /// are intentionally rejected by `TaskGraph.transition`.
+    public func canTransition(to next: TaskStatus, isRetry: Bool = false) -> Bool {
+        if self == next { return true }
+        switch (self, next) {
+        case (.created, .assigned),
+             (.created, .queued),
+             (.created, .cancelled),
+             (.assigned, .queued),
+             (.assigned, .cancelled),
+             (.queued, .running),
+             (.queued, .cancelled),
+             (.running, .completed),
+             (.running, .failed),
+             (.running, .cancelled):
+            return true
+        case (.failed, .queued), (.cancelled, .queued):
+            return isRetry
+        default:
+            return false
+        }
+    }
+}
+
+/// How a scheduled invocation is returned to its issuer. Optional on
+/// `TaskContract` so logs written before this field existed remain decodable.
+public enum TaskReplyMode: String, Codable, Sendable, Hashable {
+    case none
+    case answer
+    case taskReport = "task_report"
 }
 
 public struct TaskContract: Codable, Sendable, Hashable {
@@ -33,6 +78,9 @@ public struct TaskContract: Codable, Sendable, Hashable {
     public var relatedAgents: [AgentID]
     public var relatedTasks: [TaskID]
     public var constraints: [String]
+    public var replyMode: TaskReplyMode?
+    public var executionTimeoutSeconds: Double?
+    public var maxAttempts: Int?
 
     public init(id: TaskID = TaskID.new(),
                 kind: TaskKind = .agentInvocation,
@@ -47,7 +95,10 @@ public struct TaskContract: Codable, Sendable, Hashable {
                 capabilityLeaseID: CapabilityLeaseID? = nil,
                 relatedAgents: [AgentID] = [],
                 relatedTasks: [TaskID] = [],
-                constraints: [String] = []) {
+                constraints: [String] = [],
+                replyMode: TaskReplyMode? = nil,
+                executionTimeoutSeconds: Double? = nil,
+                maxAttempts: Int? = nil) {
         self.id = id
         self.kind = kind
         self.issuer = issuer
@@ -62,5 +113,8 @@ public struct TaskContract: Codable, Sendable, Hashable {
         self.relatedAgents = relatedAgents
         self.relatedTasks = relatedTasks
         self.constraints = constraints
+        self.replyMode = replyMode
+        self.executionTimeoutSeconds = executionTimeoutSeconds
+        self.maxAttempts = maxAttempts
     }
 }

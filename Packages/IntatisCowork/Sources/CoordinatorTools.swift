@@ -56,7 +56,7 @@ public struct ListAgentsTool: Tool {
 
     public static let descriptor = ToolDescriptor(
         name: "list_agents",
-        description: "List the agents currently active in this conversation (name, model, folder).",
+        description: "List active agents with name, model, coordinator/worker lease role, compact task state, and folder.",
         sideEffect: .readOnly,
         parameters: .object([
             "type": .string("object"),
@@ -80,7 +80,7 @@ public struct RemoveAgentTool: Tool {
     public static let descriptor = ToolDescriptor(
         name: "remove_agent",
         description: "Remove a sub-agent early. Completed task-scoped sub-agents are recycled automatically. You cannot remove @main.",
-        sideEffect: .readOnly,
+        sideEffect: .write,
         parameters: .object([
             "type": .string("object"),
             "properties": .object([

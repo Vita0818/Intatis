@@ -61,6 +61,17 @@ public struct ShellResult: Equatable, Sendable {
     }
 }
 
+public struct GitPatchResult: Equatable, Sendable {
+    public var text: String
+    public var changedFiles: [String]
+    public var diff: String
+    public init(text: String, changedFiles: [String], diff: String) {
+        self.text = text
+        self.changedFiles = changedFiles
+        self.diff = diff
+    }
+}
+
 public protocol ShellRunner: Sendable {
     func run(_ command: String, cwd: URL) async throws -> ShellResult
 }
@@ -70,6 +81,24 @@ public protocol ShellRunner: Sendable {
 public protocol GitService: Sendable {
     func status(workspace: URL) async throws -> String   // porcelain v1
     func diff(workspace: URL) async throws -> String      // unified diff
+    func stagedDiff(workspace: URL) async throws -> String // unified diff for index
+    func repositoryInfo(workspace: URL) async throws -> String
+    func recentCommits(limit: Int, workspace: URL) async throws -> String
+    func diffAgainst(base: String, workspace: URL) async throws -> String
+    func branchInfo(workspace: URL) async throws -> String
+    func createBranch(name: String, startPoint: String?, workspace: URL) async throws -> String
+    func stage(paths: [String], workspace: URL) async throws -> String
+    func unstage(paths: [String], workspace: URL) async throws -> String
+    func commit(message: String, workspace: URL) async throws -> String
+    func applyPatch(diff: String, reverse: Bool, checkOnly: Bool, cached: Bool, workspace: URL) async throws -> GitPatchResult
+    func worktrees(workspace: URL) async throws -> String
+    func createWorktree(name: String, startPoint: String?, branch: String?, workspace: URL) async throws -> String
+    func removeWorktree(name: String, force: Bool, workspace: URL) async throws -> String
+    func remotes(workspace: URL) async throws -> String
+    func fetch(remote: String, branch: String?, prune: Bool, workspace: URL) async throws -> String
+    func pullFastForward(remote: String, branch: String, workspace: URL) async throws -> String
+    func push(remote: String, branch: String, setUpstream: Bool, workspace: URL) async throws -> String
+    func switchBranch(name: String, workspace: URL) async throws -> String
 }
 
 /// Provider-backed or local-model image generation service injected by the app
@@ -110,20 +139,82 @@ public protocol AgentManager: Sendable {
 
 public struct ToolContext: Sendable {
     public let workspaceRoot: URL
+    /// Effective task/workspace lease. Direct tool hosts that omit it receive
+    /// the standard read-write lease (including default secret deny patterns),
+    /// so process-backed tools never silently run with a wider policy.
+    public let workspaceLease: WorkspaceLease
+    /// Raw, model-authored shell commands. The default runner is workspace and
+    /// network confined.
     public let shell: ShellRunner
+    /// Shell backend for structured Swift tools (browser/document wrappers)
+    /// whose arguments and paths have already been validated by the tool. This
+    /// runner is workspace-confined and network-denied.
+    public let structuredShell: ShellRunner
+    /// Dedicated workspace-confined structured runner for tools whose
+    /// descriptor and permission request explicitly declare network access.
+    /// Keeping this separate prevents a document/LaTeX wrapper from inheriting
+    /// browser network authority merely because both are process-backed.
+    public let networkStructuredShell: ShellRunner
     public let git: GitService
     public let messenger: AgentMessenger?
     public let agentManager: AgentManager?
     public let imageGenerator: ImageGenerationToolService?
     public init(workspaceRoot: URL,
+                workspaceLease: WorkspaceLease? = nil,
                 shell: ShellRunner = ProcessShellRunner(),
+                structuredShell: ShellRunner? = nil,
+                networkStructuredShell: ShellRunner? = nil,
                 git: GitService = ProcessGitService(),
                 messenger: AgentMessenger? = nil,
                 agentManager: AgentManager? = nil,
                 imageGenerator: ImageGenerationToolService? = nil) {
+        let effectiveLease = workspaceLease ?? WorkspaceLease(
+            rootPath: workspaceRoot.resolvingSymlinksInPath().standardizedFileURL.path,
+            access: .readWrite)
         self.workspaceRoot = workspaceRoot
-        self.shell = shell
-        self.git = git
+        self.workspaceLease = effectiveLease
+        if let processShell = shell as? ProcessShellRunner {
+            self.shell = processShell.scoped(to: effectiveLease)
+        } else {
+            self.shell = shell
+        }
+        let resolvedStructuredShell: ShellRunner
+        if let structuredShell {
+            if let processShell = structuredShell as? StructuredProcessShellRunner {
+                resolvedStructuredShell = processShell.scoped(to: effectiveLease)
+            } else if let processShell = structuredShell as? ProcessShellRunner {
+                resolvedStructuredShell = processShell.scoped(to: effectiveLease)
+            } else {
+                resolvedStructuredShell = structuredShell
+            }
+        } else if shell is ProcessShellRunner {
+            resolvedStructuredShell = StructuredProcessShellRunner(workspaceLease: effectiveLease)
+        } else {
+            // Preserve injected fake runners in unit tests and custom hosts.
+            resolvedStructuredShell = shell
+        }
+        self.structuredShell = resolvedStructuredShell
+        if let networkStructuredShell {
+            if let processShell = networkStructuredShell as? StructuredProcessShellRunner {
+                self.networkStructuredShell = processShell.scoped(to: effectiveLease)
+            } else if let processShell = networkStructuredShell as? ProcessShellRunner {
+                self.networkStructuredShell = processShell.scoped(to: effectiveLease)
+            } else {
+                self.networkStructuredShell = networkStructuredShell
+            }
+        } else if shell is ProcessShellRunner, structuredShell == nil {
+            self.networkStructuredShell = StructuredProcessShellRunner(
+                allowsNetwork: true,
+                workspaceLease: effectiveLease)
+        } else {
+            // Preserve the pre-existing single fake-runner injection behavior.
+            self.networkStructuredShell = resolvedStructuredShell
+        }
+        if let processGit = git as? ProcessGitService {
+            self.git = processGit.scoped(to: effectiveLease)
+        } else {
+            self.git = git
+        }
         self.messenger = messenger
         self.agentManager = agentManager
         self.imageGenerator = imageGenerator
@@ -161,11 +252,22 @@ public struct ToolRegistry: Sendable {
         ToolRegistry(all() + extra)
     }
 
-    /// The full v0.2 read/write/git/shell tool set.
+    /// The production read/write/Git/document/browser tool set. Raw `run_shell`
+    /// stays implemented for isolated tests/future helper processes but is not
+    /// model-exposed because arbitrary commands cannot declare exact touched
+    /// paths for WorkspaceLease denied-pattern enforcement.
     public static func standard() -> ToolRegistry {
         ToolRegistry([
             ReadFileTool(), ListFilesTool(), SearchTextTool(), WriteFileTool(),
-            ApplyPatchTool(), RunShellTool(), GitStatusTool(), GitDiffTool(),
+            ApplyPatchTool(), GitStatusTool(), GitDiffTool(),
+            GitStagedDiffTool(), GitInfoTool(), GitRecentCommitsTool(),
+            GitDiffBaseTool(), GitBranchTool(), GitCreateBranchTool(),
+            GitStageTool(), GitUnstageTool(), GitCommitTool(),
+            GitApplyPatchCheckTool(), GitApplyPatchTool(), GitStagePatchTool(),
+            GitUnstagePatchTool(), GitRevertPatchTool(), GitWorktreeListTool(),
+            GitWorktreeCreateTool(), GitWorktreeRemoveTool(),
+            GitRemotesTool(), GitFetchTool(), GitPullFastForwardTool(),
+            GitPushTool(), GitSwitchBranchTool(),
             ReadPDFTool(), EditPDFPagesTool(), ReconstructDocumentImageTool(),
             CompileLaTeXTool(), GenerateImageTool(),
             WebFetchTool(), BrowserDiagnosticsTool(), BrowserProfilesTool(), BrowserProfileDeleteTool(), BrowserHistoryTool(),

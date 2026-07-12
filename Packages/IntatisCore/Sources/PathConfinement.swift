@@ -64,6 +64,14 @@ public enum PathConfinement {
         guard let base = components.last else { return false }
 
         if base == ".env" || base.hasPrefix(".env.") { return true }
+        // Repository config can activate hooks, filters, merge drivers,
+        // credential helpers, or external diff commands. Model-facing generic
+        // file/patch tools must not mutate it while a structured Git operation
+        // is validating and using the repository. ProcessGitService has its own
+        // read-only preflight and fixed command surface.
+        if components.contains(".git"), (base == "config" || base == "config.worktree") {
+            return true
+        }
         if isAgentConfigSecretPath(components: components, base: base) { return true }
         if [".ssh", ".aws", ".gnupg", ".gpg"].contains(where: { components.contains($0) }) { return true }
         if components.contains("secrets") || components.contains("keychains") { return true }

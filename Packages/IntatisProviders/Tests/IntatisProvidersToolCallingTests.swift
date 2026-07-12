@@ -519,18 +519,25 @@ final class IntatisProvidersToolCallingTests: XCTestCase {
         XCTAssertEqual(t["content"], .string("obs"))
     }
 
-    func testReasoningEffortInRequestBody() throws {
+    func testReasoningEffortAndOutputCeilingInRequestBody() throws {
         let provider = OpenAIWireProvider(endpoint: endpoint, apiKey: "k", http: FakeHTTP2(chunks: []))
 
         let withEffort = try provider.buildAgentRequest(
-            AgentRequest(model: ModelID(rawValue: "m"), messages: [.user("hi")], tools: [], reasoningEffort: .high))
+            AgentRequest(
+                model: ModelID(rawValue: "m"),
+                messages: [.user("hi")],
+                tools: [],
+                reasoningEffort: .high,
+                maxOutputTokens: 321))
         let body = try JSONSerialization.jsonObject(with: XCTUnwrap(withEffort.httpBody)) as! [String: Any]
         XCTAssertEqual(body["reasoning_effort"] as? String, "high")
+        XCTAssertEqual(body["max_tokens"] as? Int, 321)
 
         let without = try provider.buildAgentRequest(
             AgentRequest(model: ModelID(rawValue: "m"), messages: [.user("hi")], tools: []))
         let body2 = try JSONSerialization.jsonObject(with: XCTUnwrap(without.httpBody)) as! [String: Any]
         XCTAssertNil(body2["reasoning_effort"])
+        XCTAssertNil(body2["max_tokens"])
     }
 
     func testAgentMessageWithImageEncodesAsContentArray() {

@@ -69,14 +69,22 @@ public struct AgentRequest: Sendable {
     public var temperature: Double?
     public var reasoningEffort: ReasoningEffort?
     public var includeUsage: Bool
+    /// Best-effort provider-side output ceiling. OpenAI-compatible providers map
+    /// this to `max_tokens`; providers that do not support a ceiling may ignore it,
+    /// so callers must still account the reported/estimated total after the stream.
+    public var maxOutputTokens: Int?
     public init(model: ModelID, messages: [AgentMessage], tools: [ToolSpec],
-                temperature: Double? = nil, reasoningEffort: ReasoningEffort? = nil, includeUsage: Bool = false) {
+                temperature: Double? = nil,
+                reasoningEffort: ReasoningEffort? = nil,
+                includeUsage: Bool = false,
+                maxOutputTokens: Int? = nil) {
         self.model = model
         self.messages = messages
         self.tools = tools
         self.temperature = temperature
         self.reasoningEffort = reasoningEffort
         self.includeUsage = includeUsage
+        self.maxOutputTokens = maxOutputTokens.flatMap { $0 > 0 ? $0 : nil }
     }
 }
 

@@ -58,10 +58,13 @@ final class IntatisPermissionTests: XCTestCase {
         }
     }
 
-    func testGateWriteReviewedPasses() {
-        guard case .pass = gate.evaluate(call("write_file", .write, paths: ["a.swift"]), ctx(profile: .reviewed)) else {
-            return XCTFail("write in reviewed should pass to reviewer")
+    func testGateWriteReviewedAsks() {
+        guard case .ask(let reason, let risk) = gate.evaluate(call("write_file", .write, paths: ["a.swift"]),
+                                                             ctx(profile: .reviewed)) else {
+            return XCTFail("write in reviewed should ask")
         }
+        XCTAssertEqual(reason, "write to workspace")
+        XCTAssertEqual(risk, .medium)
     }
 
     func testGateWriteManualAsks() {
@@ -110,6 +113,15 @@ final class IntatisPermissionTests: XCTestCase {
         }
     }
 
+    func testGateDestructiveNetworkAsksHighRisk() {
+        guard case .ask(let reason, let risk) = gate.evaluate(call("git_push", .destructive, paths: [".git"], network: true),
+                                                             ctx(profile: .reviewed, allowsShell: true)) else {
+            return XCTFail("destructive network operation should ask")
+        }
+        XCTAssertEqual(risk, .high)
+        XCTAssertTrue(reason.contains("destructive network"))
+    }
+
     func testGateShellSudoDenied() {
         guard case .deny = gate.evaluate(call("run_shell", .exec, args: #"{"command":"sudo rm -rf /"}"#),
                                          ctx(allowsShell: true)) else {
@@ -132,7 +144,7 @@ final class IntatisPermissionTests: XCTestCase {
 
     // MARK: Engine
 
-    func testEnginePassWithoutReviewerAsks() async {
+    func testEngineWriteWithoutAutomaticResponderAsks() async {
         let engine = PermissionEngine()
         let outcome = await engine.decide(call("write_file", .write, paths: ["a.swift"]), ctx(profile: .reviewed))
         XCTAssertEqual(outcome.decision, .askUser)
@@ -150,7 +162,7 @@ final class IntatisPermissionTests: XCTestCase {
         XCTAssertEqual(outcome.decision, .allow)
     }
 
-    func testEngineReviewerHandlesPass() async {
+    func testEngineReviewerDoesNotBypassWriteApproval() async {
         struct AllowReviewer: PermissionReviewer {
             func review(_ c: ToolCallContext, _ x: PermissionContext,
                         gateReason: String, risk: RiskLevel) async -> PermissionOutcome {
@@ -159,7 +171,7 @@ final class IntatisPermissionTests: XCTestCase {
         }
         let engine = PermissionEngine(reviewer: AllowReviewer())
         let outcome = await engine.decide(call("write_file", .write, paths: ["a.swift"]), ctx(profile: .reviewed))
-        XCTAssertEqual(outcome.decision, .allow)
-        XCTAssertEqual(outcome.reason, "reviewer ok")
+        XCTAssertEqual(outcome.decision, .askUser)
+        XCTAssertEqual(outcome.reason, "write to workspace")
     }
 }

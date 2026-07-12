@@ -69,6 +69,27 @@ private struct ThrowingProvider: ToolCallingProvider {
     }
 }
 
+private final class FailOnceProvider: ToolCallingProvider, @unchecked Sendable {
+    private let lock = NSLock()
+    private var invocationCount = 0
+
+    func stream(_ request: AgentRequest) -> AsyncThrowingStream<AgentChunk, Error> {
+        lock.lock()
+        invocationCount += 1
+        let shouldFail = invocationCount == 1
+        lock.unlock()
+        return AsyncThrowingStream { continuation in
+            if shouldFail {
+                continuation.finish(throwing: ProviderFailure.unavailable)
+            } else {
+                continuation.yield(.textDelta("retried"))
+                continuation.yield(.done(finishReason: "stop"))
+                continuation.finish()
+            }
+        }
+    }
+}
+
 private func tempLog() throws -> EventLog {
     let url = FileManager.default.temporaryDirectory
         .appendingPathComponent("intatis-cowork-\(UUID().uuidString)", isDirectory: true)
@@ -255,29 +276,22 @@ final class IntatisCoworkTests: XCTestCase {
         let log = try tempLog()
         let wsA = try tempWorkspace()
         defer { try? FileManager.default.removeItem(at: wsA) }
-        let provider = CapturingProvider([.textDelta("retried"), .done(finishReason: "stop")])
+        let provider = FailOnceProvider()
         let orch = Orchestrator(log: log, allowsShell: true, responder: FixedResponder(.allow)) { _ in provider }
         await orch.attach(Agent(name: A, workspaceRoot: wsA, model: ModelID(rawValue: "m"), profile: .reviewed))
-        let contract = TaskContract(
-            id: TaskID(rawValue: "task_retry"),
-            issuer: nil,
-            assignee: A,
-            objective: "Retry the failed task.",
-            roleHint: "retry worker",
-            expectedDeliverable: "retried")
-        let failed = CoworkTaskView(
-            id: contract.id,
-            contract: contract,
-            status: .failed,
-            assignee: A,
-            error: "provider failed")
+        let firstResult = await orch.send("Retry the failed task.", to: A)
+        guard case .failed = firstResult else { return XCTFail("first attempt must fail") }
+        let failedProjection = CoworkProjection.build(from: await log.replay())
+        let failed = try XCTUnwrap(failedProjection.failedTasks.first)
+        let originalContract = try XCTUnwrap(failed.contract)
 
         let result = await orch.retry(failed)
 
         XCTAssertEqual(result, .sent)
         let projection = CoworkProjection.build(from: await log.replay())
-        XCTAssertEqual(projection.tasks[contract.id]?.status, .completed)
-        XCTAssertEqual(projection.tasks[contract.id]?.result, "retried")
+        XCTAssertEqual(projection.tasks[originalContract.id]?.status, .completed)
+        XCTAssertEqual(projection.tasks[originalContract.id]?.result, "retried")
+        XCTAssertEqual(projection.tasks[originalContract.id]?.attempt, 2)
     }
 
     func testAgentToAgentFlowIsMediatedAndLogged() async throws {
@@ -339,8 +353,8 @@ final class IntatisCoworkTests: XCTestCase {
         await orch.send("ask worker", to: A)
 
         let events = await log.replay()
-        let created = taskCreatedContracts(events)
-        let assigned = taskAssignedContracts(events)
+        let created = taskCreatedContracts(events).filter { $0.assignee == B }
+        let assigned = taskAssignedContracts(events).filter { $0.assignee == B }
         XCTAssertEqual(created.count, 1)
         XCTAssertEqual(assigned.count, 1)
         let contract = try XCTUnwrap(created.first)
@@ -356,15 +370,21 @@ final class IntatisCoworkTests: XCTestCase {
 
         let request = try XCTUnwrap(workerProvider.requests.first)
         let systemPrompt = try XCTUnwrap(request.messages.first?.content)
-        XCTAssertTrue(systemPrompt.contains("Current task:"))
-        XCTAssertTrue(systemPrompt.contains("- Task ID: \(contract.id.rawValue)"))
-        XCTAssertTrue(systemPrompt.contains("- Assigned by: @\(A.rawValue)"))
-        XCTAssertTrue(systemPrompt.contains("- Your role in this task: \(contract.roleHint)"))
-        XCTAssertTrue(systemPrompt.contains("- Objective: \(contract.objective)"))
-        XCTAssertTrue(systemPrompt.contains("- Expected deliverable: \(contract.expectedDeliverable)"))
-        XCTAssertTrue(systemPrompt.contains("Complete only the assigned task."))
-        XCTAssertTrue(systemPrompt.contains("Do not re-run the global task decomposition."))
-        XCTAssertTrue(systemPrompt.contains("Do not create, remove, or coordinate other agents."))
+        let untrustedContext = try XCTUnwrap(request.messages.first {
+            $0.role == .user && $0.content?.contains("<<<UNTRUSTED_CONTEXT_DATA>>>") == true
+        }?.content)
+        XCTAssertFalse(systemPrompt.contains(contract.objective))
+        XCTAssertTrue(untrustedContext.contains("Current task data:"))
+        XCTAssertTrue(untrustedContext.contains(contract.id.rawValue))
+        XCTAssertTrue(untrustedContext.contains("@\(A.rawValue)"))
+        XCTAssertTrue(untrustedContext.contains(contract.roleHint))
+        XCTAssertTrue(untrustedContext.contains("[same as the current user turn; omitted here]"))
+        XCTAssertEqual(request.messages.filter { $0.role == .user }.compactMap(\.content).last,
+                       contract.objective)
+        XCTAssertTrue(untrustedContext.contains(contract.expectedDeliverable))
+        XCTAssertTrue(untrustedContext.contains("Complete only the assigned task."))
+        XCTAssertTrue(untrustedContext.contains("Do not re-run the global task decomposition."))
+        XCTAssertTrue(untrustedContext.contains("Do not create, remove, or coordinate other agents."))
         XCTAssertFalse(systemPrompt.lowercased().contains("you can spawn agents"))
         XCTAssertFalse(systemPrompt.lowercased().contains("you can coordinate agents"))
         XCTAssertFalse(systemPrompt.lowercased().contains("you can delegate freely"))
@@ -586,8 +606,8 @@ final class IntatisCoworkTests: XCTestCase {
         XCTAssertEqual(agents.first { $0.name == macos }?.coordinationDepth, 0)
         XCTAssertEqual(agents.first { $0.name == ios }?.coordinationDepth, 0)
 
-        let macosPrompt = try XCTUnwrap(macosProvider.requests.first?.messages.first?.content)
-        let iosPrompt = try XCTUnwrap(iosProvider.requests.first?.messages.first?.content)
+        let macosPrompt = macosProvider.requests.first?.messages.compactMap(\.content).joined(separator: "\n") ?? ""
+        let iosPrompt = iosProvider.requests.first?.messages.compactMap(\.content).joined(separator: "\n") ?? ""
         XCTAssertTrue(macosPrompt.contains("macOS Swift file counter"))
         XCTAssertTrue(macosPrompt.contains("Recursively count macOS Swift files only."))
         XCTAssertTrue(iosPrompt.contains("iOS Swift file counter"))
