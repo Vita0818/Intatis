@@ -25,6 +25,22 @@ private final class NonRecursiveFlag: @unchecked Sendable {
     }
 }
 
+private actor CapturingNonRecursiveResponder: PermissionResponder {
+    private var captured: [PermissionRequestPayload] = []
+    private let decision: PermissionDecision
+
+    init(_ decision: PermissionDecision) {
+        self.decision = decision
+    }
+
+    func requestApproval(_ request: PermissionRequestPayload) async -> PermissionDecision {
+        captured.append(request)
+        return decision
+    }
+
+    func requests() -> [PermissionRequestPayload] { captured }
+}
+
 private final class NonRecursiveProvider: ToolCallingProvider, @unchecked Sendable {
     private let responses: [[AgentChunk]]
     private let onStream: (@Sendable (Int, AgentRequest) -> Void)?
@@ -82,6 +98,15 @@ private func delegateArgs(to: String,
     return String(decoding: try! JSONSerialization.data(withJSONObject: object), as: UTF8.self)
 }
 
+private func automaticDelegateArgs(objective: String,
+                                   roleHint: String? = nil,
+                                   expectedDeliverable: String? = nil) -> String {
+    var object: [String: String] = ["objective": objective]
+    if let roleHint { object["roleHint"] = roleHint }
+    if let expectedDeliverable { object["expectedDeliverable"] = expectedDeliverable }
+    return String(decoding: try! JSONSerialization.data(withJSONObject: object), as: UTF8.self)
+}
+
 private func askArgs(to: String, question: String) -> String {
     String(decoding: try! JSONSerialization.data(withJSONObject: [
         "to": to,
@@ -102,6 +127,105 @@ private func spawnArgs(name: String,
 final class AgentInvocationNonRecursiveTests: XCTestCase {
     private let main = AgentID(rawValue: "main")
     private let worker = AgentID(rawValue: "worker")
+
+    func testDelegateTaskWithoutTargetAtomicallyCreatesWorkerAndReturnsStableIdentity() async throws {
+        let log = try nonRecursiveLog()
+        let workspace = try nonRecursiveWorkspace("automatic-worker-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let generatedWorker = AgentID(rawValue: "worker-1")
+        let workerProvider = NonRecursiveProvider([
+            [.textDelta("automatic worker result"), .done(finishReason: "stop")],
+        ])
+        let mainProvider = NonRecursiveProvider([
+            [.toolCalls([
+                ToolCall(
+                    id: "delegate-auto",
+                    name: "delegate_task",
+                    arguments: automaticDelegateArgs(
+                        objective: "Perform one bounded worker task.",
+                        roleHint: "automatic worker",
+                        expectedDeliverable: "Return the bounded result."))
+            ]), .done(finishReason: "tool_calls")],
+            [.textDelta("main synthesized automatic worker result"), .done(finishReason: "stop")],
+        ])
+        let responder = CapturingNonRecursiveResponder(.allow)
+        let orch = Orchestrator(log: log, allowsShell: true, responder: responder) { agent in
+            agent.name == generatedWorker ? workerProvider : mainProvider
+        }
+        let mainAttached = await orch.attach(Agent(
+            name: main,
+            workspaceRoot: workspace,
+            model: ModelID(rawValue: "m"),
+            profile: .reviewed,
+            coordinationDepth: Agent.defaultCoordinationDepth))
+        XCTAssertTrue(mainAttached)
+
+        let sent = await orch.send("Delegate without naming a worker.", to: main)
+        XCTAssertEqual(sent, .sent)
+
+        XCTAssertEqual(workerProvider.requests.count, 1)
+        let mainFollowup = try XCTUnwrap(mainProvider.requests.last)
+        let delegateResult = try XCTUnwrap(mainFollowup.messages.first {
+            $0.role == .tool && $0.toolCallId == "delegate-auto"
+        }?.content)
+        XCTAssertTrue(delegateResult.contains("task_id="))
+        XCTAssertTrue(delegateResult.contains("agent_id=@worker-1"))
+        XCTAssertTrue(delegateResult.contains("automatic worker result"))
+        let approvals = await responder.requests()
+        XCTAssertEqual(approvals.filter { $0.tool == "delegate_task" }.count, 1)
+        XCTAssertFalse(approvals.contains { $0.tool == "agent.attach" && $0.agent == generatedWorker })
+        let events = await log.replay()
+        XCTAssertTrue(events.contains {
+            if case .agentSpawned(let payload) = $0.event { return payload.agent == generatedWorker }
+            return false
+        })
+        XCTAssertTrue(events.contains {
+            if case .taskCompleted(let payload) = $0.event {
+                return payload.report?.summary == "automatic worker result"
+            }
+            return false
+        })
+    }
+
+    func testAutomaticDelegateRollsBackNewWorkerWhenTaskAdmissionIsBlocked() async throws {
+        let log = try nonRecursiveLog()
+        let workspace = try nonRecursiveWorkspace("automatic-worker-rollback-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let provider = NonRecursiveProvider([
+            [.textDelta("unused"), .done(finishReason: "stop")],
+        ])
+        let orch = Orchestrator(log: log, allowsShell: true, responder: FixedResponder(.allow)) { _ in provider }
+        let mainAttached = await orch.attach(Agent(
+            name: main,
+            workspaceRoot: workspace,
+            model: ModelID(rawValue: "m"),
+            profile: .reviewed,
+            coordinationDepth: Agent.defaultCoordinationDepth))
+        XCTAssertTrue(mainAttached)
+
+        let result = await orch.delegateTask(
+            from: main,
+            to: nil,
+            objective: "Do not forward this secret marker ghp_abcdef1234567890")
+
+        XCTAssertEqual(result, "your delegated task was blocked by the mediator")
+        let remainingAgents = await orch.agentNames()
+        XCTAssertFalse(remainingAgents.contains(AgentID(rawValue: "worker-1")))
+        let events = await log.replay()
+        XCTAssertTrue(events.contains {
+            if case .agentSpawned(let payload) = $0.event {
+                return payload.agent == AgentID(rawValue: "worker-1")
+            }
+            return false
+        })
+        XCTAssertTrue(events.contains {
+            if case .agentDetached(let payload) = $0.event {
+                return payload.agent == AgentID(rawValue: "worker-1")
+            }
+            return false
+        })
+        XCTAssertTrue(provider.requests.isEmpty)
+    }
 
     func testDelegateTaskToolRunsScheduledWorkerAndReturnsResultToCallerLoop() async throws {
         let log = try nonRecursiveLog()

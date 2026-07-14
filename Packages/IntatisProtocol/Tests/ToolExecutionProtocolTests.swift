@@ -32,6 +32,12 @@ final class ToolExecutionProtocolTests: XCTestCase {
         let session = SessionID(rawValue: "sess_tool_execution")
         let taskID = TaskID(rawValue: "task_tool_execution")
         let agent = AgentID(rawValue: "worker")
+        let intent = PermissionIntent(
+            action: "filesystem.write",
+            resources: [PermissionResource(kind: .workspacePath, value: "a.swift", access: .readWrite)],
+            dataEffects: [.mutate],
+            risks: [.workspaceMutation],
+            replayPolicy: .requiresManualReconciliation)
         let prepared = ToolExecutionPreparedPayload(
             executionID: "exec_1",
             taskID: taskID,
@@ -39,7 +45,8 @@ final class ToolExecutionProtocolTests: XCTestCase {
             toolCallID: "call_1",
             agent: agent,
             tool: "write_file",
-            sideEffect: .write)
+            sideEffect: .write,
+            intent: intent)
         let settled = ToolExecutionSettledPayload(
             prepared: prepared,
             outcome: .succeeded,
@@ -78,5 +85,17 @@ final class ToolExecutionProtocolTests: XCTestCase {
         XCTAssertEqual(
             envelope.event,
             .toolResult(.init(toolCallId: "call_legacy", observation: "ok")))
+    }
+
+    func testLegacyPreparedExecutionWithoutIntentStillDecodes() throws {
+        let json = #"{"executionID":"exec_legacy","toolCallID":"call_legacy","tool":"read_file","sideEffect":"read_only","replayPolicy":"safe_to_replay"}"#
+
+        let payload = try JSONDecoder().decode(
+            ToolExecutionPreparedPayload.self,
+            from: Data(json.utf8))
+
+        XCTAssertEqual(payload.executionID, "exec_legacy")
+        XCTAssertNil(payload.intent)
+        XCTAssertEqual(payload.replayPolicy, .safeToReplay)
     }
 }

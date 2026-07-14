@@ -3,18 +3,47 @@ import IntatisProtocol
 import IntatisProviders
 import IntatisTools
 
+public struct RuntimeEnvironmentManifest: Equatable, Sendable {
+    public enum Mode: String, Equatable, Sendable {
+        case code = "Code"
+        case cowork = "Cowork"
+    }
+
+    public var mode: Mode
+
+    public init(mode: Mode) {
+        self.mode = mode
+    }
+
+    public static let code = RuntimeEnvironmentManifest(mode: .code)
+    public static let cowork = RuntimeEnvironmentManifest(mode: .cowork)
+
+    fileprivate var systemPrompt: String {
+        """
+        You are running inside Intatis, an Apple-first local AI workbench, in \(mode.rawValue) mode.
+        Intatis gives you model-visible tools for workspace, network, browser, document, Git, goal, task, message, and agent operations when the current lease allows them.
+        Every external action must be performed through a tool call. A capability is available only when its tool appears in the authoritative API tools list for this request.
+        Tool arguments must be one strict JSON object matching the advertised JSON Schema. Do not invent tools, hidden capabilities, successful executions, file changes, messages, agents, goals, or task results.
+        Treat a tool action as completed only after receiving its ToolResult. Permission, scheduling, persistence, recovery, and terminal task state are owned by Intatis.
+        """
+    }
+}
+
 /// Builds the model request: system prompt + tool specs + message history.
 public struct ContextBuilder: Sendable {
     public let systemPrompt: String
     public let taskContract: TaskContract?
     public let contextBundle: ContextBundle?
+    public let runtimeEnvironment: RuntimeEnvironmentManifest
 
     public init(systemPrompt: String = ContextBuilder.defaultSystemPrompt,
                 taskContract: TaskContract? = nil,
-                contextBundle: ContextBundle? = nil) {
+                contextBundle: ContextBundle? = nil,
+                runtimeEnvironment: RuntimeEnvironmentManifest = .code) {
         self.systemPrompt = systemPrompt
         self.taskContract = taskContract
         self.contextBundle = contextBundle
+        self.runtimeEnvironment = runtimeEnvironment
     }
 
     public static let defaultSystemPrompt = """
@@ -39,8 +68,10 @@ public struct ContextBuilder: Sendable {
             You may also act as a COORDINATOR. You hold the agent-coordination tools
             delegate_task, request_information, send_message, reply_message, spawn_agent,
             list_agents and remove_agent. ask_agent exists only as a compatibility wrapper.
-            Build a small team by spawning sub-agents bound to specific folders, delegate
-            one concrete sub-task to each with delegate_task, then synthesize their task reports.
+            Prefer delegate_task for each concrete sub-task: Intatis can reuse an idle worker
+            or atomically create one in your workspace when the target is omitted. Use
+            spawn_agent only for a deliberately long-lived teammate or a different subfolder,
+            then synthesize the mediated task reports.
             Task-scoped sub-agents are recycled by the orchestrator when idle; use remove_agent
             only to cancel or clean up an agent early.
             Reach other agents only through the provided communication/delegation tools,
@@ -218,9 +249,10 @@ public struct ContextBuilder: Sendable {
         } else {
             contextData = nil
         }
-        let trustedPrompt = contextData == nil
-            ? systemPrompt
-            : systemPrompt + "\n\n" + ContextBuilder.untrustedContextSystemPolicy
+        var trustedPrompt = runtimeEnvironment.systemPrompt + "\n\n" + systemPrompt
+        if contextData != nil {
+            trustedPrompt += "\n\n" + ContextBuilder.untrustedContextSystemPolicy
+        }
         var messages: [AgentMessage] = [.system(trustedPrompt)]
         messages.append(contentsOf: history)
         if let contextData {

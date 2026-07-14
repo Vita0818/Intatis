@@ -942,4 +942,39 @@ final class AgentLoopPolicyTests: XCTestCase {
             toolMessages.compactMap(\.content),
             ["result:ask-slow", "result:delegate-fast", "result:ask-mid", "result:delegate-mid"])
     }
+
+    func testRepeatedIdenticalDeniedToolCallIsReviewedOnceThenTerminates() async throws {
+        let (workspace, log) = try makeWorkspaceAndLog("denial-circuit-breaker")
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let arguments = json(["path": "blocked.txt", "content": "blocked"])
+        let provider = PolicyScriptedProvider([
+            [.toolCalls([ToolCall(id: "denied-1", name: "write_file", arguments: arguments)]),
+             .done(finishReason: "tool_calls")],
+            [.toolCalls([ToolCall(id: "denied-2", name: "write_file", arguments: arguments)]),
+             .done(finishReason: "tool_calls")],
+            [.toolCalls([ToolCall(id: "denied-3", name: "write_file", arguments: arguments)]),
+             .done(finishReason: "tool_calls")],
+        ])
+        let responder = CapturingPolicyResponder(.deny)
+        let loop = makeLoop(
+            workspace: workspace,
+            log: log,
+            provider: provider,
+            registry: ToolRegistry([WriteFileTool()]),
+            responder: responder)
+
+        do {
+            _ = try await loop.send("Keep retrying the same denied write.")
+            XCTFail("The third identical denied call must terminate the run.")
+        } catch let error as AgentLoopError {
+            XCTAssertEqual(error, .repeatedDeniedToolCall(tool: "write_file"))
+        }
+
+        let approvalRequests = await responder.requests()
+        XCTAssertEqual(approvalRequests.count, 1)
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: workspace.appendingPathComponent("blocked.txt").path))
+        let terminalErrors = await errors(in: log)
+        XCTAssertEqual(terminalErrors.last?.code, "repeated_denied_tool_call")
+    }
 }

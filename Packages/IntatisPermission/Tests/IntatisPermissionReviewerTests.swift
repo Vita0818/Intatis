@@ -47,14 +47,14 @@ final class IntatisPermissionReviewerTests: XCTestCase {
         XCTAssertEqual(out.decision, .askUser)
     }
 
-    func testEngineWriteAsksBeforeModelReviewer() async {
+    func testEngineWriteUsesConfiguredModelReviewer() async {
         let reviewer = ModelPermissionReviewer(
             provider: CannedChat(text: #"{"decision":"allow","risk":"low","reason":"fine"}"#),
             model: ModelID(rawValue: "rev"))
         let engine = PermissionEngine(reviewer: reviewer)
         let out = await engine.decide(writeCall(), reviewCtx(profile: .reviewed))
-        XCTAssertEqual(out.decision, .askUser)
-        XCTAssertEqual(out.reason, "write to workspace")
+        XCTAssertEqual(out.decision, .allow)
+        XCTAssertEqual(out.reason, "fine")
     }
 
     func testHardDenyNeverReachesReviewer() async {

@@ -1,8 +1,8 @@
 # Intatis
 
-一个 clean-room 的本地 AI 工作台：**Chat + Cowork + Code** 三合一，底层是同一个
-headless Agent Kernel。架构设计见 [`ARCHITECTURE.md`](ARCHITECTURE.md)，clean-room
-声明见 [`NOTICE.md`](NOTICE.md)。
+一个 Apple-first、Swift-native 优先的本地 AI 工作台：**Chat + Cowork + Code** 三合一，底层是同一个
+headless Agent Kernel。架构设计见 [`ARCHITECTURE.md`](ARCHITECTURE.md)，项目来源与许可证状态见
+[`NOTICE.md`](NOTICE.md)，开源复用规则见 [`docs/OPEN_SOURCE_REUSE.md`](docs/OPEN_SOURCE_REUSE.md)。
 
 当前仓库已经有可运行的 Chat / Code / Cowork 核心路径，但仍处在 v0.9.x 硬化阶段。下面按
 **implemented / partial / planned** 标明真实状态，避免把半成品能力写成完整功能。

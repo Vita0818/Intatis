@@ -70,46 +70,51 @@ public struct CapabilityLease: Codable, Sendable, Hashable {
         self.expiresAtTaskCompletion = expiresAtTaskCompletion
     }
 
-    public static func worker(taskID: TaskID? = nil) -> CapabilityLease {
-        CapabilityLease(
-            taskID: taskID,
-            tools: [
-                .readWorkspace,
-                .listWorkspace,
-                .searchWorkspace,
-                .readPDF,
-                .replyMessage,
-                .requestDelegation,
-            ],
-            communication: .replyOnly,
-            delegation: .requestOnly)
-    }
-
-    public static func coordinator(taskID: TaskID? = nil,
-                                   budget: DelegationBudget = DelegationBudget(maxTasks: 8, maxDepth: 1)) -> CapabilityLease {
-        CapabilityLease(
-            taskID: taskID,
-            tools: [
-                .readWorkspace,
-                .listWorkspace,
-                .searchWorkspace,
+    public static func worker(taskID: TaskID? = nil,
+                              workspaceAccess: WorkspaceAccess = .readOnly) -> CapabilityLease {
+        var tools: Set<ToolCapability> = [
+            .readWorkspace,
+            .listWorkspace,
+            .searchWorkspace,
+            .readPDF,
+            .replyMessage,
+            .requestDelegation,
+        ]
+        if workspaceAccess == .readWrite {
+            tools.formUnion([
                 .gitControl,
                 .gitRemote,
                 .proposePatch,
                 .applyPatch,
-                .readPDF,
                 .editPDF,
                 .reconstructDocument,
                 .compileLaTeX,
                 .generateMedia,
                 .browseWeb,
-                .sendMessage,
-                .requestInformation,
-                .replyMessage,
-                .requestDelegation,
-                .delegateTask,
-                .attachWorkspace,
-            ],
+            ])
+        }
+        return CapabilityLease(
+            taskID: taskID,
+            tools: tools,
+            communication: .replyOnly,
+            delegation: .requestOnly)
+    }
+
+    public static func coordinator(taskID: TaskID? = nil,
+                                   budget: DelegationBudget = DelegationBudget(maxTasks: 8, maxDepth: 1),
+                                   workspaceAccess: WorkspaceAccess = .readWrite) -> CapabilityLease {
+        var tools = worker(taskID: taskID, workspaceAccess: workspaceAccess).tools
+        tools.formUnion([
+            .sendMessage,
+            .requestInformation,
+            .replyMessage,
+            .requestDelegation,
+            .delegateTask,
+            .attachWorkspace,
+        ])
+        return CapabilityLease(
+            taskID: taskID,
+            tools: tools,
             communication: .anyAgentInThread,
             delegation: .granted(budget),
             expiresAtTaskCompletion: taskID != nil)

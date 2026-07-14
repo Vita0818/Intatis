@@ -4,8 +4,8 @@ import IntatisProtocol
 import IntatisTools
 
 /// Coordinator tools (ARCHITECTURE.md §7). They let an explicit lead agent build
-/// and steer a small team of worker agents. Creating an agent expands the active
-/// workspace/capability boundary, so `spawn_agent` is intentionally not read-only.
+/// and steer a small team of worker agents. Their structured PermissionIntent
+/// separates control-plane admission from later workspace file operations.
 
 /// Create + attach a new sub-agent bound to a folder.
 public struct SpawnAgentTool: Tool {
@@ -16,6 +16,7 @@ public struct SpawnAgentTool: Tool {
         description: "Create a new sub-agent bound to a folder so you can delegate work to it. "
             + "Give it a short name and an absolute folder path; model is optional (defaults to "
             + "yours). Set canCoordinate only when this sub-agent must manage lower-level agents. "
+            + "New agents are read-only unless requestedAccess is explicitly read_write. "
             + "After spawning, assign work with delegate_task; the orchestrator recycles task-scoped agents when idle.",
         sideEffect: .write,
         parameters: .object([
@@ -27,6 +28,11 @@ public struct SpawnAgentTool: Tool {
                                  "description": .string("absolute path to the agent's workspace folder")]),
                 "model": .object(["type": .string("string"),
                                   "description": .string("optional model id; defaults to your model")]),
+                "requestedAccess": .object([
+                    "type": .string("string"),
+                    "enum": .array([.string("read_only"), .string("read_write")]),
+                    "description": .string("optional workspace ceiling; defaults to read_only"),
+                ]),
                 "canCoordinate": .object(["type": .string("boolean"),
                                            "description": .string("optional; true grants coordinator tools to this sub-agent")]),
             ]),
@@ -35,7 +41,53 @@ public struct SpawnAgentTool: Tool {
         ])
     )
 
-    struct Args: Decodable { let name: String; let path: String; let model: String?; let canCoordinate: Bool? }
+    struct Args: Decodable {
+        let name: String
+        let path: String
+        let model: String?
+        let requestedAccess: WorkspaceAccess?
+        let canCoordinate: Bool?
+    }
+
+    public func touchedPaths(_ args: ToolArgs) -> [String] {
+        // The target is a workspace admission resource, not a file path that
+        // this invocation reads or writes. The orchestrator separately
+        // canonicalizes and assesses it before committing the admission.
+        []
+    }
+
+    public func permissionIntent(_ args: ToolArgs, workspaceRoot: URL) -> PermissionIntent {
+        guard let value = try? args.decode(Args.self) else {
+            return .derived(
+                toolName: Self.descriptor.name,
+                sideEffect: Self.descriptor.sideEffect,
+                touchedPaths: [],
+                risksNetwork: false)
+        }
+        let requestedAccess = value.requestedAccess ?? .readOnly
+        var risks: Set<PermissionRisk> = [.controlPlaneMutation, .capabilityGrant, .modelCost]
+        if !PathConfinement.isWithin(value.path, root: workspaceRoot) {
+            risks.insert(.workspaceExpansion)
+        }
+        if requestedAccess == .readWrite {
+            risks.insert(.workspaceMutation)
+        }
+        return PermissionIntent(
+            action: "agent.spawn",
+            resources: [
+                PermissionResource(kind: .agent, value: value.name),
+                PermissionResource(kind: .workspace, value: value.path, access: requestedAccess),
+            ],
+            metadata: [
+                "model": value.model.map(JSONValue.string) ?? .null,
+                "requestedAccess": .string(requestedAccess.rawValue),
+                "canCoordinate": .bool(value.canCoordinate ?? false),
+            ],
+            dataEffects: [.none],
+            controlEffects: [.createAgent, .grantCapability],
+            risks: risks,
+            replayPolicy: .requiresManualReconciliation)
+    }
 
     public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {
         let a = try args.decode(Args.self)
@@ -46,6 +98,7 @@ public struct SpawnAgentTool: Tool {
             name: a.name,
             path: a.path,
             model: a.model,
+            requestedAccess: a.requestedAccess ?? .readOnly,
             canCoordinate: a.canCoordinate ?? false))
     }
 }
@@ -64,6 +117,14 @@ public struct ListAgentsTool: Tool {
             "additionalProperties": .bool(false),
         ])
     )
+
+    public func permissionIntent(_ args: ToolArgs, workspaceRoot: URL) -> PermissionIntent {
+        PermissionIntent(
+            action: "agent.list",
+            resources: [PermissionResource(kind: .agent, value: "thread")],
+            dataEffects: [.read],
+            replayPolicy: .safeToReplay)
+    }
 
     public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {
         guard let manager = context.agentManager else {
@@ -93,6 +154,17 @@ public struct RemoveAgentTool: Tool {
     )
 
     struct Args: Decodable { let name: String }
+
+    public func permissionIntent(_ args: ToolArgs, workspaceRoot: URL) -> PermissionIntent {
+        let name = (try? args.decode(Args.self))?.name ?? "unknown"
+        return PermissionIntent(
+            action: "agent.remove",
+            resources: [PermissionResource(kind: .agent, value: name)],
+            dataEffects: [.none],
+            controlEffects: [.removeAgent],
+            risks: [.controlPlaneMutation],
+            replayPolicy: .requiresManualReconciliation)
+    }
 
     public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {
         let a = try args.decode(Args.self)

@@ -96,7 +96,7 @@ private struct IntatisChatSessionScreen: View {
 
             IntatisComposer(model: model,
                             catalog: env.providerCatalog,
-                            onSelectModel: env.selectProviderModel(providerID:modelID:))
+                            onSelectModel: env.selectProviderModel(providerID:modelID:variantID:))
                 .frame(maxWidth: layout.contentMaxWidth)
                 .padding(.horizontal, layout.horizontalPadding)
                 .padding(.top, 10)
@@ -230,7 +230,7 @@ struct IntatisChatModelMenu: View {
     let isBusy: Bool
     let isCompact: Bool
     var help: String = "Switch model"
-    let onSelect: (String, String) -> Void
+    let onSelect: (String, String, String?) -> Void
     @Environment(\.colorScheme) private var scheme
 
     private var selectedProvider: AppProviderSettings? { catalog.selectedProvider }
@@ -240,7 +240,23 @@ struct IntatisChatModelMenu: View {
             ProviderModelMenuProvider(
                 id: provider.id,
                 title: provider.title,
-                models: provider.models.map { ProviderModelMenuModel(id: $0.id, title: $0.title) })
+                models: provider.models.flatMap { model in
+                    let base = ProviderModelMenuModel(
+                        id: model.id,
+                        modelID: model.id,
+                        variantID: nil,
+                        title: model.title,
+                        detail: model.reasoningLabel)
+                    let variants = model.variants.map { variant in
+                        ProviderModelMenuModel(
+                            id: variantMenuID(modelID: model.id, variantID: variant.id),
+                            modelID: model.id,
+                            variantID: variant.id,
+                            title: model.title,
+                            detail: variantMenuDetail(variant))
+                    }
+                    return [base] + variants
+                })
         }
     }
 
@@ -249,6 +265,7 @@ struct IntatisChatModelMenu: View {
             providers: menuProviders,
             selectedProviderID: catalog.selectedProviderID,
             selectedModelID: catalog.selectedModelID,
+            selectedVariantID: catalog.selectedVariantID,
             isBusy: isBusy,
             onSelect: onSelect) {
                 label
@@ -264,11 +281,18 @@ struct IntatisChatModelMenu: View {
                 .foregroundStyle(IntatisTheme.goldDeep)
                 .frame(width: 18)
             VStack(alignment: .leading, spacing: 2) {
-                Text(selectedModel?.title ?? AppConfig.defaultDisplayName(for: AppConfig.defaultModel))
-                    .font(IntatisType.body(13, .semibold))
-                    .foregroundStyle(IntatisTheme.deepText(scheme))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                HStack(spacing: 5) {
+                    Text(selectedModel?.title ?? AppConfig.defaultDisplayName(for: AppConfig.defaultModel))
+                        .font(IntatisType.body(13, .semibold))
+                        .foregroundStyle(IntatisTheme.deepText(scheme))
+                    if let detail = selectedModelDetail {
+                        Text(detail)
+                            .font(IntatisType.body(13, .medium))
+                            .foregroundStyle(IntatisTheme.softText(scheme))
+                    }
+                }
+                .lineLimit(1)
+                .truncationMode(.middle)
                 if !isCompact {
                     Text(selectedProvider?.title ?? "OpenAI")
                         .font(IntatisType.caption(11, .medium))
@@ -293,6 +317,25 @@ struct IntatisChatModelMenu: View {
                         .stroke(IntatisTheme.glassStroke(scheme).opacity(0.75), lineWidth: 1)
                 }
         }
+    }
+
+    private var selectedModelDetail: String? {
+        if let variant = catalog.selectedVariant {
+            return variantMenuDetail(variant)
+        }
+        return selectedModel?.reasoningLabel
+    }
+
+    private func variantMenuID(modelID: String, variantID: String) -> String {
+        "\(modelID.utf8.count):\(modelID)\(variantID)"
+    }
+
+    private func variantMenuDetail(_ variant: AppProviderModelVariant) -> String {
+        guard let reasoning = variant.reasoningLabel,
+              reasoning.caseInsensitiveCompare(variant.id) != .orderedSame else {
+            return variant.reasoningLabel ?? variant.id
+        }
+        return "\(variant.id) · \(reasoning)"
     }
 }
 
@@ -407,7 +450,7 @@ struct IntatisMessageBubble: View {
 struct IntatisComposer: View {
     @ObservedObject var model: ChatViewModel
     let catalog: AppProviderCatalog
-    let onSelectModel: (String, String) -> Void
+    let onSelectModel: (String, String, String?) -> Void
     @Environment(\.colorScheme) private var scheme
 
     private var canSend: Bool {
@@ -456,7 +499,7 @@ struct IntatisComposerAccessory: View {
     let isBusy: Bool
     let latestTurnStats: TurnStatsSnapshot?
     let contextLabel: String?
-    let onSelectModel: (String, String) -> Void
+    let onSelectModel: (String, String, String?) -> Void
     @Environment(\.colorScheme) private var scheme
 
     var body: some View {
@@ -793,7 +836,7 @@ struct IntatisSettingsPanel: View {
                 .foregroundStyle(IntatisTheme.softText(scheme))
             Picker("", selection: $catalog.selectedModelID) {
                 ForEach(catalog.providers[providerIndex].models) { model in
-                    Text(model.title).tag(model.id)
+                    IntatisModelTitleLabel(model: model).tag(model.id)
                 }
             }
             .labelsHidden()
@@ -1119,6 +1162,21 @@ struct IntatisSettingsPanel: View {
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
                     .stroke(IntatisTheme.glassStroke(scheme).opacity(0.8), lineWidth: 1)
             }
+    }
+}
+
+struct IntatisModelTitleLabel: View {
+    let model: AppProviderModel
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Text(model.title)
+                .foregroundStyle(.primary)
+            if let reasoningLabel = model.reasoningLabel {
+                Text(reasoningLabel)
+                    .foregroundStyle(.secondary)
+            }
+        }
     }
 }
 #endif

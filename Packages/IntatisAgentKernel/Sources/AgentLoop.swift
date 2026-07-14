@@ -15,6 +15,7 @@ public enum AgentLoopError: Error, Sendable, Equatable, LocalizedError {
     case completionExpectedToolCalls(finishReason: String)
     case incompleteFinishReason(String)
     case toolExecutionRequiresManualReconciliation(tool: String, executionID: String, reason: String)
+    case repeatedDeniedToolCall(tool: String)
 
     public var errorDescription: String? {
         switch self {
@@ -28,6 +29,28 @@ public enum AgentLoopError: Error, Sendable, Equatable, LocalizedError {
             return "Agent response ended incompletely with finish reason \(finishReason)."
         case .toolExecutionRequiresManualReconciliation(let tool, let executionID, let reason):
             return "Tool \(tool) may have produced a side effect before it failed (execution \(executionID)); manual reconciliation is required before retrying. \(reason)"
+        case .repeatedDeniedToolCall(let tool):
+            return "Agent repeatedly retried the identical denied tool call \(tool); the task was stopped to protect the automatic permission reviewer."
+        }
+    }
+}
+
+/// Per-AgentLoop circuit breaker. One exact retry is answered from the cached
+/// denial without spending another reviewer call; a further identical retry is
+/// a terminal coordination failure instead of an unbounded model/reviewer loop.
+private actor ToolDenialCircuitBreaker {
+    private var deniedAttempts: [String: Int] = [:]
+
+    func noteRepeatedAttempt(signature: String) -> Int? {
+        guard let previous = deniedAttempts[signature] else { return nil }
+        let next = previous + 1
+        deniedAttempts[signature] = next
+        return next
+    }
+
+    func recordDenial(signature: String) {
+        if deniedAttempts[signature] == nil {
+            deniedAttempts[signature] = 1
         }
     }
 }
@@ -192,6 +215,7 @@ public struct AgentLoop: Sendable {
         var firstTokenAt: Date?
         var usage: Usage?
         var turnStatsAppended = false
+        let denialCircuitBreaker = ToolDenialCircuitBreaker()
 
         do {
         for _ in 0..<maxIterations {
@@ -315,7 +339,9 @@ public struct AgentLoop: Sendable {
             }
 
             convo.append(.assistant(toolCalls: pendingToolCalls, content: assistantText.isEmpty ? nil : assistantText))
-            let observations = try await runToolCalls(pendingToolCalls)
+            let observations = try await runToolCalls(
+                pendingToolCalls,
+                denialCircuitBreaker: denialCircuitBreaker)
             for (toolCall, observation) in zip(pendingToolCalls, observations) {
                 try Task.checkCancellation()
                 convo.append(.tool(id: toolCall.id, content: observation))
@@ -377,6 +403,8 @@ public struct AgentLoop: Sendable {
             code = "incomplete_response"
         case .toolExecutionRequiresManualReconciliation:
             code = "manual_reconciliation"
+        case .repeatedDeniedToolCall:
+            code = "repeated_denied_tool_call"
         }
         return ErrorPayload(code: code, message: loopError.localizedDescription)
     }
@@ -406,7 +434,7 @@ public struct AgentLoop: Sendable {
         return max(1, Int(ceil(Double(messageCharacters + toolCharacters) / 4.0)))
     }
 
-    private func workspaceLeaseFailure(descriptor: ToolDescriptor,
+    private func workspaceLeaseFailure(intent: PermissionIntent,
                                        touchedPaths: [String]) -> String? {
         guard let lease = workspaceLease else { return nil }
         guard let rootIdentity = lease.rootIdentity else {
@@ -420,7 +448,7 @@ public struct AgentLoop: Sendable {
         guard leaseRoot.path == agentRoot.path else {
             return "workspace lease root does not match the agent workspace"
         }
-        if lease.access == .readOnly, descriptor.sideEffect != .readOnly {
+        if lease.access == .readOnly, !intent.isReadOnlyWorkspaceCompatible {
             return "workspace lease is read-only"
         }
         for path in touchedPaths {
@@ -510,7 +538,8 @@ public struct AgentLoop: Sendable {
 
     // MARK: - Tool execution with permission
 
-    private func runToolCalls(_ toolCalls: [ToolCall]) async throws -> [String] {
+    private func runToolCalls(_ toolCalls: [ToolCall],
+                              denialCircuitBreaker: ToolDenialCircuitBreaker) async throws -> [String] {
         let parallelCollaborationTools = Set(["ask_agent", "delegate_task"])
         guard toolCalls.count > 1,
               toolCalls.allSatisfy({ parallelCollaborationTools.contains($0.name) }) else {
@@ -518,7 +547,9 @@ public struct AgentLoop: Sendable {
             results.reserveCapacity(toolCalls.count)
             for toolCall in toolCalls {
                 try Task.checkCancellation()
-                results.append(try await runTool(toolCall))
+                results.append(try await runTool(
+                    toolCall,
+                    denialCircuitBreaker: denialCircuitBreaker))
             }
             return results
         }
@@ -526,7 +557,9 @@ public struct AgentLoop: Sendable {
         return try await withThrowingTaskGroup(of: (Int, String).self, returning: [String].self) { group in
             for (index, toolCall) in toolCalls.enumerated() {
                 group.addTask {
-                    (index, try await runTool(toolCall))
+                    (index, try await runTool(
+                        toolCall,
+                        denialCircuitBreaker: denialCircuitBreaker))
                 }
             }
             var indexed: [(Int, String)] = []
@@ -536,7 +569,8 @@ public struct AgentLoop: Sendable {
         }
     }
 
-    private func runTool(_ toolCall: ToolCall) async throws -> String {
+    private func runTool(_ toolCall: ToolCall,
+                         denialCircuitBreaker: ToolDenialCircuitBreaker) async throws -> String {
         try Task.checkCancellation()
         try await log.append(.toolCall(ToolCallPayload(
             toolCallId: toolCall.id, agent: agent.name, name: toolCall.name, args: toolCall.arguments)))
@@ -561,30 +595,56 @@ public struct AgentLoop: Sendable {
         }
 
         let args = ToolArgs(raw: normalizedArguments)
+        let effectiveWorkspaceRoot = workspaceLease.map { URL(fileURLWithPath: $0.rootPath) }
+            ?? agent.workspaceRoot
+        let touchedPaths = tool.touchedPaths(args)
+        let intent = tool.permissionIntent(args, workspaceRoot: effectiveWorkspaceRoot)
+        let denialSignature = descriptor.name + "\u{001F}" + normalizedArguments
+        if let repeatedAttempt = await denialCircuitBreaker.noteRepeatedAttempt(
+            signature: denialSignature) {
+            let reason = "identical tool call was already denied in this agent run"
+            let message = "permission denied: \(reason)"
+            try await log.append([
+                .permissionResolved(PermissionResolvedPayload(
+                    tool: descriptor.name,
+                    decision: .deny,
+                    risk: .medium,
+                    reason: reason,
+                    intent: intent)),
+                .toolResult(ToolResultPayload(
+                    toolCallId: toolCall.id,
+                    observation: message)),
+            ])
+            if repeatedAttempt >= 3 {
+                throw AgentLoopError.repeatedDeniedToolCall(tool: descriptor.name)
+            }
+            return message
+        }
         if let leaseFailure = workspaceLeaseFailure(
-            descriptor: descriptor,
-            touchedPaths: tool.touchedPaths(args)) {
+            intent: intent,
+            touchedPaths: touchedPaths) {
             let message = "permission denied: \(leaseFailure)"
             try await log.append([
                 .permissionResolved(PermissionResolvedPayload(
                     tool: descriptor.name,
                     decision: .deny,
                     risk: .high,
-                    reason: leaseFailure)),
+                    reason: leaseFailure,
+                    intent: intent)),
                 .toolResult(ToolResultPayload(
                     toolCallId: toolCall.id,
                     observation: message)),
             ])
+            await denialCircuitBreaker.recordDenial(signature: denialSignature)
             return message
         }
         let callContext = ToolCallContext(
             toolName: descriptor.name,
             sideEffect: descriptor.sideEffect,
-            touchedPaths: tool.touchedPaths(args),
+            touchedPaths: touchedPaths,
             risksNetwork: tool.risksNetwork(args),
-            rawArgs: normalizedArguments)
-        let effectiveWorkspaceRoot = workspaceLease.map { URL(fileURLWithPath: $0.rootPath) }
-            ?? agent.workspaceRoot
+            rawArgs: normalizedArguments,
+            intent: intent)
         let effectiveProfile: PermissionProfile = workspaceLease?.access == .readOnly
             ? .readOnly
             : agent.profile
@@ -597,9 +657,7 @@ public struct AgentLoop: Sendable {
         let outcome = await engine.decide(callContext, permissionContext)
         try Task.checkCancellation()
         let executionID = IDGen.random(prefix: "tool-execution")
-        let replayPolicy = ToolExecutionReplayPolicy.conservative(
-            for: descriptor.sideEffect,
-            tool: descriptor.name)
+        let replayPolicy = intent.replayPolicy
         let settled = try await settle(outcome,
                                        descriptor: descriptor,
                                        toolCall: ToolCall(id: toolCall.id,
@@ -613,6 +671,7 @@ public struct AgentLoop: Sendable {
         guard settled.decision == .allow else {
             let message = "permission denied: \(settled.reason)"
             try await log.append(.toolResult(ToolResultPayload(toolCallId: toolCall.id, observation: message)))
+            await denialCircuitBreaker.recordDenial(signature: denialSignature)
             return message
         }
 
@@ -620,7 +679,7 @@ public struct AgentLoop: Sendable {
         // workspace identity after that await boundary so an approved action
         // cannot be redirected into a replacement directory at the same path.
         if let leaseFailure = workspaceLeaseFailure(
-            descriptor: descriptor,
+            intent: intent,
             touchedPaths: callContext.touchedPaths) {
             let message = "permission denied: \(leaseFailure)"
             try await log.append([
@@ -628,11 +687,13 @@ public struct AgentLoop: Sendable {
                     tool: descriptor.name,
                     decision: .deny,
                     risk: .high,
-                    reason: leaseFailure)),
+                    reason: leaseFailure,
+                    intent: intent)),
                 .toolResult(ToolResultPayload(
                     toolCallId: toolCall.id,
                     observation: message)),
             ])
+            await denialCircuitBreaker.recordDenial(signature: denialSignature)
             return message
         }
 
@@ -646,6 +707,7 @@ public struct AgentLoop: Sendable {
             agent: agent.name,
             tool: descriptor.name,
             sideEffect: descriptor.sideEffect,
+            intent: intent,
             replayPolicy: replayPolicy)
         // This record is the durable boundary: if it cannot be written, the
         // executor is never invoked. An unresolved non-replayable record after
@@ -656,7 +718,7 @@ public struct AgentLoop: Sendable {
         // more immediately before entering the executor. If the root changed,
         // settle the unused ticket explicitly; no side effect has run.
         if let leaseFailure = workspaceLeaseFailure(
-            descriptor: descriptor,
+            intent: intent,
             touchedPaths: callContext.touchedPaths) {
             let message = "permission denied: \(leaseFailure)"
             try await log.append([
@@ -664,7 +726,8 @@ public struct AgentLoop: Sendable {
                     tool: descriptor.name,
                     decision: .deny,
                     risk: .high,
-                    reason: leaseFailure)),
+                    reason: leaseFailure,
+                    intent: intent)),
                 .toolResult(ToolResultPayload(
                     toolCallId: toolCall.id,
                     observation: message)),
@@ -673,6 +736,7 @@ public struct AgentLoop: Sendable {
                     outcome: .failed,
                     reason: leaseFailure)),
             ])
+            await denialCircuitBreaker.recordDenial(signature: denialSignature)
             return message
         }
 
@@ -959,7 +1023,11 @@ public struct AgentLoop: Sendable {
         switch outcome.decision {
         case .allow, .deny:
             try await log.append(.permissionResolved(PermissionResolvedPayload(
-                tool: descriptor.name, decision: outcome.decision, risk: outcome.risk, reason: outcome.reason)))
+                tool: descriptor.name,
+                decision: outcome.decision,
+                risk: outcome.risk,
+                reason: outcome.reason,
+                intent: callContext.intent)))
             return SettledPermission(decision: outcome.decision, reason: outcome.reason)
 
         case .askUser:
@@ -988,7 +1056,8 @@ public struct AgentLoop: Sendable {
                     tool: descriptor.name,
                     decision: .deny,
                     risk: outcome.risk,
-                    reason: "permission request cancelled")))
+                    reason: "permission request cancelled",
+                    intent: callContext.intent)))
                 throw CancellationError()
             }
             let resolvedReason = userDecision == .allow
@@ -1000,7 +1069,8 @@ public struct AgentLoop: Sendable {
                     tool: descriptor.name,
                     decision: userDecision,
                     risk: outcome.risk,
-                    reason: resolvedReason)),
+                    reason: resolvedReason,
+                    intent: callContext.intent)),
                 .agentStatus(AgentStatusPayload(agent: agent.name, state: .tool)),
             ])
             return SettledPermission(decision: userDecision, reason: resolvedReason)
@@ -1044,6 +1114,7 @@ public struct AgentLoop: Sendable {
             touchedPaths: callContext.touchedPaths,
             risksNetwork: callContext.risksNetwork,
             sideEffect: callContext.sideEffect,
+            intent: callContext.intent,
             gate: PermissionReviewGateSnapshot(
                 decision: gateDecision,
                 risk: outcome.risk,

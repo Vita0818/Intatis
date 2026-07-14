@@ -132,7 +132,7 @@ public struct CodeShell: View {
     }
 
     @ViewBuilder private func thread(layout: IntatisThreadContentLayout) -> some View {
-        if items.isEmpty {
+        if items.isEmpty && !showsThinkingIndicator {
             CodeEmptyThreadView(style: threadStyle)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .padding(.horizontal, layout.horizontalPadding)
@@ -143,6 +143,10 @@ public struct CodeShell: View {
                         ForEach(items) { item in
                             CodeItemRow(item: item, style: threadStyle, layout: layout)
                                 .id(item.id)
+                        }
+                        if showsThinkingIndicator {
+                            IntatisThreadThinkingRow(layout: layout, style: threadStyle)
+                                .id("intatis-code-thinking")
                         }
                         Color.clear
                             .frame(height: 1)
@@ -164,6 +168,13 @@ public struct CodeShell: View {
         }
     }
 
+    private var showsThinkingIndicator: Bool {
+        IntatisThreadActivity.isAwaitingModelOutput(
+            items: items,
+            isWorking: isWorking,
+            permissionBlocksResponse: permissionBlocksComposer)
+    }
+
     private var itemScrollSignature: String {
         guard let last = items.last else { return "0" }
         return [
@@ -171,7 +182,8 @@ public struct CodeShell: View {
             last.id,
             "\(last.body.count)",
             "\(last.complete)",
-            "\(isWorking)"
+            "\(isWorking)",
+            "\(showsThinkingIndicator)"
         ].joined(separator: ":")
     }
 

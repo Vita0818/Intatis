@@ -226,6 +226,128 @@ final class AutomaticPermissionReviewTests: XCTestCase {
         XCTAssertNil(CoworkProjection.build(from: events).workspaceLeases[reviewerWorkspaceLeaseID])
     }
 
+    func testFreshSessionBootstrapsMainThenReviewerWithoutReviewingMainAdmission() async throws {
+        let log = try autoReviewTempLog()
+        let ws = try autoReviewWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let reviewerProvider = AutoReviewCapturingProvider([
+            .textDelta(#"{"decision":"allow","reason":"unused"}"#),
+            .done(finishReason: "stop"),
+        ])
+        let orch = try Orchestrator.runtime(
+            log: log,
+            allowsShell: true,
+            responder: DenyAllResponder()) { _ in reviewerProvider }
+
+        let mainResult = await orch.bootstrapMainAgent(Agent(
+            name: main,
+            workspaceRoot: ws,
+            model: ModelID(rawValue: "main-model"),
+            profile: .reviewed,
+            coordinationDepth: Agent.defaultCoordinationDepth))
+        XCTAssertEqual(mainResult, .attached(main))
+
+        let reviewerResult = await orch.enableAutomaticPermissionReview(
+            model: ModelID(rawValue: "reviewer-model"),
+            workspaceRoot: ws)
+        XCTAssertEqual(reviewerResult, .enabled(reviewer))
+        XCTAssertTrue(reviewerProvider.requests.isEmpty)
+
+        let events = await log.replay()
+        let projection = CoworkProjection.build(from: events)
+        XCTAssertEqual(Set(projection.agentRoster.keys), Set([main, reviewer]))
+        XCTAssertFalse(events.contains { envelope in
+            guard case .permissionRequest(let payload) = envelope.event else { return false }
+            return payload.tool == "agent.attach" && payload.agent == main
+        })
+        XCTAssertFalse(events.contains { envelope in
+            guard case .permissionReviewRequested(let payload) = envelope.event else { return false }
+            return payload.task.tool == "agent.attach" && payload.task.requestingAgent == main
+        })
+        let mainWorkspaceLeases = projection.workspaceLeaseAgents.filter { $0.value == main }
+        let reviewerWorkspaceLeases = projection.workspaceLeaseAgents.filter { $0.value == reviewer }
+        XCTAssertEqual(mainWorkspaceLeases.count, 1)
+        XCTAssertEqual(reviewerWorkspaceLeases.count, 1)
+        XCTAssertEqual(mainWorkspaceLeases.values.first, main)
+        XCTAssertEqual(reviewerWorkspaceLeases.values.first, reviewer)
+        XCTAssertEqual(
+            mainWorkspaceLeases.keys.first.flatMap { projection.workspaceLeases[$0]?.access },
+            .readWrite)
+        XCTAssertEqual(
+            reviewerWorkspaceLeases.keys.first.flatMap { projection.workspaceLeases[$0]?.access },
+            .readOnly)
+    }
+
+    func testMainBootstrapFailsClosedForNonemptySession() async throws {
+        let log = try autoReviewTempLog()
+        let ws = try autoReviewWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        try await log.append(.error(ErrorPayload(code: "existing", message: "existing session state")))
+        let orch = Orchestrator(
+            log: log,
+            allowsShell: true,
+            responder: DenyAllResponder()) { _ in
+                AutoReviewScriptedProvider([[.done(finishReason: "stop")]])
+            }
+
+        let result = await orch.bootstrapMainAgent(Agent(
+            name: main,
+            workspaceRoot: ws,
+            model: ModelID(rawValue: "main-model"),
+            profile: .reviewed,
+            coordinationDepth: Agent.defaultCoordinationDepth))
+
+        guard case .failed(let message) = result else {
+            return XCTFail("nonempty sessions must not use the bootstrap bypass")
+        }
+        XCTAssertTrue(message.contains("empty Cowork session"))
+        let agents = await orch.agentList()
+        let projection = CoworkProjection.build(from: await log.replay())
+        XCTAssertTrue(agents.isEmpty)
+        XCTAssertNil(projection.agentRoster[main])
+    }
+
+    func testMainBootstrapPersistenceFailureLeavesNoGhostAgentOrLease() async throws {
+        let log = try autoReviewTempLog()
+        let ws = try autoReviewWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let orch = Orchestrator(
+            log: log,
+            allowsShell: true,
+            responder: DenyAllResponder()) { _ in
+                AutoReviewScriptedProvider([[.done(finishReason: "stop")]])
+            }
+        let mainID = main
+        await orch.setAdmissionEventsAppender { events in
+            if events.contains(where: { event in
+                guard case .agentAttached(let payload) = event else { return false }
+                return payload.agent == mainID
+            }) {
+                throw AutoReviewPersistenceError.forcedBatchFailure
+            }
+            try await log.append(events)
+        }
+
+        let result = await orch.bootstrapMainAgent(Agent(
+            name: main,
+            workspaceRoot: ws,
+            model: ModelID(rawValue: "main-model"),
+            profile: .reviewed,
+            coordinationDepth: Agent.defaultCoordinationDepth))
+
+        guard case .failed = result else {
+            return XCTFail("bootstrap must fail when its atomic admission batch fails")
+        }
+        let agents = await orch.agentList()
+        let workspaceLeases = await orch.workspaceLeaseList()
+        let capabilityLeases = await orch.capabilityLeaseList()
+        let projection = CoworkProjection.build(from: await log.replay())
+        XCTAssertTrue(agents.isEmpty)
+        XCTAssertTrue(workspaceLeases.isEmpty)
+        XCTAssertTrue(capabilityLeases.isEmpty)
+        XCTAssertNil(projection.agentRoster[main])
+    }
+
     func testRestoreRevokesStaleReviewerIdentityAndLeasesBeforeReenable() async throws {
         let log = try autoReviewTempLog()
         let ws = try autoReviewWorkspace()
@@ -644,24 +766,33 @@ final class AutomaticPermissionReviewTests: XCTestCase {
         XCTAssertTrue(prompt.contains(#""canCoordinate":false"#))
     }
 
-    func testReviewerSeesFrozenCanCoordinateSpawnContractAndCommittedLeasesMatch() async throws {
+    func testSpawnToolUsesOneAutomaticReviewAndCommitsCoordinatorAdmissionAtomically() async throws {
         let log = try autoReviewTempLog()
         let mainWorkspace = try autoReviewWorkspace()
-        let childWorkspace = try autoReviewWorkspace()
-        defer {
-            try? FileManager.default.removeItem(at: mainWorkspace)
-            try? FileManager.default.removeItem(at: childWorkspace)
-        }
+        let childWorkspace = mainWorkspace.appendingPathComponent("child", isDirectory: true)
+        try FileManager.default.createDirectory(at: childWorkspace, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: mainWorkspace) }
+        let spawnArgs = String(decoding: try JSONSerialization.data(withJSONObject: [
+            "name": "coordinator-admission",
+            "path": childWorkspace.path,
+            "model": "child-model",
+            "canCoordinate": true,
+        ], options: [.sortedKeys]), as: UTF8.self)
+        let mainProvider = AutoReviewScriptedProvider([
+            [.toolCalls([ToolCall(id: "spawn-once", name: "spawn_agent", arguments: spawnArgs)]),
+             .done(finishReason: "tool_calls")],
+            [.textDelta("coordinator created"), .done(finishReason: "stop")],
+        ])
         let reviewerProvider = AutoReviewCapturingProvider([
-            .textDelta(#"{"decision":"allow","risk":"medium","reason":"reviewed coordinator admission"}"#),
+            .textDelta(#"{"decision":"allow","risk":"medium","reason":"bounded coordinator spawn"}"#),
             .done(finishReason: "stop"),
         ])
         let reviewerID = reviewer
-        let orch = Orchestrator(log: log, allowsShell: true, responder: AttachOnlyResponder()) { agent in
+        let orch = Orchestrator(log: log, allowsShell: true, responder: AttachOnlyResponder()) { agent -> any ToolCallingProvider in
             if agent.name == reviewerID {
                 return reviewerProvider
             }
-            return AutoReviewScriptedProvider([[.textDelta("unused"), .done(finishReason: "stop")]])
+            return mainProvider
         }
         let mainAttached = await orch.attach(Agent(
             name: main,
@@ -670,61 +801,32 @@ final class AutomaticPermissionReviewTests: XCTestCase {
             profile: .reviewed,
             coordinationDepth: Agent.defaultCoordinationDepth))
         XCTAssertTrue(mainAttached)
-        let enableResult = await orch.enableAutomaticPermissionReview(
+        let enabled = await orch.enableAutomaticPermissionReview(
             model: ModelID(rawValue: "reviewer-model"),
             workspaceRoot: mainWorkspace)
-        XCTAssertEqual(enableResult, .enabled(reviewer))
+        XCTAssertEqual(enabled, .enabled(reviewer))
+
+        let sent = await orch.send("create one coordinator for child", to: main)
+        XCTAssertEqual(sent, .sent)
 
         let childID = AgentID(rawValue: "coordinator-admission")
-        let result = await orch.spawnFromTool(
-            requestedBy: main,
-            name: childID.rawValue,
-            path: childWorkspace.path,
-            model: "child-model",
-            canCoordinate: true)
-
-        XCTAssertTrue(result.contains("coordinator"))
-        XCTAssertEqual(reviewerProvider.requests.count, 1)
         let events = await log.replay()
-        let reviewTask = try XCTUnwrap(events.compactMap { envelope -> PermissionReviewTask? in
-            guard case .permissionReviewRequested(let payload) = envelope.event,
-                  payload.task.requestingAgent == childID,
-                  payload.task.tool == "agent.attach" else { return nil }
+        let reviewTasks = events.compactMap { envelope -> PermissionReviewTask? in
+            guard case .permissionReviewRequested(let payload) = envelope.event else { return nil }
             return payload.task
-        }.first)
-        let taskID = try XCTUnwrap(reviewTask.taskID)
-        let proposedCapability = try XCTUnwrap(reviewTask.capabilityLease)
-        let proposedWorkspace = try XCTUnwrap(reviewTask.workspaceLease)
-        let contract = try XCTUnwrap(reviewTask.taskContract)
-
-        XCTAssertEqual(reviewTask.rootTaskID, taskID)
-        XCTAssertEqual(reviewTask.attempt, 1)
-        XCTAssertEqual(reviewTask.causalContext.taskLineage, [taskID])
-        XCTAssertEqual(reviewTask.causalContext.issuer, main)
-        XCTAssertEqual(reviewTask.causalContext.relatedAgents, [main])
-        XCTAssertEqual(contract.id, taskID)
-        XCTAssertEqual(contract.kind, .agentAdmission)
-        XCTAssertEqual(contract.issuer, main)
-        XCTAssertEqual(contract.assignee, childID)
-        XCTAssertEqual(contract.workspaceLeaseID, proposedWorkspace.id)
-        XCTAssertEqual(contract.capabilityLeaseID, proposedCapability.id)
-        XCTAssertEqual(proposedWorkspace.access, .readWrite)
-        XCTAssertTrue(proposedCapability.tools.contains(.delegateTask))
-        XCTAssertTrue(proposedCapability.tools.contains(.attachWorkspace))
-        if case .granted = proposedCapability.delegation {
-            // The reviewed proposal is a coordinator grant.
-        } else {
-            XCTFail("reviewed coordinator lease must include a delegation grant")
         }
-
-        let argsData = try XCTUnwrap(reviewTask.normalizedArgs.data(using: .utf8))
-        let args = try XCTUnwrap(
-            JSONSerialization.jsonObject(with: argsData) as? [String: Any])
-        XCTAssertEqual(args["canCoordinate"] as? Bool, true)
-        XCTAssertEqual(
-            args["coordinationDepth"] as? Int,
-            Agent.defaultCoordinationDepth)
-        XCTAssertEqual(args["admissionTaskID"] as? String, taskID.rawValue)
+        XCTAssertEqual(reviewerProvider.requests.count, 1)
+        XCTAssertEqual(reviewTasks.filter { $0.tool == "spawn_agent" }.count, 1)
+        XCTAssertFalse(reviewTasks.contains { $0.tool == "agent.attach" && $0.requestingAgent == childID })
+        let spawnReview = try XCTUnwrap(reviewTasks.first { $0.tool == "spawn_agent" })
+        XCTAssertEqual(spawnReview.requestingAgent, main)
+        XCTAssertTrue(spawnReview.normalizedArgs.contains(#""canCoordinate":true"#))
+        XCTAssertTrue(spawnReview.touchedPaths.isEmpty)
+        XCTAssertEqual(spawnReview.intent?.action, "agent.spawn")
+        XCTAssertEqual(spawnReview.intent?.dataEffects, [.none])
+        XCTAssertEqual(spawnReview.intent?.controlEffects, [.createAgent, .grantCapability])
+        XCTAssertEqual(spawnReview.intent?.metadata["requestedAccess"],
+                       .string(WorkspaceAccess.readOnly.rawValue))
 
         let committedCapability = try XCTUnwrap(events.compactMap { envelope -> CapabilityLease? in
             guard case .capabilityLeaseCreated(let payload) = envelope.event,
@@ -736,26 +838,20 @@ final class AutomaticPermissionReviewTests: XCTestCase {
                   payload.agent == childID else { return nil }
             return payload.lease
         }.last)
-        XCTAssertEqual(committedCapability, proposedCapability)
-        XCTAssertEqual(committedWorkspace, proposedWorkspace)
-        let attachedMetadata = try XCTUnwrap(events.compactMap { envelope -> CoworkEventMetadata? in
-            guard case .agentAttached(let payload) = envelope.event,
-                  payload.agent == childID else { return nil }
-            return payload.metadata
-        }.last)
-        XCTAssertEqual(attachedMetadata.taskID, taskID)
-        XCTAssertEqual(attachedMetadata.rootTaskID, taskID)
-        XCTAssertEqual(attachedMetadata.issuer, main)
-        XCTAssertEqual(attachedMetadata.workspaceLeaseID, proposedWorkspace.id)
-        XCTAssertEqual(attachedMetadata.capabilityLeaseID, proposedCapability.id)
-
-        let prompt = try XCTUnwrap(
-            reviewerProvider.requests.first?.messages.compactMap(\.content).joined(separator: "\n"))
-        XCTAssertTrue(prompt.contains("task_id: \(taskID.rawValue)"))
-        XCTAssertTrue(prompt.contains("issuer=main"))
-        XCTAssertTrue(prompt.contains("kind=agent_admission"))
-        XCTAssertTrue(prompt.contains(#""canCoordinate":true"#))
-        XCTAssertTrue(prompt.contains("capability_lease: id=\(proposedCapability.id.rawValue)"))
+        XCTAssertEqual(committedWorkspace.rootPath, childWorkspace.resolvingSymlinksInPath().path)
+        XCTAssertEqual(committedWorkspace.access, .readOnly)
+        XCTAssertTrue(committedCapability.tools.contains(.delegateTask))
+        XCTAssertTrue(committedCapability.tools.contains(.attachWorkspace))
+        XCTAssertFalse(committedCapability.tools.contains(.applyPatch))
+        if case .granted = committedCapability.delegation {
+            // Expected coordinator grant.
+        } else {
+            XCTFail("committed coordinator lease must include delegation")
+        }
+        XCTAssertTrue(events.contains {
+            guard case .agentSpawned(let payload) = $0.event else { return false }
+            return payload.agent == childID && payload.requestedBy == main
+        })
     }
 
     func testReviewerApprovesWorkspaceWriteWithoutTerminalApproval() async throws {
@@ -799,6 +895,7 @@ final class AutomaticPermissionReviewTests: XCTestCase {
         let reviewRequest = try XCTUnwrap(reviewerProvider.requests.first)
         XCTAssertEqual(reviewRequest.model, ModelID(rawValue: "reviewer-model"))
         XCTAssertTrue(reviewRequest.tools.isEmpty)
+        XCTAssertEqual(reviewRequest.maxOutputTokens, 1_024)
         let prompt = reviewRequest.messages.compactMap(\.content).joined(separator: "\n")
         XCTAssertTrue(prompt.contains("Active agent roster:"))
         XCTAssertTrue(prompt.contains("@main"))
@@ -818,7 +915,59 @@ final class AutomaticPermissionReviewTests: XCTestCase {
         XCTAssertEqual(reviews.last?.reviewerModel, "@permission-reviewer:reviewer-model")
     }
 
-    func testReviewerAskUserFallsBackToResponderDeny() async throws {
+    func testCancellingActiveTasksKeepsAutomaticReviewerAvailableForNextRequest() async throws {
+        let log = try autoReviewTempLog()
+        let ws = try autoReviewWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let mainProvider = AutoReviewScriptedProvider([
+            [.toolCalls([ToolCall(
+                id: "write-after-cancel",
+                name: "write_file",
+                arguments: autoReviewWriteArgs(path: "after-cancel.txt", content: "reviewed"))]),
+             .done(finishReason: "tool_calls")],
+            [.textDelta("done"), .done(finishReason: "stop")],
+        ])
+        let reviewerProvider = AutoReviewCapturingProvider([
+            .textDelta(#"{"decision":"allow","reason":"next request remains reviewable"}"#),
+            .done(finishReason: "stop"),
+        ])
+        let reviewerID = reviewer
+        let orch = Orchestrator(
+            log: log,
+            allowsShell: true,
+            responder: AttachOnlyResponder()) { agent -> any ToolCallingProvider in
+                if agent.name == reviewerID { return reviewerProvider }
+                return mainProvider
+            }
+        let attached = await orch.attach(Agent(
+            name: main,
+            workspaceRoot: ws,
+            model: ModelID(rawValue: "main-model"),
+            profile: .reviewed,
+            coordinationDepth: Agent.defaultCoordinationDepth))
+        XCTAssertTrue(attached)
+        let enabled = await orch.enableAutomaticPermissionReview(
+            model: ModelID(rawValue: "reviewer-model"),
+            workspaceRoot: ws)
+        XCTAssertEqual(enabled, .enabled(reviewer))
+
+        await orch.cancelActiveTasks(reason: "cancelled by user")
+
+        let stillEnabled = await orch.automaticPermissionReviewEnabled()
+        let health = await orch.automaticPermissionReviewHealth()
+        let sent = await orch.send("write after-cancel.txt", to: main)
+        XCTAssertTrue(stillEnabled)
+        XCTAssertEqual(health, .healthy)
+        XCTAssertEqual(sent, .sent)
+        XCTAssertEqual(
+            try String(
+                contentsOf: ws.appendingPathComponent("after-cancel.txt"),
+                encoding: .utf8),
+            "reviewed")
+        XCTAssertEqual(reviewerProvider.requests.count, 1)
+    }
+
+    func testReviewerAskUserIsNormalizedToAutomaticDenyWithoutFallback() async throws {
         let log = try autoReviewTempLog()
         let ws = try autoReviewWorkspace()
         defer { try? FileManager.default.removeItem(at: ws) }
@@ -858,7 +1007,7 @@ final class AutomaticPermissionReviewTests: XCTestCase {
             }
             return nil
         }
-        XCTAssertEqual(reviews.last?.decision, .askUser)
+        XCTAssertEqual(reviews.last?.decision, .deny)
     }
 
     func testHardDenyNeverReachesAutomaticReviewer() async throws {

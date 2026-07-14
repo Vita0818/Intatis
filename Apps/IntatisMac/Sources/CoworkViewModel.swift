@@ -138,6 +138,15 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
     @Published private(set) var addAgentStatus: CoworkAddAgentStatus = .idle
     @Published private(set) var permissionReviewerStatus: CoworkPermissionReviewerStatus = .disabled
 
+    var isAutomaticPermissionReviewReady: Bool {
+        switch permissionReviewerStatus {
+        case .enabled, .degraded:
+            return true
+        case .disabled, .enabling, .fallback, .failed:
+            return false
+        }
+    }
+
     private let log: EventLog
     private let registryBox: ProviderRegistryBox
     private var orchestrator: Orchestrator?
@@ -207,15 +216,41 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             var turnStats = TurnStatsProjection.build(from: replayed)
             self.restoreWorkspaceAccess(for: coworkProjection)
             await self.orchestrator?.restore(from: coworkProjection)
+
+            // Restore may durably reconcile stale control-plane state. Rebuild
+            // every projection from that authoritative tail before starting
+            // bootstrap, then register the stream first so bootstrap admission
+            // events cannot remain invisible while another startup step waits.
+            let restored = await self.log.replay()
+            codeProjection = CodeProjection.build(from: restored)
+            coworkProjection = CoworkProjection.build(from: restored)
+            permissions = PermissionProjection.build(from: restored, markNeedsRerun: true)
+            turnStats = TurnStatsProjection.build(from: restored)
             self.items = codeProjection.items
             self.pendingPermission = self.presentedPermission(projected: permissions.latest)
             self.permissionNotice = permissions.latestResolved
             self.latestTurnStats = turnStats.latest
             self.applyCoworkProjection(coworkProjection)
-            await self.ensureAutomaticPermissionReview(existingProjection: coworkProjection)
-            await self.bootstrapMainAgentIfNeeded(existingProjection: coworkProjection)
+            let stream = await self.log.stream(from: (restored.last?.seq ?? -1) + 1)
+
+            if restored.isEmpty {
+                // Choosing the primary workspace is the explicit authorization
+                // for the fixed @main bootstrap. Do not ask a model to approve
+                // that same user choice a second time.
+                await self.bootstrapMainAgentIfNeeded(
+                    existingProjection: coworkProjection,
+                    allowsInitialSessionBootstrap: true)
+                await self.ensureAutomaticPermissionReview(existingProjection: coworkProjection)
+            } else {
+                // Recovery is not a fresh-session trust boundary. Re-enable the
+                // reviewer first, then keep ordinary attach semantics if a
+                // historical session is unexpectedly missing @main.
+                await self.ensureAutomaticPermissionReview(existingProjection: coworkProjection)
+                await self.bootstrapMainAgentIfNeeded(
+                    existingProjection: coworkProjection,
+                    allowsInitialSessionBootstrap: false)
+            }
             await self.orchestrator?.resumePendingTasks()
-            let stream = await self.log.stream(from: (replayed.last?.seq ?? -1) + 1)
             for await envelope in stream {
                 codeProjection.apply(envelope)
                 coworkProjection.apply(envelope)
@@ -435,7 +470,8 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         activeOperations[operationID] = operation
     }
 
-    private func bootstrapMainAgentIfNeeded(existingProjection projection: CoworkProjection) async {
+    private func bootstrapMainAgentIfNeeded(existingProjection projection: CoworkProjection,
+                                            allowsInitialSessionBootstrap: Bool) async {
         guard !didRequestMainAgentAttach else { return }
         guard let orchestrator else { return }
         let mainID = AgentID(rawValue: projectSettings.mainAgentName)
@@ -445,14 +481,30 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         let url = WorkspaceAccess.restoreAccess(forPath: workspace.path)
             ?? URL(fileURLWithPath: workspace.path)
         let model = await defaultAgentModel()
-        let attached = await orchestrator.attach(Agent(
+        let main = Agent(
             name: mainID,
             workspaceRoot: url,
             model: model,
             profile: projectSettings.defaultProfile,
-            coordinationDepth: Agent.defaultCoordinationDepth))
-        await synchronizePermissionReviewerHealth(using: orchestrator)
+            coordinationDepth: Agent.defaultCoordinationDepth)
+        let attached: Bool
+        if allowsInitialSessionBootstrap {
+            switch await orchestrator.bootstrapMainAgent(main) {
+            case .attached, .alreadyAttached:
+                attached = true
+            case .failed(let message):
+                attached = false
+                composerError = message
+            }
+        } else {
+            attached = await orchestrator.attach(main)
+            await synchronizePermissionReviewerHealth(using: orchestrator)
+            if !attached {
+                composerError = "@\(mainID.rawValue) could not be attached to the primary workspace."
+            }
+        }
         if attached {
+            composerError = nil
             rememberWorkspace(url, agentName: mainID.rawValue, isPrimary: true)
         }
     }
@@ -587,6 +639,10 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
 
     func send() {
         guard !isWorking, let orchestrator else { return }
+        guard isAutomaticPermissionReviewReady else {
+            composerError = "Automatic permission review must be ready before Cowork can run a task. Retry the reviewer."
+            return
+        }
         let originalInput = input
         let initialParsed: ParsedUserInput
         switch GoalInputParser.parse(originalInput) {
@@ -639,6 +695,21 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             }
             activeOperations[operationID] = operation
         }
+    }
+
+    func cancelCurrentTask() {
+        guard isWorking, let orchestrator else { return }
+        composerError = "Cancelling the current Cowork task…"
+        let operationID = UUID()
+        let operation = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.activeOperations.removeValue(forKey: operationID) }
+            await orchestrator.cancelActiveTasks(reason: "cancelled by user")
+            await self.synchronizePermissionReviewerHealth(using: orchestrator)
+            self.composerError = nil
+            self.isWorking = false
+        }
+        activeOperations[operationID] = operation
     }
 
     private func routeProjectInput(_ input: String) -> CoworkMentionRoute {
@@ -792,13 +863,13 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
     private var permissionFallbackReason: String {
         switch steadyPermissionReviewerStatus {
         case .enabled:
-            return "Automatic review requested a user decision."
+            return "Automatic review unexpectedly left the automatic path; Cowork input is locked."
         case .failed(let reason):
-            return "Automatic review is unavailable (\(reason)); user approval is required."
+            return "Automatic review is unavailable (\(reason)); retry before running Cowork tasks."
         case .disabled:
-            return "Automatic review is disabled; user approval is required."
+            return "Automatic review is disabled; Cowork input is locked."
         case .enabling:
-            return "Automatic review is still starting; user approval is required."
+            return "Automatic review is still starting; Cowork input remains locked."
         case .degraded(let reason):
             return reason
         case .fallback(let reason):

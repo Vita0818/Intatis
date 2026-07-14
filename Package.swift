@@ -106,7 +106,7 @@ let package = Package(
             dependencies: ["IntatisCore", "IntatisProtocol", "IntatisProviders", "IntatisConversation", "IntatisArtifacts"],
             path: "Packages/IntatisSharedUI/Sources"
         ),
-        // v0.6 — CLI: clean-room `intatis` command (chat + code agent), talks to
+        // v0.6 — CLI: Swift-native `intatis` command (chat + code agent), talks to
         // any OpenAI-compatible endpoint via env vars.
         .executableTarget(
             name: "IntatisCLI",

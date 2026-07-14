@@ -144,6 +144,10 @@ enum CoworkProjectSettingsStore {
         return decoded.primaryWorkspace?.path ?? WorkspaceAccess.workspacePath(for: sessionID)
     }
 
+    static func remove(sessionID: SessionID) {
+        UserDefaults.standard.removeObject(forKey: key(sessionID))
+    }
+
     private static func key(_ sessionID: SessionID) -> String {
         "intatis.cowork.projectSettings.\(sessionID.rawValue)"
     }
@@ -255,7 +259,8 @@ struct CoworkProjectSettingsSheet: View {
                     ForEach(catalog.providers) { provider in
                         Section(provider.title) {
                             ForEach(provider.models) { model in
-                                Text(model.title).tag(modelSelectionKey(providerID: provider.id, modelID: model.id))
+                                IntatisModelTitleLabel(model: model)
+                                    .tag(modelSelectionKey(providerID: provider.id, modelID: model.id))
                             }
                         }
                     }

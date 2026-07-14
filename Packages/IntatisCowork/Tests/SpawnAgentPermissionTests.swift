@@ -17,9 +17,31 @@ private struct EmptyProvider: ToolCallingProvider {
     }
 }
 
+private final class SpawnScriptedProvider: ToolCallingProvider, @unchecked Sendable {
+    private let lock = NSLock()
+    private var responses: [[AgentChunk]]
+    private var index = 0
+
+    init(_ responses: [[AgentChunk]]) {
+        self.responses = responses
+    }
+
+    func stream(_ request: AgentRequest) -> AsyncThrowingStream<AgentChunk, Error> {
+        lock.lock()
+        let chunks = responses[min(index, responses.count - 1)]
+        index += 1
+        lock.unlock()
+        return AsyncThrowingStream { continuation in
+            for chunk in chunks { continuation.yield(chunk) }
+            continuation.finish()
+        }
+    }
+}
+
 private struct MainOnlyAttachResponder: PermissionResponder {
     func requestApproval(_ request: PermissionRequestPayload) async -> PermissionDecision {
-        request.agent == Orchestrator.mainAgentID ? .allow : .deny
+        if request.tool == "spawn_agent" { return .deny }
+        return request.agent == Orchestrator.mainAgentID ? .allow : .deny
     }
 }
 
@@ -199,10 +221,20 @@ final class SpawnAgentPermissionTests: XCTestCase {
             try? FileManager.default.removeItem(at: mainWorkspace)
             try? FileManager.default.removeItem(at: workerWorkspace)
         }
+        let spawnArgs = String(decoding: try JSONSerialization.data(withJSONObject: [
+            "name": "worker",
+            "path": workerWorkspace.path,
+            "model": "m",
+        ], options: [.sortedKeys]), as: UTF8.self)
+        let provider = SpawnScriptedProvider([
+            [.toolCalls([ToolCall(id: "spawn-external", name: "spawn_agent", arguments: spawnArgs)]),
+             .done(finishReason: "tool_calls")],
+            [.textDelta("spawn denied"), .done(finishReason: "stop")],
+        ])
         let orch = Orchestrator(
             log: log,
             allowsShell: true,
-            responder: MainOnlyAttachResponder()) { _ in EmptyProvider() }
+            responder: MainOnlyAttachResponder()) { _ in provider }
         let mainAttached = await orch.attach(Agent(
             name: Orchestrator.mainAgentID,
             workspaceRoot: mainWorkspace,
@@ -211,26 +243,21 @@ final class SpawnAgentPermissionTests: XCTestCase {
             coordinationDepth: Agent.defaultCoordinationDepth))
         XCTAssertTrue(mainAttached)
 
-        let message = await orch.spawnFromTool(
-            requestedBy: Orchestrator.mainAgentID,
-            name: "worker",
-            path: workerWorkspace.path,
-            model: "m")
+        let sendResult = await orch.send("spawn a worker in another workspace", to: Orchestrator.mainAgentID)
         let agents = await orch.agentList()
 
-        XCTAssertTrue(message.contains("permission denied"))
+        XCTAssertEqual(sendResult, .sent)
         XCTAssertEqual(agents.map(\.name), [Orchestrator.mainAgentID])
         let events = await log.replay()
-        let workerRequest = try XCTUnwrap(events.compactMap { envelope -> PermissionRequestPayload? in
-            if case .permissionRequest(let payload) = envelope.event,
-               payload.agent == AgentID(rawValue: "worker"), payload.tool == "agent.attach" {
-                return payload
-            }
-            return nil
-        }.first)
         XCTAssertTrue(events.contains {
             if case .permissionResolved(let payload) = $0.event {
-                return payload.requestId == workerRequest.requestId && payload.decision == .deny
+                return payload.tool == "spawn_agent" && payload.decision == .deny
+            }
+            return false
+        })
+        XCTAssertFalse(events.contains {
+            if case .permissionRequest(let payload) = $0.event {
+                return payload.agent == AgentID(rawValue: "worker") && payload.tool == "agent.attach"
             }
             return false
         })
@@ -282,6 +309,15 @@ final class SpawnAgentPermissionTests: XCTestCase {
         XCTAssertTrue(defaultLease.tools.contains(.delegateTask))
         XCTAssertTrue(defaultLease.tools.contains(.attachWorkspace))
         XCTAssertTrue(defaultLease.tools.contains(.requestInformation))
+        XCTAssertFalse(defaultLease.tools.contains(.applyPatch))
+        let defaultWorkspace = try XCTUnwrap(events.compactMap { envelope -> WorkspaceLease? in
+            if case .workspaceLeaseGranted(let payload) = envelope.event,
+               payload.agent == childID, payload.lease.taskID == nil {
+                return payload.lease
+            }
+            return nil
+        }.last)
+        XCTAssertEqual(defaultWorkspace.access, .readOnly)
         if case .granted = defaultLease.delegation {
             // Expected coordinator delegation grant.
         } else {
@@ -289,5 +325,47 @@ final class SpawnAgentPermissionTests: XCTestCase {
         }
         let liveLease = await orch.capabilityLease(id: defaultLease.id)
         XCTAssertEqual(liveLease, defaultLease)
+    }
+
+    func testSpawnAgentGrantsReadWriteOnlyWhenExplicitlyRequested() async throws {
+        let log = try tempLog()
+        let mainWorkspace = try tempWorkspace(name: "main")
+        let childWorkspace = try tempWorkspace(name: "child-read-write")
+        defer {
+            try? FileManager.default.removeItem(at: mainWorkspace)
+            try? FileManager.default.removeItem(at: childWorkspace)
+        }
+        let orch = orchestrator(log: log, decision: .allow)
+        let attached = await orch.attach(Agent(
+            name: Orchestrator.mainAgentID,
+            workspaceRoot: mainWorkspace,
+            model: ModelID(rawValue: "m"),
+            profile: .reviewed,
+            coordinationDepth: Agent.defaultCoordinationDepth))
+        XCTAssertTrue(attached)
+
+        let message = await orch.spawnFromTool(
+            requestedBy: Orchestrator.mainAgentID,
+            name: "child-read-write",
+            path: childWorkspace.path,
+            model: "m",
+            requestedAccess: .readWrite)
+
+        XCTAssertTrue(message.contains(WorkspaceAccess.readWrite.rawValue))
+        let childID = AgentID(rawValue: "child-read-write")
+        let events = await log.replay()
+        let workspace = try XCTUnwrap(events.compactMap { envelope -> WorkspaceLease? in
+            guard case .workspaceLeaseGranted(let payload) = envelope.event,
+                  payload.agent == childID else { return nil }
+            return payload.lease
+        }.last)
+        let capability = try XCTUnwrap(events.compactMap { envelope -> CapabilityLease? in
+            guard case .capabilityLeaseCreated(let payload) = envelope.event,
+                  payload.agent == childID else { return nil }
+            return payload.lease
+        }.last)
+        XCTAssertEqual(workspace.access, .readWrite)
+        XCTAssertTrue(capability.tools.contains(.applyPatch))
+        XCTAssertFalse(capability.tools.contains(.delegateTask))
     }
 }

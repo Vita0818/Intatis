@@ -47,7 +47,7 @@ targets:
         GENERATE_INFOPLIST_FILE: "YES"
         INFOPLIST_KEY_CFBundleDisplayName: Intatis
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
-        INFOPLIST_KEY_NSHumanReadableCopyright: "Intatis — clean-room. See NOTICE.md."
+        INFOPLIST_KEY_NSHumanReadableCopyright: "Copyright © 2026 Intatis contributors. See NOTICE.md."
         CODE_SIGN_ENTITLEMENTS: Apps/IntatisMac/IntatisMac.DeveloperID.entitlements
         # AppStore/chat-only builds can still switch back to:
         #   CODE_SIGN_ENTITLEMENTS: Apps/IntatisMac/IntatisMac.AppStore.entitlements

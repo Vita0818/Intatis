@@ -1,5 +1,6 @@
 import Foundation
 import IntatisCore
+import IntatisProtocol
 
 /// A minimal unified-diff parser + applier. It applies each hunk by locating the
 /// hunk's old block (context + removed lines) verbatim in the file and replacing
@@ -107,6 +108,22 @@ public struct ApplyPatchTool: Tool {
     public func touchedPaths(_ args: ToolArgs) -> [String] {
         guard let a = try? args.decode(Args.self) else { return [] }
         return UnifiedDiff.parse(a.diff).map { $0.path }
+    }
+
+    public func permissionIntent(_ args: ToolArgs, workspaceRoot: URL) -> PermissionIntent {
+        let value = try? args.decode(Args.self)
+        return PermissionIntent(
+            action: "filesystem.patch",
+            resources: touchedPaths(args).map {
+                PermissionResource(kind: .workspacePath, value: $0, access: .readWrite)
+            },
+            metadata: [
+                "operation": .string("apply_unified_diff"),
+                "diffCharacterCount": .number(Double(value?.diff.count ?? 0)),
+            ],
+            dataEffects: [.mutate],
+            risks: [.workspaceMutation],
+            replayPolicy: .requiresManualReconciliation)
     }
 
     public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {

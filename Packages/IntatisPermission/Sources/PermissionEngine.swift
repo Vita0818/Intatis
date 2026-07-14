@@ -2,12 +2,12 @@ import Foundation
 import IntatisCore
 import IntatisProtocol
 
-/// Combines the deterministic gate (A) with the optional reviewer (B). v0.2
-/// constructs it with `reviewer == nil`, so gate `pass` results degrade to
-/// `ask_user`. Current policy returns `ask_user` directly for permission-bearing
-/// writes, shell, and network operations; Cowork routes those requests to its
-/// automatic reviewer before falling back to the user. A hard `deny` from the
-/// gate is always final.
+/// Combines the deterministic gate (A) with one optional in-engine reviewer.
+/// A `pass` is the sole reviewer entry point. Production Cowork deliberately
+/// constructs this with `reviewer == nil`, converts `pass` to `ask_user`, and
+/// uses its durable PermissionResponder control plane as the one reviewer.
+/// Non-Cowork hosts may instead inject this reviewer. Hosts must not configure
+/// both routes for the same call. A hard `deny` from the gate is always final.
 public struct PermissionEngine: Sendable {
     private let gate: DeterministicPolicyGate
     private let reviewer: PermissionReviewer?
@@ -36,8 +36,7 @@ public struct PermissionEngine: Sendable {
                 // only ever sees `pass`, but re-assert that it didn't widen scope.
                 return outcome
             }
-            return PermissionOutcome(decision: .askUser, risk: risk,
-                                     reason: reason + " (no reviewer configured → asking user)")
+            return PermissionOutcome(decision: .askUser, risk: risk, reason: reason)
         }
     }
 }

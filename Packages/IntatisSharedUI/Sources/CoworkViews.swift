@@ -189,6 +189,7 @@ public struct CoworkShell: View {
     private let project: CoworkProjectInfo
     private let composerError: String?
     private let isWorking: Bool
+    private let isComposerAvailable: Bool
     private let threadStyle: IntatisThreadStyle
     private let onShowSessions: (() -> Void)?
     private let onNewSession: (() -> Void)?
@@ -196,6 +197,7 @@ public struct CoworkShell: View {
     private let composerAccessory: AnyView?
     @Binding private var input: String
     private let onSend: () -> Void
+    private let onCancelCurrent: (() -> Void)?
     private let onResolve: (PermissionDecision) -> Void
     private let onAddAgent: (() -> Void)?
     private let onRemoveAgent: ((String) -> Void)?
@@ -212,6 +214,7 @@ public struct CoworkShell: View {
                 project: CoworkProjectInfo = CoworkProjectInfo(),
                 composerError: String?,
                 isWorking: Bool,
+                isComposerAvailable: Bool = true,
                 threadStyle: IntatisThreadStyle = .standard(.light),
                 splitLayout: IntatisSplitColumnLayout = .workspace,
                 onShowSessions: (() -> Void)? = nil,
@@ -220,6 +223,7 @@ public struct CoworkShell: View {
                 composerAccessory: AnyView? = nil,
                 input: Binding<String>,
                 onSend: @escaping () -> Void,
+                onCancelCurrent: (() -> Void)? = nil,
                 onResolve: @escaping (PermissionDecision) -> Void,
                 onAddAgent: (() -> Void)? = nil,
                 onRemoveAgent: ((String) -> Void)? = nil,
@@ -233,6 +237,7 @@ public struct CoworkShell: View {
         self.project = project
         self.composerError = composerError
         self.isWorking = isWorking
+        self.isComposerAvailable = isComposerAvailable
         self.threadStyle = threadStyle
         self.onShowSessions = onShowSessions
         self.onNewSession = onNewSession
@@ -240,6 +245,7 @@ public struct CoworkShell: View {
         self.composerAccessory = composerAccessory
         self._input = input
         self.onSend = onSend
+        self.onCancelCurrent = onCancelCurrent
         self.onResolve = onResolve
         self.onAddAgent = onAddAgent
         self.onRemoveAgent = onRemoveAgent
@@ -250,6 +256,10 @@ public struct CoworkShell: View {
     private var permissionBlocksComposer: Bool {
         guard let pending else { return false }
         return pending.state == .livePending || pending.state == .resolving
+    }
+
+    private var hasMainAgent: Bool {
+        agents.contains { $0.name == project.mainAgentName }
     }
 
     private var selectedAgent: CoworkAgentInfo? {
@@ -1111,7 +1121,7 @@ public struct CoworkShell: View {
     }
 
     @ViewBuilder private func thread(layout: IntatisThreadContentLayout) -> some View {
-        if items.isEmpty {
+        if items.isEmpty && !showsThinkingIndicator {
             CoworkEmptyThreadView(style: threadStyle)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .padding(.horizontal, layout.horizontalPadding)
@@ -1122,6 +1132,10 @@ public struct CoworkShell: View {
                         ForEach(items) { item in
                             CodeItemRow(item: item, style: threadStyle, layout: layout)
                                 .id(item.id)
+                        }
+                        if showsThinkingIndicator {
+                            IntatisThreadThinkingRow(layout: layout, style: threadStyle)
+                                .id("intatis-cowork-thinking")
                         }
                         Color.clear
                             .frame(height: 1)
@@ -1143,6 +1157,13 @@ public struct CoworkShell: View {
         }
     }
 
+    private var showsThinkingIndicator: Bool {
+        IntatisThreadActivity.isAwaitingModelOutput(
+            items: items,
+            isWorking: isWorking && summary.runningCount > 0,
+            permissionBlocksResponse: permissionBlocksComposer)
+    }
+
     private var itemScrollSignature: String {
         guard let last = items.last else { return "0" }
         return [
@@ -1150,7 +1171,8 @@ public struct CoworkShell: View {
             last.id,
             "\(last.body.count)",
             "\(last.complete)",
-            "\(isWorking)"
+            "\(isWorking)",
+            "\(showsThinkingIndicator)"
         ].joined(separator: ":")
     }
 
@@ -1190,16 +1212,28 @@ public struct CoworkShell: View {
                 placeholder: "Give Main a project task...",
                 input: $input,
                 canSend: !isWorking
+                    && isComposerAvailable
                     && !permissionBlocksComposer
-                    && !agents.isEmpty
+                    && hasMainAgent
                     && !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                isInputDisabled: isWorking || permissionBlocksComposer || agents.isEmpty,
+                isInputDisabled: isWorking
+                    || !isComposerAvailable
+                    || permissionBlocksComposer
+                    || !hasMainAgent,
                 style: threadStyle,
                 accessory: {
-                    if let composerAccessory {
-                        composerAccessory
-                    } else if let latestTurnStats {
-                        IntatisTurnStatsSummaryView(stats: latestTurnStats, style: threadStyle)
+                    HStack(spacing: 10) {
+                        if let composerAccessory {
+                            composerAccessory
+                        } else if let latestTurnStats {
+                            IntatisTurnStatsSummaryView(stats: latestTurnStats, style: threadStyle)
+                        }
+                        if isWorking, let onCancelCurrent {
+                            Button("Cancel task", action: onCancelCurrent)
+                                .buttonStyle(.borderless)
+                                .foregroundStyle(threadStyle.error)
+                                .accessibilityLabel("Cancel current Cowork task")
+                        }
                     }
                 },
                 onSend: onSend)

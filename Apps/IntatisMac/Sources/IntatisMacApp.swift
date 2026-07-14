@@ -72,6 +72,21 @@ final class AppEnvironment: ObservableObject {
         AppConfig.recentSessions(kind: .chat)
     }
 
+    func deleteChatSession(_ session: SessionID) throws {
+        if session == chatSessionID {
+            guard !viewModel.isBusy else {
+                throw IntatisError.io("Wait for the current Chat response to finish before deleting this session.")
+            }
+            let replacement = recentChatSessions()
+                .first(where: { $0.id != session })?.id
+                ?? SessionID.new()
+            try switchChatSession(to: replacement)
+        }
+        try SessionHistoryStore.deleteSession(
+            root: AppConfig.appSupportDir(),
+            session: session)
+    }
+
     func saveAPIKey(_ key: String) {
         let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
@@ -124,8 +139,11 @@ final class AppEnvironment: ObservableObject {
         refreshProviderRegistry()
     }
 
-    func selectProviderModel(providerID: String, modelID: String) {
-        let catalog = AppConfig.selectProviderModel(providerID: providerID, modelID: modelID)
+    func selectProviderModel(providerID: String, modelID: String, variantID: String?) {
+        let catalog = AppConfig.selectProviderModel(
+            providerID: providerID,
+            modelID: modelID,
+            variantID: variantID)
         providerCatalog = catalog
         needsAPIKey = !Self.hasAPIKey(ref: catalog.selectedProvider.map(AppConfig.apiKeyRef(for:))
                                       ?? .authFile(providerID: "default"))
@@ -398,7 +416,7 @@ private struct RecentSessionList: View {
 struct CodeSessionView: View {
     @ObservedObject var vm: CodeViewModel
     let catalog: AppProviderCatalog
-    let onSelectModel: (String, String) -> Void
+    let onSelectModel: (String, String, String?) -> Void
     let onShowSessions: () -> Void
     let onNewSession: () -> Void
     @Environment(\.colorScheme) private var scheme
@@ -443,11 +461,16 @@ struct CodeSessionView: View {
 struct CoworkSessionView: View {
     @ObservedObject var vm: CoworkViewModel
     let catalog: AppProviderCatalog
-    let onSelectModel: (String, String) -> Void
+    let onSelectModel: (String, String, String?) -> Void
     let onShowSessions: () -> Void
     let onNewSession: () -> Void
+    let onSessionDidBecomeReady: () -> Void
     @State private var showProjectSettings = false
     @Environment(\.colorScheme) private var scheme
+
+    private var hasMainAgent: Bool {
+        vm.agents.contains { $0.name == vm.project.mainAgentName }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -459,8 +482,9 @@ struct CoworkSessionView: View {
                         latestTurnStats: vm.latestTurnStats,
                         summary: vm.summary,
                         project: vm.project,
-                        composerError: vm.composerError,
+                        composerError: vm.composerError ?? vm.projectionError,
                         isWorking: vm.isWorking,
+                        isComposerAvailable: vm.isAutomaticPermissionReviewReady,
                         threadStyle: .intatisMac(scheme),
                         onShowSessions: onShowSessions,
                         onNewSession: onNewSession,
@@ -473,11 +497,21 @@ struct CoworkSessionView: View {
                             onSelectModel: onSelectModel)),
                         input: $vm.input,
                         onSend: { vm.send() },
+                        onCancelCurrent: { vm.cancelCurrentTask() },
                         onResolve: { vm.resolvePermission($0) },
                         onRemoveAgent: { vm.removeAgent(name: $0) },
                         onRetryTask: { vm.retryFailedTask(id: $0) })
         }
-        .task { vm.start() }
+        // SwiftUI preserves this view's structural identity when one Cowork
+        // session replaces another. Key startup to the durable session ID so
+        // the new view model cannot inherit the completed task of the old one.
+        .task(id: vm.sessionID.rawValue) { vm.start() }
+        .onChange(of: hasMainAgent) { isReady in
+            guard isReady else { return }
+            // The first @main projection also means events.jsonl now exists,
+            // so a history rescan can expose the new session in the sidebar.
+            onSessionDidBecomeReady()
+        }
         .sheet(isPresented: $showProjectSettings) { projectSettingsSheet }
     }
 
@@ -528,7 +562,7 @@ struct CoworkSessionView: View {
         case .disabled:
             return (
                 "Permission reviewer disabled",
-                "Automatic review is not active; permission requests require user approval.",
+                "Cowork input stays unavailable until automatic review is active.",
                 "shield.slash",
                 .secondary,
                 false)
@@ -548,7 +582,7 @@ struct CoworkSessionView: View {
                 false)
         case .fallback(let reason):
             return (
-                "Manual permission fallback",
+                "Permission reviewer unavailable",
                 reason,
                 "person.crop.circle.badge.questionmark",
                 .orange,
@@ -563,7 +597,7 @@ struct CoworkSessionView: View {
         case .failed(let reason):
             return (
                 "Permission reviewer failed",
-                "\(reason) Permission requests will fall back to user approval.",
+                "\(reason) Cowork input is locked until automatic review starts.",
                 "exclamationmark.shield.fill",
                 .red,
                 false)

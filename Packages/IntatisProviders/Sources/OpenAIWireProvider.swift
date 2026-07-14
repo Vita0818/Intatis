@@ -163,16 +163,27 @@ public struct OpenAIWireProvider: ChatProvider {
         r.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         r.setValue(ProviderAuthorization.bearerHeaderValue(apiKey: apiKey),
                    forHTTPHeaderField: "Authorization")
-        var root: [String: JSONValue] = [
-            "model": .string(request.model.rawValue),
-            "messages": .array(request.messages.map(Self.chatMessageJSON)),
-            "stream": .bool(true),
-        ]
+        var root = Self.configuredRequestBody(endpoint: endpoint, model: request.model)
+        root["model"] = .string(request.model.rawValue)
+        root["messages"] = .array(request.messages.map(Self.chatMessageJSON))
+        root["stream"] = .bool(true)
         if let t = request.temperature { root["temperature"] = .number(t) }
         if let reasoning = request.reasoningEffort { root["reasoning_effort"] = .string(reasoning.rawValue) }
         if request.includeUsage { root["stream_options"] = .object(["include_usage": .bool(true)]) }
         r.httpBody = try JSONEncoder().encode(JSONValue.object(root))
         return r
+    }
+
+    /// Model options are an open JSON extension point. Intatis protects only
+    /// the structural fields that must match the actual runtime request; every
+    /// other key is preserved verbatim for the selected wire endpoint.
+    static func configuredRequestBody(endpoint: ProviderEndpoint,
+                                      model: ModelID) -> [String: JSONValue] {
+        var body = endpoint.requestOptions(for: model)
+        for key in ["model", "messages", "tools", "stream"] {
+            body.removeValue(forKey: key)
+        }
+        return body
     }
 
     /// Encodes a message as a plain string, or as a content-parts array when it

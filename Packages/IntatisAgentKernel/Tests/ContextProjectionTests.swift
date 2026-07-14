@@ -234,6 +234,22 @@ final class ContextProjectionTests: XCTestCase {
         XCTAssertFalse(prompt.contains("iOS private count result"))
     }
 
+    func testFirstCodeRequestDeclaresIntatisRuntimeAndToolProtocol() {
+        let messages = ContextBuilder(
+            systemPrompt: "Code-specific instructions.",
+            runtimeEnvironment: .code)
+            .initialMessages(history: [], userText: "Inspect the workspace.")
+        let systemPrompt = messages.first?.content ?? ""
+
+        XCTAssertTrue(systemPrompt.contains("running inside Intatis"))
+        XCTAssertTrue(systemPrompt.contains("in Code mode"))
+        XCTAssertTrue(systemPrompt.contains("Every external action must be performed through a tool call"))
+        XCTAssertTrue(systemPrompt.contains("authoritative API tools list"))
+        XCTAssertTrue(systemPrompt.contains("strict JSON object"))
+        XCTAssertTrue(systemPrompt.contains("only after receiving its ToolResult"))
+        XCTAssertTrue(systemPrompt.contains("Code-specific instructions."))
+    }
+
     func testWorkerPromptDoesNotReplayOriginalSpawnInstructionAsFreshUserMessage() async throws {
         let ws = FileManager.default.temporaryDirectory
             .appendingPathComponent("intatis-context-\(UUID().uuidString)", isDirectory: true)

@@ -2,7 +2,7 @@
 
 > draft-0 · 2026-06-11
 > 本文件回应规格第 12 节要求的 7 项产出，作为 v0.1 动工前的设计基线。
-> **clean-room 声明**：本项目所有命名、协议、prompt、代码、UI 资源均自研，不复制、不链接、不运行 DeepCode / Codex / Claude Code / OpenCode 的源码、私有 prompt、图标、商标或品牌文案。可参考公开的能力与交互模式，内部实现完全独立。
+> **来源与复用政策（2026-07-12 更新）**：Intatis 是 Apple-first、Swift-native 优先的本地 AI workbench。项目允许按 [`docs/OPEN_SOURCE_REUSE.md`](docs/OPEN_SOURCE_REUSE.md) 选择性复制、翻译、修改或运行兼容许可证的公开源码、公开 model-facing prompt 与测试，并保留 provenance/NOTICE；不使用泄露或私有材料，也不复制第三方名称、Logo、图标、截图、UI 资产、商标性外观或品牌文案。外部实现不得绕过 Intatis 的权限、lease、EventLog 和 Apple 平台边界。
 
 ---
 
@@ -94,13 +94,13 @@ Tool 只是"哑执行器"：它声明自己的副作用元数据 (`ToolDescripto
 ```text
 Intatis/
 ├── ARCHITECTURE.md            ← 本文件
-├── NOTICE.md                  ← clean-room 声明 + 第三方依赖许可
+├── NOTICE.md                  ← 项目来源 + 当前上游采用状态 + 第三方依赖许可
 ├── Package.swift              ← 顶层 workspace（或用 .xcworkspace 聚合）
 │
 ├── Apps/
 │   ├── IntatisMac/            ← macOS app target（链接全部包，内嵌 kernel）
 │   ├── IntatisiOS/            ← iOS app target（只链接子集，见 §4）
-│   └── intatis-cli/           ← clean-room CLI + headless kernel 入口
+│   └── intatis-cli/           ← Swift-native CLI + headless kernel 入口
 │
 ├── Packages/
 │   ├── IntatisCore/           ← 基础类型、ID、配置、错误
@@ -692,11 +692,11 @@ v0.1 Chat 脊柱 ──> v0.2 +Tools/+Permission(A)/+Kernel ──> v0.3 +Cowork
 
 ---
 
-## 附：clean-room 与"不要"清单的对照自检
+## 附：开源复用与"不要"清单的对照自检
 
 | 规格的"不要" | 本设计如何从结构上满足 |
 |--------------|------------------------|
-| 不复制现有工具源码/prompt/资源 | 顶层 NOTICE 声明；协议/命名/prompt 全自研；不链接、不运行任何第三方 agent 进程 |
+| 不使用来源不明、泄露或许可证不兼容的源码/prompt/资源 | 允许按 `docs/OPEN_SOURCE_REUSE.md` 合规选择性复用公开实现；每批固定 commit、核对许可证、记录 provenance、更新 NOTICE；品牌/UI 资产和私有材料仍禁止使用 |
 | 不要把工程做大 | 三产品面 = 同一 kernel 三种 policy（原则 C）；walking skeleton；多模态/daemon 后置 |
 | GUI 不要写成只能聊天的 chatbox | headless kernel + 协议（原则 B）；UI 只消费事件、只发命令；v0.1 聊天就走 kernel 通路 |
 | Agent 不要只能单目录 | 多目录协作活在 Orchestrator/Bus（原则 D）；Agent 本体保持单一、对"多"无感知 |
@@ -776,4 +776,3 @@ struct ResolvedModels {
 - `ResolvedModels.reviewer` 是独立 `ModelRef`，**可指向与 chat / agent 完全不同的端点**（不同 baseURL + 不同 key + 不同 wire）。配置里 reviewer 端点与主端点平级，由用户自行指定。
 - **隐私强化（重要）**：因为 reviewer 可能是另一个第三方端点，送审输入必须先过 `SecretScanner` 脱敏——绝不把 .env / key / token / 源码大段原文发给 reviewer 端点。即"送审内容"本身也受转发规则约束（已同步更新 §6.3）。
 - **未配 reviewer 端点时的降级**：`reviewed` / `autopilot` 模式**降级为 manual**（所有 `pass` 类请求回落 ask_user），而**不是**偷偷用主模型审自己——避免"模型审自己"的信任闭环。
-

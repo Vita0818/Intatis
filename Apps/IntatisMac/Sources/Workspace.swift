@@ -75,6 +75,11 @@ enum WorkspaceAccess {
         UserDefaults.standard.string(forKey: sessionPathKey(session))
     }
 
+    static func forget(session: SessionID) {
+        UserDefaults.standard.removeObject(forKey: sessionBookmarkKey(session))
+        UserDefaults.standard.removeObject(forKey: sessionPathKey(session))
+    }
+
     private static let bookmarkStoreKey = "intatis.workspace.bookmarks"
 
     private static func sessionBookmarkKey(_ session: SessionID) -> String {

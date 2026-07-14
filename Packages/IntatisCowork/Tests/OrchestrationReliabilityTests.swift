@@ -606,12 +606,14 @@ final class OrchestrationReliabilityTests: XCTestCase {
         let rootID = try XCTUnwrap(rootIDValue)
         let baselineCapabilityLeases = await orchestrator.capabilityLeaseList().count
         let baselineWorkspaceLeases = await orchestrator.workspaceLeaseList().count
-        await orchestrator.setAdmissionEventAppender { event in
-            if case .taskQueued(let payload) = event,
-               payload.contract.kind == .agentInvocation {
+        await orchestrator.setAdmissionEventsAppender { events in
+            if events.contains(where: { event in
+                guard case .taskQueued(let payload) = event else { return false }
+                return payload.contract.kind == .agentInvocation
+            }) {
                 throw ReliabilityForcedError.terminalPersistenceFailure
             }
-            _ = try await log.append(event)
+            _ = try await log.append(events)
         }
 
         let queued = await orchestrator.enqueueDelegatedTask(
@@ -626,16 +628,16 @@ final class OrchestrationReliabilityTests: XCTestCase {
         let finalCapabilityLeaseCount = await orchestrator.capabilityLeaseList().count
         let finalWorkspaceLeaseCount = await orchestrator.workspaceLeaseList().count
         let projection = CoworkProjection.build(from: await log.replay())
-        let partialTask = try XCTUnwrap(projection.tasks.values.first {
+        let partialTask = projection.tasks.values.first {
             $0.contract?.objective == "must remain unexecutable"
-        })
+        }
         XCTAssertNil(queued.taskID)
         XCTAssertTrue(queued.message.contains("could not be persisted"))
         XCTAssertTrue(queuedTasks.isEmpty)
         XCTAssertEqual(graph.nodes.count, 1)
         XCTAssertEqual(finalCapabilityLeaseCount, baselineCapabilityLeases)
         XCTAssertEqual(finalWorkspaceLeaseCount, baselineWorkspaceLeases)
-        XCTAssertEqual(partialTask.status, .cancelled)
+        XCTAssertNil(partialTask)
         XCTAssertTrue(provider.requests.isEmpty)
     }
 

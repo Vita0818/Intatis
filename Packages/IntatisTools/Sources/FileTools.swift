@@ -1,5 +1,6 @@
 import Foundation
 import IntatisCore
+import IntatisProtocol
 
 // MARK: - read_file
 
@@ -115,6 +116,22 @@ public struct WriteFileTool: Tool {
 
     public func touchedPaths(_ args: ToolArgs) -> [String] {
         (try? args.decode(Args.self).path).map { [$0] } ?? []
+    }
+
+    public func permissionIntent(_ args: ToolArgs, workspaceRoot: URL) -> PermissionIntent {
+        let value = try? args.decode(Args.self)
+        return PermissionIntent(
+            action: "filesystem.write",
+            resources: touchedPaths(args).map {
+                PermissionResource(kind: .workspacePath, value: $0, access: .readWrite)
+            },
+            metadata: [
+                "operation": .string("create_or_overwrite"),
+                "byteCount": .number(Double(value?.content.utf8.count ?? 0)),
+            ],
+            dataEffects: [.mutate],
+            risks: [.workspaceMutation],
+            replayPolicy: .requiresManualReconciliation)
     }
 
     public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {

@@ -57,6 +57,14 @@ enum IntatisNavItem: String, CaseIterable, Identifiable, Hashable {
     }
 }
 
+private struct SessionActionTarget: Identifiable {
+    let sessionID: SessionID
+    let kind: SessionKind
+    let title: String
+
+    var id: String { "\(kind.rawValue):\(sessionID.rawValue)" }
+}
+
 struct IntatisMacRootView: View {
     @EnvironmentObject var env: AppEnvironment
     @Environment(\.colorScheme) private var scheme
@@ -71,6 +79,9 @@ struct IntatisMacRootView: View {
     @State private var coworkTransitionID: UUID?
     @State private var codeSessionError: String?
     @State private var coworkSessionError: String?
+    @State private var renameTarget: SessionActionTarget?
+    @State private var deleteTarget: SessionActionTarget?
+    @State private var sessionActionError: String?
 
     private var items: [IntatisNavItem] {
         IntatisNavItem.allCases.filter { item in
@@ -94,7 +105,9 @@ struct IntatisMacRootView: View {
                 newSessionTitle: selection.newSessionTitle,
                 isNewDisabled: newSessionDisabled,
                 onNewSession: startNewSelectedSession,
-                onSelectSession: resumeSelectedSession)
+                onSelectSession: resumeSelectedSession,
+                onRenameSession: beginRenameSession,
+                onDeleteSession: beginDeleteSession)
                 .navigationSplitViewColumnWidth(
                     min: IntatisSplitColumnLayout.chatInspector.sidebarMin,
                     ideal: 236)
@@ -116,6 +129,24 @@ struct IntatisMacRootView: View {
         .onReceive(env.$registry) { registry in
             codeVM?.updateProviderRegistry(registry)
             coworkVM?.updateProviderRegistry(registry)
+        }
+        .sheet(item: $renameTarget) { target in
+            SessionRenameSheet(initialName: target.title) { newName in
+                try renameSession(target, to: newName)
+            }
+        }
+        .alert("Delete Session?", isPresented: deleteAlertPresented, presenting: deleteTarget) { target in
+            Button("Cancel", role: .cancel) {}
+            Button("Delete", role: .destructive) {
+                deleteSession(target)
+            }
+        } message: { target in
+            Text("\"\(target.title)\" and its Intatis event history and artifacts will be permanently deleted. Files in the linked workspace will not be changed.")
+        }
+        .alert("Session Action Failed", isPresented: sessionErrorPresented) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(sessionActionError ?? "The session action failed.")
         }
     }
 
@@ -139,7 +170,7 @@ struct IntatisMacRootView: View {
             CodeSessionView(
                 vm: vm,
                 catalog: env.providerCatalog,
-                onSelectModel: env.selectProviderModel(providerID:modelID:),
+                onSelectModel: env.selectProviderModel(providerID:modelID:variantID:),
                 onShowSessions: showCodeSessions,
                 onNewSession: startNewCodeSession)
         } else {
@@ -164,9 +195,10 @@ struct IntatisMacRootView: View {
             CoworkSessionView(
                 vm: vm,
                 catalog: env.providerCatalog,
-                onSelectModel: env.selectProviderModel(providerID:modelID:),
+                onSelectModel: env.selectProviderModel(providerID:modelID:variantID:),
                 onShowSessions: showCoworkSessions,
-                onNewSession: startNewCoworkSession)
+                onNewSession: startNewCoworkSession,
+                onSessionDidBecomeReady: refreshCoworkSessions)
         } else {
             WorkspaceSessionHome(
                 title: "Cowork",
@@ -217,10 +249,22 @@ struct IntatisMacRootView: View {
                              selected: Bool) -> IntatisSessionHistoryItem {
         IntatisSessionHistoryItem(
             id: session.id,
-            title: session.id.rawValue,
+            title: session.displayName ?? session.id.rawValue,
             detail: sessionDetail(session),
             systemImage: icon,
-            isSelected: selected)
+            isSelected: selected,
+            isDeleteDisabled: isDeleteDisabled(session))
+    }
+
+    private func isDeleteDisabled(_ session: AppSessionSummary) -> Bool {
+        switch session.kind {
+        case .chat:
+            return session.id == env.chatSessionID && env.viewModel.isBusy
+        case .code:
+            return session.id == codeVM?.sessionID && codeVM?.isWorking == true
+        case .cowork:
+            return session.id == coworkVM?.sessionID && coworkVM?.isWorking == true
+        }
     }
 
     private func sessionDetail(_ session: AppSessionSummary) -> String {
@@ -282,6 +326,94 @@ struct IntatisMacRootView: View {
             resumeCodeSession(sessionID)
         case .cowork:
             resumeCoworkSession(sessionID)
+        }
+    }
+
+    private var deleteAlertPresented: Binding<Bool> {
+        Binding(
+            get: { deleteTarget != nil },
+            set: { if !$0 { deleteTarget = nil } })
+    }
+
+    private var sessionErrorPresented: Binding<Bool> {
+        Binding(
+            get: { sessionActionError != nil },
+            set: { if !$0 { sessionActionError = nil } })
+    }
+
+    private func beginRenameSession(_ sessionID: SessionID) {
+        guard let session = sessions(for: selection.sessionKind)
+            .first(where: { $0.id == sessionID }) else { return }
+        renameTarget = SessionActionTarget(
+            sessionID: session.id,
+            kind: session.kind,
+            title: session.displayName ?? session.id.rawValue)
+    }
+
+    private func beginDeleteSession(_ sessionID: SessionID) {
+        guard let session = sessions(for: selection.sessionKind)
+            .first(where: { $0.id == sessionID }) else { return }
+        deleteTarget = SessionActionTarget(
+            sessionID: session.id,
+            kind: session.kind,
+            title: session.displayName ?? session.id.rawValue)
+    }
+
+    private func sessions(for kind: SessionKind) -> [AppSessionSummary] {
+        switch kind {
+        case .chat: return recentChatSessions
+        case .code: return recentCodeSessions
+        case .cowork: return recentCoworkSessions
+        }
+    }
+
+    private func renameSession(_ target: SessionActionTarget, to newName: String) throws {
+        try SessionHistoryStore.setDisplayName(
+            newName,
+            root: AppConfig.appSupportDir(),
+            session: target.sessionID)
+        refreshAllSessions()
+    }
+
+    private func deleteSession(_ target: SessionActionTarget) {
+        Task { @MainActor in
+            do {
+                switch target.kind {
+                case .chat:
+                    try env.deleteChatSession(target.sessionID)
+                case .code:
+                    if let active = codeVM, active.sessionID == target.sessionID {
+                        guard !active.isWorking else {
+                            throw IntatisError.io("Wait for the current Code task to finish before deleting this session.")
+                        }
+                        active.stop()
+                        codeVM = nil
+                    }
+                    try SessionHistoryStore.deleteSession(
+                        root: AppConfig.appSupportDir(),
+                        session: target.sessionID)
+                    WorkspaceAccess.forget(session: target.sessionID)
+                case .cowork:
+                    if let active = coworkVM, active.sessionID == target.sessionID {
+                        guard !active.isWorking else {
+                            throw IntatisError.io("Wait for the current Cowork task to finish before deleting this session.")
+                        }
+                        let transitionID = UUID()
+                        coworkTransitionID = transitionID
+                        await active.stop()
+                        guard coworkTransitionID == transitionID else { return }
+                        coworkVM = nil
+                    }
+                    try SessionHistoryStore.deleteSession(
+                        root: AppConfig.appSupportDir(),
+                        session: target.sessionID)
+                    CoworkProjectSettingsStore.remove(sessionID: target.sessionID)
+                    WorkspaceAccess.forget(session: target.sessionID)
+                }
+                refreshAllSessions()
+            } catch {
+                sessionActionError = error.localizedDescription
+            }
         }
     }
 
@@ -373,6 +505,64 @@ struct IntatisMacRootView: View {
     }
 }
 
+private struct SessionRenameSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var name: String
+    @State private var errorText: String?
+    private let onRename: (String) throws -> Void
+
+    init(initialName: String,
+         onRename: @escaping (String) throws -> Void) {
+        _name = State(initialValue: initialName)
+        self.onRename = onRename
+    }
+
+    private var trimmedName: String {
+        name.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var canRename: Bool {
+        !trimmedName.isEmpty && trimmedName.count <= 120
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Rename Session")
+                .font(.headline)
+            TextField("Session name", text: $name)
+                .textFieldStyle(.roundedBorder)
+                .onSubmit(rename)
+
+            if let errorText {
+                Text(errorText)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            HStack {
+                Spacer()
+                Button("Cancel", action: dismiss.callAsFunction)
+                Button("Rename", action: rename)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(!canRename)
+            }
+        }
+        .padding(20)
+        .frame(width: 380)
+    }
+
+    private func rename() {
+        guard canRename else { return }
+        do {
+            try onRename(trimmedName)
+            dismiss()
+        } catch {
+            errorText = error.localizedDescription
+        }
+    }
+}
+
 // MARK: - Sidebar
 
 struct IntatisSidebar: View {
@@ -386,6 +576,8 @@ struct IntatisSidebar: View {
     let isNewDisabled: Bool
     let onNewSession: () -> Void
     let onSelectSession: (SessionID) -> Void
+    let onRenameSession: (SessionID) -> Void
+    let onDeleteSession: (SessionID) -> Void
     @Environment(\.colorScheme) private var scheme
 
     private var modeTabs: [IntatisModeTab] {
@@ -428,7 +620,9 @@ struct IntatisSidebar: View {
                 style: .intatisMac(scheme),
                 isNewDisabled: isNewDisabled,
                 onNew: onNewSession,
-                onSelect: onSelectSession)
+                onSelect: onSelectSession,
+                onRename: onRenameSession,
+                onDelete: onDeleteSession)
             .padding(.horizontal, 12)
             .frame(maxHeight: .infinity, alignment: .top)
 

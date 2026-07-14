@@ -1,10 +1,10 @@
 # ARCHITECTURE
 
-最近自查日期：2026-07-11
+最近自查日期：2026-07-12
 
 ## 总体架构
 
-Intatis 是 clean-room 本地 AI 工作区，三个产品面：Chat（普通多模态对话）/ Code（单 agent 本地工作区）/ Cowork（多 agent 本地工作区协作）。默认 `IntatisMac` 是 DeveloperID/non-sandbox 本地 workbench，提供全量 macOS 产品面；iOS 仍是 chat 子集。
+Intatis 是 Apple-first、Swift-native 优先的本地 AI 工作区，三个产品面：Chat（普通多模态对话）/ Code（单 agent 本地工作区）/ Cowork（多 agent 本地工作区协作）。项目允许按 `docs/OPEN_SOURCE_REUSE.md` 选择性复用兼容许可证的公开源码，但 Intatis 继续拥有自己的产品身份、权限/lease/EventLog 控制面和 Apple 平台边界。默认 `IntatisMac` 是 DeveloperID/non-sandbox 本地 workbench，提供全量 macOS 产品面；iOS 仍是 chat 子集。
 
 ```text
                     ┌─────────────────────────────────────┐
@@ -51,6 +51,16 @@ Code composer -> GoalInputParser (/goal metadata) -> AgentLoop.send()
   -> GUI folds CodeProjection + TurnStatsProjection
   -> macOS Code inspector shows structured plan/workspace/Git-status-only/failure/turn state
 ```
+
+### Provider 模型请求扩展
+
+macOS 的 Intatis-owned OpenCode-compatible 配置把 `provider.<id>.models.<model>.options` 视为开放的 model-scoped JSON 请求扩展点。`AppConfig` 不解释厂商字段，而是保真为 `[String: JSONValue]`，按 model ID 挂到 `ProviderEndpoint.modelRequestOptions`；当前 OpenAI-compatible wire adapter 在构造 Chat 与 tool-calling body 时先加载这些扩展，再写入运行时字段。因此 `provider` routing、sampling、reasoning、response format 或未来厂商自定义嵌套对象无需为每个 provider 增加 Swift 字段。
+
+顶层 `model` 解析先在启用的 provider model map 中按完整字符串精确匹配；只有未命中时才解释为 `provider/model`。这使 `deepseek/deepseek-v4-pro` 一类本身含 `/` 的 endpoint model ID 与显式 `OpenRouter/deepseek/...` provider-qualified 形式可以共存，且多 provider 出现同名 model 时只有显式 selected provider 才能消除歧义。
+
+`model`、`messages`、`tools`、`stream` 是 Intatis 运行时拥有的结构字段，配置不得覆盖；单次 runtime 明确设置的 `temperature`、`reasoning_effort`、`max_tokens`、usage 选项也覆盖同名配置默认。provider-level `options.baseURL` / `apiKey` / `chatEndpoint` 仍分别属于 endpoint、secret 与 transport 配置，不会被盲目复制到请求 body。未来新增非 OpenAI wire adapter 时，应消费同一个 model-scoped JSON，但按该 wire 的协议完成映射，不得静默丢弃未知配置。
+
+配置解析与 UI 展示是独立的只读投影。`AppConfig` 在内存保留完整 model object；`ModelConfigurationPresentation` 可从原始 model metadata 与 `options` 识别常见 reasoning/thinking effort、thinking level 或 token budget 的原始值，供模型列表显示灰色辅助标签。该识别覆盖 OpenRouter/OpenAI 常见 `reasoning.effort` / `reasoning_effort`、OpenCode/SDK 常见 `reasoningEffort` / `thinking.budgetTokens`、Anthropic 常见 `output_config.effort` / `thinking.budget_tokens` 等拼写，但只代表“配置中存在这个值”，不代表 Intatis 验证了目标模型支持它。投影不得改变 key/value、不得回写配置。`variants` 是同一 model 的命名请求参数预设：macOS 把基础项与未禁用 variants 摊平成菜单选择，持久化 provider/model/variant identity；选中 variant 后按原字段名和值浅覆盖基础 model `options`，但不改变发给 provider 的 model ID。未显式选择 variant 时，UI 与请求都不得任选一个 variant 冒充活动配置。
 
 ### Agent 文档/媒体工具链路（v0.16，Code / Cowork / CLI）
 
@@ -111,7 +121,7 @@ provider tool_call -> AgentLoop schema validation
 - `git_switch`：只在 clean working tree 上切换到既有本地分支；要求 `confirmBranch` 精确匹配；这是 destructive 工具，不做 `checkout .` / discard。
 
 设计取舍：
-- 本轮对照 Codex App/Worktrees/CLI 官方文档与 openai/codex 开源实现后，Intatis 采用相同方向：Git 不是开放 shell，而是受限工具能力，围绕 read-only 状态、diff、patch preflight/apply/revert/stage、受管 worktree 和权限审批暴露。实现不复制 Codex 源码或文案。
+- 本轮对照 Codex App/Worktrees/CLI 官方文档与 openai/codex 开源实现后，Intatis 采用相同方向：Git 不是开放 shell，而是受限工具能力，围绕 read-only 状态、diff、patch preflight/apply/revert/stage、受管 worktree 和权限审批暴露。当前已落地 Git slice 没有复制 Codex 源码或文案；未来若选择性复用兼容许可证实现，必须按 `docs/OPEN_SOURCE_REUSE.md` 固定来源并适配现有安全边界。
 - 继续使用 `GitService` 抽象 + 本地 `git` wrapper，不新增第三方依赖。libgit2/SwiftGit2 仍是未来 sandbox 内 in-process backend 候选，但需先做许可证、native build、App Store/DeveloperID 边界审查。
 - `ProcessGitService` 不拼 shell 字符串，而是通过 `Process` 以参数数组调用 `git`；内部 Git 命令统一设置 `GIT_TERMINAL_PROMPT=0`、`GIT_OPTIONAL_LOCKS=0`、`core.hooksPath=/dev/null`、`core.fsmonitor=false`，本地 metadata/patch 命令用 5 秒 command timeout，remote fetch/pull/push 用 60 秒 timeout。动态 branch/ref/path/message/diff patch/remote name 不进入 shell。
 - Git repository root 必须与 agent workspace root 一致。普通 repository 的 git metadata 必须在 workspace 内；`.intatis/git-worktrees/<name>` linked worktree 允许 `.git` file 指向 owning workspace repository 的 `worktrees/` metadata，但 workspace path 仍必须在 owner root 之内。
@@ -161,8 +171,10 @@ provider tool_call -> AgentLoop schema validation
 ```text
 Cowork session open/new -> CoworkProjectSettingsStore loads/saves per-session project settings
   -> replay EventLog -> restore roster/task graph/scheduler/mailboxes/leases/token usage
-  -> restore workspace bookmarks + create @permission-reviewer before bootstrap @main if possible
-  -> bootstrap @main through agent.attach if needed
+  -> restore workspace bookmarks and current durable projection
+  -> brand-new empty session: user-selected primary workspace -> restricted durable bootstrap of fixed @main (no model re-review)
+  -> enable @permission-reviewer with fixed read_only + no-tools leases
+  -> non-empty recovery missing @main: keep ordinary reviewed agent.attach semantics
   -> CoworkViewModel -> GoalInputParser + CoworkMentionRouter -> Orchestrator (actor)
   -> AgentRegistry / MessageBus(log:, mediator:) / PermissionEngine
   -> attach(agent) -> log agent_attached
@@ -171,22 +183,22 @@ Cowork session open/new -> CoworkProjectSettingsStore loads/saves per-session pr
   -> GUI send(text) 默认路由到 @main；显式 @mention 仅作高级定向入口
   -> 每条用户指令先创建真实 root TaskContract，再进入 durable queue
   -> scheduler 对同一 agent single-flight、对不同 agent 按 policy 有界并行
-  -> 为每次 run 构建 AgentLoop + BusMessenger + OrchestratorManager
+  -> Code/Cowork 共用 headless AgentRuntime；为每次 run 构建 AgentLoop + BusMessenger + OrchestratorManager
        coordinator(canCoordinate=true) -> lease-based registry with workspace/doc/media/browser + coordination tools
        worker -> lease-based registry with read/list/search/read_pdf + reply/request-delegation tools only
   -> AgentLoop.send() 循环（maxIterations 默认 50）
-       ContextBuilder.initialMessages (system + priorHistory 投影 + user)
+       ContextBuilder.initialMessages (RuntimeEnvironmentManifest + static system + priorHistory 投影 + user)
        -> provider.stream -> message_delta
        -> toolCalls -> runTool -> PermissionEngine.decide
             askUser -> durable permission_request -> PermissionResponder
                 default -> UI 卡片/终端确认
                 Cowork auto -> PermissionReviewControlPlane FIFO/single-flight
                   -> structured PermissionReviewTask -> @permission-reviewer no-tool JSON decision
-                  -> durable permission_review_settled -> allow/deny，或 durable ask_user -> UI fallback
+                  -> durable permission_review_settled -> allow/deny；异常只 deny 当前调用，不进入 UI fallback
             allow -> revalidate workspace root identity
               -> durable tool_execution_prepared -> revalidate root identity -> executor
               -> durable tool_result + tool_execution_settled
-            ask_agent / delegate_task -> enqueue TaskContract -> scheduler runs target agent
+            ask_agent / delegate_task -> atomic reuse/create worker + enqueue TaskContract -> scheduler runs target agent
                 -> MessageBus.deliver + Mediator returns child answer/report to caller as ToolObservation
        -> ToolObservation 回填 -> 重复直至无 tool call
        -> task_completed/task_failed/task_cancelled records attempt + optional TaskReportPayload
@@ -203,19 +215,20 @@ MessageBus.deliver -> Mediator.mediate
 
 关键不变量：
 - 用户默认只与 `@main` 对话；`@main` 是项目负责人 agent，持有 coordinator capability lease，可读写主 workspace 并通过工具自动创建、委派、移除子 agent。
+- Code 与 Cowork 不维护两套执行内核：二者使用同一个 Swift-native headless `AgentRuntime` 工厂，统一 registry、permission、completion、durable tool ticket 和单次请求参数。`RuntimeEnvironmentManifest` 在每次请求的首个 system message 中稳定声明 Intatis/Code 或 Cowork、外部动作只能通过 API tools、严格 JSON Schema 和 ToolResult 完成语义；动态 agent/workspace/task/lease/event 仍只进入有界 user-role untrusted context。
 - 用户指令不是一段脱离任务图的直接 AgentLoop 调用：它必须成为 root `TaskContract`，经历 durable queue 与严格终态后 `send` 才返回。`created` / `assigned` / `queued` / `running` 不能被投影为完成；失败、取消和不完整 provider finish 必须保留原因与 attempt。
 - root、delegation、mailbox wake、retry、agent attach/reviewer attach 与 crash requeue 都遵循 persistence-first admission：先写完执行所需的 roster/lease/task/queue 事件，再提交 registry/taskGraph/scheduler 内存状态。关键 admission 事件写入失败时不得运行 provider；已写入的半 admission task 立即补 `task_cancelled`，恢复时 orphan default lease 也不得进入可执行状态。
 - `AgentScheduler` 的 claim 是短临界区；长 AgentLoop 在独立 task 中运行。同一 assignee 同时最多一个 claim，不同 assignee 受 `maxConcurrentTasks` 限制。actor reentrancy 不得绕过该 single-flight/claim 规则。
 - 恢复期间 scheduler 保持暂停：先折叠 `tool_execution_prepared/settled`。普通 read-only execution 可随 running task 以 `attempt + 1` 重排；write/exec/network/destructive 或消息/委派/spawn/remove 等协作副作用若 prepared 未 settled，任务必须以 `manual reconciliation required` 失败，禁止自动重放。created/assigned 半入队、超过 maxAttempts、缺关键 lease 的任务也明确失败；queued task、未消费 mailbox、task graph、lease history 与 token 用量从 EventLog 重建，完成恢复且 GUI/CLI 重建 reviewer/main 后才 resume。
 - 任务执行受 task/default timeout、显式 cancel/cancelAll、maxAttempts 和 session 共享 soft token budget 约束。预算在 provider dispatch 前预留 input estimate + output slice，并把 output ceiling 映射到 OpenAI-compatible `max_tokens`；provider tokenizer、usage 或 ceiling 支持差异仍可能导致 settle 时 overrun，因此不得宣传为硬计费上限。provider watchdog 使用不等待迟到任务的 race；raw shell/process 另有 OS sandbox、默认断网和 TERM→KILL 有界清理。
 - 动态层级通过 scheduler/message bus/task graph 表达，不允许 `AgentLoop` 同步递归调用另一个 `AgentLoop`。子 agent 默认是 worker，无 coordinator 工具；只有 `spawn_agent(canCoordinate:true)` 或未来显式 capability lease 授予时，子 agent 才可继续创建/调度下级 agent。
-- `ask_agent` / `delegate_task` 工具必须通过 scheduler 运行目标 agent，并通过 `MessageBus.deliver` / `Mediator` 把子任务结果返回给调用方；`ask_agent` 保持兼容的直接答案，`delegate_task` 返回结构化 Task Report tool observation。调用方不应只收到 queued ack，也不得通过直接嵌套 `AgentLoop` 取得结果。
+- `ask_agent` / `delegate_task` 工具必须通过 scheduler 运行目标 agent，并通过 `MessageBus.deliver` / `Mediator` 把子任务结果返回给调用方；`ask_agent` 保持兼容的直接答案，`delegate_task` 的 `to` 可省略：优先复用同 workspace idle worker，不存在时在当前 task delegation budget 内原子创建 `worker-N`，再返回稳定 `task_id`、`agent_id` 与结构化 Task Report。调用方不应只收到 queued ack，也不得通过直接嵌套 `AgentLoop` 取得结果。
 - `ContextProjector` 为 task-scoped worker 构造 `ContextBundle`，包含全局摘要、任务契约、lineage、direct message、agent-local event、workspace/tool brief，以及 metadata-only 的 `taskGroupEvents`。任务组状态只能暴露任务 ID、状态、agent 和 current/parent/sibling/child/related 关系，不得把 sibling objective、expected deliverable、tool args、workspace private path 或 task result 投影给无关 worker。当前 `artifact_added` 没有 task/recipient/visibility 等显式分享元数据，因此事件投影对 `explicitlySharedArtifacts` fail closed。
-- `spawn_agent` 由当前 coordinator agent 发起并记录 `requestedBy` ownership。未承接任务的 tool-spawned agent 作为 team member 保留，等待后续 `delegate_task`、普通消息或显式 `remove_agent`；已承接任务的 tool-spawned、任务域内子 agent 在无 pending/running/issued task 和 pending mailbox message 后由 Orchestrator 自动 detach。用户/GUI 手动 attach 的 agent 不参与该自动回收。
-- Cowork session 可绑定一个或多个用户选择的工作目录；per-session settings 只保存路径/bookmark/model/profile/token-budget metadata，不保存 secret，真实访问仍依赖 workspace bookmark 与 `agent.attach` 权限流。
+- `spawn_agent` 由当前 coordinator agent 发起并记录 `requestedBy` ownership。外层 ToolCall 的 `PermissionIntent` 是 `agent.spawn`：目标目录是 `workspace` admission resource，不是文件 `touchedPath`，因此不会被误报成“write to workspace”；reviewer 会看到 agent/model/`requestedAccess`/`canCoordinate`/workspace-expansion 风险。新 agent 默认 `requestedAccess=read_only`，只有显式 `read_write` 且不超过调用者 WorkspaceLease ceiling 时才可获得写入能力；`canCoordinate` 独立控制 coordinator 工具，不能暗中提升 workspace access。获准后 executor 用一个 durable admission batch 建立 roster/workspace lease/capability lease/attached/spawned 状态，内部不得递归调用普通 `attach` 或产生第二次 PermissionEngine 决策；子 agent 后续每次文件、网络、exec 调用仍各自走 PermissionEngine。未承接任务的 tool-spawned agent 作为 team member 保留，等待后续 `delegate_task`、普通消息或显式 `remove_agent`；已承接任务的 tool-spawned、任务域内子 agent 在无 pending/running/issued task 和 pending mailbox message 后由 Orchestrator 自动 detach。用户/GUI 手动 attach 的 agent 不参与该自动回收。
+- Cowork session 可绑定一个或多个用户选择的工作目录；per-session settings 只保存路径/bookmark/model/profile/token-budget metadata，不保存 secret。brand-new session 中，用户明确选择 primary workspace 后，固定 `@main` 可通过只接受空 EventLog + 空 roster 的 restricted bootstrap admission 建立默认 lease，不再让 reviewer 重复审批同一次选择；任何后续目录新增、普通 agent attach、spawn 或非空 recovery 仍依赖 workspace bookmark 与既有 `agent.attach` 权限流。
 - `@main` agent 不可被 remove。
 - Project Settings 新增目录只更新 project metadata；当前工具执行仍以 agent 单 `workspaceRoot` 为真实文件访问根。右侧 inspector 不提供 agent 删除或详情管理，只显示 Git status、未清理 agent 状态图标与目标表；`@main` 与 `@permission-reviewer` 不可删除。
-- `@permission-reviewer` 是自动权限审查保留身份和独立控制面：GUI/CLI 默认启用；CLI `/auto` 只用于重新启用，`/default` 移除；不能作为普通 send/delegate/message/ask 目标，也不会暴露给 `list_agents`。review queue 不占普通 scheduler 槽，采用 64 项上限的 FIFO/single-flight，deadline 从 submit 计时，人工 fallback 也在同一串行生命周期内；request/task/root/parent/attempt/toolCall/args/paths/network/side-effect/gate/lease/TaskContract/causal context 通过结构化任务传递。review request/settled 必须 durable-first，`allow` 只有 settled 成功后才可生效；timeout/cancel/budget/self-review/persistence failure 不得放行，orphan request 在恢复时补 deny/cancelled settlement。disable 先 quiesce，再原子持久化 revoke/detach，失败不得误报成功；GUI 必须显示 enabled/failed/fallback。
+- `@permission-reviewer` 是自动权限审查保留身份和独立控制面：GUI/CLI 默认启用；CLI `/auto` 只用于重新启用，只有用户明确 `/default` 才进入人工模式；不能作为普通 send/delegate/message/ask 目标，也不会暴露给 `list_agents`。review queue 不占普通 scheduler 槽，采用 64 项上限的 FIFO/single-flight，deadline 从 submit 计时；request/task/root/parent/attempt/toolCall/args/paths/network/side-effect/gate/lease/TaskContract/causal context 通过结构化任务传递。reviewer 只返回 `allow` / `deny`，默认预留 1024 completion tokens；timeout/cancel/truncated/malformed/tool call/provider error/persistence failure/self-review/hard deny 均 durable deny 当前调用，不转 GUI 人工等待，审计 reason 区分失败类别但不落原始 reviewer 输出。累计 reviewer token 仅是可选 soft warning（默认无 session-lifetime cap），不关闭控制面；单次 timeout、输出上限与队列容量仍是硬边界。review request/settled 必须 durable-first，`allow` 只有 settled 成功后才可生效；orphan request 在恢复时补 deny/cancelled settlement。GUI 自动 reviewer 未就绪时锁定 composer 并提供 Retry；Cancel task 只取消数据面任务并保留 reviewer，session stop/显式 disable 才 quiesce/shutdown 控制面；disable 先 quiesce，再原子持久化 revoke/detach，失败不得误报成功。
 - MessageBus 是唯一投递路径；Mediator 默认转发摘要不转发原始字节。
 - typed message 只有在 Mediator 允许且事件持久化成功后才进入 mailbox。mailbox delivery 每轮只确认 ContextProjector 实际呈现的 message IDs（当前上限 8）；未呈现/未成功完成的消息保持 pending，恢复后合成 wake task，保证至少一次投递而非静默丢失。delivery 失败在同一 task ID 上按 `maxAttempts` 有界重试；消费事件持久化失败时先不 ack，允许至少一次重投。
 - task-scoped capability/workspace lease 必须校验 task ID、工具/通信/委派 grant、workspace root、access 与 allow/deny path，并在 terminal state 撤销。WorkspaceLease 持久化 canonical root 的 device/inode identity；attach commit、权限等待后、durable prepare 后紧邻 executor、task lease 派生/retry 与 managed process 启动都必须重新核验，路径相同但目录身份改变或 legacy identity 缺失时 fail closed。retry 只能从原 lease audit history 克隆权限；历史缺失时 fail closed（当前拒绝 retry），禁止回退到 assignee 的默认 coordinator lease。
@@ -245,19 +258,19 @@ MultimodalService.generateImage/transcribe/generateVideo(轮询 job)
 | `ProviderHealthReport` | 当前 provider/model 的连接测试结果 | 不写入 EventLog；由设置页临时显示 | status、role、endpoint/model/wire、elapsed、first token、usage、code/message、裁剪 response preview；不得包含 secret 或完整响应体 |
 | `ProviderRuntimePolicy` / `HTTPDataResponse` | provider 请求的 timeout / retry / backoff / rate-limit header 策略 | 不持久化；由 provider adapter 初始化默认值；HTTP headers 只用于当前请求诊断 | streaming 默认 2 attempts + request timeout；只在首个响应字节前失败时 retry。non-streaming image/transcription 对 retryable HTTP/网络/timeout 失败重试；`Retry-After` / rate-limit reset headers 可用数字秒、HTTP 日期或 `750ms` / `1m30s` 等 duration 字符串影响 retry delay 并进入错误说明；取消不 retry |
 | `ToolCapability` / `CapabilityLease` / `WorkspaceLease` | Cowork agent 可用工具与工作区能力边界 | grant/revoke 事件 + 当前内存索引；历史 grant 保留供 retry/replay | coordinator 可用本地 Git control、remote Git control、文档/媒体读写、生图与网络/浏览器能力；worker 默认无 `gitControl` / `gitRemote`、只读 PDF 且无 `browse_web`。task-scoped lease 绑定 task ID、终态撤销；WorkspaceLease 还执行 root/access/allow/deny path 并持久化 canonical root device/inode identity，跨权限等待/prepare/retry/process 边界复核；最终工具执行仍必须过 `PermissionEngine` |
-| `PermissionReviewTask` / `PermissionReviewRequestedPayload` / `PermissionReviewSettledPayload` | reviewer 控制面工作单与 verdict | `permission_review_requested/settled` append-only 事件 | 结构化包含当前 task/attempt/tool/gate/lease/context；reviewer 使用有界 FIFO/single-flight、submit-based deadline、timeout/cancel/session-lifetime budget；allow 必须 settled-first，恢复关闭 orphan request；旧 `permission_review` 保留兼容审计 |
+| `PermissionReviewTask` / `PermissionReviewRequestedPayload` / `PermissionReviewSettledPayload` | reviewer 控制面工作单与 verdict | `permission_review_requested/settled` append-only 事件 | 结构化包含当前 task/attempt/tool/gate/lease/context；reviewer 使用有界 FIFO/single-flight、submit-based deadline、单次 timeout/cancel/output ceiling 与可选 soft usage warning；只返回 allow/deny，allow 必须 settled-first，恢复关闭 orphan request；旧 `permission_review` 保留兼容审计 |
 | `ToolExecutionPreparedPayload` / `ToolExecutionSettledPayload` | 副作用执行票据与 crash reconciliation | `tool_execution_prepared/settled` append-only 事件 | prepare 必须在 executor 前；仅普通 read-only 默认 safe-to-replay；write/exec/network/destructive 和 collaboration/lifecycle 工具默认 requires-manual-reconciliation |
 | `TaskContract` / `TaskReportPayload` | Cowork root/子任务契约与结构化回报 | `task_created/assigned/queued/started/completed/failed/cancelled` 事件；queue/start/terminal 记录 attempt | 契约记录 kind、issuer/assignee/objective/roleHint/deliverable/lease、reply mode、timeout、maxAttempts；用户消息也必须成为 kind=root 的契约。只有显式完成信号才能 completed；delegate 结果经 MessageBus/Mediator 回传；追加字段保持旧 JSONL 可解码 |
 | `AgentScheduler` / `CoworkExecutionPolicy` / `AgentExecutionBudget` | claim、并发、恢复、取消/超时、attempt 与 token 预算 | scheduler 从 task/message events 重建；token 用量从 `turn_stats` 重算 | 同 agent single-flight、跨 agent 有界并行；running crash recovery 增加 attempt；session-lifetime 共享 token meter 在 provider dispatch 前预留 input estimate + output slice，响应/失败/超时按 reported 或估算 usage settle，配置切换不丢 outstanding reservation；预算明确是 soft；取消不自动 retry |
 | `ContextBundle.taskGroupEvents` | Cowork worker prompt 的共享任务状态摘要 | `ContextProjector` 从 task events 投影，随本轮模型请求临时进入 prompt，不单独持久化 | 只包含当前/父/兄弟/子/related task 的任务 ID、状态、agent 和关系；不得泄漏其他任务的 objective、expected deliverable、tool args、结果文本或私有路径 |
-| `SessionSummary` / `SessionHistoryStore` | 最近会话摘要与路径生成 | 扫描 app support root 下 `<session>/events.jsonl` | Chat/Code/Cowork 按 `sess_` / `code_` / `cowork_` 前缀区分；macOS/iOS 共用实现，平台层只传 root 与 `SessionID` |
-| `CoworkProjectSettings` / `CoworkProjectInfo` | Cowork project-mode session metadata 与右侧 inspector 投影 | UserDefaults `intatis.cowork.projectSettings.<sessionID>`；GUI 运行时投影 | 保存主 agent 名称、默认 provider/model、默认 permission profile、可选 token budget、workspace path/bookmark/agent 归属；不保存 secret；恢复时按 bookmark 恢复访问并通过既有 `agent.attach` 生成 `@main` workspace lease；project info 只读投影 agent/workspace 状态；direct multi-root tool context 尚未实现 |
+| `SessionSummary` / `SessionHistoryStore` | 最近会话摘要、显示名称与路径生成 | 扫描 app support root 下 `<session>/events.jsonl`，可选读取 `<session>/session.json` | Chat/Code/Cowork 按 `sess_` / `code_` / `cowork_` 前缀区分；显示名称不改变 `SessionID`；macOS/iOS 共用实现，平台层只传 root 与 `SessionID` |
+| `CoworkProjectSettings` / `CoworkProjectInfo` | Cowork project-mode session metadata 与右侧 inspector 投影 | UserDefaults `intatis.cowork.projectSettings.<sessionID>`；GUI 运行时投影 | 保存主 agent 名称、默认 provider/model、默认 permission profile、可选 token budget、workspace path/bookmark/agent 归属；不保存 secret；fresh empty session 对用户明确选择的 primary workspace 使用受限 `@main` bootstrap admission，非空恢复/后续扩展仍走普通 `agent.attach`；project info 只读投影 agent/workspace 状态；direct multi-root tool context 尚未实现 |
 | `Agent` | agent 值类型 | 内存 | `coordinationDepth` 是当前 coordinator 工具兼容 fuse；默认 profile `.reviewed`；自动权限审查者固定 `read_only` + `coordinationDepth=0` |
 | `Capability` | provider 能力枚举 | 配置 | chat/tool_calling/vision/realtime/audio/image/video/embedding |
 | `PlatformProfile` | 平台能力信封 | launch-time | `.iOS`（最受限）/`.macAppStore`/`.macDeveloperID`；`current` 默认 `.iOS` |
 | `PermissionProfile` | 每 agent 模式 | agent | manual/reviewed/autopilot/read_only/locked；硬 DENY 优先 |
 | `Artifact` / `ArtifactRef` | blob + 索引 | blobs/<id>.<ext> + index.json | ISO-8601；pretty JSON |
-| GUI provider catalog | GUI provider/model 设置 | UserDefaults `intatis.providerCatalog.v1` + secret ref；当前聊天选择 `intatis.providerSelection.v1`；macOS 可由 `INTATIS_CONFIG` 显式指定文件、`~/.config/intatis/intatis.json` / `intatis.jsonc`、app support `intatis.json` / `intatis.jsonc` JSON/JSONC 覆盖；不自动发现 `opencode.json` 或 OpenCode app 配置；旧 `config.json` 兜底兼容读取 | provider 持久化 `baseURL` / `chatEndpoint` / secret ref；model 持久化 id / 展示名；高级 JSON 内容采用 OpenCode-compatible `model` + `enabled_providers` + `provider` map；聊天页切换只改当前选择，不改写外部 JSON；API key 不得进 UserDefaults；旧 `intatis.baseURL`/`intatis.model` 仅迁移/兼容 |
+| GUI provider catalog | GUI provider/model/variant 设置 | UserDefaults `intatis.providerCatalog.v1` + secret ref；当前聊天选择 `intatis.providerSelection.v1`；macOS 可由 `INTATIS_CONFIG` 显式指定文件、`~/.config/intatis/intatis.json` / `intatis.jsonc`、app support `intatis.json` / `intatis.jsonc` JSON/JSONC 覆盖；不自动发现 `opencode.json` 或 OpenCode app 配置；旧 `config.json` 兜底兼容读取 | provider 持久化 `baseURL` / `chatEndpoint` / secret ref；model 持久化 id / 展示名；variant 只持久化 identity，参数仍来自配置文件；高级 JSON 内容采用 OpenCode-compatible `model` + `enabled_providers` + `provider` map；聊天页切换只改当前选择，不改写外部 JSON；API key 不得进 UserDefaults；旧 `intatis.baseURL`/`intatis.model` 仅迁移/兼容 |
 
 ## 同步 / 通信机制
 
@@ -274,11 +287,11 @@ MultimodalService.generateImage/transcribe/generateVideo(轮询 job)
 - **Agent 网络/浏览器工具**：`ToolRegistry.standard()` 暴露轻量 `web_fetch` 和 Playwright/CDP-backed `browser_*` 工具。浏览器工具依赖用户环境里已安装的 Node.js，并优先使用 Playwright + Chromium/Chrome/Edge channel；若 Playwright 不可解析，则通过 Node.js 内置 `WebSocket` 使用 Chrome DevTools Protocol 启动已安装 Chrome/Edge/Chromium。缺少后端时返回配置错误或 `browser_diagnostics` 的可行动诊断。profile/state/history/downloads 全部通过 `PathConfinement` 限定在 workspace `.intatis/browser/` 下，刷新、历史前进/后退、表单点击/输入/提交/下拉选择/按键/滚动/等待交互通过 locator 或当前焦点执行；click/download 的 CDP 路径使用真实鼠标事件，打开新页面的交互会跟随到新 tab/window 并把最终页面写回 state/history；截图只能写入工作区 PNG 路径，上传只能引用 workspace 内文件，显式下载只能写入 `.intatis/browser/downloads/<profile>`；`browser_profiles` 可报告 active browser / profile lock runtime marker 是否存在，但不得列内部 marker 文件名或读取内容；`browser_profile_delete` 只在目标 profile 与 `confirmProfile` 匹配时删除 `.intatis/browser/profiles/<profile>`、`downloads/<profile>`、`state/<profile>.json` 并剪除对应 history metadata，删除前如果发现 marker 只给概括性提示；profile 可能包含 cookies 与登录态，不能当成普通日志、artifact 或 secret-free 文本处理。
 - **macOS UI information architecture**：`IntatisMacRootView` 是 macOS Chat/Code/Cowork 的 shell。左侧栏固定 `Intatis` 标题、横向 mode switch、mode-specific session history 与 Settings；New session 动作在 history 区域内，Cowork New session 会先要求用户选择主 workspace 并初始化 per-session project settings。主 thread header 保持标题/副标题，不承载 New/session/model 控件。`IntatisThreadComposer` 支持 composer accessory，macOS Chat/Code/Cowork 把 provider/model menu、context label 与 turn stats 放在输入区旁；Cowork composer 默认把无 @mention 指令交给 `@main`。Thread content 使用共享 responsive layout 计算 horizontal padding、显式 `contentWidth`、message gutter 与 bubble max width；Chat/Code/Cowork 的 message list 均以 `contentWidth` 固定列宽后再在可用区域内居中；对话泡泡通过 `IntatisThreadBubbleRow` 在整行层面按 user trailing、assistant/agent leading 对齐，短消息也在自身 max-width 框内按角色对齐，而不是只靠 bubble 内部 spacer 推位置。Chat 默认无右 inspector；Code 使用右 inspector 展示 structured plan/workspace/Git-status-only/recent failure/last turn；Cowork 右 inspector 只保留三块：`Git Status` status-only、`Agents` 中未清理 agent 的名字与状态图标、`Goals` 中由 task objective 自动生成的目标表，完成项以勾选图标和删除线声明完成。Git 在 UI rail 层仍只读展示状态；本地 stage/commit/branch 等控制通过 Agent Git tools + PermissionEngine 执行，不在右栏直接放 commit/branch/PR/CI 控件。
 - **GUI token/turn stats**：ChatLoop 与 AgentLoop 每轮结束追加 `turn_stats`，包含 endpoint 返回的 prompt/completion/total token（若有）、可选 cached prompt tokens、可选 context window tokens、TTFT、总耗时和 model。OpenAI-compatible `prompt_tokens_details.cached_tokens` 会进入 `Usage.cachedPromptTokens`；未缓存 input 可由 prompt-cached 在 UI 层展示。ChatLoop、AgentLoop 与 ProviderHealthCheck 共用 `Usage` 规则：同一次响应内的 usage chunk 字段级合并，Agent 工具循环中多个模型请求再按请求累计。GUI 不解析消息文本计算 token，而是通过共享 `TurnStatsProjection` 折叠最近一轮统计；macOS Chat / Code / Cowork 与 iOS Chat 复用 `IntatisTurnStatsSummaryView` 显示单行低噪音统计。endpoint 不返回 cached/context usage 时，显示退化为 prompt/completion/total 或耗时信息。
-- **Chat/Code/Cowork session/history**：macOS `IntatisMacRootView` 通过 root-owned view models 和 `SessionHistoryStore.recentSessions(kind:)` 展示当前 mode 的最近 sessions；Chat 启动时优先恢复最近 Chat session，无历史时才使用 `sess_default`，Code/Cowork 在首次进入时创建对应 session。iOS `IOSAppEnvironment` 仍只恢复 Chat session，无历史时才使用 `sess_ios`。新建会话生成新的 `SessionID.new()`，打开独立 `EventLog` 与 artifact store，停止旧 view model 并重建当前 view model。恢复历史会话只切换到对应 `events.jsonl`，不会把新消息继续追加到旧的固定默认日志。路径规则在 `IntatisCore` 复用，macOS/iOS 只传不同 application-support root。
-- **GUI provider catalog**：macOS `AppConfig` 与 iOS `IOSConfig` 使用 UserDefaults 主键 `intatis.providerCatalog.v1` 保存两层配置。第一层 provider 存 `id` / 展示名 / `baseURL` / `chatEndpoint` / secret ref 元数据；第二层 model 存模型 id / 展示名。Chat 对话页提供 provider 分组的模型菜单；切换后写入 `intatis.providerSelection.v1`，重建 `ProviderRegistry` 并更新 `ChatViewModel`，下一条请求使用新 provider/model。设置页编辑 Base URL 时自动生成 Chat endpoint；编辑 Chat endpoint 时清洗 `/chat/completions` 后缀回填 Base URL。旧 `intatis.baseURL` / `intatis.model` 仍作为迁移来源与兼容镜像。
+- **Chat/Code/Cowork session/history**：macOS `IntatisMacRootView` 通过 root-owned view models 和 `SessionHistoryStore.recentSessions(kind:)` 展示当前 mode 的最近 sessions；Chat 启动时优先恢复最近 Chat session，无历史时才使用 `sess_default`，Code/Cowork 在首次进入时创建对应 session。iOS `IOSAppEnvironment` 仍只恢复 Chat session，无历史时才使用 `sess_ios`。新建会话生成新的 `SessionID.new()`，打开独立 `EventLog` 与 artifact store，停止旧 view model 并重建当前 view model。恢复历史会话只切换到对应 `events.jsonl`，不会把新消息继续追加到旧的固定默认日志。macOS history row 的右键菜单支持 Rename/Delete：Rename 只原子写入可选 `<session>/session.json` 显示名称，不改目录名、`SessionID` 或既有 envelope；Delete 在二次确认后删除目标 session 目录并清理该 session 的 workspace/Cowork settings 映射，不触碰绑定工作区内容，当前运行中的 session 禁止删除。路径与元数据规则在 `IntatisCore` 复用，平台层只传不同 application-support root。
+- **GUI provider catalog**：macOS `AppConfig` 与 iOS `IOSConfig` 使用 UserDefaults 主键 `intatis.providerCatalog.v1` 保存两层 catalog。第一层 provider 存 `id` / 展示名 / `baseURL` / `chatEndpoint` / secret ref 元数据；第二层 model 存模型 id / 展示名。macOS Chat/Code/Cowork composer 提供 provider 分组的模型菜单，并把配置中的 variants 作为同一 model 的独立选择项；切换后只把 provider/model/variant identity 写入 `intatis.providerSelection.v1`，重建 `ProviderRegistry`，下一条请求使用新选择的基础 options + variant 覆盖。iOS 保持 provider/model 两层选择。设置页编辑 Base URL 时自动生成 Chat endpoint；编辑 Chat endpoint 时清洗 `/chat/completions` 后缀回填 Base URL。旧 `intatis.baseURL` / `intatis.model` 仍作为迁移来源与兼容镜像。
 - **macOS advanced config**：macOS GUI 启动时先检查用户显式设置的 `INTATIS_CONFIG` 文件；未设置时按顺序只检查 Intatis-owned 路径：`~/.config/intatis/intatis.json` / `intatis.jsonc`、app support 的 `intatis.json` / `intatis.jsonc`，最后才兜底读取旧 Intatis `config.json` / `config.jsonc`。不会自动发现任何名为 `opencode.json` 的文件，也不读取 `~/.config/opencode/` 下的 OpenCode app 配置；OpenCode-compatible 只表示 JSON shape 兼容。找到可解码的 JSON/JSONC 后覆盖 UserDefaults provider catalog；聊天页当前选择覆盖层仍可覆盖 JSON 顶层 `model`。设置页的 Open Intatis Config 按钮会打开当前生效的 Intatis-owned 文件或 `INTATIS_CONFIG` 显式指定文件；若只发现旧 `config.json`，会从当前 catalog 生成新的 `~/.config/intatis/intatis.json` 模板并优先打开。保存设置时，用户本次主动输入的 API key 会写入同一个可编辑 provider JSON 的 `provider.<id>.options.apiKey`；写入用户 config 失败时回退到 app support `intatis.json`。创建的模板来自当前 provider catalog，只输出 OpenCode-compatible `$schema` / `enabled_providers` / `model` / `provider.<id>.npm` / `name` / `options.baseURL` / `options.apiKey` / `models`，`options.apiKey` 默认是 `{env:...}` 引用而非明文。支持兼容读取旧 direct `providers` 数组，也兼容读取 Intatis 扩展字段 `chatEndpoint` / `apiKeySource`；推荐新配置使用 `provider.<id>.options.baseURL`、`options.apiKey`（OpenCode-style 明文、`{env:NAME}` 或 `{file:path}` 均可由真实请求懒加载）、`models`，以及顶层 `model` 形如 `<provider>/<model-id>`。支持 OpenCode-compatible 的 `enabled_providers` / `disabled_providers` 过滤；`disabled_providers` 优先。省略 `options.apiKey` 时 provider 请求按 provider id 尝试 Intatis auth JSON 与当前 Intatis-owned OpenCode-compatible config，不再回落 OS Keychain。
 - **provider config reference confinement**：从 provider JSON 产生的直接 `options.apiKey` secret ref 会绑定当前配置文件；历史 UserDefaults 中的 `providerConfig` 路径只有匹配 Intatis 自有候选或当前显式 `INTATIS_CONFIG` 时才可读取，其他路径由 resolver fail closed。
-- **Cowork automatic permission review**：GUI Cowork session replay 后、bootstrap `@main` 前会尝试创建 `@permission-reviewer`；`intatis cowork` 进入 REPL 时也会先尝试启用。审查者固定 read_only、无工具 lease、`coordinationDepth=0`，不会启动嵌套 `AgentLoop`；`AgentPermissionResponder` 汇总全局 `EventLog` 摘要、active agent roster、请求 agent scoped context、近期 user/task/tool/message/permission 事件，把当前 `PermissionRequestPayload` 包在 untrusted block 中发给审查者 provider。审查者只应返回 `{"decision":"allow|deny|ask_user"}`；兼容读取可选 `risk` / `reason`，但 `ask_user`、不可解析输出或 provider error 均回退到原 responder。CLI `/auto` 重新启用该审查者，`/default` 移除审查者并恢复默认人工确认。
+- **Cowork automatic permission review**：brand-new GUI/CLI Cowork session 先用用户已选择的 primary workspace 受限 bootstrap 固定 `@main`，再创建 `@permission-reviewer`；两者之间不产生 `agent.attach` 模型审批。恢复的非空 session 会先恢复 durable roster，再重建 reviewer；若历史 session 异常缺少 `@main`，仍使用普通 reviewed attach。审查者固定 read_only、无工具 lease、`coordinationDepth=0`，不会启动嵌套 `AgentLoop`；`AgentPermissionResponder` 把结构化 `PermissionReviewTask` 与紧凑 causal/lease metadata 放入 untrusted block 后交给独立 FIFO/single-flight 控制面。审查者只返回 `{"decision":"allow|deny"}`；为 wire 兼容而收到 `ask_user` / `ask` 时规范化为 deny，不可解析输出、tool call、timeout、cancel、provider error 或 settled persistence failure 也只 durable deny 当前调用。GUI 不做隐式人工 fallback：reviewer 未就绪时 composer 锁定并提示 Retry；CLI `/auto` 重新启用，只有用户明确 `/default` 才移除审查者并恢复终端人工确认。
 
 示例（不含明文 secret）：
 
@@ -313,11 +326,11 @@ MultimodalService.generateImage/transcribe/generateVideo(轮询 job)
 - `PathConfinement.resolve`：拒 `..` 遍历与越界绝对路径。Tools 执行与权限门均使用。
 
 ### 权限 3 层门
-1. `DeterministicPolicyGate`（纯函数、模型无关、runs first、`deny` 终局）：locked→deny；敏感路径→deny；路径越界→deny；exec→evaluateShell（shell disabled / read_only hard deny；exec+network ask）；非 exec 网络在 read_only 下 deny、其他模式 ask；readOnly side-effect→allow；destructive→ask；write→read_only deny、其他 profile ask（不再因 reviewed/autopilot 静默 pass）。
-2. `ModelPermissionReviewer`（模型评审）：只见 gate `pass`；只能收窄为 deny/ask，**不能**覆盖硬 deny。
-3. `PermissionEngine`（组合）：`pass` 且无 reviewer → `askUser`。
+1. `DeterministicPolicyGate`（纯函数、模型无关、runs first、`deny` 终局）：输入包含结构化 `PermissionIntent(action/resources/metadata/dataEffects/controlEffects/risks/replayPolicy)`。locked、敏感路径、路径越界、shell disabled、read-only lease 下真实 mutate/exec/network/destructive，以及 read-only parent 试图授予 child read-write workspace 都 hard deny；普通只读数据操作 allow；其余需要审查的写入、网络、exec、destructive 和 agent/task/message/workspace 控制面操作返回 `pass`。WorkspaceLease 是权限 ceiling，不是“本次调用已经写文件”的判据。
+2. reviewer（模型评审）只见 gate `pass`，只能收窄，**不能**覆盖硬 deny。非 Cowork host 可注入 `ModelPermissionReviewer`；production Cowork 不注入该 reviewer，而把同一次 `pass -> askUser` 请求交给 durable `PermissionReviewControlPlane`。同一调用不得同时配置两条模型审查路径。
+3. `PermissionEngine`（组合）：`pass` 且无 in-engine reviewer → `askUser`，由当前 responder 处理。Cowork 自动模式 responder 只有 allow/deny、无人工 fallback；人工模式只能由用户显式切换。
 
-自动权限审查不改变上述终局规则；它只替换 Cowork `askUser` 的第一回答者。因为 hard deny 不会产生 `permission_request`，`@permission-reviewer` 无法覆盖硬 deny。审查记录写入 `permission_review`，最终执行仍以 `permission_resolved` 为准。
+自动权限审查不改变上述终局规则。因为 hard deny 不会产生 `permission_request`，`@permission-reviewer` 无法覆盖硬 deny。结构化 intent 以向后兼容的 optional 字段追加到 permission request/resolved、review task 与 tool execution prepare/settle 事件；旧 JSONL 缺字段时继续解码。审查记录写入 `permission_review_requested/settled` 与兼容 `permission_review`，最终执行仍以 durable settlement 和 `permission_resolved` 为准。
 
 ### 秘密拦截
 - `SecretScanner`：敏感路径/basename/扩展名、秘密内容标记（`-----BEGIN`、`PRIVATE KEY`、`AKIA`、`sk-`、`ssh-rsa`、`xoxb-`、`ghp_`、`AIza`…）、受保护配置路径。
@@ -335,3 +348,4 @@ MultimodalService.generateImage/transcribe/generateVideo(轮询 job)
 
 - 仓内根 `ARCHITECTURE.md`（draft-0, 2026-06-11，中文）描述 Intatis 内核/Cowork 设计。本目录 `docs/ARCHITECTURE.md` 据实际源码重写并与之对照。
 - Cowork 设计细节见 `docs/COWORK_AGENT_ARCHITECTURE.md` 等 7 个 COWORK_* 文档；原则提炼见 `docs/COWORK_PRINCIPLES.md`。
+- 开源源码、公开 prompt、依赖、bundled runtime 与上游升级的准入规则见 `docs/OPEN_SOURCE_REUSE.md`；实际已经采用的上游必须登记在 `NOTICE.md`。截至 2026-07-12，OpenCode 仍为 research-only，尚未把其源码、公开 prompt、UI 资产或 runtime 加入 Intatis。

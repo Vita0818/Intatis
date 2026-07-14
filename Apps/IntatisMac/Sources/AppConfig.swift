@@ -1,17 +1,82 @@
 #if canImport(SwiftUI)
 import Foundation
 import IntatisCore
+import IntatisProtocol
 import IntatisProviders
 
 typealias AppSessionSummary = SessionSummary
 
+struct AppProviderModelVariant: Identifiable, Equatable {
+    var id: String
+    /// Variant fields are an opaque request-parameter preset. Intatis removes
+    /// only the local `disabled` control flag and otherwise preserves keys and
+    /// values exactly as configured.
+    var requestOptions: [String: JSONValue]
+    var configurationMetadata: [String: JSONValue]
+
+    var reasoningLabel: String? {
+        ModelConfigurationPresentation(
+            modelMetadata: configurationMetadata,
+            requestOptions: requestOptions).reasoningLabel
+    }
+}
+
 struct AppProviderModel: Identifiable, Codable, Equatable {
     var id: String
     var displayName: String
+    /// Model-scoped API request options loaded from the external Intatis
+    /// configuration. They stay in memory and are deliberately not mirrored to
+    /// UserDefaults, where arbitrary user values could include secrets.
+    var requestOptions: [String: JSONValue]
+    /// Complete model-level configuration object loaded from the external file.
+    /// It is retained only in memory so unknown metadata remains available for
+    /// read-only UI projections without being normalized or written back.
+    var configurationMetadata: [String: JSONValue]
+    /// Named presets parsed from the config file. Like arbitrary model options,
+    /// variants are intentionally memory-only and never mirrored to defaults.
+    var variants: [AppProviderModelVariant]
+
+    init(id: String,
+         displayName: String,
+         requestOptions: [String: JSONValue] = [:],
+         configurationMetadata: [String: JSONValue] = [:],
+         variants: [AppProviderModelVariant] = []) {
+        self.id = id
+        self.displayName = displayName
+        self.requestOptions = requestOptions
+        self.configurationMetadata = configurationMetadata
+        self.variants = variants
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case displayName
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try container.decode(String.self, forKey: .id)
+        self.displayName = try container.decode(String.self, forKey: .displayName)
+        self.requestOptions = [:]
+        self.configurationMetadata = [:]
+        self.variants = []
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(displayName, forKey: .displayName)
+    }
 
     var title: String {
         let trimmed = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? id : trimmed
+    }
+
+    var reasoningLabel: String? {
+        ModelConfigurationPresentation(
+            modelMetadata: configurationMetadata,
+            requestOptions: requestOptions).reasoningLabel
     }
 }
 
@@ -169,6 +234,7 @@ struct AppProviderSettings: Identifiable, Codable, Equatable {
 struct AppProviderCatalog: Codable, Equatable {
     var selectedProviderID: String
     var selectedModelID: String
+    var selectedVariantID: String? = nil
     var providers: [AppProviderSettings]
 
     var selectedProvider: AppProviderSettings? {
@@ -179,11 +245,17 @@ struct AppProviderCatalog: Codable, Equatable {
         guard let provider = selectedProvider else { return nil }
         return provider.models.first { $0.id == selectedModelID } ?? provider.models.first
     }
+
+    var selectedVariant: AppProviderModelVariant? {
+        guard let selectedVariantID else { return nil }
+        return selectedModel?.variants.first { $0.id == selectedVariantID }
+    }
 }
 
 private struct AppProviderSelection: Codable, Equatable {
     var providerID: String
     var modelID: String
+    var variantID: String? = nil
 }
 
 /// App configuration. Defaults to an OpenAI-compatible endpoint; provider
@@ -291,7 +363,9 @@ enum AppConfig {
     }
 
     @discardableResult
-    static func selectProviderModel(providerID: String, modelID: String) -> AppProviderCatalog {
+    static func selectProviderModel(providerID: String,
+                                    modelID: String,
+                                    variantID: String? = nil) -> AppProviderCatalog {
         var catalog = providerCatalog
         guard let provider = catalog.providers.first(where: { $0.id == providerID }) else {
             return catalog
@@ -301,6 +375,9 @@ enum AppConfig {
             ?? defaultModel
         catalog.selectedProviderID = provider.id
         catalog.selectedModelID = selectedModelID
+        catalog.selectedVariantID = provider.models
+            .first(where: { $0.id == selectedModelID })?
+            .variants.first(where: { $0.id == variantID })?.id
         providerCatalog = catalog
         return providerCatalog
     }
@@ -392,7 +469,8 @@ enum AppConfig {
                 baseURL: URL(string: provider.baseURL) ?? URL(string: defaultBaseURL)!,
                 chatEndpoint: URL(string: provider.chatEndpoint),
                 apiKeyRef: apiKeyRef(for: provider),
-                wire: .openai)
+                wire: .openai,
+                modelRequestOptions: modelRequestOptions(for: provider, catalog: catalog))
         }
         let chat = ModelRef(endpoint: selectedProvider.id, model: ModelID(rawValue: selectedModel.id))
         var models = ResolvedModels(chat: chat, agent: chat)
@@ -433,7 +511,10 @@ enum AppConfig {
                 seenModels.insert(modelID)
                 return AppProviderModel(
                     id: modelID,
-                    displayName: model.displayName.trimmingCharacters(in: .whitespacesAndNewlines))
+                    displayName: model.displayName.trimmingCharacters(in: .whitespacesAndNewlines),
+                    requestOptions: model.requestOptions,
+                    configurationMetadata: model.configurationMetadata,
+                    variants: model.variants)
             }
             guard !baseURL.isEmpty else { return nil }
             return AppProviderSettings(
@@ -463,11 +544,40 @@ enum AppConfig {
         let selectedModelID = selectedProvider.models.contains { $0.id == catalog.selectedModelID }
             ? catalog.selectedModelID
             : selectedProvider.models[0].id
+        let selectedModel = selectedProvider.models.first { $0.id == selectedModelID }
+        let selectedVariantID = selectedModel?.variants
+            .first(where: { $0.id == catalog.selectedVariantID })?.id
 
         return AppProviderCatalog(
             selectedProviderID: selectedProviderID,
             selectedModelID: selectedModelID,
+            selectedVariantID: selectedVariantID,
             providers: providers)
+    }
+
+    fileprivate static func variantSort(_ lhs: AppProviderModelVariant,
+                                        _ rhs: AppProviderModelVariant) -> Bool {
+        let ranks = [
+            "none": 0,
+            "minimal": 1,
+            "low": 2,
+            "medium": 3,
+            "high": 4,
+            "xhigh": 5,
+            "max": 6,
+        ]
+        let left = lhs.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let right = rhs.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        switch (ranks[left], ranks[right]) {
+        case let (leftRank?, rightRank?) where leftRank != rightRank:
+            return leftRank < rightRank
+        case (_?, nil):
+            return true
+        case (nil, _?):
+            return false
+        default:
+            return lhs.id.localizedStandardCompare(rhs.id) == .orderedAscending
+        }
     }
 
     private static func legacyProviderCatalog() -> AppProviderCatalog {
@@ -494,6 +604,9 @@ enum AppConfig {
         var selected = catalog
         selected.selectedProviderID = selection.providerID
         selected.selectedModelID = selection.modelID
+        selected.selectedVariantID = provider.models
+            .first(where: { $0.id == selection.modelID })?
+            .variants.first(where: { $0.id == selection.variantID })?.id
         return selected
     }
 
@@ -506,7 +619,8 @@ enum AppConfig {
 
     private static func storeSelection(from catalog: AppProviderCatalog) {
         let selection = AppProviderSelection(providerID: catalog.selectedProviderID,
-                                             modelID: catalog.selectedModelID)
+                                             modelID: catalog.selectedModelID,
+                                             variantID: catalog.selectedVariantID)
         if let data = try? JSONEncoder().encode(selection) {
             UserDefaults.standard.set(data, forKey: providerSelectionKey)
         }
@@ -527,7 +641,22 @@ enum AppConfig {
             baseURL: URL(string: provider.baseURL) ?? URL(string: defaultBaseURL)!,
             chatEndpoint: URL(string: provider.chatEndpoint),
             apiKeyRef: apiKeyRef(for: provider),
-            wire: .openai)
+            wire: .openai,
+            modelRequestOptions: modelRequestOptions(for: provider, catalog: providerCatalog))
+    }
+
+    private static func modelRequestOptions(for provider: AppProviderSettings,
+                                            catalog: AppProviderCatalog)
+        -> [String: [String: JSONValue]] {
+        Dictionary(uniqueKeysWithValues: provider.models.compactMap { model in
+            var options = model.requestOptions
+            if provider.id == catalog.selectedProviderID,
+               model.id == catalog.selectedModelID,
+               let variant = catalog.selectedVariant {
+                options.merge(variant.requestOptions) { _, variantValue in variantValue }
+            }
+            return options.isEmpty ? nil : (model.id, options)
+        })
     }
 
     static func apiKeyRef(for provider: AppProviderSettings) -> KeychainRef {
@@ -1119,8 +1248,9 @@ private struct AppProviderConfigFile: Decodable {
         var entries = providers ?? []
         let enabled = enabledProviders ?? enabled_providers
         let disabled = disabledProviders ?? disabled_providers
-        let split = splitModel(resolvedConfigValue(model ?? smallModel ?? small_model,
-                                                   configDirectory: configDirectory))
+        let resolvedModel = resolvedConfigValue(model ?? smallModel ?? small_model,
+                                                configDirectory: configDirectory)
+        let split = splitModel(resolvedModel)
         if !entries.isEmpty {
             entries = entries.filter {
                 shouldIncludeProvider(id: $0.id, enabled: enabled, disabled: disabled)
@@ -1147,8 +1277,15 @@ private struct AppProviderConfigFile: Decodable {
         }
         guard !entries.isEmpty else { return nil }
 
-        if let providerID = split.providerID,
-           let modelID = split.modelID,
+        // OpenAI-compatible model IDs commonly contain `/` themselves. Prefer
+        // an exact model-key match across the enabled provider set before
+        // interpreting the first path component as an Intatis provider ID.
+        let exactModel = exactModelSelection(resolvedModel, in: entries)
+        let configuredProviderID = exactModel?.providerID ?? split.providerID
+        let configuredModelID = exactModel?.modelID ?? split.modelID
+
+        if let providerID = configuredProviderID,
+           let modelID = configuredModelID,
            let actualProviderID = actualProviderID(matching: providerID, in: entries),
            let index = entries.firstIndex(where: { $0.id == actualProviderID }),
            !entries[index].models.contains(where: { $0.id == modelID }) {
@@ -1157,10 +1294,10 @@ private struct AppProviderConfigFile: Decodable {
                                  displayName: AppConfig.defaultDisplayName(for: modelID)))
         }
         let selectedProvider = actualProviderID(matching: selectedProviderID, in: entries)
-            ?? actualProviderID(matching: split.providerID, in: entries)
+            ?? actualProviderID(matching: configuredProviderID, in: entries)
             ?? entries[0].id
         let selectedModel = selectedModelID
-            ?? split.modelID
+            ?? configuredModelID
             ?? entries.first(where: { $0.id == selectedProvider })?.models.first?.id
             ?? entries[0].models.first?.id
             ?? AppConfig.defaultModel
@@ -1191,6 +1328,26 @@ private struct AppProviderConfigFile: Decodable {
             return (nil, raw)
         }
         return (String(parts[0]), String(parts[1]))
+    }
+
+    private func exactModelSelection(_ raw: String?,
+                                     in entries: [AppProviderSettings])
+        -> (providerID: String, modelID: String)? {
+        guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty else {
+            return nil
+        }
+        let matches = entries.filter { provider in
+            provider.models.contains { $0.id == raw }
+        }
+        if let selectedProviderID,
+           let selected = matches.first(where: {
+               normalizedProviderID($0.id) == normalizedProviderID(selectedProviderID)
+           }) {
+            return (selected.id, raw)
+        }
+        guard matches.count == 1, let provider = matches.first else { return nil }
+        return (provider.id, raw)
     }
 
     private func shouldIncludeProvider(id: String,
@@ -1273,7 +1430,10 @@ private struct AppProviderConfigFileProvider: Decodable {
         var modelList = models?.keys.sorted().compactMap { modelID -> AppProviderModel? in
             guard let model = models?[modelID] else { return nil }
             return AppProviderModel(id: model.id ?? modelID,
-                                    displayName: model.displayName ?? model.name ?? modelID)
+                                    displayName: model.displayName ?? model.name ?? modelID,
+                                    requestOptions: model.options ?? [:],
+                                    configurationMetadata: model.rawConfiguration,
+                                    variants: model.variants)
         } ?? []
         if let selectedModelID,
            !modelList.contains(where: { $0.id == selectedModelID }) {
@@ -1307,24 +1467,58 @@ private struct AppProviderConfigFileModel: Decodable {
     var id: String?
     var name: String?
     var displayName: String?
-
-    enum CodingKeys: String, CodingKey {
-        case id
-        case name
-        case displayName
-    }
+    var options: [String: JSONValue]?
+    var rawConfiguration: [String: JSONValue]
+    var variants: [AppProviderModelVariant]
 
     init(from decoder: Decoder) throws {
         if let value = try? decoder.singleValueContainer().decode(String.self) {
             self.id = nil
             self.name = value
             self.displayName = value
+            self.options = nil
+            self.rawConfiguration = ["name": .string(value)]
+            self.variants = []
             return
         }
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        self.id = try container.decodeIfPresent(String.self, forKey: .id)
-        self.name = try container.decodeIfPresent(String.self, forKey: .name)
-        self.displayName = try container.decodeIfPresent(String.self, forKey: .displayName)
+        let value = try decoder.singleValueContainer().decode(JSONValue.self)
+        guard case .object(let object) = value else {
+            throw DecodingError.dataCorrupted(
+                .init(codingPath: decoder.codingPath,
+                      debugDescription: "Model configuration must be a string or JSON object"))
+        }
+        self.id = object.string(forKey: "id")
+        self.name = object.string(forKey: "name")
+        self.displayName = object.string(forKey: "displayName")
+        if case .object(let options) = object["options"] {
+            self.options = options
+        } else {
+            self.options = nil
+        }
+        self.rawConfiguration = object
+        if case .object(let variants) = object["variants"] {
+            self.variants = variants.compactMap { variantID, value in
+                guard case .object(var variantObject) = value,
+                      variantObject["disabled"] != .bool(true) else {
+                    return nil
+                }
+                variantObject.removeValue(forKey: "disabled")
+                return AppProviderModelVariant(
+                    id: variantID,
+                    requestOptions: variantObject,
+                    configurationMetadata: variantObject)
+            }
+            .sorted(by: AppConfig.variantSort)
+        } else {
+            self.variants = []
+        }
+    }
+}
+
+private extension Dictionary where Key == String, Value == JSONValue {
+    func string(forKey key: String) -> String? {
+        guard case .string(let value) = self[key] else { return nil }
+        return value
     }
 }
 

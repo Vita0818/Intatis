@@ -20,14 +20,21 @@ public struct ToolCallContext: Sendable {
     public let touchedPaths: [String]
     public let risksNetwork: Bool
     public let rawArgs: String   // JSON arguments
+    public let intent: PermissionIntent
 
     public init(toolName: String, sideEffect: SideEffect, touchedPaths: [String],
-                risksNetwork: Bool, rawArgs: String) {
+                risksNetwork: Bool, rawArgs: String,
+                intent: PermissionIntent? = nil) {
         self.toolName = toolName
         self.sideEffect = sideEffect
         self.touchedPaths = touchedPaths
         self.risksNetwork = risksNetwork
         self.rawArgs = rawArgs
+        self.intent = intent ?? .derived(
+            toolName: toolName,
+            sideEffect: sideEffect,
+            touchedPaths: touchedPaths,
+            risksNetwork: risksNetwork)
     }
 }
 

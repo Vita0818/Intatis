@@ -28,6 +28,21 @@ public struct AskAgentTool: Tool {
 
     struct Args: Decodable { let to: String; let question: String }
 
+    public func permissionIntent(_ args: ToolArgs, workspaceRoot: URL) -> PermissionIntent {
+        let value = try? args.decode(Args.self)
+        return PermissionIntent(
+            action: "task.ask",
+            resources: [
+                PermissionResource(kind: .agent, value: value?.to ?? "unknown"),
+                PermissionResource(kind: .task, value: "new"),
+            ],
+            metadata: ["questionLength": .number(Double(value?.question.count ?? 0))],
+            dataEffects: [.none],
+            controlEffects: [.createTask, .message],
+            risks: [.controlPlaneMutation, .modelCost],
+            replayPolicy: .requiresManualReconciliation)
+    }
+
     public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {
         let a = try args.decode(Args.self)
         guard let messenger = context.messenger else {

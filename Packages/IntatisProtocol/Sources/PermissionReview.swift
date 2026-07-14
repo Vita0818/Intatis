@@ -76,6 +76,7 @@ public struct PermissionRequestContext: Codable, Equatable, Sendable {
     public var touchedPaths: [String]
     public var risksNetwork: Bool?
     public var sideEffect: SideEffect?
+    public var intent: PermissionIntent?
     public var gate: PermissionReviewGateSnapshot?
     public var capabilityLease: CapabilityLease?
     public var workspaceLease: WorkspaceLease?
@@ -96,6 +97,7 @@ public struct PermissionRequestContext: Codable, Equatable, Sendable {
                 touchedPaths: [String] = [],
                 risksNetwork: Bool? = nil,
                 sideEffect: SideEffect? = nil,
+                intent: PermissionIntent? = nil,
                 gate: PermissionReviewGateSnapshot? = nil,
                 capabilityLease: CapabilityLease? = nil,
                 workspaceLease: WorkspaceLease? = nil,
@@ -112,6 +114,7 @@ public struct PermissionRequestContext: Codable, Equatable, Sendable {
         self.touchedPaths = touchedPaths
         self.risksNetwork = risksNetwork
         self.sideEffect = sideEffect
+        self.intent = intent
         self.gate = gate
         self.capabilityLease = capabilityLease
         self.workspaceLease = workspaceLease
@@ -123,7 +126,7 @@ public struct PermissionRequestContext: Codable, Equatable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case taskID, rootTaskID, parentTaskID, attempt, toolCallID, normalizedArgs
-        case touchedPaths, risksNetwork, sideEffect, gate, capabilityLease
+        case touchedPaths, risksNetwork, sideEffect, intent, gate, capabilityLease
         case workspaceLease, taskContract, causalContext, executionID, replayPolicy
     }
 
@@ -138,6 +141,7 @@ public struct PermissionRequestContext: Codable, Equatable, Sendable {
         touchedPaths = try container.decodeIfPresent([String].self, forKey: .touchedPaths) ?? []
         risksNetwork = try container.decodeIfPresent(Bool.self, forKey: .risksNetwork)
         sideEffect = try container.decodeIfPresent(SideEffect.self, forKey: .sideEffect)
+        intent = try container.decodeIfPresent(PermissionIntent.self, forKey: .intent)
         gate = try container.decodeIfPresent(PermissionReviewGateSnapshot.self, forKey: .gate)
         capabilityLease = try container.decodeIfPresent(CapabilityLease.self, forKey: .capabilityLease)
         workspaceLease = try container.decodeIfPresent(WorkspaceLease.self, forKey: .workspaceLease)
@@ -158,6 +162,7 @@ public struct PermissionRequestContext: Codable, Equatable, Sendable {
         if !touchedPaths.isEmpty { try container.encode(touchedPaths, forKey: .touchedPaths) }
         try container.encodeIfPresent(risksNetwork, forKey: .risksNetwork)
         try container.encodeIfPresent(sideEffect, forKey: .sideEffect)
+        try container.encodeIfPresent(intent, forKey: .intent)
         try container.encodeIfPresent(gate, forKey: .gate)
         try container.encodeIfPresent(capabilityLease, forKey: .capabilityLease)
         try container.encodeIfPresent(workspaceLease, forKey: .workspaceLease)
@@ -187,6 +192,7 @@ public struct PermissionReviewTask: Codable, Equatable, Sendable {
     public var touchedPaths: [String]
     public var risksNetwork: Bool
     public var sideEffect: SideEffect?
+    public var intent: PermissionIntent?
     public var gate: PermissionReviewGateSnapshot
     public var capabilityLease: CapabilityLease?
     public var workspaceLease: WorkspaceLease?
@@ -212,6 +218,7 @@ public struct PermissionReviewTask: Codable, Equatable, Sendable {
                 touchedPaths: [String] = [],
                 risksNetwork: Bool = false,
                 sideEffect: SideEffect? = nil,
+                intent: PermissionIntent? = nil,
                 gate: PermissionReviewGateSnapshot,
                 capabilityLease: CapabilityLease? = nil,
                 workspaceLease: WorkspaceLease? = nil,
@@ -236,6 +243,7 @@ public struct PermissionReviewTask: Codable, Equatable, Sendable {
         self.touchedPaths = touchedPaths
         self.risksNetwork = risksNetwork
         self.sideEffect = sideEffect
+        self.intent = intent
         self.gate = gate
         self.capabilityLease = capabilityLease
         self.workspaceLease = workspaceLease

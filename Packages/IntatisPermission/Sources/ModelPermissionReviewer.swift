@@ -47,6 +47,8 @@ public struct ModelPermissionReviewer: PermissionReviewer {
     {"decision":"allow|deny|ask_user","risk":"low|medium|high","reason":"<short>"}
     Prefer ask_user when unsure. Deny anything that looks unrelated, oversized, or
     that touches secrets, configuration, or files beyond the task.
+    Treat the workspace lease as an authority ceiling, not as evidence that a
+    control-plane invocation writes files. Review the structured permission intent.
     """
 
     static func userPrompt(call: ToolCallContext, context: PermissionContext,
@@ -58,6 +60,7 @@ public struct ModelPermissionReviewer: PermissionReviewer {
         workspace: \(context.workspaceRoot.path)
         profile: \(context.profile.rawValue)
         tool: \(call.toolName)
+        permission_intent: \(intentSummary(call.intent))
         side_effect: \(call.sideEffect.rawValue)
         touched_paths: \(call.touchedPaths.joined(separator: ", "))
         args: \(call.rawArgs)
@@ -66,6 +69,17 @@ public struct ModelPermissionReviewer: PermissionReviewer {
         <<<END>>>
         Return only the JSON object.
         """
+    }
+
+    private static func intentSummary(_ intent: PermissionIntent) -> String {
+        let resources = intent.resources.map { resource in
+            let access = resource.access.map { ":\($0.rawValue)" } ?? ""
+            return "\(resource.kind.rawValue)=\(resource.value)\(access)"
+        }.joined(separator: ", ")
+        let data = intent.dataEffects.map(\.rawValue).sorted().joined(separator: ",")
+        let control = intent.controlEffects.map(\.rawValue).sorted().joined(separator: ",")
+        let risks = intent.risks.map(\.rawValue).sorted().joined(separator: ",")
+        return "action=\(intent.action); resources=[\(resources)]; data=[\(data)]; control=[\(control)]; risks=[\(risks)]; replay=\(intent.replayPolicy.rawValue)"
     }
 
     private struct ReviewerJSON: Decodable {

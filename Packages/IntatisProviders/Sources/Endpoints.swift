@@ -1,5 +1,6 @@
 import Foundation
 import IntatisCore
+import IntatisProtocol
 
 /// The wire dialect an endpoint speaks. v0.1 ships only `.openai`; adding a
 /// dialect later is a new case + a new adapter, with no change to the registry,
@@ -79,17 +80,61 @@ public struct ProviderEndpoint: Codable, Equatable, Sendable {
     public var chatEndpoint: URL?
     public var apiKeyRef: KeychainRef
     public var wire: WireFormat
+    /// Arbitrary model-scoped request body options from the user's provider
+    /// configuration. Wire adapters merge the selected model's object into the
+    /// outgoing request without enumerating provider-specific keys.
+    public var modelRequestOptions: [String: [String: JSONValue]]
+
     public init(id: String, baseURL: URL, chatEndpoint: URL? = nil,
-                apiKeyRef: KeychainRef, wire: WireFormat) {
+                apiKeyRef: KeychainRef, wire: WireFormat,
+                modelRequestOptions: [String: [String: JSONValue]] = [:]) {
         self.id = id
         self.baseURL = baseURL
         self.chatEndpoint = chatEndpoint
         self.apiKeyRef = apiKeyRef
         self.wire = wire
+        self.modelRequestOptions = modelRequestOptions
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case baseURL
+        case chatEndpoint
+        case apiKeyRef
+        case wire
+        case modelRequestOptions
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try container.decode(String.self, forKey: .id)
+        self.baseURL = try container.decode(URL.self, forKey: .baseURL)
+        self.chatEndpoint = try container.decodeIfPresent(URL.self, forKey: .chatEndpoint)
+        self.apiKeyRef = try container.decode(KeychainRef.self, forKey: .apiKeyRef)
+        self.wire = try container.decode(WireFormat.self, forKey: .wire)
+        self.modelRequestOptions = try container.decodeIfPresent(
+            [String: [String: JSONValue]].self,
+            forKey: .modelRequestOptions) ?? [:]
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(baseURL, forKey: .baseURL)
+        try container.encodeIfPresent(chatEndpoint, forKey: .chatEndpoint)
+        try container.encode(apiKeyRef, forKey: .apiKeyRef)
+        try container.encode(wire, forKey: .wire)
+        if !modelRequestOptions.isEmpty {
+            try container.encode(modelRequestOptions, forKey: .modelRequestOptions)
+        }
     }
 
     public var chatCompletionsURL: URL {
         chatEndpoint ?? baseURL.appendingPathComponent("chat/completions")
+    }
+
+    public func requestOptions(for model: ModelID) -> [String: JSONValue] {
+        modelRequestOptions[model.rawValue] ?? [:]
     }
 }
 

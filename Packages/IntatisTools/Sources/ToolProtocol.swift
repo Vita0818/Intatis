@@ -121,7 +121,7 @@ public protocol AgentMessenger: Sendable {
     func requestInformation(to agent: String, question: String) async -> String
     func replyMessage(to agent: String, content: String, inReplyTo: String?) async -> String
     func requestDelegation(objective: String, reason: String) async -> String
-    func delegateTask(to agent: String,
+    func delegateTask(to agent: String?,
                       objective: String,
                       roleHint: String?,
                       expectedDeliverable: String?) async -> String
@@ -132,7 +132,11 @@ public protocol AgentMessenger: Sendable {
 /// list, and remove sub-agents through tools. Like `AgentMessenger`, the real
 /// work happens in the orchestrator/registry — tools are just thin executors.
 public protocol AgentManager: Sendable {
-    func spawnAgent(name: String, path: String, model: String?, canCoordinate: Bool) async -> String
+    func spawnAgent(name: String,
+                    path: String,
+                    model: String?,
+                    requestedAccess: WorkspaceAccess,
+                    canCoordinate: Bool) async -> String
     func listAgents() async -> String
     func removeAgent(name: String) async -> String
 }
@@ -227,12 +231,56 @@ public protocol Tool: Sendable {
     static var descriptor: ToolDescriptor { get }
     func touchedPaths(_ args: ToolArgs) -> [String]
     func risksNetwork(_ args: ToolArgs) -> Bool
+    /// Build the structured authorization input for this exact invocation.
+    /// `workspaceRoot` is context only; it is not an approval or a replacement
+    /// for CapabilityLease / WorkspaceLease enforcement in AgentKernel.
+    func permissionIntent(_ args: ToolArgs, workspaceRoot: URL) -> PermissionIntent
     func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation
 }
 
 public extension Tool {
     func touchedPaths(_ args: ToolArgs) -> [String] { [] }
     func risksNetwork(_ args: ToolArgs) -> Bool { false }
+    func permissionIntent(_ args: ToolArgs, workspaceRoot: URL) -> PermissionIntent {
+        let descriptor = Self.descriptor
+        var intent = PermissionIntent.derived(
+            toolName: descriptor.name,
+            sideEffect: descriptor.sideEffect,
+            touchedPaths: touchedPaths(args),
+            risksNetwork: risksNetwork(args))
+        guard let object = Self.permissionArgumentObject(args) else { return intent }
+
+        if descriptor.name == "run_shell",
+           case .string(let command)? = object["command"] {
+            intent.resources.append(PermissionResource(kind: .command, value: command))
+        }
+        if descriptor.name.hasPrefix("git_") {
+            intent.resources.append(PermissionResource(kind: .git, value: workspaceRoot.path))
+            for key in ["remote", "branch", "base", "name", "startPoint"] {
+                if case .string(let value)? = object[key] {
+                    intent.metadata[key] = .string(value)
+                }
+            }
+        }
+        if descriptor.name.hasPrefix("browser_") || descriptor.name == "web_fetch" {
+            for key in ["url", "startURL"] {
+                if case .string(let value)? = object[key] {
+                    intent.resources.append(PermissionResource(kind: .url, value: value))
+                }
+            }
+            if case .string(let query)? = object["query"] {
+                intent.metadata["query"] = .string(query)
+            }
+        }
+        return intent
+    }
+
+    private static func permissionArgumentObject(_ args: ToolArgs) -> [String: JSONValue]? {
+        guard let data = args.raw.data(using: .utf8),
+              let decoded = try? JSONDecoder().decode(JSONValue.self, from: data),
+              case .object(let object) = decoded else { return nil }
+        return object
+    }
 }
 
 public struct ToolRegistry: Sendable {

@@ -29,6 +29,12 @@ public enum AutomaticPermissionReviewDisableResult: Equatable, Sendable {
     case failed(String)
 }
 
+public enum CoworkSessionBootstrapResult: Equatable, Sendable {
+    case attached(AgentID)
+    case alreadyAttached(AgentID)
+    case failed(String)
+}
+
 public struct CoworkExecutionPolicy: Equatable, Sendable {
     public var maxConcurrentTasks: Int
     public var taskTimeoutSeconds: Double
@@ -443,6 +449,23 @@ public actor Orchestrator {
             admissionTaskID: admissionTaskID,
             capabilityLease: proposedLeases.capability,
             workspaceLease: proposedLeases.workspace)
+        let attachIntent = PermissionIntent(
+            action: "workspace.attach",
+            resources: [
+                PermissionResource(kind: .agent, value: proposedAgent.name.rawValue),
+                PermissionResource(
+                    kind: .workspace,
+                    value: assessedPath,
+                    access: proposedLeases.workspace.access),
+            ],
+            metadata: [
+                "model": .string(proposedAgent.model.rawValue),
+                "canCoordinate": .bool(canCoordinate),
+            ],
+            dataEffects: [.none],
+            controlEffects: [.attachWorkspace, .grantCapability],
+            risks: [.controlPlaneMutation, .capabilityGrant, .workspaceExpansion],
+            replayPolicy: .requiresManualReconciliation)
         let request = PermissionRequestPayload(
             requestId: requestID,
             agent: proposedAgent.name,
@@ -457,9 +480,10 @@ public actor Orchestrator {
                 attempt: admissionAttempt,
                 toolCallID: "agent-attach:\(requestID.rawValue)",
                 normalizedArgs: normalizedAttachArgs,
-                touchedPaths: [assessedPath],
+                touchedPaths: [],
                 risksNetwork: false,
                 sideEffect: .write,
+                intent: attachIntent,
                 gate: PermissionReviewGateSnapshot(
                     decision: assessment.canAskUser ? .ask : .deny,
                     risk: assessment.risk,
@@ -523,7 +547,7 @@ public actor Orchestrator {
         guard assessment.canAskUser else {
             try? await log.append(.permissionResolved(PermissionResolvedPayload(
                 requestId: requestID, tool: "agent.attach", decision: .deny,
-                risk: assessment.risk, reason: assessment.reason)))
+                risk: assessment.risk, reason: assessment.reason, intent: attachIntent)))
             try? await log.append(.workspaceLeaseDenied(WorkspaceLeaseDeniedPayload(
                 agent: proposedAgent.name,
                 rootPath: assessedPath,
@@ -536,7 +560,7 @@ public actor Orchestrator {
         guard decision == .allow else {
             try? await log.append(.permissionResolved(PermissionResolvedPayload(
                 requestId: requestID, tool: "agent.attach", decision: .deny,
-                risk: assessment.risk, reason: "permission denied workspace attach")))
+                risk: assessment.risk, reason: "permission denied workspace attach", intent: attachIntent)))
             try? await log.append(.workspaceLeaseDenied(WorkspaceLeaseDeniedPayload(
                 agent: proposedAgent.name,
                 rootPath: assessedPath,
@@ -548,7 +572,7 @@ public actor Orchestrator {
         guard registry.agent(id) == nil else {
             try? await log.append(.permissionResolved(PermissionResolvedPayload(
                 requestId: requestID, tool: "agent.attach", decision: .deny,
-                risk: .medium, reason: "agent already exists")))
+                risk: .medium, reason: "agent already exists", intent: attachIntent)))
             releaseAdmissionLock()
             return false
         }
@@ -563,7 +587,8 @@ public actor Orchestrator {
                         tool: "agent.attach",
                         decision: .deny,
                         risk: .high,
-                        reason: reason)),
+                        reason: reason,
+                        intent: attachIntent)),
                     .workspaceLeaseDenied(WorkspaceLeaseDeniedPayload(
                         agent: proposedAgent.name,
                         rootPath: assessedPath,
@@ -581,7 +606,7 @@ public actor Orchestrator {
         do {
             try await appendAdmissionEvent(.permissionResolved(PermissionResolvedPayload(
                 requestId: requestID, tool: "agent.attach", decision: .allow,
-                risk: assessment.risk, reason: "permission approved workspace attach")))
+                risk: assessment.risk, reason: "permission approved workspace attach", intent: attachIntent)))
             try await appendAdmissionEvent(.workspaceLeaseGranted(WorkspaceLeaseGrantedPayload(
                 agent: proposedAgent.name,
                 lease: proposedLeases.workspace,
@@ -606,6 +631,86 @@ public actor Orchestrator {
         releaseAdmissionLock()
         await enqueuePendingMailboxWakeIfNeeded(for: proposedAgent.name)
         return true
+    }
+
+    /// Establishes the fixed `@main` identity for a brand-new Cowork session.
+    ///
+    /// The caller's explicit primary-workspace selection is the authorization
+    /// for this one bootstrap admission. This path is deliberately narrower
+    /// than ordinary `attach`: it accepts only `@main`, only while both the
+    /// durable session and runtime roster are empty, and still canonicalizes
+    /// and rejects broad or sensitive workspace roots. Every later agent or
+    /// workspace expansion continues through the normal permission flow.
+    @discardableResult
+    public func bootstrapMainAgent(_ agent: Agent) async -> CoworkSessionBootstrapResult {
+        guard agent.name == Self.mainAgentID else {
+            return .failed("Cowork session bootstrap only accepts @\(Self.mainAgentID.rawValue).")
+        }
+        if let validationError = Self.agentNameValidationError(agent.name.rawValue) {
+            return .failed(validationError)
+        }
+
+        let assessment = assessWorkspaceAttach(agent.workspaceRoot)
+        guard assessment.canAskUser, let canonical = assessment.canonical else {
+            return .failed(assessment.reason)
+        }
+        var proposedAgent = agent
+        proposedAgent.workspaceRoot = canonical
+        let proposedLeases = prepareDefaultLeases(for: proposedAgent)
+
+        await acquireAdmissionLock()
+        defer { releaseAdmissionLock() }
+
+        if registry.agent(Self.mainAgentID) != nil {
+            return .alreadyAttached(Self.mainAgentID)
+        }
+        guard registry.isEmpty else {
+            return .failed("Initial @main bootstrap requires an empty agent roster.")
+        }
+        guard await log.replay().isEmpty else {
+            return .failed("Initial @main bootstrap is only available for an empty Cowork session.")
+        }
+
+        let agentMetadata = CoworkEventMetadata(
+            agentID: proposedAgent.name,
+            workspaceID: proposedLeases.workspace.workspaceID,
+            workspaceLeaseID: proposedLeases.workspace.id,
+            capabilityLeaseID: proposedLeases.capability.id,
+            scope: .agent)
+        let workspaceMetadata = CoworkEventMetadata(
+            agentID: proposedAgent.name,
+            workspaceID: proposedLeases.workspace.workspaceID,
+            workspaceLeaseID: proposedLeases.workspace.id,
+            scope: .workspace)
+        let capabilityMetadata = CoworkEventMetadata(
+            agentID: proposedAgent.name,
+            capabilityLeaseID: proposedLeases.capability.id,
+            scope: .capability)
+
+        do {
+            try await appendAdmissionEvents([
+                .workspaceLeaseGranted(WorkspaceLeaseGrantedPayload(
+                    agent: proposedAgent.name,
+                    lease: proposedLeases.workspace,
+                    metadata: workspaceMetadata)),
+                .capabilityLeaseCreated(CapabilityLeaseCreatedPayload(
+                    agent: proposedAgent.name,
+                    lease: proposedLeases.capability,
+                    metadata: capabilityMetadata)),
+                .agentAttached(AgentAttachedPayload(
+                    agent: proposedAgent.name,
+                    path: proposedAgent.workspaceRoot.path,
+                    model: proposedAgent.model,
+                    profile: proposedAgent.profile.rawValue,
+                    metadata: agentMetadata)),
+            ])
+        } catch {
+            return .failed("Initial @main admission could not be persisted: \(error.localizedDescription)")
+        }
+
+        registry.add(proposedAgent)
+        commitDefaultLeases(proposedLeases, for: proposedAgent.name)
+        return .attached(proposedAgent.name)
     }
 
     @discardableResult
@@ -1622,8 +1727,21 @@ public actor Orchestrator {
     }
 
     public func cancelAll(reason: String = "cowork session stopped") async {
+        await cancelAll(reason: reason, shutdownPermissionReviewer: true)
+    }
+
+    /// Cancels queued and running data-plane work while keeping the reserved
+    /// automatic permission reviewer available for the next user request.
+    public func cancelActiveTasks(reason: String = "cowork task cancelled") async {
+        await cancelAll(reason: reason, shutdownPermissionReviewer: false)
+    }
+
+    private func cancelAll(reason: String,
+                           shutdownPermissionReviewer: Bool) async {
         let schedulerSuspension = suspendScheduler()
-        await automaticPermissionResponder?.shutdown(reason: reason)
+        if shutdownPermissionReviewer {
+            await automaticPermissionResponder?.shutdown(reason: reason)
+        }
         let queuedIDs = scheduler.queuedTasks().map { $0.contract.id }
         let runningIDs = Array(runningExecutions.keys)
         for taskID in queuedIDs {
@@ -2038,24 +2156,112 @@ public actor Orchestrator {
     }
 
     func delegateTask(from: AgentID,
-                      to toName: String,
+                      to requestedTarget: String?,
                       objective: String,
                       roleHint: String? = nil,
                       expectedDeliverable: String? = nil,
                       parentTaskID: TaskID? = nil) async -> String {
+        guard let resolution = await resolveDelegationTarget(
+            requestedBy: from,
+            currentTaskID: parentTaskID,
+            requestedTarget: requestedTarget) else {
+            return "error: no delegation worker is available and Intatis could not create one"
+        }
+        let target = resolution.agent
         let queued = await enqueueDelegatedTask(
             from: from,
-            to: toName,
+            to: target.rawValue,
             objective: objective,
             roleHint: roleHint,
             expectedDeliverable: expectedDeliverable,
             parentTaskID: parentTaskID,
             replyMode: .taskReport)
-        guard let taskID = queued.taskID else { return queued.message }
+        guard let taskID = queued.taskID else {
+            if resolution.createdForDelegation {
+                _ = await detach(
+                    target,
+                    reason: "automatic delegate admission failed; worker rolled back")
+            }
+            return queued.message
+        }
         scheduledReplyTargets[taskID] = from
         scheduledReplyFormats[taskID] = .taskReport
         ensureSchedulerRunning()
-        return await awaitSchedulerResult(taskID) ?? queued.message
+        let report = await awaitSchedulerResult(taskID) ?? queued.message
+        return "task_id=\(taskID.rawValue) agent_id=@\(target.rawValue)\n\(report)"
+    }
+
+    private func resolveDelegationTarget(requestedBy: AgentID,
+                                         currentTaskID: TaskID?,
+                                         requestedTarget: String?) async -> (agent: AgentID, createdForDelegation: Bool)? {
+        guard let requester = registry.agent(requestedBy) else { return nil }
+        let normalized = requestedTarget.map(Self.normalizedAgentName)
+            .flatMap { $0.isEmpty || $0.lowercased() == "auto" ? nil : $0 }
+        if let normalized {
+            let requestedID = AgentID(rawValue: normalized)
+            guard requestedID != Self.mainAgentID,
+                  requestedID != Self.automaticPermissionReviewerID else { return nil }
+            if registry.agent(requestedID) != nil {
+                return (requestedID, false)
+            }
+            let spawned = await spawnFromTool(
+                requestedBy: requestedBy,
+                currentTaskID: currentTaskID,
+                name: normalized,
+                path: requester.workspaceRoot.path,
+                model: requester.model.rawValue,
+                canCoordinate: false)
+            return spawned.hasPrefix("spawned @") && registry.agent(requestedID) != nil
+                ? (requestedID, true)
+                : nil
+        }
+
+        if let idle = registry.all()
+            .filter({ candidate in
+                candidate.name != requestedBy
+                    && candidate.name != Self.mainAgentID
+                    && candidate.name != Self.automaticPermissionReviewerID
+                    && candidate.workspaceRoot.standardizedFileURL.path
+                        == requester.workspaceRoot.standardizedFileURL.path
+                    && isAgentAvailableForDelegation(candidate.name)
+            })
+            .sorted(by: { $0.name.rawValue < $1.name.rawValue })
+            .first {
+            return (idle.name, false)
+        }
+
+        let generatedName = nextAutomaticWorkerName()
+        let spawned = await spawnFromTool(
+            requestedBy: requestedBy,
+            currentTaskID: currentTaskID,
+            name: generatedName,
+            path: requester.workspaceRoot.path,
+            model: requester.model.rawValue,
+            canCoordinate: false)
+        let generatedID = AgentID(rawValue: generatedName)
+        return spawned.hasPrefix("spawned @") && registry.agent(generatedID) != nil
+            ? (generatedID, true)
+            : nil
+    }
+
+    private func isAgentAvailableForDelegation(_ agentID: AgentID) -> Bool {
+        let mailbox = scheduler.mailbox(for: agentID)
+        guard mailbox.pendingTasks.isEmpty, mailbox.pendingMessages.isEmpty else { return false }
+        guard !scheduler.queuedTasks().contains(where: {
+            $0.assignee == agentID || $0.issuer == agentID
+        }) else { return false }
+        return !taskGraph.nodes.values.contains { node in
+            Self.isActiveTaskStatus(node.status)
+                && (node.assignee == agentID || node.issuer == agentID)
+        }
+    }
+
+    private func nextAutomaticWorkerName() -> String {
+        for index in 1...taskGraph.policy.maxActiveAgentsPerThread {
+            let candidate = "worker-\(index)"
+            if registry.agent(AgentID(rawValue: candidate)) == nil { return candidate }
+        }
+        return "worker-\(IDGen.random(prefix: "auto").suffix(8))"
     }
 
     func enqueueDelegatedTask(from: AgentID,
@@ -2167,21 +2373,22 @@ public actor Orchestrator {
             return (nil, "error: scheduler rejected delegated task")
         }
         do {
-            try await appendAdmissionEvent(.delegationApproved(DelegationApprovedPayload(
+            try await appendAdmissionEvents([
+                .delegationApproved(DelegationApprovedPayload(
                 contract: contract,
-                metadata: metadata)))
-            try await appendAdmissionEvent(.capabilityLeaseCreated(CapabilityLeaseCreatedPayload(
+                metadata: metadata)),
+                .capabilityLeaseCreated(CapabilityLeaseCreatedPayload(
                 agent: currentTarget.name,
                 lease: prepared.capabilityLease,
-                metadata: metadata)))
-            try await appendAdmissionEvent(.workspaceLeaseGranted(WorkspaceLeaseGrantedPayload(
+                metadata: metadata)),
+                .workspaceLeaseGranted(WorkspaceLeaseGrantedPayload(
                 agent: currentTarget.name,
                 lease: prepared.workspaceLease,
-                metadata: metadata)))
-            try await appendAdmissionEvent(.taskCreated(TaskCreatedPayload(contract: contract, metadata: metadata)))
-            try await appendAdmissionEvent(.taskAssigned(TaskAssignedPayload(contract: contract, metadata: metadata)))
-            try await appendAdmissionEvent(.taskDelegated(TaskDelegatedPayload(contract: contract, metadata: metadata)))
-            try await appendAdmissionEvent(.taskQueued(TaskQueuedPayload(
+                metadata: metadata)),
+                .taskCreated(TaskCreatedPayload(contract: contract, metadata: metadata)),
+                .taskAssigned(TaskAssignedPayload(contract: contract, metadata: metadata)),
+                .taskDelegated(TaskDelegatedPayload(contract: contract, metadata: metadata)),
+                .taskQueued(TaskQueuedPayload(
                 contract: contract,
                 rootTaskID: scheduled.rootTaskID,
                 parentTaskID: scheduled.parentTaskID,
@@ -2192,7 +2399,8 @@ public actor Orchestrator {
                 visitedAgents: scheduled.visitedAgents,
                 attempt: 1,
                 reason: "delegation admitted",
-                metadata: metadata)))
+                metadata: metadata)),
+            ])
         } catch {
             await persistUncommittedAdmissionCancellation(
                 task: scheduled,
@@ -2223,6 +2431,7 @@ public actor Orchestrator {
                        name: String,
                        path: String,
                        model: String,
+                       requestedAccess: WorkspaceAccess = .readOnly,
                        canCoordinate: Bool = false) async -> String {
         if let validationError = Self.agentNameValidationError(name) {
             return "error: \(validationError)"
@@ -2241,6 +2450,10 @@ public actor Orchestrator {
               lease.tools.contains(.attachWorkspace) else {
             return "error: spawning agents is not granted for the current task"
         }
+        if requestedAccess == .readWrite,
+           existingWorkspaceLease(for: requestedBy, taskID: currentTaskID)?.access != .readWrite {
+            return "error: a read-only workspace lease cannot grant read-write access to a child agent"
+        }
         if canCoordinate, budget.maxDepth < 1 {
             return "error: coordinator spawning exceeds the delegation depth budget"
         }
@@ -2249,36 +2462,126 @@ public actor Orchestrator {
             return "error: active agent limit reached (\(taskGraph.policy.maxActiveAgentsPerThread))"
         }
         if registry.agent(id) != nil { return "error: an agent named @\(name) already exists" }
-        try? await log.append(.agentSpawnRequested(AgentSpawnRequestedPayload(
-            requestedBy: requestedBy,
-            agent: id,
-            path: url.path,
-            model: ModelID(rawValue: model),
-            metadata: CoworkEventMetadata(
-                sender: requestedBy,
-                agentID: id,
-                scope: .agent))))
-        let coordinationDepth = canCoordinate ? Agent.defaultCoordinationDepth : 0
-        let attached = await attach(Agent(name: id, workspaceRoot: url,
-                                          model: ModelID(rawValue: model), profile: .reviewed,
-                                          coordinationDepth: coordinationDepth),
-                                    admissionIssuer: requestedBy,
-                                    causalParentTaskID: currentTaskID)
-        if attached {
-            spawnedAgentOwners[id] = requestedBy
-            try? await log.append(.agentSpawned(AgentSpawnedPayload(
-                requestedBy: requestedBy,
-                agent: id,
-                path: url.path,
-                model: ModelID(rawValue: model),
-                metadata: CoworkEventMetadata(
-                    sender: requestedBy,
-                    agentID: id,
-                    scope: .agent))))
+        let assessment = assessWorkspaceAttach(url)
+        guard assessment.canAskUser, let canonical = assessment.canonical else {
+            return "error: \(assessment.reason)"
         }
-        return attached
-            ? "spawned @\(name) · model \(model) · \(canCoordinate ? "coordinator" : "worker") · \(url.path)"
-            : "permission denied: workspace attach for @\(name)"
+        let coordinationDepth = canCoordinate ? Agent.defaultCoordinationDepth : 0
+        let proposedAgent = Agent(
+            name: id,
+            workspaceRoot: canonical,
+            model: ModelID(rawValue: model),
+            profile: .reviewed,
+            coordinationDepth: coordinationDepth)
+        let proposedLeases = prepareDefaultLeases(
+            for: proposedAgent,
+            workspaceAccess: requestedAccess,
+            grantWorkerWriteCapabilities: requestedAccess == .readWrite)
+        let rootTaskID = currentTaskID.flatMap { taskGraph.node($0)?.rootTaskID } ?? currentTaskID
+        let baseMetadata = CoworkEventMetadata(
+            taskID: currentTaskID,
+            rootTaskID: rootTaskID,
+            parentTaskID: currentTaskID,
+            sender: requestedBy,
+            recipient: id,
+            agentID: id,
+            issuer: requestedBy,
+            assignee: id,
+            workspaceID: proposedLeases.workspace.workspaceID,
+            workspaceLeaseID: proposedLeases.workspace.id,
+            capabilityLeaseID: proposedLeases.capability.id,
+            causalParentID: currentTaskID,
+            scope: .agent,
+            visibility: .global)
+        let workspaceMetadata = CoworkEventMetadata(
+            taskID: currentTaskID,
+            rootTaskID: rootTaskID,
+            parentTaskID: currentTaskID,
+            sender: requestedBy,
+            recipient: id,
+            agentID: id,
+            issuer: requestedBy,
+            assignee: id,
+            workspaceID: proposedLeases.workspace.workspaceID,
+            workspaceLeaseID: proposedLeases.workspace.id,
+            causalParentID: currentTaskID,
+            scope: .workspace,
+            visibility: .global)
+        let capabilityMetadata = CoworkEventMetadata(
+            taskID: currentTaskID,
+            rootTaskID: rootTaskID,
+            parentTaskID: currentTaskID,
+            sender: requestedBy,
+            recipient: id,
+            agentID: id,
+            issuer: requestedBy,
+            assignee: id,
+            capabilityLeaseID: proposedLeases.capability.id,
+            causalParentID: currentTaskID,
+            scope: .capability,
+            visibility: .global)
+
+        // `spawn_agent` has already passed AgentLoop schema/lease/permission and
+        // has a durable tool execution ticket. The executor therefore performs
+        // one atomic admission; it must not recursively call ordinary `attach`
+        // and trigger a second PermissionEngine review for the same ToolCall.
+        await acquireAdmissionLock()
+        defer { releaseAdmissionLock() }
+        guard registry.agent(id) == nil else {
+            return "error: an agent named @\(name) already exists"
+        }
+        guard let rootIdentity = proposedLeases.workspace.rootIdentity,
+              rootIdentity.matchesCurrentDirectory(rootPath: proposedLeases.workspace.rootPath) else {
+            return "error: workspace root identity changed before spawn admission"
+        }
+        do {
+            try await appendAdmissionEvents([
+                .agentSpawnRequested(AgentSpawnRequestedPayload(
+                    requestedBy: requestedBy,
+                    agent: id,
+                    path: canonical.path,
+                    model: proposedAgent.model,
+                    metadata: baseMetadata)),
+                .agentAttachRequested(AgentAttachRequestedPayload(
+                    agent: id,
+                    path: canonical.path,
+                    model: proposedAgent.model,
+                    profile: proposedAgent.profile.rawValue,
+                    metadata: baseMetadata)),
+                .workspaceLeaseRequested(WorkspaceLeaseRequestedPayload(
+                    agent: id,
+                    rootPath: canonical.path,
+                    access: proposedLeases.workspace.access,
+                    reason: "spawn_agent ToolCall already approved",
+                    metadata: workspaceMetadata)),
+                .workspaceLeaseGranted(WorkspaceLeaseGrantedPayload(
+                    agent: id,
+                    lease: proposedLeases.workspace,
+                    metadata: workspaceMetadata)),
+                .capabilityLeaseCreated(CapabilityLeaseCreatedPayload(
+                    agent: id,
+                    lease: proposedLeases.capability,
+                    metadata: capabilityMetadata)),
+                .agentAttached(AgentAttachedPayload(
+                    agent: id,
+                    path: canonical.path,
+                    model: proposedAgent.model,
+                    profile: proposedAgent.profile.rawValue,
+                    metadata: baseMetadata)),
+                .agentSpawned(AgentSpawnedPayload(
+                    requestedBy: requestedBy,
+                    agent: id,
+                    path: canonical.path,
+                    model: proposedAgent.model,
+                    metadata: baseMetadata)),
+            ])
+        } catch {
+            return "error: spawn admission could not be persisted: \(error.localizedDescription)"
+        }
+        registry.add(proposedAgent)
+        commitDefaultLeases(proposedLeases, for: id)
+        spawnedAgentOwners[id] = requestedBy
+        return "spawned @\(name) · model \(model) · \(canCoordinate ? "coordinator" : "worker") · \(requestedAccess.rawValue) · \(canonical.path)"
     }
 
     /// One line per active agent, for the coordinator to read.
@@ -2391,23 +2694,25 @@ public actor Orchestrator {
             events: await log.replay(),
             allowedToolNames: allowedToolNames,
             workspaceRoot: agent.workspaceRoot)
-        let loop = AgentLoop(
-            log: log,
-            provider: provider,
+        let runtime = AgentRuntime.cowork(
             registry: toolRegistry,
             engine: engine,
+            allowsShell: allowsShell,
+            reasoningEffort: reasoningEffort,
+            includeUsage: includeUsage || executionPolicy.tokenBudget != nil,
+            maxIterations: maxSteps)
+        let loop = runtime.makeLoop(
+            log: log,
+            provider: provider,
             responder: activePermissionResponder(),
             agent: agent,
             context: ContextBuilder(systemPrompt: systemPrompt,
                                     taskContract: taskContract,
-                                    contextBundle: contextBundle),
-            allowsShell: allowsShell,
+                                    contextBundle: contextBundle,
+                                    runtimeEnvironment: .cowork),
             messenger: messenger,
             agentManager: manager,
             imageGenerator: imageGenerator,
-            reasoningEffort: reasoningEffort,
-            includeUsage: includeUsage || executionPolicy.tokenBudget != nil,
-            maxIterations: maxSteps,
             capabilityLease: capabilityLease,
             workspaceLease: workspaceLease,
             rootTaskID: rootTaskID,
@@ -2584,19 +2889,17 @@ public actor Orchestrator {
         let relatedAgents = agentVisibleNames(excluding: assignee.name)
         let taskID = TaskID.new()
         let defaultLease = defaultCapabilityLeaseIDs[assignee.name].flatMap { capabilityLeases[$0] }
-        let capabilityLease: CapabilityLease
-        if let defaultLease, Self.canCoordinate(defaultLease) {
-            let budget: DelegationBudget
-            if case .granted(let granted) = defaultLease.delegation {
-                budget = granted
-            } else {
-                budget = DelegationBudget(maxTasks: 8, maxDepth: 1)
-            }
-            capabilityLease = .coordinator(taskID: taskID, budget: budget)
-        } else {
-            capabilityLease = .worker(taskID: taskID)
-        }
-        let workspaceAccess: WorkspaceAccess = Self.canCoordinate(capabilityLease) ? .readWrite : .readOnly
+        let defaultWorkspaceAccess = defaultWorkspaceLeaseIDs[assignee.name]
+            .flatMap { workspaceLeases[$0]?.access } ?? .readOnly
+        let workspaceAccess: WorkspaceAccess = defaultWorkspaceAccess == .readWrite
+            && defaultLease.map(Self.hasWorkspaceMutationCapability) == true
+            ? .readWrite
+            : .readOnly
+        var capabilityLease = defaultLease
+            ?? CapabilityLease.worker(taskID: taskID, workspaceAccess: workspaceAccess)
+        capabilityLease.id = CapabilityLeaseID.new()
+        capabilityLease.taskID = taskID
+        capabilityLease.expiresAtTaskCompletion = true
         let workspaceLease = workspaceLeaseForTask(
             agent: assignee,
             taskID: taskID,
@@ -2634,11 +2937,15 @@ public actor Orchestrator {
         return leases
     }
 
-    private func prepareDefaultLeases(for agent: Agent) -> (capability: CapabilityLease, workspace: WorkspaceLease) {
-        let workspaceLease = WorkspaceLease(rootPath: agent.workspaceRoot.path, access: .readWrite)
+    private func prepareDefaultLeases(
+        for agent: Agent,
+        workspaceAccess: WorkspaceAccess = .readWrite,
+        grantWorkerWriteCapabilities: Bool = false
+    ) -> (capability: CapabilityLease, workspace: WorkspaceLease) {
+        let workspaceLease = WorkspaceLease(rootPath: agent.workspaceRoot.path, access: workspaceAccess)
         var capabilityLease: CapabilityLease = agent.coordinationDepth > 0
-            ? .coordinator()
-            : .worker()
+            ? .coordinator(workspaceAccess: workspaceAccess)
+            : .worker(workspaceAccess: grantWorkerWriteCapabilities ? workspaceAccess : .readOnly)
         capabilityLease.expiresAtTaskCompletion = false
         return (capabilityLease, workspaceLease)
     }
@@ -2776,6 +3083,22 @@ public actor Orchestrator {
         }
         if let leaseID = defaultCapabilityLeaseIDs[agentID] {
             return capabilityLeases[leaseID]
+        }
+        return nil
+    }
+
+    private func existingWorkspaceLease(for agentID: AgentID,
+                                        taskID: TaskID?) -> WorkspaceLease? {
+        if let taskID {
+            guard let node = taskGraph.node(taskID), node.assignee == agentID else { return nil }
+            let contract = node.contract
+            guard let leaseID = contract.workspaceLeaseID,
+                  let lease = workspaceLeases[leaseID],
+                  lease.taskID == nil || lease.taskID == taskID else { return nil }
+            return lease
+        }
+        if let leaseID = defaultWorkspaceLeaseIDs[agentID] {
+            return workspaceLeases[leaseID]
         }
         return nil
     }
@@ -3893,6 +4216,17 @@ public actor Orchestrator {
             || lease.tools.contains(.attachWorkspace)
     }
 
+    private static func hasWorkspaceMutationCapability(_ lease: CapabilityLease) -> Bool {
+        !lease.tools.isDisjoint(with: [
+            .applyPatch,
+            .editPDF,
+            .reconstructDocument,
+            .compileLaTeX,
+            .generateMedia,
+            .gitControl,
+        ])
+    }
+
     private static let defaultWorkerConstraints: [String] = [
         "Complete only the assigned task.",
         "Do not re-run the global task decomposition.",
@@ -4027,7 +4361,7 @@ struct BusMessenger: AgentMessenger {
         await orchestrator.requestDelegation(from: from, objective: objective, reason: reason, parentTaskID: currentTaskID)
     }
 
-    func delegateTask(to agent: String,
+    func delegateTask(to agent: String?,
                       objective: String,
                       roleHint: String?,
                       expectedDeliverable: String?) async -> String {
@@ -4050,13 +4384,18 @@ struct OrchestratorManager: AgentManager {
     let currentTaskID: TaskID?
     let defaultModel: String
 
-    func spawnAgent(name: String, path: String, model: String?, canCoordinate: Bool) async -> String {
+    func spawnAgent(name: String,
+                    path: String,
+                    model: String?,
+                    requestedAccess: WorkspaceAccess,
+                    canCoordinate: Bool) async -> String {
         await orchestrator.spawnFromTool(
             requestedBy: requester,
             currentTaskID: currentTaskID,
             name: name,
             path: path,
             model: model ?? defaultModel,
+            requestedAccess: requestedAccess,
             canCoordinate: canCoordinate)
     }
     func listAgents() async -> String { await orchestrator.listForTool() }

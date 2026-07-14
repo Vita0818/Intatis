@@ -15,10 +15,17 @@ private let B = AgentID(rawValue: "Kikaria")
 private final class ScriptedProvider: ToolCallingProvider, @unchecked Sendable {
     private var responses: [[AgentChunk]]
     private var index = 0
+    private var capturedRequests: [AgentRequest] = []
     private let lock = NSLock()
     init(_ responses: [[AgentChunk]]) { self.responses = responses }
+    var requests: [AgentRequest] {
+        lock.lock()
+        defer { lock.unlock() }
+        return capturedRequests
+    }
     func stream(_ request: AgentRequest) -> AsyncThrowingStream<AgentChunk, Error> {
         lock.lock()
+        capturedRequests.append(request)
         let chunks = responses.isEmpty ? [.done(finishReason: "stop")] : responses[min(index, responses.count - 1)]
         index += 1
         lock.unlock()
@@ -422,10 +429,10 @@ final class IntatisCoworkTests: XCTestCase {
         let main = AgentID(rawValue: "main")
         let worker = AgentID(rawValue: "worker")
         let wsMain = try tempWorkspace()
-        let wsWorker = try tempWorkspace()
+        let wsWorker = wsMain.appendingPathComponent("worker", isDirectory: true)
+        try FileManager.default.createDirectory(at: wsWorker, withIntermediateDirectories: true)
         defer {
             try? FileManager.default.removeItem(at: wsMain)
-            try? FileManager.default.removeItem(at: wsWorker)
         }
         let mainProvider = ScriptedProvider([
             [.toolCalls([ToolCall(id: "spawn", name: "spawn_agent",
@@ -460,6 +467,10 @@ final class IntatisCoworkTests: XCTestCase {
         XCTAssertFalse(toolNames.contains("remove_agent"))
 
         let systemPrompt = try XCTUnwrap(request.messages.first?.content)
+        XCTAssertTrue(systemPrompt.contains("running inside Intatis"))
+        XCTAssertTrue(systemPrompt.contains("in Cowork mode"))
+        XCTAssertTrue(systemPrompt.contains("authoritative API tools list"))
+        XCTAssertTrue(systemPrompt.contains("only after receiving its ToolResult"))
         XCTAssertTrue(systemPrompt.contains("You are executing the assigned task as a worker agent."))
         XCTAssertTrue(systemPrompt.contains("Do not create, remove, or coordinate other agents."))
         XCTAssertTrue(systemPrompt.contains("Only reply to task-related messages when reply_message is available."))
@@ -477,10 +488,10 @@ final class IntatisCoworkTests: XCTestCase {
         let main = AgentID(rawValue: "main")
         let lead = AgentID(rawValue: "feature-lead")
         let wsMain = try tempWorkspace()
-        let wsLead = try tempWorkspace()
+        let wsLead = wsMain.appendingPathComponent("feature", isDirectory: true)
+        try FileManager.default.createDirectory(at: wsLead, withIntermediateDirectories: true)
         defer {
             try? FileManager.default.removeItem(at: wsMain)
-            try? FileManager.default.removeItem(at: wsLead)
         }
         let mainProvider = ScriptedProvider([
             [.toolCalls([ToolCall(id: "spawn", name: "spawn_agent",
@@ -507,6 +518,21 @@ final class IntatisCoworkTests: XCTestCase {
         XCTAssertTrue(attached)
         await orch.send("create a sub coordinator for this feature", to: main)
 
+        let mainRequest = try XCTUnwrap(mainProvider.requests.first)
+        let mainToolNames = Set(mainRequest.tools.map(\.name))
+        XCTAssertTrue(mainToolNames.contains("spawn_agent"))
+        XCTAssertTrue(mainToolNames.contains("delegate_task"))
+        let spawnDescriptor = try XCTUnwrap(mainRequest.tools.first { $0.name == "spawn_agent" })
+        let spawnSchema = String(
+            decoding: try JSONEncoder().encode(spawnDescriptor.parameters),
+            as: UTF8.self)
+        XCTAssertTrue(spawnSchema.contains(#""additionalProperties":false"#))
+        let mainSystemPrompt = try XCTUnwrap(mainRequest.messages.first?.content)
+        XCTAssertTrue(mainSystemPrompt.contains("running inside Intatis"))
+        XCTAssertTrue(mainSystemPrompt.contains("in Cowork mode"))
+        XCTAssertTrue(mainSystemPrompt.contains("authoritative API tools list"))
+        XCTAssertTrue(mainSystemPrompt.contains("only after receiving its ToolResult"))
+
         let spawned = await orch.agentList().first { $0.name == lead }
         XCTAssertNotNil(spawned)
         XCTAssertEqual(spawned?.coordinationDepth, Agent.defaultCoordinationDepth)
@@ -520,6 +546,10 @@ final class IntatisCoworkTests: XCTestCase {
         XCTAssertTrue(toolNames.contains("remove_agent"))
 
         let systemPrompt = try XCTUnwrap(request.messages.first?.content)
+        XCTAssertTrue(systemPrompt.contains("running inside Intatis"))
+        XCTAssertTrue(systemPrompt.contains("in Cowork mode"))
+        XCTAssertTrue(systemPrompt.contains("authoritative API tools list"))
+        XCTAssertTrue(systemPrompt.contains("only after receiving its ToolResult"))
         XCTAssertTrue(systemPrompt.contains("You may also act as a COORDINATOR"))
         XCTAssertTrue(systemPrompt.contains("Agents you create are"))
     }
@@ -549,6 +579,23 @@ final class IntatisCoworkTests: XCTestCase {
 
     func testSpawnAgentDescriptorIsNotReadOnly() {
         XCTAssertEqual(SpawnAgentTool.descriptor.sideEffect, .write)
+    }
+
+    func testSpawnAgentIntentIsControlPlaneAndDefaultsToReadOnly() throws {
+        let root = URL(fileURLWithPath: "/workspace")
+        let args = ToolArgs(raw: #"{"name":"counter","path":"/workspace","model":"m","canCoordinate":false}"#)
+        let tool = SpawnAgentTool()
+        let intent = tool.permissionIntent(args, workspaceRoot: root)
+
+        XCTAssertEqual(intent.action, "agent.spawn")
+        XCTAssertEqual(intent.dataEffects, [.none])
+        XCTAssertEqual(intent.controlEffects, [.createAgent, .grantCapability])
+        XCTAssertEqual(intent.metadata["requestedAccess"], .string(WorkspaceAccess.readOnly.rawValue))
+        XCTAssertTrue(tool.touchedPaths(args).isEmpty)
+        XCTAssertFalse(intent.resources.contains { $0.kind == .workspacePath })
+        XCTAssertTrue(intent.resources.contains {
+            $0.kind == .workspace && $0.access == .readOnly
+        })
     }
 
     func testCountScenarioCreatesSeparateWorkerContracts() async throws {

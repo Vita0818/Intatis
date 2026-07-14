@@ -297,6 +297,60 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
     private let main = AgentID(rawValue: "main")
     private let reviewerID = Orchestrator.automaticPermissionReviewerID
 
+    func testDefaultReviewerCompletionAllowanceLeavesRoomForStructuredVerdict() {
+        XCTAssertEqual(
+            PermissionReviewControlPlanePolicy().reservedCompletionTokens,
+            1_024)
+    }
+
+    func testTruncatedReviewerVerdictIsDiagnosedAndDenied() async throws {
+        let (log, workspace) = try makeLogAndWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let provider = ReviewControlPlaneProvider(chunks: [
+            .textDelta(#"{"decision":"allow","reason":"unfinished"#),
+            .usage(Usage(promptTokens: 100, completionTokens: 64, totalTokens: 164)),
+            // Some OpenAI-compatible providers report `stop` even when usage
+            // reaches the exact requested ceiling, so usage must also diagnose
+            // the truncation seen in production logs.
+            .done(finishReason: "stop"),
+        ])
+        let responder = makeResponder(log: log, workspace: workspace, provider: provider)
+
+        let decision = await responder.requestApproval(
+            permissionRequest(id: "req_truncated_verdict"))
+
+        XCTAssertEqual(decision, .deny)
+        let settled = await log.replay().compactMap { envelope -> PermissionReviewSettledPayload? in
+            if case .permissionReviewSettled(let payload) = envelope.event { return payload }
+            return nil
+        }
+        XCTAssertEqual(settled.last?.status, .failed)
+        XCTAssertTrue(settled.last?.reason.contains("completion-token limit") == true)
+        XCTAssertFalse(settled.last?.reason.contains("tool call") == true)
+    }
+
+    func testReviewerToolCallHasDistinctFailClosedDiagnosis() async throws {
+        let (log, workspace) = try makeLogAndWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let provider = ReviewControlPlaneProvider(chunks: [
+            .toolCalls([ToolCall(id: "forbidden", name: "write_file", arguments: "{}")]),
+            .done(finishReason: "tool_calls"),
+        ])
+        let responder = makeResponder(log: log, workspace: workspace, provider: provider)
+
+        let decision = await responder.requestApproval(
+            permissionRequest(id: "req_reviewer_tool_call"))
+
+        XCTAssertEqual(decision, .deny)
+        let settled = await log.replay().compactMap { envelope -> PermissionReviewSettledPayload? in
+            if case .permissionReviewSettled(let payload) = envelope.event { return payload }
+            return nil
+        }
+        XCTAssertEqual(settled.last?.status, .failed)
+        XCTAssertTrue(settled.last?.reason.contains("attempted a tool call") == true)
+        XCTAssertFalse(settled.last?.reason.contains("invalid or") == true)
+    }
+
     func testReviewerControlPlaneDoesNotConsumeOnlyDataPlaneSchedulerSlot() async throws {
         let (log, workspace) = try makeLogAndWorkspace()
         defer { try? FileManager.default.removeItem(at: workspace) }
@@ -478,6 +532,12 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
         XCTAssertEqual(decisions, [.allow, .allow])
         XCTAssertEqual(provider.callCount, 2)
         XCTAssertEqual(provider.maximumConcurrentCalls, 1)
+        let reviewerRequest = try XCTUnwrap(provider.requests.first)
+        XCTAssertTrue(reviewerRequest.tools.isEmpty)
+        let reviewerSystemPrompt = try XCTUnwrap(reviewerRequest.messages.first?.content)
+        XCTAssertTrue(reviewerSystemPrompt.contains("automatic permission reviewer"))
+        XCTAssertTrue(reviewerSystemPrompt.contains("allow|deny"))
+        XCTAssertFalse(reviewerSystemPrompt.contains("ask_user"))
         let lifecycle = await log.replay().compactMap { envelope -> String? in
             switch envelope.event {
             case .permissionReviewRequested(let payload):
@@ -494,7 +554,7 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
         ])
     }
 
-    func testAskUserFallbackRemainsFIFOAcrossTheWholeReviewLifecycle() async throws {
+    func testAskUserIsDeniedWithoutHumanFallbackAndReviewRemainsFIFO() async throws {
         let (log, workspace) = try makeLogAndWorkspace()
         defer { try? FileManager.default.removeItem(at: workspace) }
         let provider = ReviewControlPlaneProvider(chunks: [
@@ -516,64 +576,54 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
         let fallbackOrder = await probe.order
 
         XCTAssertEqual(decisions, [.deny, .deny])
-        XCTAssertEqual(maximumFallbackConcurrency, 1)
-        XCTAssertEqual(fallbackOrder, [
-            "start:req_fallback_fifo_1", "end:req_fallback_fifo_1",
-            "start:req_fallback_fifo_2", "end:req_fallback_fifo_2",
-        ])
+        XCTAssertEqual(maximumFallbackConcurrency, 0)
+        XCTAssertTrue(fallbackOrder.isEmpty)
         XCTAssertEqual(provider.maximumConcurrentCalls, 1)
     }
 
-    func testShutdownDoesNotWaitForUncooperativeFallbackAndLateAllowCannotWin() async throws {
+    func testAskUserCannotStartUncooperativeFallbackOrDelayShutdown() async throws {
         let (log, workspace) = try makeLogAndWorkspace()
         defer { try? FileManager.default.removeItem(at: workspace) }
         let provider = ReviewControlPlaneProvider(chunks: [
             .textDelta(#"{"decision":"ask_user","reason":"needs human review"}"#),
             .done(finishReason: "stop"),
         ])
-        let fallbackGate = ReviewUncooperativeFallbackGate()
+        let fallbackProbe = ReviewFallbackProbe()
         let responder = makeResponder(
             log: log,
             workspace: workspace,
             provider: provider,
-            fallback: ReviewUncooperativeFallbackResponder(gate: fallbackGate))
-        let requestTask = Task {
-            await responder.requestApproval(permissionRequest(id: "req_uncooperative_fallback"))
-        }
-        await fallbackGate.waitUntilStarted()
+            fallback: ReviewFallbackResponder(.allow, probe: fallbackProbe))
+        let decision = await responder.requestApproval(
+            permissionRequest(id: "req_uncooperative_fallback"))
         let started = Date()
 
         await responder.shutdown(reason: "test shutdown")
-        let decision = await requestTask.value
-        await fallbackGate.releaseLate(.allow)
 
         XCTAssertEqual(decision, .deny)
         XCTAssertLessThan(Date().timeIntervalSince(started), 0.25)
+        let fallbackCount = await fallbackProbe.requests.count
+        XCTAssertEqual(fallbackCount, 0)
     }
 
-    func testQueueWaitUsesSubmissionDeadlineAndFallsBackAfterDurableTimeout() async throws {
+    func testQueueWaitUsesSubmissionDeadlineAndDurablyDeniesOnTimeout() async throws {
         let (log, workspace) = try makeLogAndWorkspace()
         defer { try? FileManager.default.removeItem(at: workspace) }
-        let provider = ReviewControlPlaneProvider(chunks: [
-            .textDelta(#"{"decision":"ask_user","reason":"needs human review"}"#),
-            .done(finishReason: "stop"),
-        ])
-        let fallbackGate = ReviewFirstFallbackGate()
+        let provider = ReviewControlPlaneProvider(delayNanoseconds: 80_000_000)
         let responder = makeResponder(
             log: log,
             workspace: workspace,
             provider: provider,
-            fallback: ReviewFirstBlockingFallbackResponder(gate: fallbackGate),
             policy: PermissionReviewControlPlanePolicy(
                 timeoutSeconds: 0.04,
                 tokenBudget: 50_000,
                 reservedCompletionTokens: 64,
                 maxRecentEvents: 12))
         async let first = responder.requestApproval(permissionRequest(id: "req_deadline_1"))
-        await fallbackGate.waitUntilFirstStarted()
+        for _ in 0..<100 where provider.callCount == 0 {
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
         async let second = responder.requestApproval(permissionRequest(id: "req_deadline_2"))
-        try await Task.sleep(nanoseconds: 70_000_000)
-        await fallbackGate.releaseFirst()
         let decisions = await [first, second]
 
         XCTAssertEqual(decisions, [.deny, .deny])
@@ -583,22 +633,18 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
             return nil
         }
         XCTAssertEqual(settled.map(\.requestID.rawValue), ["req_deadline_1", "req_deadline_2"])
-        XCTAssertEqual(settled.map(\.status), [.awaitingUser, .timedOut])
+        XCTAssertEqual(settled.map(\.status), [.timedOut, .timedOut])
+        XCTAssertTrue(settled.allSatisfy { $0.decision == .deny })
     }
 
     func testPendingReviewCapacityFailsClosedWithoutGrowingTheQueue() async throws {
         let (log, workspace) = try makeLogAndWorkspace()
         defer { try? FileManager.default.removeItem(at: workspace) }
-        let provider = ReviewControlPlaneProvider(chunks: [
-            .textDelta(#"{"decision":"ask_user","reason":"needs human review"}"#),
-            .done(finishReason: "stop"),
-        ])
-        let fallbackGate = ReviewFirstFallbackGate()
+        let provider = ReviewControlPlaneProvider(delayNanoseconds: 80_000_000)
         let responder = makeResponder(
             log: log,
             workspace: workspace,
             provider: provider,
-            fallback: ReviewFirstBlockingFallbackResponder(gate: fallbackGate),
             policy: PermissionReviewControlPlanePolicy(
                 timeoutSeconds: 1,
                 tokenBudget: 50_000,
@@ -608,15 +654,16 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
         let first = Task {
             await responder.requestApproval(permissionRequest(id: "req_capacity_1"))
         }
-        await fallbackGate.waitUntilFirstStarted()
+        for _ in 0..<100 where provider.callCount == 0 {
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
         let started = Date()
 
         let overflow = await responder.requestApproval(permissionRequest(id: "req_capacity_overflow"))
-        await fallbackGate.releaseFirst()
         let firstDecision = await first.value
 
         XCTAssertEqual(overflow, .deny)
-        XCTAssertEqual(firstDecision, .deny)
+        XCTAssertEqual(firstDecision, .allow)
         XCTAssertLessThan(Date().timeIntervalSince(started), 0.25)
         XCTAssertEqual(provider.callCount, 1)
     }
@@ -661,7 +708,7 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
         XCTAssertFalse(events.contains { if case .permissionReview = $0.event { return true }; return false })
     }
 
-    func testTimeoutDoesNotWaitForUncooperativeProviderAndFallsBackAfterDurableVerdict() async throws {
+    func testTimeoutDoesNotWaitForUncooperativeProviderAndNeverFallsBack() async throws {
         let (log, workspace) = try makeLogAndWorkspace()
         defer { try? FileManager.default.removeItem(at: workspace) }
         let provider = ReviewControlPlaneProvider(
@@ -688,7 +735,7 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
         XCTAssertEqual(secondDecision, .deny)
         XCTAssertLessThan(Date().timeIntervalSince(start), 0.25)
         let fallbackRequestCount = await fallbackProbe.requests.count
-        XCTAssertEqual(fallbackRequestCount, 2)
+        XCTAssertEqual(fallbackRequestCount, 0)
         XCTAssertEqual(provider.callCount, 1)
         guard case .degraded(let reason) = await responder.health() else {
             return XCTFail("timed-out reviewer must remain visibly degraded")
@@ -699,7 +746,7 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
             return nil
         }
         XCTAssertEqual(settled.map(\.status), [.timedOut, .failed])
-        XCTAssertTrue(settled.allSatisfy { $0.decision == .askUser })
+        XCTAssertTrue(settled.allSatisfy { $0.decision == .deny })
     }
 
     func testCancellationSettlesDenyAndDoesNotWaitForProvider() async throws {
@@ -770,7 +817,7 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
         XCTAssertEqual(replacementDecision, .deny)
         XCTAssertEqual(replacementProvider.callCount, 0)
         let fallbackRequestCount = await fallbackProbe.requests.count
-        XCTAssertEqual(fallbackRequestCount, 1)
+        XCTAssertEqual(fallbackRequestCount, 0)
         guard case .degraded(let reason) = await replacement.health() else {
             return XCTFail("replacement control plane must inherit the session quarantine")
         }
@@ -808,7 +855,7 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
         XCTAssertEqual(settled.map(\.status), [.denied, .denied])
     }
 
-    func testReviewBudgetExhaustionIsDurableAndCannotAutoAllow() async throws {
+    func testReviewBudgetIsSoftAndCannotDisableAutomaticAllow() async throws {
         let (log, workspace) = try makeLogAndWorkspace()
         defer { try? FileManager.default.removeItem(at: workspace) }
         let provider = ReviewControlPlaneProvider()
@@ -826,20 +873,20 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
 
         let decision = await responder.requestApproval(permissionRequest(id: "req_budget"))
 
-        XCTAssertEqual(decision, .deny)
-        XCTAssertEqual(provider.callCount, 0)
+        XCTAssertEqual(decision, .allow)
+        XCTAssertEqual(provider.callCount, 1)
         guard case .degraded(let reason) = await responder.health() else {
-            return XCTFail("exhausted reviewer budget must remain visibly degraded")
+            return XCTFail("crossing the reviewer soft budget should remain observable")
         }
         XCTAssertTrue(reason.contains("budget"))
         let fallbackRequestCount = await fallbackProbe.requests.count
-        XCTAssertEqual(fallbackRequestCount, 1)
+        XCTAssertEqual(fallbackRequestCount, 0)
         let settled = await log.replay().compactMap { envelope -> PermissionReviewSettledPayload? in
             if case .permissionReviewSettled(let payload) = envelope.event { return payload }
             return nil
         }
-        XCTAssertEqual(settled.last?.status, .budgetExceeded)
-        XCTAssertEqual(settled.last?.decision, .askUser)
+        XCTAssertEqual(settled.last?.status, .allowed)
+        XCTAssertEqual(settled.last?.decision, .allow)
     }
 
     func testProviderFailureAfterUsageChargesBudgetAndDegradesHealth() async throws {
@@ -862,7 +909,7 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
 
         XCTAssertEqual(first, .deny)
         XCTAssertEqual(second, .deny)
-        XCTAssertEqual(provider.callCount, 1)
+        XCTAssertEqual(provider.callCount, 2)
         guard case .degraded(let reason) = await responder.health() else {
             return XCTFail("provider failure or its restored budget must be visible in health")
         }
@@ -874,8 +921,8 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
         XCTAssertEqual(settlements.first?.status, .failed)
         XCTAssertEqual(settlements.first?.usage?.totalTokens, 99_900)
         XCTAssertEqual(settlements.first?.cumulativeTokens, 99_900)
-        XCTAssertEqual(settlements.last?.status, .budgetExceeded)
-        XCTAssertEqual(settlements.last?.cumulativeTokens, 99_900)
+        XCTAssertEqual(settlements.last?.status, .failed)
+        XCTAssertEqual(settlements.last?.cumulativeTokens, 199_800)
     }
 
     func testOrphanedDurableReviewIsDeniedBeforeNewAutomaticReviewRuns() async throws {
@@ -922,7 +969,7 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
         ])
     }
 
-    func testReviewBudgetRestoresFromDurableSettlements() async throws {
+    func testReviewBudgetRestoresAsSoftUsageWithoutBlockingNextReview() async throws {
         let (log, workspace) = try makeLogAndWorkspace()
         defer { try? FileManager.default.removeItem(at: workspace) }
         let firstProvider = ReviewControlPlaneProvider(chunks: [
@@ -956,14 +1003,14 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
 
         let decision = await secondResponder.requestApproval(permissionRequest(id: "req_budget_restored"))
 
-        XCTAssertEqual(decision, .deny)
-        XCTAssertEqual(secondProvider.callCount, 0)
+        XCTAssertEqual(decision, .allow)
+        XCTAssertEqual(secondProvider.callCount, 1)
         let settlements = await log.replay().compactMap { envelope -> PermissionReviewSettledPayload? in
             if case .permissionReviewSettled(let payload) = envelope.event { return payload }
             return nil
         }
-        XCTAssertEqual(settlements.last?.status, .budgetExceeded)
-        XCTAssertEqual(settlements.last?.cumulativeTokens, 99_000)
+        XCTAssertEqual(settlements.last?.status, .allowed)
+        XCTAssertGreaterThan(settlements.last?.cumulativeTokens ?? 0, 99_000)
     }
 
     private func makeResponder(log: EventLog,

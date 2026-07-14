@@ -303,11 +303,10 @@ extension OpenAIWireProvider: ToolCallingProvider {
     }
 
     func buildAgentRequest(_ request: AgentRequest) throws -> URLRequest {
-        var root: [String: JSONValue] = [
-            "model": .string(request.model.rawValue),
-            "messages": .array(request.messages.map(Self.messageJSON)),
-            "stream": .bool(true),
-        ]
+        var root = Self.configuredRequestBody(endpoint: endpoint, model: request.model)
+        root["model"] = .string(request.model.rawValue)
+        root["messages"] = .array(request.messages.map(Self.messageJSON))
+        root["stream"] = .bool(true)
         if !request.tools.isEmpty {
             root["tools"] = .array(request.tools.map(Self.toolJSON))
         }

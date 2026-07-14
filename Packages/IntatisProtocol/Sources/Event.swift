@@ -136,13 +136,15 @@ public struct PermissionResolvedPayload: Codable, Equatable, Sendable {
     public var decision: PermissionDecision
     public var risk: RiskLevel
     public var reason: String
+    public var intent: PermissionIntent?
     public init(requestId: RequestID? = nil, tool: String, decision: PermissionDecision,
-                risk: RiskLevel, reason: String) {
+                risk: RiskLevel, reason: String, intent: PermissionIntent? = nil) {
         self.requestId = requestId
         self.tool = tool
         self.decision = decision
         self.risk = risk
         self.reason = reason
+        self.intent = intent
     }
 }
 

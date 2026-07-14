@@ -115,16 +115,14 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
                                   workspaceRoot: self.workspaceRoot,
                                   model: model,
                                   profile: .reviewed)
-                let loop = AgentLoop(
+                let runtime = AgentRuntime.code(
+                    allowsShell: PlatformProfile.current.allowsShell)
+                let loop = runtime.makeLoop(
                     log: self.log,
                     provider: provider,
-                    registry: .standard(),
-                    engine: PermissionEngine(),
                     responder: self,
                     agent: agent,
-                    allowsShell: PlatformProfile.current.allowsShell,
-                    imageGenerator: ProviderImageGenerationToolService(registry: self.registry)
-                )
+                    imageGenerator: ProviderImageGenerationToolService(registry: self.registry))
                 didEnterAgentLoop = true
                 try await loop.send(parsed.text, userMessage: parsed.userMessagePayload)
             } catch {

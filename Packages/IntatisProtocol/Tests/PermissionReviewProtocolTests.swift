@@ -21,6 +21,16 @@ final class PermissionReviewProtocolTests: XCTestCase {
         XCTAssertNil(payload.context)
     }
 
+    func testLegacyPermissionResolvedWithoutIntentStillDecodes() throws {
+        let data = Data(#"{"tool":"write_file","decision":"deny","risk":"medium","reason":"legacy"}"#.utf8)
+
+        let payload = try JSONDecoder().decode(PermissionResolvedPayload.self, from: data)
+
+        XCTAssertEqual(payload.tool, "write_file")
+        XCTAssertEqual(payload.decision, .deny)
+        XCTAssertNil(payload.intent)
+    }
+
     func testPartialPermissionRequestContextUsesAdditiveDefaults() throws {
         let data = Data(#"{"taskID":"task_partial","gate":{"decision":"ask","risk":"medium","reason":"write"}}"#.utf8)
 
@@ -29,6 +39,7 @@ final class PermissionReviewProtocolTests: XCTestCase {
         XCTAssertEqual(context.taskID, TaskID(rawValue: "task_partial"))
         XCTAssertEqual(context.touchedPaths, [])
         XCTAssertNil(context.sideEffect)
+        XCTAssertNil(context.intent)
         XCTAssertNil(context.executionID)
     }
 
@@ -36,6 +47,16 @@ final class PermissionReviewProtocolTests: XCTestCase {
         let reviewer = AgentID(rawValue: "permission-reviewer")
         let requestID = RequestID(rawValue: "req_roundtrip")
         let reviewID = PermissionReviewTaskID(rawValue: "review_roundtrip")
+        let intent = PermissionIntent(
+            action: "filesystem.write",
+            resources: [PermissionResource(
+                kind: .workspacePath,
+                value: "Sources/App.swift",
+                access: .readWrite)],
+            metadata: ["operation": .string("overwrite")],
+            dataEffects: [.mutate],
+            risks: [.workspaceMutation],
+            replayPolicy: .requiresManualReconciliation)
         let task = PermissionReviewTask(
             id: reviewID,
             sessionID: SessionID(rawValue: "sess_roundtrip"),
@@ -51,6 +72,7 @@ final class PermissionReviewProtocolTests: XCTestCase {
             touchedPaths: ["Sources/App.swift"],
             risksNetwork: false,
             sideEffect: .write,
+            intent: intent,
             gate: .init(decision: .ask, risk: .medium, reason: "write to workspace"),
             causalContext: .init(eventSequenceNumbers: [1, 2]),
             executionID: "exec_roundtrip",

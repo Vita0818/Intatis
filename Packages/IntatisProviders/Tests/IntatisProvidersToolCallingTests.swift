@@ -540,6 +540,55 @@ final class IntatisProvidersToolCallingTests: XCTestCase {
         XCTAssertNil(body2["max_tokens"])
     }
 
+    func testConfiguredModelOptionsPassThroughAgentBodyAndExplicitRuntimeValuesWin() throws {
+        let configuredEndpoint = ProviderEndpoint(
+            id: "generic",
+            baseURL: URL(string: "https://example.test/v1")!,
+            apiKeyRef: KeychainRef(service: "s", account: "a"),
+            wire: .openai,
+            modelRequestOptions: [
+                "vendor/model": [
+                    "provider": .object(["allow_fallbacks": .bool(false)]),
+                    "parallel_tool_calls": .bool(false),
+                    "max_tokens": .number(999),
+                    "reasoning_effort": .string("low"),
+                    "model": .string("must-not-win"),
+                    "messages": .array([]),
+                    "tools": .array([]),
+                    "stream": .bool(false),
+                ],
+            ])
+        let provider = OpenAIWireProvider(
+            endpoint: configuredEndpoint,
+            apiKey: "k",
+            http: FakeHTTP2(chunks: []))
+        let encoded = try provider.buildAgentRequest(AgentRequest(
+            model: ModelID(rawValue: "vendor/model"),
+            messages: [.user("hi")],
+            tools: [ToolSpec(name: "inspect", description: "Inspect", parameters: .object([:]))],
+            reasoningEffort: .high,
+            maxOutputTokens: 321))
+        let decoded = try JSONDecoder().decode(JSONValue.self, from: XCTUnwrap(encoded.httpBody))
+        guard case .object(let body) = decoded else { return XCTFail("request body is not an object") }
+
+        XCTAssertEqual(body["provider"], JSONValue.object(["allow_fallbacks": .bool(false)]))
+        XCTAssertEqual(body["parallel_tool_calls"], JSONValue.bool(false))
+        XCTAssertEqual(body["max_tokens"], JSONValue.number(321))
+        XCTAssertEqual(body["reasoning_effort"], JSONValue.string("high"))
+        XCTAssertEqual(body["model"], JSONValue.string("vendor/model"))
+        XCTAssertEqual(body["stream"], JSONValue.bool(true))
+        guard let messageValue = body["messages"],
+              case .array(let messages) = messageValue else {
+            return XCTFail("runtime messages were not encoded")
+        }
+        guard let toolValue = body["tools"],
+              case .array(let tools) = toolValue else {
+            return XCTFail("runtime tools were not encoded")
+        }
+        XCTAssertEqual(messages.count, 1)
+        XCTAssertEqual(tools.count, 1)
+    }
+
     func testAgentMessageWithImageEncodesAsContentArray() {
         let message = AgentMessage.user("what is this?",
                                         images: [ImageAttachment(url: "data:image/png;base64,QUJD")])

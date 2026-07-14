@@ -76,7 +76,7 @@ workspace-relevant observations
 ```
 
 ### 2.4 Capability Lease
-工具应按 capability lease 暴露。普通 worker task 不应收到 coordinator 工具（`spawn_agent` / `remove_agent` / `delegate_task`）。若 task 需委派，经 `CapabilityLease.delegation` 显式授予。子 agent 不应仅因被 spawn 就获得 coordinator 能力。Git、文档/媒体与网络/浏览器工具同样按 lease 收窄：worker 默认只能获得安全的只读能力（当前为 `read_pdf`），Git stage/commit/branch、remote fetch/pull/push/switch、页面编辑、OCR/版面重建、LaTeX 编译、生图、网络访问、浏览器 profile 操作等写入/执行/网络能力必须经 coordinator lease 或未来显式 lease 授予。
+工具应按 capability lease 暴露。普通 worker task 不应收到 coordinator 工具（`spawn_agent` / `remove_agent` / `delegate_task`）。若 task 需委派，经 `CapabilityLease.delegation` 显式授予。子 agent 不应仅因被 spawn 就获得 coordinator 能力。Git、文档/媒体与网络/浏览器工具同样按 lease 收窄：新 spawn 的 worker 默认 `read_only`，只能获得安全只读能力；用户/上级显式请求 `read_write` 且不超过 issuer WorkspaceLease ceiling 时，worker 可获得不含 coordinator 工具的 Code/data-plane 写入能力。`canCoordinate` 与 workspace access 正交：只读 coordinator 可调度但不能写 workspace，read-write worker 可执行文件工作但不能 spawn/delegate 下级。
 
 Lease 不只是工具列表：task-scoped lease 必须核对 task ID、communication/delegation grant，并在终态撤销；WorkspaceLease 必须执行 root、read-only/read-write、allow/deny path，并固定 canonical root 的文件系统 identity。任何可能跨 await 的授权都不能只在入口校验：attach commit、权限等待后、durable prepare 后紧邻 executor、派生/retry 与 process 启动前必须复核 identity；同路径目录被替换或 legacy lease 无 identity 时 fail closed。retry 只可从原 lease 的持久审计记录克隆，缺失历史时收窄到 worker，禁止按 agent 默认角色扩大权限。
 
@@ -92,7 +92,9 @@ failed | cancelled -> queued  only through an explicit bounded retry attempt
 ```
 恢复时不能默认把所有 running 任务整段重放。每个实际 tool executor 调用前必须先持久化 execution ticket，结果持久化后再 settle；只有普通 read-only 调用可自动重放。write/exec/network/destructive 与通信、委派、spawn/remove 等协作副作用处于“prepared 但未 settled”时，任务必须进入人工对账失败态，不能自动增加 attempt。没有未决非幂等副作用的 running 任务才可在新 attempt 的 queue 事件成功落盘后重排；半完成 admission、耗尽 attempts 或缺失关键 lease 也必须明确失败。执行应有 bounded timeout/cancel、attempt 和明确标为 soft 的 session token budget；模型缺完成标记、迭代耗尽或不完整 finish reason 都是失败。
 
-Permission Reviewer 是独立控制面，不是普通 worker：使用结构化 `PermissionReviewTask`、有界 FIFO/single-flight、独立 timeout/cancellation/session-lifetime budget，不占数据面 scheduler 槽，也不得递归运行 `AgentLoop`。deadline 从 submit 计时，queue full/timeout fail closed，人工 fallback 也必须遵守同一串行生命周期。review request 与 verdict 都必须 durable-first；`allow` 只有 settled audit 成功后才可返回，持久化失败、超时、取消、自审或 hard deny 都不得放行，恢复时 orphan request 必须显式关闭。停用 reviewer 先 quiesce，再持久化 revoke/detach，迟到 allow 或落盘失败不得被误报成成功停用。reviewer 只可在 deterministic gate 的最大权限边界内收窄，不能批准真正越权。
+Permission Reviewer 是独立控制面，不是普通 worker：使用结构化 `PermissionReviewTask`、有界 FIFO/single-flight、独立 timeout/cancellation/单次输出上限，不占数据面 scheduler 槽，也不得递归运行 `AgentLoop`。deadline 从 submit 计时，queue full/timeout fail closed；自动模式只有 `allow` / `deny`，timeout、cancel、truncated、malformed、tool call、provider/persistence failure 只 durable deny 当前调用，不得隐式切到 GUI 人工 fallback。review request 与 verdict 都必须 durable-first；`allow` 只有 settled audit 成功后才可返回，自审或 hard deny 都不得放行，恢复时 orphan request 必须显式关闭。累计 token 仅可作为 soft warning/度量，默认不得用不可恢复的 session-lifetime cap 永久关闭 reviewer。用户取消当前数据面任务不得顺带关闭常驻 reviewer；只有 session stop、显式 disable 或控制面自身安全故障才进入 quiesce/shutdown。停用 reviewer 先 quiesce，再持久化 revoke/detach，迟到 allow 或落盘失败不得被误报成成功停用。reviewer 只可在 deterministic gate 的最大权限边界内收窄，不能批准真正越权；人工模式只能由用户显式切换。
+
+模型可见的 agent/task/message/goal 操作与文件、网络、文档工具遵循同一个 ToolCall 协议。一个外部 ToolCall 只能有一个权限决定；`spawn_agent` / 原子 `delegate_task` 获准后，内部 roster、lease、mailbox、task graph 与 scheduler admission 必须作为 executor 的 durable transaction 完成，不能再次递归进入 PermissionEngine。Code 与 Cowork agent 共用 headless `AgentRuntime`；首个 system message 必须稳定声明 Intatis 模式、API tools 权威性、严格 JSON Schema 与 ToolResult 完成语义，动态 workspace/task/lease 数据仍放在 user-role untrusted context。
 
 ## 3. 通信 vs 委派
 
@@ -128,7 +130,7 @@ unbounded agent spawning
 
 Cowork 可以采用项目制：一个 session 绑定一个或多个用户选择的工作目录，并有一个 `@main` 主 agent。用户默认只向 `@main` 下达项目任务；`@main` 通过工具创建、委派、调取、删除子 agent，并管理任务、上下文、权限 profile、token budget 等 project metadata。但 project/session settings 只是本地元数据与 UI 投影，不得替代 task contract、capability lease、workspace lease 或权限门。
 
-工作区扩展**绝非**只读。创建或附加 agent 到新目录是能力/工作区扩展，必须经权限。
+工作区扩展**绝非**只读。创建或附加 agent 到新目录是能力/工作区扩展，必须经权限。唯一例外是 brand-new session 的初始 bootstrap：用户在 New Cowork Session 文件选择器或 CLI workspace 参数中明确选定 primary workspace 后，这次显式选择本身授权固定 `@main` 在该 canonical root 建立默认 workspace/capability lease；该路径必须同时要求空 EventLog、空 roster、固定 `@main` 身份、敏感/过宽根目录拒绝和 admission batch durable-first，不能被普通 attach/spawn/tool/recovery 复用。初始 `@permission-reviewer` 可随后用其固定 read_only + 空工具 lease 挂载；两者之间不得再让模型审批同一次 primary-workspace 选择。
 
 不得让 model 静默附加到：
 ```text
@@ -142,7 +144,7 @@ secret/token/key directories
 
 所有文件访问必须经工作区约束与权限策略。
 
-新增或删除项目工作目录是 session/project metadata 变更；真正派生工作 agent 应由 `@main` 或被显式授予协调权的 agent 通过调度器和工具完成。新建子 agent 默认只获得普通 worker 能力；除非 task contract/capability lease 明确授予（例如显式协调授权），不得让子 agent 继承 `@main` 的 `spawn_agent` / `remove_agent` / `delegate_task` 等 coordinator 工具。`@main` 和自动权限审查者不应作为普通删除对象。
+新增或删除项目工作目录是 session/project metadata 变更；真正派生工作 agent 应由 `@main` 或被显式授予协调权的 agent 通过调度器和工具完成。新建子 agent 默认只获得普通 worker + read-only workspace；`requestedAccess=read_write` 和 `canCoordinate=true` 是两个独立、显式、不可超过 issuer lease 的授权维度。除非 task contract/capability lease 明确授予，不得让子 agent 继承 `@main` 的 `spawn_agent` / `remove_agent` / `delegate_task` 等 coordinator 工具。`@main` 和自动权限审查者不应作为普通删除对象。
 
 自动权限审查若启用，审查者也必须是受控子 agent：
 ```text
@@ -216,6 +218,7 @@ capability lease controls tool registry
 worker receives only read-only document/media tools and no git-control/git-remote/browser/network tools by default
 delegation cycle is rejected
 workspace expansion requires permission
+fresh-session bootstrap attaches fixed @main without model review and cannot be reused after any durable session state exists
 agent-to-agent event records caller, target, task, and causal chain
 automatic permission reviewer cannot override hard deny
 automatic permission reviewer can be enabled/disabled without becoming a normal worker
@@ -239,12 +242,16 @@ iOS must not link shell/git/patch/local-agent workspace modules.
 ```
 **不得**弱化此边界。
 
-## 10. Clean-room 规则
+## 10. 开源复用与产品身份规则
 
-不复制 Codex / Claude Code / DeepCode / OpenCode / ChatGPT / Claude 或类似产品的源码、私有 prompt、UI 资产、图标、产品名或用户面文案。用通用术语：
+Intatis 允许按 `docs/OPEN_SOURCE_REUSE.md` 选择性复制、翻译、修改或运行兼容许可证的公开 agent/runtime 实现，包括 OpenCode 等项目中经过文件级许可证和 provenance 核对的源码、公开 model-facing prompt 与测试。复用不能改变本原则定义的 TaskContract、Scoped Context、CapabilityLease、WorkspaceLease、TaskGraph/Scheduler、MessageBus 和无嵌套 `AgentLoop` 边界；上游实现若与这些原则冲突，必须适配后再进入 Intatis，不能因“来自成熟项目”而直接放行。
+
+永久禁止使用泄露/私有源码或 prompt，也不复制第三方产品名称、Logo、图标、截图、UI 资产、商标性外观或品牌文案作为 Intatis 产品身份。直接复制或逐行翻译必须记录上游 URL、固定 commit、许可证和本地修改，并更新 `NOTICE.md`。Apple 平台继续 Swift-native 优先；非 Swift runtime 只能作为受控、可审计的 macOS 隔离组件评估，不得进入 iOS workspace Agent target。
+
+产品与协议继续使用 Intatis 自己的通用术语：
 ```text
 local agent workspace
-clean-room agent kernel
+native agent kernel
 multi-agent cowork thread
 task graph
 capability lease

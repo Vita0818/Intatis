@@ -243,17 +243,20 @@ public struct IntatisSessionHistoryItem: Identifiable, Hashable {
     public var detail: String
     public var systemImage: String
     public var isSelected: Bool
+    public var isDeleteDisabled: Bool
 
     public init(id: SessionID,
                 title: String,
                 detail: String,
                 systemImage: String,
-                isSelected: Bool = false) {
+                isSelected: Bool = false,
+                isDeleteDisabled: Bool = false) {
         self.id = id
         self.title = title
         self.detail = detail
         self.systemImage = systemImage
         self.isSelected = isSelected
+        self.isDeleteDisabled = isDeleteDisabled
     }
 }
 
@@ -266,6 +269,8 @@ public struct IntatisSessionHistoryList: View {
     private let isNewDisabled: Bool
     private let onNew: () -> Void
     private let onSelect: (SessionID) -> Void
+    private let onRename: ((SessionID) -> Void)?
+    private let onDelete: ((SessionID) -> Void)?
 
     public init(title: String,
                 newTitle: String,
@@ -274,7 +279,9 @@ public struct IntatisSessionHistoryList: View {
                 style: IntatisThreadStyle,
                 isNewDisabled: Bool = false,
                 onNew: @escaping () -> Void,
-                onSelect: @escaping (SessionID) -> Void) {
+                onSelect: @escaping (SessionID) -> Void,
+                onRename: ((SessionID) -> Void)? = nil,
+                onDelete: ((SessionID) -> Void)? = nil) {
         self.title = title
         self.newTitle = newTitle
         self.emptyTitle = emptyTitle
@@ -283,6 +290,8 @@ public struct IntatisSessionHistoryList: View {
         self.isNewDisabled = isNewDisabled
         self.onNew = onNew
         self.onSelect = onSelect
+        self.onRename = onRename
+        self.onDelete = onDelete
     }
 
     public var body: some View {
@@ -321,6 +330,26 @@ public struct IntatisSessionHistoryList: View {
                                 IntatisSessionHistoryRow(item: item, style: style)
                             }
                             .buttonStyle(.plain)
+                            .contextMenu {
+                                if let onRename {
+                                    Button {
+                                        onRename(item.id)
+                                    } label: {
+                                        Label("Rename…", systemImage: "pencil")
+                                    }
+                                }
+                                if let onDelete {
+                                    if onRename != nil {
+                                        Divider()
+                                    }
+                                    Button(role: .destructive) {
+                                        onDelete(item.id)
+                                    } label: {
+                                        Label("Delete…", systemImage: "trash")
+                                    }
+                                    .disabled(item.isDeleteDisabled)
+                                }
+                            }
                         }
                     }
                     .padding(.vertical, 1)
@@ -607,6 +636,70 @@ public struct IntatisThreadBubbleRow<Content: View>: View {
                 Spacer(minLength: gutter)
             }
         }
+    }
+}
+
+/// Shared first-token waiting state for Code and Cowork threads.
+///
+/// The caller decides when a model response is pending; this view only owns the
+/// visual treatment so both workspace modes stay consistent.
+public struct IntatisThreadThinkingRow: View {
+    private let layout: IntatisThreadContentLayout
+    private let style: IntatisThreadStyle
+    private let label: String
+
+    public init(layout: IntatisThreadContentLayout,
+                style: IntatisThreadStyle,
+                label: String = "Thinking…") {
+        self.layout = layout
+        self.style = style
+        self.label = label
+    }
+
+    public var body: some View {
+        IntatisThreadBubbleRow(
+            isTrailing: false,
+            rowWidth: layout.contentWidth,
+            maxWidth: layout.messageMaxWidth,
+            gutter: layout.messageGutter) {
+            HStack(spacing: 8) {
+                ProgressView()
+                    .controlSize(.small)
+                    .tint(style.accent)
+                Text(label)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(style.secondaryText)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 4)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Thinking")
+    }
+}
+
+enum IntatisThreadActivity {
+    /// Returns true only while the thread is waiting for the next visible model
+    /// response. Informational bookkeeping events are ignored, while streamed
+    /// text and tool calls count as visible output.
+    static func isAwaitingModelOutput(items: [CodeItem],
+                                      isWorking: Bool,
+                                      permissionBlocksResponse: Bool) -> Bool {
+        guard isWorking, !permissionBlocksResponse else { return false }
+
+        for item in items.reversed() {
+            switch item.kind {
+            case .note:
+                continue
+            case .user, .toolResult:
+                return true
+            case .agent:
+                return item.body.isEmpty && !item.complete
+            case .toolCall, .patch, .error, .agentToAgent:
+                return false
+            }
+        }
+        return true
     }
 }
 

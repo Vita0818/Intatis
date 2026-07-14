@@ -1,5 +1,6 @@
 import XCTest
 import IntatisCore
+import IntatisProtocol
 @testable import IntatisProviders
 
 private struct FakeHTTP: HTTPByteStreaming {
@@ -727,5 +728,112 @@ final class IntatisProvidersTests: XCTestCase {
         let root = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
         let streamOptions = try XCTUnwrap(root["stream_options"] as? [String: Any])
         XCTAssertEqual(streamOptions["include_usage"] as? Bool, true)
+    }
+
+    func testConfiguredModelOptionsPassThroughChatBodyWithoutOverridingRuntimeStructure() throws {
+        let endpoint = ProviderEndpoint(
+            id: "generic",
+            baseURL: URL(string: "https://example.test/v1")!,
+            apiKeyRef: KeychainRef(service: "s", account: "a"),
+            wire: .openai,
+            modelRequestOptions: [
+                "vendor/model": [
+                    "provider": .object([
+                        "only": .array([.string("vendor-a")]),
+                        "allow_fallbacks": .bool(false),
+                    ]),
+                    "vendor_extension": .object([
+                        "mode": .string("exact"),
+                        "threshold": .number(0.75),
+                    ]),
+                    "temperature": .number(0.9),
+                    "model": .string("must-not-win"),
+                    "messages": .array([]),
+                    "tools": .array([]),
+                    "stream": .bool(false),
+                ],
+            ])
+        let provider = OpenAIWireProvider(endpoint: endpoint, apiKey: "k", http: FakeHTTP(chunks: []))
+        let request = try provider.buildRequest(ChatRequest(
+            model: ModelID(rawValue: "vendor/model"),
+            messages: [ChatMessage(role: .user, content: "hello")],
+            temperature: 0.2))
+        let decoded = try JSONDecoder().decode(JSONValue.self, from: XCTUnwrap(request.httpBody))
+        guard case .object(let body) = decoded else { return XCTFail("request body is not an object") }
+
+        XCTAssertEqual(body["provider"], JSONValue.object([
+            "only": .array([.string("vendor-a")]),
+            "allow_fallbacks": .bool(false),
+        ]))
+        XCTAssertEqual(body["vendor_extension"], JSONValue.object([
+            "mode": .string("exact"),
+            "threshold": .number(0.75),
+        ]))
+        XCTAssertEqual(body["temperature"], JSONValue.number(0.2))
+        XCTAssertEqual(body["model"], JSONValue.string("vendor/model"))
+        XCTAssertEqual(body["stream"], JSONValue.bool(true))
+        guard let messageValue = body["messages"],
+              case .array(let messages) = messageValue else {
+            return XCTFail("runtime messages were not encoded")
+        }
+        XCTAssertEqual(messages.count, 1)
+        XCTAssertNil(body["tools"])
+    }
+
+    func testProviderEndpointModelOptionsAreCodableAndLegacyEndpointsDefaultEmpty() throws {
+        let endpoint = ProviderEndpoint(
+            id: "generic",
+            baseURL: URL(string: "https://example.test/v1")!,
+            apiKeyRef: KeychainRef(service: "s", account: "a"),
+            wire: .openai,
+            modelRequestOptions: ["m": ["top_k": .number(7)]])
+        let roundTrip = try JSONDecoder().decode(
+            ProviderEndpoint.self,
+            from: JSONEncoder().encode(endpoint))
+        XCTAssertEqual(roundTrip, endpoint)
+
+        let legacy = #"{"id":"legacy","baseURL":"https:\/\/example.test\/v1","apiKeyRef":{"service":"s","account":"a"},"wire":"openai"}"#
+        let decoded = try JSONDecoder().decode(ProviderEndpoint.self, from: Data(legacy.utf8))
+        XCTAssertTrue(decoded.modelRequestOptions.isEmpty)
+    }
+
+    func testModelConfigurationPresentationReadsReasoningLabelsWithoutRewritingOptions() {
+        let cases: [([String: JSONValue], String)] = [
+            (["reasoning_effort": .string("max")], "max"),
+            (["reasoningEffort": .string("xhigh")], "xhigh"),
+            (["reasoning": .object(["effort": .string("high")])], "high"),
+            (["output_config": .object(["effort": .string("medium")])], "medium"),
+            (["thinking": .object(["budgetTokens": .number(16_000)])], "16000 tokens"),
+            (["reasoning": .object(["max_tokens": .number(2_000)])], "2000 tokens"),
+        ]
+
+        for (options, expected) in cases {
+            let original = options
+            let presentation = ModelConfigurationPresentation(requestOptions: options)
+            XCTAssertEqual(presentation.reasoningLabel, expected)
+            XCTAssertEqual(options, original)
+        }
+    }
+
+    func testModelConfigurationPresentationDoesNotPretendAnUnselectedVariantIsActive() {
+        let presentation = ModelConfigurationPresentation(
+            modelMetadata: [
+                "variants": .object([
+                    "high": .object(["reasoningEffort": .string("high")]),
+                    "low": .object(["reasoningEffort": .string("low")]),
+                ]),
+                "capabilities": .object(["effort": .string("unrelated")]),
+            ],
+            requestOptions: [:])
+
+        XCTAssertNil(presentation.reasoningLabel)
+    }
+
+    func testModelConfigurationPresentationCanReadDirectModelMetadata() {
+        let presentation = ModelConfigurationPresentation(
+            modelMetadata: ["reasoningEffort": .string("max")],
+            requestOptions: [:])
+
+        XCTAssertEqual(presentation.reasoningLabel, "max")
     }
 }

@@ -277,15 +277,43 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
     let restoredProjection = CoworkProjection.build(from: replayed)
     await orchestrator.restore(from: restoredProjection)
 
-    let autoReviewResult = await orchestrator.enableAutomaticPermissionReview(
-        model: ModelID(rawValue: defaultModel),
-        workspaceRoot: workspace)
+    let restoredEvents = await log.replay()
+    let currentProjection = CoworkProjection.build(from: restoredEvents)
 
     // A default agent so you can just talk; add more with /agent add.
     let mainAttached: Bool
-    if restoredProjection.agentRoster[Orchestrator.mainAgentID] != nil {
+    let autoReviewResult: AutomaticPermissionReviewResult
+    var mainBootstrapError: String? = nil
+    if currentProjection.agentRoster[Orchestrator.mainAgentID] != nil {
         mainAttached = true
+        autoReviewResult = await orchestrator.enableAutomaticPermissionReview(
+            model: ModelID(rawValue: defaultModel),
+            workspaceRoot: workspace)
+    } else if restoredEvents.isEmpty {
+        // The workspace passed to `intatis cowork` is the user's explicit
+        // initial-session authorization. Establish @main before enabling the
+        // reviewer so bootstrap never asks a model to approve that same choice.
+        switch await orchestrator.bootstrapMainAgent(Agent(
+            name: Orchestrator.mainAgentID,
+            workspaceRoot: workspace,
+            model: ModelID(rawValue: defaultModel),
+            profile: .reviewed,
+            coordinationDepth: Agent.defaultCoordinationDepth)) {
+        case .attached, .alreadyAttached:
+            mainAttached = true
+        case .failed(let message):
+            mainAttached = false
+            mainBootstrapError = message
+        }
+        autoReviewResult = await orchestrator.enableAutomaticPermissionReview(
+            model: ModelID(rawValue: defaultModel),
+            workspaceRoot: workspace)
     } else {
+        // A non-empty recovered session is outside the initial bootstrap trust
+        // boundary, so a missing @main keeps the ordinary reviewed attach path.
+        autoReviewResult = await orchestrator.enableAutomaticPermissionReview(
+            model: ModelID(rawValue: defaultModel),
+            workspaceRoot: workspace)
         mainAttached = await orchestrator.attach(Agent(
             name: Orchestrator.mainAgentID,
             workspaceRoot: workspace,
@@ -296,26 +324,31 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
     await orchestrator.resumePendingTasks()
 
     banner(mode: .cowork, model: defaultModel, host: config.baseURL.host ?? config.baseURL.absoluteString)
+    var automaticReviewRequired = true
+    var automaticReviewReady = false
     switch autoReviewResult {
     case .enabled(let id):
+        automaticReviewReady = true
         if case .some(.degraded(let reason)) = await orchestrator.automaticPermissionReviewHealth() {
-            out("\(S.yellow)automatic permission review is quarantined (@\(id.rawValue)): \(reason)\(S.reset)\n")
+            out("\(S.yellow)automatic permission review is degraded but active (@\(id.rawValue)): \(reason)\(S.reset)\n")
         } else {
-            out("\(S.dim)automatic permission review is on (@\(id.rawValue), model \(defaultModel)); ambiguous requests still fall back to you.\(S.reset)\n")
+            out("\(S.dim)automatic permission review is on (@\(id.rawValue), model \(defaultModel)); reviewer errors deny only the current tool call.\(S.reset)\n")
         }
     case .alreadyEnabled(let id):
+        automaticReviewReady = true
         if case .some(.degraded(let reason)) = await orchestrator.automaticPermissionReviewHealth() {
-            out("\(S.yellow)automatic permission review is quarantined (@\(id.rawValue)): \(reason)\(S.reset)\n")
+            out("\(S.yellow)automatic permission review is degraded but active (@\(id.rawValue)): \(reason)\(S.reset)\n")
         } else {
             out("\(S.dim)automatic permission review already on (@\(id.rawValue)).\(S.reset)\n")
         }
     case .failed(let message):
-        out("\(S.dim)automatic permission review was not enabled: \(message). Permissions will ask you directly.\(S.reset)\n")
+        out("\(S.yellow)automatic permission review was not enabled: \(message). Cowork task input is blocked; use /auto to retry or /default to explicitly choose manual approval.\(S.reset)\n")
     }
     if mainAttached {
         out("\(S.dim)@main is ready in \(workspace.lastPathComponent) — just describe the task; it can spawn its own helper agents. /agents to list · /help\(S.reset)\n")
     } else {
-        out("\(S.dim)@main was not attached. Use /agent add <name> <path> after approving a workspace. /help\(S.reset)\n")
+        let detail = mainBootstrapError.map { ": \($0)" } ?? "."
+        out("\(S.dim)@main was not attached\(detail) Start a new Cowork session or inspect the workspace configuration. /help\(S.reset)\n")
     }
 
     var lastPermissionReviewHealth = await orchestrator.automaticPermissionReviewHealth()
@@ -393,25 +426,35 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
                     workspaceRoot: workspace)
                 switch result {
                 case .enabled(let id):
+                    automaticReviewRequired = true
+                    automaticReviewReady = true
                     if case .some(.degraded(let reason)) = await orchestrator.automaticPermissionReviewHealth() {
-                        out("automatic permission review is quarantined (@\(id.rawValue)): \(reason)\n")
+                        out("automatic permission review is degraded but active (@\(id.rawValue)): \(reason)\n")
                     } else {
                         out("automatic permission review → on (@\(id.rawValue), model \(defaultModel))\n")
                     }
                 case .alreadyEnabled(let id):
+                    automaticReviewRequired = true
+                    automaticReviewReady = true
                     if case .some(.degraded(let reason)) = await orchestrator.automaticPermissionReviewHealth() {
-                        out("automatic permission review is quarantined (@\(id.rawValue)): \(reason)\n")
+                        out("automatic permission review is degraded but active (@\(id.rawValue)): \(reason)\n")
                     } else {
                         out("automatic permission review already on (@\(id.rawValue))\n")
                     }
                 case .failed(let message):
+                    automaticReviewRequired = true
+                    automaticReviewReady = false
                     out("automatic permission review not enabled: \(message)\n")
                 }
             case "default":
                 switch await orchestrator.disableAutomaticPermissionReview() {
                 case .disabled:
+                    automaticReviewRequired = false
+                    automaticReviewReady = false
                     out("automatic permission review → off\n")
                 case .alreadyDisabled:
+                    automaticReviewRequired = false
+                    automaticReviewReady = false
                     out("automatic permission review already off\n")
                 case .failed(let message):
                     out("automatic permission review could not be disabled: \(message)\n")
@@ -464,6 +507,10 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
             message = bits.count > 1 ? bits[1] : ""
         }
         let parsedInput: ParsedUserInput
+        if automaticReviewRequired, !automaticReviewReady {
+            errOut("automatic permission review is not ready; use /auto to retry or /default to explicitly choose manual approval\n")
+            continue
+        }
         switch GoalInputParser.parse(message) {
         case .success(let parsed):
             parsedInput = parsed

@@ -9,9 +9,10 @@
 2. `docs/PROJECT_MAP.md`
 3. `docs/ARCHITECTURE.md`
 4. `docs/DO_NOT_BREAK.md`
-5. `docs/TESTING.md`
-6. `docs/NEXT_TARGET.md`（如果存在）
-6. `docs/COWORK_PRINCIPLES.md`（修改 Cowork / AgentKernel / MessageBus / 权限 / agent 编排前必读）
+5. `docs/OPEN_SOURCE_REUSE.md`
+6. `docs/TESTING.md`
+7. `docs/NEXT_TARGET.md`（如果存在）
+8. `docs/COWORK_PRINCIPLES.md`（修改 Cowork / AgentKernel / MessageBus / 权限 / agent 编排前必读）
 
 如果文档与源码、工程配置、测试或脚本冲突，必须以当前源码和配置为准，并在最终报告中明确指出冲突位置和采用源码为准的原因。
 
@@ -35,7 +36,7 @@ git status --short
 
 ## 修改边界
 
-本仓库是 clean-room 本地 AI 工作区（Swift 多 target，SwiftPM + XcodeGen），含三个产品面：Chat（普通多模态对话）/ Code（单 agent 本地工作区）/ Cowork（多 agent 本地工作区协作）。macOS 是全量产品；iOS 是 chat 子集。
+本仓库是 Apple-first、Swift-native 优先的本地 AI 工作区（Swift 多 target，SwiftPM + XcodeGen），含三个产品面：Chat（普通多模态对话）/ Code（单 agent 本地工作区）/ Cowork（多 agent 本地工作区协作）。macOS 是全量产品；iOS 是 chat 子集。允许按 `docs/OPEN_SOURCE_REUSE.md` 选择性复用兼容许可证的公开源码；当前实现是否实际包含上游代码以 `NOTICE.md` 为准。
 
 未来常规任务可以按用户要求修改业务源码；但在只要求项目自查或文档更新的任务中，只允许修改：
 
@@ -62,7 +63,8 @@ git status --short
 - 不把 Cowork 实现为硬编码递归 agent 树（main/coordinator/worker/leaf 永久角色）；遵循 `docs/COWORK_PRINCIPLES.md`。
 - 不让 `AgentLoop` 直接同步递归调用另一个 `AgentLoop`；用 mailbox / scheduler / event flow。
 - 不让 worker 默认获得 coordinator 工具（spawn_agent / remove_agent / delegate_task）；能力须经 `CapabilityLease` 显式授予。
-- 不破坏 clean-room 声明：不复制 Codex / Claude Code / DeepCode / OpenCode / ChatGPT / Claude 的源码、私有 prompt、UI 资产、图标、产品名或用户面文案。
+- 不使用泄露/私有源码或 prompt，不复制第三方产品名称、Logo、图标、截图、UI 资产、商标性外观或品牌文案。兼容许可证的公开源码、公开 model-facing prompt 和测试可以选择性复制、翻译或修改，但必须先固定上游 commit、核对文件/依赖许可证、记录 provenance、更新 `NOTICE.md`，并遵守 `docs/OPEN_SOURCE_REUSE.md`；不得把派生实现错误标成独立原创。
+- 不让复用的外部源码、依赖或 runtime 绕过 PermissionEngine、CapabilityLease、WorkspaceLease、PathConfinement、SecretScanner、Mediator、durable tool execution 或 EventLog；Apple 平台继续以 Swift 原生为主，非 Swift runtime 不得隐式进入 iOS target。
 - 不弱化平台边界：iOS 不得链接 shell/git/patch/local-agent workspace 模块，不得包含本地 workspace Agent 执行。
 - 不把事件日志 JSONL schema、Envelope 格式、`seq` 单调性、ArtifactStore 索引格式当作一次性内部细节随意改动。
 
@@ -72,11 +74,11 @@ git status --short
 
 - 入口：`Apps/IntatisMac/Sources/IntatisMacApp.swift`（`@main struct IntatisMacApp`，全量 macOS）、`Apps/IntatisiOS/Sources/IntatisiOSApp.swift`（`@main struct IntatisiOSApp`，chat 子集）、`Apps/intatis-cli/Sources/IntatisCLI.swift`（CLI）。
 - Chat 链路：`ChatViewModel` → `GoalInputParser`（行首 `/goal` 只生成可选 Goal 元数据，provider 收到清洗后的文本）→ `ChatLoop`（无工具）→ `EventLog`(JSONL append-only) → `ConversationProjection`。
-- Code 链路：`CodeViewModel` → `GoalInputParser` → `AgentLoop`（maxIterations 50）→ `ContextBuilder` → `OpenAIWireProvider` → `runTool` → `PermissionEngine`（3 层门）→ `EventLog` → `CodeProjection`。
-- Cowork 链路：`CoworkViewModel` → `GoalInputParser` + `CoworkMentionRouter` → `Orchestrator.runtime`（先取得 session writer lease）→ scheduler → `AgentLoop` → `PermissionEngine` → durable tool execution ticket → executor → `EventLog`；`MessageBus` → `Mediator`。GUI/CLI 默认启用保留控制面 agent `@permission-reviewer`（read_only、空工具 lease），`AgentPermissionResponder` 把结构化 `PermissionReviewTask` 交给独立 `PermissionReviewControlPlane` FIFO/single-flight；reviewer 有独立 timeout/cancel/budget，不占普通 scheduler 槽，只返回 `allow` / `deny` / `ask_user`。request/settled 均先落 EventLog，allow 只有 settled 成功后生效；ask_user 持久化后人工兜底。CLI `/auto` 重启，`/default` 关闭；审查者不得作为普通 send/delegate/message/ask 目标，不得运行嵌套 `AgentLoop`。
-- 权限 3 层：`DeterministicPolicyGate`（纯函数、模型无关、deny 终局；普通写入/网络/exec 进入 ask 流）→ `ModelPermissionReviewer`（只能收窄 gate `pass`，不能放行 hard deny）→ `PermissionEngine`（`askUser` 交给当前 `PermissionResponder`；Cowork 中自动审批优先、人工兜底）。
+- Code 链路：`CodeViewModel` → `GoalInputParser` → 共享 headless `AgentRuntime.code` → `AgentLoop`（maxIterations 50）→ `ContextBuilder` + `RuntimeEnvironmentManifest` → `OpenAIWireProvider` → `runTool` → `PermissionEngine`（3 层门）→ `EventLog` → `CodeProjection`。
+- Cowork 链路：`CoworkViewModel` → `GoalInputParser` + `CoworkMentionRouter` → `Orchestrator.runtime`（先取得 session writer lease）→ scheduler → 共享 headless `AgentRuntime.cowork` → `AgentLoop` → `PermissionEngine` → durable tool execution ticket → executor → `EventLog`；`MessageBus` → `Mediator`。GUI/CLI 默认启用保留控制面 agent `@permission-reviewer`（read_only、空工具 lease），`AgentPermissionResponder` 把结构化 `PermissionReviewTask` 交给独立 `PermissionReviewControlPlane` FIFO/single-flight；reviewer 有独立 timeout/cancel、单次输出上限与可选 soft token warning，不占普通 scheduler 槽，只返回 `allow` / `deny`。request/settled 均先落 EventLog，allow 只有 settled 成功后生效；timeout/cancel/malformed/provider/persistence failure 只 durable deny 当前调用，不转 GUI 人工等待。GUI 在自动 reviewer 未就绪时锁定 composer；CLI `/auto` 重启，只有用户明确 `/default` 才进入人工模式。审查者不得作为普通 send/delegate/message/ask 目标，不得运行嵌套 `AgentLoop`。
+- 权限 3 层：`DeterministicPolicyGate`（纯函数、模型无关、deny 终局；普通写入/网络/exec 进入 ask 流）→ `ModelPermissionReviewer`（只能收窄 gate `pass`，不能放行 hard deny）→ `PermissionEngine`（`askUser` 交给当前 `PermissionResponder`；Cowork 自动模式只接受 control-plane allow/deny，人工模式须由用户显式切换）。
 - 平台边界：iOS 是 macOS 真子集（chat/multimodal/providers/artifacts，无 Tools/Permission/AgentKernel/Cowork）；`PlatformProfile.current` 默认 `.iOS`（最受限）。
-- 持久化：`EventLog`（`~/Library/Application Support/Intatis/<session>/events.jsonl`，append/batch 跨进程锁内分配单调 `seq`，production Cowork runtime 全生命周期持有 writer lease；permission review 与 tool execution prepare/settle 为追加事件；旧 JSONL 必须继续可解码）、`ArtifactStore`（blobs + `index.json`）、`UserDefaults`（provider catalog 主键 `intatis.providerCatalog.v1`，provider 保存 `baseURL` + `chatEndpoint` + secret ref 元数据；聊天页当前选择用 `intatis.providerSelection.v1` 覆盖；兼容镜像 `intatis.baseURL`/`intatis.model`）、高级 macOS JSON/JSONC 配置（`INTATIS_CONFIG` 显式指定文件、`~/.config/intatis/intatis.json` / `intatis.jsonc`、app support `intatis.json` / `intatis.jsonc`；不默认读取任何 OpenCode app 配置或名为 `opencode.json` 的文件；旧 `~/.config/intatis/config.json` 只作兜底兼容读取，内容采用 OpenCode-compatible 顶层 `model` + `enabled_providers` + `provider` map，覆盖 UserDefaults catalog 但可被聊天页当前选择覆盖）、配置文件/env/file 凭据懒加载（不得把 secret 写入事件或项目文档）。
+- 持久化：`EventLog`（`~/Library/Application Support/Intatis/<session>/events.jsonl`，append/batch 跨进程锁内分配单调 `seq`，production Cowork runtime 全生命周期持有 writer lease；permission review 与 tool execution prepare/settle 为追加事件；旧 JSONL 必须继续可解码）、`ArtifactStore`（blobs + `index.json`）、`UserDefaults`（provider catalog 主键 `intatis.providerCatalog.v1`，provider 保存 `baseURL` + `chatEndpoint` + secret ref 元数据；聊天页当前 provider/model/variant identity 用 `intatis.providerSelection.v1` 覆盖；兼容镜像 `intatis.baseURL`/`intatis.model`）、高级 macOS JSON/JSONC 配置（`INTATIS_CONFIG` 显式指定文件、`~/.config/intatis/intatis.json` / `intatis.jsonc`、app support `intatis.json` / `intatis.jsonc`；不默认读取任何 OpenCode app 配置或名为 `opencode.json` 的文件；旧 `~/.config/intatis/config.json` 只作兜底兼容读取，内容采用 OpenCode-compatible 顶层 `model` + `enabled_providers` + `provider` map，覆盖 UserDefaults catalog 但可被聊天页当前选择覆盖；model object 的未知元数据仅在内存保真，`provider.<id>.models.<model>.options` 作为任意 JSON 请求参数按 model 保真到 wire adapter，不得按厂商枚举或静默丢弃；`variants` 作为同一 model 的命名请求参数预设在 macOS 菜单摊平，选择后只由 variant 原始字段浅覆盖基础 options，实际 model ID 不变；模型菜单可只读识别常见 reasoning/thinking effort 或 token-budget 拼写并显示原始值，但不得改写字段、覆盖请求或从未选择的 variants 猜测活动值）、配置文件/env/file 凭据懒加载（不得把 secret 写入事件或项目文档）。
 - production Code/Cowork registry 当前不暴露 raw `run_shell`；不得在没有完整 WorkspaceLease denied-pattern 映射时重新启用。保留的 runner 仍必须使用 OS 强制的 workspace allow-list 与默认 network deny：macOS 走 Seatbelt，Linux 仅在 bwrap 可用时运行，否则 fail closed；不得退回裸 shell。structured browser/document backend 与 raw shell runner 分流，但同样必须有 timeout/cancel 与进程清理。
 - 安全：`KeychainStore`（generic-password，凭据引用 `KeychainRef`；`KeychainSecretResolver` 仅在真实 provider 请求中按 keychain/env/file/auth JSON/Intatis-owned OpenCode-compatible config `options.apiKey` 懒加载 secret 并做进程内缓存；macOS auth JSON 默认先看 `~/.config/intatis/auth.json`，再兼容 `~/.local/share/intatis/auth.json`；不默认读取 `~/.local/share/opencode/auth.json`）、`PathConfinement`（拒 `..` 与越界）、`SecretScanner`、sandbox/entitlements（AppStore sandbox 无 shell；DeveloperID Hardened Runtime）。
 
@@ -89,6 +91,7 @@ git status --short
 - `docs/CURRENT_STATE.md`：当前真实状态、已有能力、风险、工作区改动。
 - `docs/TESTING.md`：环境、构建、测试、lint/format 与手动验证方式。
 - `docs/DO_NOT_BREAK.md`：工程禁区、数据格式、协议、路径和回归要求。
+- `docs/OPEN_SOURCE_REUSE.md`：开源源码/公开 prompt/依赖准入、provenance、Apple-first 集成、NOTICE 与上游升级规则。
 - `docs/NEXT_TARGET.md`：临时下一目标记录；目标完成或不再有效后删除。
 - `docs/COWORK_PRINCIPLES.md`：Cowork 架构原则（agent 身份/任务契约/能力租约/上下文投影/递归禁止/安全边界/实现顺序/测试期望）。
 

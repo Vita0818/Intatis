@@ -3275,4 +3275,32 @@ final class IntatisToolsTests: XCTestCase {
         XCTAssertEqual(BrowserDownloadTool.descriptor.sideEffect, .exec)
         XCTAssertEqual(BrowserDownloadsTool.descriptor.sideEffect, .readOnly)
     }
+
+    func testPermissionIntentsDescribeConcreteActionResourcesAndReplay() {
+        let root = URL(fileURLWithPath: "/workspace")
+        let write = WriteFileTool().permissionIntent(
+            ToolArgs(raw: #"{"path":"Sources/App.swift","content":"hello"}"#),
+            workspaceRoot: root)
+        XCTAssertEqual(write.action, "filesystem.write")
+        XCTAssertEqual(write.dataEffects, [.mutate])
+        XCTAssertEqual(write.metadata["byteCount"], .number(5))
+        XCTAssertEqual(write.resources.first?.kind, .workspacePath)
+        XCTAssertEqual(write.resources.first?.access, .readWrite)
+        XCTAssertEqual(write.replayPolicy, .requiresManualReconciliation)
+
+        let git = GitFetchTool().permissionIntent(
+            ToolArgs(raw: #"{"remote":"origin","branch":"main","prune":false}"#),
+            workspaceRoot: root)
+        XCTAssertEqual(git.action, "git.fetch")
+        XCTAssertTrue(git.resources.contains { $0.kind == .git && $0.value == root.path })
+        XCTAssertTrue(git.dataEffects.contains(.network))
+
+        let browser = BrowserNavigateTool().permissionIntent(
+            ToolArgs(raw: #"{"url":"https://example.com"}"#),
+            workspaceRoot: root)
+        XCTAssertEqual(browser.action, "browser.navigate")
+        XCTAssertTrue(browser.resources.contains {
+            $0.kind == .url && $0.value == "https://example.com"
+        })
+    }
 }

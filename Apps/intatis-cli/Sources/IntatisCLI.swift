@@ -1,6 +1,6 @@
 import Foundation
 
-/// `intatis` — the clean-room CLI. Pure command-line Swift, so it builds and runs
+/// `intatis` — the Swift-native CLI. Pure command-line Swift, so it builds and runs
 /// from SwiftPM with no Xcode: `swift run intatis`.
 @main
 struct IntatisCLI {
