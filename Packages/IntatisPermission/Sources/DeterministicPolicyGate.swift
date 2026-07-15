@@ -128,8 +128,35 @@ public struct DeterministicPolicyGate: Sendable {
         if controls.contains(.removeAgent) {
             return .pass(reason: "remove attached agent", risk: .medium)
         }
+        if controls.contains(.delegateTask) {
+            return .pass(reason: "delegate work task to an agent invocation", risk: .medium)
+        }
         if controls.contains(.createTask) {
-            return .pass(reason: "create or delegate agent task", risk: .medium)
+            return .pass(reason: "create work task", risk: .medium)
+        }
+        if controls.contains(.updateTask) {
+            return .pass(reason: "update work task state", risk: .medium)
+        }
+        if controls.contains(.cancelTask) {
+            return .pass(reason: "cancel work task", risk: .medium)
+        }
+        if controls.contains(.clearGoal) {
+            return .pass(reason: "clear durable goal", risk: .medium)
+        }
+        if controls.contains(.createGoal) {
+            return .pass(reason: "create durable goal", risk: .medium)
+        }
+        if controls.contains(.editGoal) {
+            return .pass(reason: "edit durable goal", risk: .medium)
+        }
+        if controls.contains(.pauseGoal) {
+            return .pass(reason: "pause durable goal", risk: .medium)
+        }
+        if controls.contains(.resumeGoal) {
+            return .pass(reason: "resume durable goal", risk: .medium)
+        }
+        if controls.contains(.submitGoalVerdict) {
+            return .pass(reason: "submit goal verification verdict", risk: .low)
         }
         if controls.contains(.grantCapability) {
             return .pass(reason: "grant agent capability", risk: .high)

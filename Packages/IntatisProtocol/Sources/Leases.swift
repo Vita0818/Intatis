@@ -22,6 +22,12 @@ public enum ToolCapability: String, Codable, Sendable, Hashable {
     case requestDelegation = "request_delegation"
     case delegateTask = "delegate_task"
     case attachWorkspace = "attach_workspace"
+    case readWorkTasks = "read_work_tasks"
+    case updateOwnedWorkTask = "update_owned_work_task"
+    case manageWorkTasks = "manage_work_tasks"
+    case readGoal = "read_goal"
+    case createGoal = "create_goal"
+    case submitGoalVerdict = "submit_goal_verdict"
 }
 
 public struct DelegationBudget: Codable, Sendable, Hashable {
@@ -79,6 +85,9 @@ public struct CapabilityLease: Codable, Sendable, Hashable {
             .readPDF,
             .replyMessage,
             .requestDelegation,
+            .readWorkTasks,
+            .updateOwnedWorkTask,
+            .readGoal,
         ]
         if workspaceAccess == .readWrite {
             tools.formUnion([
@@ -111,6 +120,8 @@ public struct CapabilityLease: Codable, Sendable, Hashable {
             .requestDelegation,
             .delegateTask,
             .attachWorkspace,
+            .manageWorkTasks,
+            .createGoal,
         ])
         return CapabilityLease(
             taskID: taskID,

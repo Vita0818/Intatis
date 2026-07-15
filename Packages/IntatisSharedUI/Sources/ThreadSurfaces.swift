@@ -3,72 +3,173 @@ import Foundation
 import SwiftUI
 import IntatisCore
 import IntatisConversation
+#if canImport(AppKit)
+import AppKit
+#elseif canImport(UIKit)
+import UIKit
+#endif
 
 public struct IntatisThreadStyle {
     public var primaryText: Color
     public var secondaryText: Color
     public var tertiaryText: Color
     public var accent: Color
-    public var accentSoft: Color
-    public var surface: Color
     public var stroke: Color
-    public var userBubble: Color
-    public var assistantBubble: Color
-    public var cardSurface: Color
     public var cardStroke: Color
-    public var warningSurface: Color
-    public var warningStroke: Color
     public var error: Color
-    public var material: Material
 
     public init(primaryText: Color,
                 secondaryText: Color,
                 tertiaryText: Color,
                 accent: Color,
-                accentSoft: Color,
-                surface: Color,
                 stroke: Color,
-                userBubble: Color,
-                assistantBubble: Color,
-                cardSurface: Color,
                 cardStroke: Color,
-                warningSurface: Color,
-                warningStroke: Color,
-                error: Color = .red,
-                material: Material = .ultraThinMaterial) {
+                error: Color = .red) {
         self.primaryText = primaryText
         self.secondaryText = secondaryText
         self.tertiaryText = tertiaryText
         self.accent = accent
-        self.accentSoft = accentSoft
-        self.surface = surface
         self.stroke = stroke
-        self.userBubble = userBubble
-        self.assistantBubble = assistantBubble
-        self.cardSurface = cardSurface
         self.cardStroke = cardStroke
-        self.warningSurface = warningSurface
-        self.warningStroke = warningStroke
         self.error = error
-        self.material = material
     }
 
-    public static func standard(_ scheme: ColorScheme) -> IntatisThreadStyle {
-        let surface = scheme == .dark ? Color(red: 0.12, green: 0.12, blue: 0.12) : .white
+    public static func standard(_: ColorScheme) -> IntatisThreadStyle {
+        let stroke = intatisPlatformSeparator
         return IntatisThreadStyle(
             primaryText: .primary,
             secondaryText: .secondary,
             tertiaryText: .secondary.opacity(0.72),
             accent: .accentColor,
-            accentSoft: .accentColor.opacity(0.16),
-            surface: surface,
-            stroke: .secondary.opacity(scheme == .dark ? 0.25 : 0.16),
-            userBubble: .accentColor.opacity(scheme == .dark ? 0.18 : 0.12),
-            assistantBubble: surface.opacity(scheme == .dark ? 0.30 : 0.70),
-            cardSurface: surface.opacity(scheme == .dark ? 0.26 : 0.62),
-            cardStroke: .secondary.opacity(scheme == .dark ? 0.22 : 0.14),
-            warningSurface: .yellow.opacity(scheme == .dark ? 0.14 : 0.10),
-            warningStroke: .yellow.opacity(0.38))
+            stroke: stroke,
+            cardStroke: stroke,
+            error: .red)
+    }
+}
+
+// MARK: - System materials and Liquid Glass
+
+private var intatisPlatformSeparator: Color {
+    #if canImport(AppKit)
+    return Color(nsColor: .separatorColor)
+    #elseif canImport(UIKit)
+    return Color(uiColor: .separator)
+    #else
+    return .secondary.opacity(0.28)
+    #endif
+}
+
+private struct IntatisContentSurfaceModifier: ViewModifier {
+    let cornerRadius: CGFloat
+
+    func body(content: Content) -> some View {
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        content
+            .background(.regularMaterial, in: shape)
+            .overlay {
+                shape.stroke(intatisPlatformSeparator, lineWidth: 1)
+            }
+    }
+}
+
+private struct IntatisLiquidGlassModifier: ViewModifier {
+    let cornerRadius: CGFloat
+    let isInteractive: Bool
+
+    @ViewBuilder func body(content: Content) -> some View {
+        #if compiler(>=6.2)
+        if #available(macOS 26.0, iOS 26.0, *) {
+            content.glassEffect(
+                isInteractive ? .regular.interactive() : .regular,
+                in: .rect(cornerRadius: cornerRadius))
+        } else {
+            fallback(content)
+        }
+        #else
+        fallback(content)
+        #endif
+    }
+
+    private func fallback(_ content: Content) -> some View {
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        return content
+            .background(.regularMaterial, in: shape)
+            .overlay {
+                shape.stroke(intatisPlatformSeparator, lineWidth: 1)
+            }
+    }
+}
+
+private struct IntatisGlassButtonModifier: ViewModifier {
+    let isProminent: Bool
+
+    @ViewBuilder func body(content: Content) -> some View {
+        #if compiler(>=6.2)
+        if #available(macOS 26.0, iOS 26.0, *) {
+            if isProminent {
+                content.buttonStyle(.glassProminent)
+            } else {
+                content.buttonStyle(.glass)
+            }
+        } else {
+            fallback(content)
+        }
+        #else
+        fallback(content)
+        #endif
+    }
+
+    @ViewBuilder private func fallback(_ content: Content) -> some View {
+        if isProminent {
+            content.buttonStyle(.borderedProminent)
+        } else {
+            content.buttonStyle(.bordered)
+        }
+    }
+}
+
+public extension View {
+    /// Standard Material for content-layer cards and read-only information.
+    func intatisContentSurface(cornerRadius: CGFloat = 16) -> some View {
+        modifier(IntatisContentSurfaceModifier(cornerRadius: cornerRadius))
+    }
+
+    /// Native Liquid Glass on current systems, with semantic Material fallback.
+    func intatisLiquidGlass(cornerRadius: CGFloat = 16,
+                            interactive: Bool = false) -> some View {
+        modifier(IntatisLiquidGlassModifier(
+            cornerRadius: cornerRadius,
+            isInteractive: interactive))
+    }
+
+    /// Native glass button artwork on current systems, native bordered fallback.
+    func intatisGlassButton(prominent: Bool = false) -> some View {
+        modifier(IntatisGlassButtonModifier(isProminent: prominent))
+    }
+}
+
+public struct IntatisGlassEffectGroup<Content: View>: View {
+    private let spacing: CGFloat?
+    private let content: Content
+
+    public init(spacing: CGFloat? = nil,
+                @ViewBuilder content: () -> Content) {
+        self.spacing = spacing
+        self.content = content()
+    }
+
+    @ViewBuilder public var body: some View {
+        #if compiler(>=6.2)
+        if #available(macOS 26.0, iOS 26.0, *) {
+            GlassEffectContainer(spacing: spacing) {
+                content
+            }
+        } else {
+            content
+        }
+        #else
+        content
+        #endif
     }
 }
 
@@ -94,11 +195,7 @@ public struct IntatisTurnStatsSummaryView: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
-        .background(style.cardSurface.opacity(0.72), in: Capsule(style: .continuous))
-        .overlay {
-            Capsule(style: .continuous)
-                .stroke(style.cardStroke.opacity(0.75), lineWidth: 1)
-        }
+        .intatisContentSurface(cornerRadius: 14)
         .help(summary)
     }
 
@@ -202,38 +299,16 @@ public struct IntatisModeSegmentedControl: View {
     }
 
     public var body: some View {
-        HStack(spacing: 4) {
+        Picker("", selection: $selectionID) {
             ForEach(tabs) { tab in
-                Button {
-                    selectionID = tab.id
-                } label: {
-                    VStack(spacing: 4) {
-                        Image(systemName: tab.systemImage)
-                            .font(.system(size: 13, weight: .semibold))
-                        Text(tab.title)
-                            .font(.system(size: 11, weight: .semibold))
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.82)
-                    }
-                    .foregroundStyle(selectionID == tab.id ? style.accent : style.secondaryText)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 8)
-                    .background {
-                        RoundedRectangle(cornerRadius: 8, style: .continuous)
-                            .fill(selectionID == tab.id ? style.accentSoft : Color.clear)
-                    }
-                    .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                }
-                .buttonStyle(.plain)
-                .help(tab.title)
+                Label(tab.title, systemImage: tab.systemImage)
+                    .tag(tab.id)
             }
         }
-        .padding(4)
-        .background(style.cardSurface.opacity(0.76), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(style.cardStroke.opacity(0.85), lineWidth: 1)
-        }
+        .labelsHidden()
+        .pickerStyle(.segmented)
+        .controlSize(.large)
+        .tint(style.accent)
     }
 }
 
@@ -305,11 +380,10 @@ public struct IntatisSessionHistoryList: View {
                 Button(action: onNew) {
                     Image(systemName: "plus")
                         .font(.system(size: 12, weight: .bold))
-                        .foregroundStyle(isNewDisabled ? style.tertiaryText : style.accent)
                         .frame(width: 24, height: 24)
-                        .background(style.cardSurface.opacity(0.78), in: Circle())
                 }
-                .buttonStyle(.plain)
+                .controlSize(.small)
+                .intatisGlassButton()
                 .disabled(isNewDisabled)
                 .help(newTitle)
             }
@@ -389,8 +463,6 @@ private struct IntatisSessionHistoryRow: View {
         }
         .padding(.horizontal, 9)
         .padding(.vertical, 7)
-        .background(item.isSelected ? style.accentSoft : style.cardSurface.opacity(0.30),
-                    in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .stroke(item.isSelected ? style.accent.opacity(0.42) : Color.clear, lineWidth: 1)
@@ -498,60 +570,62 @@ public struct IntatisThreadComposer: View {
                 accessory
             }
 
-            HStack(alignment: .bottom, spacing: 10) {
-                HStack(alignment: .bottom, spacing: 8) {
-                    TextField(placeholder, text: $input, axis: .vertical)
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 15))
-                        .foregroundStyle(style.primaryText)
-                        .lineLimit(1...6)
-                        .focused($focused)
-                        .onSubmit(onSend)
-                        .disabled(isInputDisabled)
-
-                    if let secondaryAction {
-                        Button(action: secondaryAction.action) {
-                            if secondaryAction.isBusy {
-                                ProgressView().controlSize(.small)
-                            } else {
-                                Image(systemName: secondaryAction.systemImage)
-                                    .font(.system(size: 16, weight: .medium))
-                                    .foregroundStyle(secondaryAction.isDisabled ? style.tertiaryText : style.accent)
-                            }
-                        }
-                        .buttonStyle(.plain)
-                        .help(secondaryAction.help)
-                        .disabled(secondaryAction.isDisabled)
-                    }
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 11)
-                .background {
-                    Capsule(style: .continuous)
-                        .fill(style.surface.opacity(0.44))
-                }
-                .background(style.material, in: Capsule(style: .continuous))
-                .overlay {
-                    Capsule(style: .continuous)
-                        .stroke(style.stroke.opacity(0.82), lineWidth: 1)
-                }
-
-                Button(action: onSend) {
-                    ZStack {
-                        Circle()
-                            .fill(canSend ? AnyShapeStyle(style.accent)
-                                          : AnyShapeStyle(style.surface.opacity(0.50)))
-                        Image(systemName: "arrow.up")
-                            .font(.system(size: 16, weight: .bold))
-                            .foregroundStyle(canSend ? .white : style.tertiaryText)
-                    }
-                    .frame(width: 40, height: 40)
-                }
-                .buttonStyle(.plain)
-                .disabled(!canSend)
+            IntatisGlassEffectGroup(spacing: 10) {
+                composerControls
             }
         }
     }
+
+    private var composerControls: some View {
+        HStack(alignment: .bottom, spacing: 10) {
+            inputControl
+            sendButton
+        }
+    }
+
+    private var inputControl: some View {
+        HStack(alignment: .bottom, spacing: 8) {
+            TextField(placeholder, text: $input, axis: .vertical)
+                .textFieldStyle(.plain)
+                .font(.system(size: 15))
+                .foregroundStyle(.primary)
+                .lineLimit(1...6)
+                .focused($focused)
+                .onSubmit(onSend)
+                .disabled(isInputDisabled)
+
+            if let secondaryAction {
+                Button(action: secondaryAction.action) {
+                    if secondaryAction.isBusy {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Image(systemName: secondaryAction.systemImage)
+                            .font(.system(size: 16, weight: .medium))
+                            .foregroundStyle(secondaryAction.isDisabled ? .tertiary : .primary)
+                    }
+                }
+                .buttonStyle(.plain)
+                .help(secondaryAction.help)
+                .disabled(secondaryAction.isDisabled)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 11)
+        .intatisLiquidGlass(cornerRadius: 22, interactive: true)
+    }
+
+    private var sendButton: some View {
+        Button(action: onSend) {
+            Image(systemName: "arrow.up")
+                .font(.system(size: 16, weight: .bold))
+                .frame(width: 22, height: 22)
+        }
+        .controlSize(.large)
+        .intatisGlassButton(prominent: true)
+        .disabled(!canSend)
+        .accessibilityLabel("Send")
+    }
+
 }
 
 public struct IntatisThreadContentLayout {
@@ -755,14 +829,16 @@ struct IntatisWorkspaceThreadHeader: View {
 
     @ViewBuilder private var actionRow: some View {
         if !actions.isEmpty {
-            HStack(spacing: 8) {
-                ForEach(Array(actions.enumerated()), id: \.offset) { _, action in
-                    Button(action: action.action) {
-                        Label(action.title, systemImage: action.systemImage)
-                            .font(.system(size: 13, weight: .semibold))
+            IntatisGlassEffectGroup(spacing: 8) {
+                HStack(spacing: 8) {
+                    ForEach(Array(actions.enumerated()), id: \.offset) { _, action in
+                        Button(action: action.action) {
+                            Label(action.title, systemImage: action.systemImage)
+                                .font(.system(size: 13, weight: .semibold))
+                        }
+                        .intatisGlassButton()
+                        .disabled(action.isDisabled)
                     }
-                    .buttonStyle(.borderless)
-                    .disabled(action.isDisabled)
                 }
             }
         }

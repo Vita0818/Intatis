@@ -17,13 +17,28 @@ AgentLoop must never directly recurse into another AgentLoop.
 
 含义：一个 agent 可在一个任务里 coordinate、在另一个任务里 count files、在第三个任务里 review code。其当前行为由它收到的 task contract 与 capability lease 决定，而非硬编码类型。
 
-## 2. 五大顶层抽象
+## 2. 四层工作模型与五大协作抽象
 
-Cowork 应围绕五个抽象构建：
+Cowork 的用户目标、可见计划、宿主续跑和单次 agent 执行是四个不同层级，不得再用同一个 `Task` 词汇或同一终态代替：
+
+```text
+Goal             用户拥有、可跨多轮/重启持续的最终目标
+WorkTask         Goal 或普通 run 内用户可见、可验证的计划 DAG 节点
+ContinuationRun  宿主为一次推进/恢复建立的有界执行轮次
+AgentInvocation  现有 TaskContract + TaskGraph + AgentScheduler 的一次 agent 执行
+```
+
+- `AgentInvocation` 完成只产生候选结果，不能自动把关联 `WorkTask` 标成完成。
+- `WorkTask` 完成必须由 `task_update` 显式提交 result，并在有 acceptance criteria 时提交 evidence；依赖、revision 与状态转换由 `WorkTaskGraph` 校验。
+- `Goal` 完成必须经过独立 `GoalVerifier` 对 success criteria 与 host-derived `validationEvidence` 的审计；WorkTask result/evidence 只是 agent-reported，不能由 main/worker、`TaskContract` 终态、WorkTask 数量或 UI 文案自行宣告完成。
+- `ContinuationRun` 是 host-driven continuation 的 checkpoint/recovery 边界，不是递归 `AgentLoop`。一个 Goal 可跨多个 run；一个 WorkTask 可关联多个 invocation。
+- `TaskContract` 这个既有源码类型保留兼容，但在产品/架构语义里称为 **AgentInvocation execution contract**；不得把它重新投影成 Goal 或 WorkTask。
+
+上述四层与以下五个协作抽象正交。Cowork 仍围绕这些边界构建：
 
 ```text
 Agent Identity          持久本地身份（id/displayName/model/workspace lease/mailbox/status）
-Task Contract           每 task 分派的角色与交付物
+Task Contract           每 AgentInvocation 分派的角色与交付物
 Scoped Context          上下文按作用域投影，非全量原始 transcript
 Capability Lease        能力按租约授予，非永久继承
 Task Graph + Scheduler  任务图 + 调度器驱动协作
@@ -32,8 +47,8 @@ Task Graph + Scheduler  任务图 + 调度器驱动协作
 ### 2.1 Agent Identity
 Agent 是持久本地身份。应含 `id` / `displayName` / `model` / `workspace lease or default workspace` / `local memory or mailbox` / `status`。**不应**含永久 "leaf" 或 "coordinator" 角色。
 
-### 2.2 Task Contract
-角色按 task 分派。Task contract 应告诉 agent 它为何存在于当前工作流、预期交付什么。建议 shape：
+### 2.2 Task Contract（AgentInvocation 层）
+角色按 AgentInvocation 分派。Task contract 应告诉 agent 它为何存在于当前工作流、预期交付什么；它不是用户可见 WorkTask。建议 shape：
 ```swift
 struct TaskContract {
     let id: TaskID
@@ -83,7 +98,9 @@ Lease 不只是工具列表：task-scoped lease 必须核对 task ID、communica
 ### 2.5 Task Graph + Scheduler
 协作经任务图与消息总线发生。`AgentLoop` 不得直接同步递归调用另一个 `AgentLoop`——用 mailbox / scheduler / event flow。
 
-Scheduler 必须把“claim”和“执行”分开：claim 是短状态转换，同一 agent 只允许一个 running task；不同 agent 只能在显式并发上限内并行。用户输入也必须先成为 root task，不能绕开 task graph 直接跑一个不可恢复的 AgentLoop。
+这里必须区分两张图：`WorkTaskGraph` 是用户可见计划 DAG，校验依赖、revision、完成 result/evidence；既有 `TaskGraph` 是 AgentInvocation 执行图，配合 scheduler 管理 queue/claim/attempt。两者可以通过稳定 ID 关联，但任何一方的终态都不能推导另一方终态。
+
+Scheduler 必须把“claim”和“执行”分开：claim 是短状态转换，同一 agent 只允许一个 running invocation；不同 agent 只能在显式并发上限内并行。普通用户输入也必须先成为 root AgentInvocation，不能绕开执行图直接跑一个不可恢复的 AgentLoop；Goal 则由宿主创建 ContinuationRun，再把该轮 root invocation 放入同一 scheduler。
 
 Task lifecycle 是 durable state machine：
 ```text
@@ -94,7 +111,11 @@ failed | cancelled -> queued  only through an explicit bounded retry attempt
 
 Permission Reviewer 是独立控制面，不是普通 worker：使用结构化 `PermissionReviewTask`、有界 FIFO/single-flight、独立 timeout/cancellation/单次输出上限，不占数据面 scheduler 槽，也不得递归运行 `AgentLoop`。deadline 从 submit 计时，queue full/timeout fail closed；自动模式只有 `allow` / `deny`，timeout、cancel、truncated、malformed、tool call、provider/persistence failure 只 durable deny 当前调用，不得隐式切到 GUI 人工 fallback。review request 与 verdict 都必须 durable-first；`allow` 只有 settled audit 成功后才可返回，自审或 hard deny 都不得放行，恢复时 orphan request 必须显式关闭。累计 token 仅可作为 soft warning/度量，默认不得用不可恢复的 session-lifetime cap 永久关闭 reviewer。用户取消当前数据面任务不得顺带关闭常驻 reviewer；只有 session stop、显式 disable 或控制面自身安全故障才进入 quiesce/shutdown。停用 reviewer 先 quiesce，再持久化 revoke/detach，迟到 allow 或落盘失败不得被误报成成功停用。reviewer 只可在 deterministic gate 的最大权限边界内收窄，不能批准真正越权；人工模式只能由用户显式切换。
 
-模型可见的 agent/task/message/goal 操作与文件、网络、文档工具遵循同一个 ToolCall 协议。一个外部 ToolCall 只能有一个权限决定；`spawn_agent` / 原子 `delegate_task` 获准后，内部 roster、lease、mailbox、task graph 与 scheduler admission 必须作为 executor 的 durable transaction 完成，不能再次递归进入 PermissionEngine。Code 与 Cowork agent 共用 headless `AgentRuntime`；首个 system message 必须稳定声明 Intatis 模式、API tools 权威性、严格 JSON Schema 与 ToolResult 完成语义，动态 workspace/task/lease 数据仍放在 user-role untrusted context。
+Goal Verifier 是另一条独立控制面，职责仅是判定 Goal 是否已有充分证据完成。它不是 Permission Reviewer，也不是普通 agent：使用独立 system/context、无工具 provider 请求、有界 timeout/cancel/output，不能写 EventLog 或执行 workspace 动作。WorkTask result/evidence 是 agent-reported，不是完成证明；只有 host 从同一 Goal 的 durable 成功 tool-execution settlement 经 validation-tool allowlist 派生的 `validationEvidence` 才能作为 completion proof。malformed、tool call、缺完成标记、provider/usage failure、timeout/cancel 必须 fail safe 为 `continue`，不能误报 Goal 完成。只有 host 校验 verifier 返回的 requirement/evidence 与这些 host-bound evidence 一致后，才可追加 Goal audit/completed 事件。
+
+Goal 生命周期必须由 host 串行化：start、ordinary turn、Goal mutation 与 stop/shutdown 分别有 single-flight/mutation/stop gate；pending durable stop 未结算前不得启动新 run，start 取消后若已创建 continuation，必须先 scoped cancel、等待退出并 checkpoint 才返回失败。restore 必须持续暂停 scheduler，直到 roster/reviewer/main 与 Goal recovery/reconcile 完成且宿主显式 resume 成功。Cowork `/goal` 是明确 host action；普通自然语言只有在窄、确定性的中英文持续目标分类器命中时才可为本轮提供 create intent，复杂请求、Goal 提及、一次性目标、引用示例或附件内容不得提升权限。
+
+模型可见的 agent/task/message/goal 操作与文件、网络、文档工具遵循同一个 ToolCall 协议。WorkTask CRUD 与 Goal create/update 也是 control-plane effects，必须先过 schema、lease 与 PermissionEngine；worker 默认只能读取 Goal/相关 WorkTask，并更新自己当前绑定的 WorkTask，不能改 DAG/owner/priority/retry/cancel 或提交 Goal verdict。一个外部 ToolCall 只能有一个权限决定；`spawn_agent` / 原子 `delegate_task` 获准后，内部 roster、lease、mailbox、task graph 与 scheduler admission 必须作为 executor 的 durable transaction 完成，不能再次递归进入 PermissionEngine。Code 与 Cowork agent 共用 headless `AgentRuntime`；首个 system message 必须稳定声明 Intatis 模式、API tools 权威性、严格 JSON Schema 与 ToolResult 完成语义，动态 workspace/task/lease/goal/run 数据仍放在 user-role untrusted context。
 
 ## 3. 通信 vs 委派
 
@@ -109,7 +130,7 @@ reply_message
 
 **不要**长期用一个模糊的 `ask_agent` 操作覆盖所有用途。
 
-MessageBus 投递采用持久化的至少一次语义：先通过 Mediator，再持久化 typed message，然后进入 mailbox。只有确实投影给 agent 且该轮成功完成的 message ID 才能写 consumed event；消费确认必须先持久化再从运行时 mailbox 移除。恢复后未消费消息必须重新触发 wake task，单轮批量应有上限。
+MessageBus 投递采用持久化的至少一次语义：先通过 Mediator，再持久化 typed message，然后进入 mailbox。只有确实投影给 agent 且该轮成功完成的 message ID 才能写 consumed event；消费确认必须先持久化再从运行时 mailbox 移除。若 owning Goal/run 在成功呈现前取消，迟到 durable message 必须以专用 discarded event durable 结算后再 ack，不能伪装成 consumed。恢复后既未 consumed 也未 discarded 的消息必须重新触发 wake task，单轮批量应有上限；旧 run discarded message 不得复活或阻塞新 run。
 
 ## 4. 递归与循环规则
 
@@ -178,9 +199,12 @@ hard deny remains final before the reviewer can see anything
 - priorHistory/global context projection must stay scoped for task runs
 - MessageBus payload/report shape must stay structured enough for replay
 - delegate_task must return a mediated Task Report, not a queued ack
+- AgentInvocation completion must remain only a WorkTask candidate result; WorkTask and Goal completion need their own explicit authorities
+- host-driven Goal continuation must checkpoint/recover through ContinuationRun events and must never become a nested AgentLoop
+- GoalVerifier must remain independent from the acting agents and Permission Reviewer; agent-reported WorkTask evidence is non-authoritative, and Goal completion requires host-derived validation evidence from durable successful validation-tool settlements
 - task-scoped tool-spawned children must be recycled only when idle
 - cancellation is cooperative; provider/tool implementations need their own bounded cancellation/watchdog behavior
-- real-provider crash/restart and long-running multi-agent GUI/CLI matrices remain device-level validation work
+- real-provider crash/restart and long-running Goal/WorkTask multi-agent GUI/CLI matrices remain device-level validation work
 - EventLog-derived context/recovery index remains a future long-session performance optimization; request context itself must remain bounded even before such an index exists
 ```
 
@@ -203,6 +227,8 @@ hard deny remains final before the reviewer can see anything
 6. Replace nested AgentLoop calls with scheduler/mailbox.
 7. Add task graph cycle detection.
 8. Expand semantic event schema and tests.
+9. Add Goal / WorkTask / ContinuationRun above the existing AgentInvocation layer without renaming old durable event types.
+10. Add host-driven continuation and an independent GoalVerifier; never let an agent self-certify Goal completion.
 ```
 
 ## 8. 测试期望
@@ -226,7 +252,23 @@ user turn creates a root task and waits for one terminal event
 same agent is single-flight while different agents respect the concurrency limit
 running task recovery increments attempt; exhausted/interrupted admission fails explicitly
 cancel, timeout, maxIterations, missing completion marker, and incomplete finish reason never complete
-only actually presented mailbox messages are consumed; remaining batches survive replay
+Goal / WorkTask / ContinuationRun IDs remain stable and all new events round-trip/replay without breaking legacy TaskContract JSON
+WorkTask DAG rejects missing/cross-run/self/cyclic dependencies, stale revisions, invalid transitions, and completion without required result/evidence
+dependency replanning recomputes host-derived readiness atomically, and projection never trusts a DAG-inconsistent ready transition
+concurrent delegate_task(to:auto) reserves distinct eligible workers before any await and releases every reservation on every exit path
+task_create/update/get/list obey capability leases; a worker can update only its bound owned WorkTask and cannot rewrite the graph
+write-capable WorkTask admission rejects overlapping expected-artifact ancestors/descendants and treats unknown write sets as workspace-wide
+delegate_task preserves the WorkTask/run/goal binding and records invocation linkage without treating its result as WorkTask completion
+Cowork /goal creates a durable Goal; Chat/Code keep legacy Goal metadata behavior unless separately migrated
+ordinary natural-language Goal creation intent is narrow, deterministic, attachment-independent, and never bypasses schema/lease/permission/host authority
+ContinuationRun checkpoints/recovery are host-driven; restart never nests or recursively calls AgentLoop
+startup keeps the scheduler suspended through Goal recovery; pending stop, shutdown, and cancelled start cannot leak a live continuation
+cancellation persistence failure quarantines the task before provider dispatch and resolves scoped/global idle plus result waiters within a bounded path
+GoalVerifier receives no tools, cannot write EventLog, accepts only host-derived validation evidence from durable successful allowlisted tool settlements, and fails safe to continue on malformed/tool-call/timeout/cancel/provider/usage errors
+Goal completes only after a non-empty all-proven audit; the same normalized blocker must recur across the configured run threshold before blocked
+Goal/Tasks UI is derived from CoworkProjection, including revision/result/evidence/dependencies/invocation links, rather than TaskContract objective or transcript text
+only actually presented mailbox messages are consumed; cancelled-run messages are durably discarded, and remaining batches survive replay
+late scoped mailbox sends after cancellation are durably discarded rather than consumed, including across restore and a later run
 task-scoped capability/workspace leases are enforced, revoked, and safely renewed on retry
 dynamic task/message/event text stays in a bounded, escaped user-role context block
 unknown future events do not cause EventLog sequence reuse

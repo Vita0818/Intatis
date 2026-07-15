@@ -181,8 +181,13 @@ struct MessageRow: View {
             }
         }
         .padding(10)
-        .background(background)
-        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .intatisContentSurface(cornerRadius: 10)
+        .overlay {
+            if message.role == .user {
+                RoundedRectangle(cornerRadius: 10)
+                    .stroke(style.accent.opacity(0.64), lineWidth: 1)
+            }
+        }
     }
 
     private var displayText: String {
@@ -198,50 +203,41 @@ struct MessageRow: View {
         }
     }
 
-    private var background: Color {
-        message.role == .user ? Color.accentColor.opacity(0.12) : Color.gray.opacity(0.10)
-    }
-
     private func tagBadge(_ tag: String) -> some View {
         Text(tag.uppercased())
             .font(.caption2.bold())
-            .foregroundStyle(Color.accentColor)
+            .foregroundStyle(Color.primary)
             .padding(.horizontal, 6)
             .padding(.vertical, 2)
-            .background(Color.accentColor.opacity(0.14), in: Capsule())
+            .overlay {
+                Capsule().stroke(style.stroke, lineWidth: 1)
+            }
     }
 }
 
 struct ComposerView: View {
     @ObservedObject var model: ChatViewModel
+    @Environment(\.colorScheme) private var scheme
+
+    private var canSend: Bool {
+        !model.isBusy
+            && !model.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
 
     var body: some View {
-        HStack(alignment: .bottom, spacing: 8) {
-            TextField("Message Intatis…", text: $model.input, axis: .vertical)
-                .textFieldStyle(.plain)
-                .lineLimit(1...6)
-                .onSubmit { model.send() }
-                .disabled(model.isBusy)
-            Button {
-                model.generateImage()
-            } label: {
-                if model.isGeneratingArtifact {
-                    ProgressView().controlSize(.small)
-                } else {
-                    Image(systemName: "photo").font(.title3)
-                }
-            }
-            .buttonStyle(.plain)
-            .help("Generate image from prompt")
-            .disabled(model.isBusy || model.input.trimmingCharacters(in: .whitespaces).isEmpty)
-            Button {
-                model.send()
-            } label: {
-                Image(systemName: "arrow.up.circle.fill").font(.title2)
-            }
-            .buttonStyle(.plain)
-            .disabled(model.isBusy || model.input.trimmingCharacters(in: .whitespaces).isEmpty)
-        }
+        IntatisThreadComposer(
+            placeholder: "Message Intatis…",
+            input: $model.input,
+            canSend: canSend,
+            isInputDisabled: model.isBusy,
+            style: .standard(scheme),
+            secondaryAction: IntatisThreadComposerSecondaryAction(
+                systemImage: "photo",
+                help: "Generate image from prompt",
+                isBusy: model.isGeneratingArtifact,
+                isDisabled: !canSend,
+                action: { model.generateImage() }),
+            onSend: { model.send() })
         .padding(10)
     }
 }

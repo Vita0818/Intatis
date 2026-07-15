@@ -203,4 +203,36 @@ final class IntatisPermissionTests: XCTestCase {
             return XCTFail("read-only parent must not grant read-write access")
         }
     }
+
+    func testWorkTaskAndGoalControlEffectsAreNotWorkspaceWrites() {
+        let cases: [(String, PermissionControlEffect, PermissionResource)] = [
+            ("task.create", .createTask, PermissionResource(kind: .task, value: "current-run")),
+            ("task.update", .updateTask, PermissionResource(kind: .task, value: "wt_test")),
+            ("task.cancel", .cancelTask, PermissionResource(kind: .task, value: "wt_test")),
+            ("task.delegate", .delegateTask, PermissionResource(kind: .task, value: "wt_test")),
+            ("goal.create", .createGoal, PermissionResource(kind: .goal, value: "current")),
+            ("goal.edit", .editGoal, PermissionResource(kind: .goal, value: "goal_test")),
+            ("goal.pause", .pauseGoal, PermissionResource(kind: .goal, value: "goal_test")),
+            ("goal.resume", .resumeGoal, PermissionResource(kind: .goal, value: "goal_test")),
+            ("goal.clear", .clearGoal, PermissionResource(kind: .goal, value: "goal_test")),
+            ("goal.submit_verdict", .submitGoalVerdict, PermissionResource(kind: .goal, value: "goal_test")),
+        ]
+
+        for (action, controlEffect, resource) in cases {
+            let intent = PermissionIntent(
+                action: action,
+                resources: [resource],
+                dataEffects: [.none],
+                controlEffects: [controlEffect],
+                risks: [.controlPlaneMutation],
+                replayPolicy: .requiresManualReconciliation)
+            guard case .pass(let reason, _) = gate.evaluate(
+                call(action, .write, intent: intent),
+                ctx(profile: .readOnly)) else {
+                XCTFail("\(action) should enter control-plane review for a read-only workspace lease")
+                continue
+            }
+            XCTAssertFalse(reason.contains("workspace"), "\(action) was misclassified: \(reason)")
+        }
+    }
 }

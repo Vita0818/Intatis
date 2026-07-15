@@ -461,10 +461,18 @@ public struct ContextProjector: Sendable {
                                        events: [Envelope],
                                        duplicateTexts: Set<String>,
                                        budget: ContextProjectionBudget) -> [ContextEventSummary] {
-        let consumedAt = events.reduce(into: [MessageID: Int]()) { result, envelope in
-            guard case .agentMessageConsumed(let payload) = envelope.event,
-                  payload.agent == agentID else { return }
-            result[payload.messageID] = max(result[payload.messageID] ?? Int.min, envelope.seq)
+        let settledAt = events.reduce(into: [MessageID: Int]()) { result, envelope in
+            let settlement: (MessageID, AgentID)?
+            switch envelope.event {
+            case .agentMessageConsumed(let payload):
+                settlement = (payload.messageID, payload.agent)
+            case .agentMessageDiscarded(let payload):
+                settlement = (payload.messageID, payload.agent)
+            default:
+                settlement = nil
+            }
+            guard let settlement, settlement.1 == agentID else { return }
+            result[settlement.0] = max(result[settlement.0] ?? Int.min, envelope.seq)
         }
         let candidates = events.compactMap { envelope -> ContextEventSummary? in
             switch envelope.event {
@@ -483,7 +491,7 @@ public struct ContextProjector: Sendable {
                     recipient: payload.to,
                     content: payload.content)
             case .agentMessage(let payload) where payload.to == agentID:
-                guard consumedAt[payload.messageId].map({ $0 > envelope.seq }) != true else { return nil }
+                guard settledAt[payload.messageId].map({ $0 > envelope.seq }) != true else { return nil }
                 guard isRelevant(payload.taskID, taskContract: taskContract, relevantTaskIDs: relevantTaskIDs) else {
                     return nil
                 }
@@ -496,7 +504,7 @@ public struct ContextProjector: Sendable {
                     taskID: payload.taskID,
                     content: payload.content)
             case .informationRequested(let payload) where payload.to == agentID:
-                guard consumedAt[payload.requestID].map({ $0 > envelope.seq }) != true else { return nil }
+                guard settledAt[payload.requestID].map({ $0 > envelope.seq }) != true else { return nil }
                 guard isRelevant(payload.taskID, taskContract: taskContract, relevantTaskIDs: relevantTaskIDs) else {
                     return nil
                 }
@@ -509,7 +517,7 @@ public struct ContextProjector: Sendable {
                     taskID: payload.taskID,
                     content: payload.question)
             case .informationReplied(let payload) where payload.to == agentID:
-                guard consumedAt[payload.replyID].map({ $0 > envelope.seq }) != true else { return nil }
+                guard settledAt[payload.replyID].map({ $0 > envelope.seq }) != true else { return nil }
                 guard isRelevant(payload.taskID, taskContract: taskContract, relevantTaskIDs: relevantTaskIDs) else {
                     return nil
                 }

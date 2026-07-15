@@ -67,6 +67,10 @@ public struct TaskContract: Codable, Sendable, Hashable {
     public var issuer: AgentID?
     public var assignee: AgentID
     public var parentTaskID: TaskID?
+    /// Optional durable planning scope. Nil for legacy and unscoped invocations.
+    public var workTaskID: WorkTaskID?
+    public var continuationRunID: ContinuationRunID?
+    public var goalID: GoalID?
 
     public var objective: String
     public var roleHint: String
@@ -87,6 +91,9 @@ public struct TaskContract: Codable, Sendable, Hashable {
                 issuer: AgentID?,
                 assignee: AgentID,
                 parentTaskID: TaskID? = nil,
+                workTaskID: WorkTaskID? = nil,
+                continuationRunID: ContinuationRunID? = nil,
+                goalID: GoalID? = nil,
                 objective: String,
                 roleHint: String,
                 expectedDeliverable: String,
@@ -104,6 +111,9 @@ public struct TaskContract: Codable, Sendable, Hashable {
         self.issuer = issuer
         self.assignee = assignee
         self.parentTaskID = parentTaskID
+        self.workTaskID = workTaskID
+        self.continuationRunID = continuationRunID
+        self.goalID = goalID
         self.objective = objective
         self.roleHint = roleHint
         self.expectedDeliverable = expectedDeliverable

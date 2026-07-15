@@ -389,6 +389,30 @@ final class IntatisProvidersTests: XCTestCase {
         XCTAssertTrue(error.localizedDescription.contains("rate limited"))
     }
 
+    func testProviderUsageLimitTypeSurvivesRuntimeNormalizationAndExhaustion() throws {
+        let original = ProviderUsageLimitError(
+            signal: "insufficient_quota",
+            providerMessage: "Account credits are exhausted.",
+            statusCode: 429,
+            operation: "streaming request")
+        let policy = ProviderRuntimePolicy(maxAttempts: 3)
+
+        let transported = try XCTUnwrap(
+            ProviderErrorFormatting.transport(original) as? ProviderUsageLimitError)
+        let exhausted = try XCTUnwrap(
+            ProviderRuntime.exhausted(
+                original,
+                attempts: 3,
+                operation: "streaming request") as? ProviderUsageLimitError)
+
+        XCTAssertEqual(transported, original)
+        XCTAssertEqual(exhausted, original)
+        XCTAssertFalse(ProviderRuntime.shouldRetry(
+            error: original,
+            attempt: 1,
+            policy: policy))
+    }
+
     func testRetryAfterHeaderControlsRuntimeDelayAndCapsLongValues() {
         let hint = ProviderErrorFormatting.retryHint(headers: ["Retry-After": "3"])
         XCTAssertEqual(hint?.delaySeconds, 3)

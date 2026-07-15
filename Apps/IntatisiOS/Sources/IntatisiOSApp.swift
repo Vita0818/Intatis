@@ -251,7 +251,9 @@ struct IOSRootView: View {
                 .foregroundStyle(.red)
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
-                .background(.thinMaterial, in: Capsule())
+                .overlay {
+                    Capsule().stroke(Color.red.opacity(0.45), lineWidth: 1)
+                }
                 .padding(.top, 8)
         }
     }

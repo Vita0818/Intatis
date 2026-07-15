@@ -61,8 +61,7 @@ struct ArtifactProgressRow: View {
             ProgressView(value: clampedProgress)
         }
         .padding(8)
-        .background(Color.gray.opacity(0.08))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .intatisContentSurface(cornerRadius: 8)
     }
 
     private var clampedProgress: Double {
@@ -82,8 +81,7 @@ struct ArtifactCardView: View {
             }
         }
         .padding(8)
-        .background(Color.gray.opacity(0.08))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .intatisContentSurface(cornerRadius: 8)
     }
 
     @ViewBuilder private var content: some View {

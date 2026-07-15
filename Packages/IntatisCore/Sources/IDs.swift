@@ -62,6 +62,30 @@ public struct TaskID: TypedID {
     public static func new() -> TaskID { TaskID(rawValue: IDGen.random(prefix: "task")) }
 }
 
+/// Identifies a durable user-visible unit of planned work.
+///
+/// This is intentionally distinct from ``TaskID``, which identifies an
+/// execution-layer agent invocation.
+public struct WorkTaskID: TypedID {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public static func new() -> WorkTaskID { WorkTaskID(rawValue: IDGen.random(prefix: "wt")) }
+}
+
+/// Identifies a durable objective that can span multiple continuation runs.
+public struct GoalID: TypedID {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public static func new() -> GoalID { GoalID(rawValue: IDGen.random(prefix: "goal")) }
+}
+
+/// Identifies one ordinary turn or one continuation of a durable goal.
+public struct ContinuationRunID: TypedID {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public static func new() -> ContinuationRunID { ContinuationRunID(rawValue: IDGen.random(prefix: "run")) }
+}
+
 public struct TaskGroupID: TypedID {
     public let rawValue: String
     public init(rawValue: String) { self.rawValue = rawValue }

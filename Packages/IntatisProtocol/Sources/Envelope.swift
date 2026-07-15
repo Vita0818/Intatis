@@ -75,6 +75,8 @@ public struct Envelope: Codable, Equatable, Sendable {
             event = .agentMessage(try c.decode(AgentMessagePayload.self, forKey: .payload))
         case .agentMessageConsumed:
             event = .agentMessageConsumed(try c.decode(AgentMessageConsumedPayload.self, forKey: .payload))
+        case .agentMessageDiscarded:
+            event = .agentMessageDiscarded(try c.decode(AgentMessageDiscardedPayload.self, forKey: .payload))
         case .agentToAgentMessage:
             event = .agentToAgentMessage(try c.decode(AgentToAgentMessagePayload.self, forKey: .payload))
         case .informationRequested:
@@ -123,6 +125,70 @@ public struct Envelope: Codable, Equatable, Sendable {
             event = .taskCancelled(try c.decode(TaskCancelledPayload.self, forKey: .payload))
         case .taskRejected:
             event = .taskRejected(try c.decode(TaskRejectedPayload.self, forKey: .payload))
+        case .workTaskCreated:
+            event = .workTaskCreated(try c.decode(WorkTaskCreatedPayload.self, forKey: .payload))
+        case .workTaskUpdated:
+            event = .workTaskUpdated(try c.decode(WorkTaskUpdatedPayload.self, forKey: .payload))
+        case .workTaskOwnerChanged:
+            event = .workTaskOwnerChanged(try c.decode(WorkTaskOwnerChangedPayload.self, forKey: .payload))
+        case .workTaskDependencyChanged:
+            event = .workTaskDependencyChanged(try c.decode(WorkTaskDependencyChangedPayload.self, forKey: .payload))
+        case .workTaskReady:
+            event = .workTaskReady(try c.decode(WorkTaskReadyPayload.self, forKey: .payload))
+        case .workTaskStarted:
+            event = .workTaskStarted(try c.decode(WorkTaskStartedPayload.self, forKey: .payload))
+        case .workTaskProgressed:
+            event = .workTaskProgressed(try c.decode(WorkTaskProgressedPayload.self, forKey: .payload))
+        case .workTaskBlocked:
+            event = .workTaskBlocked(try c.decode(WorkTaskBlockedPayload.self, forKey: .payload))
+        case .workTaskCompleted:
+            event = .workTaskCompleted(try c.decode(WorkTaskCompletedPayload.self, forKey: .payload))
+        case .workTaskFailed:
+            event = .workTaskFailed(try c.decode(WorkTaskFailedPayload.self, forKey: .payload))
+        case .workTaskCancelled:
+            event = .workTaskCancelled(try c.decode(WorkTaskCancelledPayload.self, forKey: .payload))
+        case .workTaskInvocationLinked:
+            event = .workTaskInvocationLinked(try c.decode(WorkTaskInvocationLinkedPayload.self, forKey: .payload))
+        case .workTaskEvidenceAdded:
+            event = .workTaskEvidenceAdded(try c.decode(WorkTaskEvidenceAddedPayload.self, forKey: .payload))
+        case .workTaskCarriedForward:
+            event = .workTaskCarriedForward(try c.decode(WorkTaskCarriedForwardPayload.self, forKey: .payload))
+        case .goalCreated:
+            event = .goalCreated(try c.decode(GoalCreatedPayload.self, forKey: .payload))
+        case .goalEdited:
+            event = .goalEdited(try c.decode(GoalEditedPayload.self, forKey: .payload))
+        case .goalPaused:
+            event = .goalPaused(try c.decode(GoalPausedPayload.self, forKey: .payload))
+        case .goalResumed:
+            event = .goalResumed(try c.decode(GoalResumedPayload.self, forKey: .payload))
+        case .goalAuditCompleted:
+            event = .goalAuditCompleted(try c.decode(GoalAuditCompletedPayload.self, forKey: .payload))
+        case .goalContinuationScheduled:
+            event = .goalContinuationScheduled(try c.decode(GoalContinuationScheduledPayload.self, forKey: .payload))
+        case .goalProgressed:
+            event = .goalProgressed(try c.decode(GoalProgressedPayload.self, forKey: .payload))
+        case .goalBlocked:
+            event = .goalBlocked(try c.decode(GoalBlockedPayload.self, forKey: .payload))
+        case .goalBudgetLimited:
+            event = .goalBudgetLimited(try c.decode(GoalBudgetLimitedPayload.self, forKey: .payload))
+        case .goalUsageLimited:
+            event = .goalUsageLimited(try c.decode(GoalUsageLimitedPayload.self, forKey: .payload))
+        case .goalCompleted:
+            event = .goalCompleted(try c.decode(GoalCompletedPayload.self, forKey: .payload))
+        case .goalCleared:
+            event = .goalCleared(try c.decode(GoalClearedPayload.self, forKey: .payload))
+        case .continuationRunCreated:
+            event = .continuationRunCreated(try c.decode(ContinuationRunCreatedPayload.self, forKey: .payload))
+        case .continuationRunStarted:
+            event = .continuationRunStarted(try c.decode(ContinuationRunStartedPayload.self, forKey: .payload))
+        case .continuationRunCheckpointed:
+            event = .continuationRunCheckpointed(try c.decode(ContinuationRunCheckpointedPayload.self, forKey: .payload))
+        case .continuationRunCompleted:
+            event = .continuationRunCompleted(try c.decode(ContinuationRunCompletedPayload.self, forKey: .payload))
+        case .continuationRunCancelled:
+            event = .continuationRunCancelled(try c.decode(ContinuationRunCancelledPayload.self, forKey: .payload))
+        case .continuationRunRecovered:
+            event = .continuationRunRecovered(try c.decode(ContinuationRunRecoveredPayload.self, forKey: .payload))
         case .artifactAdded:
             event = .artifactAdded(try c.decode(ArtifactAddedPayload.self, forKey: .payload))
         case .artifactProgress:
@@ -159,6 +225,7 @@ public struct Envelope: Codable, Equatable, Sendable {
         case .agentSpawned(let p):        try c.encode(p, forKey: .payload)
         case .agentMessage(let p):        try c.encode(p, forKey: .payload)
         case .agentMessageConsumed(let p): try c.encode(p, forKey: .payload)
+        case .agentMessageDiscarded(let p): try c.encode(p, forKey: .payload)
         case .agentToAgentMessage(let p): try c.encode(p, forKey: .payload)
         case .informationRequested(let p): try c.encode(p, forKey: .payload)
         case .informationReplied(let p):   try c.encode(p, forKey: .payload)
@@ -183,6 +250,38 @@ public struct Envelope: Codable, Equatable, Sendable {
         case .taskFailed(let p):           try c.encode(p, forKey: .payload)
         case .taskCancelled(let p):        try c.encode(p, forKey: .payload)
         case .taskRejected(let p):         try c.encode(p, forKey: .payload)
+        case .workTaskCreated(let p):       try c.encode(p, forKey: .payload)
+        case .workTaskUpdated(let p):       try c.encode(p, forKey: .payload)
+        case .workTaskOwnerChanged(let p):  try c.encode(p, forKey: .payload)
+        case .workTaskDependencyChanged(let p): try c.encode(p, forKey: .payload)
+        case .workTaskReady(let p):         try c.encode(p, forKey: .payload)
+        case .workTaskStarted(let p):       try c.encode(p, forKey: .payload)
+        case .workTaskProgressed(let p):    try c.encode(p, forKey: .payload)
+        case .workTaskBlocked(let p):       try c.encode(p, forKey: .payload)
+        case .workTaskCompleted(let p):     try c.encode(p, forKey: .payload)
+        case .workTaskFailed(let p):        try c.encode(p, forKey: .payload)
+        case .workTaskCancelled(let p):     try c.encode(p, forKey: .payload)
+        case .workTaskInvocationLinked(let p): try c.encode(p, forKey: .payload)
+        case .workTaskEvidenceAdded(let p): try c.encode(p, forKey: .payload)
+        case .workTaskCarriedForward(let p): try c.encode(p, forKey: .payload)
+        case .goalCreated(let p):           try c.encode(p, forKey: .payload)
+        case .goalEdited(let p):            try c.encode(p, forKey: .payload)
+        case .goalPaused(let p):            try c.encode(p, forKey: .payload)
+        case .goalResumed(let p):           try c.encode(p, forKey: .payload)
+        case .goalAuditCompleted(let p):    try c.encode(p, forKey: .payload)
+        case .goalContinuationScheduled(let p): try c.encode(p, forKey: .payload)
+        case .goalProgressed(let p):        try c.encode(p, forKey: .payload)
+        case .goalBlocked(let p):           try c.encode(p, forKey: .payload)
+        case .goalBudgetLimited(let p):     try c.encode(p, forKey: .payload)
+        case .goalUsageLimited(let p):      try c.encode(p, forKey: .payload)
+        case .goalCompleted(let p):         try c.encode(p, forKey: .payload)
+        case .goalCleared(let p):           try c.encode(p, forKey: .payload)
+        case .continuationRunCreated(let p): try c.encode(p, forKey: .payload)
+        case .continuationRunStarted(let p): try c.encode(p, forKey: .payload)
+        case .continuationRunCheckpointed(let p): try c.encode(p, forKey: .payload)
+        case .continuationRunCompleted(let p): try c.encode(p, forKey: .payload)
+        case .continuationRunCancelled(let p): try c.encode(p, forKey: .payload)
+        case .continuationRunRecovered(let p): try c.encode(p, forKey: .payload)
         case .artifactAdded(let p):       try c.encode(p, forKey: .payload)
         case .artifactProgress(let p):    try c.encode(p, forKey: .payload)
         case .turnStats(let p):           try c.encode(p, forKey: .payload)

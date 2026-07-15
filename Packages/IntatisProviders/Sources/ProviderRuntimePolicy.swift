@@ -73,6 +73,9 @@ enum ProviderRuntime {
 
     static func exhausted(_ error: Error, attempts: Int, operation: String) -> Error {
         let normalized = ProviderErrorFormatting.transport(error)
+        if normalized is ProviderUsageLimitError {
+            return normalized
+        }
         guard attempts > 1 else { return normalized }
         let suffix = " Retried \(attempts - 1) time\(attempts == 2 ? "" : "s"); still failed."
         if let intatis = normalized as? IntatisError {
@@ -176,6 +179,7 @@ enum ProviderRuntime {
 
     private static func isRetryable(_ error: Error) -> Bool {
         if error is CancellationError { return false }
+        if error is ProviderUsageLimitError { return false }
         if let intatis = error as? IntatisError {
             switch intatis {
             case .cancelled, .config, .decoding, .permissionDenied, .notFound:

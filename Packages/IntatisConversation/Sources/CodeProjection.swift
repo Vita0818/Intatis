@@ -230,7 +230,7 @@ public struct CodeProjection: Equatable, Sendable {
             items.append(CodeItem(id: p.messageId.rawValue, kind: .agent,
                                   title: title, body: p.content))
 
-        case .agentMessageConsumed:
+        case .agentMessageConsumed, .agentMessageDiscarded:
             break
 
         case .agentToAgentMessage(let p):
@@ -341,7 +341,17 @@ public struct CodeProjection: Equatable, Sendable {
 
         case .toolExecutionPrepared, .toolExecutionSettled,
              .permissionRequest, .permissionReviewRequested, .permissionReviewSettled,
-             .agentStatus, .artifactProgress, .turnStats:
+             .agentStatus,
+             .workTaskCreated, .workTaskUpdated, .workTaskOwnerChanged, .workTaskDependencyChanged,
+             .workTaskReady, .workTaskStarted, .workTaskProgressed, .workTaskBlocked,
+             .workTaskCompleted, .workTaskFailed, .workTaskCancelled,
+             .workTaskInvocationLinked, .workTaskEvidenceAdded, .workTaskCarriedForward,
+             .goalCreated, .goalEdited, .goalPaused, .goalResumed, .goalAuditCompleted,
+             .goalContinuationScheduled, .goalProgressed, .goalBlocked,
+             .goalBudgetLimited, .goalUsageLimited, .goalCompleted, .goalCleared,
+             .continuationRunCreated, .continuationRunStarted, .continuationRunCheckpointed,
+             .continuationRunCompleted, .continuationRunCancelled, .continuationRunRecovered,
+             .artifactProgress, .turnStats:
             break
         }
     }

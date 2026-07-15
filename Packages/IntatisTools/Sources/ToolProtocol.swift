@@ -122,7 +122,8 @@ public protocol AgentMessenger: Sendable {
     func replyMessage(to agent: String, content: String, inReplyTo: String?) async -> String
     func requestDelegation(objective: String, reason: String) async -> String
     func delegateTask(to agent: String?,
-                      objective: String,
+                      workTaskID: WorkTaskID?,
+                      objective: String?,
                       roleHint: String?,
                       expectedDeliverable: String?) async -> String
 }
@@ -162,6 +163,8 @@ public struct ToolContext: Sendable {
     public let git: GitService
     public let messenger: AgentMessenger?
     public let agentManager: AgentManager?
+    public let workTaskManager: WorkTaskManager?
+    public let goalManager: GoalManager?
     public let imageGenerator: ImageGenerationToolService?
     public init(workspaceRoot: URL,
                 workspaceLease: WorkspaceLease? = nil,
@@ -171,6 +174,8 @@ public struct ToolContext: Sendable {
                 git: GitService = ProcessGitService(),
                 messenger: AgentMessenger? = nil,
                 agentManager: AgentManager? = nil,
+                workTaskManager: WorkTaskManager? = nil,
+                goalManager: GoalManager? = nil,
                 imageGenerator: ImageGenerationToolService? = nil) {
         let effectiveLease = workspaceLease ?? WorkspaceLease(
             rootPath: workspaceRoot.resolvingSymlinksInPath().standardizedFileURL.path,
@@ -221,6 +226,8 @@ public struct ToolContext: Sendable {
         }
         self.messenger = messenger
         self.agentManager = agentManager
+        self.workTaskManager = workTaskManager
+        self.goalManager = goalManager
         self.imageGenerator = imageGenerator
     }
 }

@@ -91,6 +91,8 @@ private enum CommunicationOperation: Equatable, Sendable {
 private struct RootInvocationContext: Sendable {
     var images: [ImageAttachment]
     var userMessage: UserMessagePayload?
+    var recordUserMessage: Bool
+    var explicitGoalIntent: Bool
 }
 
 private struct AgentRunResult: Sendable {
@@ -212,6 +214,15 @@ private func withTaskTimeout<T: Sendable>(
 public actor Orchestrator {
     public static let mainAgentID = AgentID(rawValue: "main")
     public static let automaticPermissionReviewerID = AgentID(rawValue: "permission-reviewer")
+    private static let carryForwardBlockerPrefix = "carry-forward blocked: "
+
+    private struct GoalRunCancellationScope: Hashable, Sendable {
+        var goalID: GoalID
+        /// `nil` is a temporary Goal-wide fence used while an exact set of
+        /// interrupted runs is being drained. It is removed only after durable
+        /// cancellation succeeds; exact run tombstones remain permanently.
+        var runID: ContinuationRunID?
+    }
 
     private let log: EventLog
     /// Retained for the runtime lifetime. The public runtime initializer
@@ -234,22 +245,43 @@ public actor Orchestrator {
     private var defaultWorkspaceLeaseIDs: [AgentID: WorkspaceLeaseID]
     private var scheduler: AgentScheduler
     private var taskGraph: TaskGraph
+    private var workTaskGraph: WorkTaskGraph
+    /// Non-nil when durable WorkTask recovery failed global graph validation.
+    /// The runtime keeps the planning graph empty and rejects its control plane
+    /// until a subsequent restore observes a valid durable graph.
+    private var workTaskRecoveryFailure: String?
     private var scheduledReplyTargets: [TaskID: AgentID]
     private var scheduledReplyFormats: [TaskID: ScheduledReplyFormat]
     private var scheduledReplyResults: [TaskID: String]
     private var spawnedAgentOwners: [AgentID: AgentID]
+    /// Actor-reentrant `delegate_task(to: auto)` calls reserve their selected
+    /// worker before mediation/admission awaits. This preserves true parallel
+    /// dispatch instead of letting concurrent calls observe the same idle
+    /// worker and serialize behind per-agent single flight.
+    private var automaticDelegationReservations: Set<AgentID>
     private var executionPolicy: CoworkExecutionPolicy
     private var runningExecutions: [TaskID: Task<Void, Never>]
     private var resultWaiters: [TaskID: [CheckedContinuation<String?, Never>]]
     private var idleWaiters: [CheckedContinuation<Void, Never>]
     private var rootInvocations: [TaskID: RootInvocationContext]
     private var cancellationReasons: [TaskID: String]
+    /// In-process admission tombstones close the race between a Goal-scoped
+    /// cancel snapshot and a root invocation that is still awaiting durable
+    /// queue admission. ContinuationRun IDs are never reused, so tombstones can
+    /// safely live for the session lifetime.
+    private var cancelledGoalRunScopes: Set<GoalRunCancellationScope>
+    private var providerUsageLimitFailures: [ContinuationRunID: (GoalID, String)]
     private var restoredPendingTaskIDs: Set<TaskID>
     private var consumedTokenCount: Int
     /// One actor for the full Cowork session lifetime. Its optional limit is
     /// reconfigured in place; it is never swapped when policy changes.
     private let tokenBudgetMeter: AgentTokenBudgetMeter
     private var schedulerSuspensionTokens: Set<UUID>
+    /// Restore leaves this suspension held across host-side identity,
+    /// permission-reviewer, and Goal recovery. Only an explicit
+    /// `resumePendingTasks` releases it, so incidental attach/mailbox/policy
+    /// operations cannot wake replayed work before recovery is safe.
+    private var startupSchedulerSuspension: UUID?
     private var schedulerResumeRequested: Bool
     private var schedulerSuspended: Bool { !schedulerSuspensionTokens.isEmpty }
     private let reasoningEffort: ReasoningEffort?
@@ -339,20 +371,26 @@ public actor Orchestrator {
         self.defaultWorkspaceLeaseIDs = [:]
         self.scheduler = AgentScheduler()
         self.taskGraph = TaskGraph(policy: taskGraphPolicy)
+        self.workTaskGraph = WorkTaskGraph()
+        self.workTaskRecoveryFailure = nil
         self.scheduledReplyTargets = [:]
         self.scheduledReplyFormats = [:]
         self.scheduledReplyResults = [:]
         self.spawnedAgentOwners = [:]
+        self.automaticDelegationReservations = []
         self.executionPolicy = executionPolicy
         self.runningExecutions = [:]
         self.resultWaiters = [:]
         self.idleWaiters = []
         self.rootInvocations = [:]
         self.cancellationReasons = [:]
+        self.cancelledGoalRunScopes = []
+        self.providerUsageLimitFailures = [:]
         self.restoredPendingTaskIDs = []
         self.consumedTokenCount = 0
         self.tokenBudgetMeter = AgentTokenBudgetMeter(limit: executionPolicy.tokenBudget)
         self.schedulerSuspensionTokens = []
+        self.startupSchedulerSuspension = nil
         self.schedulerResumeRequested = false
         self.reasoningEffort = reasoningEffort
         self.includeUsage = includeUsage || executionPolicy.tokenBudget != nil
@@ -1013,12 +1051,50 @@ public actor Orchestrator {
     }
 
     public func restore(from _: CoworkProjection) async {
-        let schedulerSuspension = suspendScheduler()
+        if startupSchedulerSuspension == nil {
+            startupSchedulerSuspension = suspendScheduler()
+        }
+        let restoreSuspension = suspendScheduler()
+        // Restore owns the same mutation boundary as task_create,
+        // task_update, delegation admission, and invocation settlement. Actor
+        // isolation alone is insufficient because replay and persistence await.
+        await acquireAdmissionLock()
         terminalPersistenceFailures.removeAll()
         terminalCommitTaskIDs.removeAll()
+        cancelledGoalRunScopes.removeAll()
+        automaticDelegationReservations.removeAll()
+        providerUsageLimitFailures.removeAll()
         automaticPermissionReviewRecoveryFailure = nil
+        workTaskRecoveryFailure = nil
         var events = await log.replay()
         var projection = CoworkProjection.build(from: events)
+        let auditedRunIDs = Set(events.compactMap { envelope -> ContinuationRunID? in
+            guard case .goalAuditCompleted(let payload) = envelope.event else { return nil }
+            return payload.runID
+        })
+        for envelope in events {
+            guard case .taskFailed(let payload) = envelope.event,
+                  payload.failureCode == .providerUsageLimit,
+                  let contract = projection.tasks[payload.taskID]?.contract,
+                  let goalID = contract.goalID,
+                  let runID = contract.continuationRunID,
+                  projection.currentGoalID == goalID,
+                  projection.goals[goalID]?.status != .completed,
+                  !auditedRunIDs.contains(runID) else { continue }
+            providerUsageLimitFailures[runID] = (goalID, payload.error)
+        }
+        // Planning state is restored before execution-layer reconciliation so
+        // every recovered invocation can be checked against its durable
+        // WorkTask/run/goal binding.
+        switch validatedRestoredWorkTaskGraph(from: projection) {
+        case .success(let restored):
+            workTaskGraph = restored
+        case .failure(let violation):
+            await failClosedWorkTaskRestore(violation)
+            releaseAdmissionLock()
+            resumeScheduler(suspension: restoreSuspension, ensureRunning: false)
+            return
+        }
         let staleReviewerCapabilityLeaseIDs = projection.capabilityLeaseAgents
             .compactMap { $0.value == Self.automaticPermissionReviewerID ? $0.key : nil }
             .sorted { $0.rawValue < $1.rawValue }
@@ -1058,6 +1134,15 @@ public actor Orchestrator {
                 try await appendAdmissionEvents(cleanupEvents)
                 events = await log.replay()
                 projection = CoworkProjection.build(from: events)
+                switch validatedRestoredWorkTaskGraph(from: projection) {
+                case .success(let restored):
+                    workTaskGraph = restored
+                case .failure(let violation):
+                    await failClosedWorkTaskRestore(violation)
+                    releaseAdmissionLock()
+                    resumeScheduler(suspension: restoreSuspension, ensureRunning: false)
+                    return
+                }
             } catch {
                 let message = "stale automatic permission reviewer cleanup could not be persisted: \(error.localizedDescription)"
                 automaticPermissionReviewRecoveryFailure = message
@@ -1066,6 +1151,9 @@ public actor Orchestrator {
                     message: message)))
             }
         }
+        // No later restore phase mutates WorkTaskGraph. Release before mailbox
+        // reconciliation, which can take the admission lock for wake tasks.
+        releaseAdmissionLock()
         var durableCapabilityGrants: [CapabilityLeaseID: CapabilityLease] = [:]
         var durableWorkspaceGrants: [WorkspaceLeaseID: WorkspaceLease] = [:]
         capabilityLeaseHistory = [:]
@@ -1373,7 +1461,7 @@ public actor Orchestrator {
         for agentID in recoveredMailboxes.keys.sorted(by: { $0.rawValue < $1.rawValue }) {
             await enqueuePendingMailboxWakeIfNeeded(for: agentID)
         }
-        resumeScheduler(suspension: schedulerSuspension, ensureRunning: false)
+        resumeScheduler(suspension: restoreSuspension, ensureRunning: false)
     }
 
     /// Route a user message to the explicit target, or to the first attached agent
@@ -1382,7 +1470,17 @@ public actor Orchestrator {
     public func send(_ text: String,
                      to: AgentID? = nil,
                      images: [ImageAttachment] = [],
-                     userMessage: UserMessagePayload? = nil) async -> OrchestratorSendResult {
+                     userMessage: UserMessagePayload? = nil,
+                     goalID: GoalID? = nil,
+                     continuationRunID: ContinuationRunID? = nil,
+                     recordUserMessage: Bool = true,
+                     explicitGoalIntent: Bool = false) async -> OrchestratorSendResult {
+        guard !Task.isCancelled,
+              !isGoalRunCancellationRequested(
+                goalID: goalID,
+                continuationRunID: continuationRunID) else {
+            return .failed("Goal continuation was cancelled before root task admission.")
+        }
         let agent: Agent
         if let to {
             guard to != Self.automaticPermissionReviewerID else {
@@ -1410,7 +1508,9 @@ public actor Orchestrator {
             assignee: agent.name,
             objective: text,
             roleHint: "root task coordinator",
-            expectedDeliverable: "Coordinate assigned subtasks and synthesize the result."),
+            expectedDeliverable: "Coordinate assigned subtasks and synthesize the result.",
+            goalID: goalID,
+            continuationRunID: continuationRunID),
               let rootNode = taskGraph.node(rootTaskID) else {
             return .failed("Could not create the root task.")
         }
@@ -1426,7 +1526,26 @@ public actor Orchestrator {
             hopCount: 0,
             visitedAgents: [agent.name],
             attempt: 1)
+        if Task.isCancelled || isGoalRunCancellationRequested(
+            goalID: goalID,
+            continuationRunID: continuationRunID) {
+            _ = await cancelUnqueuedRootTask(
+                scheduled,
+                reason: "Goal continuation was cancelled before root task queue admission")
+            return .failed("Goal continuation was cancelled before root task admission.")
+        }
         await acquireAdmissionLock()
+        if Task.isCancelled || isGoalRunCancellationRequested(
+            goalID: goalID,
+            continuationRunID: continuationRunID) {
+            let persisted = await cancelUnqueuedRootTask(
+                scheduled,
+                reason: "Goal continuation was cancelled while waiting for root task queue admission")
+            releaseAdmissionLock()
+            return .failed(persisted
+                ? "Goal continuation was cancelled before root task admission."
+                : "Goal continuation cancellation could not be persisted.")
+        }
         var preflightScheduler = scheduler
         guard preflightScheduler.enqueue(scheduled, mode: .newTask).accepted,
               taskGraph.node(rootTaskID)?.status == .assigned else {
@@ -1475,11 +1594,26 @@ public actor Orchestrator {
             releaseAdmissionLock()
             return .failed(message)
         }
+        if Task.isCancelled || isGoalRunCancellationRequested(
+            goalID: goalID,
+            continuationRunID: continuationRunID) {
+            let persisted = await cancelUnqueuedRootTask(
+                scheduled,
+                reason: "Goal continuation was cancelled during durable root task admission")
+            releaseAdmissionLock()
+            return .failed(persisted
+                ? "Goal continuation was cancelled before root task execution."
+                : "Goal continuation cancellation could not be persisted.")
+        }
         guard scheduler.enqueue(scheduled, mode: .newTask).accepted else {
             releaseAdmissionLock()
             return .failed("Root task scheduler commit failed after durable admission.")
         }
-        rootInvocations[rootTaskID] = RootInvocationContext(images: images, userMessage: userMessage)
+        rootInvocations[rootTaskID] = RootInvocationContext(
+            images: images,
+            userMessage: userMessage,
+            recordUserMessage: recordUserMessage,
+            explicitGoalIntent: explicitGoalIntent)
         _ = taskGraph.updateStatus(taskID: rootTaskID, status: .queued)
         releaseAdmissionLock()
         ensureSchedulerRunning()
@@ -1536,6 +1670,11 @@ public actor Orchestrator {
         }
         guard let currentTask = scheduler.knownTask(taskID: taskID) else {
             return .rejected("This task cannot be retried because its scheduler state is missing.")
+        }
+        guard !isGoalRunCancellationRequested(
+            goalID: currentTask.contract.goalID,
+            continuationRunID: currentTask.contract.continuationRunID) else {
+            return .rejected("Goal continuation cancellation is pending; this task cannot be retried.")
         }
         let assignee = currentTask.assignee
         guard assignee != Self.automaticPermissionReviewerID else {
@@ -1700,14 +1839,22 @@ public actor Orchestrator {
                 attempt: task.attempt,
                 metadata: metadata)))
         } catch {
+            terminalPersistenceFailures[taskID] =
+                "Task cancellation could not be persisted: \(error.localizedDescription)"
             if wasClaimed {
                 _ = scheduler.requeueClaimedTask(taskID: taskID)
             }
+            // The task remains durably non-terminal and retryable, but this
+            // in-flight caller must fail closed instead of waiting forever for
+            // a terminal scheduler record that could not be persisted.
+            completeResultWaiters(taskID)
             try? await log.append(.error(ErrorPayload(
                 code: "terminal_persistence_failed",
                 message: "Could not persist cancellation for task \(taskID.rawValue): \(error.localizedDescription)")))
             return false
         }
+
+        terminalPersistenceFailures.removeValue(forKey: taskID)
 
         if wasClaimed {
             runningExecutions[taskID]?.cancel()
@@ -1736,6 +1883,114 @@ public actor Orchestrator {
         await cancelAll(reason: reason, shutdownPermissionReviewer: false)
     }
 
+    /// Cancels only data-plane work belonging to one Goal (and optionally one
+    /// continuation run), preserving unrelated session work and the automatic
+    /// permission reviewer.
+    @discardableResult
+    public func cancelActiveTasks(goalID: GoalID,
+                                  continuationRunID: ContinuationRunID? = nil,
+                                  reason: String = "Goal continuation cancelled",
+                                  resumePendingTasksOnSuccess: Bool = true) async -> Bool {
+        let cancellationScope = GoalRunCancellationScope(
+            goalID: goalID,
+            runID: continuationRunID)
+        cancelledGoalRunScopes.insert(cancellationScope)
+        let schedulerSuspension = suspendScheduler()
+        // Wait for any root/delegation admission that was already inside its
+        // persistence transaction. New admissions for this exact run observe
+        // the tombstone above and settle cancelled before scheduler commit.
+        await acquireAdmissionLock()
+        releaseAdmissionLock()
+        var cancellationSucceeded = true
+        var attemptedTaskIDs = Set<TaskID>()
+        var previousRemainder: [TaskID]?
+        while true {
+            let scoped = scopedScheduledTaskIDs(
+                goalID: goalID,
+                continuationRunID: continuationRunID)
+            guard !scoped.isEmpty else { break }
+            attemptedTaskIDs.formUnion(scoped)
+            let executions = scoped.compactMap { runningExecutions[$0] }
+            for taskID in scoped {
+                _ = await cancel(taskID: taskID, reason: reason)
+            }
+            for execution in executions { await execution.value }
+
+            let remainder = scopedScheduledTaskIDs(
+                goalID: goalID,
+                continuationRunID: continuationRunID)
+            guard !remainder.isEmpty else { break }
+            // Persistence failure can leave an un-cancellable task in place.
+            // Fail closed without spinning forever; `cancel` already emitted a
+            // durable error and the scheduler remains suspended until below.
+            if remainder == previousRemainder, executions.isEmpty {
+                cancellationSucceeded = false
+                break
+            }
+            previousRemainder = remainder
+        }
+        if attemptedTaskIDs.contains(where: { terminalPersistenceFailures[$0] != nil }) {
+            cancellationSucceeded = false
+        }
+        // Admission can persist TaskCreated/TaskAssigned before queue commit.
+        // If the compensating cancellation failed, the nonterminal node is not
+        // visible to the scheduler snapshot. Retry those durable graph-only
+        // cancellations explicitly so a transient persistence failure cannot
+        // make this Goal/run permanently un-stoppable.
+        let scheduledIDs = Set(scopedScheduledTaskIDs(
+            goalID: goalID,
+            continuationRunID: continuationRunID))
+        let graphOnlyNodes = taskGraph.nodes.values
+            .filter {
+                Self.matchesScope(
+                    $0.contract,
+                    goalID: goalID,
+                    continuationRunID: continuationRunID)
+                    && !$0.status.isTerminal
+                    && !scheduledIDs.contains($0.id)
+                    && runningExecutions[$0.id] == nil
+            }
+            .sorted { $0.id.rawValue < $1.id.rawValue }
+        for node in graphOnlyNodes {
+            attemptedTaskIDs.insert(node.id)
+            let cancelled = await cancelUnqueuedRootTask(
+                scheduledTask(for: node),
+                reason: reason)
+            cancellationSucceeded = cancellationSucceeded && cancelled
+        }
+        let discardedScopedMessages = await discardPendingMessages(
+            goalID: goalID,
+            continuationRunID: continuationRunID,
+            reason: reason)
+        cancellationSucceeded = cancellationSucceeded && discardedScopedMessages
+        let scopedGraphNodes = taskGraph.nodes.values.filter {
+            Self.matchesScope(
+                $0.contract,
+                goalID: goalID,
+                continuationRunID: continuationRunID)
+        }
+        if scopedGraphNodes.contains(where: { !$0.status.isTerminal })
+            || scopedGraphNodes.contains(where: {
+                terminalPersistenceFailures[$0.id] != nil
+            }) {
+            cancellationSucceeded = false
+        }
+        let finalRemainder = scopedScheduledTaskIDs(
+            goalID: goalID,
+            continuationRunID: continuationRunID)
+        if !finalRemainder.isEmpty {
+            cancellationSucceeded = false
+        }
+        if cancellationSucceeded, continuationRunID == nil {
+            cancelledGoalRunScopes.remove(cancellationScope)
+        }
+        resumeScheduler(
+            suspension: schedulerSuspension,
+            ensureRunning: cancellationSucceeded && resumePendingTasksOnSuccess)
+        notifyIdleIfNeeded()
+        return cancellationSucceeded
+    }
+
     private func cancelAll(reason: String,
                            shutdownPermissionReviewer: Bool) async {
         let schedulerSuspension = suspendScheduler()
@@ -1759,12 +2014,22 @@ public actor Orchestrator {
         notifyIdleIfNeeded()
     }
 
-    public func resumePendingTasks() {
+    @discardableResult
+    public func resumePendingTasks() -> Bool {
+        guard !Task.isCancelled else { return false }
+        if let startupSchedulerSuspension {
+            self.startupSchedulerSuspension = nil
+            resumeScheduler(
+                suspension: startupSchedulerSuspension,
+                ensureRunning: true)
+            return true
+        }
         if schedulerSuspended {
             schedulerResumeRequested = true
         } else {
             ensureSchedulerRunning()
         }
+        return true
     }
 
     public func updateExecutionPolicy(_ policy: CoworkExecutionPolicy) async {
@@ -1837,13 +2102,27 @@ public actor Orchestrator {
             return "@\(Self.automaticPermissionReviewerID.rawValue) is reserved for automatic permission review"
         }
         guard registry.agent(to) != nil else { return "no such agent: \(toName)" }
+        if let cancellationFailure = communicationCancellationFailure(taskID: taskID) {
+            return "error: \(cancellationFailure)"
+        }
         if let failure = communicationFailure(from: from, to: to, taskID: taskID, operation: .send) {
             return "error: \(failure)"
         }
+
+        await acquireAdmissionLock()
+        if let cancellationFailure = communicationCancellationFailure(taskID: taskID) {
+            releaseAdmissionLock()
+            return "error: \(cancellationFailure)"
+        }
+        if let failure = communicationFailure(from: from, to: to, taskID: taskID, operation: .send) {
+            releaseAdmissionLock()
+            return "error: \(failure)"
+        }
         guard let payload = await bus.sendMessage(from: from, to: to, content: content, taskID: taskID) else {
+            releaseAdmissionLock()
             return "your message was blocked by the mediator"
         }
-        _ = scheduler.enqueueMessage(PendingAgentMessage(
+        let message = PendingAgentMessage(
             id: payload.messageId,
             sender: from,
             recipient: to,
@@ -1851,7 +2130,15 @@ public actor Orchestrator {
             kind: AgentCommunicationKind.sendMessage.rawValue,
             taskID: taskID,
             causalParentID: taskID,
-            inReplyTo: payload.inReplyTo))
+            inReplyTo: payload.inReplyTo)
+        _ = scheduler.enqueueMessage(message)
+        if let cancellationFailure = await settleLateCancelledCommunication(
+            message,
+            taskID: taskID) {
+            releaseAdmissionLock()
+            return "error: \(cancellationFailure)"
+        }
+        releaseAdmissionLock()
         await enqueueMailboxWakeTask(sender: from, recipient: to, causalTaskID: taskID)
         return "sent message to @\(to.rawValue)"
     }
@@ -1864,6 +2151,9 @@ public actor Orchestrator {
             return "@\(Self.automaticPermissionReviewerID.rawValue) is reserved for automatic permission review"
         }
         guard registry.agent(to) != nil else { return "no such agent: \(toName)" }
+        if let cancellationFailure = communicationCancellationFailure(taskID: taskID) {
+            return "error: \(cancellationFailure)"
+        }
         if let failure = communicationFailure(
             from: from,
             to: to,
@@ -1871,21 +2161,44 @@ public actor Orchestrator {
             operation: .requestInformation) {
             return "error: \(failure)"
         }
+
+        await acquireAdmissionLock()
+        if let cancellationFailure = communicationCancellationFailure(taskID: taskID) {
+            releaseAdmissionLock()
+            return "error: \(cancellationFailure)"
+        }
+        if let failure = communicationFailure(
+            from: from,
+            to: to,
+            taskID: taskID,
+            operation: .requestInformation) {
+            releaseAdmissionLock()
+            return "error: \(failure)"
+        }
         guard let payload = await bus.requestInformation(
             from: from,
             to: to,
             question: question,
             taskID: taskID) else {
+            releaseAdmissionLock()
             return "your information request was blocked by the mediator"
         }
-        _ = scheduler.enqueueMessage(PendingAgentMessage(
+        let message = PendingAgentMessage(
             id: payload.requestID,
             sender: from,
             recipient: to,
             content: payload.question,
             kind: AgentCommunicationKind.requestInformation.rawValue,
             taskID: taskID,
-            causalParentID: taskID))
+            causalParentID: taskID)
+        _ = scheduler.enqueueMessage(message)
+        if let cancellationFailure = await settleLateCancelledCommunication(
+            message,
+            taskID: taskID) {
+            releaseAdmissionLock()
+            return "error: \(cancellationFailure)"
+        }
+        releaseAdmissionLock()
         await enqueueMailboxWakeTask(sender: from, recipient: to, causalTaskID: taskID)
         return "requested information from @\(to.rawValue)"
     }
@@ -1898,7 +2211,20 @@ public actor Orchestrator {
             return "@\(Self.automaticPermissionReviewerID.rawValue) is reserved for automatic permission review"
         }
         guard registry.agent(to) != nil else { return "no such agent: \(toName)" }
+        if let cancellationFailure = communicationCancellationFailure(taskID: taskID) {
+            return "error: \(cancellationFailure)"
+        }
         if let failure = communicationFailure(from: from, to: to, taskID: taskID, operation: .reply) {
+            return "error: \(failure)"
+        }
+
+        await acquireAdmissionLock()
+        if let cancellationFailure = communicationCancellationFailure(taskID: taskID) {
+            releaseAdmissionLock()
+            return "error: \(cancellationFailure)"
+        }
+        if let failure = communicationFailure(from: from, to: to, taskID: taskID, operation: .reply) {
+            releaseAdmissionLock()
             return "error: \(failure)"
         }
         let replyID = inReplyTo.map { MessageID(rawValue: $0) }
@@ -1908,9 +2234,10 @@ public actor Orchestrator {
             content: content,
             inReplyTo: replyID,
             taskID: taskID) else {
+            releaseAdmissionLock()
             return "your reply was blocked by the mediator"
         }
-        _ = scheduler.enqueueMessage(PendingAgentMessage(
+        let message = PendingAgentMessage(
             id: payload.replyID,
             sender: from,
             recipient: to,
@@ -1918,7 +2245,15 @@ public actor Orchestrator {
             kind: AgentCommunicationKind.replyMessage.rawValue,
             taskID: taskID,
             causalParentID: taskID,
-            inReplyTo: payload.inReplyTo))
+            inReplyTo: payload.inReplyTo)
+        _ = scheduler.enqueueMessage(message)
+        if let cancellationFailure = await settleLateCancelledCommunication(
+            message,
+            taskID: taskID) {
+            releaseAdmissionLock()
+            return "error: \(cancellationFailure)"
+        }
+        releaseAdmissionLock()
         await enqueueMailboxWakeTask(sender: from, recipient: to, causalTaskID: taskID)
         return "replied to @\(to.rawValue)"
     }
@@ -1928,6 +2263,9 @@ public actor Orchestrator {
               let currentTask = taskGraph.node(parentTaskID),
               let recipient = currentTask.issuer else {
             return "error: delegation request has no assigning agent"
+        }
+        if let cancellationFailure = communicationCancellationFailure(taskID: parentTaskID) {
+            return "error: \(cancellationFailure)"
         }
         guard let lease = existingCapabilityLease(for: from, taskID: parentTaskID) else {
             return "error: delegation lease unavailable"
@@ -1941,6 +2279,34 @@ public actor Orchestrator {
         case .none:
             return "error: requesting delegation is not granted for the current task"
         }
+
+        await acquireAdmissionLock()
+        if let cancellationFailure = communicationCancellationFailure(taskID: parentTaskID) {
+            releaseAdmissionLock()
+            return "error: \(cancellationFailure)"
+        }
+        guard let currentTask = taskGraph.node(parentTaskID),
+              let currentRecipient = currentTask.issuer,
+              currentRecipient == recipient else {
+            releaseAdmissionLock()
+            return "error: delegation request has no assigning agent"
+        }
+        guard let currentLease = existingCapabilityLease(for: from, taskID: parentTaskID) else {
+            releaseAdmissionLock()
+            return "error: delegation lease unavailable"
+        }
+        guard currentLease.tools.contains(.requestDelegation) else {
+            releaseAdmissionLock()
+            return "error: requesting delegation is not granted for the current task"
+        }
+        switch currentLease.delegation {
+        case .requestOnly, .granted:
+            break
+        case .none:
+            releaseAdmissionLock()
+            return "error: requesting delegation is not granted for the current task"
+        }
+
         let trimmedObjective = objective.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedReason = reason.trimmingCharacters(in: .whitespacesAndNewlines)
         let requestID = RequestID.new()
@@ -1954,6 +2320,7 @@ public actor Orchestrator {
             content: content,
             taskID: parentTaskID,
             messageID: messageID) else {
+            releaseAdmissionLock()
             return "your delegation request was blocked by the mediator"
         }
         try? await log.append(.delegationRequested(DelegationRequestedPayload(
@@ -1971,14 +2338,22 @@ public actor Orchestrator {
                 agentID: from,
                 scope: .task,
                 visibility: .task))))
-        _ = scheduler.enqueueMessage(PendingAgentMessage(
+        let pendingMessage = PendingAgentMessage(
             id: message.messageId,
             sender: from,
             recipient: recipient,
             content: message.content,
             kind: "request_delegation",
             taskID: parentTaskID,
-            causalParentID: parentTaskID))
+            causalParentID: parentTaskID)
+        _ = scheduler.enqueueMessage(pendingMessage)
+        if let cancellationFailure = await settleLateCancelledCommunication(
+            pendingMessage,
+            taskID: parentTaskID) {
+            releaseAdmissionLock()
+            return "error: \(cancellationFailure)"
+        }
+        releaseAdmissionLock()
         await enqueueMailboxWakeTask(sender: from, recipient: recipient, causalTaskID: parentTaskID)
         return "delegation request delivered to @\(recipient.rawValue)"
     }
@@ -2002,10 +2377,24 @@ public actor Orchestrator {
         await acquireAdmissionLock()
         defer { releaseAdmissionLock() }
         guard let target = registry.agent(recipient) else { return }
+        let causalContract = causalTaskID.flatMap {
+            taskGraph.node($0)?.contract ?? scheduler.knownTask(taskID: $0)?.contract
+        }
+        guard !isGoalRunCancellationRequested(
+            goalID: causalContract?.goalID,
+            continuationRunID: causalContract?.continuationRunID) else {
+            return
+        }
         let alreadyScheduled = scheduler.queuedTasks().contains {
-            $0.assignee == recipient && $0.contract.kind == .mailboxDelivery
+            $0.assignee == recipient
+                && $0.contract.kind == .mailboxDelivery
+                && $0.contract.goalID == causalContract?.goalID
+                && $0.contract.continuationRunID == causalContract?.continuationRunID
         } || scheduler.currentlyClaimedTasks().contains {
-            $0.assignee == recipient && $0.contract.kind == .mailboxDelivery
+            $0.assignee == recipient
+                && $0.contract.kind == .mailboxDelivery
+                && $0.contract.goalID == causalContract?.goalID
+                && $0.contract.continuationRunID == causalContract?.continuationRunID
         }
         guard !alreadyScheduled else {
             ensureSchedulerRunning()
@@ -2019,6 +2408,7 @@ public actor Orchestrator {
             roleHint: "mailbox responder",
             expectedDeliverable: "Handle each pending message using the appropriate reply or task tool.",
             parentTaskID: nil,
+            scopeContract: causalContract,
             replyMode: .none)
         prepared.contract.kind = .mailboxDelivery
         prepared.contract.relatedTasks = causalTaskID.map { [$0] } ?? []
@@ -2091,7 +2481,9 @@ public actor Orchestrator {
     func createRootTask(assignee: AgentID,
                         objective: String,
                         roleHint: String = "root task coordinator",
-                        expectedDeliverable: String = "Coordinate assigned subtasks and synthesize the result.") async -> TaskID? {
+                        expectedDeliverable: String = "Coordinate assigned subtasks and synthesize the result.",
+                        goalID: GoalID? = nil,
+                        continuationRunID: ContinuationRunID? = nil) async -> TaskID? {
         guard assignee != Self.automaticPermissionReviewerID else { return nil }
         await acquireAdmissionLock()
         defer { releaseAdmissionLock() }
@@ -2104,6 +2496,8 @@ public actor Orchestrator {
             kind: .root,
             issuer: nil,
             assignee: agent.name,
+            continuationRunID: continuationRunID,
+            goalID: goalID,
             objective: objective.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty ?? "Coordinate the cowork task.",
             roleHint: roleHint,
             expectedDeliverable: expectedDeliverable,
@@ -2157,10 +2551,21 @@ public actor Orchestrator {
 
     func delegateTask(from: AgentID,
                       to requestedTarget: String?,
-                      objective: String,
+                      workTaskID: WorkTaskID? = nil,
+                      objective: String? = nil,
                       roleHint: String? = nil,
                       expectedDeliverable: String? = nil,
                       parentTaskID: TaskID? = nil) async -> String {
+        let durableTask = workTaskID.flatMap { workTaskGraph.task($0) }
+        if let workTaskID, durableTask == nil {
+            return "error: no WorkTask named " + workTaskID.rawValue
+        }
+        let suppliedObjective = objective?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfEmpty
+        guard let effectiveObjective = suppliedObjective ?? durableTask?.description.nilIfEmpty else {
+            return "error: delegate_task requires a ready WorkTask or a non-empty legacy objective"
+        }
         guard let resolution = await resolveDelegationTarget(
             requestedBy: from,
             currentTaskID: parentTaskID,
@@ -2168,12 +2573,22 @@ public actor Orchestrator {
             return "error: no delegation worker is available and Intatis could not create one"
         }
         let target = resolution.agent
+        defer {
+            if resolution.automaticallyReserved {
+                automaticDelegationReservations.remove(target)
+            }
+        }
         let queued = await enqueueDelegatedTask(
             from: from,
             to: target.rawValue,
-            objective: objective,
+            workTaskID: workTaskID,
+            objective: effectiveObjective,
             roleHint: roleHint,
-            expectedDeliverable: expectedDeliverable,
+            expectedDeliverable: expectedDeliverable ?? durableTask.map {
+                $0.acceptanceCriteria.isEmpty
+                    ? "Return a candidate result for WorkTask " + $0.id.rawValue + "."
+                    : $0.acceptanceCriteria.joined(separator: "; ")
+            },
             parentTaskID: parentTaskID,
             replyMode: .taskReport)
         guard let taskID = queued.taskID else {
@@ -2188,12 +2603,17 @@ public actor Orchestrator {
         scheduledReplyFormats[taskID] = .taskReport
         ensureSchedulerRunning()
         let report = await awaitSchedulerResult(taskID) ?? queued.message
-        return "task_id=\(taskID.rawValue) agent_id=@\(target.rawValue)\n\(report)"
+        let binding = workTaskID.map { " work_task_id=\($0.rawValue)" } ?? ""
+        return "task_id=\(taskID.rawValue)\(binding) agent_id=@\(target.rawValue)\n\(report)"
     }
 
     private func resolveDelegationTarget(requestedBy: AgentID,
                                          currentTaskID: TaskID?,
-                                         requestedTarget: String?) async -> (agent: AgentID, createdForDelegation: Bool)? {
+                                         requestedTarget: String?) async -> (
+        agent: AgentID,
+        createdForDelegation: Bool,
+        automaticallyReserved: Bool
+    )? {
         guard let requester = registry.agent(requestedBy) else { return nil }
         let normalized = requestedTarget.map(Self.normalizedAgentName)
             .flatMap { $0.isEmpty || $0.lowercased() == "auto" ? nil : $0 }
@@ -2202,7 +2622,7 @@ public actor Orchestrator {
             guard requestedID != Self.mainAgentID,
                   requestedID != Self.automaticPermissionReviewerID else { return nil }
             if registry.agent(requestedID) != nil {
-                return (requestedID, false)
+                return (requestedID, false, false)
             }
             let spawned = await spawnFromTool(
                 requestedBy: requestedBy,
@@ -2212,7 +2632,7 @@ public actor Orchestrator {
                 model: requester.model.rawValue,
                 canCoordinate: false)
             return spawned.hasPrefix("spawned @") && registry.agent(requestedID) != nil
-                ? (requestedID, true)
+                ? (requestedID, true, false)
                 : nil
         }
 
@@ -2223,14 +2643,18 @@ public actor Orchestrator {
                     && candidate.name != Self.automaticPermissionReviewerID
                     && candidate.workspaceRoot.standardizedFileURL.path
                         == requester.workspaceRoot.standardizedFileURL.path
+                    && !automaticDelegationReservations.contains(candidate.name)
                     && isAgentAvailableForDelegation(candidate.name)
             })
             .sorted(by: { $0.name.rawValue < $1.name.rawValue })
             .first {
-            return (idle.name, false)
+            automaticDelegationReservations.insert(idle.name)
+            return (idle.name, false, true)
         }
 
         let generatedName = nextAutomaticWorkerName()
+        let generatedID = AgentID(rawValue: generatedName)
+        automaticDelegationReservations.insert(generatedID)
         let spawned = await spawnFromTool(
             requestedBy: requestedBy,
             currentTaskID: currentTaskID,
@@ -2238,10 +2662,11 @@ public actor Orchestrator {
             path: requester.workspaceRoot.path,
             model: requester.model.rawValue,
             canCoordinate: false)
-        let generatedID = AgentID(rawValue: generatedName)
-        return spawned.hasPrefix("spawned @") && registry.agent(generatedID) != nil
-            ? (generatedID, true)
-            : nil
+        guard spawned.hasPrefix("spawned @"), registry.agent(generatedID) != nil else {
+            automaticDelegationReservations.remove(generatedID)
+            return nil
+        }
+        return (generatedID, true, true)
     }
 
     private func isAgentAvailableForDelegation(_ agentID: AgentID) -> Bool {
@@ -2259,13 +2684,18 @@ public actor Orchestrator {
     private func nextAutomaticWorkerName() -> String {
         for index in 1...taskGraph.policy.maxActiveAgentsPerThread {
             let candidate = "worker-\(index)"
-            if registry.agent(AgentID(rawValue: candidate)) == nil { return candidate }
+            let candidateID = AgentID(rawValue: candidate)
+            if registry.agent(candidateID) == nil,
+               !automaticDelegationReservations.contains(candidateID) {
+                return candidate
+            }
         }
         return "worker-\(IDGen.random(prefix: "auto").suffix(8))"
     }
 
     func enqueueDelegatedTask(from: AgentID,
                               to toName: String,
+                              workTaskID: WorkTaskID? = nil,
                               objective: String,
                               roleHint: String? = nil,
                               expectedDeliverable: String? = nil,
@@ -2292,6 +2722,9 @@ public actor Orchestrator {
 
         await acquireAdmissionLock()
         defer { releaseAdmissionLock() }
+        if workTaskID != nil, let workTaskRecoveryFailure {
+            return (nil, "error: \(workTaskRecoveryFailure)")
+        }
         guard let currentTarget = registry.agent(to) else {
             return (nil, "no such agent: \(toName)")
         }
@@ -2301,15 +2734,67 @@ public actor Orchestrator {
             parentTaskID: parentTaskID) {
             return (nil, "error: \(delegationFailure)")
         }
+        let boundWorkTask: WorkTask?
+        if let workTaskID {
+            guard let task = workTaskGraph.task(workTaskID) else {
+                return (nil, "error: no WorkTask named \(workTaskID.rawValue)")
+            }
+            guard let callerLease = existingCapabilityLease(for: from, taskID: parentTaskID),
+                  callerLease.tools.contains(.manageWorkTasks) else {
+                return (nil, "error: the current capability lease cannot delegate durable WorkTasks")
+            }
+            guard task.status == .ready else {
+                return (nil, "error: WorkTask \(workTaskID.rawValue) is \(task.status.rawValue), not ready")
+            }
+            switch workTaskGraph.readiness(of: workTaskID) {
+            case .success(.ready):
+                break
+            case .success(.waitingFor(let dependencies)):
+                return (nil, "error: WorkTask is waiting for dependencies: "
+                    + dependencies.map(\.rawValue).sorted().joined(separator: ", "))
+            case .success(.blockedBy(let dependencies)):
+                return (nil, "error: WorkTask has terminal dependencies: "
+                    + dependencies.map(\.rawValue).sorted().joined(separator: ", "))
+            case .failure(let violation):
+                return (nil, "error: \(violation.message)")
+            }
+            if let parentTaskID, let parent = taskGraph.node(parentTaskID)?.contract {
+                if let parentRunID = parent.continuationRunID, task.runID != parentRunID {
+                    return (nil, "error: WorkTask is outside the current ContinuationRun")
+                }
+                if let parentGoalID = parent.goalID, task.goalID != parentGoalID {
+                    return (nil, "error: WorkTask is outside the current Goal")
+                }
+            }
+            boundWorkTask = task
+        } else {
+            boundWorkTask = nil
+        }
         let prepared = prepareDelegatedTask(
             issuer: from,
             assignee: currentTarget,
+            workTask: boundWorkTask,
             objective: mediatedObjective,
             roleHint: roleHint,
             expectedDeliverable: expectedDeliverable,
             parentTaskID: parentTaskID,
+            scopeContract: parentTaskID.flatMap {
+                taskGraph.node($0)?.contract ?? scheduler.knownTask(taskID: $0)?.contract
+            },
             replyMode: replyMode)
         let contract = prepared.contract
+        guard !isGoalRunCancellationRequested(
+            goalID: contract.goalID,
+            continuationRunID: contract.continuationRunID) else {
+            return (nil, "error: Goal continuation cancellation is pending")
+        }
+        if let boundWorkTask,
+           let conflict = workTaskResourceConflict(
+               candidate: boundWorkTask,
+               target: currentTarget,
+               capabilityLease: prepared.capabilityLease) {
+            return (nil, "error: WorkTask resource conflict: \(conflict)")
+        }
 
         let admission: TaskGraphAdmission
         var preflightGraph = taskGraph
@@ -2372,6 +2857,38 @@ public actor Orchestrator {
               preflightGraph.updateStatus(taskID: contract.id, status: .queued) else {
             return (nil, "error: scheduler rejected delegated task")
         }
+        var preflightWorkTaskGraph = workTaskGraph
+        var workTaskEvents: [Event] = []
+        if let boundWorkTask {
+            let started: WorkTask
+            switch preflightWorkTaskGraph.transition(
+                taskID: boundWorkTask.id,
+                to: .inProgress,
+                expectedRevision: boundWorkTask.revision,
+                owner: currentTarget.name,
+                progressNote: "delegated to @\(currentTarget.name.rawValue)") {
+            case .success(let task):
+                started = task
+            case .failure(let violation):
+                return (nil, "error: WorkTask admission failed: \(violation.message)")
+            }
+            let linked: WorkTask
+            switch preflightWorkTaskGraph.linkInvocation(
+                taskID: started.id,
+                invocationID: contract.id,
+                expectedRevision: started.revision) {
+            case .success(let task):
+                linked = task
+            case .failure(let violation):
+                return (nil, "error: WorkTask invocation link failed: \(violation.message)")
+            }
+            workTaskEvents = [
+                .workTaskStarted(WorkTaskStartedPayload(task: started)),
+                .workTaskInvocationLinked(WorkTaskInvocationLinkedPayload(
+                    task: linked,
+                    invocationID: contract.id)),
+            ]
+        }
         do {
             try await appendAdmissionEvents([
                 .delegationApproved(DelegationApprovedPayload(
@@ -2398,9 +2915,9 @@ public actor Orchestrator {
                 hopCount: scheduled.hopCount,
                 visitedAgents: scheduled.visitedAgents,
                 attempt: 1,
-                reason: "delegation admitted",
-                metadata: metadata)),
-            ])
+                    reason: "delegation admitted",
+                    metadata: metadata)),
+            ] + workTaskEvents)
         } catch {
             await persistUncommittedAdmissionCancellation(
                 task: scheduled,
@@ -2419,7 +2936,1123 @@ public actor Orchestrator {
         }
         capabilityLeases[prepared.capabilityLease.id] = prepared.capabilityLease
         workspaceLeases[prepared.workspaceLease.id] = prepared.workspaceLease
+        workTaskGraph = preflightWorkTaskGraph
         return (contract.id, "task queued: \(contract.id.rawValue)")
+    }
+
+    // MARK: - Durable WorkTask control plane
+
+    private func validatedRestoredWorkTaskGraph(
+        from projection: CoworkProjection
+    ) -> Result<WorkTaskGraph, WorkTaskGraphViolation> {
+        WorkTaskGraph.validating(Array(projection.workTaskGraph.tasks.values))
+    }
+
+    private func failClosedWorkTaskRestore(_ violation: WorkTaskGraphViolation) async {
+        let message = "WorkTaskGraph recovery rejected: \(violation.message)"
+        workTaskGraph = WorkTaskGraph()
+        workTaskRecoveryFailure = message
+        try? await log.append(.error(ErrorPayload(
+            code: "work_task_graph_restore_rejected",
+            message: message)))
+    }
+
+    private func requireValidWorkTaskGraph() throws {
+        if let workTaskRecoveryFailure {
+            throw IntatisError.config(workTaskRecoveryFailure)
+        }
+    }
+
+    func createWorkTask(requestedBy: AgentID,
+                        currentRunID: ContinuationRunID?,
+                        currentGoalID: GoalID?,
+                        canManage: Bool,
+                        request: WorkTaskCreateRequest) async throws -> WorkTaskDetail {
+        guard canManage else {
+            throw IntatisError.permissionDenied("the current capability lease cannot create WorkTasks")
+        }
+        guard let currentRunID else {
+            throw IntatisError.config("task_create requires a current ContinuationRun")
+        }
+        let title = request.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let description = request.description.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty, !description.isEmpty else {
+            throw IntatisError.decoding("WorkTask title and description must be non-empty")
+        }
+
+        await acquireAdmissionLock()
+        defer { releaseAdmissionLock() }
+        try requireValidWorkTaskGraph()
+
+        let owner = request.owner ?? requestedBy
+        guard owner != Self.automaticPermissionReviewerID,
+              registry.agent(owner) != nil else {
+            throw IntatisError.notFound("WorkTask owner is not an attached data-plane agent")
+        }
+
+        var preflight = workTaskGraph
+        var created = WorkTask(
+            runID: currentRunID,
+            goalID: currentGoalID,
+            title: title,
+            description: description,
+            acceptanceCriteria: request.acceptanceCriteria,
+            expectedArtifacts: request.expectedArtifacts,
+            status: .pending,
+            priority: request.priority,
+            owner: owner,
+            dependsOn: request.dependsOn)
+        switch preflight.add(created) {
+        case .success:
+            break
+        case .failure(let violation):
+            throw violation
+        }
+
+        var events: [Event] = [.workTaskCreated(WorkTaskCreatedPayload(task: created))]
+        switch preflight.readiness(of: created.id) {
+        case .success(.ready):
+            switch preflight.transition(
+                taskID: created.id,
+                to: .ready,
+                expectedRevision: created.revision) {
+            case .success(let ready):
+                created = ready
+                events.append(.workTaskReady(WorkTaskReadyPayload(task: ready)))
+            case .failure(let violation):
+                throw violation
+            }
+        case .success(.waitingFor):
+            break
+        case .success(.blockedBy(let dependencyIDs)):
+            let blocker = "dependency failed or was cancelled: "
+                + dependencyIDs.map(\.rawValue).sorted().joined(separator: ", ")
+            switch preflight.transition(
+                taskID: created.id,
+                to: .blocked,
+                expectedRevision: created.revision,
+                progressNote: blocker) {
+            case .success(let blocked):
+                created = blocked
+                events.append(.workTaskBlocked(WorkTaskBlockedPayload(
+                    task: blocked,
+                    blocker: blocker)))
+            case .failure(let violation):
+                throw violation
+            }
+        case .failure(let violation):
+            throw violation
+        }
+
+        try await appendAdmissionEvents(events)
+        workTaskGraph = preflight
+        return workTaskDetail(created)
+    }
+
+    func updateWorkTask(requestedBy: AgentID,
+                        currentWorkTaskID: WorkTaskID?,
+                        currentRunID: ContinuationRunID?,
+                        canManage: Bool,
+                        canUpdateOwned: Bool,
+                        request: WorkTaskUpdateRequest) async throws -> WorkTaskDetail {
+        await acquireAdmissionLock()
+        defer { releaseAdmissionLock() }
+        try requireValidWorkTaskGraph()
+
+        guard let current = workTaskGraph.task(request.taskID) else {
+            throw IntatisError.notFound("WorkTask \(request.taskID.rawValue)")
+        }
+        guard current.runID == currentRunID else {
+            throw IntatisError.permissionDenied("only WorkTasks in the current ContinuationRun can be updated")
+        }
+        if !canManage {
+            guard canUpdateOwned,
+                  currentWorkTaskID == current.id,
+                  current.owner == requestedBy else {
+                throw IntatisError.permissionDenied("workers may update only their assigned WorkTask")
+            }
+            guard request.title == nil,
+                  request.description == nil,
+                  request.acceptanceCriteria == nil,
+                  request.expectedArtifacts == nil,
+                  request.owner == .unchanged,
+                  request.dependsOn == nil,
+                  request.priority == nil,
+                  !request.isRetry,
+                  request.status != .ready,
+                  request.status != .cancelled else {
+                throw IntatisError.permissionDenied(
+                    "workers cannot change WorkTask graph, ownership, priority, retry, or cancellation state")
+            }
+        }
+        if current.status == .inProgress {
+            var changedContractFields: [String] = []
+            if let value = request.title, value != current.title {
+                changedContractFields.append("title")
+            }
+            if let value = request.description, value != current.description {
+                changedContractFields.append("description")
+            }
+            if let value = request.acceptanceCriteria, value != current.acceptanceCriteria {
+                changedContractFields.append("acceptance_criteria")
+            }
+            if let value = request.expectedArtifacts, value != current.expectedArtifacts {
+                changedContractFields.append("expected_artifacts")
+            }
+            switch request.owner {
+            case .unchanged:
+                break
+            case .unassigned where current.owner != nil:
+                changedContractFields.append("owner")
+            case .agent(let owner) where owner != current.owner:
+                changedContractFields.append("owner")
+            case .unassigned, .agent:
+                break
+            }
+            if let value = request.dependsOn, value != current.dependsOn {
+                changedContractFields.append("depends_on")
+            }
+            if let value = request.priority, value != current.priority {
+                changedContractFields.append("priority")
+            }
+            guard changedContractFields.isEmpty else {
+                throw IntatisError.permissionDenied(
+                    "in-progress WorkTask execution contract is frozen: "
+                        + changedContractFields.joined(separator: ", "))
+            }
+        }
+
+        let hasMutation = request.title != nil
+            || request.description != nil
+            || request.acceptanceCriteria != nil
+            || request.expectedArtifacts != nil
+            || request.owner != .unchanged
+            || request.dependsOn != nil
+            || request.priority != nil
+            || request.progressNote != nil
+            || request.status != nil
+            || request.result != nil
+            || request.evidence != nil
+            || request.isRetry
+        guard hasMutation else {
+            throw IntatisError.decoding("task_update requires at least one mutable field")
+        }
+
+        var proposed = current
+        if let title = request.title { proposed.title = title }
+        if let description = request.description { proposed.description = description }
+        if let criteria = request.acceptanceCriteria { proposed.acceptanceCriteria = criteria }
+        if let artifacts = request.expectedArtifacts { proposed.expectedArtifacts = artifacts }
+        switch request.owner {
+        case .unchanged:
+            break
+        case .unassigned:
+            proposed.owner = nil
+        case .agent(let owner):
+            guard owner != Self.automaticPermissionReviewerID,
+                  registry.agent(owner) != nil else {
+                throw IntatisError.notFound("WorkTask owner is not an attached data-plane agent")
+            }
+            proposed.owner = owner
+        }
+        if let dependencies = request.dependsOn { proposed.dependsOn = dependencies }
+        if let priority = request.priority { proposed.priority = priority }
+        if let progressNote = request.progressNote { proposed.progressNote = progressNote }
+        if let status = request.status { proposed.status = status }
+        if let result = request.result { proposed.result = result }
+        if let evidence = request.evidence {
+            proposed.evidence = evidence.map { $0.materialize() }
+        }
+
+        var preflight = workTaskGraph
+        let updated: WorkTask
+        switch preflight.update(
+            proposed,
+            expectedRevision: request.expectedRevision,
+            isRetry: request.isRetry,
+            recomputeReadinessAfterDependencyChange:
+                request.dependsOn != nil && request.status == nil) {
+        case .success(let task):
+            updated = task
+        case .failure(let violation):
+            throw violation
+        }
+        if updated.status == .ready {
+            switch preflight.readiness(of: updated.id) {
+            case .success(.ready):
+                break
+            case .success(.waitingFor):
+                throw WorkTaskGraphViolation(
+                    kind: .dependenciesUnsatisfied,
+                    message: "WorkTask dependencies are not completed",
+                    taskID: updated.id)
+            case .success(.blockedBy):
+                throw WorkTaskGraphViolation(
+                    kind: .terminalDependency,
+                    message: "WorkTask has a failed or cancelled dependency",
+                    taskID: updated.id)
+            case .failure(let violation):
+                throw violation
+            }
+        }
+
+        var events = workTaskMutationEvents(previous: current, next: updated)
+        reconcileWorkTaskDependents(changedTaskID: updated.id, graph: &preflight, events: &events)
+        try await appendAdmissionEvents(events)
+        workTaskGraph = preflight
+        return workTaskDetail(preflight.task(updated.id) ?? updated)
+    }
+
+    /// Host-only continuation primitive. This is intentionally module-internal
+    /// and is not registered as a model-visible tool.
+    func carryForwardNonterminalWorkTasks(
+        goalID: GoalID,
+        toRunID: ContinuationRunID
+    ) async throws -> [WorkTask] {
+        await acquireAdmissionLock()
+        defer { releaseAdmissionLock() }
+        try requireValidWorkTaskGraph()
+
+        let projection = CoworkProjection.build(from: await log.replay())
+        guard projection.currentGoalID == goalID,
+              let goal = projection.goals[goalID],
+              goal.status == .active else {
+            throw IntatisError.notFound("active current Goal \(goalID.rawValue)")
+        }
+        guard let targetRun = projection.continuationRuns[toRunID],
+              targetRun.sessionID == goal.sessionID,
+              targetRun.goalID == goalID,
+              targetRun.status == .running else {
+            throw IntatisError.config(
+                "carry-forward target ContinuationRun \(toRunID.rawValue) is not a running run of Goal \(goalID.rawValue)")
+        }
+
+        let sources = workTaskGraph.tasks.values
+            .filter {
+                $0.goalID == goalID
+                    && $0.runID != toRunID
+                    && !$0.status.isTerminal
+            }
+            .sorted {
+                if $0.createdAt == $1.createdAt {
+                    return $0.id.rawValue < $1.id.rawValue
+                }
+                return $0.createdAt < $1.createdAt
+            }
+        guard !sources.isEmpty else { return [] }
+        for source in sources {
+            guard let sourceRun = projection.continuationRuns[source.runID],
+                  sourceRun.sessionID == goal.sessionID,
+                  sourceRun.goalID == goalID else {
+                throw IntatisError.config(
+                    "carry-forward source WorkTask \(source.id.rawValue) is not attached to a durable run of Goal \(goalID.rawValue)")
+            }
+        }
+
+        let sourceIDs = Set(sources.map(\.id))
+        if let externalDependent = workTaskGraph.tasks.values
+            .filter({ task in
+                !sourceIDs.contains(task.id)
+                    && !task.status.isTerminal
+                    && task.dependsOn.contains(where: sourceIDs.contains)
+            })
+            .sorted(by: { $0.id.rawValue < $1.id.rawValue })
+            .first {
+            throw IntatisError.config(
+                "cannot carry forward Goal \(goalID.rawValue): nonterminal WorkTask "
+                    + externalDependent.id.rawValue
+                    + " outside the carry set depends on a source task")
+        }
+
+        // IDs are allocated before any graph mutation so every dependency and
+        // cancellation reason is derived from one stable source ordering.
+        var cloneIDs: [WorkTaskID: WorkTaskID] = [:]
+        for source in sources {
+            cloneIDs[source.id] = WorkTaskID.new()
+        }
+
+        let carriedAt = Date()
+        var plans: [(source: WorkTask, initial: WorkTask, blockers: [String])] = []
+        plans.reserveCapacity(sources.count)
+        for source in sources {
+            guard let cloneID = cloneIDs[source.id] else {
+                throw IntatisError.config("carry-forward clone ID allocation failed")
+            }
+            var mappedDependencies: [WorkTaskID] = []
+            var blockers: [String] = []
+            for dependencyID in source.dependsOn {
+                guard let dependency = workTaskGraph.task(dependencyID) else {
+                    throw WorkTaskGraphViolation(
+                        kind: .missingDependency,
+                        message: "dependency does not exist: \(dependencyID.rawValue)",
+                        taskID: source.id,
+                        dependencyID: dependencyID)
+                }
+                if sourceIDs.contains(dependencyID) {
+                    guard let mappedID = cloneIDs[dependencyID] else {
+                        throw IntatisError.config("carry-forward dependency mapping failed")
+                    }
+                    mappedDependencies.append(mappedID)
+                    continue
+                }
+                switch dependency.status {
+                case .completed:
+                    // Completion is already durable evidence; the new run does
+                    // not retain a cross-run edge to it.
+                    break
+                case .failed, .cancelled:
+                    blockers.append(
+                        "dependency \(dependency.id.rawValue) is \(dependency.status.rawValue)")
+                case .pending, .ready, .inProgress, .blocked:
+                    blockers.append(
+                        "dependency \(dependency.id.rawValue) is nonterminal but was not carried forward")
+                }
+            }
+            let clone = WorkTask(
+                id: cloneID,
+                runID: toRunID,
+                goalID: goalID,
+                title: source.title,
+                description: source.description,
+                acceptanceCriteria: source.acceptanceCriteria,
+                expectedArtifacts: source.expectedArtifacts,
+                status: .pending,
+                priority: source.priority,
+                owner: nil,
+                dependsOn: mappedDependencies,
+                createdAt: carriedAt,
+                updatedAt: carriedAt)
+            plans.append((source: source, initial: clone, blockers: blockers.sorted()))
+        }
+
+        var preflight = workTaskGraph
+        var events: [Event] = []
+        events.reserveCapacity(plans.count * 3)
+        for plan in plans {
+            let reason = "carried forward to WorkTask \(plan.initial.id.rawValue) in ContinuationRun \(toRunID.rawValue)"
+            switch preflight.transition(
+                taskID: plan.source.id,
+                to: .cancelled,
+                expectedRevision: plan.source.revision,
+                progressNote: reason) {
+            case .success(let cancelled):
+                events.append(.workTaskCancelled(WorkTaskCancelledPayload(
+                    task: cancelled,
+                    reason: reason)))
+            case .failure(let violation):
+                throw violation
+            }
+        }
+
+        switch WorkTaskGraph.validating(
+            Array(preflight.tasks.values) + plans.map { $0.initial }) {
+        case .success(let graph):
+            preflight = graph
+        case .failure(let violation):
+            throw violation
+        }
+        events.append(contentsOf: plans.map { plan in
+            .workTaskCarriedForward(WorkTaskCarriedForwardPayload(
+                task: plan.initial,
+                sourceTaskID: plan.source.id,
+                sourceRunID: plan.source.runID))
+        })
+
+        var carried: [WorkTask] = []
+        carried.reserveCapacity(plans.count)
+        for plan in plans {
+            let final: WorkTask
+            if !plan.blockers.isEmpty {
+                let blocker = Self.carryForwardBlockerPrefix
+                    + plan.blockers.joined(separator: "; ")
+                switch preflight.transition(
+                    taskID: plan.initial.id,
+                    to: .blocked,
+                    expectedRevision: plan.initial.revision,
+                    progressNote: blocker) {
+                case .success(let blocked):
+                    final = blocked
+                    events.append(.workTaskBlocked(WorkTaskBlockedPayload(
+                        task: blocked,
+                        blocker: blocker)))
+                case .failure(let violation):
+                    throw violation
+                }
+            } else {
+                switch preflight.readiness(of: plan.initial.id) {
+                case .success(.ready):
+                    switch preflight.transition(
+                        taskID: plan.initial.id,
+                        to: .ready,
+                        expectedRevision: plan.initial.revision) {
+                    case .success(let ready):
+                        final = ready
+                        events.append(.workTaskReady(WorkTaskReadyPayload(task: ready)))
+                    case .failure(let violation):
+                        throw violation
+                    }
+                case .success(.waitingFor):
+                    guard let pending = preflight.task(plan.initial.id) else {
+                        throw IntatisError.notFound("carried WorkTask \(plan.initial.id.rawValue)")
+                    }
+                    final = pending
+                case .success(.blockedBy(let dependencies)):
+                    let blocker = Self.carryForwardBlockerPrefix
+                        + "mapped dependency became terminal: "
+                        + dependencies.map(\.rawValue).sorted().joined(separator: ", ")
+                    switch preflight.transition(
+                        taskID: plan.initial.id,
+                        to: .blocked,
+                        expectedRevision: plan.initial.revision,
+                        progressNote: blocker) {
+                    case .success(let blocked):
+                        final = blocked
+                        events.append(.workTaskBlocked(WorkTaskBlockedPayload(
+                            task: blocked,
+                            blocker: blocker)))
+                    case .failure(let violation):
+                        throw violation
+                    }
+                case .failure(let violation):
+                    throw violation
+                }
+            }
+            carried.append(final)
+        }
+
+        try await appendAdmissionEvents(events)
+        workTaskGraph = preflight
+        return carried
+    }
+
+    func getWorkTask(requestedBy: AgentID,
+                     currentWorkTaskID: WorkTaskID?,
+                     currentRunID: ContinuationRunID?,
+                     currentGoalID: GoalID?,
+                     canManage: Bool,
+                     taskID: WorkTaskID) throws -> WorkTaskDetail {
+        try requireValidWorkTaskGraph()
+        guard let task = workTaskGraph.task(taskID) else {
+            throw IntatisError.notFound("WorkTask \(taskID.rawValue)")
+        }
+        guard canReadWorkTask(
+            task,
+            requestedBy: requestedBy,
+            currentWorkTaskID: currentWorkTaskID,
+            currentRunID: currentRunID,
+            currentGoalID: currentGoalID,
+            canManage: canManage) else {
+            throw IntatisError.permissionDenied("WorkTask is outside the caller's readable scope")
+        }
+        return workTaskDetail(task)
+    }
+
+    func listWorkTasks(requestedBy: AgentID,
+                       currentWorkTaskID: WorkTaskID?,
+                       currentRunID: ContinuationRunID?,
+                       currentGoalID: GoalID?,
+                       canManage: Bool,
+                       request: WorkTaskListRequest) throws -> [WorkTaskDetail] {
+        try requireValidWorkTaskGraph()
+        let visible: [WorkTask]
+        if canManage {
+            if request.includeGoalHistory {
+                guard let currentGoalID else {
+                    throw IntatisError.permissionDenied("goal history requires a current Goal binding")
+                }
+                visible = workTaskGraph.tasks.values.filter { $0.goalID == currentGoalID }
+            } else if let explicitRunID = request.runID {
+                guard explicitRunID == currentRunID
+                    || (currentGoalID != nil && workTaskGraph.tasks.values.contains {
+                        $0.runID == explicitRunID && $0.goalID == currentGoalID
+                    }) else {
+                    throw IntatisError.permissionDenied("ContinuationRun is outside the current Goal scope")
+                }
+                visible = workTaskGraph.tasks.values.filter { $0.runID == explicitRunID }
+            } else {
+                guard let currentRunID else { return [] }
+                visible = workTaskGraph.tasks.values.filter { $0.runID == currentRunID }
+            }
+        } else {
+            guard let currentWorkTaskID,
+                  let current = workTaskGraph.task(currentWorkTaskID),
+                  current.owner == requestedBy else { return [] }
+            let visibleIDs = Set([current.id] + current.dependsOn)
+            visible = workTaskGraph.tasks.values.filter { visibleIDs.contains($0.id) }
+        }
+
+        return visible
+            .filter { request.statuses.isEmpty || request.statuses.contains($0.status) }
+            .filter { request.owner == nil || $0.owner == request.owner }
+            .filter { !request.unassignedOnly || $0.owner == nil }
+            .sorted {
+                if $0.createdAt == $1.createdAt { return $0.id.rawValue < $1.id.rawValue }
+                return $0.createdAt < $1.createdAt
+            }
+            .map(workTaskDetail)
+    }
+
+    private func canReadWorkTask(_ task: WorkTask,
+                                 requestedBy: AgentID,
+                                 currentWorkTaskID: WorkTaskID?,
+                                 currentRunID: ContinuationRunID?,
+                                 currentGoalID: GoalID?,
+                                 canManage: Bool) -> Bool {
+        if canManage {
+            return task.runID == currentRunID
+                || (currentGoalID != nil && task.goalID == currentGoalID)
+        }
+        guard let currentWorkTaskID,
+              let current = workTaskGraph.task(currentWorkTaskID),
+              current.owner == requestedBy else { return false }
+        return task.id == current.id || current.dependsOn.contains(task.id)
+    }
+
+    private func workTaskDetail(_ task: WorkTask) -> WorkTaskDetail {
+        let dependencies = task.dependsOn.compactMap { dependencyID -> WorkTaskDependencyView? in
+            guard let dependency = workTaskGraph.task(dependencyID) else { return nil }
+            return WorkTaskDependencyView(taskID: dependency.id, status: dependency.status)
+        }
+        let downstream = workTaskGraph.tasks.values
+            .filter { $0.dependsOn.contains(task.id) }
+            .sorted {
+                if $0.createdAt == $1.createdAt { return $0.id.rawValue < $1.id.rawValue }
+                return $0.createdAt < $1.createdAt
+            }
+            .map(\.id)
+        let candidates = task.latestInvocationIDs.compactMap { invocationID -> WorkTaskCandidateResultView? in
+            guard let result = scheduler.record(for: invocationID)?.result else { return nil }
+            return WorkTaskCandidateResultView(
+                invocationTaskID: invocationID,
+                result: result,
+                receivedAt: task.updatedAt)
+        }
+        return WorkTaskDetail(
+            task: task,
+            dependencies: dependencies,
+            downstreamTaskIDs: downstream,
+            candidateResults: candidates)
+    }
+
+    private func workTaskMutationEvents(previous: WorkTask, next: WorkTask) -> [Event] {
+        var events: [Event] = [.workTaskUpdated(WorkTaskUpdatedPayload(
+            task: next,
+            previousRevision: previous.revision))]
+        if previous.owner != next.owner {
+            events.append(.workTaskOwnerChanged(WorkTaskOwnerChangedPayload(
+                task: next,
+                previousOwner: previous.owner)))
+        }
+        if previous.dependsOn != next.dependsOn {
+            events.append(.workTaskDependencyChanged(WorkTaskDependencyChangedPayload(
+                task: next,
+                previousDependencies: previous.dependsOn)))
+        }
+        let addedEvidence = next.evidence.filter { !previous.evidence.contains($0) }
+        events.append(contentsOf: addedEvidence.map {
+            .workTaskEvidenceAdded(WorkTaskEvidenceAddedPayload(task: next, evidence: $0))
+        })
+        if previous.status != next.status {
+            switch next.status {
+            case .pending:
+                break
+            case .ready:
+                events.append(.workTaskReady(WorkTaskReadyPayload(task: next)))
+            case .inProgress:
+                events.append(.workTaskStarted(WorkTaskStartedPayload(task: next)))
+            case .blocked:
+                events.append(.workTaskBlocked(WorkTaskBlockedPayload(
+                    task: next,
+                    blocker: next.progressNote ?? "WorkTask blocked")))
+            case .completed:
+                events.append(.workTaskCompleted(WorkTaskCompletedPayload(task: next)))
+            case .failed:
+                events.append(.workTaskFailed(WorkTaskFailedPayload(
+                    task: next,
+                    error: next.result ?? next.progressNote ?? "WorkTask failed")))
+            case .cancelled:
+                events.append(.workTaskCancelled(WorkTaskCancelledPayload(
+                    task: next,
+                    reason: next.progressNote ?? "WorkTask cancelled")))
+            }
+        } else if previous.progressNote != next.progressNote {
+            events.append(.workTaskProgressed(WorkTaskProgressedPayload(task: next)))
+        }
+        return events
+    }
+
+    private func reconcileWorkTaskDependents(changedTaskID: WorkTaskID,
+                                             graph: inout WorkTaskGraph,
+                                             events: inout [Event]) {
+        let dependentIDs = graph.tasks.values
+            .filter { $0.dependsOn.contains(changedTaskID) && !$0.status.isTerminal }
+            .map(\.id)
+            .sorted { $0.rawValue < $1.rawValue }
+        for dependentID in dependentIDs {
+            guard let current = graph.task(dependentID),
+                  current.status != .inProgress,
+                  !(current.status == .blocked
+                    && current.progressNote?.hasPrefix(Self.carryForwardBlockerPrefix) == true) else {
+                continue
+            }
+            let target: (WorkTaskStatus, String?)?
+            switch graph.readiness(of: dependentID) {
+            case .success(.ready) where current.status == .pending || current.status == .blocked:
+                target = (.ready, nil)
+            case .success(.waitingFor(let waiting)) where current.status == .ready:
+                target = (.blocked, "waiting for dependencies: "
+                    + waiting.map(\.rawValue).sorted().joined(separator: ", "))
+            case .success(.blockedBy(let blocked)) where current.status == .pending || current.status == .ready:
+                target = (.blocked, "dependency failed or was cancelled: "
+                    + blocked.map(\.rawValue).sorted().joined(separator: ", "))
+            default:
+                target = nil
+            }
+            guard let target else { continue }
+            switch graph.transition(
+                taskID: dependentID,
+                to: target.0,
+                expectedRevision: current.revision,
+                progressNote: target.1) {
+            case .success(let changed):
+                if changed.status == .ready {
+                    events.append(.workTaskReady(WorkTaskReadyPayload(task: changed)))
+                } else {
+                    events.append(.workTaskBlocked(WorkTaskBlockedPayload(
+                        task: changed,
+                        blocker: target.1 ?? "dependency blocked")))
+                }
+            case .failure:
+                continue
+            }
+        }
+    }
+
+    /// Rejects concurrent writers when their declared artifacts overlap. An
+    /// empty or unsafe artifact declaration is an unknown write set and is
+    /// therefore treated as workspace-wide for a write-capable invocation.
+    private func workTaskResourceConflict(candidate: WorkTask,
+                                          target: Agent,
+                                          capabilityLease: CapabilityLease) -> String? {
+        guard Self.hasWorkspaceMutationCapability(capabilityLease) else { return nil }
+        let workspacePath = target.workspaceRoot.standardizedFileURL.path
+        let candidatePaths = Self.normalizedExpectedArtifactPaths(candidate.expectedArtifacts)
+
+        let activeWriters = workTaskGraph.tasks.values
+            .filter { $0.id != candidate.id && $0.status == .inProgress }
+            .sorted { $0.id.rawValue < $1.id.rawValue }
+        for other in activeWriters {
+            guard workTaskHasActiveWriter(other, inWorkspace: workspacePath) else { continue }
+            let otherPaths = Self.normalizedExpectedArtifactPaths(other.expectedArtifacts)
+            if candidatePaths == nil || otherPaths == nil {
+                return "unknown write set overlaps active WorkTask \(other.id.rawValue) workspace-wide"
+            }
+            guard let candidatePaths, let otherPaths else { continue }
+            for lhs in candidatePaths {
+                for rhs in otherPaths where Self.pathComponentsOverlap(lhs, rhs) {
+                    return "artifact paths overlap WorkTask \(other.id.rawValue): "
+                        + lhs.joined(separator: "/") + " <-> " + rhs.joined(separator: "/")
+                }
+            }
+        }
+        return nil
+    }
+
+    private func workTaskHasActiveWriter(_ task: WorkTask, inWorkspace workspacePath: String) -> Bool {
+        for invocationID in task.latestInvocationIDs {
+            guard let node = taskGraph.node(invocationID),
+                  Self.isActiveTaskStatus(node.status),
+                  let agent = registry.agent(node.assignee),
+                  agent.workspaceRoot.standardizedFileURL.path == workspacePath else { continue }
+            if let leaseID = node.contract.capabilityLeaseID,
+               let lease = capabilityLeases[leaseID],
+               Self.hasWorkspaceMutationCapability(lease) {
+                return true
+            }
+        }
+        guard let owner = task.owner,
+              let agent = registry.agent(owner),
+              agent.workspaceRoot.standardizedFileURL.path == workspacePath,
+              taskGraph.nodes.values.contains(where: {
+                  Self.isActiveTaskStatus($0.status) && $0.assignee == owner
+              }),
+              let leaseID = defaultCapabilityLeaseIDs[owner],
+              let lease = capabilityLeases[leaseID] else { return false }
+        return Self.hasWorkspaceMutationCapability(lease)
+    }
+
+    private static func normalizedExpectedArtifactPaths(_ values: [String]) -> [[String]]? {
+        guard !values.isEmpty else { return nil }
+        var normalized: [[String]] = []
+        for raw in values {
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, !trimmed.hasPrefix("/") else { return nil }
+            // A glob is a pattern, not a provable bounded write set. Treat all
+            // common glob metacharacters conservatively as workspace-wide.
+            guard trimmed.rangeOfCharacter(from: CharacterSet(charactersIn: "*?[]{}")) == nil else {
+                return nil
+            }
+            let components = trimmed.split(separator: "/", omittingEmptySubsequences: true)
+                .map(String.init)
+                .filter { $0 != "." }
+            guard !components.isEmpty, !components.contains("..") else { return nil }
+            normalized.append(components)
+        }
+        return normalized
+    }
+
+    private static func pathComponentsOverlap(_ lhs: [String], _ rhs: [String]) -> Bool {
+        let sharedCount = min(lhs.count, rhs.count)
+        return Array(lhs.prefix(sharedCount)) == Array(rhs.prefix(sharedCount))
+    }
+
+    // MARK: - Durable Goal control plane
+
+    func createGoal(request: GoalCreateRequest,
+                    explicitGoalIntent: Bool,
+                    canCreate: Bool) async throws -> Goal {
+        guard canCreate else {
+            throw IntatisError.permissionDenied("the current capability lease cannot create Goals")
+        }
+        guard explicitGoalIntent else {
+            throw IntatisError.permissionDenied(
+                "create_goal requires explicit user or host Goal intent")
+        }
+        let objective = request.objective.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !objective.isEmpty else {
+            throw IntatisError.decoding("Goal objective must be non-empty")
+        }
+        if let tokenBudget = request.tokenBudget, tokenBudget <= 0 {
+            throw IntatisError.decoding("Goal token budget must be greater than zero")
+        }
+        let sessionID = await log.sessionID
+
+        await acquireAdmissionLock()
+        defer { releaseAdmissionLock() }
+        let projection = CoworkProjection.build(from: await log.replay())
+        if let current = projection.currentGoal, !current.status.isTerminal {
+            throw IntatisError.config(
+                "a current Goal already exists: \(current.id.rawValue) (\(current.status.rawValue))")
+        }
+        let goal = Goal(
+            sessionID: sessionID,
+            objective: objective,
+            successCriteria: request.successCriteria,
+            constraints: request.constraints,
+            tokenBudget: request.tokenBudget)
+        try await appendAdmissionEvent(.goalCreated(GoalCreatedPayload(goal: goal)))
+        return goal
+    }
+
+    func currentGoalSnapshot() async -> Goal? {
+        CoworkProjection.build(from: await log.replay()).currentGoal
+    }
+
+    func editGoal(request: GoalEditRequest,
+                  hostAuthorized: Bool) async throws -> Goal {
+        guard hostAuthorized else {
+            throw IntatisError.permissionDenied("Goal edits are reserved for the user/host control plane")
+        }
+        let objective = request.objective.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !objective.isEmpty else {
+            throw IntatisError.decoding("Goal objective must be non-empty")
+        }
+        if let tokenBudget = request.tokenBudget, tokenBudget <= 0 {
+            throw IntatisError.decoding("Goal token budget must be greater than zero")
+        }
+
+        await acquireAdmissionLock()
+        defer { releaseAdmissionLock() }
+        let projection = CoworkProjection.build(from: await log.replay())
+        guard projection.currentGoalID == request.goalID,
+              let current = projection.goals[request.goalID] else {
+            throw IntatisError.notFound("current Goal \(request.goalID.rawValue)")
+        }
+        let edited: Goal
+        switch current.edited(
+            objective: objective,
+            successCriteria: request.successCriteria,
+            constraints: request.constraints,
+            tokenBudget: request.tokenBudget,
+            expectedRevision: request.expectedRevision) {
+        case .success(let value):
+            edited = value
+        case .failure(let violation):
+            throw violation
+        }
+        try await appendAdmissionEvent(.goalEdited(GoalEditedPayload(
+            goal: edited,
+            previousRevision: current.revision)))
+        return edited
+    }
+
+    func transitionGoal(_ goalID: GoalID,
+                        expectedRevision: Int,
+                        to status: GoalStatus,
+                        canSubmitVerdict: Bool,
+                        hostAuthorized: Bool,
+                        resetNoProgress: Bool = false,
+                        transitionReason: String? = nil) async throws -> Goal {
+        if !hostAuthorized {
+            guard canSubmitVerdict, status == .completed || status == .blocked else {
+                throw IntatisError.permissionDenied(
+                    "model Goal transitions are limited to complete or blocked verifier verdicts")
+            }
+        }
+
+        await acquireAdmissionLock()
+        defer { releaseAdmissionLock() }
+        let projection = CoworkProjection.build(from: await log.replay())
+        guard projection.currentGoalID == goalID,
+              let current = projection.goals[goalID] else {
+            throw IntatisError.notFound("current Goal \(goalID.rawValue)")
+        }
+        if status == .blocked {
+            guard current.latestAudit?.verdict == .blockedCandidate,
+                  current.consecutiveBlockedRuns >= 3 else {
+                throw IntatisError.permissionDenied(
+                    "Goal blocked requires the same verified blocker across at least three completed runs")
+            }
+        }
+        let transitioned: Goal
+        switch current.transitioning(
+            to: status,
+            expectedRevision: expectedRevision,
+            audit: current.latestAudit) {
+        case .success(var value):
+            if hostAuthorized, status == .active, resetNoProgress {
+                value.noProgressRuns = 0
+            }
+            transitioned = value
+        case .failure(let violation):
+            throw violation
+        }
+
+        let event: Event
+        switch status {
+        case .active:
+            event = .goalResumed(GoalResumedPayload(goal: transitioned))
+        case .paused:
+            event = .goalPaused(GoalPausedPayload(goal: transitioned))
+        case .blocked:
+            event = .goalBlocked(GoalBlockedPayload(
+                goal: transitioned,
+                blocker: transitioned.latestAudit?.blocker ?? "Goal verifier reported a blocker"))
+        case .budgetLimited:
+            event = .goalBudgetLimited(GoalBudgetLimitedPayload(goal: transitioned))
+        case .usageLimited:
+            event = .goalUsageLimited(GoalUsageLimitedPayload(
+                goal: transitioned,
+                reason: transitionReason))
+        case .completed:
+            event = .goalCompleted(GoalCompletedPayload(
+                goal: transitioned,
+                audit: transitioned.latestAudit))
+        }
+        try await appendAdmissionEvent(event)
+        return transitioned
+    }
+
+    /// Applies one audit to one checkpointed run. This lower-level seam is used
+    /// by focused authority tests; production continuation uses
+    /// ``settleGoalRunAudit`` so audit, run settlement, and an optional Goal
+    /// terminal transition share one durable batch.
+    func applyGoalAudit(_ audit: GoalAuditSummary,
+                        goalID: GoalID,
+                        runID: ContinuationRunID,
+                        expectedRevision: Int,
+                        tokenDelta: Int,
+                        activeElapsedDelta: Double) async throws -> Goal {
+        await acquireAdmissionLock()
+        defer { releaseAdmissionLock() }
+
+        let replayed = await log.replay()
+        let projection = CoworkProjection.build(from: replayed)
+        guard projection.currentGoalID == goalID,
+              let current = projection.goals[goalID] else {
+            throw IntatisError.notFound("current Goal \(goalID.rawValue)")
+        }
+        guard let run = projection.continuationRuns[runID],
+              run.sessionID == current.sessionID,
+              run.goalID == goalID,
+              run.status == .checkpointed else {
+            throw IntatisError.config(
+                "Goal audit requires a checkpointed ContinuationRun owned by Goal \(goalID.rawValue)")
+        }
+        guard !Self.hasGoalAudit(runID: runID, in: replayed) else {
+            throw IntatisError.config(
+                "ContinuationRun \(runID.rawValue) already has a Goal audit")
+        }
+
+        let audited = try Self.goalByApplyingAudit(
+            audit,
+            to: current,
+            expectedRevision: expectedRevision,
+            tokenDelta: tokenDelta,
+            activeElapsedDelta: activeElapsedDelta)
+        try await appendAdmissionEvent(.goalAuditCompleted(GoalAuditCompletedPayload(
+            goal: audited,
+            audit: audit,
+            runID: runID)))
+        return audited
+    }
+
+    /// Atomically commits the only valid end of a Goal continuation run:
+    /// verifier audit, completed run, and (when warranted) terminal Goal state.
+    /// A run can be audited at most once and only after its checkpoint is
+    /// durable, so one blocker confirmation can count at most once per run.
+    func settleGoalRunAudit(_ audit: GoalAuditSummary,
+                            goalID: GoalID,
+                            runID: ContinuationRunID,
+                            expectedRevision: Int,
+                            tokenDelta: Int,
+                            activeElapsedDelta: Double,
+                            runProgressSummary: String,
+                            usageLimitReason: String?,
+                            blockedRunThreshold: Int) async throws -> (goal: Goal, run: ContinuationRun) {
+        await acquireAdmissionLock()
+        defer { releaseAdmissionLock() }
+
+        let replayed = await log.replay()
+        let projection = CoworkProjection.build(from: replayed)
+        guard projection.currentGoalID == goalID,
+              let current = projection.goals[goalID],
+              current.status == .active else {
+            throw IntatisError.notFound("active current Goal \(goalID.rawValue)")
+        }
+        guard let checkpointed = projection.continuationRuns[runID],
+              checkpointed.sessionID == current.sessionID,
+              checkpointed.goalID == goalID,
+              checkpointed.status == .checkpointed else {
+            throw IntatisError.config(
+                "Goal run settlement requires a checkpointed ContinuationRun owned by Goal \(goalID.rawValue)")
+        }
+        guard !Self.hasGoalAudit(runID: runID, in: replayed) else {
+            throw IntatisError.config(
+                "ContinuationRun \(runID.rawValue) already has a Goal audit")
+        }
+
+        let audited = try Self.goalByApplyingAudit(
+            audit,
+            to: current,
+            expectedRevision: expectedRevision,
+            tokenDelta: tokenDelta,
+            activeElapsedDelta: activeElapsedDelta)
+        let completedRun = try checkpointed.transitioning(
+            to: .completed,
+            progressSummary: runProgressSummary).get()
+        var settledGoal = audited
+        var events: [Event] = [
+            .goalAuditCompleted(GoalAuditCompletedPayload(
+                goal: audited,
+                audit: audit,
+                runID: runID)),
+            .continuationRunCompleted(ContinuationRunCompletedPayload(run: completedRun)),
+        ]
+
+        if audit.isCompletionProof(for: audited) {
+            settledGoal = try audited.transitioning(
+                to: .completed,
+                expectedRevision: audited.revision,
+                audit: audit).get()
+            events.append(.goalCompleted(GoalCompletedPayload(
+                goal: settledGoal,
+                audit: audit)))
+        } else if let usageLimitReason {
+            settledGoal = try audited.transitioning(
+                to: .usageLimited,
+                expectedRevision: audited.revision).get()
+            events.append(.goalUsageLimited(GoalUsageLimitedPayload(
+                goal: settledGoal,
+                reason: usageLimitReason)))
+        } else if audit.verdict == .blockedCandidate,
+                  audited.consecutiveBlockedRuns >= max(3, blockedRunThreshold) {
+            settledGoal = try audited.transitioning(
+                to: .blocked,
+                expectedRevision: audited.revision,
+                audit: audit).get()
+            events.append(.goalBlocked(GoalBlockedPayload(
+                goal: settledGoal,
+                blocker: audit.blocker ?? "Repeated verified blocker")))
+        } else if let budget = audited.tokenBudget,
+                  audited.tokensUsed >= budget {
+            settledGoal = try audited.transitioning(
+                to: .budgetLimited,
+                expectedRevision: audited.revision).get()
+            events.append(.goalBudgetLimited(GoalBudgetLimitedPayload(goal: settledGoal)))
+        }
+
+        try await appendAdmissionEvents(events)
+        if usageLimitReason != nil {
+            providerUsageLimitFailures = providerUsageLimitFailures.filter { $0.value.0 != goalID }
+        } else {
+            providerUsageLimitFailures.removeValue(forKey: runID)
+        }
+        return (settledGoal, completedRun)
+    }
+
+    private static func goalByApplyingAudit(_ audit: GoalAuditSummary,
+                                            to current: Goal,
+                                            expectedRevision: Int,
+                                            tokenDelta: Int,
+                                            activeElapsedDelta: Double) throws -> Goal {
+        var value = try current.applyingAudit(
+            audit,
+            expectedRevision: expectedRevision).get()
+        value.tokensUsed = saturatingAdd(current.tokensUsed, max(tokenDelta, 0))
+        value.activeElapsedSeconds = current.activeElapsedSeconds
+            + max(activeElapsedDelta, 0)
+        if audit.verdict == .blockedCandidate,
+           let blocker = audit.blocker,
+           !blocker.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let fingerprint = normalizedGoalBlocker(blocker)
+            if current.blockerFingerprint == fingerprint {
+                value.consecutiveBlockedRuns = saturatingAdd(
+                    current.consecutiveBlockedRuns,
+                    1)
+            } else {
+                value.blockerFingerprint = fingerprint
+                value.consecutiveBlockedRuns = 1
+            }
+        } else {
+            value.blockerFingerprint = nil
+            value.consecutiveBlockedRuns = 0
+        }
+        return value
+    }
+
+    private static func hasGoalAudit(runID: ContinuationRunID,
+                                     in envelopes: [Envelope]) -> Bool {
+        envelopes.contains { envelope in
+            guard case .goalAuditCompleted(let payload) = envelope.event else { return false }
+            return payload.runID == runID
+        }
+    }
+
+    func clearGoal(_ goalID: GoalID,
+                   expectedRevision: Int,
+                   hostAuthorized: Bool) async throws {
+        guard hostAuthorized else {
+            throw IntatisError.permissionDenied("clearing a Goal is reserved for the user/host control plane")
+        }
+        await acquireAdmissionLock()
+        defer { releaseAdmissionLock() }
+        let projection = CoworkProjection.build(from: await log.replay())
+        guard projection.currentGoalID == goalID,
+              let current = projection.goals[goalID] else {
+            throw IntatisError.notFound("current Goal \(goalID.rawValue)")
+        }
+        guard current.revision == expectedRevision else {
+            throw GoalMutationViolation(
+                kind: .staleRevision,
+                message: "expected revision \(expectedRevision), actual \(current.revision)",
+                goalID: goalID,
+                expectedRevision: expectedRevision,
+                actualRevision: current.revision)
+        }
+        try await appendAdmissionEvent(.goalCleared(GoalClearedPayload(
+            goal: current,
+            reason: "cleared by user/host control plane")))
     }
 
     // MARK: - Coordinator tools (a lead agent spawns / lists / removes sub-agents)
@@ -2666,6 +4299,8 @@ public actor Orchestrator {
                      input: String,
                      images: [ImageAttachment] = [],
                      userMessage: UserMessagePayload? = nil,
+                     recordUserMessage: Bool = true,
+                     explicitGoalIntent: Bool = false,
                      taskContract: TaskContract? = nil,
                      rootTaskID: TaskID? = nil,
                      taskAttempt: Int? = nil) async throws -> AgentRunResult {
@@ -2678,6 +4313,19 @@ public actor Orchestrator {
             requester: agent.name,
             currentTaskID: taskContract?.id,
             defaultModel: agent.model.rawValue)
+        let workTaskManager = OrchestratorWorkTaskManager(
+            orchestrator: self,
+            requester: agent.name,
+            currentWorkTaskID: taskContract?.workTaskID,
+            currentRunID: taskContract?.continuationRunID,
+            currentGoalID: taskContract?.goalID,
+            canManage: capabilityLease.tools.contains(.manageWorkTasks),
+            canUpdateOwned: capabilityLease.tools.contains(.updateOwnedWorkTask))
+        let goalManager = OrchestratorGoalManager(
+            orchestrator: self,
+            explicitGoalIntent: explicitGoalIntent,
+            canCreate: capabilityLease.tools.contains(.createGoal),
+            canSubmitVerdict: capabilityLease.tools.contains(.submitGoalVerdict))
         let toolRegistry = Self.toolRegistry(for: capabilityLease)
         let imageGenerator = await imageGeneratorFor(agent)
         let allowedToolNames = toolRegistry.descriptors().map(\.name).sorted()
@@ -2712,14 +4360,26 @@ public actor Orchestrator {
                                     runtimeEnvironment: .cowork),
             messenger: messenger,
             agentManager: manager,
+            workTaskManager: workTaskManager,
+            goalManager: goalManager,
             imageGenerator: imageGenerator,
             capabilityLease: capabilityLease,
             workspaceLease: workspaceLease,
             rootTaskID: rootTaskID,
             taskAttempt: taskAttempt,
+            executionScope: AgentExecutionScope(
+                goalID: taskContract?.goalID,
+                continuationRunID: taskContract?.continuationRunID,
+                workTaskID: taskContract?.workTaskID,
+                invocationTaskID: taskContract?.id,
+                agentID: agent.name),
             tokenBudgetMeter: tokenBudgetMeter
         )
-        let output = try await loop.send(input, images: images, userMessage: userMessage)
+        let output = try await loop.send(
+            input,
+            images: images,
+            userMessage: userMessage,
+            recordUserMessage: recordUserMessage)
         return AgentRunResult(
             output: output,
             presentedMessageIDs: contextBundle.directMessages.compactMap(\.messageID))
@@ -2880,10 +4540,12 @@ public actor Orchestrator {
 
     private func prepareDelegatedTask(issuer: AgentID,
                                       assignee: Agent,
+                                      workTask: WorkTask? = nil,
                                       objective: String,
                                       roleHint: String? = nil,
                                       expectedDeliverable: String? = nil,
                                       parentTaskID: TaskID? = nil,
+                                      scopeContract: TaskContract? = nil,
                                       replyMode: TaskReplyMode = .taskReport) -> PreparedDelegatedTask {
         let trimmedObjective = objective.trimmingCharacters(in: .whitespacesAndNewlines)
         let relatedAgents = agentVisibleNames(excluding: assignee.name)
@@ -2897,6 +4559,9 @@ public actor Orchestrator {
             : .readOnly
         var capabilityLease = defaultLease
             ?? CapabilityLease.worker(taskID: taskID, workspaceAccess: workspaceAccess)
+        if assignee.name != Self.mainAgentID {
+            capabilityLease.tools.remove(.createGoal)
+        }
         capabilityLease.id = CapabilityLeaseID.new()
         capabilityLease.taskID = taskID
         capabilityLease.expiresAtTaskCompletion = true
@@ -2910,6 +4575,9 @@ public actor Orchestrator {
             issuer: issuer,
             assignee: assignee.name,
             parentTaskID: parentTaskID,
+            workTaskID: workTask?.id,
+            continuationRunID: workTask?.runID ?? scopeContract?.continuationRunID,
+            goalID: workTask?.goalID ?? scopeContract?.goalID,
             objective: trimmedObjective.isEmpty ? "Answer the assigned task." : trimmedObjective,
             roleHint: roleHint?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
                 ?? Self.defaultRoleHint(for: assignee.name, objective: trimmedObjective),
@@ -2946,6 +4614,9 @@ public actor Orchestrator {
         var capabilityLease: CapabilityLease = agent.coordinationDepth > 0
             ? .coordinator(workspaceAccess: workspaceAccess)
             : .worker(workspaceAccess: grantWorkerWriteCapabilities ? workspaceAccess : .readOnly)
+        if agent.name != Self.mainAgentID {
+            capabilityLease.tools.remove(.createGoal)
+        }
         capabilityLease.expiresAtTaskCompletion = false
         return (capabilityLease, workspaceLease)
     }
@@ -3013,17 +4684,25 @@ public actor Orchestrator {
                 throw CoworkTaskExecutionError.invalidLease(
                     "capability lease belongs to task \(boundTaskID.rawValue)")
             }
-            return lease
+            return Self.goalScopedCapabilityLease(lease, for: agent.name)
         }
         if let leaseID = defaultCapabilityLeaseIDs[agent.name],
            let lease = capabilityLeases[leaseID] {
-            return lease
+            return Self.goalScopedCapabilityLease(lease, for: agent.name)
         }
         var lease = CapabilityLease.worker()
         lease.expiresAtTaskCompletion = false
         capabilityLeases[lease.id] = lease
         defaultCapabilityLeaseIDs[agent.name] = lease.id
         return lease
+    }
+
+    private static func goalScopedCapabilityLease(_ lease: CapabilityLease,
+                                                   for agentID: AgentID) -> CapabilityLease {
+        guard agentID != mainAgentID else { return lease }
+        var scoped = lease
+        scoped.tools.remove(.createGoal)
+        return scoped
     }
 
     private func workspaceLease(for agent: Agent,
@@ -3209,7 +4888,9 @@ public actor Orchestrator {
 
     @discardableResult
     func runNextScheduledTask() async -> Bool {
-        guard let task = scheduler.claimNext(excluding: terminalCommitTaskIDs) else { return false }
+        let excludedTaskIDs = terminalCommitTaskIDs
+            .union(Set(terminalPersistenceFailures.keys))
+        guard let task = scheduler.claimNext(excluding: excludedTaskIDs) else { return false }
         let execution = launchClaimedTask(task)
         await execution.value
         return true
@@ -3229,8 +4910,10 @@ public actor Orchestrator {
     private func ensureSchedulerRunning() {
         guard !schedulerSuspended else { return }
         let concurrencyLimit = max(1, executionPolicy.maxConcurrentTasks)
+        let excludedTaskIDs = terminalCommitTaskIDs
+            .union(Set(terminalPersistenceFailures.keys))
         while runningExecutions.count < concurrencyLimit,
-              let task = scheduler.claimNext(excluding: terminalCommitTaskIDs) {
+              let task = scheduler.claimNext(excluding: excludedTaskIDs) {
             _ = launchClaimedTask(task)
         }
         notifyIdleIfNeeded()
@@ -3255,6 +4938,19 @@ public actor Orchestrator {
             runningExecutions.removeValue(forKey: taskID)
             return
         }
+        // A Goal/run tombstone remains an execution-time fence if a prior
+        // durable cancellation failed and left the task queued. Unrelated
+        // scheduler wakes must never dispatch that task to its provider.
+        if isGoalRunCancellationRequested(
+            goalID: task.contract.goalID,
+            continuationRunID: task.contract.continuationRunID) {
+            _ = await cancelBeforeExecution(
+                task,
+                reason: "Goal continuation cancellation is pending",
+                wasClaimed: true)
+            executionDidFinish(taskID)
+            return
+        }
         do {
             try await appendTaskLifecycleEvent(.taskStarted(TaskStartedPayload(
                 taskID: taskID,
@@ -3271,6 +4967,21 @@ public actor Orchestrator {
                 task,
                 message: "Task start could not be persisted: \(error.localizedDescription)",
                 metadata: metadata)
+            executionDidFinish(taskID)
+            return
+        }
+        // `appendTaskLifecycleEvent` is an actor reentrancy point. A scoped
+        // cancellation may have installed a Goal/run tombstone and attempted
+        // to cancel this still-queued claim while `taskStarted` was being
+        // persisted. Revalidate every execution fence before committing the
+        // scheduler transition: even a failed `taskCancelled` persistence
+        // attempt must never allow the original claim to reach its provider.
+        guard scheduler.record(for: taskID)?.status == .queued,
+              !terminalCommitTaskIDs.contains(taskID),
+              terminalPersistenceFailures[taskID] == nil,
+              !isGoalRunCancellationRequested(
+                goalID: task.contract.goalID,
+                continuationRunID: task.contract.continuationRunID) else {
             executionDidFinish(taskID)
             return
         }
@@ -3327,6 +5038,8 @@ public actor Orchestrator {
                     input: task.input,
                     images: invocation?.images ?? [],
                     userMessage: invocation?.userMessage,
+                    recordUserMessage: invocation?.recordUserMessage ?? true,
+                    explicitGoalIntent: invocation?.explicitGoalIntent ?? false,
                     taskContract: task.contract,
                     rootTaskID: task.rootTaskID,
                     taskAttempt: task.attempt)
@@ -3346,7 +5059,20 @@ public actor Orchestrator {
                 let reason = cancellationReasons[taskID] ?? "execution cancelled"
                 await finishCancelledTask(task, reason: reason, metadata: metadata)
             } else {
-                await finishFailedTask(task, message: error.localizedDescription, metadata: metadata)
+                let usageLimit = error as? ProviderUsageLimitError
+                let failurePersisted = await finishFailedTask(
+                    task,
+                    message: error.localizedDescription,
+                    metadata: metadata,
+                    failureCode: usageLimit == nil ? nil : .providerUsageLimit)
+                if failurePersisted,
+                   let usageLimit,
+                   let goalID = task.contract.goalID,
+                   let runID = task.contract.continuationRunID {
+                    providerUsageLimitFailures[runID] = (
+                        goalID,
+                        usageLimit.localizedDescription)
+                }
             }
         }
         executionDidFinish(taskID, resumeScheduler: false)
@@ -3361,9 +5087,9 @@ public actor Orchestrator {
         notifyIdleIfNeeded()
     }
 
-    func runSchedulerUntilIdle() async {
+    public func runSchedulerUntilIdle() async {
         ensureSchedulerRunning()
-        if scheduler.queuedTasks().isEmpty, runningExecutions.isEmpty {
+        if !hasRunnableScheduledWork() {
             await recycleIdleToolSpawnedAgents(reason: "scheduled tasks drained; auto-recycled idle tool-spawned agent")
             return
         }
@@ -3371,6 +5097,106 @@ public actor Orchestrator {
             idleWaiters.append(continuation)
         }
         await recycleIdleToolSpawnedAgents(reason: "scheduled tasks drained; auto-recycled idle tool-spawned agent")
+    }
+
+    /// Waits only for invocations owned by one Goal/run scope. Unrelated
+    /// Cowork work cannot hold a Goal verifier barrier open indefinitely.
+    public func runSchedulerUntilIdle(goalID: GoalID,
+                                      continuationRunID: ContinuationRunID? = nil) async {
+        ensureSchedulerRunning()
+        while hasScheduledWork(goalID: goalID, continuationRunID: continuationRunID) {
+            guard !Task.isCancelled else { return }
+            do {
+                try await Task.sleep(nanoseconds: 20_000_000)
+            } catch {
+                return
+            }
+        }
+    }
+
+    /// Returns the structured provider/account hard-limit signal observed by
+    /// this run, or an earlier unsettled run of the same Goal. The durable
+    /// atomic Goal/run settlement consumes it only after persistence succeeds;
+    /// no free-form error text is classified here.
+    func consumeProviderUsageLimitFailure(goalID: GoalID,
+                                          continuationRunID: ContinuationRunID) -> String? {
+        if let failure = providerUsageLimitFailures[continuationRunID],
+           failure.0 == goalID {
+            return failure.1
+        }
+        return providerUsageLimitFailures
+            .filter { $0.value.0 == goalID }
+            .sorted { $0.key.rawValue < $1.key.rawValue }
+            .first?.value.1
+    }
+
+    private func hasScheduledWork(goalID: GoalID,
+                                  continuationRunID: ContinuationRunID?) -> Bool {
+        let snapshot = scheduler.snapshot()
+        if (snapshot.queuedTasks + snapshot.claimedTasks).contains(where: {
+            terminalPersistenceFailures[$0.contract.id] == nil
+                &&
+            Self.matchesScope(
+                $0.contract,
+                goalID: goalID,
+                continuationRunID: continuationRunID)
+        }) {
+            return true
+        }
+        return runningExecutions.keys.contains { taskID in
+            guard let task = snapshot.knownTasks[taskID] else { return false }
+            return Self.matchesScope(
+                task.contract,
+                goalID: goalID,
+                continuationRunID: continuationRunID)
+        }
+    }
+
+    private func scopedScheduledTaskIDs(
+        goalID: GoalID,
+        continuationRunID: ContinuationRunID?
+    ) -> [TaskID] {
+        let snapshot = scheduler.snapshot()
+        var seen = Set<TaskID>()
+        var ordered: [TaskID] = []
+        for task in snapshot.queuedTasks + snapshot.claimedTasks
+        where Self.matchesScope(
+            task.contract,
+            goalID: goalID,
+            continuationRunID: continuationRunID) {
+            if seen.insert(task.contract.id).inserted {
+                ordered.append(task.contract.id)
+            }
+        }
+        for taskID in runningExecutions.keys.sorted(by: { $0.rawValue < $1.rawValue }) {
+            guard let task = snapshot.knownTasks[taskID],
+                  Self.matchesScope(
+                    task.contract,
+                    goalID: goalID,
+                    continuationRunID: continuationRunID),
+                  seen.insert(taskID).inserted else { continue }
+            ordered.append(taskID)
+        }
+        return ordered
+    }
+
+    private static func matchesScope(_ contract: TaskContract,
+                                     goalID: GoalID,
+                                     continuationRunID: ContinuationRunID?) -> Bool {
+        guard contract.goalID == goalID else { return false }
+        return continuationRunID == nil || contract.continuationRunID == continuationRunID
+    }
+
+    private static func saturatingAdd(_ lhs: Int, _ rhs: Int) -> Int {
+        let (sum, overflow) = lhs.addingReportingOverflow(rhs)
+        return overflow ? Int.max : sum
+    }
+
+    private static func normalizedGoalBlocker(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
     }
 
     private func finishCompletedTask(_ task: ScheduledTask,
@@ -3382,14 +5208,19 @@ public actor Orchestrator {
             status: .completed,
             result: result,
             attempt: task.attempt)
-        do {
-            try await appendTaskLifecycleEvent(.taskCompleted(TaskCompletedPayload(
+        let lifecycleEvent = Event.taskCompleted(TaskCompletedPayload(
                 taskID: task.contract.id,
                 agent: task.assignee,
                 result: result,
                 report: report,
                 attempt: task.attempt,
-                metadata: metadata)))
+                metadata: metadata))
+        do {
+            try await persistInvocationSettlement(
+                lifecycleEvent,
+                contract: task.contract,
+                workTaskProgressNote:
+                    "candidate result received from invocation \(task.contract.id.rawValue); awaiting explicit task settlement")
         } catch {
             let message = "Task completion could not be persisted: \(error.localizedDescription)"
             _ = await finishFailedTask(task, message: message, metadata: metadata)
@@ -3413,20 +5244,27 @@ public actor Orchestrator {
     @discardableResult
     private func finishFailedTask(_ task: ScheduledTask,
                                   message: String,
-                                  metadata: CoworkEventMetadata) async -> Bool {
+                                  metadata: CoworkEventMetadata,
+                                  failureCode: TaskFailureCode? = nil) async -> Bool {
         let report = Self.makeTaskReport(
             task: task,
             status: .failed,
             error: message,
             attempt: task.attempt)
-        do {
-            try await appendTaskLifecycleEvent(.taskFailed(TaskFailedPayload(
+        let lifecycleEvent = Event.taskFailed(TaskFailedPayload(
                 taskID: task.contract.id,
                 agent: task.assignee,
                 error: message,
+                failureCode: failureCode,
                 report: report,
                 attempt: task.attempt,
-                metadata: metadata)))
+                metadata: metadata))
+        do {
+            try await persistInvocationSettlement(
+                lifecycleEvent,
+                contract: task.contract,
+                workTaskProgressNote:
+                    "candidate invocation \(task.contract.id.rawValue) failed: \(message); awaiting explicit task settlement")
         } catch {
             await recordTerminalPersistenceFailure(task: task, error: error)
             return false
@@ -3467,14 +5305,19 @@ public actor Orchestrator {
             status: .cancelled,
             error: reason,
             attempt: task.attempt)
-        do {
-            try await appendTaskLifecycleEvent(.taskCancelled(TaskCancelledPayload(
+        let lifecycleEvent = Event.taskCancelled(TaskCancelledPayload(
                 taskID: task.contract.id,
                 agent: task.assignee,
                 reason: reason,
                 report: report,
                 attempt: task.attempt,
-                metadata: metadata)))
+                metadata: metadata))
+        do {
+            try await persistInvocationSettlement(
+                lifecycleEvent,
+                contract: task.contract,
+                workTaskProgressNote:
+                    "candidate invocation \(task.contract.id.rawValue) was cancelled: \(reason); awaiting explicit task settlement")
         } catch {
             await recordTerminalPersistenceFailure(task: task, error: error)
             return false
@@ -3495,6 +5338,61 @@ public actor Orchestrator {
             try await taskLifecycleEventAppender(event)
         } else {
             try await log.append(event)
+        }
+    }
+
+    private func appendTaskLifecycleEvents(_ events: [Event]) async throws {
+        guard !events.isEmpty else { return }
+        if let taskLifecycleEventAppender {
+            for event in events {
+                try await taskLifecycleEventAppender(event)
+            }
+        } else {
+            try await log.append(events)
+        }
+    }
+
+    /// Persists execution settlement and its candidate-only WorkTask progress
+    /// snapshot under the same admission lock as every other WorkTask write.
+    /// This prevents an actor re-entry at the EventLog await from committing a
+    /// stale graph copy over a newer optimistic revision.
+    private func persistInvocationSettlement(
+        _ lifecycleEvent: Event,
+        contract: TaskContract,
+        workTaskProgressNote: String
+    ) async throws {
+        await acquireAdmissionLock()
+        defer { releaseAdmissionLock() }
+
+        var preflightWorkTaskGraph = workTaskGraph
+        var events = [lifecycleEvent]
+        if workTaskRecoveryFailure == nil,
+           let progressEvent = candidateWorkTaskProgressEvent(
+               for: contract,
+               note: workTaskProgressNote,
+               graph: &preflightWorkTaskGraph) {
+            events.append(progressEvent)
+        }
+        try await appendTaskLifecycleEvents(events)
+        workTaskGraph = preflightWorkTaskGraph
+    }
+
+    private func candidateWorkTaskProgressEvent(
+        for contract: TaskContract,
+        note: String,
+        graph: inout WorkTaskGraph
+    ) -> Event? {
+        guard let workTaskID = contract.workTaskID,
+              var current = graph.task(workTaskID),
+              !current.status.isTerminal else { return nil }
+        current.progressNote = note
+        switch graph.update(current, expectedRevision: current.revision) {
+        case .success(let updated):
+            return .workTaskProgressed(WorkTaskProgressedPayload(task: updated))
+        case .failure:
+            // Invocation settlement must remain durable even if a stale or
+            // externally settled WorkTask no longer accepts a progress note.
+            return nil
         }
     }
 
@@ -3538,6 +5436,73 @@ public actor Orchestrator {
             metadata: metadata)))
     }
 
+    @discardableResult
+    private func cancelUnqueuedRootTask(_ task: ScheduledTask,
+                                        reason: String) async -> Bool {
+        let metadata = taskMetadata(
+            contract: task.contract,
+            rootTaskID: task.rootTaskID,
+            parentTaskID: task.parentTaskID,
+            sender: task.issuer,
+            recipient: task.assignee)
+        let report = Self.makeTaskReport(
+            task: task,
+            status: .cancelled,
+            error: reason,
+            attempt: task.attempt)
+        do {
+            try await appendTaskLifecycleEvent(.taskCancelled(TaskCancelledPayload(
+                taskID: task.contract.id,
+                agent: task.assignee,
+                reason: reason,
+                report: report,
+                attempt: task.attempt,
+                metadata: metadata)))
+        } catch {
+            terminalPersistenceFailures[task.contract.id] =
+                "Root task cancellation could not be persisted: \(error.localizedDescription)"
+            completeResultWaiters(task.contract.id)
+            return false
+        }
+        terminalPersistenceFailures.removeValue(forKey: task.contract.id)
+        _ = taskGraph.updateStatus(taskID: task.contract.id, status: .cancelled)
+        await revokeTaskLeases(contract: task.contract, reason: "task cancelled before queue admission")
+        rootInvocations.removeValue(forKey: task.contract.id)
+        completeResultWaiters(task.contract.id)
+        return true
+    }
+
+    private func scheduledTask(for node: TaskNode) -> ScheduledTask {
+        let lineage = Self.uniqueAgents([node.issuer, node.assignee].compactMap { $0 })
+        return ScheduledTask(
+            contract: node.contract,
+            input: node.contract.objective,
+            rootTaskID: node.rootTaskID,
+            parentTaskID: node.parentTaskID,
+            issuer: node.issuer,
+            assignee: node.assignee,
+            causalParentID: node.parentTaskID,
+            hopCount: max(0, taskGraph.depth(of: node.id)),
+            visitedAgents: lineage,
+            attempt: scheduler.record(for: node.id)?.attempt ?? 1)
+    }
+
+    private func isGoalRunCancellationRequested(
+        goalID: GoalID?,
+        continuationRunID: ContinuationRunID?
+    ) -> Bool {
+        guard let goalID else { return false }
+        if cancelledGoalRunScopes.contains(GoalRunCancellationScope(
+            goalID: goalID,
+            runID: nil)) {
+            return true
+        }
+        guard let continuationRunID else { return false }
+        return cancelledGoalRunScopes.contains(GoalRunCancellationScope(
+            goalID: goalID,
+            runID: continuationRunID))
+    }
+
     private func acquireAdmissionLock() async {
         if !admissionLocked {
             admissionLocked = true
@@ -3554,6 +5519,11 @@ public actor Orchestrator {
         } else {
             admissionWaiters.removeFirst().resume()
         }
+    }
+
+    /// Internal observability for deterministic admission serialization tests.
+    func admissionWaiterCountForTesting() -> Int {
+        admissionWaiters.count
     }
 
     @discardableResult
@@ -3652,10 +5622,17 @@ public actor Orchestrator {
     }
 
     private func notifyIdleIfNeeded() {
-        guard scheduler.queuedTasks().isEmpty, runningExecutions.isEmpty else { return }
+        guard !hasRunnableScheduledWork() else { return }
         let waiters = idleWaiters
         idleWaiters.removeAll()
         for waiter in waiters { waiter.resume() }
+    }
+
+    private func hasRunnableScheduledWork() -> Bool {
+        !runningExecutions.isEmpty
+            || scheduler.queuedTasks().contains {
+                terminalPersistenceFailures[$0.contract.id] == nil
+            }
     }
 
     private func completeResultWaiters(_ taskID: TaskID) {
@@ -3704,6 +5681,122 @@ public actor Orchestrator {
             }
             _ = scheduler.acknowledgeMessage(message.id, recipient: task.assignee)
         }
+    }
+
+    /// Settles stale mailbox entries when their owning Goal/run is cancelled.
+    /// They were never successfully presented, so this uses the dedicated
+    /// discard event rather than falsifying an `agent_message_consumed` audit.
+    private func discardPendingMessages(goalID: GoalID,
+                                        continuationRunID: ContinuationRunID?,
+                                        reason: String) async -> Bool {
+        var seen = Set<MessageID>()
+        let messages = scheduler.snapshot().mailboxes.values
+            .flatMap(\.pendingMessageDetails)
+            .filter { message in
+                guard seen.insert(message.id).inserted,
+                      let causalTaskID = message.causalParentID ?? message.taskID,
+                      let contract = taskGraph.node(causalTaskID)?.contract
+                        ?? scheduler.knownTask(taskID: causalTaskID)?.contract else {
+                    return false
+                }
+                return Self.matchesScope(
+                    contract,
+                    goalID: goalID,
+                    continuationRunID: continuationRunID)
+            }
+            .sorted {
+                if $0.createdAt == $1.createdAt {
+                    return $0.id.rawValue < $1.id.rawValue
+                }
+                return $0.createdAt < $1.createdAt
+            }
+        return await persistDiscardedMessages(
+            messages,
+            goalID: goalID,
+            continuationRunID: continuationRunID,
+            reason: reason)
+    }
+
+    private func persistDiscardedMessages(
+        _ messages: [PendingAgentMessage],
+        goalID: GoalID?,
+        continuationRunID: ContinuationRunID?,
+        reason: String
+    ) async -> Bool {
+        guard !messages.isEmpty else { return true }
+
+        let events = messages.map { message in
+            Event.agentMessageDiscarded(AgentMessageDiscardedPayload(
+                messageID: message.id,
+                agent: message.recipient,
+                reason: reason,
+                taskID: message.taskID,
+                goalID: goalID,
+                continuationRunID: continuationRunID,
+                metadata: CoworkEventMetadata(
+                    taskID: message.taskID,
+                    sender: message.sender,
+                    recipient: message.recipient,
+                    agentID: message.recipient,
+                    causalParentID: message.causalParentID,
+                    scope: .task,
+                    visibility: .privateAgent)))
+        }
+        do {
+            try await appendAdmissionEvents(events)
+        } catch {
+            try? await log.append(.error(ErrorPayload(
+                code: "mailbox_cancellation_settlement_failed",
+                message: "Could not discard cancelled Goal mailbox messages: \(error.localizedDescription)")))
+            return false
+        }
+        for message in messages {
+            _ = scheduler.acknowledgeMessage(
+                message.id,
+                recipient: message.recipient)
+        }
+        return true
+    }
+
+    private func taskContract(forCausalTaskID taskID: TaskID?) -> TaskContract? {
+        guard let taskID else { return nil }
+        return taskGraph.node(taskID)?.contract
+            ?? scheduler.knownTask(taskID: taskID)?.contract
+    }
+
+    private func communicationCancellationFailure(taskID: TaskID?) -> String? {
+        if Task.isCancelled {
+            return "communication was cancelled"
+        }
+        let contract = taskContract(forCausalTaskID: taskID)
+        guard isGoalRunCancellationRequested(
+            goalID: contract?.goalID,
+            continuationRunID: contract?.continuationRunID) else {
+            return nil
+        }
+        return "Goal continuation cancellation is pending"
+    }
+
+    /// `MessageBus` persists before returning. If cancellation installs a
+    /// Goal/run tombstone (or cancels the caller) during that await, close the
+    /// newly durable mailbox entry with an equally durable discard before the
+    /// admission lock is released. This prevents a non-cooperative provider
+    /// from reviving a cancelled run after restore.
+    private func settleLateCancelledCommunication(
+        _ message: PendingAgentMessage,
+        taskID: TaskID?
+    ) async -> String? {
+        guard let failure = communicationCancellationFailure(taskID: taskID) else {
+            return nil
+        }
+        let contract = taskContract(forCausalTaskID: taskID)
+        let settled = await persistDiscardedMessages(
+            [message],
+            goalID: contract?.goalID,
+            continuationRunID: contract?.continuationRunID,
+            reason: failure)
+        if settled { return failure }
+        return "\(failure); mailbox discard could not be persisted"
     }
 
     private func revokeTaskLeases(contract: TaskContract, reason: String) async {
@@ -4160,6 +6253,29 @@ public actor Orchestrator {
             tools.append(BrowserDownloadsTool())
             tools.append(BrowserSearchTool())
         }
+        if lease.tools.contains(.manageWorkTasks) {
+            tools.append(TaskCreateTool())
+            tools.append(TaskUpdateTool())
+            tools.append(TaskGetTool())
+            tools.append(TaskListTool())
+        } else {
+            if lease.tools.contains(.updateOwnedWorkTask) {
+                tools.append(TaskUpdateTool())
+            }
+            if lease.tools.contains(.readWorkTasks) {
+                tools.append(TaskGetTool())
+                tools.append(TaskListTool())
+            }
+        }
+        if lease.tools.contains(.readGoal) {
+            tools.append(GetGoalTool())
+        }
+        if lease.tools.contains(.createGoal) {
+            tools.append(CreateGoalTool())
+        }
+        if lease.tools.contains(.submitGoalVerdict) {
+            tools.append(UpdateGoalTool())
+        }
         let canInitiateCommunication: Bool
         switch lease.communication {
         case .selectedAgents, .taskGroup, .anyAgentInThread:
@@ -4362,12 +6478,14 @@ struct BusMessenger: AgentMessenger {
     }
 
     func delegateTask(to agent: String?,
-                      objective: String,
+                      workTaskID: WorkTaskID?,
+                      objective: String?,
                       roleHint: String?,
                       expectedDeliverable: String?) async -> String {
         await orchestrator.delegateTask(
             from: from,
             to: agent,
+            workTaskID: workTaskID,
             objective: objective,
             roleHint: roleHint,
             expectedDeliverable: expectedDeliverable,
@@ -4404,6 +6522,102 @@ struct OrchestratorManager: AgentManager {
             requestedBy: requester,
             currentTaskID: currentTaskID,
             name: name)
+    }
+}
+
+/// Capability- and invocation-scoped adapter for the model-facing WorkTask
+/// tools. Keeping the authority context here prevents callers from widening
+/// their own read or mutation scope through tool arguments.
+private struct OrchestratorWorkTaskManager: WorkTaskManager {
+    let orchestrator: Orchestrator
+    let requester: AgentID
+    let currentWorkTaskID: WorkTaskID?
+    let currentRunID: ContinuationRunID?
+    let currentGoalID: GoalID?
+    let canManage: Bool
+    let canUpdateOwned: Bool
+
+    func createWorkTask(_ request: WorkTaskCreateRequest) async throws -> WorkTaskDetail {
+        try await orchestrator.createWorkTask(
+            requestedBy: requester,
+            currentRunID: currentRunID,
+            currentGoalID: currentGoalID,
+            canManage: canManage,
+            request: request)
+    }
+
+    func updateWorkTask(_ request: WorkTaskUpdateRequest) async throws -> WorkTaskDetail {
+        try await orchestrator.updateWorkTask(
+            requestedBy: requester,
+            currentWorkTaskID: currentWorkTaskID,
+            currentRunID: currentRunID,
+            canManage: canManage,
+            canUpdateOwned: canUpdateOwned,
+            request: request)
+    }
+
+    func getWorkTask(_ taskID: WorkTaskID) async throws -> WorkTaskDetail {
+        try await orchestrator.getWorkTask(
+            requestedBy: requester,
+            currentWorkTaskID: currentWorkTaskID,
+            currentRunID: currentRunID,
+            currentGoalID: currentGoalID,
+            canManage: canManage,
+            taskID: taskID)
+    }
+
+    func listWorkTasks(_ request: WorkTaskListRequest) async throws -> [WorkTaskDetail] {
+        try await orchestrator.listWorkTasks(
+            requestedBy: requester,
+            currentWorkTaskID: currentWorkTaskID,
+            currentRunID: currentRunID,
+            currentGoalID: currentGoalID,
+            canManage: canManage,
+            request: request)
+    }
+}
+
+/// Goal tool authority is bound by the host, never inferred from arguments.
+/// Ordinary model runtimes can create only under explicit Goal intent, read the
+/// current projection, and (with a dedicated verifier lease) submit a terminal
+/// candidate. User-owned edit/pause/resume/clear operations stay host-only.
+private struct OrchestratorGoalManager: GoalManager {
+    let orchestrator: Orchestrator
+    let explicitGoalIntent: Bool
+    let canCreate: Bool
+    let canSubmitVerdict: Bool
+
+    func createGoal(_ request: GoalCreateRequest) async throws -> Goal {
+        try await orchestrator.createGoal(
+            request: request,
+            explicitGoalIntent: explicitGoalIntent,
+            canCreate: canCreate)
+    }
+
+    func currentGoal() async throws -> Goal? {
+        await orchestrator.currentGoalSnapshot()
+    }
+
+    func editGoal(_ request: GoalEditRequest) async throws -> Goal {
+        try await orchestrator.editGoal(request: request, hostAuthorized: false)
+    }
+
+    func transitionGoal(_ goalID: GoalID,
+                        expectedRevision: Int,
+                        to status: GoalStatus) async throws -> Goal {
+        try await orchestrator.transitionGoal(
+            goalID,
+            expectedRevision: expectedRevision,
+            to: status,
+            canSubmitVerdict: canSubmitVerdict,
+            hostAuthorized: false)
+    }
+
+    func clearGoal(_ goalID: GoalID, expectedRevision: Int) async throws {
+        try await orchestrator.clearGoal(
+            goalID,
+            expectedRevision: expectedRevision,
+            hostAuthorized: false)
     }
 }
 

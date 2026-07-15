@@ -59,6 +59,35 @@ private actor ReliabilityTaskStartGate {
     }
 }
 
+private actor ReliabilityForwardingGate: ForwardingReviewer {
+    private var entered = false
+    private var enteredWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiter: CheckedContinuation<Void, Never>?
+
+    func review(from: AgentID, to: AgentID, content: String) async -> ForwardingDecision {
+        entered = true
+        let waiters = enteredWaiters
+        enteredWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+        await withCheckedContinuation { continuation in
+            releaseWaiter = continuation
+        }
+        return .forward(content)
+    }
+
+    func waitUntilEntered() async {
+        if entered { return }
+        await withCheckedContinuation { continuation in
+            enteredWaiters.append(continuation)
+        }
+    }
+
+    func release() {
+        releaseWaiter?.resume()
+        releaseWaiter = nil
+    }
+}
+
 private enum ReliabilityForcedError: Error, LocalizedError {
     case providerFailure
     case terminalPersistenceFailure
@@ -84,6 +113,21 @@ private actor ReliabilityOneShotRevocationFailure {
             throw ReliabilityForcedError.terminalPersistenceFailure
         }
         try await log.append(events)
+    }
+}
+
+private actor ReliabilityCancellationPersistenceGate {
+    private var rejectsCancellation = true
+
+    func append(_ event: Event, to log: EventLog) async throws {
+        if rejectsCancellation, case .taskCancelled = event {
+            throw ReliabilityForcedError.terminalPersistenceFailure
+        }
+        _ = try await log.append(event)
+    }
+
+    func allowCancellation() {
+        rejectsCancellation = false
     }
 }
 
@@ -1118,6 +1162,95 @@ final class OrchestrationReliabilityTests: XCTestCase {
         XCTAssertEqual(attempts, [1, 2, 3])
     }
 
+    func testScopedCancellationDurablyDiscardsMessageAdmittedByNonCooperativeSender() async throws {
+        let log = try reliabilityLog()
+        let mainWorkspace = try reliabilityWorkspace()
+        let workerWorkspace = try reliabilityWorkspace()
+        defer {
+            try? FileManager.default.removeItem(at: mainWorkspace)
+            try? FileManager.default.removeItem(at: workerWorkspace)
+        }
+        let worker = AgentID(rawValue: "worker")
+        let goalID = GoalID.new()
+        let runID = ContinuationRunID.new()
+        let mediationGate = ReliabilityForwardingGate()
+        let provider = ReliabilityCapturingProvider()
+        let orchestrator = Orchestrator(
+            log: log,
+            mediator: Mediator(reviewer: mediationGate),
+            allowsShell: true,
+            responder: FixedResponder(.allow)) { _ in provider }
+        let mainAttached = await orchestrator.attach(Agent(
+            name: main,
+            workspaceRoot: mainWorkspace,
+            model: ModelID(rawValue: "m"),
+            profile: .reviewed,
+            coordinationDepth: Agent.defaultCoordinationDepth))
+        let workerAttached = await orchestrator.attach(Agent(
+            name: worker,
+            workspaceRoot: workerWorkspace,
+            model: ModelID(rawValue: "m"),
+            profile: .reviewed))
+        XCTAssertTrue(mainAttached)
+        XCTAssertTrue(workerAttached)
+        let causalTaskIDValue = await orchestrator.createRootTask(
+            assignee: main,
+            objective: "scoped communication root",
+            goalID: goalID,
+            continuationRunID: runID)
+        let causalTaskID = try XCTUnwrap(causalTaskIDValue)
+
+        let send = Task {
+            await orchestrator.sendMessage(
+                from: main,
+                to: worker.rawValue,
+                content: "late scoped message",
+                taskID: causalTaskID)
+        }
+        await mediationGate.waitUntilEntered()
+        let cancellation = Task {
+            await orchestrator.cancelActiveTasks(
+                goalID: goalID,
+                continuationRunID: runID,
+                reason: "cancel while sender ignores cancellation",
+                resumePendingTasksOnSuccess: false)
+        }
+        for _ in 0..<100 {
+            if await orchestrator.admissionWaiterCountForTesting() > 0 { break }
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        let admissionWaiterCount = await orchestrator.admissionWaiterCountForTesting()
+        XCTAssertGreaterThan(admissionWaiterCount, 0)
+        await mediationGate.release()
+
+        let sendResult = await send.value
+        let cancellationSucceeded = await cancellation.value
+
+        XCTAssertTrue(cancellationSucceeded)
+        XCTAssertTrue(sendResult.contains("Goal continuation cancellation is pending"))
+        XCTAssertTrue(provider.requests.isEmpty)
+        let pendingMessages = await orchestrator.mailbox(for: worker).pendingMessages
+        XCTAssertTrue(pendingMessages.isEmpty)
+        let events = await log.replay()
+        XCTAssertTrue(events.contains { envelope in
+            guard case .agentMessageDiscarded(let payload) = envelope.event else { return false }
+            return payload.agent == worker
+                && payload.taskID == causalTaskID
+                && payload.goalID == goalID
+                && payload.continuationRunID == runID
+        })
+        XCTAssertFalse(events.contains { envelope in
+            guard case .agentMessageConsumed(let payload) = envelope.event else { return false }
+            return payload.agent == worker
+        })
+        XCTAssertFalse(events.contains { envelope in
+            guard case .taskCreated(let payload) = envelope.event else { return false }
+            return payload.contract.kind == .mailboxDelivery
+                && payload.contract.goalID == goalID
+                && payload.contract.continuationRunID == runID
+        })
+    }
+
     func testClaimedTaskCanBeCancelledBeforeTaskStartedCommit() async throws {
         let log = try reliabilityLog()
         let workspace = try reliabilityWorkspace()
@@ -1156,6 +1289,187 @@ final class OrchestrationReliabilityTests: XCTestCase {
         XCTAssertNil(reliabilityEventIndex(events, type: .taskStarted, taskID: taskID))
         XCTAssertNotNil(reliabilityEventIndex(events, type: .taskCancelled, taskID: taskID))
         XCTAssertEqual(CoworkProjection.build(from: events).tasks[taskID]?.status, .cancelled)
+    }
+
+    func testScopeCancellationDuringTaskStartedPersistenceNeverEntersProvider() async throws {
+        let log = try reliabilityLog()
+        let workspace = try reliabilityWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let provider = ReliabilityCapturingProvider()
+        let startedPersistenceGate = ReliabilityTaskStartGate()
+        let goalID = GoalID.new()
+        let runID = ContinuationRunID.new()
+        let orchestrator = Orchestrator(
+            log: log,
+            allowsShell: true,
+            responder: FixedResponder(.allow)) { _ in provider }
+        let attached = await orchestrator.attach(Agent(
+            name: main,
+            workspaceRoot: workspace,
+            model: ModelID(rawValue: "m"),
+            profile: .reviewed,
+            coordinationDepth: Agent.defaultCoordinationDepth))
+        XCTAssertTrue(attached)
+        await orchestrator.setTaskLifecycleEventAppender { event in
+            _ = try await log.append(event)
+            if case .taskStarted = event {
+                await startedPersistenceGate.pause()
+            }
+        }
+
+        let sendTask = Task {
+            await orchestrator.send(
+                "cancel while task-start persistence is suspended",
+                to: main,
+                goalID: goalID,
+                continuationRunID: runID)
+        }
+        await startedPersistenceGate.waitUntilEntered()
+        let cancellation = Task {
+            await orchestrator.cancelActiveTasks(
+                goalID: goalID,
+                continuationRunID: runID,
+                reason: "scope cancelled during task-start persistence",
+                resumePendingTasksOnSuccess: false)
+        }
+        var observedDurableCancellation = false
+        for _ in 0..<100 {
+            observedDurableCancellation = await log.replay().contains { envelope in
+                if case .taskCancelled = envelope.event { return true }
+                return false
+            }
+            if observedDurableCancellation { break }
+            try await Task.sleep(nanoseconds: 2_000_000)
+        }
+        XCTAssertTrue(observedDurableCancellation)
+        await startedPersistenceGate.release()
+
+        let cancellationSucceeded = await cancellation.value
+        XCTAssertTrue(cancellationSucceeded)
+        let sendResult = await sendTask.value
+        guard case .failed = sendResult else {
+            return XCTFail("scope-cancelled send must fail closed")
+        }
+        await orchestrator.runSchedulerUntilIdle()
+        await orchestrator.runSchedulerUntilIdle(
+            goalID: goalID,
+            continuationRunID: runID)
+        XCTAssertTrue(provider.requests.isEmpty)
+    }
+
+    func testCancellationPersistenceFailureQuarantinesTaskWithoutBlockingWaiters() async throws {
+        let log = try reliabilityLog()
+        let workspace = try reliabilityWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let provider = ReliabilityCapturingProvider()
+        let startGate = ReliabilityTaskStartGate()
+        let cancellationGate = ReliabilityCancellationPersistenceGate()
+        let goalID = GoalID.new()
+        let runID = ContinuationRunID.new()
+        let orchestrator = Orchestrator(
+            log: log,
+            allowsShell: true,
+            responder: FixedResponder(.allow)) { _ in provider }
+        let attached = await orchestrator.attach(Agent(
+            name: main,
+            workspaceRoot: workspace,
+            model: ModelID(rawValue: "m"),
+            profile: .reviewed,
+            coordinationDepth: Agent.defaultCoordinationDepth))
+        XCTAssertTrue(attached)
+        await orchestrator.setTaskStartGate { _ in await startGate.pause() }
+        await orchestrator.setTaskLifecycleEventAppender { event in
+            try await cancellationGate.append(event, to: log)
+        }
+
+        let sendTask = Task {
+            await orchestrator.send(
+                "quarantine cancellation persistence failure",
+                to: main,
+                goalID: goalID,
+                continuationRunID: runID)
+        }
+        await startGate.waitUntilEntered()
+        let cancellation = Task {
+            await orchestrator.cancelActiveTasks(
+                goalID: goalID,
+                continuationRunID: runID,
+                reason: "forced cancellation persistence failure",
+                resumePendingTasksOnSuccess: false)
+        }
+        await Task.yield()
+        await startGate.release()
+
+        let cancellationSucceeded = await cancellation.value
+        XCTAssertFalse(cancellationSucceeded)
+        let sendResult = await sendTask.value
+        guard case .failed(let message) = sendResult else {
+            return XCTFail("quarantined send must return a failure")
+        }
+        XCTAssertTrue(message.contains("could not be persisted"))
+        let globalStarted = Date()
+        await orchestrator.runSchedulerUntilIdle()
+        XCTAssertLessThan(Date().timeIntervalSince(globalStarted), 1)
+        let scopedStarted = Date()
+        await orchestrator.runSchedulerUntilIdle(
+            goalID: goalID,
+            continuationRunID: runID)
+        XCTAssertLessThan(Date().timeIntervalSince(scopedStarted), 1)
+        XCTAssertTrue(provider.requests.isEmpty)
+    }
+
+    func testGraphOnlyAssignedRootCancellationRetriesAfterPersistenceRecovers() async throws {
+        let log = try reliabilityLog()
+        let workspace = try reliabilityWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let provider = ReliabilityCapturingProvider()
+        let cancellationGate = ReliabilityCancellationPersistenceGate()
+        let goalID = GoalID.new()
+        let runID = ContinuationRunID.new()
+        let orchestrator = Orchestrator(
+            log: log,
+            allowsShell: true,
+            responder: FixedResponder(.allow)) { _ in provider }
+        let attached = await orchestrator.attach(Agent(
+            name: main,
+            workspaceRoot: workspace,
+            model: ModelID(rawValue: "m"),
+            profile: .reviewed,
+            coordinationDepth: Agent.defaultCoordinationDepth))
+        XCTAssertTrue(attached)
+        await orchestrator.setTaskLifecycleEventAppender { event in
+            try await cancellationGate.append(event, to: log)
+        }
+        let createdRootID = await orchestrator.createRootTask(
+            assignee: main,
+            objective: "durable assigned root without queue admission",
+            goalID: goalID,
+            continuationRunID: runID)
+        let rootID = try XCTUnwrap(createdRootID)
+
+        let first = await orchestrator.cancelActiveTasks(
+            goalID: goalID,
+            continuationRunID: runID,
+            reason: "first cancellation fails",
+            resumePendingTasksOnSuccess: false)
+        XCTAssertFalse(first)
+        let failedCancellationProjection = CoworkProjection.build(from: await log.replay())
+        XCTAssertEqual(
+            failedCancellationProjection.tasks[rootID]?.status,
+            .assigned)
+
+        await cancellationGate.allowCancellation()
+        let second = await orchestrator.cancelActiveTasks(
+            goalID: goalID,
+            continuationRunID: runID,
+            reason: "retry after persistence recovery",
+            resumePendingTasksOnSuccess: false)
+        XCTAssertTrue(second)
+        let recoveredCancellationProjection = CoworkProjection.build(from: await log.replay())
+        XCTAssertEqual(
+            recoveredCancellationProjection.tasks[rootID]?.status,
+            .cancelled)
+        XCTAssertTrue(provider.requests.isEmpty)
     }
 
     func testRunningTaskCancellationHasOneCancelledTerminalState() async throws {

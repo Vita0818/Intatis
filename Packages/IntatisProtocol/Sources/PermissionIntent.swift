@@ -17,10 +17,19 @@ public enum PermissionDataEffect: String, Codable, Equatable, Sendable, Hashable
 public enum PermissionControlEffect: String, Codable, Equatable, Sendable, Hashable {
     case message
     case createTask = "create_task"
+    case updateTask = "update_task"
+    case cancelTask = "cancel_task"
+    case delegateTask = "delegate_task"
     case createAgent = "create_agent"
     case removeAgent = "remove_agent"
     case attachWorkspace = "attach_workspace"
     case grantCapability = "grant_capability"
+    case createGoal = "create_goal"
+    case editGoal = "edit_goal"
+    case pauseGoal = "pause_goal"
+    case resumeGoal = "resume_goal"
+    case clearGoal = "clear_goal"
+    case submitGoalVerdict = "submit_goal_verdict"
 }
 
 public enum PermissionRisk: String, Codable, Equatable, Sendable, Hashable {
@@ -40,6 +49,7 @@ public struct PermissionResource: Codable, Equatable, Sendable, Hashable {
         case workspace
         case agent
         case task
+        case goal
         case command
         case url
         case git

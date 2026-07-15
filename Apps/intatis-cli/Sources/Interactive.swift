@@ -232,6 +232,10 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
 
 private let coworkHelp = """
   Just talk to @main — it can spawn / list / remove its own helper agents.
+  /goal <objective>                    create and run one durable Goal
+  /goal status                         show the current Goal and verifier state
+  /goal pause|resume|clear             control the current Goal
+  /goal edit <objective>               revise the current Goal objective
   /agent add <name> <path> [model]   manually attach an agent (optional model)
   /agent remove <name>               detach an agent
   /agents                            list attached agents
@@ -253,6 +257,7 @@ private let coworkHelp = """
 private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REPLExit {
     let registry = ProviderRegistry(config: config.providerConfig(), resolver: StaticSecretResolver(key: config.apiKey))
     var defaultModel = config.model
+    let initialMainModel = ModelID(rawValue: defaultModel)
     var pending = PendingAttachments()
     let log = try coworkSessionLog(workspace: workspace)
     let spinner = TurnSpinner()
@@ -267,11 +272,6 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
         maxSteps: config.maxSteps,
         imageGeneratorFor: { _ in ProviderImageGenerationToolService(registry: registry) }
     ) { _ in try await registry.defaultAgentProvider() }
-
-    func finishCowork(_ exit: REPLExit) async -> REPLExit {
-        await orchestrator.cancelAll(reason: "CLI Cowork session ended")
-        return exit
-    }
 
     let replayed = await log.replay()
     let restoredProjection = CoworkProjection.build(from: replayed)
@@ -321,8 +321,6 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
             profile: .reviewed,
             coordinationDepth: Agent.defaultCoordinationDepth))
     }
-    await orchestrator.resumePendingTasks()
-
     banner(mode: .cowork, model: defaultModel, host: config.baseURL.host ?? config.baseURL.absoluteString)
     var automaticReviewRequired = true
     var automaticReviewReady = false
@@ -349,6 +347,162 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
     } else {
         let detail = mainBootstrapError.map { ": \($0)" } ?? "."
         out("\(S.dim)@main was not attached\(detail) Start a new Cowork session or inspect the workspace configuration. /help\(S.reset)\n")
+    }
+
+    let goalRuntime = GoalRuntimeController(
+        sessionID: await log.sessionID,
+        log: log,
+        orchestrator: orchestrator,
+        verifierProvider: { try await registry.defaultAgentProvider() },
+        verifierModel: {
+            await orchestrator.agentList().first(where: {
+                $0.name == Orchestrator.mainAgentID
+            })?.model ?? initialMainModel
+        })
+    var goalRuntimeStarted = false
+    var dataPlaneResumed = false
+
+    func ensureGoalRuntimeStarted() async -> Bool {
+        guard mainAttached else {
+            errOut("@main is not attached; a durable Goal cannot run\n")
+            return false
+        }
+        if automaticReviewRequired, !automaticReviewReady {
+            errOut("automatic permission review is not ready; use /auto to retry or /default to explicitly choose manual approval\n")
+            return false
+        }
+        if !goalRuntimeStarted {
+            let recoverySafe = await goalRuntime.start()
+            guard recoverySafe else {
+                errOut("Goal recovery could not be completed safely; pending Cowork work remains stopped. Resolve the persistence/cancellation error and retry.\n")
+                return false
+            }
+            goalRuntimeStarted = true
+        }
+        if !dataPlaneResumed {
+            guard await orchestrator.resumePendingTasks() else {
+                errOut("Cowork data-plane resume was cancelled; retry after the session is ready.\n")
+                return false
+            }
+            dataPlaneResumed = true
+        }
+        return true
+    }
+
+    if mainAttached, automaticReviewReady {
+        _ = await ensureGoalRuntimeStarted()
+    }
+
+    func printGoalStatus() async {
+        guard let goal = await goalRuntime.currentGoal() else {
+            out("(no current Goal)\n")
+            return
+        }
+        let budget = goal.tokenBudget.map(String.init) ?? "unlimited"
+        out("  \(goal.id.rawValue)  \(goal.status.rawValue)  revision \(goal.revision)\n")
+        out("  objective: \(goal.objective)\n")
+        out("  tokens: \(goal.tokensUsed) / \(budget) · elapsed: \(Int(goal.activeElapsedSeconds.rounded()))s\n")
+        if let audit = goal.latestAudit {
+            let proven = audit.requirements.filter { $0.status == .proven }.count
+            out("  verifier: \(audit.verdict.rawValue) · \(proven)/\(audit.requirements.count) requirements proven\n")
+            if !audit.remainingWork.isEmpty {
+                out("  remaining: \(audit.remainingWork.joined(separator: "; "))\n")
+            }
+            if let blocker = audit.blocker, !blocker.isEmpty {
+                out("  blocker: \(blocker)\n")
+            }
+        }
+    }
+
+    func createDurableGoal(_ objective: String, mention: AgentID? = nil) async {
+        guard await ensureGoalRuntimeStarted() else { return }
+        do {
+            let durableObjective: String
+            if let mention, mention != Orchestrator.mainAgentID {
+                durableObjective = "@\(mention.rawValue): \(objective)"
+            } else {
+                durableObjective = objective
+            }
+            let goal = try await goalRuntime.createGoal(objective: durableObjective)
+            let mentionContext: String
+            if let mention, mention != Orchestrator.mainAgentID {
+                mentionContext = " · requested via @\(mention.rawValue); @main hosts execution"
+            } else {
+                mentionContext = " · @main hosts execution"
+            }
+            out("Goal created: \(goal.id.rawValue)\(mentionContext)\n")
+        } catch {
+            errOut("Goal not created: \(error.localizedDescription)\n")
+        }
+    }
+
+    func handleGoalCommand(_ argument: String) async {
+        let trimmed = argument.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            out("usage: /goal <objective> | /goal status|pause|resume|clear|edit <objective>\n")
+            return
+        }
+        let components = trimmed.split(separator: " ", maxSplits: 1).map(String.init)
+        let operation = components[0].lowercased()
+        let remainder = components.count > 1
+            ? components[1].trimmingCharacters(in: .whitespacesAndNewlines)
+            : ""
+        switch operation {
+        case "status":
+            await printGoalStatus()
+        case "pause":
+            guard await ensureGoalRuntimeStarted() else { return }
+            do {
+                let goal = try await goalRuntime.pauseCurrentGoal()
+                out("Goal \(goal.id.rawValue) → paused\n")
+            } catch {
+                errOut("Goal not paused: \(error.localizedDescription)\n")
+            }
+        case "resume":
+            guard await ensureGoalRuntimeStarted() else { return }
+            do {
+                let goal = try await goalRuntime.resumeCurrentGoal()
+                out("Goal \(goal.id.rawValue) → active\n")
+            } catch {
+                errOut("Goal not resumed: \(error.localizedDescription)\n")
+            }
+        case "clear":
+            guard await ensureGoalRuntimeStarted() else { return }
+            do {
+                try await goalRuntime.clearCurrentGoal(reason: "Cleared from Intatis CLI")
+                out("current Goal cleared\n")
+            } catch {
+                errOut("Goal not cleared: \(error.localizedDescription)\n")
+            }
+        case "edit":
+            guard !remainder.isEmpty else {
+                out("usage: /goal edit <objective>\n")
+                return
+            }
+            guard await ensureGoalRuntimeStarted() else { return }
+            guard let current = await goalRuntime.currentGoal() else {
+                errOut("Goal not edited: there is no current Goal\n")
+                return
+            }
+            do {
+                let goal = try await goalRuntime.editCurrentGoal(
+                    objective: remainder,
+                    successCriteria: current.successCriteria,
+                    constraints: current.constraints,
+                    tokenBudget: current.tokenBudget)
+                out("Goal \(goal.id.rawValue) edited · revision \(goal.revision)\n")
+            } catch {
+                errOut("Goal not edited: \(error.localizedDescription)\n")
+            }
+        default:
+            await createDurableGoal(trimmed)
+        }
+    }
+
+    func finishCowork(_ exit: REPLExit) async -> REPLExit {
+        await goalRuntime.shutdown()
+        await orchestrator.cancelAll(reason: "CLI Cowork session ended")
+        return exit
     }
 
     var lastPermissionReviewHealth = await orchestrator.automaticPermissionReviewHealth()
@@ -378,13 +532,17 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
         case .shortcut(.switchModel):
             if case .text(let m) = editor.readLine(prompt: "\(S.green)model ❯\(S.reset) ") {
                 let name = unbracket(m.trimmingCharacters(in: .whitespaces))
-                if !name.isEmpty { defaultModel = name; out("default model for new agents → \(defaultModel)\n") }
+                if !name.isEmpty {
+                    defaultModel = name
+                    out("default model for new agents → \(defaultModel); GoalVerifier remains aligned with @main\n")
+                }
             }
             continue
         case .shortcut(.settings):
             do {
                 try runSettings()
             } catch {
+                await goalRuntime.shutdown()
                 await orchestrator.cancelAll(reason: "CLI Cowork session failed")
                 throw error
             }
@@ -398,6 +556,8 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
         if text.hasPrefix("/") {
             let parts = text.dropFirst().split(separator: " ").map(String.init)
             let cmd = parts.first ?? ""
+            let commandArgument = text.dropFirst().split(separator: " ", maxSplits: 1)
+                .dropFirst().first.map(String.init) ?? ""
             switch cmd {
             case "help":
                 out(coworkHelp)
@@ -409,8 +569,13 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
                 }
                 else { out("usage: /mode chat|code|cowork\n") }
             case "model":
-                if parts.count > 1 { defaultModel = parts[1]; out("default model for new agents → \(defaultModel)\n") }
+                if parts.count > 1 {
+                    defaultModel = parts[1]
+                    out("default model for new agents → \(defaultModel); GoalVerifier remains aligned with @main\n")
+                }
                 else { out("default model for new agents: \(defaultModel)\n") }
+            case "goal":
+                await handleGoalCommand(commandArgument)
             case "verbose":
                 if parts.count > 1, parts[1].lowercased() == "off" { options.verbose = false }
                 else if parts.count > 1, parts[1].lowercased() == "on" { options.verbose = true }
@@ -428,6 +593,7 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
                 case .enabled(let id):
                     automaticReviewRequired = true
                     automaticReviewReady = true
+                    _ = await ensureGoalRuntimeStarted()
                     if case .some(.degraded(let reason)) = await orchestrator.automaticPermissionReviewHealth() {
                         out("automatic permission review is degraded but active (@\(id.rawValue)): \(reason)\n")
                     } else {
@@ -436,6 +602,7 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
                 case .alreadyEnabled(let id):
                     automaticReviewRequired = true
                     automaticReviewReady = true
+                    _ = await ensureGoalRuntimeStarted()
                     if case .some(.degraded(let reason)) = await orchestrator.automaticPermissionReviewHealth() {
                         out("automatic permission review is degraded but active (@\(id.rawValue)): \(reason)\n")
                     } else {
@@ -444,6 +611,10 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
                 case .failed(let message):
                     automaticReviewRequired = true
                     automaticReviewReady = false
+                    if goalRuntimeStarted {
+                        await goalRuntime.shutdown()
+                        goalRuntimeStarted = false
+                    }
                     out("automatic permission review not enabled: \(message)\n")
                 }
             case "default":
@@ -451,10 +622,12 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
                 case .disabled:
                     automaticReviewRequired = false
                     automaticReviewReady = false
+                    _ = await ensureGoalRuntimeStarted()
                     out("automatic permission review → off\n")
                 case .alreadyDisabled:
                     automaticReviewRequired = false
                     automaticReviewReady = false
+                    _ = await ensureGoalRuntimeStarted()
                     out("automatic permission review already off\n")
                 case .failed(let message):
                     out("automatic permission review could not be disabled: \(message)\n")
@@ -472,6 +645,7 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
                     }
                 }
             case "agent":
+                guard await ensureGoalRuntimeStarted() else { continue }
                 if parts.count >= 4, parts[1] == "add" {
                     let name = parts[2]
                     let path = parts[3]
@@ -519,11 +693,19 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
             errOut(error.message + "\n")
             continue
         }
+        if let objective = parsedInput.goal {
+            await createDurableGoal(objective, mention: target)
+            continue
+        }
+        guard await ensureGoalRuntimeStarted() else { continue }
+        let explicitGoalIntent = ExplicitGoalIntentClassifier
+            .classify(message)
+            .isExplicit
         for file in pending.textFiles { message += "\n\n[attached file: \(file.name)]\n\(file.content)" }
         let images = pending.images
         pending.clear()
         spinner.start()
-        _ = await orchestrator.send(
+        _ = await goalRuntime.sendUserTurn(
             message,
             to: target,
             images: images,
@@ -531,7 +713,8 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
                 text: message,
                 to: target,
                 tags: parsedInput.tags.isEmpty ? nil : parsedInput.tags,
-                goal: parsedInput.goal))
+                goal: parsedInput.goal),
+            explicitGoalIntent: explicitGoalIntent)
         spinner.stop()
     }
 }

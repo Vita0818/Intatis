@@ -285,6 +285,36 @@ public struct AgentMessageConsumedPayload: Codable, Equatable, Sendable {
     }
 }
 
+/// Durable cancellation settlement for a mailbox item that must never be
+/// presented after its owning Goal/run has stopped. This is distinct from
+/// `agent_message_consumed`, which is reserved for messages actually projected
+/// into a successfully completed agent invocation.
+public struct AgentMessageDiscardedPayload: Codable, Equatable, Sendable {
+    public var messageID: MessageID
+    public var agent: AgentID
+    public var reason: String
+    public var taskID: TaskID?
+    public var goalID: GoalID?
+    public var continuationRunID: ContinuationRunID?
+    public var metadata: CoworkEventMetadata?
+
+    public init(messageID: MessageID,
+                agent: AgentID,
+                reason: String,
+                taskID: TaskID? = nil,
+                goalID: GoalID? = nil,
+                continuationRunID: ContinuationRunID? = nil,
+                metadata: CoworkEventMetadata? = nil) {
+        self.messageID = messageID
+        self.agent = agent
+        self.reason = reason
+        self.taskID = taskID
+        self.goalID = goalID
+        self.continuationRunID = continuationRunID
+        self.metadata = metadata
+    }
+}
+
 public struct DelegationRequestedPayload: Codable, Equatable, Sendable {
     public var requestID: RequestID
     public var requester: AgentID

@@ -112,6 +112,13 @@ final class ToolRegistryLeaseTests: XCTestCase {
         XCTAssertFalse(toolNames.contains("spawn_agent"))
         XCTAssertFalse(toolNames.contains("remove_agent"))
         XCTAssertFalse(toolNames.contains("ask_agent"))
+        XCTAssertFalse(toolNames.contains("task_create"))
+        XCTAssertTrue(toolNames.contains("task_update"))
+        XCTAssertTrue(toolNames.contains("task_get"))
+        XCTAssertTrue(toolNames.contains("task_list"))
+        XCTAssertTrue(toolNames.contains("get_goal"))
+        XCTAssertFalse(toolNames.contains("create_goal"))
+        XCTAssertFalse(toolNames.contains("update_goal"))
     }
 
     func testCoordinatorLeaseCanExposeDelegationTools() {
@@ -175,6 +182,28 @@ final class ToolRegistryLeaseTests: XCTestCase {
         XCTAssertTrue(toolNames.contains("git_pull_ff"))
         XCTAssertTrue(toolNames.contains("git_push"))
         XCTAssertTrue(toolNames.contains("git_switch"))
+        XCTAssertTrue(toolNames.contains("task_create"))
+        XCTAssertTrue(toolNames.contains("task_update"))
+        XCTAssertTrue(toolNames.contains("task_get"))
+        XCTAssertTrue(toolNames.contains("task_list"))
+        XCTAssertTrue(toolNames.contains("get_goal"))
+        XCTAssertTrue(toolNames.contains("create_goal"))
+        XCTAssertFalse(toolNames.contains("update_goal"))
+    }
+
+    func testGoalVerifierCapabilityExposesOnlyReadAndVerdictGoalTools() {
+        let lease = CapabilityLease(
+            tools: [.readGoal, .readWorkTasks, .submitGoalVerdict])
+        let toolNames = Set(Orchestrator.toolRegistry(for: lease).descriptors().map(\.name))
+
+        XCTAssertTrue(toolNames.contains("get_goal"))
+        XCTAssertTrue(toolNames.contains("task_get"))
+        XCTAssertTrue(toolNames.contains("task_list"))
+        XCTAssertTrue(toolNames.contains("update_goal"))
+        XCTAssertFalse(toolNames.contains("create_goal"))
+        XCTAssertFalse(toolNames.contains("task_create"))
+        XCTAssertFalse(toolNames.contains("task_update"))
+        XCTAssertFalse(toolNames.contains("delegate_task"))
     }
 
     func testTaskLeasePreservesCoordinatorCapabilityAndPrompt() async throws {
@@ -212,6 +241,8 @@ final class ToolRegistryLeaseTests: XCTestCase {
         XCTAssertTrue(toolNames.contains("remove_agent"))
         XCTAssertTrue(toolNames.contains("list_agents"))
         XCTAssertTrue(toolNames.contains("ask_agent"))
+        XCTAssertFalse(toolNames.contains("create_goal"), "only @main receives Goal creation authority")
+        XCTAssertTrue(toolNames.contains("get_goal"))
 
         let systemPrompt = try XCTUnwrap(request.messages.first?.content)
         XCTAssertTrue(systemPrompt.contains("You may also act as a COORDINATOR"))

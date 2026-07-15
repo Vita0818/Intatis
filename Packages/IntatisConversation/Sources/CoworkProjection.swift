@@ -78,7 +78,13 @@ public struct CoworkToolExecutionView: Identifiable, Equatable, Sendable {
 }
 
 public struct CoworkProjection: Equatable, Sendable {
+    /// Execution-layer invocation views (legacy `TaskID` semantics).
     public private(set) var tasks: [TaskID: CoworkTaskView] = [:]
+    /// Durable user-visible work plan, independent of invocation completion.
+    public private(set) var workTasks: [WorkTaskID: WorkTask] = [:]
+    public private(set) var goals: [GoalID: Goal] = [:]
+    public private(set) var continuationRuns: [ContinuationRunID: ContinuationRun] = [:]
+    public private(set) var currentGoalID: GoalID?
     public private(set) var agentRoster: [AgentID: AgentAttachedPayload] = [:]
     public private(set) var mailboxes: [AgentID: CoworkMailboxView] = [:]
     public private(set) var pendingDelegations: [RequestID: DelegationRequestedPayload] = [:]
@@ -117,6 +123,20 @@ public struct CoworkProjection: Equatable, Sendable {
 
     public var cancelledTasks: [CoworkTaskView] {
         tasks.values.filter { $0.status == .cancelled }.sorted { $0.id.rawValue < $1.id.rawValue }
+    }
+
+    public var currentGoal: Goal? {
+        currentGoalID.flatMap { goals[$0] }
+    }
+
+    public var activeWorkTasks: [WorkTask] {
+        workTasks.values
+            .filter { !$0.status.isTerminal }
+            .sorted { $0.id.rawValue < $1.id.rawValue }
+    }
+
+    public var workTaskGraph: WorkTaskGraph {
+        WorkTaskGraph(tasks: workTasks)
     }
 
     public var unresolvedToolExecutions: [CoworkToolExecutionView] {
@@ -186,6 +206,8 @@ public struct CoworkProjection: Equatable, Sendable {
             }
         case .agentMessageConsumed(let payload):
             mailboxes[payload.agent, default: CoworkMailboxView()].pendingMessages.removeAll { $0 == payload.messageID }
+        case .agentMessageDiscarded(let payload):
+            mailboxes[payload.agent, default: CoworkMailboxView()].pendingMessages.removeAll { $0 == payload.messageID }
         case .informationRequested(let payload):
             var mailbox = mailboxes[payload.to, default: CoworkMailboxView()]
             Self.appendUnique(payload.requestID, to: &mailbox.pendingMessages)
@@ -253,6 +275,96 @@ public struct CoworkProjection: Equatable, Sendable {
                            assignee: payload.assignee,
                            error: payload.reason)
             }
+        case .workTaskCreated(let payload):
+            applyWorkTaskSnapshot(payload.task)
+        case .workTaskUpdated(let payload):
+            applyWorkTaskSnapshot(
+                payload.task,
+                allowsDependencyReadinessRecompute: true)
+        case .workTaskOwnerChanged(let payload):
+            applyWorkTaskSnapshot(payload.task)
+        case .workTaskDependencyChanged(let payload):
+            applyWorkTaskSnapshot(
+                payload.task,
+                allowsDependencyReadinessRecompute: true)
+        case .workTaskReady(let payload):
+            applyWorkTaskSnapshot(payload.task, isRetry: true, requiredStatus: .ready)
+        case .workTaskStarted(let payload):
+            applyWorkTaskSnapshot(payload.task, requiredStatus: .inProgress)
+        case .workTaskProgressed(let payload):
+            applyWorkTaskSnapshot(payload.task)
+        case .workTaskBlocked(let payload):
+            applyWorkTaskSnapshot(payload.task, requiredStatus: .blocked)
+        case .workTaskCompleted(let payload):
+            applyWorkTaskSnapshot(payload.task, requiredStatus: .completed)
+        case .workTaskFailed(let payload):
+            applyWorkTaskSnapshot(payload.task, requiredStatus: .failed)
+        case .workTaskCancelled(let payload):
+            applyWorkTaskSnapshot(payload.task, requiredStatus: .cancelled)
+        case .workTaskInvocationLinked(let payload):
+            applyWorkTaskSnapshot(payload.task)
+        case .workTaskEvidenceAdded(let payload):
+            applyWorkTaskSnapshot(payload.task)
+        case .workTaskCarriedForward(let payload):
+            applyWorkTaskSnapshot(payload.task)
+        case .goalCreated(let payload):
+            applyGoalSnapshot(payload.goal)
+            if payload.goal.status != .completed,
+               currentGoalID == nil || currentGoalID == payload.goal.id ||
+               currentGoal?.status == .completed {
+                currentGoalID = payload.goal.id
+            }
+        case .goalEdited(let payload):
+            applyGoalSnapshot(payload.goal)
+        case .goalPaused(let payload):
+            applyGoalSnapshot(payload.goal, requiredStatus: .paused)
+        case .goalResumed(let payload):
+            applyGoalSnapshot(payload.goal, requiredStatus: .active)
+            if goals[payload.goal.id]?.status == .active {
+                currentGoalID = payload.goal.id
+            }
+        case .goalAuditCompleted(let payload):
+            applyGoalSnapshot(payload.goal)
+        case .goalContinuationScheduled(let payload):
+            applyGoalSnapshot(payload.goal)
+        case .goalProgressed(let payload):
+            applyGoalSnapshot(payload.goal)
+        case .goalBlocked(let payload):
+            applyGoalSnapshot(payload.goal, requiredStatus: .blocked)
+        case .goalBudgetLimited(let payload):
+            applyGoalSnapshot(payload.goal, requiredStatus: .budgetLimited)
+        case .goalUsageLimited(let payload):
+            applyGoalSnapshot(payload.goal, requiredStatus: .usageLimited)
+        case .goalCompleted(let payload):
+            var completed = payload.goal
+            if let payloadAudit = payload.audit {
+                // A completion event has two legacy-compatible audit locations.
+                // Accept either one, but reject contradictory snapshots rather
+                // than choosing whichever proof is more permissive.
+                if let embeddedAudit = completed.latestAudit,
+                   embeddedAudit != payloadAudit {
+                    return
+                }
+                completed.latestAudit = payloadAudit
+            }
+            applyGoalSnapshot(completed, requiredStatus: .completed)
+        case .goalCleared(let payload):
+            applyGoalSnapshot(payload.goal)
+            if currentGoalID == payload.goal.id {
+                currentGoalID = nil
+            }
+        case .continuationRunCreated(let payload):
+            applyContinuationRunSnapshot(payload.run)
+        case .continuationRunStarted(let payload):
+            applyContinuationRunSnapshot(payload.run, requiredStatus: .running)
+        case .continuationRunCheckpointed(let payload):
+            applyContinuationRunSnapshot(payload.run, requiredStatus: .checkpointed)
+        case .continuationRunCompleted(let payload):
+            applyContinuationRunSnapshot(payload.run, requiredStatus: .completed)
+        case .continuationRunCancelled(let payload):
+            applyContinuationRunSnapshot(payload.run, requiredStatus: .cancelled)
+        case .continuationRunRecovered(let payload):
+            applyContinuationRunSnapshot(payload.run, isRecovery: true)
         case .workspaceLeaseGranted(let payload):
             workspaceLeases[payload.lease.id] = payload.lease
             if let agent = payload.agent {
@@ -363,6 +475,108 @@ public struct CoworkProjection: Equatable, Sendable {
         view.attempt = attempt ?? view.attempt
         view.statusReason = statusReason ?? view.statusReason
         tasks[taskID] = view
+    }
+
+    /// Applies only monotonic, identity-preserving snapshots. Equal revisions
+    /// are idempotent but cannot overwrite different content.
+    private mutating func applyWorkTaskSnapshot(_ snapshot: WorkTask,
+                                                isRetry: Bool = false,
+                                                allowsDependencyReadinessRecompute: Bool = false,
+                                                requiredStatus: WorkTaskStatus? = nil) {
+        if let requiredStatus, snapshot.status != requiredStatus { return }
+        if snapshot.status == .completed && !snapshot.hasValidCompletionEvidence { return }
+        guard let current = workTasks[snapshot.id] else {
+            workTasks[snapshot.id] = snapshot
+            return
+        }
+        guard snapshot.id == current.id,
+              snapshot.runID == current.runID,
+              snapshot.goalID == current.goalID,
+              snapshot.createdAt == current.createdAt,
+              snapshot.revision >= current.revision else { return }
+        if snapshot.revision == current.revision {
+            if snapshot == current { workTasks[snapshot.id] = snapshot }
+            return
+        }
+        let isStandardTransition = current.status.canTransition(
+            to: snapshot.status,
+            isRetry: isRetry)
+        let isHostDerivedReadinessTransition = allowsDependencyReadinessRecompute
+            && snapshot.dependsOn != current.dependsOn
+            && Self.canHostRecomputeReadiness(from: current)
+            && Self.snapshotMatchesDependencyReadiness(
+                snapshot,
+                existingTasks: workTasks)
+        guard isStandardTransition || isHostDerivedReadinessTransition else { return }
+        workTasks[snapshot.id] = snapshot
+    }
+
+    private static func canHostRecomputeReadiness(from task: WorkTask) -> Bool {
+        task.status == .pending
+            || task.status == .ready
+            || (task.status == .blocked
+                && (task.progressNote?.hasPrefix("waiting for dependencies:") == true
+                    || task.progressNote?.hasPrefix("dependency failed or was cancelled:") == true
+                    || task.progressNote?.hasPrefix("blocked by terminal dependencies:") == true))
+    }
+
+    private static func snapshotMatchesDependencyReadiness(
+        _ snapshot: WorkTask,
+        existingTasks: [WorkTaskID: WorkTask]
+    ) -> Bool {
+        var candidateTasks = existingTasks
+        candidateTasks[snapshot.id] = snapshot
+        switch WorkTaskGraph(tasks: candidateTasks).readiness(of: snapshot.id) {
+        case .success(.ready):
+            return snapshot.status == .ready
+        case .success(.waitingFor):
+            return snapshot.status == .pending
+        case .success(.blockedBy):
+            return snapshot.status == .blocked
+        case .failure:
+            return false
+        }
+    }
+
+    private mutating func applyGoalSnapshot(_ snapshot: Goal,
+                                            requiredStatus: GoalStatus? = nil) {
+        if let requiredStatus, snapshot.status != requiredStatus { return }
+        if snapshot.status == .completed,
+           !snapshot.hasValidCompletionProof { return }
+        guard let current = goals[snapshot.id] else {
+            goals[snapshot.id] = snapshot
+            return
+        }
+        guard snapshot.id == current.id,
+              snapshot.sessionID == current.sessionID,
+              snapshot.createdAt == current.createdAt,
+              snapshot.revision >= current.revision else { return }
+        if snapshot.revision == current.revision {
+            if snapshot == current { goals[snapshot.id] = snapshot }
+            return
+        }
+        guard current.status.canTransition(to: snapshot.status) else { return }
+        goals[snapshot.id] = snapshot
+    }
+
+    private mutating func applyContinuationRunSnapshot(
+        _ snapshot: ContinuationRun,
+        isRecovery: Bool = false,
+        requiredStatus: ContinuationRunStatus? = nil
+    ) {
+        if let requiredStatus, snapshot.status != requiredStatus { return }
+        guard let current = continuationRuns[snapshot.id] else {
+            continuationRuns[snapshot.id] = snapshot
+            return
+        }
+        guard snapshot.id == current.id,
+              snapshot.sessionID == current.sessionID,
+              snapshot.goalID == current.goalID,
+              snapshot.ordinal == current.ordinal,
+              current.status.canTransition(to: snapshot.status, isRecovery: isRecovery) else {
+            return
+        }
+        continuationRuns[snapshot.id] = snapshot
     }
 
     private static func appendUnique<T: Equatable>(_ value: T, to values: inout [T]) {

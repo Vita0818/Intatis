@@ -292,11 +292,9 @@ struct CoworkProjectSettingsSheet: View {
             }
         }
         .padding(12)
-        .background(IntatisTheme.glassSurface(scheme).opacity(scheme == .dark ? 0.24 : 0.58),
-                    in: RoundedRectangle(cornerRadius: 10, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(IntatisTheme.glassStroke(scheme).opacity(0.55), lineWidth: 1)
+                .stroke(IntatisTheme.separator(scheme), lineWidth: 1)
         }
     }
 
@@ -322,7 +320,7 @@ struct CoworkProjectSettingsSheet: View {
                 ForEach(vm.project.workspaces) { workspace in
                     HStack(spacing: 9) {
                         Image(systemName: workspace.isPrimary ? "house" : "folder")
-                            .foregroundStyle(workspace.isPrimary ? IntatisTheme.goldDeep : .secondary)
+                            .foregroundStyle(workspace.isPrimary ? IntatisTheme.accent(scheme) : .secondary)
                             .frame(width: 18)
                         VStack(alignment: .leading, spacing: 2) {
                             Text(workspace.displayName)
@@ -352,8 +350,10 @@ struct CoworkProjectSettingsSheet: View {
                         .help(workspace.canRemove ? "Remove workspace" : "Primary workspace is kept with @\(draft.mainAgentName)")
                     }
                     .padding(8)
-                    .background(IntatisTheme.glassSurface(scheme).opacity(scheme == .dark ? 0.18 : 0.42),
-                                in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .stroke(IntatisTheme.separator(scheme), lineWidth: 1)
+                    }
                 }
             }
         }

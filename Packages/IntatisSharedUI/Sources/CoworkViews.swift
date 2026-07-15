@@ -74,6 +74,156 @@ public struct CoworkTaskLine: Identifiable, Equatable, Sendable {
     }
 }
 
+/// Product-level Goal presentation for Cowork. This is deliberately separate
+/// from `CoworkTaskLine`, which still describes execution-layer task activity.
+/// A caller may therefore migrate the durable Goal projection independently
+/// without making an AgentInvocation look like a user-owned Goal.
+public struct CoworkGoalCardInfo: Identifiable, Equatable, Sendable {
+    public let id: String
+    public let objective: String
+    public let status: String
+    public let activeElapsedSeconds: Double
+    public let activeSince: Date?
+    public let tokensUsed: Int
+    public let tokenBudget: Int?
+    public let auditProvenCount: Int?
+    public let auditRequirementCount: Int?
+    public let latestAuditSummary: String?
+    public let currentRunOrdinal: Int?
+    public let revision: Int
+    public let canPause: Bool
+    public let canResume: Bool
+    public let canEdit: Bool
+    public let canClear: Bool
+
+    public init(id: String,
+                objective: String,
+                status: String,
+                activeElapsedSeconds: Double = 0,
+                activeSince: Date? = nil,
+                tokensUsed: Int = 0,
+                tokenBudget: Int? = nil,
+                auditProvenCount: Int? = nil,
+                auditRequirementCount: Int? = nil,
+                latestAuditSummary: String? = nil,
+                currentRunOrdinal: Int? = nil,
+                revision: Int = 0,
+                canPause: Bool = false,
+                canResume: Bool = false,
+                canEdit: Bool = true,
+                canClear: Bool = true) {
+        self.id = id
+        self.objective = objective
+        self.status = status
+        self.activeElapsedSeconds = max(activeElapsedSeconds, 0)
+        self.activeSince = activeSince
+        self.tokensUsed = max(tokensUsed, 0)
+        self.tokenBudget = tokenBudget
+        self.auditProvenCount = auditProvenCount
+        self.auditRequirementCount = auditRequirementCount
+        self.latestAuditSummary = latestAuditSummary
+        self.currentRunOrdinal = currentRunOrdinal
+        self.revision = revision
+        self.canPause = canPause
+        self.canResume = canResume
+        self.canEdit = canEdit
+        self.canClear = canClear
+    }
+
+    public func elapsedSeconds(at date: Date) -> Double {
+        guard normalizedStatus == "active", let activeSince else {
+            return activeElapsedSeconds
+        }
+        return activeElapsedSeconds + max(date.timeIntervalSince(activeSince), 0)
+    }
+
+    public var normalizedStatus: String {
+        status
+            .replacingOccurrences(of: "-", with: "_")
+            .replacingOccurrences(of: " ", with: "_")
+            .lowercased()
+    }
+}
+
+/// Product-level WorkTask presentation. It intentionally contains no
+/// execution status aliases: linked AgentInvocation IDs live in the detail
+/// disclosure while the row itself represents the durable work item.
+public struct CoworkWorkTaskLine: Identifiable, Equatable, Sendable {
+    public let id: String
+    public let ordinal: Int?
+    public let title: String
+    public let detail: String
+    public let status: String
+    public let owner: String?
+    public let dependencySummary: String?
+    public let statusReason: String?
+    public let acceptanceCriteria: [String]
+    public let result: String?
+    public let evidence: [String]
+    public let linkedInvocationIDs: [String]
+
+    public init(id: String,
+                ordinal: Int? = nil,
+                title: String,
+                detail: String = "",
+                status: String,
+                owner: String? = nil,
+                dependencySummary: String? = nil,
+                statusReason: String? = nil,
+                acceptanceCriteria: [String] = [],
+                result: String? = nil,
+                evidence: [String] = [],
+                linkedInvocationIDs: [String] = []) {
+        self.id = id
+        self.ordinal = ordinal
+        self.title = title
+        self.detail = detail
+        self.status = status
+        self.owner = owner
+        self.dependencySummary = dependencySummary
+        self.statusReason = statusReason
+        self.acceptanceCriteria = acceptanceCriteria
+        self.result = result
+        self.evidence = evidence
+        self.linkedInvocationIDs = linkedInvocationIDs
+    }
+
+    public var normalizedStatus: String {
+        status
+            .replacingOccurrences(of: "-", with: "_")
+            .replacingOccurrences(of: " ", with: "_")
+            .lowercased()
+    }
+
+    public var isCompleted: Bool {
+        ["completed", "complete", "done"].contains(normalizedStatus)
+    }
+
+    public var hasExpandedDetails: Bool {
+        !detail.isEmpty
+            || dependencySummary != nil
+            || statusReason != nil
+            || !acceptanceCriteria.isEmpty
+            || result != nil
+            || !evidence.isEmpty
+            || !linkedInvocationIDs.isEmpty
+    }
+}
+
+public struct CoworkWorkTaskSummary: Equatable, Sendable {
+    public let tasks: [CoworkWorkTaskLine]
+
+    public init(tasks: [CoworkWorkTaskLine] = []) {
+        self.tasks = tasks
+    }
+
+    public var totalCount: Int { tasks.count }
+    public var completedCount: Int { tasks.filter(\.isCompleted).count }
+    public var runningCount: Int {
+        tasks.filter { ["in_progress", "inprogress", "running"].contains($0.normalizedStatus) }.count
+    }
+}
+
 public struct CoworkWorkspaceInfo: Identifiable, Equatable, Sendable {
     public let id: String
     public let path: String
@@ -187,6 +337,8 @@ public struct CoworkShell: View {
     private let latestTurnStats: TurnStatsSnapshot?
     private let summary: CoworkStatusSummary
     private let project: CoworkProjectInfo
+    private let goal: CoworkGoalCardInfo?
+    private let workTasks: CoworkWorkTaskSummary
     private let composerError: String?
     private let isWorking: Bool
     private let isComposerAvailable: Bool
@@ -202,6 +354,10 @@ public struct CoworkShell: View {
     private let onAddAgent: (() -> Void)?
     private let onRemoveAgent: ((String) -> Void)?
     private let onRetryTask: ((String) -> Void)?
+    private let onPauseGoal: (() -> Void)?
+    private let onResumeGoal: (() -> Void)?
+    private let onEditGoal: (() -> Void)?
+    private let onClearGoal: (() -> Void)?
     @State private var selectedAgentID: String?
     @State private var inspectorTab: CoworkInspectorTab = .agents
 
@@ -212,6 +368,8 @@ public struct CoworkShell: View {
                 latestTurnStats: TurnStatsSnapshot? = nil,
                 summary: CoworkStatusSummary,
                 project: CoworkProjectInfo = CoworkProjectInfo(),
+                goal: CoworkGoalCardInfo? = nil,
+                workTasks: CoworkWorkTaskSummary = CoworkWorkTaskSummary(),
                 composerError: String?,
                 isWorking: Bool,
                 isComposerAvailable: Bool = true,
@@ -227,7 +385,11 @@ public struct CoworkShell: View {
                 onResolve: @escaping (PermissionDecision) -> Void,
                 onAddAgent: (() -> Void)? = nil,
                 onRemoveAgent: ((String) -> Void)? = nil,
-                onRetryTask: ((String) -> Void)? = nil) {
+                onRetryTask: ((String) -> Void)? = nil,
+                onPauseGoal: (() -> Void)? = nil,
+                onResumeGoal: (() -> Void)? = nil,
+                onEditGoal: (() -> Void)? = nil,
+                onClearGoal: (() -> Void)? = nil) {
         self.items = items
         self.agents = agents
         self.pending = pending
@@ -235,6 +397,8 @@ public struct CoworkShell: View {
         self.latestTurnStats = latestTurnStats
         self.summary = summary
         self.project = project
+        self.goal = goal
+        self.workTasks = workTasks
         self.composerError = composerError
         self.isWorking = isWorking
         self.isComposerAvailable = isComposerAvailable
@@ -250,6 +414,10 @@ public struct CoworkShell: View {
         self.onAddAgent = onAddAgent
         self.onRemoveAgent = onRemoveAgent
         self.onRetryTask = onRetryTask
+        self.onPauseGoal = onPauseGoal
+        self.onResumeGoal = onResumeGoal
+        self.onEditGoal = onEditGoal
+        self.onClearGoal = onClearGoal
         _ = splitLayout
     }
 
@@ -296,6 +464,9 @@ public struct CoworkShell: View {
                               showsCompactActions: Bool) -> some View {
         VStack(spacing: 0) {
             header(layout: layout, showsCompactActions: showsCompactActions)
+            if showsCompactActions {
+                compactGoalTaskDock(layout: layout)
+            }
             thread(layout: layout)
             permissionArea(layout: layout)
             composerArea(layout: layout)
@@ -338,11 +509,15 @@ public struct CoworkShell: View {
             VStack(alignment: .leading, spacing: 14) {
                 gitStatusSection
                 agentStatusSection
-                goalTableSection
+                if goal != nil {
+                    goalCardSection
+                }
+                if !workTasks.tasks.isEmpty {
+                    workTasksSection
+                }
             }
             .padding(16)
         }
-        .background(threadStyle.cardSurface.opacity(0.38))
     }
 
     private var gitStatusSection: some View {
@@ -417,67 +592,219 @@ public struct CoworkShell: View {
         .help("\(agent.name): \(agent.status)")
     }
 
-    private var goalTableSection: some View {
-        rightRailSection("Goals") {
-            goalTable
+    private var goalCardSection: some View {
+        rightRailSection("Goal") {
+            goalCardContent
+        }
+        .accessibilityIdentifier("cowork.goal.card")
+    }
+
+    private var workTasksSection: some View {
+        rightRailSection("Tasks") {
+            workTasksContent
+        }
+        .accessibilityIdentifier("cowork.tasks.card")
+    }
+
+    @ViewBuilder private func compactGoalTaskDock(layout: IntatisThreadContentLayout) -> some View {
+        if goal != nil || !workTasks.tasks.isEmpty {
+            ScrollView(.horizontal) {
+                HStack(alignment: .top, spacing: 10) {
+                    if goal != nil {
+                        inspectorSection("Goal") {
+                            goalCardContent
+                        }
+                        .frame(width: min(max(layout.contentWidth * 0.82, 280), 380))
+                        .accessibilityIdentifier("cowork.goal.card")
+                    }
+                    if !workTasks.tasks.isEmpty {
+                        inspectorSection("Tasks") {
+                            workTasksContent
+                        }
+                        .frame(width: min(max(layout.contentWidth * 0.92, 300), 440))
+                        .accessibilityIdentifier("cowork.tasks.card")
+                    }
+                }
+                .padding(.horizontal, layout.horizontalPadding)
+                .padding(.vertical, 1)
+            }
+            .scrollIndicators(.hidden)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.bottom, 10)
         }
     }
 
-    @ViewBuilder private var goalTable: some View {
-        if goalRows.isEmpty {
-            Text("No agent-declared goals yet")
+    @ViewBuilder private var goalCardContent: some View {
+        if let goal {
+            TimelineView(.periodic(from: .now, by: 1)) { timeline in
+                VStack(alignment: .leading, spacing: 9) {
+                    HStack(alignment: .firstTextBaseline, spacing: 7) {
+                        Label(displayStatus(goal.status), systemImage: statusIconName(for: goal.status))
+                            .font(.caption2.bold())
+                            .foregroundStyle(statusColor(for: goal.status))
+                            .lineLimit(1)
+                            .accessibilityIdentifier("cowork.goal.status")
+                        Spacer(minLength: 6)
+                        Label(formatElapsed(goal.elapsedSeconds(at: timeline.date)), systemImage: "timer")
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(threadStyle.secondaryText)
+                            .lineLimit(1)
+                    }
+
+                    Text(goal.objective)
+                        .font(.caption.bold())
+                        .foregroundStyle(threadStyle.primaryText)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                        .accessibilityIdentifier("cowork.goal.objective")
+
+                    HStack(alignment: .top, spacing: 12) {
+                        goalMetric("Tokens", value: tokenSummary(for: goal))
+                        goalMetric("Run", value: goal.currentRunOrdinal.map { "#\($0)" } ?? "Not started")
+                    }
+
+                    if let auditSummary = auditSummary(for: goal) {
+                        Label(auditSummary, systemImage: "checkmark.shield")
+                            .font(.caption2)
+                            .foregroundStyle(threadStyle.secondaryText)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    if goal.revision > 0 {
+                        Text("Revision \(goal.revision)")
+                            .font(.caption2)
+                            .foregroundStyle(threadStyle.tertiaryText)
+                    }
+
+                    goalActions(goal)
+                }
+            }
+        } else {
+            Text("No active goal")
+                .font(.caption)
+                .foregroundStyle(threadStyle.tertiaryText)
+        }
+    }
+
+    private func goalMetric(_ title: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title.uppercased())
+                .font(.caption2.bold())
+                .foregroundStyle(threadStyle.tertiaryText)
+            Text(value)
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(threadStyle.primaryText)
+                .lineLimit(2)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder private func goalActions(_ goal: CoworkGoalCardInfo) -> some View {
+        if goal.canPause || goal.canResume || goal.canEdit || goal.canClear {
+            Divider().opacity(0.35)
+            IntatisGlassEffectGroup(spacing: 10) {
+                HStack(spacing: 10) {
+                    if goal.canPause {
+                        Button("Pause") { onPauseGoal?() }
+                            .intatisGlassButton()
+                            .disabled(onPauseGoal == nil)
+                            .accessibilityIdentifier("cowork.goal.pause")
+                    }
+                    if goal.canResume {
+                        Button("Resume") { onResumeGoal?() }
+                            .intatisGlassButton()
+                            .disabled(onResumeGoal == nil)
+                            .accessibilityIdentifier("cowork.goal.resume")
+                    }
+                    if goal.canEdit {
+                        Button("Edit") { onEditGoal?() }
+                            .intatisGlassButton()
+                            .disabled(onEditGoal == nil)
+                            .accessibilityIdentifier("cowork.goal.edit")
+                    }
+                    Spacer(minLength: 0)
+                    if goal.canClear {
+                        Button("Clear") { onClearGoal?() }
+                            .intatisGlassButton()
+                            .foregroundStyle(threadStyle.error)
+                            .disabled(onClearGoal == nil)
+                            .accessibilityIdentifier("cowork.goal.clear")
+                    }
+                }
+            }
+            .font(.caption.bold())
+        }
+    }
+
+    @ViewBuilder private var workTasksContent: some View {
+        if workTasks.tasks.isEmpty {
+            Text("No work tasks yet")
                 .font(.caption)
                 .foregroundStyle(threadStyle.tertiaryText)
         } else {
             VStack(alignment: .leading, spacing: 8) {
-                ForEach(Array(goalRows.enumerated()), id: \.element.id) { index, task in
-                    goalRow(index: index + 1, task: task)
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text("\(workTasks.completedCount) / \(workTasks.totalCount) complete")
+                        .font(.caption2.bold())
+                        .foregroundStyle(threadStyle.secondaryText)
+                    if workTasks.runningCount > 0 {
+                        Text("· \(workTasks.runningCount) running")
+                            .font(.caption2)
+                            .foregroundStyle(threadStyle.accent)
+                    }
+                    Spacer(minLength: 0)
+                }
+
+                ForEach(Array(workTasks.tasks.enumerated()), id: \.element.id) { index, task in
+                    if index > 0 {
+                        Divider().opacity(0.25)
+                    }
+                    CoworkWorkTaskRow(
+                        task: task,
+                        ordinal: task.ordinal ?? index + 1,
+                        style: threadStyle)
                 }
             }
         }
     }
 
-    private func goalRow(index: Int, task: CoworkTaskLine) -> some View {
-        let completed = isCompleted(task)
-        return HStack(alignment: .top, spacing: 8) {
-            goalMarker(index: index, completed: completed)
-            VStack(alignment: .leading, spacing: 3) {
-                Text(goalText(for: task))
-                    .font(.caption)
-                    .foregroundStyle(completed ? threadStyle.secondaryText : threadStyle.primaryText)
-                    .strikethrough(completed, color: threadStyle.secondaryText)
-                    .lineLimit(4)
-                    .fixedSize(horizontal: false, vertical: true)
-                if !task.title.isEmpty {
-                    Text(task.title)
-                        .font(.caption2)
-                        .foregroundStyle(threadStyle.tertiaryText)
-                        .lineLimit(1)
-                }
-            }
-            Spacer(minLength: 0)
+    private func formatElapsed(_ seconds: Double) -> String {
+        let total = max(Int(seconds.rounded(.down)), 0)
+        let hours = total / 3_600
+        let minutes = (total % 3_600) / 60
+        let remainingSeconds = total % 60
+        if hours > 0 {
+            return String(format: "%d:%02d:%02d", hours, minutes, remainingSeconds)
         }
-        .padding(.vertical, 2)
+        return String(format: "%02d:%02d", minutes, remainingSeconds)
     }
 
-    @ViewBuilder private func goalMarker(index: Int, completed: Bool) -> some View {
-        if completed {
-            Image(systemName: "checkmark.circle.fill")
-                .font(.system(size: 18, weight: .semibold))
-                .foregroundStyle(.green)
-                .frame(width: 22, height: 22)
-        } else {
-            ZStack {
-                Circle()
-                    .stroke(threadStyle.secondaryText, lineWidth: 1)
-                Text("\(index)")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(threadStyle.secondaryText)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.6)
-            }
-            .frame(width: 22, height: 22)
+    private func tokenSummary(for goal: CoworkGoalCardInfo) -> String {
+        let used = NumberFormatter.localizedString(from: NSNumber(value: goal.tokensUsed), number: .decimal)
+        guard let tokenBudget = goal.tokenBudget else {
+            return "\(used) · no budget"
         }
+        let budget = NumberFormatter.localizedString(from: NSNumber(value: max(tokenBudget, 0)), number: .decimal)
+        return "\(used) / \(budget)"
+    }
+
+    private func auditSummary(for goal: CoworkGoalCardInfo) -> String? {
+        var parts: [String] = []
+        if let proven = goal.auditProvenCount, let required = goal.auditRequirementCount {
+            parts.append("\(max(proven, 0)) / \(max(required, 0)) requirements proven")
+        }
+        if let summary = goal.latestAuditSummary?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !summary.isEmpty {
+            parts.append(summary)
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    private func displayStatus(_ status: String) -> String {
+        status
+            .replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: "-", with: " ")
+            .capitalized
     }
 
     private func rightRailSection<Content: View>(_ title: String,
@@ -507,7 +834,7 @@ public struct CoworkShell: View {
                         Label("Project Settings", systemImage: "slider.horizontal.3")
                             .labelStyle(.iconOnly)
                     }
-                    .buttonStyle(.borderless)
+                    .intatisGlassButton()
                     .disabled(isWorking)
                     .help("Project Settings")
                 }
@@ -524,11 +851,7 @@ public struct CoworkShell: View {
         }
         .padding(11)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(threadStyle.cardSurface, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(threadStyle.cardStroke, lineWidth: 1)
-        }
+        .intatisContentSurface(cornerRadius: 8)
     }
 
     private func overviewMetric(_ title: String, _ value: String) -> some View {
@@ -629,7 +952,7 @@ public struct CoworkShell: View {
                     Label("Project Settings", systemImage: "slider.horizontal.3")
                         .font(.caption.bold())
                 }
-                .buttonStyle(.borderless)
+                .intatisGlassButton()
                 .disabled(isWorking)
             }
         }
@@ -729,11 +1052,7 @@ public struct CoworkShell: View {
         }
         .padding(11)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(threadStyle.cardSurface, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(threadStyle.cardStroke, lineWidth: 1)
-        }
+        .intatisContentSurface(cornerRadius: 8)
     }
 
     private func inspectorRow(_ title: String, value: String) -> some View {
@@ -783,7 +1102,6 @@ public struct CoworkShell: View {
         .padding(.horizontal, 11)
         .padding(.vertical, 8)
         .frame(minWidth: 96, alignment: .leading)
-        .background(threadStyle.cardSurface, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .stroke(threadStyle.cardStroke, lineWidth: 1)
@@ -824,8 +1142,11 @@ public struct CoworkShell: View {
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 7)
-            .background(selected ? threadStyle.accentSoft : Color.clear,
-                        in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .stroke(selected ? threadStyle.accent.opacity(0.48) : Color.clear,
+                            lineWidth: 1)
+            }
         }
         .buttonStyle(.plain)
     }
@@ -849,7 +1170,7 @@ public struct CoworkShell: View {
                         Label("Remove agent", systemImage: "trash")
                             .labelStyle(.iconOnly)
                     }
-                    .buttonStyle(.borderless)
+                    .intatisGlassButton()
                     .disabled(isWorking)
                     .help("Remove agent")
                 }
@@ -888,7 +1209,7 @@ public struct CoworkShell: View {
                 Spacer(minLength: 6)
                 if let actionTitle, let action {
                     Button(actionTitle, action: action)
-                        .buttonStyle(.borderless)
+                        .intatisGlassButton()
                         .disabled(actionDisabled)
                 }
                 Text(task.status)
@@ -908,12 +1229,14 @@ public struct CoworkShell: View {
     }
 
     private func statusColor(for status: String) -> Color {
-        switch status.lowercased() {
+        switch normalizedStatus(status) {
         case "failed", "error", "rejected":
             return threadStyle.error
-        case "running", "thinking", "tool":
+        case "active", "in_progress", "inprogress", "running", "thinking", "tool":
             return threadStyle.accent
-        case "assigned", "queued", "mailbox":
+        case "blocked", "budget_limited", "usage_limited":
+            return .orange
+        case "assigned", "paused", "pending", "queued", "ready", "mailbox":
             return .orange
         case "completed", "complete", "done":
             return .green
@@ -923,18 +1246,31 @@ public struct CoworkShell: View {
     }
 
     private func statusIconName(for status: String) -> String {
-        switch status.lowercased() {
+        switch normalizedStatus(status) {
         case "failed", "error", "rejected":
             return "exclamationmark.triangle.fill"
-        case "running", "thinking", "tool":
+        case "active", "in_progress", "inprogress", "running", "thinking", "tool":
             return "play.circle.fill"
-        case "assigned", "queued", "mailbox":
+        case "blocked":
+            return "exclamationmark.octagon.fill"
+        case "budget_limited", "usage_limited":
+            return "gauge.with.dots.needle.67percent"
+        case "assigned", "paused", "pending", "queued", "ready", "mailbox":
             return "clock.fill"
         case "completed", "complete", "done":
             return "checkmark.circle.fill"
+        case "cancelled", "canceled":
+            return "slash.circle.fill"
         default:
             return "circle"
         }
+    }
+
+    private func normalizedStatus(_ status: String) -> String {
+        status
+            .replacingOccurrences(of: "-", with: "_")
+            .replacingOccurrences(of: " ", with: "_")
+            .lowercased()
     }
 
     private var visibleAgents: [CoworkAgentInfo] {
@@ -942,10 +1278,6 @@ public struct CoworkShell: View {
             let status = agent.status.lowercased()
             return status != "cleaned" && status != "removed" && status != "detached"
         }
-    }
-
-    private var goalRows: [CoworkTaskLine] {
-        summary.runningTasks + summary.failedTasks + summary.recentCompletedTasks
     }
 
     private var primaryWorkspace: CoworkWorkspaceInfo? {
@@ -960,40 +1292,29 @@ public struct CoworkShell: View {
         primaryWorkspace?.path ?? "Attach a workspace to inspect git state."
     }
 
-    private func isCompleted(_ task: CoworkTaskLine) -> Bool {
-        switch task.status.lowercased() {
-        case "completed", "complete", "done":
-            return true
-        default:
-            return false
-        }
-    }
-
-    private func goalText(for task: CoworkTaskLine) -> String {
-        task.detail.isEmpty ? task.title : task.detail
-    }
-
     private func agentRoster(layout: IntatisThreadContentLayout) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             ScrollView(.horizontal) {
-                HStack(spacing: 8) {
-                    if agents.isEmpty {
-                        Text("No agents attached")
-                            .font(.caption)
-                            .foregroundStyle(threadStyle.secondaryText)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 9)
-                            .background(threadStyle.cardSurface, in: Capsule())
-                    }
-                    ForEach(agents) { agent in
-                        agentPill(agent)
-                    }
-                    if let onAddAgent {
-                        Button(action: onAddAgent) {
-                            Label("Attach", systemImage: "plus")
-                                .font(.caption.bold())
+                IntatisGlassEffectGroup(spacing: 8) {
+                    HStack(spacing: 8) {
+                        if agents.isEmpty {
+                            Text("No agents attached")
+                                .font(.caption)
+                                .foregroundStyle(threadStyle.secondaryText)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 9)
+                                .intatisContentSurface(cornerRadius: 18)
                         }
-                        .buttonStyle(.borderless)
+                        ForEach(agents) { agent in
+                            agentPill(agent)
+                        }
+                        if let onAddAgent {
+                            Button(action: onAddAgent) {
+                                Label("Attach", systemImage: "plus")
+                                    .font(.caption.bold())
+                            }
+                            .intatisGlassButton()
+                        }
                     }
                 }
                 .padding(.vertical, 1)
@@ -1030,8 +1351,7 @@ public struct CoworkShell: View {
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
-            .background(selected ? threadStyle.accentSoft : threadStyle.cardSurface, in: Capsule())
-            .overlay { Capsule().stroke(selected ? threadStyle.accent : threadStyle.cardStroke, lineWidth: 1) }
+            .intatisLiquidGlass(cornerRadius: 18, interactive: true)
         }
         .buttonStyle(.plain)
     }
@@ -1072,18 +1392,14 @@ public struct CoworkShell: View {
                     } label: {
                         Image(systemName: "trash")
                     }
-                    .buttonStyle(.borderless)
+                    .intatisGlassButton()
                     .disabled(isWorking)
                     .help("Remove agent")
                 }
             }
         }
         .padding(11)
-        .background(threadStyle.cardSurface, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(threadStyle.cardStroke, lineWidth: 1)
-        }
+        .intatisContentSurface(cornerRadius: 8)
     }
 
     private func agentDetailRow(_ title: String, value: String) -> some View {
@@ -1230,7 +1546,7 @@ public struct CoworkShell: View {
                         }
                         if isWorking, let onCancelCurrent {
                             Button("Cancel task", action: onCancelCurrent)
-                                .buttonStyle(.borderless)
+                                .intatisGlassButton()
                                 .foregroundStyle(threadStyle.error)
                                 .accessibilityLabel("Cancel current Cowork task")
                         }
@@ -1242,6 +1558,190 @@ public struct CoworkShell: View {
         .padding(.horizontal, layout.horizontalPadding)
         .padding(.top, 10)
         .padding(.bottom, 22)
+    }
+}
+
+private struct CoworkWorkTaskRow: View {
+    let task: CoworkWorkTaskLine
+    let ordinal: Int
+    let style: IntatisThreadStyle
+    @State private var isExpanded = false
+
+    var body: some View {
+        Group {
+            if task.hasExpandedDetails {
+                DisclosureGroup(isExpanded: $isExpanded) {
+                    taskDetails
+                        .padding(.top, 7)
+                        .padding(.leading, 30)
+                } label: {
+                    taskLabel
+                }
+                .buttonStyle(.plain)
+            } else {
+                taskLabel
+            }
+        }
+        .padding(.vertical, 2)
+        .accessibilityIdentifier("cowork.task.\(task.id)")
+    }
+
+    private var taskLabel: some View {
+        HStack(alignment: .top, spacing: 8) {
+            taskMarker
+            VStack(alignment: .leading, spacing: 3) {
+                Text(task.title)
+                    .font(.caption.bold())
+                    .foregroundStyle(task.isCompleted ? style.secondaryText : style.primaryText)
+                    .strikethrough(task.isCompleted, color: style.secondaryText)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(alignment: .firstTextBaseline, spacing: 5) {
+                    Text(displayStatus)
+                        .font(.caption2.bold())
+                        .foregroundStyle(statusColor)
+                        .lineLimit(1)
+                    if let owner = task.owner, !owner.isEmpty {
+                        Text("· \(displayOwner(owner))")
+                            .font(.caption2)
+                            .foregroundStyle(style.tertiaryText)
+                            .lineLimit(1)
+                    }
+                }
+            }
+            Spacer(minLength: 0)
+        }
+    }
+
+    private func displayOwner(_ owner: String) -> String {
+        owner.hasPrefix("@") ? owner : "@\(owner)"
+    }
+
+    @ViewBuilder private var taskMarker: some View {
+        switch task.normalizedStatus {
+        case "completed", "complete", "done":
+            Image(systemName: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+                .frame(width: 22, height: 22)
+        case "in_progress", "inprogress", "running":
+            ProgressView()
+                .progressViewStyle(.circular)
+                .controlSize(.small)
+                .frame(width: 22, height: 22)
+        case "blocked":
+            Image(systemName: "exclamationmark.octagon.fill")
+                .foregroundStyle(.orange)
+                .frame(width: 22, height: 22)
+        case "failed", "error":
+            Image(systemName: "xmark.circle.fill")
+                .foregroundStyle(style.error)
+                .frame(width: 22, height: 22)
+        case "cancelled", "canceled":
+            Image(systemName: "slash.circle")
+                .foregroundStyle(style.tertiaryText)
+                .frame(width: 22, height: 22)
+        case "pending", "queued":
+            Image(systemName: "clock")
+                .foregroundStyle(style.tertiaryText)
+                .frame(width: 22, height: 22)
+        default:
+            numberedMarker
+        }
+    }
+
+    private var numberedMarker: some View {
+        ZStack {
+            Circle()
+                .stroke(statusColor, lineWidth: 1)
+            Text("\(ordinal)")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(statusColor)
+                .lineLimit(1)
+                .minimumScaleFactor(0.6)
+        }
+        .frame(width: 22, height: 22)
+    }
+
+    private var taskDetails: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            if !task.detail.isEmpty {
+                detailBlock("Details", value: task.detail)
+            }
+            if let dependencies = task.dependencySummary, !dependencies.isEmpty {
+                detailBlock("Dependencies", value: dependencies)
+            }
+            if let reason = task.statusReason, !reason.isEmpty {
+                detailBlock("Status reason", value: reason)
+            }
+            if !task.acceptanceCriteria.isEmpty {
+                detailList("Acceptance", values: task.acceptanceCriteria)
+            }
+            if let result = task.result, !result.isEmpty {
+                detailBlock("Result", value: result)
+            }
+            if !task.evidence.isEmpty {
+                detailList("Evidence", values: task.evidence)
+            }
+            if !task.linkedInvocationIDs.isEmpty {
+                detailList("Invocations", values: task.linkedInvocationIDs, monospaced: true)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func detailBlock(_ title: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title.uppercased())
+                .font(.caption2.bold())
+                .foregroundStyle(style.tertiaryText)
+            Text(value)
+                .font(.caption2)
+                .foregroundStyle(style.secondaryText)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+        }
+    }
+
+    private func detailList(_ title: String,
+                            values: [String],
+                            monospaced: Bool = false) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title.uppercased())
+                .font(.caption2.bold())
+                .foregroundStyle(style.tertiaryText)
+            ForEach(Array(values.enumerated()), id: \.offset) { _, value in
+                HStack(alignment: .top, spacing: 5) {
+                    Text("•")
+                    Text(value)
+                        .font(monospaced ? .caption2.monospaced() : .caption2)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                }
+                .font(.caption2)
+                .foregroundStyle(style.secondaryText)
+            }
+        }
+    }
+
+    private var displayStatus: String {
+        task.status
+            .replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: "-", with: " ")
+            .capitalized
+    }
+
+    private var statusColor: Color {
+        switch task.normalizedStatus {
+        case "completed", "complete", "done":
+            return .green
+        case "active", "in_progress", "inprogress", "running":
+            return style.accent
+        case "blocked", "budget_limited", "usage_limited":
+            return .orange
+        case "failed", "error", "rejected":
+            return style.error
+        default:
+            return style.tertiaryText
+        }
     }
 }
 
@@ -1274,7 +1774,7 @@ private struct CoworkTaskLineRow: View {
                 Spacer(minLength: 6)
                 if let actionTitle, let action {
                     Button(actionTitle, action: action)
-                        .buttonStyle(.borderless)
+                        .intatisGlassButton()
                         .disabled(actionDisabled)
                 }
                 Text(task.status).font(.caption).foregroundStyle(style.secondaryText)
@@ -1287,11 +1787,7 @@ private struct CoworkTaskLineRow: View {
             }
         }
         .padding(10)
-        .background(style.cardSurface, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(style.cardStroke, lineWidth: 1)
-        }
+        .intatisContentSurface(cornerRadius: 8)
     }
 }
 
@@ -1305,7 +1801,6 @@ private struct CoworkEmptyThreadView: View {
                 .font(.system(size: 30, weight: .semibold))
                 .foregroundStyle(style.accent)
                 .frame(width: 76, height: 76)
-                .background(style.accentSoft, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
             Spacer()
         }
         .multilineTextAlignment(.center)

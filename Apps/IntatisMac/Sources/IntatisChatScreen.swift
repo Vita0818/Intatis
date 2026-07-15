@@ -2,9 +2,9 @@
 //  IntatisChatScreen.swift
 //  IntatisMac
 //
-//  The fully restyled Chat surface (the vertical slice): page header, message
-//  bubbles (user = warm champagne tint, assistant = neutral glass), an empty
-//  greeting, and a glass composer with a gold send button. Plus the Settings panel.
+//  The macOS Chat surface follows the native window material. Content uses
+//  semantic system Material, while the custom composer and controls adopt
+//  Liquid Glass on current systems.
 //
 
 #if canImport(SwiftUI)
@@ -193,15 +193,10 @@ private struct IntatisChatSessionScreen: View {
     private var emptyState: some View {
         VStack(spacing: 12) {
             Spacer()
-            ZStack {
-                RoundedRectangle(cornerRadius: 22, style: .continuous)
-                    .fill(IntatisTheme.accentGradient)
-                Image(systemName: "sparkle")
-                    .font(.system(size: 30, weight: .semibold))
-                    .foregroundStyle(.white)
-            }
+            Image(systemName: "sparkle")
+                .font(.system(size: 30, weight: .semibold))
+                .foregroundStyle(IntatisTheme.accent(scheme))
             .frame(width: 76, height: 76)
-            .shadow(color: IntatisTheme.gold.opacity(scheme == .light ? 0.3 : 0), radius: 16, x: 0, y: 8)
 
             Spacer()
         }
@@ -270,7 +265,7 @@ struct IntatisChatModelMenu: View {
             onSelect: onSelect) {
                 label
         }
-        .buttonStyle(.plain)
+        .intatisGlassButton()
         .help(isBusy ? "Model changes apply after the current response finishes" : help)
     }
 
@@ -278,7 +273,7 @@ struct IntatisChatModelMenu: View {
         HStack(spacing: 9) {
             Image(systemName: "cpu")
                 .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(IntatisTheme.goldDeep)
+                .foregroundStyle(IntatisTheme.accent(scheme))
                 .frame(width: 18)
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 5) {
@@ -309,14 +304,6 @@ struct IntatisChatModelMenu: View {
         .frame(minWidth: isCompact ? 0 : 190,
                maxWidth: isCompact ? .infinity : 260,
                alignment: .leading)
-        .background {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(IntatisTheme.glassSurface(scheme).opacity(scheme == .dark ? 0.28 : 0.66))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .stroke(IntatisTheme.glassStroke(scheme).opacity(0.75), lineWidth: 1)
-                }
-        }
     }
 
     private var selectedModelDetail: String? {
@@ -361,7 +348,7 @@ struct IntatisArtifactProgressStrip: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 9)
-        .intatisGlassCard(cornerRadius: 14)
+        .intatisCard(cornerRadius: 14)
     }
 }
 
@@ -405,7 +392,7 @@ struct IntatisMessageBubble: View {
                 Text(roleLabel.uppercased())
                     .font(IntatisType.caption(10, .semibold))
                     .tracking(0.6)
-                    .foregroundStyle(isUser ? IntatisTheme.goldDeep : IntatisTheme.tertiaryText(scheme))
+                    .foregroundStyle(isUser ? IntatisTheme.accent(scheme) : IntatisTheme.tertiaryText(scheme))
                 ForEach(message.tags, id: \.self) { tag in
                     goalTag(tag)
                 }
@@ -418,30 +405,26 @@ struct IntatisMessageBubble: View {
         }
         .padding(.horizontal, 15)
         .padding(.vertical, 11)
-        .background { bubbleBackground }
+        .intatisContentSurface(cornerRadius: 16)
+        .overlay { userSelectionStroke }
     }
 
-    @ViewBuilder private var bubbleBackground: some View {
-        let shape = RoundedRectangle(cornerRadius: 16, style: .continuous)
+    @ViewBuilder private var userSelectionStroke: some View {
         if isUser {
-            shape
-                .fill(IntatisTheme.sand.opacity(scheme == .dark ? 0.16 : 0.85))
-                .overlay { shape.stroke(IntatisTheme.gold.opacity(scheme == .dark ? 0.34 : 0.30), lineWidth: 1) }
-        } else {
-            shape
-                .fill(IntatisTheme.glassSurface(scheme).opacity(scheme == .dark ? 0.30 : 0.70))
-                .background(.ultraThinMaterial, in: shape)
-                .overlay { shape.stroke(IntatisTheme.glassStroke(scheme).opacity(scheme == .dark ? 0.50 : 0.85), lineWidth: 1) }
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(IntatisTheme.selectedStroke(scheme), lineWidth: 1)
         }
     }
 
     private func goalTag(_ tag: String) -> some View {
         Text(tag.uppercased())
             .font(IntatisType.caption(10, .semibold))
-            .foregroundStyle(IntatisTheme.goldDeep)
+            .foregroundStyle(IntatisTheme.accent(scheme))
             .padding(.horizontal, 6)
             .padding(.vertical, 2)
-            .background(IntatisTheme.goldSoft.opacity(scheme == .dark ? 0.24 : 0.45), in: Capsule())
+            .overlay {
+                Capsule().stroke(IntatisTheme.separator(scheme), lineWidth: 1)
+            }
     }
 }
 
@@ -550,12 +533,7 @@ struct IntatisComposerAccessory: View {
             .foregroundStyle(IntatisTheme.softText(scheme))
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
-            .background(IntatisTheme.glassSurface(scheme).opacity(scheme == .dark ? 0.24 : 0.58),
-                        in: Capsule(style: .continuous))
-            .overlay {
-                Capsule(style: .continuous)
-                    .stroke(IntatisTheme.glassStroke(scheme).opacity(0.70), lineWidth: 1)
-            }
+            .intatisContentSurface(cornerRadius: 14)
         }
     }
 }
@@ -624,7 +602,7 @@ struct IntatisSettingsPanel: View {
                 providerDetail(layout: layout)
             }
             .padding(22)
-            .intatisGlassCard(cornerRadius: 24)
+            .intatisCard(cornerRadius: 24)
             .frame(maxWidth: layout.settingsCardMaxWidth, alignment: .leading)
         } else {
             VStack(alignment: .leading, spacing: 18) {
@@ -634,7 +612,7 @@ struct IntatisSettingsPanel: View {
                 providerDetail(layout: layout)
             }
             .padding(18)
-            .intatisGlassCard(cornerRadius: 20)
+            .intatisCard(cornerRadius: 20)
             .frame(maxWidth: layout.settingsCardMaxWidth, alignment: .leading)
         }
     }
@@ -668,7 +646,7 @@ struct IntatisSettingsPanel: View {
         if saved {
             Label("Saved", systemImage: "checkmark.circle.fill")
                 .font(IntatisType.caption(12, .semibold))
-                .foregroundStyle(IntatisTheme.goldDeep)
+                .foregroundStyle(.green)
         }
     }
 
@@ -676,12 +654,9 @@ struct IntatisSettingsPanel: View {
         Button(action: openJSONConfig) {
             Label("Open Intatis Config", systemImage: "curlybraces")
                 .font(IntatisType.body(14, .semibold))
-                .foregroundStyle(IntatisTheme.deepText(scheme))
-                .padding(.horizontal, 14)
-                .padding(.vertical, 9)
-                .background(inputBackground)
+                .foregroundStyle(.primary)
         }
-        .buttonStyle(.plain)
+        .intatisGlassButton()
         .help("Open the Intatis provider config")
     }
 
@@ -690,12 +665,9 @@ struct IntatisSettingsPanel: View {
             Label(isTestingProvider ? "Testing" : (layout.isCompact ? "Test" : "Test Provider"),
                   systemImage: isTestingProvider ? "hourglass" : "checkmark.seal")
                 .font(IntatisType.body(14, .semibold))
-                .foregroundStyle(IntatisTheme.deepText(scheme))
-                .padding(.horizontal, 14)
-                .padding(.vertical, 9)
-                .background(inputBackground)
+                .foregroundStyle(.primary)
         }
-        .buttonStyle(.plain)
+        .intatisGlassButton()
         .disabled(isTestingProvider)
         .help("Save current settings and run a small model health check")
     }
@@ -704,12 +676,9 @@ struct IntatisSettingsPanel: View {
         Button(action: save) {
             Text("Save")
                 .font(IntatisType.body(14, .semibold))
-                .foregroundStyle(.white)
-                .padding(.horizontal, 22)
-                .padding(.vertical, 9)
-                .background(IntatisTheme.accentGradient, in: Capsule())
+                .foregroundStyle(.primary)
         }
-        .buttonStyle(.plain)
+        .intatisGlassButton(prominent: true)
     }
 
     @ViewBuilder private var providerHealthSummary: some View {
@@ -723,7 +692,7 @@ struct IntatisSettingsPanel: View {
                     VStack(alignment: .leading, spacing: 4) {
                         Label(report.displayTitle, systemImage: report.isOK ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
                             .font(IntatisType.caption(12, .semibold))
-                            .foregroundStyle(report.isOK ? IntatisTheme.goldDeep : .red)
+                            .foregroundStyle(report.isOK ? .green : .red)
                         Text(report.displaySummary)
                             .font(IntatisType.caption(11, .medium))
                             .foregroundStyle(IntatisTheme.softText(scheme))
@@ -800,7 +769,7 @@ struct IntatisSettingsPanel: View {
                 HStack(spacing: 7) {
                     Image(systemName: selected ? "checkmark.circle.fill" : "circle")
                         .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(selected ? IntatisTheme.goldDeep : IntatisTheme.tertiaryText(scheme))
+                        .foregroundStyle(selected ? IntatisTheme.accent(scheme) : IntatisTheme.tertiaryText(scheme))
                     Text(provider.title)
                         .font(IntatisType.body(13, .semibold))
                         .foregroundStyle(IntatisTheme.deepText(scheme))
@@ -814,15 +783,9 @@ struct IntatisSettingsPanel: View {
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 9)
-            .background {
-                RoundedRectangle(cornerRadius: 11, style: .continuous)
-                    .fill(selected
-                          ? IntatisTheme.goldSoft.opacity(scheme == .dark ? 0.22 : 0.32)
-                          : IntatisTheme.glassSurface(scheme).opacity(scheme == .dark ? 0.20 : 0.45))
-            }
             .overlay {
                 RoundedRectangle(cornerRadius: 11, style: .continuous)
-                    .stroke(selected ? IntatisTheme.gold.opacity(0.55) : IntatisTheme.glassStroke(scheme).opacity(0.5),
+                    .stroke(selected ? IntatisTheme.selectedStroke(scheme) : IntatisTheme.separator(scheme),
                             lineWidth: 1)
             }
         }
@@ -1136,7 +1099,7 @@ struct IntatisSettingsPanel: View {
                 .foregroundStyle(IntatisTheme.deepText(scheme))
                 .padding(.horizontal, 12)
                 .padding(.vertical, 9)
-                .background(inputBackground)
+                .overlay(inputBackground)
         }
     }
 
@@ -1151,17 +1114,13 @@ struct IntatisSettingsPanel: View {
                 .foregroundStyle(IntatisTheme.deepText(scheme))
                 .padding(.horizontal, 12)
                 .padding(.vertical, 9)
-                .background(inputBackground)
+                .overlay(inputBackground)
         }
     }
 
     private var inputBackground: some View {
         RoundedRectangle(cornerRadius: 10, style: .continuous)
-            .fill(IntatisTheme.glassSurface(scheme).opacity(scheme == .dark ? 0.30 : 0.70))
-            .overlay {
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .stroke(IntatisTheme.glassStroke(scheme).opacity(0.8), lineWidth: 1)
-            }
+            .stroke(IntatisTheme.separator(scheme), lineWidth: 1)
     }
 }
 

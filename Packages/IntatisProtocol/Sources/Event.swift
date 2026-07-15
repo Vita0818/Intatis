@@ -305,10 +305,15 @@ public struct TaskCompletedPayload: Codable, Equatable, Sendable {
     }
 }
 
+public enum TaskFailureCode: String, Codable, Equatable, Sendable {
+    case providerUsageLimit = "provider_usage_limit"
+}
+
 public struct TaskFailedPayload: Codable, Equatable, Sendable {
     public var taskID: TaskID
     public var agent: AgentID
     public var error: String
+    public var failureCode: TaskFailureCode?
     public var report: TaskReportPayload?
     public var attempt: Int?
     public var metadata: CoworkEventMetadata?
@@ -316,12 +321,14 @@ public struct TaskFailedPayload: Codable, Equatable, Sendable {
     public init(taskID: TaskID,
                 agent: AgentID,
                 error: String,
+                failureCode: TaskFailureCode? = nil,
                 report: TaskReportPayload? = nil,
                 attempt: Int? = nil,
                 metadata: CoworkEventMetadata? = nil) {
         self.taskID = taskID
         self.agent = agent
         self.error = error
+        self.failureCode = failureCode
         self.report = report
         self.attempt = attempt
         self.metadata = metadata
@@ -404,6 +411,7 @@ public enum Event: Equatable, Sendable {
     case agentSpawned(AgentSpawnedPayload)
     case agentMessage(AgentMessagePayload)
     case agentMessageConsumed(AgentMessageConsumedPayload)
+    case agentMessageDiscarded(AgentMessageDiscardedPayload)
     case agentToAgentMessage(AgentToAgentMessagePayload)
     case informationRequested(InformationRequestedPayload)
     case informationReplied(InformationRepliedPayload)
@@ -429,6 +437,41 @@ public enum Event: Equatable, Sendable {
     case taskFailed(TaskFailedPayload)
     case taskCancelled(TaskCancelledPayload)
     case taskRejected(TaskRejectedPayload)
+    // durable user-visible WorkTask plan
+    case workTaskCreated(WorkTaskCreatedPayload)
+    case workTaskUpdated(WorkTaskUpdatedPayload)
+    case workTaskOwnerChanged(WorkTaskOwnerChangedPayload)
+    case workTaskDependencyChanged(WorkTaskDependencyChangedPayload)
+    case workTaskReady(WorkTaskReadyPayload)
+    case workTaskStarted(WorkTaskStartedPayload)
+    case workTaskProgressed(WorkTaskProgressedPayload)
+    case workTaskBlocked(WorkTaskBlockedPayload)
+    case workTaskCompleted(WorkTaskCompletedPayload)
+    case workTaskFailed(WorkTaskFailedPayload)
+    case workTaskCancelled(WorkTaskCancelledPayload)
+    case workTaskInvocationLinked(WorkTaskInvocationLinkedPayload)
+    case workTaskEvidenceAdded(WorkTaskEvidenceAddedPayload)
+    case workTaskCarriedForward(WorkTaskCarriedForwardPayload)
+    // durable Goal lifecycle
+    case goalCreated(GoalCreatedPayload)
+    case goalEdited(GoalEditedPayload)
+    case goalPaused(GoalPausedPayload)
+    case goalResumed(GoalResumedPayload)
+    case goalAuditCompleted(GoalAuditCompletedPayload)
+    case goalContinuationScheduled(GoalContinuationScheduledPayload)
+    case goalProgressed(GoalProgressedPayload)
+    case goalBlocked(GoalBlockedPayload)
+    case goalBudgetLimited(GoalBudgetLimitedPayload)
+    case goalUsageLimited(GoalUsageLimitedPayload)
+    case goalCompleted(GoalCompletedPayload)
+    case goalCleared(GoalClearedPayload)
+    // ordinary turn / Goal continuation lifecycle
+    case continuationRunCreated(ContinuationRunCreatedPayload)
+    case continuationRunStarted(ContinuationRunStartedPayload)
+    case continuationRunCheckpointed(ContinuationRunCheckpointedPayload)
+    case continuationRunCompleted(ContinuationRunCompletedPayload)
+    case continuationRunCancelled(ContinuationRunCancelledPayload)
+    case continuationRunRecovered(ContinuationRunRecoveredPayload)
     // v0.4 (Multimodal)
     case artifactAdded(ArtifactAddedPayload)
     case artifactProgress(ArtifactProgressPayload)
@@ -456,6 +499,7 @@ public enum Event: Equatable, Sendable {
         case agentSpawned = "agent_spawned"
         case agentMessage = "agent_message"
         case agentMessageConsumed = "agent_message_consumed"
+        case agentMessageDiscarded = "agent_message_discarded"
         case agentToAgentMessage = "agent_to_agent_message"
         case informationRequested = "information_requested"
         case informationReplied = "information_replied"
@@ -480,6 +524,38 @@ public enum Event: Equatable, Sendable {
         case taskFailed = "task_failed"
         case taskCancelled = "task_cancelled"
         case taskRejected = "task_rejected"
+        case workTaskCreated = "work_task_created"
+        case workTaskUpdated = "work_task_updated"
+        case workTaskOwnerChanged = "work_task_owner_changed"
+        case workTaskDependencyChanged = "work_task_dependency_changed"
+        case workTaskReady = "work_task_ready"
+        case workTaskStarted = "work_task_started"
+        case workTaskProgressed = "work_task_progressed"
+        case workTaskBlocked = "work_task_blocked"
+        case workTaskCompleted = "work_task_completed"
+        case workTaskFailed = "work_task_failed"
+        case workTaskCancelled = "work_task_cancelled"
+        case workTaskInvocationLinked = "work_task_invocation_linked"
+        case workTaskEvidenceAdded = "work_task_evidence_added"
+        case workTaskCarriedForward = "work_task_carried_forward"
+        case goalCreated = "goal_created"
+        case goalEdited = "goal_edited"
+        case goalPaused = "goal_paused"
+        case goalResumed = "goal_resumed"
+        case goalAuditCompleted = "goal_audit_completed"
+        case goalContinuationScheduled = "goal_continuation_scheduled"
+        case goalProgressed = "goal_progressed"
+        case goalBlocked = "goal_blocked"
+        case goalBudgetLimited = "goal_budget_limited"
+        case goalUsageLimited = "goal_usage_limited"
+        case goalCompleted = "goal_completed"
+        case goalCleared = "goal_cleared"
+        case continuationRunCreated = "continuation_run_created"
+        case continuationRunStarted = "continuation_run_started"
+        case continuationRunCheckpointed = "continuation_run_checkpointed"
+        case continuationRunCompleted = "continuation_run_completed"
+        case continuationRunCancelled = "continuation_run_cancelled"
+        case continuationRunRecovered = "continuation_run_recovered"
         case artifactAdded = "artifact_added"
         case artifactProgress = "artifact_progress"
         case turnStats = "turn_stats"
@@ -506,6 +582,7 @@ public enum Event: Equatable, Sendable {
         case .agentSpawned:        return .agentSpawned
         case .agentMessage:        return .agentMessage
         case .agentMessageConsumed: return .agentMessageConsumed
+        case .agentMessageDiscarded: return .agentMessageDiscarded
         case .agentToAgentMessage: return .agentToAgentMessage
         case .informationRequested: return .informationRequested
         case .informationReplied:   return .informationReplied
@@ -530,6 +607,38 @@ public enum Event: Equatable, Sendable {
         case .taskFailed:          return .taskFailed
         case .taskCancelled:       return .taskCancelled
         case .taskRejected:        return .taskRejected
+        case .workTaskCreated:     return .workTaskCreated
+        case .workTaskUpdated:     return .workTaskUpdated
+        case .workTaskOwnerChanged: return .workTaskOwnerChanged
+        case .workTaskDependencyChanged: return .workTaskDependencyChanged
+        case .workTaskReady:       return .workTaskReady
+        case .workTaskStarted:     return .workTaskStarted
+        case .workTaskProgressed:  return .workTaskProgressed
+        case .workTaskBlocked:     return .workTaskBlocked
+        case .workTaskCompleted:   return .workTaskCompleted
+        case .workTaskFailed:      return .workTaskFailed
+        case .workTaskCancelled:   return .workTaskCancelled
+        case .workTaskInvocationLinked: return .workTaskInvocationLinked
+        case .workTaskEvidenceAdded: return .workTaskEvidenceAdded
+        case .workTaskCarriedForward: return .workTaskCarriedForward
+        case .goalCreated:         return .goalCreated
+        case .goalEdited:          return .goalEdited
+        case .goalPaused:          return .goalPaused
+        case .goalResumed:         return .goalResumed
+        case .goalAuditCompleted:  return .goalAuditCompleted
+        case .goalContinuationScheduled: return .goalContinuationScheduled
+        case .goalProgressed:      return .goalProgressed
+        case .goalBlocked:         return .goalBlocked
+        case .goalBudgetLimited:   return .goalBudgetLimited
+        case .goalUsageLimited:    return .goalUsageLimited
+        case .goalCompleted:       return .goalCompleted
+        case .goalCleared:         return .goalCleared
+        case .continuationRunCreated: return .continuationRunCreated
+        case .continuationRunStarted: return .continuationRunStarted
+        case .continuationRunCheckpointed: return .continuationRunCheckpointed
+        case .continuationRunCompleted: return .continuationRunCompleted
+        case .continuationRunCancelled: return .continuationRunCancelled
+        case .continuationRunRecovered: return .continuationRunRecovered
         case .artifactAdded:       return .artifactAdded
         case .artifactProgress:    return .artifactProgress
         case .turnStats:           return .turnStats

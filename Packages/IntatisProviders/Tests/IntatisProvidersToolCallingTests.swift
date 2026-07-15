@@ -505,6 +505,30 @@ final class IntatisProvidersToolCallingTests: XCTestCase {
         }
     }
 
+    func testToolCallingStreamingPreservesStructuredHardUsageLimitError() async {
+        let sse = #"""
+        data: {"error":{"message":"usage_limit_reached","type":"billing_error"}}
+
+        """#
+        let provider = OpenAIWireProvider(
+            endpoint: endpoint,
+            apiKey: "k",
+            http: FakeHTTP2(chunks: fragment(sse, size: 9)))
+
+        do {
+            for try await _ in provider.stream(AgentRequest(
+                model: ModelID(rawValue: "m"),
+                messages: [.user("hi")],
+                tools: [])) {}
+            XCTFail("expected hard provider usage limit")
+        } catch let error as ProviderUsageLimitError {
+            XCTAssertEqual(error.signal, "usage_limit_reached")
+            XCTAssertNil(error.statusCode)
+        } catch {
+            XCTFail("expected ProviderUsageLimitError, got \(type(of: error)): \(error)")
+        }
+    }
+
     func testMessageJSONShapes() {
         let assistant = OpenAIWireProvider.messageJSON(
             .assistant(toolCalls: [ToolCall(id: "c1", name: "f", arguments: "{}")]))

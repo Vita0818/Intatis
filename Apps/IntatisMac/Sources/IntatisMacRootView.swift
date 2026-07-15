@@ -113,7 +113,7 @@ struct IntatisMacRootView: View {
                     ideal: 236)
         } detail: {
             ZStack {
-                IntatisTheme.pageGradient(scheme).ignoresSafeArea()
+                IntatisSystemCanvas().ignoresSafeArea()
                 detail
             }
         }
@@ -634,11 +634,6 @@ struct IntatisSidebar: View {
             .padding(.top, 12)
             .padding(.bottom, 14)
         }
-        .background {
-            Rectangle()
-                .fill(IntatisTheme.glassSurface(scheme).opacity(scheme == .dark ? 0.18 : 0.32))
-                .background(.thinMaterial)
-        }
     }
 
     private var titleBlock: some View {
@@ -664,7 +659,7 @@ private struct IntatisSidebarSettingsRow: View {
         HStack(spacing: 9) {
             Image(systemName: "gearshape")
                 .font(.system(size: 13, weight: .medium))
-                .foregroundStyle(selected ? IntatisTheme.goldDeep : IntatisTheme.softText(scheme))
+                .foregroundStyle(selected ? IntatisTheme.accent(scheme) : IntatisTheme.softText(scheme))
                 .frame(width: 20)
             Text("Settings")
                 .font(IntatisType.body(13, selected ? .semibold : .medium))
@@ -673,15 +668,10 @@ private struct IntatisSidebarSettingsRow: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 9)
-        .background {
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(selected ? IntatisTheme.goldSoft.opacity(scheme == .dark ? 0.22 : 0.36)
-                               : IntatisTheme.glassSurface(scheme).opacity(scheme == .dark ? 0.16 : 0.30))
-                .opacity(selected || hover ? 1 : 0.85)
-        }
         .overlay {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(IntatisTheme.gold.opacity(scheme == .dark ? 0.34 : 0.42), lineWidth: 1)
+                .stroke(selected ? IntatisTheme.selectedStroke(scheme) : IntatisTheme.separator(scheme),
+                        lineWidth: 1)
                 .opacity(selected ? 1 : (hover ? 0.4 : 0))
         }
         .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))

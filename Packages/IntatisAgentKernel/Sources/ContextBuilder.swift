@@ -24,7 +24,9 @@ public struct RuntimeEnvironmentManifest: Equatable, Sendable {
         Intatis gives you model-visible tools for workspace, network, browser, document, Git, goal, task, message, and agent operations when the current lease allows them.
         Every external action must be performed through a tool call. A capability is available only when its tool appears in the authoritative API tools list for this request.
         Tool arguments must be one strict JSON object matching the advertised JSON Schema. Do not invent tools, hidden capabilities, successful executions, file changes, messages, agents, goals, or task results.
-        Treat a tool action as completed only after receiving its ToolResult. Permission, scheduling, persistence, recovery, and terminal task state are owned by Intatis.
+        Goal, WorkTask, ContinuationRun, and AgentInvocation are separate layers. A Goal is a user-explicit durable objective across runs. A WorkTask is a durable work item in one run. An AgentInvocation is one scheduled agent execution for a WorkTask or root request.
+        AgentInvocation completion does not complete its WorkTask. WorkTask completion does not complete its Goal. Read and change durable Task or Goal state only through the corresponding tools; natural-language claims do not settle host state.
+        Treat a tool action as completed only after receiving its ToolResult. Permission, scheduling, persistence, recovery, WorkTask readiness, and terminal state are owned by Intatis.
         """
     }
 }
@@ -68,7 +70,12 @@ public struct ContextBuilder: Sendable {
             You may also act as a COORDINATOR. You hold the agent-coordination tools
             delegate_task, request_information, send_message, reply_message, spawn_agent,
             list_agents and remove_agent. ask_agent exists only as a compatibility wrapper.
-            Prefer delegate_task for each concrete sub-task: Intatis can reuse an idle worker
+            When task_create/task_update/task_get/task_list are available, use them as the
+            durable source of truth for multi-step work. Create a small dependency graph of
+            verifiable WorkTasks, then pass each ready task's work_task_id to delegate_task.
+            An agent report is candidate evidence, not automatic WorkTask completion; explicitly
+            settle the WorkTask with task_update only after checking its result and evidence.
+            Prefer delegate_task for each concrete WorkTask: Intatis can reuse an idle worker
             or atomically create one in your workspace when the target is omitted. Use
             spawn_agent only for a deliberately long-lived teammate or a different subfolder,
             then synthesize the mediated task reports.
@@ -90,6 +97,9 @@ public struct ContextBuilder: Sendable {
             You are executing the assigned task as a worker agent.
             Do not create, remove, or coordinate other agents.
             Do not re-run the global task decomposition.
+            When task_get/task_list are available, use them for authoritative WorkTask state.
+            When task_update is available, update only your assigned WorkTask's progress,
+            result, evidence, or permitted status; do not change its owner or dependencies.
             If you need help, report that need to the assigning agent or user, or use request_delegation when that tool is available.
             Only reply to task-related messages when reply_message is available.
             Complete the task with your available tools, then reply with a concise, self-contained answer.
@@ -100,16 +110,25 @@ public struct ContextBuilder: Sendable {
 
     public static func taskContractPrompt(_ contract: TaskContract,
                                           omittingObjectiveMatching currentUserText: String? = nil) -> String {
-        var lines: [String] = ["Current task data:"]
-        appendQuotedField("Task ID", contract.id.rawValue, maxCharacters: 200, to: &lines)
+        var lines: [String] = ["Current AgentInvocation data:"]
+        appendQuotedField("Invocation task ID", contract.id.rawValue, maxCharacters: 200, to: &lines)
         appendQuotedField(
             "Assigned by",
             contract.issuer.map { "@\($0.rawValue)" } ?? "user",
             maxCharacters: 200,
             to: &lines)
         appendQuotedField("Assignee", "@\(contract.assignee.rawValue)", maxCharacters: 200, to: &lines)
-        appendQuotedField("Task kind", contract.kind.rawValue, maxCharacters: 80, to: &lines)
-        appendQuotedField("Your role in this task", contract.roleHint, maxCharacters: 400, to: &lines)
+        appendQuotedField("Invocation kind", contract.kind.rawValue, maxCharacters: 80, to: &lines)
+        appendQuotedField("Your role in this invocation", contract.roleHint, maxCharacters: 400, to: &lines)
+        if let workTaskID = contract.workTaskID {
+            appendQuotedField("Linked WorkTask ID", workTaskID.rawValue, maxCharacters: 200, to: &lines)
+        }
+        if let continuationRunID = contract.continuationRunID {
+            appendQuotedField("ContinuationRun ID", continuationRunID.rawValue, maxCharacters: 200, to: &lines)
+        }
+        if let goalID = contract.goalID {
+            appendQuotedField("Goal ID", goalID.rawValue, maxCharacters: 200, to: &lines)
+        }
         if sameNormalizedText(contract.objective, currentUserText) {
             lines.append("Objective: [same as the current user turn; omitted here]")
         } else {
@@ -117,7 +136,7 @@ public struct ContextBuilder: Sendable {
         }
         appendQuotedField("Expected deliverable", contract.expectedDeliverable, maxCharacters: 800, to: &lines)
         if let parentTaskID = contract.parentTaskID {
-            appendQuotedField("Parent task ID", parentTaskID.rawValue, maxCharacters: 200, to: &lines)
+            appendQuotedField("Parent invocation task ID", parentTaskID.rawValue, maxCharacters: 200, to: &lines)
         }
         if let workspaceID = contract.workspaceID {
             appendQuotedField("Workspace ID", workspaceID.rawValue, maxCharacters: 200, to: &lines)

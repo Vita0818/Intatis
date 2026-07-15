@@ -145,6 +145,8 @@ public struct AgentLoop: Sendable {
     private let git: GitService
     private let messenger: AgentMessenger?
     private let agentManager: AgentManager?
+    private let workTaskManager: WorkTaskManager?
+    private let goalManager: GoalManager?
     private let imageGenerator: ImageGenerationToolService?
     private let reasoningEffort: ReasoningEffort?
     private let includeUsage: Bool
@@ -153,6 +155,7 @@ public struct AgentLoop: Sendable {
     private let workspaceLease: WorkspaceLease?
     private let rootTaskID: TaskID?
     private let taskAttempt: Int?
+    private let executionScope: AgentExecutionScope?
     private let tokenBudgetMeter: AgentTokenBudgetMeter?
 
     public init(log: EventLog,
@@ -167,6 +170,8 @@ public struct AgentLoop: Sendable {
                 git: GitService = ProcessGitService(),
                 messenger: AgentMessenger? = nil,
                 agentManager: AgentManager? = nil,
+                workTaskManager: WorkTaskManager? = nil,
+                goalManager: GoalManager? = nil,
                 imageGenerator: ImageGenerationToolService? = nil,
                 reasoningEffort: ReasoningEffort? = nil,
                 includeUsage: Bool = false,
@@ -175,6 +180,7 @@ public struct AgentLoop: Sendable {
                 workspaceLease: WorkspaceLease? = nil,
                 rootTaskID: TaskID? = nil,
                 taskAttempt: Int? = nil,
+                executionScope: AgentExecutionScope? = nil,
                 tokenBudgetMeter: AgentTokenBudgetMeter? = nil) {
         self.log = log
         self.provider = provider
@@ -188,6 +194,8 @@ public struct AgentLoop: Sendable {
         self.git = git
         self.messenger = messenger
         self.agentManager = agentManager
+        self.workTaskManager = workTaskManager
+        self.goalManager = goalManager
         self.imageGenerator = imageGenerator
         self.reasoningEffort = reasoningEffort
         self.includeUsage = includeUsage
@@ -196,6 +204,7 @@ public struct AgentLoop: Sendable {
         self.workspaceLease = workspaceLease
         self.rootTaskID = rootTaskID
         self.taskAttempt = taskAttempt
+        self.executionScope = executionScope
         self.tokenBudgetMeter = tokenBudgetMeter
     }
 
@@ -204,9 +213,12 @@ public struct AgentLoop: Sendable {
     @discardableResult
     public func send(_ userText: String,
                      images: [ImageAttachment] = [],
-                     userMessage: UserMessagePayload? = nil) async throws -> String {
+                     userMessage: UserMessagePayload? = nil,
+                     recordUserMessage: Bool = true) async throws -> String {
         let history = await projectedHistory()
-        try await log.append(.userMessage(userMessage ?? UserMessagePayload(text: userText)))
+        if recordUserMessage {
+            try await log.append(.userMessage(userMessage ?? UserMessagePayload(text: userText)))
+        }
         try await log.append(.agentStatus(AgentStatusPayload(agent: agent.name, state: .thinking)))
 
         var convo = context.initialMessages(history: history, userText: userText, userImages: images)
@@ -533,7 +545,12 @@ public struct AgentLoop: Sendable {
             contextWindowTokens: usage?.contextWindowTokens,
             ttftMillis: firstTokenAt.map { Int($0.timeIntervalSince(start) * 1000) },
             totalMillis: Int(now.timeIntervalSince(start) * 1000),
-            model: agent.model.rawValue)))
+            model: agent.model.rawValue,
+            goalID: executionScope?.goalID ?? context.taskContract?.goalID,
+            continuationRunID: executionScope?.continuationRunID ?? context.taskContract?.continuationRunID,
+            workTaskID: executionScope?.workTaskID ?? context.taskContract?.workTaskID,
+            invocationTaskID: executionScope?.invocationTaskID ?? rootTaskID ?? context.taskContract?.id,
+            agentID: executionScope?.agentID ?? agent.name)))
     }
 
     // MARK: - Tool execution with permission
@@ -746,6 +763,8 @@ public struct AgentLoop: Sendable {
                                       git: git,
                                       messenger: messenger,
                                       agentManager: agentManager,
+                                      workTaskManager: workTaskManager,
+                                      goalManager: goalManager,
                                       imageGenerator: imageGenerator)
         let observation: ToolObservation
         do {

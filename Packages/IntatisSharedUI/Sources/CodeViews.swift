@@ -112,7 +112,7 @@ public struct CodeShell: View {
             title: "Code",
             subtitle: "\(workspaceName) · \(agentState)",
             style: threadStyle,
-            actions: [])
+            actions: headerActions)
         .frame(maxWidth: layout.contentMaxWidth)
         .frame(maxWidth: .infinity)
         .padding(.horizontal, layout.horizontalPadding)
@@ -316,21 +316,17 @@ struct CodeItemRow: View {
         }
         .padding(.horizontal, 15)
         .padding(.vertical, 11)
-        .background {
+        .intatisContentSurface(cornerRadius: 16)
+        .overlay {
             RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(isUser ? style.userBubble : style.assistantBubble)
-                .background(style.material, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .stroke(bubbleStroke(isUser: isUser), lineWidth: 1)
-                }
+                .stroke(bubbleStroke(isUser: isUser), lineWidth: 1)
         }
     }
 
     private func bubbleStroke(isUser: Bool) -> Color {
-        if isUser { return style.accentSoft }
+        if isUser { return style.accent.opacity(0.48) }
         if item.isFailure { return style.error.opacity(0.36) }
-        return style.stroke
+        return .clear
     }
 
     private func card(icon: String, title: String, body: String, tint: Color) -> some View {
@@ -343,7 +339,7 @@ struct CodeItemRow: View {
             }
         }
         .padding(11)
-        .background(style.cardSurface)
+        .intatisContentSurface(cornerRadius: 8)
         .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(tint.opacity(0.25)))
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         .frame(maxWidth: min(layout.contentMaxWidth, 740), alignment: .leading)
@@ -356,7 +352,7 @@ struct CodeItemRow: View {
             .foregroundStyle(style.accent)
             .padding(.horizontal, 6)
             .padding(.vertical, 2)
-            .background(style.accentSoft, in: Capsule())
+            .overlay { Capsule().stroke(style.stroke, lineWidth: 1) }
     }
 }
 
@@ -370,7 +366,6 @@ private struct CodeEmptyThreadView: View {
                 .font(.system(size: 30, weight: .semibold))
                 .foregroundStyle(style.accent)
                 .frame(width: 76, height: 76)
-                .background(style.accentSoft, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
             Spacer()
         }
         .multilineTextAlignment(.center)
@@ -399,8 +394,7 @@ public struct PermissionResolutionNoticeView: View {
             Spacer(minLength: 0)
         }
         .padding(10)
-        .background(Color.gray.opacity(0.08))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .intatisContentSurface(cornerRadius: 8)
         .padding(.horizontal)
         .padding(.vertical, 4)
     }
@@ -433,8 +427,10 @@ public struct PermissionCard: View {
                     .frame(maxWidth: .infinity, alignment: .leading) }
                     .frame(maxHeight: 160)
                     .padding(6)
-                    .background(Color.gray.opacity(0.08))
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 6)
+                            .stroke(Color.primary.opacity(0.16), lineWidth: 1)
+                    }
             }
             HStack {
                 Spacer()
@@ -448,8 +444,7 @@ public struct PermissionCard: View {
             }
         }
         .padding(12)
-        .background(Color.yellow.opacity(0.10))
-        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.yellow.opacity(0.4)))
+        .intatisContentSurface(cornerRadius: 10)
         .clipShape(RoundedRectangle(cornerRadius: 10))
         .padding(.horizontal)
     }
@@ -556,7 +551,6 @@ private struct CodeInspectorView: View {
             }
             .padding(16)
         }
-        .background(style.cardSurface.opacity(0.38))
     }
 
     private var inspectorHeader: some View {
@@ -580,11 +574,7 @@ private struct CodeInspectorView: View {
         }
         .padding(11)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(style.cardSurface, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(style.cardStroke, lineWidth: 1)
-        }
+        .intatisContentSurface(cornerRadius: 8)
     }
 
     private func inspectorRow(_ title: String, value: String) -> some View {

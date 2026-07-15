@@ -6,6 +6,29 @@ import IntatisProtocol
 import IntatisProviders
 import IntatisTools
 
+/// Optional durable scope for one AgentLoop turn. Cowork hosts can supply a
+/// scope explicitly for control-plane runs; ordinary task executions derive
+/// missing invocation/agent identifiers inside AgentLoop.
+public struct AgentExecutionScope: Equatable, Sendable {
+    public var goalID: GoalID?
+    public var continuationRunID: ContinuationRunID?
+    public var workTaskID: WorkTaskID?
+    public var invocationTaskID: TaskID?
+    public var agentID: AgentID?
+
+    public init(goalID: GoalID? = nil,
+                continuationRunID: ContinuationRunID? = nil,
+                workTaskID: WorkTaskID? = nil,
+                invocationTaskID: TaskID? = nil,
+                agentID: AgentID? = nil) {
+        self.goalID = goalID
+        self.continuationRunID = continuationRunID
+        self.workTaskID = workTaskID
+        self.invocationTaskID = invocationTaskID
+        self.agentID = agentID
+    }
+}
+
 /// Shared headless execution unit used by visible Code sessions and every
 /// Cowork agent. UI/ViewModels own presentation; this type owns the common
 /// request/tool/permission configuration that must not drift between modes.
@@ -73,11 +96,14 @@ public struct AgentRuntime: Sendable {
                          git: GitService = ProcessGitService(),
                          messenger: AgentMessenger? = nil,
                          agentManager: AgentManager? = nil,
+                         workTaskManager: WorkTaskManager? = nil,
+                         goalManager: GoalManager? = nil,
                          imageGenerator: ImageGenerationToolService? = nil,
                          capabilityLease: CapabilityLease? = nil,
                          workspaceLease: WorkspaceLease? = nil,
                          rootTaskID: TaskID? = nil,
                          taskAttempt: Int? = nil,
+                         executionScope: AgentExecutionScope? = nil,
                          tokenBudgetMeter: AgentTokenBudgetMeter? = nil) -> AgentLoop {
         let supplied = context ?? ContextBuilder()
         let runtimeContext = ContextBuilder(
@@ -98,6 +124,8 @@ public struct AgentRuntime: Sendable {
             git: git,
             messenger: messenger,
             agentManager: agentManager,
+            workTaskManager: workTaskManager,
+            goalManager: goalManager,
             imageGenerator: imageGenerator,
             reasoningEffort: reasoningEffort,
             includeUsage: includeUsage,
@@ -106,6 +134,7 @@ public struct AgentRuntime: Sendable {
             workspaceLease: workspaceLease,
             rootTaskID: rootTaskID,
             taskAttempt: taskAttempt,
+            executionScope: executionScope,
             tokenBudgetMeter: tokenBudgetMeter)
     }
 }

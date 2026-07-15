@@ -1,6 +1,7 @@
 import Foundation
 import IntatisCore
 import IntatisProtocol
+import IntatisProviders
 
 public struct RuntimeRecoveryAdvice: Equatable, Sendable {
     public var title: String
@@ -24,6 +25,9 @@ public enum RuntimeErrorPresentation {
     public static func code(for error: Error, fallbackCode: String) -> String {
         if error is CancellationError {
             return "cancelled"
+        }
+        if error is ProviderUsageLimitError {
+            return "provider.usage_limit"
         }
         if let intatis = error as? IntatisError {
             switch intatis {

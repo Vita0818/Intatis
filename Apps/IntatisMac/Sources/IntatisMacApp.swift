@@ -301,10 +301,8 @@ struct WorkspaceSessionHome: View {
                     VStack(alignment: .leading, spacing: 14) {
                         Image(systemName: icon)
                             .font(.system(size: 28, weight: .semibold))
-                            .foregroundStyle(IntatisTheme.goldDeep)
+                            .foregroundStyle(IntatisTheme.accent(scheme))
                             .frame(width: 64, height: 64)
-                            .background(IntatisTheme.goldSoft.opacity(scheme == .dark ? 0.22 : 0.34),
-                                        in: RoundedRectangle(cornerRadius: 18, style: .continuous))
                         Text(primaryTitle)
                             .font(IntatisType.title(20))
                             .foregroundStyle(IntatisTheme.deepText(scheme))
@@ -318,7 +316,7 @@ struct WorkspaceSessionHome: View {
                     }
                     .padding(20)
                     .frame(maxWidth: 620, alignment: .leading)
-                    .intatisGlassCard(cornerRadius: 22)
+                    .intatisCard(cornerRadius: 22)
 
                     if !sessions.isEmpty {
                         RecentSessionList(
@@ -345,12 +343,10 @@ struct WorkspaceSessionHome: View {
         let button = Button(action: onPrimary) {
             Label(primaryTitle, systemImage: primarySystemImage)
                 .font(IntatisType.body(14, .semibold))
-                .foregroundStyle(.white)
-                .padding(.horizontal, 16)
-                .padding(.vertical, 10)
-                .background(IntatisTheme.accentGradient, in: Capsule())
+                .foregroundStyle(.primary)
         }
-        .buttonStyle(.plain)
+        .controlSize(.large)
+        .intatisGlassButton(prominent: true)
 
         if let primaryShortcut {
             button.keyboardShortcut(primaryShortcut)
@@ -388,15 +384,14 @@ private struct RecentSessionList: View {
                     }
                     Spacer(minLength: 8)
                     Button(actionTitle) { onAction(session) }
-                        .buttonStyle(.borderless)
+                        .controlSize(.small)
+                        .intatisGlassButton()
                 }
                 .padding(.horizontal, 13)
                 .padding(.vertical, 10)
-                .background(IntatisTheme.glassSurface(scheme).opacity(scheme == .dark ? 0.25 : 0.62),
-                            in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                 .overlay {
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .stroke(IntatisTheme.glassStroke(scheme).opacity(scheme == .dark ? 0.36 : 0.70), lineWidth: 1)
+                        .stroke(IntatisTheme.separator(scheme), lineWidth: 1)
                 }
             }
         }
@@ -466,10 +461,21 @@ struct CoworkSessionView: View {
     let onNewSession: () -> Void
     let onSessionDidBecomeReady: () -> Void
     @State private var showProjectSettings = false
+    @State private var showGoalEditor = false
+    @State private var showGoalClearConfirmation = false
+    @State private var goalObjectiveDraft = ""
+    @State private var goalSuccessCriteriaDraft = ""
+    @State private var goalConstraintsDraft = ""
+    @State private var goalTokenBudgetDraft = ""
+    @State private var goalEditorSubmissionError: String?
     @Environment(\.colorScheme) private var scheme
 
     private var hasMainAgent: Bool {
         vm.agents.contains { $0.name == vm.project.mainAgentName }
+    }
+
+    private var isCoworkBusy: Bool {
+        vm.isWorking || vm.isGoalContinuing
     }
 
     var body: some View {
@@ -482,25 +488,32 @@ struct CoworkSessionView: View {
                         latestTurnStats: vm.latestTurnStats,
                         summary: vm.summary,
                         project: vm.project,
+                        goal: vm.goal,
+                        workTasks: vm.workTasks,
                         composerError: vm.composerError ?? vm.projectionError,
-                        isWorking: vm.isWorking,
-                        isComposerAvailable: vm.isAutomaticPermissionReviewReady,
+                        isWorking: isCoworkBusy,
+                        isComposerAvailable: vm.isAutomaticPermissionReviewReady
+                            && vm.isGoalRuntimeReady,
                         threadStyle: .intatisMac(scheme),
                         onShowSessions: onShowSessions,
                         onNewSession: onNewSession,
                         onShowProjectSettings: { showProjectSettings = true },
                         composerAccessory: AnyView(IntatisComposerAccessory(
                             catalog: catalog,
-                            isBusy: vm.isWorking,
+                            isBusy: isCoworkBusy,
                             latestTurnStats: vm.latestTurnStats,
                             contextLabel: contextLabel,
                             onSelectModel: onSelectModel)),
                         input: $vm.input,
                         onSend: { vm.send() },
-                        onCancelCurrent: { vm.cancelCurrentTask() },
+                        onCancelCurrent: vm.isWorking ? { vm.cancelCurrentTask() } : nil,
                         onResolve: { vm.resolvePermission($0) },
                         onRemoveAgent: { vm.removeAgent(name: $0) },
-                        onRetryTask: { vm.retryFailedTask(id: $0) })
+                        onRetryTask: { vm.retryFailedTask(id: $0) },
+                        onPauseGoal: { vm.pauseGoal() },
+                        onResumeGoal: { vm.resumeGoal() },
+                        onEditGoal: { presentGoalEditor() },
+                        onClearGoal: { showGoalClearConfirmation = true })
         }
         // SwiftUI preserves this view's structural identity when one Cowork
         // session replaces another. Key startup to the durable session ID so
@@ -513,6 +526,13 @@ struct CoworkSessionView: View {
             onSessionDidBecomeReady()
         }
         .sheet(isPresented: $showProjectSettings) { projectSettingsSheet }
+        .sheet(isPresented: $showGoalEditor) { goalEditorSheet }
+        .alert("Clear this Goal?", isPresented: $showGoalClearConfirmation) {
+            Button("Clear", role: .destructive) { vm.clearGoal() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("The Goal card will be cleared without marking the Goal completed. Its durable history remains in the session log.")
+        }
     }
 
     private var permissionReviewerBanner: some View {
@@ -546,7 +566,6 @@ struct CoworkSessionView: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(presentation.tint.opacity(scheme == .dark ? 0.10 : 0.07))
         .overlay(alignment: .bottom) { Divider().opacity(0.45) }
         .help("\(presentation.title): \(presentation.detail)")
     }
@@ -616,6 +635,28 @@ struct CoworkSessionView: View {
         return formatter
     }()
 
+    private var goalEditorValidationMessage: String? {
+        if let goalEditorSubmissionError { return goalEditorSubmissionError }
+        if goalObjectiveDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "A Goal objective is required."
+        }
+        let budget = goalTokenBudgetDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !budget.isEmpty, Int(budget).map({ $0 > 0 }) != true {
+            return "Token budget must be a positive whole number, or left empty for no budget."
+        }
+        return nil
+    }
+
+    private func presentGoalEditor() {
+        guard let draft = vm.currentGoalEditDraft() else { return }
+        goalObjectiveDraft = draft.objective
+        goalSuccessCriteriaDraft = draft.successCriteria
+        goalConstraintsDraft = draft.constraints
+        goalTokenBudgetDraft = draft.tokenBudget
+        goalEditorSubmissionError = nil
+        showGoalEditor = true
+    }
+
     private var projectSettingsSheet: some View {
         CoworkProjectSettingsSheet(
             vm: vm,
@@ -626,15 +667,139 @@ struct CoworkSessionView: View {
                 }
             })
     }
+
+    private var goalEditorSheet: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Edit Goal")
+                .font(.title2.bold())
+            Text("Edit the durable objective and its requirements. Enter one success criterion or constraint per line. Leaving token budget empty means no Goal budget. A paused Goal remains paused.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Objective")
+                    .font(.caption.bold())
+                TextEditor(text: $goalObjectiveDraft)
+                    .font(.body)
+                    .frame(minWidth: 500, minHeight: 90)
+                    .padding(8)
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 10)
+                            .stroke(IntatisTheme.separator(scheme), lineWidth: 1)
+                    }
+                    .accessibilityLabel("Goal objective")
+                    .accessibilityIdentifier("cowork.goal.editor.objective")
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("Success criteria")
+                        .font(.caption.bold())
+                    Spacer()
+                    Text("One per line")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+                TextEditor(text: $goalSuccessCriteriaDraft)
+                    .font(.body)
+                    .frame(minHeight: 82)
+                    .padding(8)
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 10)
+                            .stroke(IntatisTheme.separator(scheme), lineWidth: 1)
+                    }
+                    .accessibilityLabel("Goal success criteria, one per line")
+                    .accessibilityIdentifier("cowork.goal.editor.success_criteria")
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("Constraints")
+                        .font(.caption.bold())
+                    Spacer()
+                    Text("One per line")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+                TextEditor(text: $goalConstraintsDraft)
+                    .font(.body)
+                    .frame(minHeight: 82)
+                    .padding(8)
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 10)
+                            .stroke(IntatisTheme.separator(scheme), lineWidth: 1)
+                    }
+                    .accessibilityLabel("Goal constraints, one per line")
+                    .accessibilityIdentifier("cowork.goal.editor.constraints")
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Token budget (optional)")
+                    .font(.caption.bold())
+                TextField("No budget", text: $goalTokenBudgetDraft)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(maxWidth: 220)
+                    .accessibilityLabel("Optional positive Goal token budget")
+                    .accessibilityIdentifier("cowork.goal.editor.token_budget")
+            }
+
+            if let validationMessage = goalEditorValidationMessage {
+                Label(validationMessage, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("cowork.goal.editor.validation")
+            }
+
+            HStack {
+                Spacer()
+                Button("Cancel") { showGoalEditor = false }
+                    .keyboardShortcut(.cancelAction)
+                    .accessibilityIdentifier("cowork.goal.editor.cancel")
+                Button("Save") {
+                    if let error = vm.editGoal(
+                        objective: goalObjectiveDraft,
+                        successCriteria: goalSuccessCriteriaDraft,
+                        constraints: goalConstraintsDraft,
+                        tokenBudget: goalTokenBudgetDraft) {
+                        goalEditorSubmissionError = error
+                        return
+                    }
+                    showGoalEditor = false
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(goalEditorValidationMessage != nil)
+                .accessibilityIdentifier("cowork.goal.editor.save")
+            }
+        }
+        .padding(22)
+        .frame(width: 580)
+        .accessibilityIdentifier("cowork.goal.editor")
+        .onChange(of: goalObjectiveDraft) { _ in goalEditorSubmissionError = nil }
+        .onChange(of: goalSuccessCriteriaDraft) { _ in goalEditorSubmissionError = nil }
+        .onChange(of: goalConstraintsDraft) { _ in goalEditorSubmissionError = nil }
+        .onChange(of: goalTokenBudgetDraft) { _ in goalEditorSubmissionError = nil }
+    }
 }
 
 @main
 struct IntatisMacApp: App {
     @StateObject private var env = AppEnvironment()
 
+    private var launchAppearance: ColorScheme? {
+        #if DEBUG
+        let arguments = ProcessInfo.processInfo.arguments
+        if arguments.contains("-IntatisAppearanceDark") { return .dark }
+        if arguments.contains("-IntatisAppearanceLight") { return .light }
+        #endif
+        return nil
+    }
+
     var body: some Scene {
         WindowGroup {
-            IntatisMacRootView().environmentObject(env)
+            IntatisMacRootView()
+                .environmentObject(env)
+                .preferredColorScheme(launchAppearance)
         }
         .defaultSize(width: 1100, height: 760)
     }

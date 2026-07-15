@@ -164,7 +164,7 @@ final class IntatisProvidersMultimodalTests: XCTestCase {
         let success = Data("{\"data\":[{\"b64_json\":\"\(b64)\"}]}".utf8)
         let client = SequencedDataClient(responses: [
             HTTPDataResponse(
-                data: Data(#"{"error":{"message":"rate limited"}}"#.utf8),
+                data: Data(#"{"error":{"message":"request rate exceeded","type":"rate_limit_error","code":"rate_limit_exceeded"}}"#.utf8),
                 status: 429,
                 headers: ["retry-after": "0"]),
             HTTPDataResponse(data: success, status: 200),
@@ -183,6 +183,36 @@ final class IntatisProvidersMultimodalTests: XCTestCase {
 
         XCTAssertEqual(images.first?.data, Data("PNGDATA".utf8))
         XCTAssertEqual(client.attemptCount, 2)
+    }
+
+    func testImageGenHardUsageLimitDoesNotRetryAndPreservesTypedError() async {
+        let client = SequencedDataClient(responses: [
+            HTTPDataResponse(
+                data: Data(#"{"error":{"message":"No credits remain.","type":"insufficient_quota","code":"insufficient_quota"}}"#.utf8),
+                status: 429),
+            HTTPDataResponse(data: Data(#"{"data":[]}"#.utf8), status: 200),
+        ])
+        let provider = OpenAIImageProvider(
+            endpoint: ep,
+            apiKey: "k",
+            http: client,
+            runtimePolicy: ProviderRuntimePolicy(maxAttempts: 2,
+                                                 requestTimeoutSeconds: 1,
+                                                 initialRetryDelaySeconds: 0,
+                                                 maxRetryDelaySeconds: 0))
+
+        do {
+            _ = try await provider.generate(
+                ImageRequest(model: ModelID(rawValue: "image-model"), prompt: "a cat"))
+            XCTFail("expected hard provider usage limit")
+        } catch let error as ProviderUsageLimitError {
+            XCTAssertEqual(error.signal, "insufficient_quota")
+            XCTAssertEqual(error.statusCode, 429)
+            XCTAssertTrue(error.localizedDescription.contains("hard usage limit"))
+            XCTAssertEqual(client.attemptCount, 1)
+        } catch {
+            XCTFail("expected ProviderUsageLimitError, got \(type(of: error)): \(error)")
+        }
     }
 
     func testTranscriptionParsesText() async throws {

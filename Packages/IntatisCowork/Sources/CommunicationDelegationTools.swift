@@ -180,28 +180,56 @@ public struct DelegateTaskTool: Tool {
 
     public static let descriptor = ToolDescriptor(
         name: "delegate_task",
-        description: "Delegate one bounded task. If 'to' names an attached agent it is reused; "
+        description: "Run one ready durable WorkTask by ID. The WorkTask remains the source of truth, "
+            + "and the invocation report is only a candidate result until task_update explicitly settles it. "
+            + "Legacy unscoped calls may provide objective instead. If 'to' names an attached agent it is reused; "
             + "if that name does not exist, or 'to' is omitted/'auto', Intatis reuses an idle worker "
-            + "or atomically creates a worker in your current workspace. Returns task_id, agent_id, and the mediated Task Report.",
+            + "or atomically creates a worker in your current workspace. Returns invocation task_id, agent_id, and the mediated Task Report.",
         sideEffect: .write,
         parameters: .object([
             "type": .string("object"),
             "properties": .object([
                 "to": .object(["type": .string("string"), "description": .string("target agent name")]),
-                "objective": .object(["type": .string("string")]),
+                "work_task_id": .object(["type": .string("string"), "description": .string("ready durable WorkTask ID")]),
+                "objective": .object(["type": .string("string"), "description": .string("legacy unscoped invocation objective")]),
+                "role_hint": .object(["type": .string("string")]),
+                "expected_deliverable": .object(["type": .string("string")]),
+                // Compatibility aliases for previously emitted tool calls.
                 "roleHint": .object(["type": .string("string")]),
                 "expectedDeliverable": .object(["type": .string("string")]),
             ]),
-            "required": .array([.string("objective")]),
+            "required": .array([]),
             "additionalProperties": .bool(false),
         ])
     )
 
     struct Args: Decodable {
         let to: String?
-        let objective: String
+        let workTaskID: WorkTaskID?
+        let objective: String?
         let roleHint: String?
         let expectedDeliverable: String?
+
+        enum CodingKeys: String, CodingKey {
+            case to
+            case workTaskID = "work_task_id"
+            case objective
+            case roleHint = "role_hint"
+            case expectedDeliverable = "expected_deliverable"
+            case legacyRoleHint = "roleHint"
+            case legacyExpectedDeliverable = "expectedDeliverable"
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            to = try container.decodeIfPresent(String.self, forKey: .to)
+            workTaskID = try container.decodeIfPresent(WorkTaskID.self, forKey: .workTaskID)
+            objective = try container.decodeIfPresent(String.self, forKey: .objective)
+            roleHint = try container.decodeIfPresent(String.self, forKey: .roleHint)
+                ?? container.decodeIfPresent(String.self, forKey: .legacyRoleHint)
+            expectedDeliverable = try container.decodeIfPresent(String.self, forKey: .expectedDeliverable)
+                ?? container.decodeIfPresent(String.self, forKey: .legacyExpectedDeliverable)
+        }
     }
 
     public func permissionIntent(_ args: ToolArgs, workspaceRoot: URL) -> PermissionIntent {
@@ -210,14 +238,14 @@ public struct DelegateTaskTool: Tool {
             action: "task.delegate",
             resources: [
                 PermissionResource(kind: .agent, value: value?.to ?? "auto"),
-                PermissionResource(kind: .task, value: "new"),
+                PermissionResource(kind: .task, value: value?.workTaskID?.rawValue ?? "new"),
             ],
             metadata: [
-                "objectiveLength": .number(Double(value?.objective.count ?? 0)),
+                "objectiveLength": .number(Double(value?.objective?.count ?? 0)),
                 "roleHint": value?.roleHint.map(JSONValue.string) ?? .null,
             ],
             dataEffects: [.none],
-            controlEffects: [.createTask],
+            controlEffects: [.delegateTask],
             risks: [.controlPlaneMutation, .modelCost],
             replayPolicy: .requiresManualReconciliation)
     }
@@ -227,8 +255,13 @@ public struct DelegateTaskTool: Tool {
         guard let messenger = context.messenger else {
             return ToolObservation(text: "agent delegation is not available in this session")
         }
+        guard a.workTaskID != nil
+                || !(a.objective?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true) else {
+            throw IntatisError.decoding("delegate_task requires work_task_id or a legacy objective")
+        }
         return ToolObservation(text: await messenger.delegateTask(
             to: a.to,
+            workTaskID: a.workTaskID,
             objective: a.objective,
             roleHint: a.roleHint,
             expectedDeliverable: a.expectedDeliverable))

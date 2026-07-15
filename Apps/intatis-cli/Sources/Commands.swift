@@ -22,7 +22,7 @@ func printHelp() {
       intatis                 Start your default mode (set via `intatis settings`)
       intatis chat            Streaming chat (no tools)
       intatis code [dir]      Coding agent: read/search/edit files, git/shell (with approval)
-      intatis cowork [dir]    Multi-agent: /agent add <name> <path>, then @name <message>
+      intatis cowork [dir]    Multi-agent work; use /goal <objective> for durable Goal execution
       intatis settings        Interactive settings (endpoint, key, model, reasoning, mode)
       intatis config          Print the resolved config
       intatis selftest        Offline smoke test (no key)

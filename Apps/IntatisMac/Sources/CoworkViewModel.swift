@@ -117,6 +117,13 @@ private final class CoworkPermissionWaiter: @unchecked Sendable {
     }
 }
 
+struct CoworkGoalEditDraft: Equatable {
+    var objective: String
+    var successCriteria: String
+    var constraints: String
+    var tokenBudget: String
+}
+
 /// Drives a Cowork project session: user input defaults to the project `Main`
 /// agent, while the orchestrator and scheduler handle sub-agent work behind it.
 /// The view model folds the shared event log into the visible thread, project
@@ -127,9 +134,13 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
     @Published private(set) var agents: [CoworkAgentInfo] = []
     @Published private(set) var summary = CoworkStatusSummary()
     @Published private(set) var project = CoworkProjectInfo()
+    @Published private(set) var goal: CoworkGoalCardInfo?
+    @Published private(set) var workTasks = CoworkWorkTaskSummary()
     @Published private(set) var projectSettings: CoworkProjectSettings
     @Published var input: String = ""
     @Published private(set) var isWorking = false
+    @Published private(set) var isGoalContinuing = false
+    @Published private(set) var isGoalRuntimeReady = false
     @Published var pendingPermission: PendingPermission?
     @Published private(set) var permissionNotice: PermissionResolutionNotice?
     @Published private(set) var latestTurnStats: TurnStatsSnapshot?
@@ -150,6 +161,7 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
     private let log: EventLog
     private let registryBox: ProviderRegistryBox
     private var orchestrator: Orchestrator?
+    private var goalRuntime: GoalRuntimeController?
     private var subscription: Task<Void, Never>?
     private var shutdownTask: Task<Void, Never>?
     private var permissionWaiters: [RequestID: CoworkPermissionWaiter] = [:]
@@ -192,7 +204,7 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         setPermissionReviewerStatus(.enabling)
         let registryBox = registryBox
         do {
-            orchestrator = try Orchestrator.runtime(
+            let runtime = try Orchestrator.runtime(
                 log: log,
                 allowsShell: PlatformProfile.current.allowsShell,
                 responder: self,
@@ -201,6 +213,20 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             ) { _ in
                 try await registryBox.defaultAgentProvider()
             }
+            orchestrator = runtime
+            goalRuntime = GoalRuntimeController(
+                sessionID: sessionID,
+                log: log,
+                orchestrator: runtime,
+                verifierProvider: { try await registryBox.defaultAgentProvider() },
+                verifierModel: {
+                    if let model = await runtime.agentList().first(where: {
+                        $0.name == Orchestrator.mainAgentID
+                    })?.model {
+                        return model
+                    }
+                    return await registryBox.agentModel()
+                })
         } catch {
             let message = RuntimeErrorPresentation.message(for: error)
             projectionError = "Cowork session could not start: \(message)"
@@ -250,7 +276,11 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                     existingProjection: coworkProjection,
                     allowsInitialSessionBootstrap: false)
             }
-            await self.orchestrator?.resumePendingTasks()
+            // Data-plane recovery is authorized only after both @main and the
+            // automatic reviewer are actually ready. Goal recovery runs first
+            // so a paused legacy run can be cancelled before pending scheduler
+            // work is allowed to resume.
+            await self.resumeRuntimeIfReady()
             for await envelope in stream {
                 codeProjection.apply(envelope)
                 coworkProjection.apply(envelope)
@@ -274,10 +304,13 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             await shutdownTask.value
             return
         }
-        subscription?.cancel()
+        let runningSubscription = subscription
+        runningSubscription?.cancel()
         subscription = nil
         let runningOrchestrator = orchestrator
+        let runningGoalRuntime = goalRuntime
         orchestrator = nil
+        goalRuntime = nil
         for operation in activeOperations.values { operation.cancel() }
         activeOperations.removeAll()
         for (requestID, waiter) in permissionWaiters {
@@ -291,9 +324,21 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             pendingPermission = pending
         }
         isWorking = false
+        isGoalContinuing = false
+        isGoalRuntimeReady = false
+        goal = Self.goalPresentation(
+            from: latestCoworkProjection,
+            controlsEnabled: false)
         addAgentStatus = .idle
         setPermissionReviewerStatus(.disabled)
         let task = Task<Void, Never> {
+            // Let the cancelled startup/stream task observe cancellation before
+            // teardown touches the captured runtime. This prevents a stale
+            // startup continuation from releasing the restore scheduler gate.
+            if let runningSubscription { await runningSubscription.value }
+            if let runningGoalRuntime {
+                await runningGoalRuntime.shutdown()
+            }
             if let runningOrchestrator {
                 await runningOrchestrator.cancelAll(reason: "cowork view stopped")
             }
@@ -305,6 +350,18 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
 
     private func applyCoworkProjection(_ projection: CoworkProjection) {
         latestCoworkProjection = projection
+        goal = Self.goalPresentation(
+            from: projection,
+            controlsEnabled: isGoalRuntimeReady)
+        workTasks = Self.workTaskPresentation(from: projection)
+        if let currentGoalID = projection.currentGoalID,
+           projection.goals[currentGoalID]?.status == .active {
+            isGoalContinuing = projection.continuationRuns.values.contains {
+                $0.goalID == currentGoalID && !$0.status.isTerminal
+            }
+        } else {
+            isGoalContinuing = false
+        }
         agents = projection.agentRoster.values
             .sorted { $0.agent.rawValue < $1.agent.rawValue }
             .map { payload in
@@ -350,6 +407,102 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         let retryable = projection.failedTasks + projection.cancelledTasks
         retryableTasks = Dictionary(uniqueKeysWithValues: retryable.map { ($0.id.rawValue, $0) })
         projectionError = nil
+    }
+
+    private static func goalPresentation(
+        from projection: CoworkProjection,
+        controlsEnabled: Bool
+    ) -> CoworkGoalCardInfo? {
+        guard let goal = projection.currentGoal else { return nil }
+        let audit = goal.latestAudit
+        let proven = audit?.requirements.filter { $0.status == .proven }.count
+        let auditSummary: String?
+        if let audit {
+            var parts = [audit.verdict.rawValue]
+            if !audit.remainingWork.isEmpty {
+                parts.append("Remaining: " + audit.remainingWork.joined(separator: "; "))
+            }
+            if let blocker = audit.blocker, !blocker.isEmpty {
+                parts.append("Blocker: \(blocker)")
+            }
+            auditSummary = parts.joined(separator: " · ")
+        } else {
+            auditSummary = nil
+        }
+        let runOrdinal = projection.continuationRuns.values
+            .filter { $0.goalID == goal.id }
+            .map(\.ordinal)
+            .max()
+        let canResume: Bool
+        switch goal.status {
+        case .paused, .blocked, .budgetLimited, .usageLimited:
+            canResume = true
+        case .active:
+            canResume = goal.noProgressRuns >= 2
+        case .completed:
+            canResume = false
+        }
+        return CoworkGoalCardInfo(
+            id: goal.id.rawValue,
+            objective: goal.objective,
+            status: goal.status.rawValue,
+            activeElapsedSeconds: goal.activeElapsedSeconds,
+            activeSince: goal.status == .active ? goal.updatedAt : nil,
+            tokensUsed: goal.tokensUsed,
+            tokenBudget: goal.tokenBudget,
+            auditProvenCount: proven,
+            auditRequirementCount: audit?.requirements.count,
+            latestAuditSummary: auditSummary,
+            currentRunOrdinal: runOrdinal,
+            revision: goal.revision,
+            canPause: controlsEnabled && goal.status == .active,
+            canResume: controlsEnabled && canResume,
+            canEdit: controlsEnabled && goal.status != .completed,
+            canClear: controlsEnabled)
+    }
+
+    private static func workTaskPresentation(from projection: CoworkProjection) -> CoworkWorkTaskSummary {
+        let selected: [WorkTask]
+        if let goalID = projection.currentGoalID {
+            selected = projection.workTasks.values.filter { $0.goalID == goalID }
+        } else if let run = projection.continuationRuns.values
+            .filter({ $0.goalID == nil })
+            .max(by: { $0.startedAt < $1.startedAt }) {
+            selected = projection.workTasks.values.filter { $0.runID == run.id }
+        } else {
+            selected = []
+        }
+        let ordered = selected.sorted { lhs, rhs in
+            let lhsRun = projection.continuationRuns[lhs.runID]?.ordinal ?? 0
+            let rhsRun = projection.continuationRuns[rhs.runID]?.ordinal ?? 0
+            if lhsRun != rhsRun { return lhsRun < rhsRun }
+            if lhs.createdAt != rhs.createdAt { return lhs.createdAt < rhs.createdAt }
+            return lhs.id.rawValue < rhs.id.rawValue
+        }
+        let lines = ordered.enumerated().map { index, task in
+            let dependencies = task.dependsOn.map { dependencyID -> String in
+                let status = projection.workTasks[dependencyID]?.status.rawValue ?? "missing"
+                return "\(dependencyID.rawValue) [\(status)]"
+            }
+            let evidence = task.evidence.map {
+                "\($0.kind) · \($0.reference) — \($0.summary)"
+            }
+            return CoworkWorkTaskLine(
+                id: task.id.rawValue,
+                ordinal: index + 1,
+                title: task.title,
+                detail: task.description,
+                status: task.status.rawValue,
+                owner: task.owner.map { "@\($0.rawValue)" },
+                dependencySummary: dependencies.isEmpty
+                    ? nil : dependencies.joined(separator: ", "),
+                statusReason: task.progressNote,
+                acceptanceCriteria: task.acceptanceCriteria,
+                result: task.result,
+                evidence: evidence,
+                linkedInvocationIDs: task.latestInvocationIDs.map(\.rawValue))
+        }
+        return CoworkWorkTaskSummary(tasks: lines)
     }
 
     private func agentStatus(for agent: AgentID, in projection: CoworkProjection) -> String {
@@ -466,8 +619,47 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             guard let self else { return }
             defer { self.activeOperations.removeValue(forKey: operationID) }
             await self.ensureAutomaticPermissionReview(existingProjection: self.latestCoworkProjection)
+            await self.resumeRuntimeIfReady()
         }
         activeOperations[operationID] = operation
+    }
+
+    private func resumeRuntimeIfReady() async {
+        guard isAutomaticPermissionReviewReady,
+              let orchestrator,
+              let goalRuntime else { return }
+        let mainID = AgentID(rawValue: projectSettings.mainAgentName)
+        guard await orchestrator.agentList().contains(where: { $0.name == mainID }) else {
+            return
+        }
+        isGoalRuntimeReady = false
+        goal = Self.goalPresentation(
+            from: latestCoworkProjection,
+            controlsEnabled: false)
+        let recoverySafe = await goalRuntime.start()
+        guard !Task.isCancelled,
+              self.orchestrator === orchestrator,
+              self.goalRuntime === goalRuntime else {
+            return
+        }
+        guard recoverySafe else {
+            let message = "Goal recovery could not be completed safely. Pending Cowork work remains stopped; retry after resolving the persistence or cancellation error."
+            projectionError = message
+            setPermissionReviewerStatus(.failed(message))
+            return
+        }
+        let resumedPendingTasks = await orchestrator.resumePendingTasks()
+        guard resumedPendingTasks,
+              !Task.isCancelled,
+              self.orchestrator === orchestrator,
+              self.goalRuntime === goalRuntime else {
+            return
+        }
+        isGoalRuntimeReady = true
+        projectionError = nil
+        goal = Self.goalPresentation(
+            from: latestCoworkProjection,
+            controlsEnabled: true)
     }
 
     private func bootstrapMainAgentIfNeeded(existingProjection projection: CoworkProjection,
@@ -638,9 +830,13 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
     }
 
     func send() {
-        guard !isWorking, let orchestrator else { return }
+        guard !isWorking, let orchestrator, let goalRuntime else { return }
         guard isAutomaticPermissionReviewReady else {
             composerError = "Automatic permission review must be ready before Cowork can run a task. Retry the reviewer."
+            return
+        }
+        guard isGoalRuntimeReady else {
+            composerError = "Goal recovery must finish before Cowork can run a task. Retry session recovery."
             return
         }
         let originalInput = input
@@ -686,7 +882,31 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             let operation = Task { @MainActor [weak self] in
                 guard let self else { return }
                 defer { self.activeOperations.removeValue(forKey: operationID) }
-                let result = await orchestrator.send(finalParsed.text, to: target, userMessage: payload)
+                if finalParsed.isGoal {
+                    let baseObjective = finalParsed.goal ?? finalParsed.text
+                    let objective: String
+                    if target != Orchestrator.mainAgentID {
+                        objective = "@\(target.rawValue): \(baseObjective)"
+                    } else {
+                        objective = baseObjective
+                    }
+                    do {
+                        _ = try await goalRuntime.createGoal(objective: objective)
+                    } catch {
+                        self.composerError = error.localizedDescription
+                    }
+                    await self.synchronizePermissionReviewerHealth(using: orchestrator)
+                    self.isWorking = false
+                    return
+                }
+                let explicitGoalIntent = ExplicitGoalIntentClassifier
+                    .classify(finalParsed.text)
+                    .isExplicit
+                let result = await goalRuntime.sendUserTurn(
+                    finalParsed.text,
+                    to: target,
+                    userMessage: payload,
+                    explicitGoalIntent: explicitGoalIntent)
                 await self.synchronizePermissionReviewerHealth(using: orchestrator)
                 if let message = result.errorMessage {
                     self.composerError = message
@@ -710,6 +930,94 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             self.isWorking = false
         }
         activeOperations[operationID] = operation
+    }
+
+    func pauseGoal() {
+        guard isGoalRuntimeReady, let goalRuntime else { return }
+        performGoalAction {
+            _ = try await goalRuntime.pauseCurrentGoal()
+        }
+    }
+
+    func resumeGoal() {
+        guard isGoalRuntimeReady, let goalRuntime else { return }
+        performGoalAction {
+            _ = try await goalRuntime.resumeCurrentGoal()
+        }
+    }
+
+    func currentGoalEditDraft() -> CoworkGoalEditDraft? {
+        guard let durableGoal = latestCoworkProjection.currentGoal else { return nil }
+        return CoworkGoalEditDraft(
+            objective: durableGoal.objective,
+            successCriteria: durableGoal.successCriteria.joined(separator: "\n"),
+            constraints: durableGoal.constraints.joined(separator: "\n"),
+            tokenBudget: durableGoal.tokenBudget.map(String.init) ?? "")
+    }
+
+    @discardableResult
+    func editGoal(objective: String,
+                  successCriteria: String,
+                  constraints: String,
+                  tokenBudget: String) -> String? {
+        let objective = objective.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !objective.isEmpty else { return "A Goal objective is required." }
+
+        let budgetText = tokenBudget.trimmingCharacters(in: .whitespacesAndNewlines)
+        let parsedBudget: Int?
+        if budgetText.isEmpty {
+            parsedBudget = nil
+        } else if let value = Int(budgetText), value > 0 {
+            parsedBudget = value
+        } else {
+            return "Token budget must be a positive whole number, or left empty for no budget."
+        }
+
+        guard isGoalRuntimeReady,
+              let goalRuntime,
+              latestCoworkProjection.currentGoal != nil else {
+            return "Goal recovery must finish before the durable Goal can be edited."
+        }
+        let parsedCriteria = Self.goalEditLines(successCriteria)
+        let parsedConstraints = Self.goalEditLines(constraints)
+        performGoalAction {
+            _ = try await goalRuntime.editCurrentGoal(
+                objective: objective,
+                successCriteria: parsedCriteria,
+                constraints: parsedConstraints,
+                tokenBudget: parsedBudget)
+        }
+        return nil
+    }
+
+    func clearGoal() {
+        guard isGoalRuntimeReady, let goalRuntime else { return }
+        performGoalAction {
+            try await goalRuntime.clearCurrentGoal(reason: "cleared by user from Cowork Goal card")
+        }
+    }
+
+    private func performGoalAction(
+        _ action: @escaping @MainActor @Sendable () async throws -> Void
+    ) {
+        composerError = nil
+        let operationID = UUID()
+        let operation = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.activeOperations.removeValue(forKey: operationID) }
+            do {
+                try await action()
+            } catch {
+                self.composerError = error.localizedDescription
+            }
+        }
+        activeOperations[operationID] = operation
+    }
+
+    private static func goalEditLines(_ value: String) -> [String] {
+        value.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
     }
 
     private func routeProjectInput(_ input: String) -> CoworkMentionRoute {

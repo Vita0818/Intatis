@@ -154,6 +154,30 @@ final class AgentLoopOutcomeTests: XCTestCase {
         XCTAssertEqual(completed.first?.text, "Finished.")
     }
 
+    func testHostControlInputCanSkipUserMessageRecording() async throws {
+        let provider = OutcomeProvider(chunks: [
+            .textDelta("Control-plane result."),
+            .done(finishReason: "stop"),
+        ])
+        let (loop, log, workspace) = try makeLoop(provider: provider)
+        defer { try? FileManager.default.removeItem(at: workspace) }
+
+        let result = try await loop.send(
+            "Internal continuation input.",
+            recordUserMessage: false)
+
+        XCTAssertEqual(result, "Control-plane result.")
+        let events = await log.replay()
+        XCTAssertFalse(events.contains {
+            if case .userMessage = $0.event { return true }
+            return false
+        })
+        XCTAssertTrue(events.contains {
+            if case .messageCompleted = $0.event { return true }
+            return false
+        })
+    }
+
     func testStreamWithoutCompletionMarkerThrowsAndKeepsPartialMessageIncomplete() async throws {
         let provider = OutcomeProvider(chunks: [.textDelta("partial")])
         let (loop, log, workspace) = try makeLoop(provider: provider)

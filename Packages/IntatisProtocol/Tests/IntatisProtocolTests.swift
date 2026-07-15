@@ -80,6 +80,17 @@ final class IntatisProtocolTests: XCTestCase {
                 "agent_message_consumed"
             ),
             (
+                .agentMessageDiscarded(.init(
+                    messageID: MessageID(rawValue: "msg_cancelled"),
+                    agent: agent,
+                    reason: "owning Goal run was cancelled",
+                    taskID: taskID,
+                    goalID: GoalID(rawValue: "goal_cancelled"),
+                    continuationRunID: ContinuationRunID(rawValue: "run_cancelled"),
+                    metadata: metadata)),
+                "agent_message_discarded"
+            ),
+            (
                 .workspaceLeaseRevoked(.init(
                     agent: agent,
                     leaseID: WorkspaceLeaseID(rawValue: "wlease_1"),

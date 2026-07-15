@@ -381,7 +381,7 @@ final class IntatisCoworkTests: XCTestCase {
             $0.role == .user && $0.content?.contains("<<<UNTRUSTED_CONTEXT_DATA>>>") == true
         }?.content)
         XCTAssertFalse(systemPrompt.contains(contract.objective))
-        XCTAssertTrue(untrustedContext.contains("Current task data:"))
+        XCTAssertTrue(untrustedContext.contains("Current AgentInvocation data:"))
         XCTAssertTrue(untrustedContext.contains(contract.id.rawValue))
         XCTAssertTrue(untrustedContext.contains("@\(A.rawValue)"))
         XCTAssertTrue(untrustedContext.contains(contract.roleHint))
