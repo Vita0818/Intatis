@@ -46,9 +46,19 @@ public struct AskAgentTool: Tool {
     public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {
         let a = try args.decode(Args.self)
         guard let messenger = context.messenger else {
-            return ToolObservation(text: "agent messaging is not available in this session")
+            throw IntatisError.io("agent messaging is not available in this session")
         }
-        let answer = await messenger.ask(to: a.to, question: a.question)
-        return ToolObservation(text: answer)
+        switch await messenger.ask(to: a.to, question: a.question) {
+        case .success(let answer):
+            return ToolObservation(text: answer)
+        case .failure(let failure):
+            let normalized = failure.lowercased().hasPrefix("error:")
+                ? String(failure.dropFirst("error:".count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                : failure.trimmingCharacters(in: .whitespacesAndNewlines)
+            throw IntatisError.io(normalized.isEmpty
+                ? "agent request did not complete"
+                : normalized)
+        }
     }
 }

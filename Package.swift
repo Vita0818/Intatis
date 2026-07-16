@@ -13,8 +13,8 @@ import PackageDescription
 let package = Package(
     name: "Intatis",
     platforms: [
-        .macOS(.v13),
-        .iOS(.v16),
+        .macOS("26.0"),
+        .iOS("26.0"),
     ],
     products: [
         .library(name: "IntatisCore", targets: ["IntatisCore"]),
@@ -33,6 +33,32 @@ let package = Package(
         // The GUI apps (IntatisMac, IntatisiOS) are Xcode App targets, not SPM
         // products — SwiftPM cannot build a .app bundle, and iOS apps cannot be
         // built from SPM at all. See project.yml (XcodeGen) + README.
+    ],
+    dependencies: [
+        // Conversation rendering engines. Exact tags are paired with the
+        // resolved commits and provenance recorded in ThirdPartyNotices/.
+        .package(
+            url: "https://github.com/gonzalezreal/swift-markdown-ui.git",
+            exact: "2.4.1"
+        ),
+        // MarkdownUI declares these with open ranges. Direct exact constraints
+        // keep Intatis builds on the audited dependency graph.
+        .package(
+            url: "https://github.com/gonzalezreal/NetworkImage.git",
+            exact: "6.0.0"
+        ),
+        .package(
+            url: "https://github.com/swiftlang/swift-cmark.git",
+            exact: "0.5.0"
+        ),
+        .package(
+            url: "https://github.com/pointfreeco/swift-snapshot-testing.git",
+            exact: "1.12.0"
+        ),
+        .package(
+            url: "https://github.com/kostub/iosMath.git",
+            exact: "2.5.0"
+        ),
     ],
     targets: [
         // MARK: Library targets (module == target)
@@ -103,8 +129,41 @@ let package = Package(
         .target(
             name: "IntatisSharedUI",
             // Providers is needed because ChatViewModel drives ProviderRegistry.
-            dependencies: ["IntatisCore", "IntatisProtocol", "IntatisProviders", "IntatisConversation", "IntatisArtifacts"],
-            path: "Packages/IntatisSharedUI/Sources"
+            dependencies: [
+                "IntatisCore", "IntatisProtocol", "IntatisProviders",
+                "IntatisConversation", "IntatisArtifacts",
+                .product(
+                    name: "MarkdownUI",
+                    package: "swift-markdown-ui",
+                    condition: .when(platforms: [.macOS, .iOS])
+                ),
+                // The math adapter asks the same pinned CommonMark engine for
+                // source ranges so formulas are never rewritten inside code
+                // blocks. Markdown grammar remains upstream-owned.
+                .product(
+                    name: "cmark-gfm",
+                    package: "swift-cmark",
+                    condition: .when(platforms: [.macOS, .iOS])
+                ),
+                // Keep the complexity/source-range inspection parser in lockstep
+                // with MarkdownUI's GFM extension set.
+                .product(
+                    name: "cmark-gfm-extensions",
+                    package: "swift-cmark",
+                    condition: .when(platforms: [.macOS, .iOS])
+                ),
+                .product(
+                    name: "iosMath",
+                    package: "iosMath",
+                    condition: .when(platforms: [.macOS, .iOS])
+                ),
+            ],
+            path: "Packages/IntatisSharedUI/Sources",
+            resources: [
+                // Fixed upstream highlight.js 11.11.1 engine + the only two
+                // themes Intatis ships. See ThirdPartyNotices/SyntaxHighlighting.md.
+                .process("MessageRendering/Resources"),
+            ]
         ),
         // v0.6 — CLI: Swift-native `intatis` command (chat + code agent), talks to
         // any OpenAI-compatible endpoint via env vars.
@@ -120,7 +179,7 @@ let package = Package(
         // the Xcode project generated from project.yml — they link these library
         // products. The iOS app intentionally links only the subset.
 
-        // MARK: Test targets (none depend on UI/app targets, so `swift test` is headless)
+        // MARK: Test targets (none depend on app targets; SharedUI tests run headlessly on macOS)
         .testTarget(
             name: "IntatisCoreTests",
             dependencies: ["IntatisCore"],
@@ -179,6 +238,11 @@ let package = Package(
                 "IntatisArtifacts", "IntatisConversation",
             ],
             path: "Packages/IntatisMultimodal/Tests"
+        ),
+        .testTarget(
+            name: "IntatisSharedUITests",
+            dependencies: ["IntatisSharedUI"],
+            path: "Packages/IntatisSharedUI/Tests"
         ),
     ]
 )

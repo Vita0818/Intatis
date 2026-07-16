@@ -23,6 +23,16 @@ public enum AutomaticPermissionReviewResult: Equatable, Sendable {
     case failed(String)
 }
 
+private struct DelegationAuthorizationArguments: Decodable {
+    var to: String?
+    var workTaskID: WorkTaskID?
+
+    private enum CodingKeys: String, CodingKey {
+        case to
+        case workTaskID = "work_task_id"
+    }
+}
+
 public enum AutomaticPermissionReviewDisableResult: Equatable, Sendable {
     case disabled(AgentID)
     case alreadyDisabled
@@ -252,7 +262,10 @@ public actor Orchestrator {
     private var workTaskRecoveryFailure: String?
     private var scheduledReplyTargets: [TaskID: AgentID]
     private var scheduledReplyFormats: [TaskID: ScheduledReplyFormat]
-    private var scheduledReplyResults: [TaskID: String]
+    /// Keeps delivery success distinct from a human-readable reply. In
+    /// particular, a Mediator block must not become a successful ask_agent
+    /// observation merely because it has explanatory text.
+    private var scheduledReplyResults: [TaskID: AgentMessengerReply]
     private var spawnedAgentOwners: [AgentID: AgentID]
     /// Actor-reentrant `delegate_task(to: auto)` calls reserve their selected
     /// worker before mediation/admission awaits. This preserves true parallel
@@ -262,6 +275,7 @@ public actor Orchestrator {
     private var executionPolicy: CoworkExecutionPolicy
     private var runningExecutions: [TaskID: Task<Void, Never>]
     private var resultWaiters: [TaskID: [CheckedContinuation<String?, Never>]]
+    private var schedulerResultWaiterHookForTesting: (@Sendable (TaskID) -> Void)?
     private var idleWaiters: [CheckedContinuation<Void, Never>]
     private var rootInvocations: [TaskID: RootInvocationContext]
     private var cancellationReasons: [TaskID: String]
@@ -381,6 +395,7 @@ public actor Orchestrator {
         self.executionPolicy = executionPolicy
         self.runningExecutions = [:]
         self.resultWaiters = [:]
+        self.schedulerResultWaiterHookForTesting = nil
         self.idleWaiters = []
         self.rootInvocations = [:]
         self.cancellationReasons = [:]
@@ -504,6 +519,49 @@ public actor Orchestrator {
             controlEffects: [.attachWorkspace, .grantCapability],
             risks: [.controlPlaneMutation, .capabilityGrant, .workspaceExpansion],
             replayPolicy: .requiresManualReconciliation)
+        let attachGate = PermissionReviewGateSnapshot(
+            decision: assessment.canAskUser ? .ask : .deny,
+            risk: assessment.risk,
+            reason: assessment.reason,
+            policyVersion: "intatis.workspace-admission.v1")
+        let attachAuthorization = ResolvedToolAuthorization(
+            authorizationID: IDGen.random(prefix: "tool-authorization"),
+            registryVersion: "intatis.cowork.admission.v1",
+            concreteToolID: "intatis.cowork.admission.v1/agent.attach",
+            descriptorFingerprint: ToolRegistry.authorizationDigest(
+                "agent.attach|workspace.attach|v1"),
+            toolName: "agent.attach",
+            canonicalAction: attachIntent.action,
+            requiredCapabilities: [],
+            membership: .notRequired,
+            capabilityLeaseID: proposedLeases.capability.id,
+            capabilityTaskID: proposedLeases.capability.taskID,
+            workspaceLeaseID: proposedLeases.workspace.id,
+            workspaceAccess: proposedLeases.workspace.access,
+            workspaceRootIdentity: proposedLeases.workspace.rootIdentity,
+            invocation: ToolAuthorizationInvocationContext(
+                sessionID: await log.sessionID,
+                agent: proposedAgent.name,
+                taskID: admissionTaskID,
+                rootTaskID: admissionRootTaskID,
+                parentTaskID: causalParentTaskID,
+                attempt: admissionAttempt,
+                toolCallID: "agent-attach:\(requestID.rawValue)",
+                taskObjective: String(admissionContract.objective.prefix(1_200))),
+            normalizedArgumentsDigest: ToolRegistry.authorizationDigest(normalizedAttachArgs),
+            normalizedArgumentsCharacterCount: normalizedAttachArgs.count,
+            intent: attachIntent,
+            sideEffect: .write,
+            risksNetwork: false,
+            replayPolicy: .requiresManualReconciliation,
+            deterministicGate: attachGate,
+            capabilityLeaseFingerprint: ToolRegistry.authorizationFingerprint(
+                proposedLeases.capability),
+            workspaceID: proposedLeases.workspace.workspaceID,
+            workspaceTaskID: proposedLeases.workspace.taskID,
+            workspaceRootPath: proposedLeases.workspace.rootPath,
+            workspaceLeaseFingerprint: ToolRegistry.authorizationFingerprint(
+                proposedLeases.workspace))
         let request = PermissionRequestPayload(
             requestId: requestID,
             agent: proposedAgent.name,
@@ -522,10 +580,7 @@ public actor Orchestrator {
                 risksNetwork: false,
                 sideEffect: .write,
                 intent: attachIntent,
-                gate: PermissionReviewGateSnapshot(
-                    decision: assessment.canAskUser ? .ask : .deny,
-                    risk: assessment.risk,
-                    reason: assessment.reason),
+                gate: attachGate,
                 capabilityLease: proposedLeases.capability,
                 workspaceLease: proposedLeases.workspace,
                 taskContract: admissionContract,
@@ -535,8 +590,9 @@ public actor Orchestrator {
                     assignee: proposedAgent.name,
                     taskLineage: admissionLineage,
                     relatedAgents: admissionContract.relatedAgents),
+                authorization: attachAuthorization,
                 executionID: "agent-admission:\(admissionTaskID.rawValue)",
-                replayPolicy: "admission_once"))
+                replayPolicy: ToolExecutionReplayPolicy.requiresManualReconciliation.rawValue))
         let agentMetadata = taskMetadata(
             contract: admissionContract,
             rootTaskID: admissionRootTaskID,
@@ -562,19 +618,21 @@ public actor Orchestrator {
             scope: .capability,
             visibility: .global)
         do {
-            try await appendAdmissionEvent(.agentAttachRequested(AgentAttachRequestedPayload(
-                agent: proposedAgent.name,
-                path: assessedPath,
-                model: proposedAgent.model,
-                profile: proposedAgent.profile.rawValue,
-                metadata: agentMetadata)))
-            try await appendAdmissionEvent(.workspaceLeaseRequested(WorkspaceLeaseRequestedPayload(
-                agent: proposedAgent.name,
-                rootPath: assessedPath,
-                access: proposedLeases.workspace.access,
-                reason: assessment.reason,
-                metadata: workspaceMetadata)))
-            try await appendAdmissionEvent(.permissionRequest(request))
+            try await appendAdmissionEvents([
+                .agentAttachRequested(AgentAttachRequestedPayload(
+                    agent: proposedAgent.name,
+                    path: assessedPath,
+                    model: proposedAgent.model,
+                    profile: proposedAgent.profile.rawValue,
+                    metadata: agentMetadata)),
+                .workspaceLeaseRequested(WorkspaceLeaseRequestedPayload(
+                    agent: proposedAgent.name,
+                    rootPath: assessedPath,
+                    access: proposedLeases.workspace.access,
+                    reason: assessment.reason,
+                    metadata: workspaceMetadata)),
+                .permissionRequest(request),
+            ])
         } catch {
             try? await log.append(.error(ErrorPayload(
                 code: "agent_attach_request_persistence_failed",
@@ -583,34 +641,58 @@ public actor Orchestrator {
         }
 
         guard assessment.canAskUser else {
-            try? await log.append(.permissionResolved(PermissionResolvedPayload(
-                requestId: requestID, tool: "agent.attach", decision: .deny,
-                risk: assessment.risk, reason: assessment.reason, intent: attachIntent)))
-            try? await log.append(.workspaceLeaseDenied(WorkspaceLeaseDeniedPayload(
-                agent: proposedAgent.name,
-                rootPath: assessedPath,
-                reason: assessment.reason,
-                metadata: workspaceMetadata)))
+            try? await appendAdmissionEvents([
+                .permissionResolved(PermissionResolvedPayload(
+                    requestId: requestID, tool: "agent.attach", decision: .deny,
+                    risk: assessment.risk, reason: assessment.reason, intent: attachIntent,
+                    authorization: attachAuthorization,
+                    source: .deterministicPolicy)),
+                .workspaceLeaseDenied(WorkspaceLeaseDeniedPayload(
+                    agent: proposedAgent.name,
+                    rootPath: assessedPath,
+                    reason: assessment.reason,
+                    metadata: workspaceMetadata)),
+            ])
             return false
         }
 
-        let decision = await activePermissionResponder().requestApproval(request)
-        guard decision == .allow else {
-            try? await log.append(.permissionResolved(PermissionResolvedPayload(
-                requestId: requestID, tool: "agent.attach", decision: .deny,
-                risk: assessment.risk, reason: "permission denied workspace attach", intent: attachIntent)))
-            try? await log.append(.workspaceLeaseDenied(WorkspaceLeaseDeniedPayload(
-                agent: proposedAgent.name,
-                rootPath: assessedPath,
-                reason: "permission denied workspace attach",
-                metadata: workspaceMetadata)))
+        let resolution = await activePermissionResponder().requestResolution(request)
+        guard resolution.decision == .allow else {
+            let suppliedReason = resolution.reason?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let denialReason = (suppliedReason?.isEmpty == false ? suppliedReason : nil)
+                ?? "permission denied workspace attach"
+            try? await appendAdmissionEvents([
+                .permissionResolved(PermissionResolvedPayload(
+                    requestId: requestID, tool: "agent.attach", decision: .deny,
+                    risk: resolution.risk ?? assessment.risk,
+                    reason: denialReason, intent: attachIntent,
+                    authorization: attachAuthorization,
+                    source: resolution.source,
+                    reviewTaskID: resolution.reviewTaskID,
+                    reviewStatus: resolution.reviewStatus,
+                    failureKind: resolution.failureKind)),
+                .workspaceLeaseDenied(WorkspaceLeaseDeniedPayload(
+                    agent: proposedAgent.name,
+                    rootPath: assessedPath,
+                    reason: denialReason,
+                    metadata: workspaceMetadata)),
+            ])
             return false
         }
+        let suppliedApprovalReason = resolution.reason?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let approvalReason = (suppliedApprovalReason?.isEmpty == false
+            ? suppliedApprovalReason
+            : nil) ?? "permission approved workspace attach"
         await acquireAdmissionLock()
         guard registry.agent(id) == nil else {
             try? await log.append(.permissionResolved(PermissionResolvedPayload(
                 requestId: requestID, tool: "agent.attach", decision: .deny,
-                risk: .medium, reason: "agent already exists", intent: attachIntent)))
+                risk: .medium, reason: "agent already exists", intent: attachIntent,
+                authorization: attachAuthorization,
+                source: .authorizationRevalidation,
+                reviewTaskID: resolution.reviewTaskID)))
             releaseAdmissionLock()
             return false
         }
@@ -626,7 +708,10 @@ public actor Orchestrator {
                         decision: .deny,
                         risk: .high,
                         reason: reason,
-                        intent: attachIntent)),
+                        intent: attachIntent,
+                        authorization: attachAuthorization,
+                        source: .authorizationRevalidation,
+                        reviewTaskID: resolution.reviewTaskID)),
                     .workspaceLeaseDenied(WorkspaceLeaseDeniedPayload(
                         agent: proposedAgent.name,
                         rootPath: assessedPath,
@@ -642,21 +727,30 @@ public actor Orchestrator {
             return false
         }
         do {
-            try await appendAdmissionEvent(.permissionResolved(PermissionResolvedPayload(
-                requestId: requestID, tool: "agent.attach", decision: .allow,
-                risk: assessment.risk, reason: "permission approved workspace attach", intent: attachIntent)))
-            try await appendAdmissionEvent(.workspaceLeaseGranted(WorkspaceLeaseGrantedPayload(
-                agent: proposedAgent.name,
-                lease: proposedLeases.workspace,
-                metadata: workspaceMetadata)))
-            try await appendAdmissionEvent(.capabilityLeaseCreated(CapabilityLeaseCreatedPayload(
-                agent: proposedAgent.name,
-                lease: proposedLeases.capability,
-                metadata: capabilityMetadata)))
-            try await appendAdmissionEvent(.agentAttached(AgentAttachedPayload(
-                agent: proposedAgent.name, path: proposedAgent.workspaceRoot.path, model: proposedAgent.model,
-                profile: proposedAgent.profile.rawValue,
-                metadata: agentMetadata)))
+            try await appendAdmissionEvents([
+                .permissionResolved(PermissionResolvedPayload(
+                    requestId: requestID, tool: "agent.attach", decision: .allow,
+                    risk: resolution.risk ?? assessment.risk,
+                    reason: approvalReason,
+                    intent: attachIntent,
+                    authorization: attachAuthorization,
+                    source: resolution.source,
+                    reviewTaskID: resolution.reviewTaskID,
+                    reviewStatus: resolution.reviewStatus,
+                    failureKind: resolution.failureKind)),
+                .workspaceLeaseGranted(WorkspaceLeaseGrantedPayload(
+                    agent: proposedAgent.name,
+                    lease: proposedLeases.workspace,
+                    metadata: workspaceMetadata)),
+                .capabilityLeaseCreated(CapabilityLeaseCreatedPayload(
+                    agent: proposedAgent.name,
+                    lease: proposedLeases.capability,
+                    metadata: capabilityMetadata)),
+                .agentAttached(AgentAttachedPayload(
+                    agent: proposedAgent.name, path: proposedAgent.workspaceRoot.path, model: proposedAgent.model,
+                    profile: proposedAgent.profile.rawValue,
+                    metadata: agentMetadata)),
+            ])
         } catch {
             try? await log.append(.error(ErrorPayload(
                 code: "agent_attach_admission_persistence_failed",
@@ -705,8 +799,13 @@ public actor Orchestrator {
         guard registry.isEmpty else {
             return .failed("Initial @main bootstrap requires an empty agent roster.")
         }
-        guard await log.replay().isEmpty else {
-            return .failed("Initial @main bootstrap is only available for an empty Cowork session.")
+        do {
+            guard try await log.isEmptyChecked() else {
+                return .failed("Initial @main bootstrap is only available for an empty Cowork session.")
+            }
+        } catch {
+            return .failed(
+                "Initial @main bootstrap could not verify an empty Cowork event log: \(error.localizedDescription)")
         }
 
         let agentMetadata = CoworkEventMetadata(
@@ -1066,7 +1165,17 @@ public actor Orchestrator {
         providerUsageLimitFailures.removeAll()
         automaticPermissionReviewRecoveryFailure = nil
         workTaskRecoveryFailure = nil
-        var events = await log.replay()
+        var events: [Envelope]
+        do {
+            events = try await log.replayChecked()
+        } catch {
+            let message = "Cowork restore could not verify the durable event log: \(error.localizedDescription)"
+            automaticPermissionReviewRecoveryFailure = message
+            workTaskRecoveryFailure = message
+            releaseAdmissionLock()
+            resumeScheduler(suspension: restoreSuspension, ensureRunning: false)
+            return
+        }
         var projection = CoworkProjection.build(from: events)
         let auditedRunIDs = Set(events.compactMap { envelope -> ContinuationRunID? in
             guard case .goalAuditCompleted(let payload) = envelope.event else { return nil }
@@ -1132,7 +1241,7 @@ public actor Orchestrator {
                     scope: .agent))))
             do {
                 try await appendAdmissionEvents(cleanupEvents)
-                events = await log.replay()
+                events = try await log.replayChecked()
                 projection = CoworkProjection.build(from: events)
                 switch validatedRestoredWorkTaskGraph(from: projection) {
                 case .success(let restored):
@@ -1144,11 +1253,12 @@ public actor Orchestrator {
                     return
                 }
             } catch {
-                let message = "stale automatic permission reviewer cleanup could not be persisted: \(error.localizedDescription)"
+                let message = "stale automatic permission reviewer cleanup or replay verification failed: \(error.localizedDescription)"
                 automaticPermissionReviewRecoveryFailure = message
-                try? await log.append(.error(ErrorPayload(
-                    code: "automatic_review_restore_cleanup_failed",
-                    message: message)))
+                workTaskRecoveryFailure = message
+                releaseAdmissionLock()
+                resumeScheduler(suspension: restoreSuspension, ensureRunning: false)
+                return
             }
         }
         // No later restore phase mutates WorkTaskGraph. Release before mailbox
@@ -1232,9 +1342,9 @@ public actor Orchestrator {
                 workspaceRoot: URL(fileURLWithPath: payload.path),
                 model: payload.model,
                 profile: profile,
-                coordinationDepth: payload.agent == Self.mainAgentID || defaultLease.map(Self.canCoordinate) == true
+                coordinationDepth: payload.agent == Self.mainAgentID
                     ? Agent.defaultCoordinationDepth
-                    : 0))
+                    : defaultLease.map(Self.coordinationDepth) ?? 0))
         }
 
         defaultWorkspaceLeaseIDs = deterministicDefaultWorkspaceLeases(
@@ -1421,7 +1531,7 @@ public actor Orchestrator {
             records: records,
             mailboxes: recoveredMailboxes))
 
-        await refreshConsumedTokenCount()
+        consumedTokenCount = Self.consumedTokenCount(in: events)
         await tokenBudgetMeter.reconfigure(
             tokenBudget: executionPolicy.tokenBudget,
             durableConsumed: consumedTokenCount)
@@ -1758,7 +1868,13 @@ public actor Orchestrator {
     }
 
     private func retryReconciliationFailure(taskID: TaskID, attempt: Int) async -> String? {
-        let projection = CoworkProjection.build(from: await log.replay())
+        let events: [Envelope]
+        do {
+            events = try await log.replayChecked()
+        } catch {
+            return "retry denied because durable side-effect history could not be verified: \(error.localizedDescription)"
+        }
+        let projection = CoworkProjection.build(from: events)
         let nonReplayable = projection.startedNonReplayableToolExecutions(
             taskID: taskID,
             attempt: attempt)
@@ -2050,7 +2166,11 @@ public actor Orchestrator {
         // reservation without waiting for the old operation to cooperate.
         let schedulerSuspension = suspendScheduler()
         executionPolicyUpdateInProgress = true
-        await refreshConsumedTokenCount()
+        guard await refreshConsumedTokenCount() else {
+            executionPolicyUpdateInProgress = false
+            resumeScheduler(suspension: schedulerSuspension, ensureRunning: false)
+            return
+        }
         await tokenBudgetMeter.reconfigure(
             tokenBudget: policy.tokenBudget,
             durableConsumed: consumedTokenCount)
@@ -2061,9 +2181,33 @@ public actor Orchestrator {
 
     /// Called by `BusMessenger` when `from` asks the agent named `toName`.
     func ask(from: AgentID, to toName: String, question: String, parentTaskID: TaskID? = nil) async -> String {
+        switch await askResult(
+            from: from,
+            to: toName,
+            question: question,
+            parentTaskID: parentTaskID) {
+        case .success(let result), .failure(let result):
+            return result
+        }
+    }
+
+    func askResult(from: AgentID,
+                   to toName: String,
+                   question: String,
+                   parentTaskID: TaskID? = nil) async -> AgentMessengerReply {
         let queued = await enqueueAsk(from: from, to: toName, question: question, parentTaskID: parentTaskID)
-        guard let taskID = queued.taskID else { return queued.message }
-        return await awaitSchedulerResult(taskID) ?? queued.message
+        guard let taskID = queued.taskID else { return .failure(queued.message) }
+        let result = await awaitSchedulerResult(taskID)
+        guard let record = scheduler.record(for: taskID),
+              record.status == .completed,
+              result != nil else {
+            return .failure(result ?? queued.message)
+        }
+        guard let reply = scheduledReplyResults[taskID] else {
+            return .failure(
+                "delegated task completed without a settled reply-delivery outcome")
+        }
+        return reply
     }
 
     func enqueueAsk(from: AgentID, to toName: String, question: String, parentTaskID: TaskID?) async -> (taskID: TaskID?, message: String) {
@@ -2547,6 +2691,111 @@ public actor Orchestrator {
                 metadata: taskMetadata(contract: contract, rootTaskID: contract.id))))
             return nil
         }
+    }
+
+    func delegateAuthorizedTask(
+        from: AgentID,
+        authorization: ResolvedToolAuthorization,
+        to reviewedTarget: String,
+        workTaskID: WorkTaskID? = nil,
+        objective: String? = nil,
+        roleHint: String? = nil,
+        expectedDeliverable: String? = nil,
+        parentTaskID: TaskID? = nil
+    ) async -> String {
+        guard authorization.toolName == "delegate_task",
+              authorization.agent == from,
+              authorization.taskID == parentTaskID,
+              let authorizedTargetValue = authorization.intent.resources.first(where: {
+                  $0.kind == .agent
+              })?.value else {
+            return "error: delegate_task authorization binding is invalid"
+        }
+        let target = AgentID(rawValue: Self.normalizedAgentName(reviewedTarget))
+        guard target.rawValue == authorizedTargetValue,
+              !target.rawValue.isEmpty,
+              target.rawValue.lowercased() != "auto" else {
+            return "error: delegate_task target differs from the reviewed authorization"
+        }
+        if let failure = authorizationRevalidationFailure(authorization) {
+            return "error: \(failure)"
+        }
+        guard case .string(let targetResolution)? =
+            authorization.intent.metadata["targetResolution"] else {
+            return "error: delegate_task authorization has no target resolution"
+        }
+
+        let durableTask = workTaskID.flatMap { workTaskGraph.task($0) }
+        if let workTaskID, durableTask == nil {
+            return "error: no WorkTask named " + workTaskID.rawValue
+        }
+        let suppliedObjective = objective?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfEmpty
+        guard let effectiveObjective = suppliedObjective ?? durableTask?.description.nilIfEmpty else {
+            return "error: delegate_task requires a ready WorkTask or a non-empty legacy objective"
+        }
+
+        guard !automaticDelegationReservations.contains(target) else {
+            return "error: reviewed delegation target is already reserved by another invocation"
+        }
+        automaticDelegationReservations.insert(target)
+        defer { automaticDelegationReservations.remove(target) }
+        let createdForDelegation: Bool
+        switch targetResolution {
+        case "reuse_existing":
+            guard registry.agent(target) != nil else {
+                return "error: reviewed delegation target is no longer attached"
+            }
+            createdForDelegation = false
+        case "create_proposed":
+            guard let requester = registry.agent(from) else {
+                return "error: delegating agent is not attached"
+            }
+            let spawned = await spawnFromTool(
+                requestedBy: from,
+                currentTaskID: parentTaskID,
+                name: target.rawValue,
+                path: requester.workspaceRoot.path,
+                model: requester.model.rawValue,
+                canCoordinate: false)
+            guard spawned.hasPrefix("spawned @"), registry.agent(target) != nil else {
+                return spawned.lowercased().hasPrefix("error:")
+                    ? spawned
+                    : "error: reviewed delegation worker could not be created"
+            }
+            createdForDelegation = true
+        default:
+            return "error: delegate_task target resolution is invalid"
+        }
+
+        let queued = await enqueueDelegatedTask(
+            from: from,
+            to: target.rawValue,
+            workTaskID: workTaskID,
+            objective: effectiveObjective,
+            roleHint: roleHint,
+            expectedDeliverable: expectedDeliverable ?? durableTask.map {
+                $0.acceptanceCriteria.isEmpty
+                    ? "Return a candidate result for WorkTask " + $0.id.rawValue + "."
+                    : $0.acceptanceCriteria.joined(separator: "; ")
+            },
+            parentTaskID: parentTaskID,
+            replyMode: .taskReport)
+        guard let taskID = queued.taskID else {
+            if createdForDelegation {
+                _ = await detach(
+                    target,
+                    reason: "authorized delegate admission failed; worker rolled back")
+            }
+            return queued.message
+        }
+        scheduledReplyTargets[taskID] = from
+        scheduledReplyFormats[taskID] = .taskReport
+        ensureSchedulerRunning()
+        let report = await awaitSchedulerResult(taskID) ?? queued.message
+        let binding = workTaskID.map { " work_task_id=\($0.rawValue)" } ?? ""
+        return "task_id=\(taskID.rawValue)\(binding) agent_id=@\(target.rawValue)\n\(report)"
     }
 
     func delegateTask(from: AgentID,
@@ -4083,8 +4332,13 @@ public actor Orchestrator {
               lease.tools.contains(.attachWorkspace) else {
             return "error: spawning agents is not granted for the current task"
         }
+        guard let parentWorkspaceLease = existingWorkspaceLease(
+            for: requestedBy,
+            taskID: currentTaskID) else {
+            return "error: spawning agents requires an active workspace lease"
+        }
         if requestedAccess == .readWrite,
-           existingWorkspaceLease(for: requestedBy, taskID: currentTaskID)?.access != .readWrite {
+           parentWorkspaceLease.access != .readWrite {
             return "error: a read-only workspace lease cannot grant read-write access to a child agent"
         }
         if canCoordinate, budget.maxDepth < 1 {
@@ -4099,17 +4353,19 @@ public actor Orchestrator {
         guard assessment.canAskUser, let canonical = assessment.canonical else {
             return "error: \(assessment.reason)"
         }
-        let coordinationDepth = canCoordinate ? Agent.defaultCoordinationDepth : 0
+        let coordinationDepth = canCoordinate ? max(1, min(Agent.defaultCoordinationDepth, budget.maxDepth)) : 0
         let proposedAgent = Agent(
             name: id,
             workspaceRoot: canonical,
             model: ModelID(rawValue: model),
             profile: .reviewed,
             coordinationDepth: coordinationDepth)
-        let proposedLeases = prepareDefaultLeases(
+        let proposedLeases = prepareSpawnLeases(
             for: proposedAgent,
+            parentCapabilityLease: lease,
+            parentWorkspaceLease: parentWorkspaceLease,
             workspaceAccess: requestedAccess,
-            grantWorkerWriteCapabilities: requestedAccess == .readWrite)
+            canCoordinate: canCoordinate)
         let rootTaskID = currentTaskID.flatMap { taskGraph.node($0)?.rootTaskID } ?? currentTaskID
         let baseMetadata = CoworkEventMetadata(
             taskID: currentTaskID,
@@ -4373,7 +4629,13 @@ public actor Orchestrator {
                 workTaskID: taskContract?.workTaskID,
                 invocationTaskID: taskContract?.id,
                 agentID: agent.name),
-            tokenBudgetMeter: tokenBudgetMeter
+            tokenBudgetMeter: tokenBudgetMeter,
+            authorizationPreparer: { [self] request in
+                try await prepareAuthorizationIntent(request)
+            },
+            authorizationRevalidator: { [self] authorization in
+                await authorizationRevalidationFailure(authorization)
+            }
         )
         let output = try await loop.send(
             input,
@@ -4383,6 +4645,421 @@ public actor Orchestrator {
         return AgentRunResult(
             output: output,
             presentedMessageIDs: contextBundle.directMessages.compactMap(\.messageID))
+    }
+
+    private func prepareAuthorizationIntent(
+        _ request: ToolAuthorizationPreparationRequest
+    ) throws -> PermissionIntent {
+        guard request.toolName == "delegate_task" else {
+            return request.baseIntent
+        }
+        guard let requesterID = request.invocation.agent,
+              let requester = registry.agent(requesterID) else {
+            throw IntatisError.permissionDenied("delegating agent is not attached")
+        }
+        let arguments = try JSONDecoder().decode(
+            DelegationAuthorizationArguments.self,
+            from: Data(request.normalizedArguments.utf8))
+        let suppliedTarget = arguments.to.map(Self.normalizedAgentName)
+            .flatMap { value in
+                value.isEmpty || value.lowercased() == "auto" ? nil : value
+            }
+        let targetWasExplicit = suppliedTarget != nil
+        let target: AgentID
+        let targetResolution: String
+        let targetFingerprint: String?
+        let targetModel: ModelID
+        let targetWorkspace: String
+
+        if let suppliedTarget {
+            let candidate = AgentID(rawValue: suppliedTarget)
+            guard candidate != requesterID,
+                  candidate != Self.mainAgentID,
+                  candidate != Self.automaticPermissionReviewerID else {
+                throw IntatisError.permissionDenied("requested delegation target is reserved")
+            }
+            if let existing = registry.agent(candidate) {
+                target = candidate
+                targetResolution = "reuse_existing"
+                targetFingerprint = delegationTargetFingerprint(existing)
+                targetModel = existing.model
+                targetWorkspace = existing.workspaceRoot.resolvingSymlinksInPath()
+                    .standardizedFileURL.path
+            } else {
+                if let validationError = Self.agentNameValidationError(candidate.rawValue) {
+                    throw IntatisError.permissionDenied(validationError)
+                }
+                try validateProposedDelegationTarget(
+                    requester: requester,
+                    requesterID: requesterID,
+                    taskID: request.invocation.taskID,
+                    target: candidate)
+                target = candidate
+                targetResolution = "create_proposed"
+                targetFingerprint = nil
+                targetModel = requester.model
+                targetWorkspace = requester.workspaceRoot.resolvingSymlinksInPath()
+                    .standardizedFileURL.path
+            }
+        } else if let idle = registry.all()
+            .filter({ candidate in
+                candidate.name != requesterID
+                    && candidate.name != Self.mainAgentID
+                    && candidate.name != Self.automaticPermissionReviewerID
+                    && candidate.workspaceRoot.standardizedFileURL.path
+                        == requester.workspaceRoot.standardizedFileURL.path
+                    && !automaticDelegationReservations.contains(candidate.name)
+                    && isAgentAvailableForDelegation(candidate.name)
+            })
+            .sorted(by: { $0.name.rawValue < $1.name.rawValue })
+            .first {
+            target = idle.name
+            targetResolution = "reuse_existing"
+            targetFingerprint = delegationTargetFingerprint(idle)
+            targetModel = idle.model
+            targetWorkspace = idle.workspaceRoot.resolvingSymlinksInPath()
+                .standardizedFileURL.path
+        } else {
+            let candidate = AgentID(rawValue: nextAutomaticWorkerName())
+            try validateProposedDelegationTarget(
+                requester: requester,
+                requesterID: requesterID,
+                taskID: request.invocation.taskID,
+                target: candidate)
+            target = candidate
+            targetResolution = "create_proposed"
+            targetFingerprint = nil
+            targetModel = requester.model
+            targetWorkspace = requester.workspaceRoot.resolvingSymlinksInPath()
+                .standardizedFileURL.path
+        }
+
+        if let failure = delegationFailure(
+            from: requesterID,
+            to: target,
+            parentTaskID: request.invocation.taskID) {
+            throw IntatisError.permissionDenied(failure)
+        }
+
+        var intent = request.baseIntent
+        intent.resources.removeAll { $0.kind == .agent }
+        intent.resources.insert(
+            PermissionResource(kind: .agent, value: target.rawValue),
+            at: 0)
+        intent.resources.removeAll { $0.kind == .workspace }
+        intent.resources.append(PermissionResource(
+            kind: .workspace,
+            value: targetWorkspace,
+            access: .readOnly))
+        intent.metadata["targetResolution"] = .string(targetResolution)
+        intent.metadata["targetWasExplicit"] = .bool(targetWasExplicit)
+        intent.metadata["targetModel"] = .string(targetModel.rawValue)
+        intent.metadata["targetWorkspace"] = .string(targetWorkspace)
+        intent.metadata["requestedAccess"] = .string(WorkspaceAccess.readOnly.rawValue)
+        intent.metadata["canCoordinate"] = .bool(false)
+        intent.metadata["mayCreateWorker"] = .bool(targetResolution == "create_proposed")
+        if let targetFingerprint {
+            intent.metadata["targetFingerprint"] = .string(targetFingerprint)
+        } else {
+            intent.metadata.removeValue(forKey: "targetFingerprint")
+        }
+        return intent
+    }
+
+    private func validateProposedDelegationTarget(
+        requester: Agent,
+        requesterID: AgentID,
+        taskID: TaskID?,
+        target: AgentID
+    ) throws {
+        guard registry.agent(target) == nil else {
+            throw IntatisError.permissionDenied("proposed delegation target is already attached")
+        }
+        guard let capabilityLease = existingCapabilityLease(
+            for: requesterID,
+            taskID: taskID),
+            capabilityLease.tools.contains(.attachWorkspace),
+            case .granted = capabilityLease.delegation else {
+            throw IntatisError.permissionDenied(
+                "creating a delegation worker is not granted for the current task")
+        }
+        guard let workspaceLease = existingWorkspaceLease(
+            for: requesterID,
+            taskID: taskID),
+            workspaceLease.rootPath
+                == requester.workspaceRoot.resolvingSymlinksInPath().standardizedFileURL.path,
+            workspaceLease.rootIdentity?.matchesCurrentDirectory(
+                rootPath: workspaceLease.rootPath) == true else {
+            throw IntatisError.permissionDenied(
+                "creating a delegation worker requires the current reviewed workspace lease")
+        }
+        let activeAgentCount = registry.names.filter {
+            $0 != Self.automaticPermissionReviewerID
+        }.count
+        guard activeAgentCount < taskGraph.policy.maxActiveAgentsPerThread else {
+            throw IntatisError.permissionDenied(
+                "active agent limit reached (\(taskGraph.policy.maxActiveAgentsPerThread))")
+        }
+    }
+
+    private func delegationTargetFingerprint(_ agent: Agent) -> String {
+        let capabilityLeaseID = defaultCapabilityLeaseIDs[agent.name]
+        let workspaceLeaseID = defaultWorkspaceLeaseIDs[agent.name]
+        return ToolRegistry.authorizationDigest([
+            agent.name.rawValue,
+            agent.workspaceRoot.resolvingSymlinksInPath().standardizedFileURL.path,
+            agent.model.rawValue,
+            agent.profile.rawValue,
+            String(agent.coordinationDepth),
+            capabilityLeaseID?.rawValue ?? "",
+            capabilityLeaseID.flatMap { capabilityLeases[$0] }
+                .map(ToolRegistry.authorizationFingerprint) ?? "",
+            workspaceLeaseID?.rawValue ?? "",
+            workspaceLeaseID.flatMap { workspaceLeases[$0] }
+                .map(ToolRegistry.authorizationFingerprint) ?? "",
+        ].joined(separator: "\u{001F}"))
+    }
+
+    /// Live actor-isolated lease check used immediately after review and again
+    /// after the durable execution prepare boundary. A captured lease value is
+    /// not enough: task completion, detach, or cancellation may revoke it while
+    /// the reviewer is awaiting its provider.
+    private func authorizationRevalidationFailure(
+        _ authorization: ResolvedToolAuthorization
+    ) -> String? {
+        if authorization.capabilityLeaseID != nil
+            || !authorization.requiredCapabilities.isEmpty
+            || authorization.requiredCommunication != .none
+            || authorization.requiredDelegation != .none {
+            guard let leaseID = authorization.capabilityLeaseID,
+                  let liveLease = capabilityLeases[leaseID] else {
+                return "capability lease was revoked before tool execution"
+            }
+            let required = Set(authorization.requiredCapabilities)
+            guard required.isEmpty || !required.isDisjoint(with: liveLease.tools) else {
+                return "capability lease no longer grants the registered tool"
+            }
+            guard liveLease.taskID == authorization.capabilityTaskID else {
+                return "capability lease task binding changed before tool execution"
+            }
+            guard authorization.capabilityLeaseFingerprint
+                    == ToolRegistry.authorizationFingerprint(liveLease) else {
+                return "capability lease grants changed before tool execution"
+            }
+            if let boundTaskID = liveLease.taskID,
+               boundTaskID != authorization.taskID {
+                return "capability lease belongs to a different task"
+            }
+        }
+
+        if let workspaceLeaseID = authorization.workspaceLeaseID {
+            guard let liveLease = workspaceLeases[workspaceLeaseID] else {
+                return "workspace lease was revoked before tool execution"
+            }
+            guard liveLease.access == authorization.workspaceAccess else {
+                return "workspace lease access changed before tool execution"
+            }
+            guard liveLease.workspaceID == authorization.workspaceID,
+                  liveLease.taskID == authorization.workspaceTaskID,
+                  liveLease.rootPath == authorization.workspaceRootPath else {
+                return "workspace lease identity or task binding changed before tool execution"
+            }
+            guard liveLease.rootIdentity == authorization.workspaceRootIdentity else {
+                return "workspace lease root identity changed before tool execution"
+            }
+            guard authorization.workspaceLeaseFingerprint
+                    == ToolRegistry.authorizationFingerprint(liveLease) else {
+                return "workspace lease path rules changed before tool execution"
+            }
+            if let boundTaskID = liveLease.taskID,
+               boundTaskID != authorization.taskID {
+                return "workspace lease belongs to a different task"
+            }
+            if let rootIdentity = liveLease.rootIdentity,
+               !rootIdentity.matchesCurrentDirectory(rootPath: liveLease.rootPath) {
+                return "workspace root identity changed before tool execution"
+            }
+        }
+        return semanticAuthorizationFailure(authorization)
+    }
+
+    private func semanticAuthorizationFailure(
+        _ authorization: ResolvedToolAuthorization
+    ) -> String? {
+        guard let from = authorization.agent else {
+            return "authorization snapshot has no requesting agent"
+        }
+        func targetAgent() -> AgentID? {
+            guard let value = authorization.intent.resources.first(where: {
+                $0.kind == .agent
+            })?.value else { return nil }
+            return AgentID(rawValue: Self.normalizedAgentName(value))
+        }
+
+        switch authorization.toolName {
+        case "send_message", "request_information", "reply_message":
+            guard let to = targetAgent() else {
+                return "communication authorization has no concrete target agent"
+            }
+            guard registry.agent(to) != nil,
+                  to != Self.automaticPermissionReviewerID else {
+                return "communication target is not an attached task agent"
+            }
+            let operation: CommunicationOperation
+            switch authorization.toolName {
+            case "send_message": operation = .send
+            case "request_information": operation = .requestInformation
+            default: operation = .reply
+            }
+            return communicationFailure(
+                from: from,
+                to: to,
+                taskID: authorization.taskID,
+                operation: operation)
+
+        case "ask_agent":
+            guard let to = targetAgent(), registry.agent(to) != nil else {
+                return "delegation target is not an attached agent"
+            }
+            return delegationFailure(
+                from: from,
+                to: to,
+                parentTaskID: authorization.taskID)
+
+        case "delegate_task":
+            guard let target = targetAgent(),
+                  !target.rawValue.isEmpty,
+                  target.rawValue.lowercased() != "auto" else {
+                return "delegation authorization has no concrete target agent"
+            }
+            guard target != from,
+                  target != Self.mainAgentID,
+                  target != Self.automaticPermissionReviewerID else {
+                return "requested delegation target is reserved"
+            }
+            if let failure = delegationFailure(
+                from: from,
+                to: target,
+                parentTaskID: authorization.taskID) {
+                return failure
+            }
+            guard let requester = registry.agent(from) else {
+                return "delegating agent is not attached"
+            }
+            guard case .string(let resolution)? = authorization.intent.metadata["targetResolution"],
+                  case .string(let reviewedWorkspace)? = authorization.intent.metadata["targetWorkspace"],
+                  case .bool(let targetWasExplicit)? = authorization.intent.metadata["targetWasExplicit"] else {
+                return "delegation authorization has no host target resolution"
+            }
+            switch resolution {
+            case "reuse_existing":
+                guard let existing = registry.agent(target) else {
+                    return "reviewed delegation target is no longer attached"
+                }
+                guard existing.workspaceRoot.resolvingSymlinksInPath()
+                    .standardizedFileURL.path == reviewedWorkspace else {
+                    return "reviewed delegation target workspace changed"
+                }
+                guard case .string(let reviewedFingerprint)? =
+                    authorization.intent.metadata["targetFingerprint"],
+                    delegationTargetFingerprint(existing) == reviewedFingerprint else {
+                    return "reviewed delegation target identity changed"
+                }
+                if !targetWasExplicit,
+                   (!isAgentAvailableForDelegation(target)
+                    || automaticDelegationReservations.contains(target)) {
+                    return "automatically selected delegation target is no longer available"
+                }
+            case "create_proposed":
+                guard reviewedWorkspace == requester.workspaceRoot.resolvingSymlinksInPath()
+                    .standardizedFileURL.path else {
+                    return "proposed delegation workspace changed before execution"
+                }
+                do {
+                    try validateProposedDelegationTarget(
+                        requester: requester,
+                        requesterID: from,
+                        taskID: authorization.taskID,
+                        target: target)
+                } catch {
+                    return error.localizedDescription
+                }
+            default:
+                return "delegation authorization target resolution is invalid"
+            }
+            return nil
+
+        case "spawn_agent":
+            if let target = targetAgent() {
+                if target == from { return "agent cannot spawn itself" }
+                if target == Self.mainAgentID || target == Self.automaticPermissionReviewerID {
+                    return "requested agent name is reserved"
+                }
+                if registry.agent(target) != nil { return "agent already exists" }
+            }
+            guard let path = authorization.intent.resources.first(where: {
+                $0.kind == .workspace
+            })?.value else {
+                return "agent spawn authorization has no concrete workspace"
+            }
+            let assessment = assessWorkspaceAttach(URL(fileURLWithPath: path))
+            guard assessment.canAskUser,
+                  let canonical = assessment.canonical,
+                  canonical.path == path else {
+                return assessment.canAskUser
+                    ? "agent spawn workspace must use its canonical reviewed path"
+                    : assessment.reason
+            }
+            guard let currentIdentity = WorkspaceRootIdentity.capture(rootPath: path),
+                  case .string(let reviewedDevice)? = authorization.intent.metadata["targetDeviceID"],
+                  case .string(let reviewedFile)? = authorization.intent.metadata["targetFileID"],
+                  String(currentIdentity.deviceID) == reviewedDevice,
+                  String(currentIdentity.fileID) == reviewedFile else {
+                return "agent spawn workspace identity changed before authorization"
+            }
+            guard let lease = existingCapabilityLease(
+                for: from,
+                taskID: authorization.taskID),
+                case .granted(let budget) = lease.delegation,
+                lease.tools.contains(.attachWorkspace) else {
+                return "spawning agents is not granted for the current task"
+            }
+            let requestedAccess = authorization.intent.resources.first(where: {
+                $0.kind == .workspace
+            })?.access ?? .readOnly
+            if requestedAccess == .readWrite,
+               existingWorkspaceLease(for: from, taskID: authorization.taskID)?.access != .readWrite {
+                return "a read-only workspace lease cannot grant read-write access to a child agent"
+            }
+            let canCoordinate: Bool
+            if case .bool(let value)? = authorization.intent.metadata["canCoordinate"] {
+                canCoordinate = value
+            } else {
+                canCoordinate = false
+            }
+            if canCoordinate, budget.maxDepth < 1 {
+                return "coordinator spawning exceeds the delegation depth budget"
+            }
+            let activeAgentCount = registry.names.filter {
+                $0 != Self.automaticPermissionReviewerID
+            }.count
+            guard activeAgentCount < taskGraph.policy.maxActiveAgentsPerThread else {
+                return "active agent limit reached (\(taskGraph.policy.maxActiveAgentsPerThread))"
+            }
+            return nil
+
+        case "remove_agent":
+            guard let target = targetAgent() else {
+                return "agent removal authorization has no concrete target"
+            }
+            if target == Self.mainAgentID || target == Self.automaticPermissionReviewerID {
+                return "requested agent cannot be removed"
+            }
+            return registry.agent(target) == nil ? "agent does not exist" : nil
+
+        default:
+            return nil
+        }
     }
 
     private static func normalizedAgentName(_ raw: String) -> String {
@@ -4618,6 +5295,66 @@ public actor Orchestrator {
             capabilityLease.tools.remove(.createGoal)
         }
         capabilityLease.expiresAtTaskCompletion = false
+        return (capabilityLease, workspaceLease)
+    }
+
+    /// Tool-spawned agents receive a monotonic derivation of the caller's
+    /// authority. In particular, a child coordinator never receives a fresh
+    /// default delegation depth or a tool/communication grant absent from its
+    /// parent lease.
+    private func prepareSpawnLeases(
+        for agent: Agent,
+        parentCapabilityLease: CapabilityLease,
+        parentWorkspaceLease: WorkspaceLease,
+        workspaceAccess: WorkspaceAccess,
+        canCoordinate: Bool
+    ) -> (capability: CapabilityLease, workspace: WorkspaceLease) {
+        let workspaceLease = WorkspaceLease(
+            rootPath: agent.workspaceRoot.path,
+            access: workspaceAccess,
+            allowedPathRules: parentWorkspaceLease.allowedPathRules,
+            deniedPatterns: parentWorkspaceLease.deniedPatterns,
+            expiresAtTaskCompletion: false)
+
+        let baseline = canCoordinate
+            ? CapabilityLease.coordinator(workspaceAccess: workspaceAccess)
+            : CapabilityLease.worker(
+                workspaceAccess: workspaceAccess == .readWrite ? .readWrite : .readOnly)
+        var tools = baseline.tools.intersection(parentCapabilityLease.tools)
+        tools.remove(.createGoal)
+
+        let communication: CommunicationGrant
+        if canCoordinate {
+            communication = parentCapabilityLease.communication
+        } else {
+            switch parentCapabilityLease.communication {
+            case .none:
+                communication = .none
+            default:
+                communication = .replyOnly
+            }
+        }
+
+        let delegation: DelegationGrant
+        if canCoordinate,
+           case .granted(let parentBudget) = parentCapabilityLease.delegation {
+            delegation = .granted(DelegationBudget(
+                maxTasks: max(0, parentBudget.maxTasks - 1),
+                maxDepth: max(0, parentBudget.maxDepth - 1)))
+        } else {
+            switch parentCapabilityLease.delegation {
+            case .none:
+                delegation = .none
+            case .requestOnly, .granted:
+                delegation = .requestOnly
+            }
+        }
+
+        let capabilityLease = CapabilityLease(
+            tools: tools,
+            communication: communication,
+            delegation: delegation,
+            expiresAtTaskCompletion: false)
         return (capabilityLease, workspaceLease)
     }
 
@@ -5228,10 +5965,14 @@ public actor Orchestrator {
         }
 
         terminalPersistenceFailures.removeValue(forKey: task.contract.id)
-        scheduler.recordCompleted(task: task, result: result)
-        _ = taskGraph.updateStatus(taskID: task.contract.id, status: .completed)
         await consumeDeliveredMessages(for: task, messageIDs: presentedMessageIDs)
         await storeScheduledReply(task: task, result: result, report: report, error: nil)
+        // Publish the terminal scheduler record only after the typed reply
+        // delivery outcome exists. Otherwise an actor-reentrant late waiter can
+        // observe `record.result` while Mediator delivery is still pending and
+        // incorrectly turn a later block into ask_agent success.
+        scheduler.recordCompleted(task: task, result: result)
+        _ = taskGraph.updateStatus(taskID: task.contract.id, status: .completed)
         await revokeTaskLeases(contract: task.contract, reason: "task completed")
         await refreshConsumedTokenCount()
         completeResultWaiters(task.contract.id)
@@ -5271,9 +6012,9 @@ public actor Orchestrator {
         }
 
         terminalPersistenceFailures.removeValue(forKey: task.contract.id)
+        await storeScheduledReply(task: task, result: nil, report: report, error: message)
         scheduler.recordFailed(task: task, error: message)
         commitFailedTaskGraphState(taskID: task.contract.id)
-        await storeScheduledReply(task: task, result: nil, report: report, error: message)
         await revokeTaskLeases(contract: task.contract, reason: "task failed")
         await refreshConsumedTokenCount()
         completeResultWaiters(task.contract.id)
@@ -5324,9 +6065,9 @@ public actor Orchestrator {
         }
 
         terminalPersistenceFailures.removeValue(forKey: task.contract.id)
+        await storeScheduledReply(task: task, result: nil, report: report, error: reason)
         scheduler.recordCancelled(task: task, reason: reason)
         _ = taskGraph.updateStatus(taskID: task.contract.id, status: .cancelled)
-        await storeScheduledReply(task: task, result: nil, report: report, error: reason)
         await revokeTaskLeases(contract: task.contract, reason: "task cancelled")
         await refreshConsumedTokenCount()
         completeResultWaiters(task.contract.id)
@@ -5646,7 +6387,11 @@ public actor Orchestrator {
             return "error: \(failure)"
         }
         guard let record = scheduler.record(for: taskID), record.status.isTerminal else { return nil }
-        return scheduledReplyResults[taskID]
+        return scheduledReplyResults[taskID].map { reply in
+            switch reply {
+            case .success(let value), .failure(let value): value
+            }
+        }
             ?? record.result
             ?? record.error.map { "error: \($0)" }
             ?? (record.status == .cancelled ? "error: task cancelled" : nil)
@@ -5946,11 +6691,26 @@ public actor Orchestrator {
         }
     }
 
-    private func refreshConsumedTokenCount() async {
-        consumedTokenCount = await log.replay().reduce(into: 0) { total, envelope in
+    @discardableResult
+    private func refreshConsumedTokenCount() async -> Bool {
+        let events: [Envelope]
+        do {
+            events = try await log.replayChecked()
+        } catch {
+            workTaskRecoveryFailure =
+                "Cowork token usage could not be verified from the durable event log: \(error.localizedDescription)"
+            return false
+        }
+        consumedTokenCount = Self.consumedTokenCount(in: events)
+        return true
+    }
+
+    private static func consumedTokenCount(in events: [Envelope]) -> Int {
+        events.reduce(into: 0) { total, envelope in
             guard case .turnStats(let payload) = envelope.event else { return }
-            total += payload.totalTokens
+            total = saturatingAdd(total, payload.totalTokens
                 ?? ((payload.promptTokens ?? 0) + (payload.completionTokens ?? 0))
+            )
         }
     }
 
@@ -5959,21 +6719,22 @@ public actor Orchestrator {
                                        to: AgentID,
                                        result: String?,
                                        report: TaskReportPayload,
-                                       error: String?) async -> String {
+                                       error: String?) async -> AgentMessengerReply {
         switch format {
         case .answer:
             let content = result ?? error.map { "error: \($0)" } ?? Self.formattedTaskReport(report)
             if let forwarded = await bus.deliver(from: from, to: to, content: content) {
-                return forwarded
+                return .success(forwarded)
             }
-            return error.map { "error: \($0)" }
-                ?? "delegated task completed, but the result was blocked by the mediator; ask @\(from.rawValue) for a shorter summary"
+            return .failure(error.map { "error: \($0)" }
+                ?? "delegated task completed, but the result was blocked by the mediator; ask @\(from.rawValue) for a shorter summary")
         case .taskReport:
             let content = Self.formattedTaskReport(report)
             if let forwarded = await bus.deliver(from: from, to: to, content: content) {
-                return forwarded
+                return .success(forwarded)
             }
-            return "delegated task finished, but the task report was blocked by the mediator; ask @\(from.rawValue) for a shorter summary"
+            return .failure(
+                "delegated task finished, but the task report was blocked by the mediator; ask @\(from.rawValue) for a shorter summary")
         }
     }
 
@@ -6021,7 +6782,14 @@ public actor Orchestrator {
         ensureSchedulerRunning()
         return await withCheckedContinuation { continuation in
             resultWaiters[taskID, default: []].append(continuation)
+            schedulerResultWaiterHookForTesting?(taskID)
         }
+    }
+
+    func setSchedulerResultWaiterHookForTesting(
+        _ hook: (@Sendable (TaskID) -> Void)?
+    ) {
+        schedulerResultWaiterHookForTesting = hook
     }
 
     private func causalMetadata(issuer: AgentID,
@@ -6165,116 +6933,108 @@ public actor Orchestrator {
     }
 
     static func toolRegistry(for lease: CapabilityLease) -> ToolRegistry {
-        var tools: [any Tool] = []
+        var registrations: [ToolRegistration] = []
+        func register(
+            _ tools: [any Tool],
+            granting capabilities: Set<ToolCapability>,
+            communication: ToolCommunicationRequirement = .none,
+            delegation: ToolDelegationRequirement = .none
+        ) {
+            registrations.append(contentsOf: tools.map {
+                ToolRegistration(
+                    tool: $0,
+                    grantingCapabilities: capabilities,
+                    requiredCommunication: communication,
+                    requiredDelegation: delegation)
+            })
+        }
         if lease.tools.contains(.readWorkspace) {
-            tools.append(ReadFileTool())
+            register([ReadFileTool()], granting: [.readWorkspace])
         }
         if lease.tools.contains(.readPDF) {
-            tools.append(ReadPDFTool())
+            register([ReadPDFTool()], granting: [.readPDF])
         }
         if lease.tools.contains(.listWorkspace) {
-            tools.append(ListFilesTool())
+            register([ListFilesTool()], granting: [.listWorkspace])
         }
         if lease.tools.contains(.searchWorkspace) {
-            tools.append(SearchTextTool())
+            register([SearchTextTool()], granting: [.searchWorkspace])
         }
         if lease.tools.contains(.applyPatch) {
-            tools.append(WriteFileTool())
-            tools.append(ApplyPatchTool())
+            // One lease capability deliberately exposes two concrete editing
+            // tools. Keep that alias here in the same entries used for model
+            // schemas, host authorization, and executor lookup.
+            register([WriteFileTool(), ApplyPatchTool()], granting: [.applyPatch])
         }
         if lease.tools.contains(.editPDF) {
-            tools.append(EditPDFPagesTool())
+            register([EditPDFPagesTool()], granting: [.editPDF])
         }
         // Raw run_shell is deliberately not exposed, even when a legacy lease
         // contains `.runShell`: arbitrary shell cannot declare exact touched
         // paths for WorkspaceLease denied-pattern enforcement. The capability
         // remains as a compatibility signal for the read-only Git tools below.
         if lease.tools.contains(.gitControl) || lease.tools.contains(.runShell) {
-            tools.append(GitStatusTool())
-            tools.append(GitDiffTool())
-            tools.append(GitInfoTool())
-            tools.append(GitRecentCommitsTool())
-            tools.append(GitDiffBaseTool())
+            register([
+                GitStatusTool(), GitDiffTool(), GitInfoTool(),
+                GitRecentCommitsTool(), GitDiffBaseTool(),
+            ], granting: [.gitControl, .runShell])
         }
         if lease.tools.contains(.gitControl) {
-            tools.append(GitStagedDiffTool())
-            tools.append(GitBranchTool())
-            tools.append(GitCreateBranchTool())
-            tools.append(GitStageTool())
-            tools.append(GitUnstageTool())
-            tools.append(GitCommitTool())
-            tools.append(GitApplyPatchCheckTool())
-            tools.append(GitApplyPatchTool())
-            tools.append(GitStagePatchTool())
-            tools.append(GitUnstagePatchTool())
-            tools.append(GitRevertPatchTool())
-            tools.append(GitWorktreeListTool())
-            tools.append(GitWorktreeCreateTool())
-            tools.append(GitWorktreeRemoveTool())
+            register([
+                GitStagedDiffTool(), GitBranchTool(), GitCreateBranchTool(),
+                GitStageTool(), GitUnstageTool(), GitCommitTool(),
+                GitApplyPatchCheckTool(), GitApplyPatchTool(), GitStagePatchTool(),
+                GitUnstagePatchTool(), GitRevertPatchTool(), GitWorktreeListTool(),
+                GitWorktreeCreateTool(), GitWorktreeRemoveTool(), GitSwitchBranchTool(),
+            ], granting: [.gitControl])
         }
         if lease.tools.contains(.gitRemote) {
-            tools.append(GitRemotesTool())
-            tools.append(GitFetchTool())
-            tools.append(GitPullFastForwardTool())
-            tools.append(GitPushTool())
-            tools.append(GitSwitchBranchTool())
+            register([
+                GitRemotesTool(), GitFetchTool(), GitPullFastForwardTool(),
+                GitPushTool(),
+            ], granting: [.gitRemote])
         }
         if lease.tools.contains(.reconstructDocument) {
-            tools.append(ReconstructDocumentImageTool())
+            register([ReconstructDocumentImageTool()], granting: [.reconstructDocument])
         }
         if lease.tools.contains(.compileLaTeX) {
-            tools.append(CompileLaTeXTool())
+            register([CompileLaTeXTool()], granting: [.compileLaTeX])
         }
         if lease.tools.contains(.generateMedia) {
-            tools.append(GenerateImageTool())
+            register([GenerateImageTool()], granting: [.generateMedia])
         }
         if lease.tools.contains(.browseWeb) {
-            tools.append(WebFetchTool())
-            tools.append(BrowserDiagnosticsTool())
-            tools.append(BrowserProfilesTool())
-            tools.append(BrowserProfileDeleteTool())
-            tools.append(BrowserHistoryTool())
-            tools.append(BrowserNavigateTool())
-            tools.append(BrowserSnapshotTool())
-            tools.append(BrowserHandoffTool())
-            tools.append(BrowserReloadTool())
-            tools.append(BrowserBackTool())
-            tools.append(BrowserForwardTool())
-            tools.append(BrowserClickTool())
-            tools.append(BrowserTypeTool())
-            tools.append(BrowserSubmitTool())
-            tools.append(BrowserSelectOptionTool())
-            tools.append(BrowserPressKeyTool())
-            tools.append(BrowserScrollTool())
-            tools.append(BrowserWaitTool())
-            tools.append(BrowserScreenshotTool())
-            tools.append(BrowserUploadFileTool())
-            tools.append(BrowserDownloadTool())
-            tools.append(BrowserDownloadsTool())
-            tools.append(BrowserSearchTool())
+            register([
+                WebFetchTool(), BrowserDiagnosticsTool(), BrowserProfilesTool(),
+                BrowserProfileDeleteTool(), BrowserHistoryTool(), BrowserNavigateTool(),
+                BrowserSnapshotTool(), BrowserHandoffTool(), BrowserReloadTool(),
+                BrowserBackTool(), BrowserForwardTool(), BrowserClickTool(),
+                BrowserTypeTool(), BrowserSubmitTool(), BrowserSelectOptionTool(),
+                BrowserPressKeyTool(), BrowserScrollTool(), BrowserWaitTool(),
+                BrowserScreenshotTool(), BrowserUploadFileTool(), BrowserDownloadTool(),
+                BrowserDownloadsTool(), BrowserSearchTool(),
+            ], granting: [.browseWeb])
         }
         if lease.tools.contains(.manageWorkTasks) {
-            tools.append(TaskCreateTool())
-            tools.append(TaskUpdateTool())
-            tools.append(TaskGetTool())
-            tools.append(TaskListTool())
+            register([
+                TaskCreateTool(), TaskUpdateTool(), TaskGetTool(), TaskListTool(),
+            ], granting: [.manageWorkTasks])
         } else {
             if lease.tools.contains(.updateOwnedWorkTask) {
-                tools.append(TaskUpdateTool())
+                register([TaskUpdateTool()], granting: [.updateOwnedWorkTask])
             }
             if lease.tools.contains(.readWorkTasks) {
-                tools.append(TaskGetTool())
-                tools.append(TaskListTool())
+                register([TaskGetTool(), TaskListTool()], granting: [.readWorkTasks])
             }
         }
         if lease.tools.contains(.readGoal) {
-            tools.append(GetGoalTool())
+            register([GetGoalTool()], granting: [.readGoal])
         }
         if lease.tools.contains(.createGoal) {
-            tools.append(CreateGoalTool())
+            register([CreateGoalTool()], granting: [.createGoal])
         }
         if lease.tools.contains(.submitGoalVerdict) {
-            tools.append(UpdateGoalTool())
+            register([UpdateGoalTool()], granting: [.submitGoalVerdict])
         }
         let canInitiateCommunication: Bool
         switch lease.communication {
@@ -6299,37 +7059,68 @@ public actor Orchestrator {
         }
 
         if lease.tools.contains(.requestInformation), canInitiateCommunication {
-            tools.append(RequestInformationTool())
+            register(
+                [RequestInformationTool()],
+                granting: [.requestInformation],
+                communication: .initiate)
         }
         if lease.tools.contains(.delegateTask), hasDelegationGrant {
-            tools.append(AskAgentTool())
+            register(
+                [AskAgentTool()],
+                granting: [.delegateTask],
+                delegation: .granted)
         }
         if lease.tools.contains(.sendMessage), canInitiateCommunication {
-            tools.append(SendMessageTool())
+            register(
+                [SendMessageTool()],
+                granting: [.sendMessage],
+                communication: .initiate)
         }
         if lease.tools.contains(.replyMessage), canReply {
-            tools.append(ReplyMessageTool())
+            register(
+                [ReplyMessageTool()],
+                granting: [.replyMessage],
+                communication: .reply)
         }
         if lease.tools.contains(.requestDelegation), lease.delegation != .none {
-            tools.append(RequestDelegationTool())
+            register(
+                [RequestDelegationTool()],
+                granting: [.requestDelegation],
+                delegation: .requestOrGranted)
         }
         if lease.tools.contains(.delegateTask), hasDelegationGrant {
-            tools.append(DelegateTaskTool())
+            register(
+                [DelegateTaskTool()],
+                granting: [.delegateTask],
+                delegation: .granted)
         }
         if hasDelegationGrant, lease.tools.contains(.attachWorkspace) {
-            tools.append(SpawnAgentTool())
+            register(
+                [SpawnAgentTool()],
+                granting: [.attachWorkspace],
+                delegation: .granted)
         }
         if lease.tools.contains(.delegateTask), hasDelegationGrant {
-            tools.append(ListAgentsTool())
-            tools.append(RemoveAgentTool())
+            register(
+                [ListAgentsTool(), RemoveAgentTool()],
+                granting: [.delegateTask],
+                delegation: .granted)
         }
-        return ToolRegistry(tools)
+        return ToolRegistry(
+            registrations: registrations,
+            registryVersion: "intatis.cowork.v1")
     }
 
     private static func canCoordinate(_ lease: CapabilityLease) -> Bool {
         guard case .granted = lease.delegation else { return false }
         return lease.tools.contains(.delegateTask)
             || lease.tools.contains(.attachWorkspace)
+    }
+
+    private static func coordinationDepth(_ lease: CapabilityLease) -> Int {
+        guard case .granted(let budget) = lease.delegation,
+              canCoordinate(lease) else { return 0 }
+        return max(1, min(Agent.defaultCoordinationDepth, budget.maxDepth + 1))
     }
 
     private static func hasWorkspaceMutationCapability(_ lease: CapabilityLease) -> Bool {
@@ -6457,8 +7248,12 @@ struct BusMessenger: AgentMessenger {
     let currentTaskID: TaskID?
     let orchestrator: Orchestrator
 
-    func ask(to agent: String, question: String) async -> String {
-        await orchestrator.ask(from: from, to: agent, question: question, parentTaskID: currentTaskID)
+    func ask(to agent: String, question: String) async -> AgentMessengerReply {
+        await orchestrator.askResult(
+            from: from,
+            to: agent,
+            question: question,
+            parentTaskID: currentTaskID)
     }
 
     func sendMessage(to agent: String, content: String) async -> String {
@@ -6477,13 +7272,18 @@ struct BusMessenger: AgentMessenger {
         await orchestrator.requestDelegation(from: from, objective: objective, reason: reason, parentTaskID: currentTaskID)
     }
 
-    func delegateTask(to agent: String?,
+    func delegateTask(authorization: ResolvedToolAuthorization,
+                      to agent: String?,
                       workTaskID: WorkTaskID?,
                       objective: String?,
                       roleHint: String?,
                       expectedDeliverable: String?) async -> String {
-        await orchestrator.delegateTask(
+        guard let agent else {
+            return "error: delegate_task authorization has no concrete target"
+        }
+        return await orchestrator.delegateAuthorizedTask(
             from: from,
+            authorization: authorization,
             to: agent,
             workTaskID: workTaskID,
             objective: objective,

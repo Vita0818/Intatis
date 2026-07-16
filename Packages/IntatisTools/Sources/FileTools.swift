@@ -106,6 +106,7 @@ public struct SearchTextTool: Tool {
 
 public struct WriteFileTool: Tool {
     public init() {}
+    public static let canonicalPermission: String? = "filesystem.edit"
     public static let descriptor = ToolDescriptor(
         name: "write_file",
         description: "Write (create or overwrite) a UTF-8 text file within the workspace.",

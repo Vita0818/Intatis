@@ -425,6 +425,11 @@ public struct PermissionResolutionNotice: Identifiable, Equatable, Sendable {
     public var decision: PermissionDecision
     public var risk: RiskLevel
     public var reason: String
+    public var authorization: ResolvedToolAuthorization?
+    public var source: PermissionApprovalSource?
+    public var reviewTaskID: PermissionReviewTaskID?
+    public var reviewStatus: PermissionReviewStatus?
+    public var failureKind: PermissionApprovalFailureKind?
     public var resolvedSeq: Int
 
     public init(id: String,
@@ -433,6 +438,11 @@ public struct PermissionResolutionNotice: Identifiable, Equatable, Sendable {
                 decision: PermissionDecision,
                 risk: RiskLevel,
                 reason: String,
+                authorization: ResolvedToolAuthorization? = nil,
+                source: PermissionApprovalSource? = nil,
+                reviewTaskID: PermissionReviewTaskID? = nil,
+                reviewStatus: PermissionReviewStatus? = nil,
+                failureKind: PermissionApprovalFailureKind? = nil,
                 resolvedSeq: Int) {
         self.id = id
         self.requestId = requestId
@@ -440,6 +450,11 @@ public struct PermissionResolutionNotice: Identifiable, Equatable, Sendable {
         self.decision = decision
         self.risk = risk
         self.reason = reason
+        self.authorization = authorization
+        self.source = source
+        self.reviewTaskID = reviewTaskID
+        self.reviewStatus = reviewStatus
+        self.failureKind = failureKind
         self.resolvedSeq = resolvedSeq
     }
 }
@@ -468,6 +483,11 @@ public struct PermissionProjection: Equatable, Sendable {
                 decision: resolved.decision,
                 risk: resolved.risk,
                 reason: resolved.reason,
+                authorization: resolved.authorization,
+                source: resolved.source,
+                reviewTaskID: resolved.reviewTaskID,
+                reviewStatus: resolved.reviewStatus,
+                failureKind: resolved.failureKind,
                 resolvedSeq: envelope.seq))
         default:
             break

@@ -170,8 +170,8 @@ private final class ReliabilityMailboxSideEffectThenFailProvider: ToolCallingPro
             if requestNumber == 1 {
                 continuation.yield(.toolCalls([ToolCall(
                     id: "mailbox-reply-side-effect",
-                    name: "reply_message",
-                    arguments: #"{"to":"missing-agent","content":"already attempted"}"#)]))
+                    name: "write_file",
+                    arguments: #"{"path":"mailbox-side-effect.txt","content":"already attempted"}"#)]))
                 continuation.yield(.done(finishReason: "tool_calls"))
                 continuation.finish()
             } else {
@@ -506,11 +506,14 @@ final class OrchestrationReliabilityTests: XCTestCase {
             log: log,
             allowsShell: true,
             responder: FixedResponder(.allow)) { _ in ReliabilityFinalProvider() }
-        await orchestrator.setAdmissionEventAppender { event in
-            if case .agentAttached = event {
+        await orchestrator.setAdmissionEventsAppender { events in
+            if events.contains(where: { event in
+                if case .agentAttached = event { return true }
+                return false
+            }) {
                 throw ReliabilityForcedError.terminalPersistenceFailure
             }
-            _ = try await log.append(event)
+            _ = try await log.append(events)
         }
 
         let attached = await orchestrator.attach(Agent(
@@ -829,7 +832,8 @@ final class OrchestrationReliabilityTests: XCTestCase {
             name: worker,
             workspaceRoot: workerWorkspace,
             model: ModelID(rawValue: "m"),
-            profile: .reviewed))
+            profile: .reviewed,
+            coordinationDepth: Agent.defaultCoordinationDepth))
         XCTAssertTrue(mainAttached)
         XCTAssertTrue(workerAttached)
 
@@ -2175,6 +2179,47 @@ final class OrchestrationReliabilityTests: XCTestCase {
             }
             XCTAssertEqual(queuedAttempts, [1])
         }
+    }
+
+    func testRetryFailsClosedWhenDurableSideEffectHistoryCannotBeVerified() async throws {
+        let name = "retry-corrupt-history-\(UUID().uuidString)"
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("intatis-reliability-\(name)", isDirectory: true)
+            .appendingPathComponent("events.jsonl")
+        defer { try? FileManager.default.removeItem(at: fileURL.deletingLastPathComponent()) }
+        let log = try reliabilityLog(name)
+        let workspace = try reliabilityWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let taskID = TaskID(rawValue: "retry-corrupt-history")
+        try await appendReliabilityTaskWithSettledSideEffect(
+            to: log,
+            workspace: workspace,
+            taskID: taskID,
+            agent: main,
+            terminalStatus: .failed)
+
+        let provider = ReliabilityCapturingProvider()
+        let orchestrator = Orchestrator(
+            log: log,
+            allowsShell: true,
+            responder: FixedResponder(.allow)) { _ in provider }
+        let initialProjection = CoworkProjection.build(from: try await log.replayChecked())
+        await orchestrator.restore(from: initialProjection)
+        let failedView = try XCTUnwrap(initialProjection.tasks[taskID])
+
+        let handle = try FileHandle(forWritingTo: fileURL)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data("{\"invalid\":true}\n".utf8))
+        try handle.synchronize()
+        try handle.close()
+
+        let result = await orchestrator.retry(failedView)
+
+        guard case .failed(let message) = result else {
+            return XCTFail("Retry must fail closed when durable history is corrupt.")
+        }
+        XCTAssertTrue(message.contains("could not be verified"))
+        XCTAssertTrue(provider.requests.isEmpty)
     }
 
     func testRestoreAtMaxAttemptFailsAtLastActualAttemptWithoutPhantomRetry() async throws {

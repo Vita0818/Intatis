@@ -97,6 +97,7 @@ public enum UnifiedDiff {
 
 public struct ApplyPatchTool: Tool {
     public init() {}
+    public static let canonicalPermission: String? = "filesystem.edit"
     public static let descriptor = ToolDescriptor(
         name: "apply_patch",
         description: "Apply a unified diff to files within the workspace.",

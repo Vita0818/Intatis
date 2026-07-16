@@ -83,6 +83,18 @@ public struct PermissionOutcome: Equatable, Sendable {
     }
 }
 
+/// Preserves the exact layer-A result even when PermissionEngine adapts `pass`
+/// to an in-engine reviewer verdict or to `ask_user` for a durable responder.
+public struct PermissionEngineDecision: Equatable, Sendable {
+    public let gate: GateResult
+    public let outcome: PermissionOutcome
+
+    public init(gate: GateResult, outcome: PermissionOutcome) {
+        self.gate = gate
+        self.outcome = outcome
+    }
+}
+
 /// Layer B (v0.3). Only ever consulted for gate `pass` results; can narrow to
 /// deny/ask but can never override a hard deny.
 public protocol PermissionReviewer: Sendable {

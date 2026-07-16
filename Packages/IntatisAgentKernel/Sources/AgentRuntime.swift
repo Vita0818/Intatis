@@ -104,7 +104,9 @@ public struct AgentRuntime: Sendable {
                          rootTaskID: TaskID? = nil,
                          taskAttempt: Int? = nil,
                          executionScope: AgentExecutionScope? = nil,
-                         tokenBudgetMeter: AgentTokenBudgetMeter? = nil) -> AgentLoop {
+                         tokenBudgetMeter: AgentTokenBudgetMeter? = nil,
+                         authorizationPreparer: ToolAuthorizationPreparer? = nil,
+                         authorizationRevalidator: ToolAuthorizationRevalidator? = nil) -> AgentLoop {
         let supplied = context ?? ContextBuilder()
         let runtimeContext = ContextBuilder(
             systemPrompt: supplied.systemPrompt,
@@ -135,6 +137,8 @@ public struct AgentRuntime: Sendable {
             rootTaskID: rootTaskID,
             taskAttempt: taskAttempt,
             executionScope: executionScope,
-            tokenBudgetMeter: tokenBudgetMeter)
+            tokenBudgetMeter: tokenBudgetMeter,
+            authorizationPreparer: authorizationPreparer,
+            authorizationRevalidator: authorizationRevalidator)
     }
 }

@@ -19,24 +19,32 @@ public struct PermissionEngine: Sendable {
     }
 
     public func decide(_ call: ToolCallContext, _ ctx: PermissionContext) async -> PermissionOutcome {
-        switch gate.evaluate(call, ctx) {
+        await decideDetailed(call, ctx).outcome
+    }
+
+    public func decideDetailed(_ call: ToolCallContext,
+                               _ ctx: PermissionContext) async -> PermissionEngineDecision {
+        let gateResult = gate.evaluate(call, ctx)
+        let outcome: PermissionOutcome
+        switch gateResult {
         case .deny(let reason, let risk):
-            return PermissionOutcome(decision: .deny, risk: risk, reason: reason)
+            outcome = PermissionOutcome(decision: .deny, risk: risk, reason: reason)
 
         case .ask(let reason, let risk):
-            return PermissionOutcome(decision: .askUser, risk: risk, reason: reason)
+            outcome = PermissionOutcome(decision: .askUser, risk: risk, reason: reason)
 
         case .allow(let reason, let risk):
-            return PermissionOutcome(decision: .allow, risk: risk, reason: reason)
+            outcome = PermissionOutcome(decision: .allow, risk: risk, reason: reason)
 
         case .pass(let reason, let risk):
             if let reviewer {
-                let outcome = await reviewer.review(call, ctx, gateReason: reason, risk: risk)
+                outcome = await reviewer.review(call, ctx, gateReason: reason, risk: risk)
                 // Safety net: a reviewer can never turn a hard deny into allow; it
                 // only ever sees `pass`, but re-assert that it didn't widen scope.
-                return outcome
+            } else {
+                outcome = PermissionOutcome(decision: .askUser, risk: risk, reason: reason)
             }
-            return PermissionOutcome(decision: .askUser, risk: risk, reason: reason)
         }
+        return PermissionEngineDecision(gate: gateResult, outcome: outcome)
     }
 }

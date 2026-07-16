@@ -7,6 +7,18 @@ import IntatisProtocol
 public protocol PermissionResponder: Sendable {
     /// Returns `.allow` or `.deny` for the given request.
     func requestApproval(_ request: PermissionRequestPayload) async -> PermissionDecision
+    /// Returns the decision together with its authoritative reason/source when
+    /// the responder supports structured settlement.
+    func requestResolution(_ request: PermissionRequestPayload) async -> PermissionApprovalResolution
+}
+
+public extension PermissionResponder {
+    func requestResolution(_ request: PermissionRequestPayload) async -> PermissionApprovalResolution {
+        PermissionApprovalResolution(
+            decision: await requestApproval(request),
+            risk: request.risk,
+            source: .user)
+    }
 }
 
 /// Convenience responder that always returns the same decision (tests / autopilot UI off).

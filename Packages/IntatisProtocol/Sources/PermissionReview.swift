@@ -27,13 +27,16 @@ public struct PermissionReviewGateSnapshot: Codable, Equatable, Sendable {
     public var decision: PermissionReviewGateDecision
     public var risk: RiskLevel
     public var reason: String
+    public var policyVersion: String?
 
     public init(decision: PermissionReviewGateDecision,
                 risk: RiskLevel,
-                reason: String) {
+                reason: String,
+                policyVersion: String? = nil) {
         self.decision = decision
         self.risk = risk
         self.reason = reason
+        self.policyVersion = policyVersion
     }
 }
 
@@ -82,6 +85,9 @@ public struct PermissionRequestContext: Codable, Equatable, Sendable {
     public var workspaceLease: WorkspaceLease?
     public var taskContract: TaskContract?
     public var causalContext: PermissionReviewCausalContext?
+    /// Host-resolved concrete tool/capability facts. Reviewers consume this
+    /// snapshot instead of inferring tool membership from capability names.
+    public var authorization: ResolvedToolAuthorization?
     /// Reserved for crash-reconciliation/idempotency integration.
     public var executionID: String?
     /// Forward-compatible policy label such as `safe_replay` or
@@ -103,6 +109,7 @@ public struct PermissionRequestContext: Codable, Equatable, Sendable {
                 workspaceLease: WorkspaceLease? = nil,
                 taskContract: TaskContract? = nil,
                 causalContext: PermissionReviewCausalContext? = nil,
+                authorization: ResolvedToolAuthorization? = nil,
                 executionID: String? = nil,
                 replayPolicy: String? = nil) {
         self.taskID = taskID
@@ -120,6 +127,7 @@ public struct PermissionRequestContext: Codable, Equatable, Sendable {
         self.workspaceLease = workspaceLease
         self.taskContract = taskContract
         self.causalContext = causalContext
+        self.authorization = authorization
         self.executionID = executionID
         self.replayPolicy = replayPolicy
     }
@@ -127,7 +135,7 @@ public struct PermissionRequestContext: Codable, Equatable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case taskID, rootTaskID, parentTaskID, attempt, toolCallID, normalizedArgs
         case touchedPaths, risksNetwork, sideEffect, intent, gate, capabilityLease
-        case workspaceLease, taskContract, causalContext, executionID, replayPolicy
+        case workspaceLease, taskContract, causalContext, authorization, executionID, replayPolicy
     }
 
     public init(from decoder: Decoder) throws {
@@ -147,6 +155,7 @@ public struct PermissionRequestContext: Codable, Equatable, Sendable {
         workspaceLease = try container.decodeIfPresent(WorkspaceLease.self, forKey: .workspaceLease)
         taskContract = try container.decodeIfPresent(TaskContract.self, forKey: .taskContract)
         causalContext = try container.decodeIfPresent(PermissionReviewCausalContext.self, forKey: .causalContext)
+        authorization = try container.decodeIfPresent(ResolvedToolAuthorization.self, forKey: .authorization)
         executionID = try container.decodeIfPresent(String.self, forKey: .executionID)
         replayPolicy = try container.decodeIfPresent(String.self, forKey: .replayPolicy)
     }
@@ -168,6 +177,7 @@ public struct PermissionRequestContext: Codable, Equatable, Sendable {
         try container.encodeIfPresent(workspaceLease, forKey: .workspaceLease)
         try container.encodeIfPresent(taskContract, forKey: .taskContract)
         try container.encodeIfPresent(causalContext, forKey: .causalContext)
+        try container.encodeIfPresent(authorization, forKey: .authorization)
         try container.encodeIfPresent(executionID, forKey: .executionID)
         try container.encodeIfPresent(replayPolicy, forKey: .replayPolicy)
     }
@@ -198,6 +208,7 @@ public struct PermissionReviewTask: Codable, Equatable, Sendable {
     public var workspaceLease: WorkspaceLease?
     public var taskContract: TaskContract?
     public var causalContext: PermissionReviewCausalContext
+    public var authorization: ResolvedToolAuthorization?
     public var executionID: String?
     public var replayPolicy: String?
     public var createdAt: Date
@@ -224,6 +235,7 @@ public struct PermissionReviewTask: Codable, Equatable, Sendable {
                 workspaceLease: WorkspaceLease? = nil,
                 taskContract: TaskContract? = nil,
                 causalContext: PermissionReviewCausalContext = .init(),
+                authorization: ResolvedToolAuthorization? = nil,
                 executionID: String? = nil,
                 replayPolicy: String? = nil,
                 createdAt: Date = Date(),
@@ -249,6 +261,7 @@ public struct PermissionReviewTask: Codable, Equatable, Sendable {
         self.workspaceLease = workspaceLease
         self.taskContract = taskContract
         self.causalContext = causalContext
+        self.authorization = authorization
         self.executionID = executionID
         self.replayPolicy = replayPolicy
         self.createdAt = createdAt
@@ -302,6 +315,8 @@ public struct PermissionReviewSettledPayload: Codable, Equatable, Sendable {
     public var risk: RiskLevel
     public var status: PermissionReviewStatus
     public var reason: String
+    public var failureKind: PermissionApprovalFailureKind?
+    public var authorization: ResolvedToolAuthorization?
     public var usage: PermissionReviewUsage?
     public var cumulativeTokens: Int?
     public var durationMillis: Int
@@ -317,6 +332,8 @@ public struct PermissionReviewSettledPayload: Codable, Equatable, Sendable {
                 risk: RiskLevel,
                 status: PermissionReviewStatus,
                 reason: String,
+                failureKind: PermissionApprovalFailureKind? = nil,
+                authorization: ResolvedToolAuthorization? = nil,
                 usage: PermissionReviewUsage? = nil,
                 cumulativeTokens: Int? = nil,
                 durationMillis: Int,
@@ -331,6 +348,8 @@ public struct PermissionReviewSettledPayload: Codable, Equatable, Sendable {
         self.risk = risk
         self.status = status
         self.reason = reason
+        self.failureKind = failureKind
+        self.authorization = authorization
         self.usage = usage
         self.cumulativeTokens = cumulativeTokens
         self.durationMillis = durationMillis

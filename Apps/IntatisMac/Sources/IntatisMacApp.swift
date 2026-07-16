@@ -784,8 +784,6 @@ struct CoworkSessionView: View {
 
 @main
 struct IntatisMacApp: App {
-    @StateObject private var env = AppEnvironment()
-
     private var launchAppearance: ColorScheme? {
         #if DEBUG
         let arguments = ProcessInfo.processInfo.arguments
@@ -797,11 +795,29 @@ struct IntatisMacApp: App {
 
     var body: some Scene {
         WindowGroup {
-            IntatisMacRootView()
-                .environmentObject(env)
-                .preferredColorScheme(launchAppearance)
+            #if DEBUG
+            if ProcessInfo.processInfo.arguments.contains("-IntatisRendererFixture") {
+                RendererFixtureView()
+                    .preferredColorScheme(launchAppearance)
+            } else {
+                IntatisProductionRootView(launchAppearance: launchAppearance)
+            }
+            #else
+            IntatisProductionRootView(launchAppearance: launchAppearance)
+            #endif
         }
         .defaultSize(width: 1100, height: 760)
+    }
+}
+
+private struct IntatisProductionRootView: View {
+    @StateObject private var env = AppEnvironment()
+    let launchAppearance: ColorScheme?
+
+    var body: some View {
+        IntatisMacRootView()
+            .environmentObject(env)
+            .preferredColorScheme(launchAppearance)
     }
 }
 #else

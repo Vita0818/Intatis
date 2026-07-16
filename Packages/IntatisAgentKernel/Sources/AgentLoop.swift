@@ -6,6 +6,38 @@ import IntatisTools
 import IntatisPermission
 import IntatisConversation
 
+public typealias ToolAuthorizationRevalidator = @Sendable (
+    ResolvedToolAuthorization
+) async -> String?
+
+/// Host preflight performed after schema validation but before the immutable
+/// authorization snapshot is created. Cowork uses it to turn symbolic targets
+/// such as delegate_task(to:auto) into concrete resources for review without
+/// mutating the roster, leases, scheduler, or event log.
+public struct ToolAuthorizationPreparationRequest: Sendable {
+    public let authorizationID: String
+    public let toolName: String
+    public let normalizedArguments: String
+    public let baseIntent: PermissionIntent
+    public let invocation: ToolAuthorizationInvocationContext
+
+    public init(authorizationID: String,
+                toolName: String,
+                normalizedArguments: String,
+                baseIntent: PermissionIntent,
+                invocation: ToolAuthorizationInvocationContext) {
+        self.authorizationID = authorizationID
+        self.toolName = toolName
+        self.normalizedArguments = normalizedArguments
+        self.baseIntent = baseIntent
+        self.invocation = invocation
+    }
+}
+
+public typealias ToolAuthorizationPreparer = @Sendable (
+    ToolAuthorizationPreparationRequest
+) async throws -> PermissionIntent
+
 /// Terminal failures produced by the agent loop itself, rather than by a
 /// provider or tool. Callers can distinguish these from a successful (possibly
 /// empty) final response without parsing an event-log message.
@@ -16,6 +48,7 @@ public enum AgentLoopError: Error, Sendable, Equatable, LocalizedError {
     case incompleteFinishReason(String)
     case toolExecutionRequiresManualReconciliation(tool: String, executionID: String, reason: String)
     case repeatedDeniedToolCall(tool: String)
+    case unresolvedDeniedSideEffects([String])
 
     public var errorDescription: String? {
         switch self {
@@ -31,6 +64,8 @@ public enum AgentLoopError: Error, Sendable, Equatable, LocalizedError {
             return "Tool \(tool) may have produced a side effect before it failed (execution \(executionID)); manual reconciliation is required before retrying. \(reason)"
         case .repeatedDeniedToolCall(let tool):
             return "Agent repeatedly retried the identical denied tool call \(tool); the task was stopped to protect the automatic permission reviewer."
+        case .unresolvedDeniedSideEffects(let actions):
+            return "Agent invocation cannot complete because required side effects remain denied or failed: \(actions.joined(separator: "; "))."
         }
     }
 }
@@ -55,18 +90,217 @@ private actor ToolDenialCircuitBreaker {
     }
 }
 
+/// Host-derived completion evidence for Cowork. A model cannot turn a denied
+/// mutating/network/exec action into a successful invocation merely by ending
+/// its response. A later successful execution against the same capability and
+/// resources clears the outstanding denial.
+private actor SideEffectEvidenceLedger {
+    private struct Key: Hashable {
+        var authority: String
+        var resources: [String]
+    }
+
+    private var unresolved: [Key: String] = [:]
+
+    /// Rebuilds completion evidence from the append-only log for the current
+    /// Cowork task. This closes the crash window between a durable permission
+    /// decision and a durable successful tool settlement: a restarted
+    /// invocation cannot simply claim completion while an earlier required
+    /// side effect for the same task still lacks host-derived success evidence.
+    func restore(from envelopes: [Envelope],
+                 taskID: TaskID,
+                 throughAttempt: Int?) {
+        for envelope in envelopes {
+            switch envelope.event {
+            case .permissionRequest(let payload):
+                guard let context = payload.context,
+                      let authorization = context.authorization,
+                      Self.belongsToCurrentTask(
+                        authorization: authorization,
+                        taskID: taskID,
+                        throughAttempt: throughAttempt)
+                else { continue }
+                recordDenied(
+                    tool: payload.tool,
+                    intent: context.intent ?? authorization.intent,
+                    authorization: authorization)
+
+            case .permissionReviewRequested(let payload):
+                guard let authorization = payload.task.authorization,
+                      Self.belongsToCurrentTask(
+                        authorization: authorization,
+                        taskID: taskID,
+                        throughAttempt: throughAttempt)
+                else { continue }
+                recordDenied(
+                    tool: payload.task.tool,
+                    intent: payload.task.intent ?? authorization.intent,
+                    authorization: authorization)
+
+            case .permissionReviewSettled(let payload):
+                guard let authorization = payload.authorization,
+                      Self.belongsToCurrentTask(
+                        authorization: authorization,
+                        taskID: taskID,
+                        throughAttempt: throughAttempt)
+                else { continue }
+                recordDenied(
+                    tool: payload.tool,
+                    intent: authorization.intent,
+                    authorization: authorization)
+
+            case .permissionResolved(let payload):
+                guard let authorization = payload.authorization,
+                      Self.belongsToCurrentTask(
+                        authorization: authorization,
+                        taskID: taskID,
+                        throughAttempt: throughAttempt)
+                else { continue }
+                recordDenied(
+                    tool: payload.tool,
+                    intent: payload.intent ?? authorization.intent,
+                    authorization: authorization)
+
+            case .toolExecutionPrepared(let payload):
+                guard Self.belongsToCurrentTask(
+                    payloadTaskID: payload.taskID,
+                    payloadAttempt: payload.attempt,
+                    authorization: payload.authorization,
+                    taskID: taskID,
+                    throughAttempt: throughAttempt),
+                    let intent = payload.intent ?? payload.authorization?.intent
+                else { continue }
+                recordDenied(
+                    tool: payload.tool,
+                    intent: intent,
+                    authorization: payload.authorization)
+
+            case .toolExecutionSettled(let payload):
+                guard Self.belongsToCurrentTask(
+                    payloadTaskID: payload.taskID,
+                    payloadAttempt: payload.attempt,
+                    authorization: payload.authorization,
+                    taskID: taskID,
+                    throughAttempt: throughAttempt),
+                    let intent = payload.intent ?? payload.authorization?.intent
+                else { continue }
+                if payload.outcome == .succeeded,
+                   let authorization = payload.authorization {
+                    recordSucceeded(intent: intent, authorization: authorization)
+                } else {
+                    recordDenied(
+                        tool: payload.tool,
+                        intent: intent,
+                        authorization: payload.authorization)
+                }
+
+            default:
+                continue
+            }
+        }
+    }
+
+    func recordDenied(tool: String,
+                      intent: PermissionIntent,
+                      authorization: ResolvedToolAuthorization?) {
+        guard Self.requiresExecutionEvidence(intent) else { return }
+        let key = Self.key(intent: intent, authorization: authorization)
+        unresolved[key] = Self.description(tool: tool, intent: intent)
+    }
+
+    func recordSucceeded(intent: PermissionIntent,
+                         authorization: ResolvedToolAuthorization) {
+        guard Self.requiresExecutionEvidence(intent) else { return }
+        let succeededKey = Self.key(
+            intent: intent,
+            authorization: authorization)
+        unresolved.removeValue(forKey: succeededKey)
+        // A malformed mutating call may not expose a usable resource yet. A
+        // later successful action in the same canonical permission family is
+        // the strongest host-derived remediation available for that wildcard.
+        unresolved.removeValue(forKey: Key(
+            authority: succeededKey.authority,
+            resources: []))
+    }
+
+    func unresolvedDescriptions() -> [String] {
+        unresolved.values.sorted()
+    }
+
+    private static func requiresExecutionEvidence(_ intent: PermissionIntent) -> Bool {
+        !intent.controlEffects.isEmpty || intent.dataEffects.contains { effect in
+            effect != .none && effect != .read
+        }
+    }
+
+    private static func key(intent: PermissionIntent,
+                            authorization: ResolvedToolAuthorization?) -> Key {
+        let capabilities = authorization?.requiredCapabilities.map(\.rawValue).sorted() ?? []
+        let semanticAction: String
+        if let canonicalPermission = authorization?.canonicalPermission {
+            semanticAction = canonicalPermission
+        } else if authorization?.requiredCapabilities.contains(.applyPatch) == true
+            || intent.action == "filesystem.write"
+            || intent.action == "filesystem.patch" {
+            semanticAction = "filesystem.edit"
+        } else {
+            semanticAction = intent.action
+        }
+        let authority = capabilities.isEmpty
+            ? "action:\(semanticAction)"
+            : "capabilities:\(capabilities.joined(separator: ","))|action:\(semanticAction)"
+        let resources = intent.resources.map { resource in
+            "\(resource.kind.rawValue):\(resource.value):\(resource.access?.rawValue ?? "")"
+        }.sorted()
+        return Key(authority: authority, resources: resources)
+    }
+
+    private static func belongsToCurrentTask(
+        authorization: ResolvedToolAuthorization,
+        taskID: TaskID,
+        throughAttempt: Int?
+    ) -> Bool {
+        belongsToCurrentTask(
+            payloadTaskID: authorization.taskID,
+            payloadAttempt: authorization.attempt,
+            authorization: authorization,
+            taskID: taskID,
+            throughAttempt: throughAttempt)
+    }
+
+    private static func belongsToCurrentTask(
+        payloadTaskID: TaskID?,
+        payloadAttempt: Int?,
+        authorization: ResolvedToolAuthorization?,
+        taskID: TaskID,
+        throughAttempt: Int?
+    ) -> Bool {
+        guard (payloadTaskID ?? authorization?.taskID) == taskID else { return false }
+        guard let throughAttempt else { return true }
+        guard let eventAttempt = payloadAttempt ?? authorization?.attempt else { return true }
+        return eventAttempt <= throughAttempt
+    }
+
+    private static func description(tool: String, intent: PermissionIntent) -> String {
+        let resources = intent.resources.map(\.value).sorted().joined(separator: ", ")
+        return resources.isEmpty
+            ? "\(tool) (\(intent.action))"
+            : "\(tool) (\(intent.action)) on \(resources)"
+    }
+}
+
 /// Resolves the kernel-side permission wait exactly once. The approval request
 /// runs in its own task so cancelling an AgentLoop never depends on a responder
 /// cooperatively returning from its UI/network wait.
 private final class PermissionApprovalGate: @unchecked Sendable {
     private let lock = NSLock()
-    private var continuation: CheckedContinuation<PermissionDecision, Error>?
-    private var pendingResult: Result<PermissionDecision, Error>?
+    private var continuation: CheckedContinuation<PermissionApprovalResolution, Error>?
+    private var pendingResult: Result<PermissionApprovalResolution, Error>?
     private var approvalTask: Task<Void, Never>?
     private var isResolved = false
 
-    func install(_ continuation: CheckedContinuation<PermissionDecision, Error>) {
-        let result: Result<PermissionDecision, Error>?
+    func install(_ continuation: CheckedContinuation<PermissionApprovalResolution, Error>) {
+        let result: Result<PermissionApprovalResolution, Error>?
         lock.lock()
         if let pendingResult {
             result = pendingResult
@@ -96,8 +330,8 @@ private final class PermissionApprovalGate: @unchecked Sendable {
         }
     }
 
-    func resolve(_ result: Result<PermissionDecision, Error>) {
-        let continuation: CheckedContinuation<PermissionDecision, Error>?
+    func resolve(_ result: Result<PermissionApprovalResolution, Error>) {
+        let continuation: CheckedContinuation<PermissionApprovalResolution, Error>?
         let taskToCancel: Task<Void, Never>?
         lock.lock()
         guard !isResolved else {
@@ -157,6 +391,8 @@ public struct AgentLoop: Sendable {
     private let taskAttempt: Int?
     private let executionScope: AgentExecutionScope?
     private let tokenBudgetMeter: AgentTokenBudgetMeter?
+    private let authorizationPreparer: ToolAuthorizationPreparer?
+    private let authorizationRevalidator: ToolAuthorizationRevalidator?
 
     public init(log: EventLog,
                 provider: ToolCallingProvider,
@@ -181,7 +417,9 @@ public struct AgentLoop: Sendable {
                 rootTaskID: TaskID? = nil,
                 taskAttempt: Int? = nil,
                 executionScope: AgentExecutionScope? = nil,
-                tokenBudgetMeter: AgentTokenBudgetMeter? = nil) {
+                tokenBudgetMeter: AgentTokenBudgetMeter? = nil,
+                authorizationPreparer: ToolAuthorizationPreparer? = nil,
+                authorizationRevalidator: ToolAuthorizationRevalidator? = nil) {
         self.log = log
         self.provider = provider
         self.registry = registry
@@ -206,6 +444,8 @@ public struct AgentLoop: Sendable {
         self.taskAttempt = taskAttempt
         self.executionScope = executionScope
         self.tokenBudgetMeter = tokenBudgetMeter
+        self.authorizationPreparer = authorizationPreparer
+        self.authorizationRevalidator = authorizationRevalidator
     }
 
     /// Runs the loop and returns the agent's explicitly completed final answer.
@@ -215,7 +455,17 @@ public struct AgentLoop: Sendable {
                      images: [ImageAttachment] = [],
                      userMessage: UserMessagePayload? = nil,
                      recordUserMessage: Bool = true) async throws -> String {
-        let history = await projectedHistory()
+        let recoveredCoworkEvents: [Envelope]?
+        if context.runtimeEnvironment.mode == .cowork,
+           context.taskContract?.id != nil {
+            // A missing/corrupt security event must not be confused with an
+            // empty history. Verify the durable evidence before this run adds
+            // any new events or asks a provider to continue the task.
+            recoveredCoworkEvents = try await log.replayChecked()
+        } else {
+            recoveredCoworkEvents = nil
+        }
+        let history = await projectedHistory(recoveredEvents: recoveredCoworkEvents)
         if recordUserMessage {
             try await log.append(.userMessage(userMessage ?? UserMessagePayload(text: userText)))
         }
@@ -228,6 +478,15 @@ public struct AgentLoop: Sendable {
         var usage: Usage?
         var turnStatsAppended = false
         let denialCircuitBreaker = ToolDenialCircuitBreaker()
+        let sideEffectEvidence = SideEffectEvidenceLedger()
+        if context.runtimeEnvironment.mode == .cowork,
+           let taskID = context.taskContract?.id,
+           let recoveredCoworkEvents {
+            await sideEffectEvidence.restore(
+                from: recoveredCoworkEvents,
+                taskID: taskID,
+                throughAttempt: taskAttempt)
+        }
 
         do {
         for _ in 0..<maxIterations {
@@ -338,6 +597,14 @@ public struct AgentLoop: Sendable {
                 throw AgentLoopError.incompleteFinishReason(finishReason)
             }
 
+            if pendingToolCalls.isEmpty,
+               context.runtimeEnvironment.mode == .cowork {
+                let unresolved = await sideEffectEvidence.unresolvedDescriptions()
+                if !unresolved.isEmpty {
+                    throw AgentLoopError.unresolvedDeniedSideEffects(unresolved)
+                }
+            }
+
             if !assistantText.isEmpty {
                 try await log.append(.messageCompleted(
                     MessageCompletedPayload(messageId: assistantID, role: .agent, agent: agent.name, text: assistantText)))
@@ -353,7 +620,8 @@ public struct AgentLoop: Sendable {
             convo.append(.assistant(toolCalls: pendingToolCalls, content: assistantText.isEmpty ? nil : assistantText))
             let observations = try await runToolCalls(
                 pendingToolCalls,
-                denialCircuitBreaker: denialCircuitBreaker)
+                denialCircuitBreaker: denialCircuitBreaker,
+                sideEffectEvidence: sideEffectEvidence)
             for (toolCall, observation) in zip(pendingToolCalls, observations) {
                 try Task.checkCancellation()
                 convo.append(.tool(id: toolCall.id, content: observation))
@@ -417,6 +685,8 @@ public struct AgentLoop: Sendable {
             code = "manual_reconciliation"
         case .repeatedDeniedToolCall:
             code = "repeated_denied_tool_call"
+        case .unresolvedDeniedSideEffects:
+            code = "unresolved_denied_side_effects"
         }
         return ErrorPayload(code: code, message: loopError.localizedDescription)
     }
@@ -556,7 +826,8 @@ public struct AgentLoop: Sendable {
     // MARK: - Tool execution with permission
 
     private func runToolCalls(_ toolCalls: [ToolCall],
-                              denialCircuitBreaker: ToolDenialCircuitBreaker) async throws -> [String] {
+                              denialCircuitBreaker: ToolDenialCircuitBreaker,
+                              sideEffectEvidence: SideEffectEvidenceLedger) async throws -> [String] {
         let parallelCollaborationTools = Set(["ask_agent", "delegate_task"])
         guard toolCalls.count > 1,
               toolCalls.allSatisfy({ parallelCollaborationTools.contains($0.name) }) else {
@@ -566,7 +837,8 @@ public struct AgentLoop: Sendable {
                 try Task.checkCancellation()
                 results.append(try await runTool(
                     toolCall,
-                    denialCircuitBreaker: denialCircuitBreaker))
+                    denialCircuitBreaker: denialCircuitBreaker,
+                    sideEffectEvidence: sideEffectEvidence))
             }
             return results
         }
@@ -576,7 +848,8 @@ public struct AgentLoop: Sendable {
                 group.addTask {
                     (index, try await runTool(
                         toolCall,
-                        denialCircuitBreaker: denialCircuitBreaker))
+                        denialCircuitBreaker: denialCircuitBreaker,
+                        sideEffectEvidence: sideEffectEvidence))
                 }
             }
             var indexed: [(Int, String)] = []
@@ -587,47 +860,84 @@ public struct AgentLoop: Sendable {
     }
 
     private func runTool(_ toolCall: ToolCall,
-                         denialCircuitBreaker: ToolDenialCircuitBreaker) async throws -> String {
+                         denialCircuitBreaker: ToolDenialCircuitBreaker,
+                         sideEffectEvidence: SideEffectEvidenceLedger) async throws -> String {
         try Task.checkCancellation()
         try await log.append(.toolCall(ToolCallPayload(
             toolCallId: toolCall.id, agent: agent.name, name: toolCall.name, args: toolCall.arguments)))
 
         guard let tool = registry.tool(named: toolCall.name) else {
+            let denialSignature = "unknown\u{001F}\(toolCall.name)\u{001F}\(toolCall.arguments.trimmingCharacters(in: .whitespacesAndNewlines))"
+            if let repeatedAttempt = await denialCircuitBreaker.noteRepeatedAttempt(
+                signature: denialSignature),
+               repeatedAttempt >= 3 {
+                throw AgentLoopError.repeatedDeniedToolCall(tool: toolCall.name)
+            }
             let available = registry.descriptors().map(\.name).sorted().joined(separator: ", ")
             let message = available.isEmpty
                 ? "unknown tool: \(toolCall.name)"
                 : "unknown tool: \(toolCall.name). Available tools: \(available)"
             try await log.append(.toolResult(ToolResultPayload(toolCallId: toolCall.id, observation: message)))
+            await denialCircuitBreaker.recordDenial(signature: denialSignature)
             return message
         }
 
         let descriptor = type(of: tool).descriptor
+        let effectiveWorkspaceRoot = workspaceLease.map { URL(fileURLWithPath: $0.rootPath) }
+            ?? agent.workspaceRoot
         let normalizedArguments: String
         switch normalizeToolArguments(toolCall.arguments, descriptor: descriptor) {
         case .valid(let arguments):
             normalizedArguments = arguments
         case .invalid(let message):
+            let denialSignature = "invalid\u{001F}\(descriptor.name)\u{001F}\(toolCall.arguments.trimmingCharacters(in: .whitespacesAndNewlines))"
+            if let repeatedAttempt = await denialCircuitBreaker.noteRepeatedAttempt(
+                signature: denialSignature),
+               repeatedAttempt >= 3 {
+                throw AgentLoopError.repeatedDeniedToolCall(tool: descriptor.name)
+            }
             try await log.append(.toolResult(ToolResultPayload(toolCallId: toolCall.id, observation: message)))
+            await denialCircuitBreaker.recordDenial(signature: denialSignature)
+            await sideEffectEvidence.recordDenied(
+                tool: descriptor.name,
+                intent: invalidInputIntent(
+                    tool: tool,
+                    descriptor: descriptor,
+                    rawArguments: toolCall.arguments,
+                    workspaceRoot: effectiveWorkspaceRoot),
+                authorization: nil)
             return message
         }
 
         let args = ToolArgs(raw: normalizedArguments)
-        let effectiveWorkspaceRoot = workspaceLease.map { URL(fileURLWithPath: $0.rootPath) }
-            ?? agent.workspaceRoot
         let touchedPaths = tool.touchedPaths(args)
-        let intent = tool.permissionIntent(args, workspaceRoot: effectiveWorkspaceRoot)
+        let baseIntent = tool.permissionIntent(args, workspaceRoot: effectiveWorkspaceRoot)
+        let risksNetwork = tool.risksNetwork(args)
+        let sessionID = await log.sessionID
+        let authorizationInvocation = ToolAuthorizationInvocationContext(
+            sessionID: sessionID,
+            agent: agent.name,
+            taskID: context.taskContract?.id,
+            rootTaskID: rootTaskID,
+            parentTaskID: context.taskContract?.parentTaskID,
+            attempt: taskAttempt,
+            toolCallID: toolCall.id,
+            taskObjective: context.taskContract.map {
+                String($0.objective.prefix(1_200))
+            })
         let denialSignature = descriptor.name + "\u{001F}" + normalizedArguments
         if let repeatedAttempt = await denialCircuitBreaker.noteRepeatedAttempt(
             signature: denialSignature) {
             let reason = "identical tool call was already denied in this agent run"
-            let message = "permission denied: \(reason)"
+            let message = Self.permissionDeniedMessage(reason)
             try await log.append([
                 .permissionResolved(PermissionResolvedPayload(
                     tool: descriptor.name,
                     decision: .deny,
                     risk: .medium,
                     reason: reason,
-                    intent: intent)),
+                    intent: baseIntent,
+                    source: .deterministicPolicy)),
                 .toolResult(ToolResultPayload(
                     toolCallId: toolCall.id,
                     observation: message)),
@@ -635,31 +945,115 @@ public struct AgentLoop: Sendable {
             if repeatedAttempt >= 3 {
                 throw AgentLoopError.repeatedDeniedToolCall(tool: descriptor.name)
             }
+            await sideEffectEvidence.recordDenied(
+                tool: descriptor.name,
+                intent: baseIntent,
+                authorization: nil)
+            return message
+        }
+
+        let authorizationID = IDGen.random(prefix: "tool-authorization")
+        let intent: PermissionIntent
+        do {
+            if let authorizationPreparer {
+                intent = try await authorizationPreparer(
+                    ToolAuthorizationPreparationRequest(
+                        authorizationID: authorizationID,
+                        toolName: descriptor.name,
+                        normalizedArguments: normalizedArguments,
+                        baseIntent: baseIntent,
+                        invocation: authorizationInvocation))
+            } else {
+                intent = baseIntent
+            }
+        } catch {
+            let reason = "authorization preflight failed: \(error.localizedDescription)"
+            let message = Self.permissionDeniedMessage(reason)
+            try await log.append([
+                .permissionResolved(PermissionResolvedPayload(
+                    tool: descriptor.name,
+                    decision: .deny,
+                    risk: .high,
+                    reason: reason,
+                    intent: baseIntent,
+                    source: .authorizationRevalidation,
+                    failureKind: .authorizationSnapshotInvalid)),
+                .toolResult(ToolResultPayload(
+                    toolCallId: toolCall.id,
+                    observation: message)),
+            ])
+            await denialCircuitBreaker.recordDenial(signature: denialSignature)
+            await sideEffectEvidence.recordDenied(
+                tool: descriptor.name,
+                intent: baseIntent,
+                authorization: nil)
+            return message
+        }
+
+        var authorization: ResolvedToolAuthorization
+        do {
+            authorization = try registry.resolveAuthorization(
+                toolName: descriptor.name,
+                intent: intent,
+                risksNetwork: risksNetwork,
+                normalizedArguments: normalizedArguments,
+                authorizationID: authorizationID,
+                invocation: authorizationInvocation,
+                capabilityLease: capabilityLease,
+                workspaceLease: workspaceLease)
+        } catch {
+            let reason = error.localizedDescription
+            let message = Self.permissionDeniedMessage(reason)
+            try await log.append([
+                .permissionResolved(PermissionResolvedPayload(
+                    tool: descriptor.name,
+                    decision: .deny,
+                    risk: .high,
+                    reason: reason,
+                    intent: intent,
+                    source: .authorizationRevalidation,
+                    failureKind: .authorizationSnapshotInvalid)),
+                .toolResult(ToolResultPayload(
+                    toolCallId: toolCall.id,
+                    observation: message)),
+            ])
+            await denialCircuitBreaker.recordDenial(
+                signature: descriptor.name + "\u{001F}" + normalizedArguments)
+            await sideEffectEvidence.recordDenied(
+                tool: descriptor.name,
+                intent: intent,
+                authorization: nil)
             return message
         }
         if let leaseFailure = workspaceLeaseFailure(
             intent: intent,
             touchedPaths: touchedPaths) {
-            let message = "permission denied: \(leaseFailure)"
+            let message = Self.permissionDeniedMessage(leaseFailure)
             try await log.append([
                 .permissionResolved(PermissionResolvedPayload(
                     tool: descriptor.name,
                     decision: .deny,
                     risk: .high,
                     reason: leaseFailure,
-                    intent: intent)),
+                    intent: intent,
+                    authorization: authorization,
+                    source: .deterministicPolicy)),
                 .toolResult(ToolResultPayload(
                     toolCallId: toolCall.id,
                     observation: message)),
             ])
             await denialCircuitBreaker.recordDenial(signature: denialSignature)
+            await sideEffectEvidence.recordDenied(
+                tool: descriptor.name,
+                intent: intent,
+                authorization: authorization)
             return message
         }
         let callContext = ToolCallContext(
             toolName: descriptor.name,
             sideEffect: descriptor.sideEffect,
             touchedPaths: touchedPaths,
-            risksNetwork: tool.risksNetwork(args),
+            risksNetwork: risksNetwork,
             rawArgs: normalizedArguments,
             intent: intent)
         let effectiveProfile: PermissionProfile = workspaceLease?.access == .readOnly
@@ -671,7 +1065,41 @@ public struct AgentLoop: Sendable {
             allowsShell: allowsShell,
             agent: agent.name)
 
-        let outcome = await engine.decide(callContext, permissionContext)
+        let engineDecision = await engine.decideDetailed(callContext, permissionContext)
+        let outcome = engineDecision.outcome
+        authorization = authorization.withDeterministicGate(
+            Self.gateSnapshot(engineDecision.gate))
+        if outcome.decision != .deny,
+           let authorizationFailure = await authorizationRevalidationFailure(
+            authorization,
+            toolName: descriptor.name,
+            normalizedArguments: normalizedArguments,
+            intent: intent,
+            risksNetwork: risksNetwork,
+            invocation: authorizationInvocation
+           ) {
+            let message = Self.permissionDeniedMessage(authorizationFailure)
+            try await log.append([
+                .permissionResolved(PermissionResolvedPayload(
+                    tool: descriptor.name,
+                    decision: .deny,
+                    risk: .high,
+                    reason: authorizationFailure,
+                    intent: intent,
+                    authorization: authorization,
+                    source: .authorizationRevalidation,
+                    failureKind: .authorizationSnapshotInvalid)),
+                .toolResult(ToolResultPayload(
+                    toolCallId: toolCall.id,
+                    observation: message)),
+            ])
+            await denialCircuitBreaker.recordDenial(signature: denialSignature)
+            await sideEffectEvidence.recordDenied(
+                tool: descriptor.name,
+                intent: intent,
+                authorization: authorization)
+            return message
+        }
         try Task.checkCancellation()
         let executionID = IDGen.random(prefix: "tool-execution")
         let replayPolicy = intent.replayPolicy
@@ -681,14 +1109,50 @@ public struct AgentLoop: Sendable {
                                                           name: toolCall.name,
                                                           arguments: normalizedArguments),
                                        callContext: callContext,
+                                       authorization: authorization,
                                        executionID: executionID,
                                        replayPolicy: replayPolicy)
         try Task.checkCancellation()
 
         guard settled.decision == .allow else {
-            let message = "permission denied: \(settled.reason)"
+            let message = Self.permissionDeniedMessage(settled.reason)
             try await log.append(.toolResult(ToolResultPayload(toolCallId: toolCall.id, observation: message)))
             await denialCircuitBreaker.recordDenial(signature: denialSignature)
+            await sideEffectEvidence.recordDenied(
+                tool: descriptor.name,
+                intent: intent,
+                authorization: authorization)
+            return message
+        }
+
+        if let authorizationFailure = await authorizationRevalidationFailure(
+            authorization,
+            toolName: descriptor.name,
+            normalizedArguments: normalizedArguments,
+            intent: intent,
+            risksNetwork: risksNetwork,
+            invocation: authorizationInvocation
+        ) {
+            let message = Self.permissionDeniedMessage(authorizationFailure)
+            try await log.append([
+                .permissionResolved(PermissionResolvedPayload(
+                    tool: descriptor.name,
+                    decision: .deny,
+                    risk: .high,
+                    reason: authorizationFailure,
+                    intent: intent,
+                    authorization: authorization,
+                    source: .authorizationRevalidation,
+                    failureKind: .authorizationSnapshotInvalid)),
+                .toolResult(ToolResultPayload(
+                    toolCallId: toolCall.id,
+                    observation: message)),
+            ])
+            await denialCircuitBreaker.recordDenial(signature: denialSignature)
+            await sideEffectEvidence.recordDenied(
+                tool: descriptor.name,
+                intent: intent,
+                authorization: authorization)
             return message
         }
 
@@ -698,19 +1162,26 @@ public struct AgentLoop: Sendable {
         if let leaseFailure = workspaceLeaseFailure(
             intent: intent,
             touchedPaths: callContext.touchedPaths) {
-            let message = "permission denied: \(leaseFailure)"
+            let message = Self.permissionDeniedMessage(leaseFailure)
             try await log.append([
                 .permissionResolved(PermissionResolvedPayload(
                     tool: descriptor.name,
                     decision: .deny,
                     risk: .high,
                     reason: leaseFailure,
-                    intent: intent)),
+                    intent: intent,
+                    authorization: authorization,
+                    source: .authorizationRevalidation,
+                    failureKind: .authorizationSnapshotInvalid)),
                 .toolResult(ToolResultPayload(
                     toolCallId: toolCall.id,
                     observation: message)),
             ])
             await denialCircuitBreaker.recordDenial(signature: denialSignature)
+            await sideEffectEvidence.recordDenied(
+                tool: descriptor.name,
+                intent: intent,
+                authorization: authorization)
             return message
         }
 
@@ -725,11 +1196,47 @@ public struct AgentLoop: Sendable {
             tool: descriptor.name,
             sideEffect: descriptor.sideEffect,
             intent: intent,
+            authorization: authorization,
             replayPolicy: replayPolicy)
         // This record is the durable boundary: if it cannot be written, the
         // executor is never invoked. An unresolved non-replayable record after
         // a crash forces reconciliation instead of blindly replaying the task.
         try await log.append(.toolExecutionPrepared(prepared))
+
+        if let authorizationFailure = await authorizationRevalidationFailure(
+            authorization,
+            toolName: descriptor.name,
+            normalizedArguments: normalizedArguments,
+            intent: intent,
+            risksNetwork: risksNetwork,
+            invocation: authorizationInvocation
+        ) {
+            let message = Self.permissionDeniedMessage(authorizationFailure)
+            try await log.append([
+                .permissionResolved(PermissionResolvedPayload(
+                    tool: descriptor.name,
+                    decision: .deny,
+                    risk: .high,
+                    reason: authorizationFailure,
+                    intent: intent,
+                    authorization: authorization,
+                    source: .authorizationRevalidation,
+                    failureKind: .authorizationSnapshotInvalid)),
+                .toolResult(ToolResultPayload(
+                    toolCallId: toolCall.id,
+                    observation: message)),
+                .toolExecutionSettled(ToolExecutionSettledPayload(
+                    prepared: prepared,
+                    outcome: .denied,
+                    reason: authorizationFailure)),
+            ])
+            await denialCircuitBreaker.recordDenial(signature: denialSignature)
+            await sideEffectEvidence.recordDenied(
+                tool: descriptor.name,
+                intent: intent,
+                authorization: authorization)
+            return message
+        }
 
         // The durable prepare append is another suspension point. Check once
         // more immediately before entering the executor. If the root changed,
@@ -737,23 +1244,30 @@ public struct AgentLoop: Sendable {
         if let leaseFailure = workspaceLeaseFailure(
             intent: intent,
             touchedPaths: callContext.touchedPaths) {
-            let message = "permission denied: \(leaseFailure)"
+            let message = Self.permissionDeniedMessage(leaseFailure)
             try await log.append([
                 .permissionResolved(PermissionResolvedPayload(
                     tool: descriptor.name,
                     decision: .deny,
                     risk: .high,
                     reason: leaseFailure,
-                    intent: intent)),
+                    intent: intent,
+                    authorization: authorization,
+                    source: .authorizationRevalidation,
+                    failureKind: .authorizationSnapshotInvalid)),
                 .toolResult(ToolResultPayload(
                     toolCallId: toolCall.id,
                     observation: message)),
                 .toolExecutionSettled(ToolExecutionSettledPayload(
                     prepared: prepared,
-                    outcome: .failed,
+                    outcome: .denied,
                     reason: leaseFailure)),
             ])
             await denialCircuitBreaker.recordDenial(signature: denialSignature)
+            await sideEffectEvidence.recordDenied(
+                tool: descriptor.name,
+                intent: intent,
+                authorization: authorization)
             return message
         }
 
@@ -765,7 +1279,8 @@ public struct AgentLoop: Sendable {
                                       agentManager: agentManager,
                                       workTaskManager: workTaskManager,
                                       goalManager: goalManager,
-                                      imageGenerator: imageGenerator)
+                                      imageGenerator: imageGenerator,
+                                      authorization: authorization)
         let observation: ToolObservation
         do {
             try Task.checkCancellation()
@@ -810,6 +1325,10 @@ public struct AgentLoop: Sendable {
                     outcome: .failed,
                     reason: message)),
             ])
+            await sideEffectEvidence.recordDenied(
+                tool: descriptor.name,
+                intent: intent,
+                authorization: authorization)
             return message
         }
 
@@ -826,6 +1345,9 @@ public struct AgentLoop: Sendable {
             prepared: prepared,
             outcome: .succeeded)))
         try await log.append(completionEvents)
+        await sideEffectEvidence.recordSucceeded(
+            intent: intent,
+            authorization: authorization)
         // Persist completed side effects before surfacing a concurrent cancel.
         try Task.checkCancellation()
         return observation.text
@@ -834,6 +1356,34 @@ public struct AgentLoop: Sendable {
     private enum ToolArgumentNormalization {
         case valid(String)
         case invalid(String)
+    }
+
+    private func invalidInputIntent(tool: any Tool,
+                                    descriptor: ToolDescriptor,
+                                    rawArguments: String,
+                                    workspaceRoot: URL) -> PermissionIntent {
+        let args = ToolArgs(raw: rawArguments)
+        var intent = tool.permissionIntent(args, workspaceRoot: workspaceRoot)
+        guard intent.resources.isEmpty else { return intent }
+
+        var paths = tool.touchedPaths(args)
+        if paths.isEmpty,
+           let data = rawArguments.data(using: .utf8),
+           let decoded = try? JSONDecoder().decode(JSONValue.self, from: data),
+           case .object(let object) = decoded,
+           case .string(let path)? = object["path"],
+           !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            paths = [path]
+        }
+        if !paths.isEmpty {
+            let access: WorkspaceAccess = descriptor.sideEffect == .readOnly
+                ? .readOnly
+                : .readWrite
+            intent.resources = paths.map {
+                PermissionResource(kind: .workspacePath, value: $0, access: access)
+            }
+        }
+        return intent
     }
 
     private func normalizeToolArguments(_ raw: String, descriptor: ToolDescriptor) -> ToolArgumentNormalization {
@@ -858,7 +1408,12 @@ public struct AgentLoop: Sendable {
                 if let message = validateToolArgumentObject(object, descriptor: descriptor) {
                     return .invalid(message)
                 }
-                return .valid(trimmed)
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.sortedKeys]
+                guard let canonical = try? encoder.encode(JSONValue.object(object)) else {
+                    return .invalid("invalid tool input: arguments for \(descriptor.name) could not be normalized.")
+                }
+                return .valid(String(decoding: canonical, as: UTF8.self))
             case .null where allowsEmptyObject:
                 return .valid("{}")
             default:
@@ -1032,11 +1587,70 @@ public struct AgentLoop: Sendable {
         var reason: String
     }
 
+    private func authorizationRevalidationFailure(
+        _ authorization: ResolvedToolAuthorization,
+        toolName: String,
+        normalizedArguments: String,
+        intent: PermissionIntent,
+        risksNetwork: Bool,
+        invocation: ToolAuthorizationInvocationContext
+    ) async -> String? {
+        do {
+            try registry.validateAuthorizationSnapshot(
+                authorization,
+                toolName: toolName,
+                normalizedArguments: normalizedArguments,
+                intent: intent,
+                risksNetwork: risksNetwork,
+                invocation: invocation,
+                capabilityLease: capabilityLease,
+                workspaceLease: workspaceLease)
+        } catch {
+            return error.localizedDescription
+        }
+        return await authorizationRevalidator?(authorization)
+    }
+
+    /// Permission reasons are stored without presentation text. Defensively
+    /// normalize custom responders and injected revalidators at the final
+    /// ToolResult boundary so the UI never shows repeated denial prefixes.
+    private static func permissionDeniedMessage(_ rawReason: String) -> String {
+        var reason = rawReason.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prefix = "permission denied:"
+        while reason.lowercased().hasPrefix(prefix) {
+            reason = String(reason.dropFirst(prefix.count))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return reason.isEmpty ? "permission denied" : "permission denied: \(reason)"
+    }
+
+    private static func gateSnapshot(_ result: GateResult) -> PermissionReviewGateSnapshot {
+        switch result {
+        case .deny(let reason, let risk):
+            return PermissionReviewGateSnapshot(
+                decision: .deny, risk: risk, reason: reason,
+                policyVersion: "intatis.deterministic-policy.v1")
+        case .ask(let reason, let risk):
+            return PermissionReviewGateSnapshot(
+                decision: .ask, risk: risk, reason: reason,
+                policyVersion: "intatis.deterministic-policy.v1")
+        case .allow(let reason, let risk):
+            return PermissionReviewGateSnapshot(
+                decision: .allow, risk: risk, reason: reason,
+                policyVersion: "intatis.deterministic-policy.v1")
+        case .pass(let reason, let risk):
+            return PermissionReviewGateSnapshot(
+                decision: .pass, risk: risk, reason: reason,
+                policyVersion: "intatis.deterministic-policy.v1")
+        }
+    }
+
     /// Emit the right audit events and, for `ask_user`, await the responder.
     private func settle(_ outcome: PermissionOutcome,
                         descriptor: ToolDescriptor,
                         toolCall: ToolCall,
                         callContext: ToolCallContext,
+                        authorization: ResolvedToolAuthorization,
                         executionID: String,
                         replayPolicy: ToolExecutionReplayPolicy) async throws -> SettledPermission {
         switch outcome.decision {
@@ -1046,18 +1660,25 @@ public struct AgentLoop: Sendable {
                 decision: outcome.decision,
                 risk: outcome.risk,
                 reason: outcome.reason,
-                intent: callContext.intent)))
+                intent: callContext.intent,
+                authorization: authorization,
+                source: .deterministicPolicy)))
             return SettledPermission(decision: outcome.decision, reason: outcome.reason)
 
         case .askUser:
             let requestID = RequestID.new()
+            let boundedArguments = "digest=\(authorization.normalizedArgumentsDigest); characters=\(authorization.normalizedArgumentsCharacterCount)"
             let request = PermissionRequestPayload(
                 requestId: requestID, agent: agent.name, tool: descriptor.name,
-                args: toolCall.arguments, risk: outcome.risk, reason: outcome.reason,
+                args: context.runtimeEnvironment.mode == .cowork
+                    ? boundedArguments
+                    : toolCall.arguments,
+                risk: outcome.risk, reason: outcome.reason,
                 context: permissionRequestContext(
                     outcome: outcome,
                     callContext: callContext,
                     toolCall: toolCall,
+                    authorization: authorization,
                     executionID: executionID,
                     replayPolicy: replayPolicy))
             try await log.append([
@@ -1065,9 +1686,9 @@ public struct AgentLoop: Sendable {
                 .agentStatus(AgentStatusPayload(agent: agent.name, state: .blocked)),
             ])
 
-            let userDecision: PermissionDecision
+            let resolution: PermissionApprovalResolution
             do {
-                userDecision = try await awaitPermissionApproval(request)
+                resolution = try await awaitPermissionApproval(request)
                 try Task.checkCancellation()
             } catch is CancellationError {
                 try await log.append(.permissionResolved(PermissionResolvedPayload(
@@ -1076,20 +1697,37 @@ public struct AgentLoop: Sendable {
                     decision: .deny,
                     risk: outcome.risk,
                     reason: "permission request cancelled",
-                    intent: callContext.intent)))
+                    intent: callContext.intent,
+                    authorization: authorization,
+                    source: .callerCancellation,
+                    reviewStatus: .cancelled,
+                    failureKind: .callerCancelled)))
                 throw CancellationError()
             }
-            let resolvedReason = userDecision == .allow
-                ? "permission approved"
-                : "permission denied: \(outcome.reason)"
+            let userDecision: PermissionDecision = resolution.decision == .allow ? .allow : .deny
+            let suppliedReason = resolution.reason?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let resolvedReason: String
+            if let suppliedReason, !suppliedReason.isEmpty {
+                resolvedReason = suppliedReason
+            } else {
+                resolvedReason = userDecision == .allow
+                    ? "permission approved"
+                    : outcome.reason
+            }
             try await log.append([
                 .permissionResolved(PermissionResolvedPayload(
                     requestId: requestID,
                     tool: descriptor.name,
                     decision: userDecision,
-                    risk: outcome.risk,
+                    risk: resolution.risk ?? outcome.risk,
                     reason: resolvedReason,
-                    intent: callContext.intent)),
+                    intent: callContext.intent,
+                    authorization: authorization,
+                    source: resolution.source,
+                    reviewTaskID: resolution.reviewTaskID,
+                    reviewStatus: resolution.reviewStatus,
+                    failureKind: resolution.failureKind)),
                 .agentStatus(AgentStatusPayload(agent: agent.name, state: .tool)),
             ])
             return SettledPermission(decision: userDecision, reason: resolvedReason)
@@ -1099,6 +1737,7 @@ public struct AgentLoop: Sendable {
     private func permissionRequestContext(outcome: PermissionOutcome,
                                           callContext: ToolCallContext,
                                           toolCall: ToolCall,
+                                          authorization: ResolvedToolAuthorization,
                                           executionID: String,
                                           replayPolicy: ToolExecutionReplayPolicy) -> PermissionRequestContext {
         let contract = context.taskContract
@@ -1117,11 +1756,21 @@ public struct AgentLoop: Sendable {
             where !relatedAgents.contains(candidate) {
             relatedAgents.append(candidate)
         }
-        let gateDecision: PermissionReviewGateDecision
-        switch outcome.decision {
-        case .allow: gateDecision = .allow
-        case .deny: gateDecision = .deny
-        case .askUser: gateDecision = .ask
+        let gateSnapshot: PermissionReviewGateSnapshot
+        if let resolvedGate = authorization.deterministicGate {
+            gateSnapshot = resolvedGate
+        } else {
+            let gateDecision: PermissionReviewGateDecision
+            switch outcome.decision {
+            case .allow: gateDecision = .allow
+            case .deny: gateDecision = .deny
+            case .askUser: gateDecision = .ask
+            }
+            gateSnapshot = PermissionReviewGateSnapshot(
+                decision: gateDecision,
+                risk: outcome.risk,
+                reason: outcome.reason,
+                policyVersion: "intatis.deterministic-policy.v1")
         }
         return PermissionRequestContext(
             taskID: contract?.id,
@@ -1129,15 +1778,12 @@ public struct AgentLoop: Sendable {
             parentTaskID: contract?.parentTaskID,
             attempt: taskAttempt,
             toolCallID: toolCall.id,
-            normalizedArgs: toolCall.arguments,
+            normalizedArgs: "digest=\(authorization.normalizedArgumentsDigest); characters=\(authorization.normalizedArgumentsCharacterCount)",
             touchedPaths: callContext.touchedPaths,
             risksNetwork: callContext.risksNetwork,
             sideEffect: callContext.sideEffect,
             intent: callContext.intent,
-            gate: PermissionReviewGateSnapshot(
-                decision: gateDecision,
-                risk: outcome.risk,
-                reason: outcome.reason),
+            gate: gateSnapshot,
             capabilityLease: capabilityLease,
             workspaceLease: workspaceLease,
             taskContract: contract,
@@ -1147,19 +1793,20 @@ public struct AgentLoop: Sendable {
                 assignee: contract?.assignee,
                 taskLineage: lineage,
                 relatedAgents: relatedAgents),
+            authorization: authorization,
             executionID: executionID,
             replayPolicy: replayPolicy.rawValue)
     }
 
-    private func awaitPermissionApproval(_ request: PermissionRequestPayload) async throws -> PermissionDecision {
+    private func awaitPermissionApproval(_ request: PermissionRequestPayload) async throws -> PermissionApprovalResolution {
         let gate = PermissionApprovalGate()
         return try await withTaskCancellationHandler(operation: {
             try Task.checkCancellation()
             return try await withCheckedThrowingContinuation { continuation in
                 gate.install(continuation)
                 let approvalTask = Task {
-                    let decision = await responder.requestApproval(request)
-                    gate.resolve(.success(decision))
+                    let resolution = await responder.requestResolution(request)
+                    gate.resolve(.success(resolution))
                 }
                 gate.setApprovalTask(approvalTask)
             }
@@ -1168,15 +1815,24 @@ public struct AgentLoop: Sendable {
         })
     }
 
-    private func projectedHistory() async -> [AgentMessage] {
+    private func projectedHistory(recoveredEvents: [Envelope]? = nil) async -> [AgentMessage] {
         guard context.contextBundle == nil else {
             return []
         }
-        return await priorHistory()
+        return await priorHistory(recoveredEvents: recoveredEvents)
     }
 
-    private func priorHistory() async -> [AgentMessage] {
-        let projection = ConversationProjection.build(from: await log.replay())
+    private func priorHistory(recoveredEvents: [Envelope]? = nil) async -> [AgentMessage] {
+        // Cowork already performed a strict replay at the start of `send`.
+        // Reuse that verified snapshot so a safety-sensitive run never falls
+        // back to the compatibility replay that skips malformed records.
+        let events: [Envelope]
+        if let recoveredEvents {
+            events = recoveredEvents
+        } else {
+            events = await log.replay()
+        }
+        let projection = ConversationProjection.build(from: events)
         return projection.messages.compactMap { m in
             switch m.role {
             case .user:

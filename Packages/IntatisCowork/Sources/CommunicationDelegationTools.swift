@@ -38,9 +38,11 @@ public struct SendMessageTool: Tool {
     public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {
         let a = try args.decode(Args.self)
         guard let messenger = context.messenger else {
-            return ToolObservation(text: "agent messaging is not available in this session")
+            throw IntatisError.io("agent messaging is not available in this session")
         }
-        return ToolObservation(text: await messenger.sendMessage(to: a.to, content: a.content))
+        return try Self.checked(
+            await messenger.sendMessage(to: a.to, content: a.content),
+            successPrefix: "sent message to @")
     }
 }
 
@@ -79,9 +81,11 @@ public struct RequestInformationTool: Tool {
     public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {
         let a = try args.decode(Args.self)
         guard let messenger = context.messenger else {
-            return ToolObservation(text: "agent messaging is not available in this session")
+            throw IntatisError.io("agent messaging is not available in this session")
         }
-        return ToolObservation(text: await messenger.requestInformation(to: a.to, question: a.question))
+        return try Self.checked(
+            await messenger.requestInformation(to: a.to, question: a.question),
+            successPrefix: "requested information from @")
     }
 }
 
@@ -125,9 +129,13 @@ public struct ReplyMessageTool: Tool {
     public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {
         let a = try args.decode(Args.self)
         guard let messenger = context.messenger else {
-            return ToolObservation(text: "agent messaging is not available in this session")
+            throw IntatisError.io("agent messaging is not available in this session")
         }
-        return ToolObservation(text: await messenger.replyMessage(to: a.to, content: a.content, inReplyTo: a.inReplyTo))
+        return try Self.checked(await messenger.replyMessage(
+            to: a.to,
+            content: a.content,
+            inReplyTo: a.inReplyTo),
+            successPrefix: "replied to @")
     }
 }
 
@@ -169,9 +177,12 @@ public struct RequestDelegationTool: Tool {
     public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {
         let a = try args.decode(Args.self)
         guard let messenger = context.messenger else {
-            return ToolObservation(text: "agent messaging is not available in this session")
+            throw IntatisError.io("agent messaging is not available in this session")
         }
-        return ToolObservation(text: await messenger.requestDelegation(objective: a.objective, reason: a.reason))
+        return try Self.checked(await messenger.requestDelegation(
+            objective: a.objective,
+            reason: a.reason),
+            successPrefix: "delegation request delivered to @")
     }
 }
 
@@ -239,31 +250,62 @@ public struct DelegateTaskTool: Tool {
             resources: [
                 PermissionResource(kind: .agent, value: value?.to ?? "auto"),
                 PermissionResource(kind: .task, value: value?.workTaskID?.rawValue ?? "new"),
+                PermissionResource(
+                    kind: .workspace,
+                    value: workspaceRoot.standardizedFileURL.path,
+                    access: .readOnly),
             ],
             metadata: [
                 "objectiveLength": .number(Double(value?.objective?.count ?? 0)),
                 "roleHint": value?.roleHint.map(JSONValue.string) ?? .null,
+                "mayCreateWorker": .bool(true),
             ],
             dataEffects: [.none],
-            controlEffects: [.delegateTask],
-            risks: [.controlPlaneMutation, .modelCost],
+            controlEffects: [.delegateTask, .createAgent, .attachWorkspace, .grantCapability],
+            risks: [.controlPlaneMutation, .capabilityGrant, .modelCost],
             replayPolicy: .requiresManualReconciliation)
     }
 
     public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {
         let a = try args.decode(Args.self)
         guard let messenger = context.messenger else {
-            return ToolObservation(text: "agent delegation is not available in this session")
+            throw IntatisError.io("agent delegation is not available in this session")
         }
         guard a.workTaskID != nil
                 || !(a.objective?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true) else {
             throw IntatisError.decoding("delegate_task requires work_task_id or a legacy objective")
         }
-        return ToolObservation(text: await messenger.delegateTask(
-            to: a.to,
+        guard let authorization = context.authorization,
+              authorization.toolName == Self.descriptor.name,
+              let concreteTarget = authorization.intent.resources.first(where: {
+                  $0.kind == .agent
+              })?.value,
+              !concreteTarget.isEmpty,
+              concreteTarget.lowercased() != "auto" else {
+            throw IntatisError.permissionDenied(
+                "delegate_task requires a concrete host-resolved target authorization")
+        }
+        return try Self.checked(await messenger.delegateTask(
+            authorization: authorization,
+            to: concreteTarget,
             workTaskID: a.workTaskID,
             objective: a.objective,
             roleHint: a.roleHint,
-            expectedDeliverable: a.expectedDeliverable))
+            expectedDeliverable: a.expectedDeliverable),
+            successPrefix: "task_id=")
+    }
+}
+
+private extension Tool {
+    static func checked(_ result: String, successPrefix: String) throws -> ToolObservation {
+        let trimmed = result.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix(successPrefix) else {
+            let message = trimmed.lowercased().hasPrefix("error:")
+                ? String(trimmed.dropFirst("error:".count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                : trimmed
+            throw IntatisError.io(message.isEmpty ? "tool operation did not complete" : message)
+        }
+        return ToolObservation(text: trimmed)
     }
 }

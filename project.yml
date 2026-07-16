@@ -10,10 +10,10 @@
 name: Intatis
 
 options:
-  bundleIdPrefix: com.intatis
+  bundleIdPrefix: com.Vita0818
   deploymentTarget:
-    macOS: "13.0"
-    iOS: "16.0"
+    macOS: "26.0"
+    iOS: "26.0"
   createIntermediateGroups: true
   localPackagesGroup: "Internal Modules"
   postGenCommand: "sh scripts/hide-xcode-package-schemes.sh"
@@ -42,7 +42,7 @@ targets:
       - Apps/IntatisMac/Sources
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.intatis.app
+        PRODUCT_BUNDLE_IDENTIFIER: com.Vita0818.IntatisMac
         # Let Xcode synthesize Info.plist (injects CFBundleExecutable etc.).
         GENERATE_INFOPLIST_FILE: "YES"
         INFOPLIST_KEY_CFBundleDisplayName: Intatis
@@ -84,7 +84,7 @@ targets:
       - Apps/IntatisiOS/Sources
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.intatis.ios
+        PRODUCT_BUNDLE_IDENTIFIER: com.Vita0818.Intatis
         TARGETED_DEVICE_FAMILY: "1,2"
         # Let Xcode synthesize Info.plist (injects CFBundleExecutable etc.).
         GENERATE_INFOPLIST_FILE: "YES"

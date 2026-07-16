@@ -787,7 +787,7 @@ final class IntatisAgentKernelTests: XCTestCase {
         })
         let result = await toolResults(in: log).first
         XCTAssertEqual(result?.observation,
-                       "permission denied: permission denied: modify workspace resource")
+                       "permission denied: modify workspace resource")
     }
 
     func testNoArgumentToolsRejectUnknownArguments() async throws {

@@ -173,9 +173,18 @@ struct MessageRow: View {
                     tagBadge(tag)
                 }
             }
-            Text(displayText)
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            if message.role == .assistant || message.role == .agent {
+                IntatisMessageContentView(
+                    messageID: message.id.rawValue,
+                    rawText: message.text,
+                    isComplete: message.isComplete,
+                    policy: .richText,
+                    style: style)
+            } else {
+                Text(displayText)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
             if let advice = message.recoveryAdvice {
                 IntatisRecoveryAdviceView(advice: advice, tint: .red, style: style)
             }

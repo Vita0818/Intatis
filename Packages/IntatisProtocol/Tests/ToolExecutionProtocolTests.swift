@@ -96,6 +96,7 @@ final class ToolExecutionProtocolTests: XCTestCase {
 
         XCTAssertEqual(payload.executionID, "exec_legacy")
         XCTAssertNil(payload.intent)
+        XCTAssertNil(payload.authorization)
         XCTAssertEqual(payload.replayPolicy, .safeToReplay)
     }
 }

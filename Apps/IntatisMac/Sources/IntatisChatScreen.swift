@@ -397,11 +397,20 @@ struct IntatisMessageBubble: View {
                     goalTag(tag)
                 }
             }
-            Text(displayText)
-                .font(IntatisType.chat(15))
-                .foregroundStyle(IntatisTheme.deepText(scheme))
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
+            if message.role == .assistant || message.role == .agent {
+                IntatisMessageContentView(
+                    messageID: message.id.rawValue,
+                    rawText: message.text,
+                    isComplete: message.isComplete,
+                    policy: .richText,
+                    style: .intatisMac(scheme))
+            } else {
+                Text(displayText)
+                    .font(IntatisType.chat(15))
+                    .foregroundStyle(IntatisTheme.deepText(scheme))
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .padding(.horizontal, 15)
         .padding(.vertical, 11)

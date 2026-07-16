@@ -535,7 +535,7 @@ final class IntatisCoworkTests: XCTestCase {
 
         let spawned = await orch.agentList().first { $0.name == lead }
         XCTAssertNotNil(spawned)
-        XCTAssertEqual(spawned?.coordinationDepth, Agent.defaultCoordinationDepth)
+        XCTAssertEqual(spawned?.coordinationDepth, 1)
 
         await orch.send("coordinate the nested implementation work", to: lead)
         let request = try XCTUnwrap(leadProvider.requests.last)
@@ -589,7 +589,7 @@ final class IntatisCoworkTests: XCTestCase {
 
         XCTAssertEqual(intent.action, "agent.spawn")
         XCTAssertEqual(intent.dataEffects, [.none])
-        XCTAssertEqual(intent.controlEffects, [.createAgent, .grantCapability])
+        XCTAssertEqual(intent.controlEffects, [.createAgent, .attachWorkspace, .grantCapability])
         XCTAssertEqual(intent.metadata["requestedAccess"], .string(WorkspaceAccess.readOnly.rawValue))
         XCTAssertTrue(tool.touchedPaths(args).isEmpty)
         XCTAssertFalse(intent.resources.contains { $0.kind == .workspacePath })

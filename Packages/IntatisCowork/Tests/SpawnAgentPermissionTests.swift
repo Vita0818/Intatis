@@ -246,7 +246,10 @@ final class SpawnAgentPermissionTests: XCTestCase {
         let sendResult = await orch.send("spawn a worker in another workspace", to: Orchestrator.mainAgentID)
         let agents = await orch.agentList()
 
-        XCTAssertEqual(sendResult, .sent)
+        guard case .failed(let failure) = sendResult else {
+            return XCTFail("a denied agent spawn must fail the invocation")
+        }
+        XCTAssertTrue(failure.contains("required side effects remain denied or failed"))
         XCTAssertEqual(agents.map(\.name), [Orchestrator.mainAgentID])
         let events = await log.replay()
         XCTAssertTrue(events.contains {
@@ -273,6 +276,10 @@ final class SpawnAgentPermissionTests: XCTestCase {
         let log = try tempLog()
         let mainWorkspace = try tempWorkspace(name: "main")
         let childWorkspace = try tempWorkspace(name: "child-coordinator")
+        let grandchildWorkspace = childWorkspace.appendingPathComponent("nested", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: grandchildWorkspace,
+            withIntermediateDirectories: true)
         defer {
             try? FileManager.default.removeItem(at: mainWorkspace)
             try? FileManager.default.removeItem(at: childWorkspace)
@@ -318,13 +325,26 @@ final class SpawnAgentPermissionTests: XCTestCase {
             return nil
         }.last)
         XCTAssertEqual(defaultWorkspace.access, .readOnly)
-        if case .granted = defaultLease.delegation {
-            // Expected coordinator delegation grant.
+        if case .granted(let budget) = defaultLease.delegation {
+            XCTAssertEqual(budget.maxTasks, 7)
+            XCTAssertEqual(budget.maxDepth, 0)
         } else {
             XCTFail("canCoordinate child must retain a coordinator delegation grant")
         }
         let liveLease = await orch.capabilityLease(id: defaultLease.id)
         XCTAssertEqual(liveLease, defaultLease)
+
+        let nested = await orch.spawnFromTool(
+            requestedBy: childID,
+            name: "nested-coordinator",
+            path: grandchildWorkspace.path,
+            model: "m",
+            canCoordinate: true)
+        XCTAssertEqual(nested, "error: coordinator spawning exceeds the delegation depth budget")
+        let nestedAgent = await orch.agentList().first {
+            $0.name == AgentID(rawValue: "nested-coordinator")
+        }
+        XCTAssertNil(nestedAgent)
     }
 
     func testSpawnAgentGrantsReadWriteOnlyWhenExplicitlyRequested() async throws {

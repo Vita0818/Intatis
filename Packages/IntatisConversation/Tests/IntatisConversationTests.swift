@@ -45,6 +45,56 @@ final class IntatisConversationTests: XCTestCase {
             .appendingPathComponent("events.jsonl")
     }
 
+    private func encodedBatch(session: SessionID,
+                              firstSequence: Int,
+                              texts: [String],
+                              needsSeparator: Bool = false) throws -> Data {
+        let encoder = Envelope.makeEncoder()
+        var data = Data()
+        if needsSeparator { data.append(0x0A) }
+        for (offset, text) in texts.enumerated() {
+            let envelope = Envelope(
+                seq: firstSequence + offset,
+                ts: Date(timeIntervalSince1970: Double(firstSequence + offset)),
+                session: session,
+                event: .userMessage(.init(text: text)))
+            data.append(try encoder.encode(envelope))
+            data.append(0x0A)
+        }
+        return data
+    }
+
+    private func writeCrashJournal(fileURL: URL,
+                                   session: SessionID,
+                                   batchBytes: Data,
+                                   firstSequence: Int,
+                                   eventCount: Int) throws {
+        let original = try Data(contentsOf: fileURL)
+        let prefixLength = min(original.count, EventLogWriteAheadJournal.prefixLimit)
+        let prefix = Data(original.suffix(prefixLength))
+        let journal = EventLogWriteAheadJournal(
+            session: session,
+            originalOffset: UInt64(original.count),
+            prefixStartOffset: UInt64(original.count - prefixLength),
+            prefixBytes: prefix,
+            batchBytes: batchBytes,
+            firstSequence: firstSequence,
+            eventCount: eventCount)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        try encoder.encode(journal).write(
+            to: fileURL.appendingPathExtension("wal"),
+            options: .atomic)
+    }
+
+    private func appendRaw(_ data: Data, to url: URL) throws {
+        let handle = try FileHandle(forWritingTo: url)
+        defer { try? handle.close() }
+        try handle.seekToEnd()
+        try handle.write(contentsOf: data)
+        try handle.synchronize()
+    }
+
     func testAppendReplayAndResumeSeq() async throws {
         let url = tmpFile()
         defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
@@ -140,6 +190,187 @@ final class IntatisConversationTests: XCTestCase {
         XCTAssertEqual(envelopes.map(\.ts), Array(repeating: Date(timeIntervalSince1970: 123), count: 3))
         let replayed = await log.replay()
         XCTAssertEqual(replayed.map(\.seq), [0, 1, 2])
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: url.appendingPathExtension("wal").path))
+    }
+
+    func testInitializationRollsBackPartialJournaledBatch() async throws {
+        let url = tmpFile()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let session = SessionID(rawValue: "sess_partial_wal")
+        let initial = try EventLog(session: session, fileURL: url)
+        _ = try await initial.append(.userMessage(.init(text: "committed")))
+        let original = try Data(contentsOf: url)
+        let batch = try encodedBatch(
+            session: session,
+            firstSequence: 1,
+            texts: ["rolled-back-1", "rolled-back-2"])
+        try writeCrashJournal(
+            fileURL: url,
+            session: session,
+            batchBytes: batch,
+            firstSequence: 1,
+            eventCount: 2)
+        try appendRaw(Data(batch.prefix(max(1, batch.count / 2))), to: url)
+
+        let recovered = try EventLog(session: session, fileURL: url)
+        let replayed = try await recovered.replayChecked()
+        XCTAssertEqual(try Data(contentsOf: url), original)
+        XCTAssertEqual(replayed.map(\.seq), [0])
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: url.appendingPathExtension("wal").path))
+
+        let next = try await recovered.append(.userMessage(.init(text: "after-recovery")))
+        XCTAssertEqual(next.seq, 1)
+    }
+
+    func testInitializationKeepsCompleteJournaledBatch() async throws {
+        let url = tmpFile()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let session = SessionID(rawValue: "sess_complete_wal")
+        let initial = try EventLog(session: session, fileURL: url)
+        _ = try await initial.append(.userMessage(.init(text: "committed")))
+        let batch = try encodedBatch(
+            session: session,
+            firstSequence: 1,
+            texts: ["committed-1", "committed-2"])
+        try writeCrashJournal(
+            fileURL: url,
+            session: session,
+            batchBytes: batch,
+            firstSequence: 1,
+            eventCount: 2)
+        try appendRaw(batch, to: url)
+
+        let recovered = try EventLog(session: session, fileURL: url)
+        let replayed = try await recovered.replayChecked()
+        XCTAssertEqual(replayed.map(\.seq), [0, 1, 2])
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: url.appendingPathExtension("wal").path))
+        let next = try await recovered.append(.userMessage(.init(text: "after-recovery")))
+        XCTAssertEqual(next.seq, 3)
+    }
+
+    func testInitializationFailsClosedForCorruptOrMismatchedJournal() async throws {
+        let corruptURL = tmpFile()
+        defer { try? FileManager.default.removeItem(at: corruptURL.deletingLastPathComponent()) }
+        let corruptSession = SessionID(rawValue: "sess_corrupt_wal")
+        let corruptLog = try EventLog(session: corruptSession, fileURL: corruptURL)
+        _ = try await corruptLog.append(.userMessage(.init(text: "committed")))
+        try Data("not-json".utf8).write(
+            to: corruptURL.appendingPathExtension("wal"),
+            options: .atomic)
+        XCTAssertThrowsError(try EventLog(session: corruptSession, fileURL: corruptURL)) { error in
+            XCTAssertEqual(error as? EventLogError, .journalCorrupted)
+        }
+
+        let mismatchURL = tmpFile()
+        defer { try? FileManager.default.removeItem(at: mismatchURL.deletingLastPathComponent()) }
+        let mismatchSession = SessionID(rawValue: "sess_mismatch_wal")
+        let mismatchLog = try EventLog(session: mismatchSession, fileURL: mismatchURL)
+        _ = try await mismatchLog.append(.userMessage(.init(text: "committed")))
+        let batch = try encodedBatch(
+            session: mismatchSession,
+            firstSequence: 1,
+            texts: ["expected-1", "expected-2"])
+        try writeCrashJournal(
+            fileURL: mismatchURL,
+            session: mismatchSession,
+            batchBytes: batch,
+            firstSequence: 1,
+            eventCount: 2)
+        try appendRaw(Data("different bytes".utf8), to: mismatchURL)
+        XCTAssertThrowsError(try EventLog(session: mismatchSession, fileURL: mismatchURL)) { error in
+            XCTAssertEqual(error as? EventLogError, .journalMismatch)
+        }
+    }
+
+    func testReplayAPIsRecoverJournalCreatedAfterReaderInitialization() async throws {
+        for state in ["untouched", "partial"] {
+            let url = tmpFile()
+            defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+            let session = SessionID(rawValue: "sess_live_\(state)_wal")
+            let log = try EventLog(session: session, fileURL: url)
+            _ = try await log.append(.userMessage(.init(text: "committed")))
+            let original = try Data(contentsOf: url)
+            let batch = try encodedBatch(
+                session: session,
+                firstSequence: 1,
+                texts: ["not-visible-1", "not-visible-2"])
+            try writeCrashJournal(
+                fileURL: url,
+                session: session,
+                batchBytes: batch,
+                firstSequence: 1,
+                eventCount: 2)
+            if state == "partial" {
+                let firstLineEnd = try XCTUnwrap(batch.firstIndex(of: 0x0A))
+                // Simulate a process dying after one complete member of the
+                // atomic batch reached JSONL but before the second member.
+                try appendRaw(Data(batch.prefix(firstLineEnd + 1)), to: url)
+            }
+
+            let replayed: [Envelope]
+            if state == "partial" {
+                // The compatibility projection is fail-soft, but it must still
+                // recover rather than expose the first complete batch member.
+                replayed = await log.replay()
+            } else {
+                replayed = try await log.replayChecked()
+            }
+
+            XCTAssertEqual(try Data(contentsOf: url), original)
+            XCTAssertEqual(replayed.map(\.seq), [0])
+            XCTAssertFalse(FileManager.default.fileExists(
+                atPath: url.appendingPathExtension("wal").path))
+        }
+    }
+
+    func testCheckedReplayAndAppendRejectEventsFromAnotherSession() async throws {
+        for useUnknownType in [false, true] {
+            let url = tmpFile()
+            defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+            let session = SessionID(rawValue: "sess_expected_\(useUnknownType)")
+            let otherSession = SessionID(rawValue: "sess_other_\(useUnknownType)")
+            let log = try EventLog(session: session, fileURL: url)
+            let encoder = Envelope.makeEncoder()
+            let encoded = try encoder.encode(Envelope(
+                seq: 0,
+                ts: Date(timeIntervalSince1970: 0),
+                session: otherSession,
+                event: .userMessage(.init(text: "wrong session"))))
+            var bytes: Data
+            if useUnknownType {
+                var object = try XCTUnwrap(
+                    JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+                object["type"] = "future_event_type"
+                object["payload"] = ["futureField": true]
+                bytes = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+            } else {
+                bytes = encoded
+            }
+            bytes.append(0x0A)
+            try bytes.write(to: url)
+
+            do {
+                _ = try await log.replayChecked()
+                XCTFail("strict replay must reject a \(useUnknownType ? "future" : "known") event from another session")
+            } catch let error as EventLogError {
+                XCTAssertEqual(error, .sessionMismatch)
+            }
+            do {
+                _ = try await log.isEmptyChecked()
+                XCTFail("strict emptiness must reject another session")
+            } catch let error as EventLogError {
+                XCTAssertEqual(error, .sessionMismatch)
+            }
+            do {
+                _ = try await log.append(.userMessage(.init(text: "must not reuse sequence")))
+                XCTFail("append must not allocate after another session's tail")
+            } catch let error as EventLogError {
+                XCTAssertEqual(error, .sessionMismatch)
+            }
+        }
     }
 
     func testUnknownFutureEventReservesItsSequenceForConcurrentSafeAppend() async throws {
@@ -179,6 +410,100 @@ final class IntatisConversationTests: XCTestCase {
         // occupied sequence remains reserved.
         let replayed = await log.replay()
         XCTAssertEqual(replayed.map(\.seq), [0, 8])
+    }
+
+    func testReplayCheckedSkipsValidUnknownFutureTypeButEmptyCheckCountsIt() async throws {
+        let url = tmpFile()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true)
+        let session = SessionID(rawValue: "sess_checked_future")
+        let encoder = Envelope.makeEncoder()
+        let placeholder = try encoder.encode(Envelope(
+            seq: 7,
+            ts: Date(timeIntervalSince1970: 7),
+            session: session,
+            event: .userMessage(.init(text: "placeholder"))))
+        var futureObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: placeholder) as? [String: Any])
+        futureObject["type"] = "future_event_type"
+        futureObject["payload"] = ["futureField": true]
+        var future = try JSONSerialization.data(
+            withJSONObject: futureObject,
+            options: [.sortedKeys])
+        future.append(0x0A)
+        try future.write(to: url)
+
+        let log = try EventLog(session: session, fileURL: url)
+        let replayed = try await log.replayChecked()
+        let isEmpty = try await log.isEmptyChecked()
+        XCTAssertTrue(replayed.isEmpty)
+        XCTAssertFalse(isEmpty, "a valid unknown header is still durable session state")
+        let appended = try await log.append(.userMessage(.init(text: "current")))
+        XCTAssertEqual(appended.seq, 8)
+    }
+
+    func testReplayCheckedThrowsForKnownTypeWithCorruptPayload() async throws {
+        let url = tmpFile()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true)
+        let session = SessionID(rawValue: "sess_checked_corrupt_known")
+        let encoder = Envelope.makeEncoder()
+        let encoded = try encoder.encode(Envelope(
+            seq: 0,
+            ts: Date(timeIntervalSince1970: 0),
+            session: session,
+            event: .userMessage(.init(text: "placeholder"))))
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        object["payload"] = ["attachments": []]
+        var corrupted = try JSONSerialization.data(
+            withJSONObject: object,
+            options: [.sortedKeys])
+        corrupted.append(0x0A)
+        try corrupted.write(to: url)
+
+        let log = try EventLog(session: session, fileURL: url)
+        do {
+            _ = try await log.replayChecked()
+            XCTFail("a known event with an invalid payload must fail strict replay")
+        } catch let error as EventLogError {
+            XCTAssertEqual(error, .corruptedEvent(line: 1))
+            XCTAssertFalse(error.localizedDescription.contains(url.path))
+        }
+        do {
+            _ = try await log.isEmptyChecked()
+            XCTFail("strict emptiness must not turn corruption into an empty session")
+        } catch let error as EventLogError {
+            XCTAssertEqual(error, .corruptedEvent(line: 1))
+        }
+
+        // The legacy API remains fail-soft for projection callers.
+        let compatibilityReplay = await log.replay()
+        XCTAssertTrue(compatibilityReplay.isEmpty)
+    }
+
+    func testReplayCheckedThrowsForReadFailure() async throws {
+        let url = tmpFile()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let log = try EventLog(
+            session: SessionID(rawValue: "sess_checked_read_failure"),
+            fileURL: url)
+        let initiallyEmpty = try await log.isEmptyChecked()
+        XCTAssertTrue(initiallyEmpty)
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: false)
+
+        do {
+            _ = try await log.replayChecked()
+            XCTFail("strict replay must surface storage read failures")
+        } catch let error as EventLogError {
+            guard case .storageUnavailable = error else {
+                return XCTFail("unexpected error: \(error)")
+            }
+        }
     }
 
     func testInitializationRejectsNonMonotonicValidEnvelopeHeadersWithoutPathLeak() throws {

@@ -34,6 +34,10 @@ public struct AgentPermissionResponder: PermissionResponder {
         await controlPlane.submit(request)
     }
 
+    public func requestResolution(_ request: PermissionRequestPayload) async -> PermissionApprovalResolution {
+        await controlPlane.submitResolution(request)
+    }
+
     public func health() async -> PermissionReviewControlPlaneHealth {
         await controlPlane.health()
     }

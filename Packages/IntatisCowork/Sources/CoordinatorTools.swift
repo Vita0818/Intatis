@@ -65,8 +65,12 @@ public struct SpawnAgentTool: Tool {
                 risksNetwork: false)
         }
         let requestedAccess = value.requestedAccess ?? .readOnly
+        let targetURL = URL(fileURLWithPath: (value.path as NSString).expandingTildeInPath)
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+        let targetIdentity = WorkspaceRootIdentity.capture(rootPath: targetURL.path)
         var risks: Set<PermissionRisk> = [.controlPlaneMutation, .capabilityGrant, .modelCost]
-        if !PathConfinement.isWithin(value.path, root: workspaceRoot) {
+        if !PathConfinement.isWithin(targetURL.path, root: workspaceRoot) {
             risks.insert(.workspaceExpansion)
         }
         if requestedAccess == .readWrite {
@@ -76,15 +80,22 @@ public struct SpawnAgentTool: Tool {
             action: "agent.spawn",
             resources: [
                 PermissionResource(kind: .agent, value: value.name),
-                PermissionResource(kind: .workspace, value: value.path, access: requestedAccess),
+                PermissionResource(kind: .workspace, value: targetURL.path, access: requestedAccess),
             ],
             metadata: [
                 "model": value.model.map(JSONValue.string) ?? .null,
                 "requestedAccess": .string(requestedAccess.rawValue),
                 "canCoordinate": .bool(value.canCoordinate ?? false),
+                "targetCanonicalPath": .string(targetURL.path),
+                "targetDeviceID": targetIdentity.map {
+                    .string(String($0.deviceID))
+                } ?? .null,
+                "targetFileID": targetIdentity.map {
+                    .string(String($0.fileID))
+                } ?? .null,
             ],
             dataEffects: [.none],
-            controlEffects: [.createAgent, .grantCapability],
+            controlEffects: [.createAgent, .attachWorkspace, .grantCapability],
             risks: risks,
             replayPolicy: .requiresManualReconciliation)
     }
@@ -92,14 +103,23 @@ public struct SpawnAgentTool: Tool {
     public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {
         let a = try args.decode(Args.self)
         guard let manager = context.agentManager else {
-            return ToolObservation(text: "agent management is not available in this session")
+            throw IntatisError.io("agent management is not available in this session")
         }
-        return ToolObservation(text: await manager.spawnAgent(
+        let result = await manager.spawnAgent(
             name: a.name,
             path: a.path,
             model: a.model,
             requestedAccess: a.requestedAccess ?? .readOnly,
-            canCoordinate: a.canCoordinate ?? false))
+            canCoordinate: a.canCoordinate ?? false)
+        let trimmed = result.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("spawned @") else {
+            let message = trimmed.lowercased().hasPrefix("error:")
+                ? String(trimmed.dropFirst("error:".count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                : trimmed
+            throw IntatisError.io(message.isEmpty ? "agent spawn did not complete" : message)
+        }
+        return ToolObservation(text: trimmed)
     }
 }
 
@@ -171,6 +191,11 @@ public struct RemoveAgentTool: Tool {
         guard let manager = context.agentManager else {
             return ToolObservation(text: "agent management is not available in this session")
         }
-        return ToolObservation(text: await manager.removeAgent(name: a.name))
+        let result = await manager.removeAgent(name: a.name)
+        if result.lowercased().hasPrefix("error:") {
+            throw IntatisError.io(String(result.dropFirst("error:".count))
+                .trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        return ToolObservation(text: result)
     }
 }

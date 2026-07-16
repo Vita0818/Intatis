@@ -29,6 +29,11 @@ final class PermissionReviewProtocolTests: XCTestCase {
         XCTAssertEqual(payload.tool, "write_file")
         XCTAssertEqual(payload.decision, .deny)
         XCTAssertNil(payload.intent)
+        XCTAssertNil(payload.authorization)
+        XCTAssertNil(payload.source)
+        XCTAssertNil(payload.reviewTaskID)
+        XCTAssertNil(payload.reviewStatus)
+        XCTAssertNil(payload.failureKind)
     }
 
     func testPartialPermissionRequestContextUsesAdditiveDefaults() throws {
@@ -40,7 +45,193 @@ final class PermissionReviewProtocolTests: XCTestCase {
         XCTAssertEqual(context.touchedPaths, [])
         XCTAssertNil(context.sideEffect)
         XCTAssertNil(context.intent)
+        XCTAssertNil(context.authorization)
         XCTAssertNil(context.executionID)
+    }
+
+    func testLegacyReviewTaskAndSettlementWithoutAuthorizationStillDecode() throws {
+        let taskJSON = Data(#"""
+        {
+          "id":"review_legacy",
+          "sessionID":"session_legacy",
+          "requestID":"request_legacy",
+          "reviewerAgent":"permission-reviewer",
+          "tool":"write_file",
+          "normalizedArgs":"{}",
+          "touchedPaths":[],
+          "risksNetwork":false,
+          "gate":{"decision":"pass","risk":"medium","reason":"write"},
+          "causalContext":{"taskLineage":[],"relatedAgents":[],"eventSequenceNumbers":[]},
+          "createdAt":0,
+          "deadline":1
+        }
+        """#.utf8)
+        let settledJSON = Data(#"""
+        {
+          "reviewTaskID":"review_legacy",
+          "requestID":"request_legacy",
+          "reviewerAgent":"permission-reviewer",
+          "reviewerModel":"reviewer-model",
+          "tool":"write_file",
+          "decision":"deny",
+          "risk":"medium",
+          "status":"denied",
+          "reason":"legacy reason",
+          "durationMillis":12,
+          "settledAt":1
+        }
+        """#.utf8)
+
+        let task = try JSONDecoder().decode(PermissionReviewTask.self, from: taskJSON)
+        let settled = try JSONDecoder().decode(PermissionReviewSettledPayload.self, from: settledJSON)
+
+        XCTAssertEqual(task.id.rawValue, "review_legacy")
+        XCTAssertNil(task.authorization)
+        XCTAssertEqual(settled.reason, "legacy reason")
+        XCTAssertNil(settled.authorization)
+        XCTAssertNil(settled.failureKind)
+    }
+
+    func testResolvedToolAuthorizationRoundTripsAllPinnedFacts() throws {
+        let intent = PermissionIntent(
+            action: "filesystem.patch",
+            resources: [PermissionResource(
+                kind: .workspacePath,
+                value: "Sources/App.swift",
+                access: .readWrite)],
+            metadata: ["operation": .string("apply_unified_diff")],
+            dataEffects: [.mutate],
+            risks: [.workspaceMutation],
+            replayPolicy: .requiresManualReconciliation)
+        let gate = PermissionReviewGateSnapshot(
+            decision: .ask,
+            risk: .medium,
+            reason: "workspace mutation requires review",
+            policyVersion: "intatis.deterministic-policy.v1")
+        let authorization = ResolvedToolAuthorization(
+            authorizationID: "authorization-roundtrip",
+            registryVersion: "intatis.cowork.v1",
+            concreteToolID: "intatis.cowork.v1/apply_patch",
+            descriptorFingerprint: String(repeating: "a", count: 64),
+            toolName: "apply_patch",
+            canonicalAction: intent.action,
+            canonicalPermission: "filesystem.edit",
+            actionPreview: PermissionActionPreview(
+                kind: "filesystem.patch",
+                fields: [
+                    "path": "Sources/App.swift",
+                    "summary": "Apply a bounded source patch",
+                ]),
+            requiredCapabilities: [.applyPatch],
+            membership: .granted,
+            capabilityLeaseID: CapabilityLeaseID(rawValue: "capability-roundtrip"),
+            capabilityTaskID: TaskID(rawValue: "task-roundtrip"),
+            workspaceLeaseID: WorkspaceLeaseID(rawValue: "workspace-lease-roundtrip"),
+            workspaceAccess: .readWrite,
+            workspaceRootIdentity: WorkspaceRootIdentity(
+                canonicalPath: "/tmp/workspace",
+                deviceID: 10,
+                fileID: 20),
+            invocation: ToolAuthorizationInvocationContext(
+                sessionID: SessionID(rawValue: "session-roundtrip"),
+                agent: AgentID(rawValue: "main"),
+                taskID: TaskID(rawValue: "task-roundtrip"),
+                rootTaskID: TaskID(rawValue: "root-roundtrip"),
+                parentTaskID: TaskID(rawValue: "parent-roundtrip"),
+                attempt: 2,
+                toolCallID: "call-roundtrip",
+                taskObjective: "Patch the selected source file"),
+            normalizedArgumentsDigest: String(repeating: "b", count: 64),
+            normalizedArgumentsCharacterCount: 128,
+            intent: intent,
+            sideEffect: .write,
+            risksNetwork: false,
+            replayPolicy: .requiresManualReconciliation,
+            deterministicGate: gate,
+            capabilityLeaseFingerprint: String(repeating: "c", count: 64),
+            workspaceID: WorkspaceID(rawValue: "workspace-roundtrip"),
+            workspaceTaskID: TaskID(rawValue: "task-roundtrip"),
+            workspaceRootPath: "/tmp/workspace",
+            workspaceLeaseFingerprint: String(repeating: "d", count: 64))
+
+        let data = try JSONEncoder().encode(authorization)
+        let decoded = try JSONDecoder().decode(ResolvedToolAuthorization.self, from: data)
+
+        XCTAssertEqual(decoded, authorization)
+        XCTAssertEqual(decoded.canonicalPermission, "filesystem.edit")
+        XCTAssertEqual(decoded.actionPreview?.kind, "filesystem.patch")
+        XCTAssertEqual(decoded.actionPreview?.fields["path"], "Sources/App.swift")
+
+        var legacyObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertNotNil(legacyObject.removeValue(forKey: "canonicalPermission"))
+        XCTAssertNotNil(legacyObject.removeValue(forKey: "actionPreview"))
+        let legacyData = try JSONSerialization.data(withJSONObject: legacyObject)
+        let legacyDecoded = try JSONDecoder().decode(
+            ResolvedToolAuthorization.self,
+            from: legacyData)
+
+        XCTAssertNil(legacyDecoded.canonicalPermission)
+        XCTAssertNil(legacyDecoded.actionPreview)
+        XCTAssertEqual(legacyDecoded.authorizationID, authorization.authorizationID)
+        XCTAssertEqual(legacyDecoded.intent, authorization.intent)
+    }
+
+    func testPermissionActionPreviewDecodeResanitizesForgedSecretValues() throws {
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+        let data = Data(#"""
+        {
+          "kind":"network.fetch",
+          "fields":{
+            "authorization":"Authorization: Bearer \#(secret)",
+            "url":"https://example.test/resource?access_token=\#(secret)"
+          },
+          "redacted":false,
+          "truncated":false
+        }
+        """#.utf8)
+
+        let preview = try JSONDecoder().decode(PermissionActionPreview.self, from: data)
+        let reencoded = try JSONEncoder().encode(preview)
+        let reencodedText = try XCTUnwrap(String(data: reencoded, encoding: .utf8))
+
+        XCTAssertTrue(preview.redacted)
+        XCTAssertFalse(preview.truncated)
+        XCTAssertFalse(preview.fields.values.joined().contains(secret))
+        XCTAssertFalse(reencodedText.contains(secret))
+        XCTAssertTrue(preview.fields["authorization"]?.contains("[REDACTED]") == true)
+        XCTAssertTrue(preview.fields["url"]?.contains("[REDACTED]") == true)
+    }
+
+    func testPermissionActionPreviewDecodeEnforcesFieldAndCharacterBounds() throws {
+        let longKind = String(repeating: "k", count: 100)
+        let longValue = String(repeating: "v", count: 1_000)
+        let object: [String: Any] = [
+            "kind": longKind,
+            "fields": [
+                "a_long": longValue,
+                "b": "b",
+                "c": "c",
+                "d": "d",
+                "e": "e",
+                "f": "f",
+                "g": "g",
+                "h": "h",
+                "z_omitted": "z",
+            ],
+            "redacted": false,
+            "truncated": false,
+        ]
+        let data = try JSONSerialization.data(withJSONObject: object)
+
+        let preview = try JSONDecoder().decode(PermissionActionPreview.self, from: data)
+
+        XCTAssertTrue(preview.truncated)
+        XCTAssertFalse(preview.redacted)
+        XCTAssertEqual(preview.kind, String(longKind.prefix(80)) + "...")
+        XCTAssertEqual(preview.fields.count, 8)
+        XCTAssertNil(preview.fields["z_omitted"])
+        XCTAssertEqual(preview.fields["a_long"], String(longValue.prefix(800)) + "...")
     }
 
     func testReviewRequestedAndSettledEventsRoundTrip() throws {

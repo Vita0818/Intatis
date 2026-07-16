@@ -137,14 +137,29 @@ public struct PermissionResolvedPayload: Codable, Equatable, Sendable {
     public var risk: RiskLevel
     public var reason: String
     public var intent: PermissionIntent?
+    public var authorization: ResolvedToolAuthorization?
+    public var source: PermissionApprovalSource?
+    public var reviewTaskID: PermissionReviewTaskID?
+    public var reviewStatus: PermissionReviewStatus?
+    public var failureKind: PermissionApprovalFailureKind?
     public init(requestId: RequestID? = nil, tool: String, decision: PermissionDecision,
-                risk: RiskLevel, reason: String, intent: PermissionIntent? = nil) {
+                risk: RiskLevel, reason: String, intent: PermissionIntent? = nil,
+                authorization: ResolvedToolAuthorization? = nil,
+                source: PermissionApprovalSource? = nil,
+                reviewTaskID: PermissionReviewTaskID? = nil,
+                reviewStatus: PermissionReviewStatus? = nil,
+                failureKind: PermissionApprovalFailureKind? = nil) {
         self.requestId = requestId
         self.tool = tool
         self.decision = decision
         self.risk = risk
         self.reason = reason
         self.intent = intent
+        self.authorization = authorization
+        self.source = source
+        self.reviewTaskID = reviewTaskID
+        self.reviewStatus = reviewStatus
+        self.failureKind = failureKind
     }
 }
 

@@ -19,6 +19,35 @@ final class PermissionProjectionTests: XCTestCase {
                                  reason: "write to workspace")
     }
 
+    private func authorization() -> ResolvedToolAuthorization {
+        let intent = PermissionIntent(
+            action: "filesystem.write",
+            resources: [PermissionResource(kind: .workspacePath, value: "a.txt", access: .readWrite)],
+            dataEffects: [.mutate],
+            risks: [.workspaceMutation],
+            replayPolicy: .requiresManualReconciliation)
+        return ResolvedToolAuthorization(
+            authorizationID: "authorization_projection",
+            registryVersion: "test.v1",
+            concreteToolID: "test.v1/write_file",
+            descriptorFingerprint: "descriptor",
+            toolName: "write_file",
+            canonicalAction: intent.action,
+            requiredCapabilities: [],
+            membership: .notRequired,
+            capabilityLeaseID: nil,
+            capabilityTaskID: nil,
+            workspaceLeaseID: nil,
+            workspaceAccess: nil,
+            workspaceRootIdentity: nil,
+            normalizedArgumentsDigest: "arguments",
+            normalizedArgumentsCharacterCount: 16,
+            intent: intent,
+            sideEffect: .write,
+            risksNetwork: false,
+            replayPolicy: .requiresManualReconciliation)
+    }
+
     func testUnresolvedPermissionRequestAppearsPending() {
         let projection = PermissionProjection.build(from: [
             env(0, .permissionRequest(request()))
@@ -50,7 +79,10 @@ final class PermissionProjectionTests: XCTestCase {
                                              tool: "write_file",
                                              decision: .allow,
                                              risk: .medium,
-                                             reason: "user approved")))
+                                             reason: "user approved",
+                                             source: .automaticReviewer,
+                                             reviewTaskID: PermissionReviewTaskID(rawValue: "review_1"),
+                                             reviewStatus: .allowed)))
         ])
         let replayed = PermissionProjection.build(from: [
             env(0, .permissionRequest(request())),
@@ -58,12 +90,45 @@ final class PermissionProjectionTests: XCTestCase {
                                              tool: "write_file",
                                              decision: .allow,
                                              risk: .medium,
-                                             reason: "user approved")))
+                                             reason: "user approved",
+                                             source: .automaticReviewer,
+                                             reviewTaskID: PermissionReviewTaskID(rawValue: "review_1"),
+                                             reviewStatus: .allowed)))
         ])
 
         XCTAssertEqual(projection.latestResolved?.id, "permission:req_1:resolved")
         XCTAssertEqual(projection.latestResolved?.decision, .allow)
+        XCTAssertEqual(projection.latestResolved?.source, .automaticReviewer)
+        XCTAssertEqual(
+            projection.latestResolved?.reviewTaskID,
+            PermissionReviewTaskID(rawValue: "review_1"))
+        XCTAssertEqual(projection.latestResolved?.reviewStatus, .allowed)
         XCTAssertEqual(projection.latestResolved, replayed.latestResolved)
+    }
+
+    func testPermissionFailureClassificationAndAuthorizationReachProjection() {
+        let authorization = authorization()
+        let projection = PermissionProjection.build(from: [
+            env(0, .permissionRequest(request())),
+            env(1, .permissionResolved(.init(
+                requestId: RequestID(rawValue: "req_1"),
+                tool: "write_file",
+                decision: .deny,
+                risk: .high,
+                reason: "review provider failed",
+                authorization: authorization,
+                source: .automaticReviewerFailure,
+                reviewTaskID: PermissionReviewTaskID(rawValue: "review_failure"),
+                reviewStatus: .failed,
+                failureKind: .providerFailure))),
+        ])
+
+        XCTAssertEqual(projection.latestResolved?.risk, .high)
+        XCTAssertEqual(projection.latestResolved?.reason, "review provider failed")
+        XCTAssertEqual(projection.latestResolved?.authorization, authorization)
+        XCTAssertEqual(projection.latestResolved?.source, .automaticReviewerFailure)
+        XCTAssertEqual(projection.latestResolved?.reviewStatus, .failed)
+        XCTAssertEqual(projection.latestResolved?.failureKind, .providerFailure)
     }
 
     func testReplayAfterReloadPreservesPendingPermissionState() async throws {

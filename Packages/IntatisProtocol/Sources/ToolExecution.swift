@@ -49,6 +49,7 @@ public struct ToolExecutionPreparedPayload: Codable, Equatable, Sendable {
     public var tool: String
     public var sideEffect: SideEffect
     public var intent: PermissionIntent?
+    public var authorization: ResolvedToolAuthorization?
     public var replayPolicy: ToolExecutionReplayPolicy
 
     public init(executionID: String,
@@ -59,6 +60,7 @@ public struct ToolExecutionPreparedPayload: Codable, Equatable, Sendable {
                 tool: String,
                 sideEffect: SideEffect,
                 intent: PermissionIntent? = nil,
+                authorization: ResolvedToolAuthorization? = nil,
                 replayPolicy: ToolExecutionReplayPolicy? = nil) {
         self.executionID = executionID
         self.taskID = taskID
@@ -68,6 +70,7 @@ public struct ToolExecutionPreparedPayload: Codable, Equatable, Sendable {
         self.tool = tool
         self.sideEffect = sideEffect
         self.intent = intent
+        self.authorization = authorization
         self.replayPolicy = replayPolicy ?? .conservative(for: sideEffect, tool: tool)
     }
 
@@ -92,6 +95,7 @@ public struct ToolExecutionSettledPayload: Codable, Equatable, Sendable {
     public var tool: String
     public var sideEffect: SideEffect
     public var intent: PermissionIntent?
+    public var authorization: ResolvedToolAuthorization?
     public var replayPolicy: ToolExecutionReplayPolicy
     public var outcome: ToolExecutionOutcome
     public var reason: String?
@@ -104,6 +108,7 @@ public struct ToolExecutionSettledPayload: Codable, Equatable, Sendable {
                 tool: String,
                 sideEffect: SideEffect,
                 intent: PermissionIntent? = nil,
+                authorization: ResolvedToolAuthorization? = nil,
                 replayPolicy: ToolExecutionReplayPolicy? = nil,
                 outcome: ToolExecutionOutcome,
                 reason: String? = nil) {
@@ -115,6 +120,7 @@ public struct ToolExecutionSettledPayload: Codable, Equatable, Sendable {
         self.tool = tool
         self.sideEffect = sideEffect
         self.intent = intent
+        self.authorization = authorization
         self.replayPolicy = replayPolicy ?? .conservative(for: sideEffect, tool: tool)
         self.outcome = outcome
         self.reason = reason
@@ -132,6 +138,7 @@ public struct ToolExecutionSettledPayload: Codable, Equatable, Sendable {
             tool: prepared.tool,
             sideEffect: prepared.sideEffect,
             intent: prepared.intent,
+            authorization: prepared.authorization,
             replayPolicy: prepared.replayPolicy,
             outcome: outcome,
             reason: reason)
@@ -147,6 +154,7 @@ public struct ToolExecutionSettledPayload: Codable, Equatable, Sendable {
             tool: tool,
             sideEffect: sideEffect,
             intent: intent,
+            authorization: authorization,
             replayPolicy: replayPolicy)
     }
 }

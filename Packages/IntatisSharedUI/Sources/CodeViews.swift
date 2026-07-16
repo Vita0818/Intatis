@@ -302,11 +302,20 @@ struct CodeItemRow: View {
                     tagBadge(tag)
                 }
             }
-            Text(body)
-                .font(.system(size: 15))
-                .foregroundStyle(style.primaryText)
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
+            if isUser {
+                Text(body)
+                    .font(.system(size: 15))
+                    .foregroundStyle(style.primaryText)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                IntatisMessageContentView(
+                    messageID: item.id,
+                    rawText: item.body,
+                    isComplete: item.complete,
+                    policy: .richText,
+                    style: style)
+            }
             if let advice = item.recoveryAdvice {
                 IntatisRecoveryAdviceView(
                     advice: advice,

@@ -93,7 +93,6 @@ public struct CapabilityLease: Codable, Sendable, Hashable {
             tools.formUnion([
                 .gitControl,
                 .gitRemote,
-                .proposePatch,
                 .applyPatch,
                 .editPDF,
                 .reconstructDocument,

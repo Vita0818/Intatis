@@ -11,14 +11,20 @@ import IntatisProviders
 private final class AutoReviewScriptedProvider: ToolCallingProvider, @unchecked Sendable {
     private var responses: [[AgentChunk]]
     private var index = 0
+    private var capturedRequests: [AgentRequest] = []
     private let lock = NSLock()
 
     init(_ responses: [[AgentChunk]]) {
         self.responses = responses
     }
 
+    var requests: [AgentRequest] {
+        lock.withLock { capturedRequests }
+    }
+
     func stream(_ request: AgentRequest) -> AsyncThrowingStream<AgentChunk, Error> {
         lock.lock()
+        capturedRequests.append(request)
         let chunks = responses.isEmpty ? [.done(finishReason: "stop")] : responses[min(index, responses.count - 1)]
         index += 1
         lock.unlock()
@@ -305,6 +311,65 @@ final class AutomaticPermissionReviewTests: XCTestCase {
         let projection = CoworkProjection.build(from: await log.replay())
         XCTAssertTrue(agents.isEmpty)
         XCTAssertNil(projection.agentRoster[main])
+    }
+
+    func testMainBootstrapTreatsUnknownStateAsNonemptyAndKnownCorruptionAsFailure() async throws {
+        let encoder = Envelope.makeEncoder()
+        let session = SessionID(rawValue: "auto_review")
+        let valid = try encoder.encode(Envelope(
+            seq: 0,
+            ts: Date(timeIntervalSince1970: 0),
+            session: session,
+            event: .error(ErrorPayload(code: "existing", message: "state"))))
+        var unknownObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: valid) as? [String: Any])
+        unknownObject["type"] = "future_security_state"
+        var corruptObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: valid) as? [String: Any])
+        var corruptPayload = try XCTUnwrap(corruptObject["payload"] as? [String: Any])
+        corruptPayload.removeValue(forKey: "message")
+        corruptObject["payload"] = corruptPayload
+        let variants: [(suffix: String, line: Data, expected: String)] = [
+            ("unknown", try JSONSerialization.data(withJSONObject: unknownObject), "empty Cowork session"),
+            ("corrupt-known", try JSONSerialization.data(withJSONObject: corruptObject), "could not verify"),
+        ]
+
+        for variant in variants {
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent(
+                    "intatis-bootstrap-\(variant.suffix)-\(UUID().uuidString)",
+                    isDirectory: true)
+            let url = directory.appendingPathComponent("events.jsonl")
+            let ws = try autoReviewWorkspace()
+            defer {
+                try? FileManager.default.removeItem(at: directory)
+                try? FileManager.default.removeItem(at: ws)
+            }
+            let log = try EventLog(session: session, fileURL: url)
+            var line = variant.line
+            line.append(0x0A)
+            try line.write(to: url, options: .atomic)
+            let orch = Orchestrator(
+                log: log,
+                allowsShell: true,
+                responder: DenyAllResponder()) { _ in
+                    AutoReviewScriptedProvider([[.done(finishReason: "stop")]])
+                }
+
+            let result = await orch.bootstrapMainAgent(Agent(
+                name: main,
+                workspaceRoot: ws,
+                model: ModelID(rawValue: "main-model"),
+                profile: .reviewed,
+                coordinationDepth: Agent.defaultCoordinationDepth))
+
+            guard case .failed(let message) = result else {
+                return XCTFail("bootstrap must fail closed for \(variant.suffix) log state")
+            }
+            XCTAssertTrue(message.contains(variant.expected), message)
+            let agents = await orch.agentList()
+            XCTAssertTrue(agents.isEmpty)
+        }
     }
 
     func testMainBootstrapPersistenceFailureLeavesNoGhostAgentOrLease() async throws {
@@ -655,8 +720,7 @@ final class AutomaticPermissionReviewTests: XCTestCase {
         let prompt = try XCTUnwrap(reviewerProvider.requests.first?.messages.compactMap(\.content).joined(separator: "\n"))
         XCTAssertTrue(prompt.contains("tool: agent.attach"))
         XCTAssertTrue(prompt.contains("requesting_agent: @main"))
-        XCTAssertTrue(prompt.contains("Requesting agent scoped context:"))
-        XCTAssertTrue(prompt.contains("Scoped context:"))
+        XCTAssertTrue(prompt.contains("Directly related causal events:"))
 
         let reviews = await log.replay().compactMap { envelope -> PermissionReviewPayload? in
             if case .permissionReview(let payload) = envelope.event {
@@ -725,14 +789,14 @@ final class AutomaticPermissionReviewTests: XCTestCase {
         XCTAssertFalse(proposedCapability.tools.contains(.attachWorkspace))
         XCTAssertEqual(proposedCapability.delegation, .requestOnly)
 
-        let argsData = try XCTUnwrap(reviewTask.normalizedArgs.data(using: .utf8))
-        let args = try XCTUnwrap(
-            JSONSerialization.jsonObject(with: argsData) as? [String: Any])
-        XCTAssertEqual(args["canCoordinate"] as? Bool, false)
-        XCTAssertEqual(args["coordinationDepth"] as? Int, 0)
-        XCTAssertEqual(args["admissionTaskID"] as? String, taskID.rawValue)
-        XCTAssertEqual(args["capabilityLeaseID"] as? String, proposedCapability.id.rawValue)
-        XCTAssertEqual(args["workspaceLeaseID"] as? String, proposedWorkspace.id.rawValue)
+        let authorization = try XCTUnwrap(reviewTask.authorization)
+        XCTAssertEqual(
+            reviewTask.normalizedArgs,
+            "digest=\(authorization.normalizedArgumentsDigest); characters=\(authorization.normalizedArgumentsCharacterCount)")
+        XCTAssertEqual(reviewTask.intent?.metadata["canCoordinate"], .bool(false))
+        XCTAssertEqual(authorization.taskID, taskID)
+        XCTAssertEqual(authorization.capabilityLeaseID, proposedCapability.id)
+        XCTAssertEqual(authorization.workspaceLeaseID, proposedWorkspace.id)
 
         let committedCapability = try XCTUnwrap(events.compactMap { envelope -> CapabilityLease? in
             guard case .capabilityLeaseCreated(let payload) = envelope.event,
@@ -763,7 +827,7 @@ final class AutomaticPermissionReviewTests: XCTestCase {
         XCTAssertTrue(prompt.contains("kind=agent_admission"))
         XCTAssertTrue(prompt.contains("capability_lease: id=\(proposedCapability.id.rawValue)"))
         XCTAssertTrue(prompt.contains("workspace_lease: id=\(proposedWorkspace.id.rawValue)"))
-        XCTAssertTrue(prompt.contains(#""canCoordinate":false"#))
+        XCTAssertTrue(prompt.contains("canCoordinate=false"))
     }
 
     func testSpawnToolUsesOneAutomaticReviewAndCommitsCoordinatorAdmissionAtomically() async throws {
@@ -820,11 +884,17 @@ final class AutomaticPermissionReviewTests: XCTestCase {
         XCTAssertFalse(reviewTasks.contains { $0.tool == "agent.attach" && $0.requestingAgent == childID })
         let spawnReview = try XCTUnwrap(reviewTasks.first { $0.tool == "spawn_agent" })
         XCTAssertEqual(spawnReview.requestingAgent, main)
-        XCTAssertTrue(spawnReview.normalizedArgs.contains(#""canCoordinate":true"#))
+        let spawnAuthorization = try XCTUnwrap(spawnReview.authorization)
+        XCTAssertEqual(
+            spawnReview.normalizedArgs,
+            "digest=\(spawnAuthorization.normalizedArgumentsDigest); characters=\(spawnAuthorization.normalizedArgumentsCharacterCount)")
         XCTAssertTrue(spawnReview.touchedPaths.isEmpty)
         XCTAssertEqual(spawnReview.intent?.action, "agent.spawn")
         XCTAssertEqual(spawnReview.intent?.dataEffects, [.none])
-        XCTAssertEqual(spawnReview.intent?.controlEffects, [.createAgent, .grantCapability])
+        XCTAssertEqual(
+            spawnReview.intent?.controlEffects,
+            [.createAgent, .attachWorkspace, .grantCapability])
+        XCTAssertEqual(spawnReview.intent?.metadata["canCoordinate"], .bool(true))
         XCTAssertEqual(spawnReview.intent?.metadata["requestedAccess"],
                        .string(WorkspaceAccess.readOnly.rawValue))
 
@@ -843,8 +913,8 @@ final class AutomaticPermissionReviewTests: XCTestCase {
         XCTAssertTrue(committedCapability.tools.contains(.delegateTask))
         XCTAssertTrue(committedCapability.tools.contains(.attachWorkspace))
         XCTAssertFalse(committedCapability.tools.contains(.applyPatch))
-        if case .granted = committedCapability.delegation {
-            // Expected coordinator grant.
+        if case .granted(let budget) = committedCapability.delegation {
+            XCTAssertEqual(budget.maxDepth, 0)
         } else {
             XCTFail("committed coordinator lease must include delegation")
         }
@@ -899,13 +969,16 @@ final class AutomaticPermissionReviewTests: XCTestCase {
         let prompt = reviewRequest.messages.compactMap(\.content).joined(separator: "\n")
         XCTAssertTrue(prompt.contains("Active agent roster:"))
         XCTAssertTrue(prompt.contains("@main"))
-        XCTAssertTrue(prompt.contains("Requesting agent scoped context:"))
-        XCTAssertTrue(prompt.contains("Scoped context:"))
-        XCTAssertTrue(prompt.contains("Recent global events:"))
+        XCTAssertTrue(prompt.contains("Directly related causal events:"))
         XCTAssertTrue(prompt.contains("create auto.txt with approved"))
         XCTAssertTrue(prompt.contains("write_file"))
+        XCTAssertTrue(prompt.contains("membership=granted"))
+        XCTAssertTrue(prompt.contains("canonical_permission=filesystem.edit"))
+        XCTAssertFalse(prompt.contains("required_capabilities=[apply_patch]"))
+        XCTAssertFalse(prompt.contains("lease-inconsistent"))
 
-        let reviews = await log.replay().compactMap { envelope -> PermissionReviewPayload? in
+        let events = await log.replay()
+        let reviews = events.compactMap { envelope -> PermissionReviewPayload? in
             if case .permissionReview(let payload) = envelope.event {
                 return payload
             }
@@ -913,6 +986,42 @@ final class AutomaticPermissionReviewTests: XCTestCase {
         }
         XCTAssertEqual(reviews.last?.decision, .allow)
         XCTAssertEqual(reviews.last?.reviewerModel, "@permission-reviewer:reviewer-model")
+        let requested = try XCTUnwrap(events.compactMap { envelope -> PermissionReviewTask? in
+            if case .permissionReviewRequested(let payload) = envelope.event { return payload.task }
+            return nil
+        }.last)
+        let settled = try XCTUnwrap(events.compactMap { envelope -> PermissionReviewSettledPayload? in
+            if case .permissionReviewSettled(let payload) = envelope.event { return payload }
+            return nil
+        }.last)
+        let resolved = try XCTUnwrap(events.compactMap { envelope -> PermissionResolvedPayload? in
+            if case .permissionResolved(let payload) = envelope.event,
+               payload.tool == "write_file",
+               payload.requestId != nil { return payload }
+            return nil
+        }.last)
+        let prepared = try XCTUnwrap(events.compactMap { envelope -> ToolExecutionPreparedPayload? in
+            if case .toolExecutionPrepared(let payload) = envelope.event,
+               payload.tool == "write_file" { return payload }
+            return nil
+        }.last)
+        let executionSettled = try XCTUnwrap(events.compactMap { envelope -> ToolExecutionSettledPayload? in
+            if case .toolExecutionSettled(let payload) = envelope.event,
+               payload.tool == "write_file" { return payload }
+            return nil
+        }.last)
+        let authorization = try XCTUnwrap(requested.authorization)
+        XCTAssertEqual(authorization.membership, .granted)
+        XCTAssertEqual(authorization.requiredCapabilities, [.applyPatch])
+        XCTAssertEqual(authorization.canonicalAction, "filesystem.write")
+        XCTAssertEqual(authorization.deterministicGate?.decision, .pass)
+        XCTAssertEqual(settled.authorization, authorization)
+        XCTAssertEqual(resolved.authorization, authorization)
+        XCTAssertEqual(prepared.authorization, authorization)
+        XCTAssertEqual(executionSettled.authorization, authorization)
+        XCTAssertEqual(resolved.source, .automaticReviewer)
+        XCTAssertEqual(resolved.reviewTaskID, requested.id)
+        XCTAssertEqual(resolved.reviewStatus, .allowed)
     }
 
     func testCancellingActiveTasksKeepsAutomaticReviewerAvailableForNextRequest() async throws {
@@ -998,7 +1107,10 @@ final class AutomaticPermissionReviewTests: XCTestCase {
         _ = await orch.enableAutomaticPermissionReview(model: ModelID(rawValue: "reviewer-model"), workspaceRoot: ws)
 
         let sendResult = await orch.send("write fallback.txt", to: main)
-        XCTAssertEqual(sendResult, OrchestratorSendResult.sent)
+        guard case .failed(let failure) = sendResult else {
+            return XCTFail("a denied required write must fail the invocation")
+        }
+        XCTAssertTrue(failure.contains("required side effects remain denied or failed"))
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: ws.appendingPathComponent("fallback.txt").path))
         let reviews = await log.replay().compactMap { envelope -> PermissionReviewPayload? in
@@ -1008,6 +1120,161 @@ final class AutomaticPermissionReviewTests: XCTestCase {
             return nil
         }
         XCTAssertEqual(reviews.last?.decision, .deny)
+    }
+
+    func testReviewerDenyReasonIsPreservedAndDeniedWriteCannotCompleteInvocation() async throws {
+        let log = try autoReviewTempLog()
+        let ws = try autoReviewWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let exactReason = "requested overwrite is outside the assigned deliverable"
+        let mainProvider = AutoReviewScriptedProvider([
+            [.toolCalls([ToolCall(
+                id: "denied-write",
+                name: "write_file",
+                arguments: autoReviewWriteArgs(path: "denied.txt", content: "not allowed"))]),
+             .done(finishReason: "tool_calls")],
+            [.textDelta("Created denied.txt successfully."), .done(finishReason: "stop")],
+        ])
+        let reviewerProvider = AutoReviewCapturingProvider([
+            .textDelta(#"{"decision":"deny","reason":"requested overwrite is outside the assigned deliverable"}"#),
+            .done(finishReason: "stop"),
+        ])
+        let reviewerID = reviewer
+        let orch = Orchestrator(
+            log: log,
+            allowsShell: true,
+            responder: AttachOnlyResponder()) { agent -> any ToolCallingProvider in
+                if agent.name == reviewerID { return reviewerProvider }
+                return mainProvider
+            }
+        let attached = await orch.attach(Agent(
+            name: main,
+            workspaceRoot: ws,
+            model: ModelID(rawValue: "main-model"),
+            profile: .reviewed,
+            coordinationDepth: Agent.defaultCoordinationDepth))
+        let enabled = await orch.enableAutomaticPermissionReview(
+            model: ModelID(rawValue: "reviewer-model"),
+            workspaceRoot: ws)
+
+        let sent = await orch.send("create denied.txt", to: main)
+        XCTAssertTrue(attached)
+        XCTAssertEqual(enabled, AutomaticPermissionReviewResult.enabled(reviewer))
+        guard case .failed(let failure) = sent else {
+            return XCTFail("a denied required write must fail the invocation")
+        }
+        XCTAssertTrue(failure.contains("required side effects remain denied or failed"))
+
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: ws.appendingPathComponent("denied.txt").path))
+        let events = await log.replay()
+        let settled = try XCTUnwrap(events.compactMap { envelope -> PermissionReviewSettledPayload? in
+            if case .permissionReviewSettled(let payload) = envelope.event { return payload }
+            return nil
+        }.last)
+        let resolved = try XCTUnwrap(events.compactMap { envelope -> PermissionResolvedPayload? in
+            if case .permissionResolved(let payload) = envelope.event,
+               payload.tool == "write_file",
+               payload.requestId != nil { return payload }
+            return nil
+        }.last)
+        let observation = try XCTUnwrap(events.compactMap { envelope -> ToolResultPayload? in
+            if case .toolResult(let payload) = envelope.event,
+               payload.toolCallId == "denied-write" { return payload }
+            return nil
+        }.last?.observation)
+        XCTAssertEqual(settled.reason, exactReason)
+        XCTAssertEqual(resolved.reason, exactReason)
+        XCTAssertEqual(resolved.source, .automaticReviewer)
+        XCTAssertEqual(resolved.reviewTaskID, settled.reviewTaskID)
+        XCTAssertEqual(resolved.reviewStatus, .denied)
+        XCTAssertEqual(observation, "permission denied: \(exactReason)")
+        XCTAssertFalse(observation.contains("permission denied: permission denied:"))
+        XCTAssertTrue(mainProvider.requests.dropFirst().first?.messages.contains {
+            $0.content == observation
+        } == true)
+        XCTAssertFalse(events.contains { envelope in
+            if case .taskCompleted(let payload) = envelope.event {
+                return payload.agent == main
+            }
+            return false
+        })
+        XCTAssertTrue(events.contains { envelope in
+            if case .taskFailed(let payload) = envelope.event {
+                return payload.agent == main
+                    && payload.error.contains("required side effects remain denied or failed")
+            }
+            return false
+        })
+    }
+
+    func testSuccessfulEquivalentEditClearsEarlierDeniedWriteEvidence() async throws {
+        let log = try autoReviewTempLog()
+        let ws = try autoReviewWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let file = ws.appendingPathComponent("document.txt")
+        try "old\n".write(to: file, atomically: true, encoding: .utf8)
+        let diff = [
+            "--- a/document.txt",
+            "+++ b/document.txt",
+            "@@ -1 +1 @@",
+            "-old",
+            "+new",
+        ].joined(separator: "\n")
+        let patchArgs = String(decoding: try JSONSerialization.data(
+            withJSONObject: ["diff": diff],
+            options: [.sortedKeys]), as: UTF8.self)
+        let mainProvider = AutoReviewScriptedProvider([
+            [.toolCalls([ToolCall(
+                id: "denied-write",
+                name: "write_file",
+                arguments: autoReviewWriteArgs(path: "document.txt", content: "new\n"))]),
+             .done(finishReason: "tool_calls")],
+            [.toolCalls([ToolCall(
+                id: "approved-patch",
+                name: "apply_patch",
+                arguments: patchArgs)]),
+             .done(finishReason: "tool_calls")],
+            [.textDelta("Updated document.txt through the approved patch."),
+             .done(finishReason: "stop")],
+        ])
+        let reviewerProvider = AutoReviewScriptedProvider([
+            [.textDelta(#"{"decision":"deny","reason":"replace the broad overwrite with a minimal patch"}"#),
+             .done(finishReason: "stop")],
+            [.textDelta(#"{"decision":"allow","reason":"minimal patch matches the requested edit"}"#),
+             .done(finishReason: "stop")],
+        ])
+        let reviewerID = reviewer
+        let orch = Orchestrator(
+            log: log,
+            allowsShell: true,
+            responder: AttachOnlyResponder()) { agent -> any ToolCallingProvider in
+                agent.name == reviewerID ? reviewerProvider : mainProvider
+            }
+        let attached = await orch.attach(Agent(
+            name: main,
+            workspaceRoot: ws,
+            model: ModelID(rawValue: "main-model"),
+            profile: .reviewed,
+            coordinationDepth: Agent.defaultCoordinationDepth))
+        XCTAssertTrue(attached)
+        let enabled = await orch.enableAutomaticPermissionReview(
+            model: ModelID(rawValue: "reviewer-model"),
+            workspaceRoot: ws)
+        XCTAssertEqual(enabled, .enabled(reviewer))
+
+        let result = await orch.send("change document.txt from old to new", to: main)
+
+        XCTAssertEqual(result, .sent)
+        XCTAssertEqual(try String(contentsOf: file, encoding: .utf8), "new\n")
+        XCTAssertEqual(reviewerProvider.requests.count, 2)
+        let settlements = await log.replay().compactMap { envelope -> ToolExecutionSettledPayload? in
+            guard case .toolExecutionSettled(let payload) = envelope.event else { return nil }
+            return payload
+        }
+        XCTAssertTrue(settlements.contains {
+            $0.tool == "apply_patch" && $0.outcome == .succeeded
+        })
     }
 
     func testHardDenyNeverReachesAutomaticReviewer() async throws {
@@ -1041,7 +1308,10 @@ final class AutomaticPermissionReviewTests: XCTestCase {
         _ = await orch.enableAutomaticPermissionReview(model: ModelID(rawValue: "reviewer-model"), workspaceRoot: ws)
 
         let sendResult = await orch.send("write .env", to: main)
-        XCTAssertEqual(sendResult, OrchestratorSendResult.sent)
+        guard case .failed(let failure) = sendResult else {
+            return XCTFail("a hard-denied required write must fail the invocation")
+        }
+        XCTAssertTrue(failure.contains("required side effects remain denied or failed"))
 
         XCTAssertTrue(reviewerProvider.requests.isEmpty)
         XCTAssertFalse(FileManager.default.fileExists(atPath: ws.appendingPathComponent(".env").path))

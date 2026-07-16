@@ -6,6 +6,7 @@ import IntatisCore
 import IntatisPermission
 import IntatisProtocol
 import IntatisProviders
+import IntatisTools
 @testable import IntatisCowork
 
 private final class ReviewControlPlaneProvider: ToolCallingProvider, @unchecked Sendable {
@@ -303,6 +304,24 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
             1_024)
     }
 
+    func testCorruptDurableReviewHistoryDeniesBeforeProviderDispatch() async throws {
+        let (log, workspace) = try makeLogAndWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace.deletingLastPathComponent()) }
+        let provider = ReviewControlPlaneProvider()
+        let responder = makeResponder(log: log, workspace: workspace, provider: provider)
+        try Data("{\"invalid\":true}\n".utf8)
+            .write(to: workspace.deletingLastPathComponent().appendingPathComponent("events.jsonl"))
+
+        let resolution = await responder.requestResolution(
+            permissionRequest(id: "req_corrupt_durable_history"))
+
+        XCTAssertEqual(resolution.decision, .deny)
+        XCTAssertEqual(resolution.source, .automaticReviewerFailure)
+        XCTAssertEqual(resolution.reviewStatus, .failed)
+        XCTAssertEqual(resolution.failureKind, .reconciliationFailure)
+        XCTAssertEqual(provider.callCount, 0)
+    }
+
     func testTruncatedReviewerVerdictIsDiagnosedAndDenied() async throws {
         let (log, workspace) = try makeLogAndWorkspace()
         defer { try? FileManager.default.removeItem(at: workspace) }
@@ -316,10 +335,14 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
         ])
         let responder = makeResponder(log: log, workspace: workspace, provider: provider)
 
-        let decision = await responder.requestApproval(
+        let resolution = await responder.requestResolution(
             permissionRequest(id: "req_truncated_verdict"))
 
-        XCTAssertEqual(decision, .deny)
+        XCTAssertEqual(resolution.decision, .deny)
+        XCTAssertEqual(resolution.source, .automaticReviewerFailure)
+        XCTAssertEqual(resolution.reviewStatus, .failed)
+        XCTAssertEqual(resolution.failureKind, .malformedVerdict)
+        XCTAssertTrue(resolution.reason?.contains("completion-token limit") == true)
         let settled = await log.replay().compactMap { envelope -> PermissionReviewSettledPayload? in
             if case .permissionReviewSettled(let payload) = envelope.event { return payload }
             return nil
@@ -338,10 +361,13 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
         ])
         let responder = makeResponder(log: log, workspace: workspace, provider: provider)
 
-        let decision = await responder.requestApproval(
+        let resolution = await responder.requestResolution(
             permissionRequest(id: "req_reviewer_tool_call"))
 
-        XCTAssertEqual(decision, .deny)
+        XCTAssertEqual(resolution.decision, .deny)
+        XCTAssertEqual(resolution.source, .automaticReviewerFailure)
+        XCTAssertEqual(resolution.reviewStatus, .failed)
+        XCTAssertEqual(resolution.failureKind, .reviewerContractViolation)
         let settled = await log.replay().compactMap { envelope -> PermissionReviewSettledPayload? in
             if case .permissionReviewSettled(let payload) = envelope.event { return payload }
             return nil
@@ -349,6 +375,100 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
         XCTAssertEqual(settled.last?.status, .failed)
         XCTAssertTrue(settled.last?.reason.contains("attempted a tool call") == true)
         XCTAssertFalse(settled.last?.reason.contains("invalid or") == true)
+    }
+
+    func testReviewerAllowWithoutNonemptyReasonIsMalformedAndDenied() async throws {
+        let (log, workspace) = try makeLogAndWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let provider = ReviewControlPlaneProvider(chunks: [
+            .textDelta(#"{"decision":"allow"}"#),
+            .done(finishReason: "stop"),
+        ])
+        let responder = makeResponder(log: log, workspace: workspace, provider: provider)
+
+        let resolution = await responder.requestResolution(
+            permissionRequest(id: "req_missing_reason"))
+
+        XCTAssertEqual(resolution.decision, .deny)
+        XCTAssertEqual(resolution.source, .automaticReviewerFailure)
+        XCTAssertEqual(resolution.reviewStatus, .failed)
+        XCTAssertEqual(resolution.failureKind, .malformedVerdict)
+        XCTAssertTrue(resolution.reason?.contains("malformed verdict JSON") == true)
+    }
+
+    func testReviewerCannotDowngradeDeterministicGateRisk() async throws {
+        let (log, workspace) = try makeLogAndWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let provider = ReviewControlPlaneProvider(chunks: [
+            .textDelta(#"{"decision":"allow","risk":"low","reason":"narrowly within scope"}"#),
+            .done(finishReason: "stop"),
+        ])
+        let responder = makeResponder(log: log, workspace: workspace, provider: provider)
+        let context = PermissionRequestContext(gate: PermissionReviewGateSnapshot(
+            decision: .ask,
+            risk: .high,
+            reason: "host classified this action as high risk",
+            policyVersion: "intatis.deterministic-policy.v1"))
+
+        let resolution = await responder.requestResolution(
+            permissionRequest(id: "req_risk_floor", context: context))
+
+        XCTAssertEqual(resolution.decision, .allow)
+        XCTAssertEqual(resolution.risk, .high)
+        let replayed = await log.replay()
+        let settled = try XCTUnwrap(replayed.compactMap { envelope -> PermissionReviewSettledPayload? in
+            if case .permissionReviewSettled(let payload) = envelope.event { return payload }
+            return nil
+        }.last)
+        XCTAssertEqual(settled.risk, .high)
+    }
+
+    func testReviewerPromptUsesBoundedSecretRedactedActionPreviewAndUntrustedFacts() async throws {
+        let (log, workspace) = try makeLogAndWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let provider = ReviewControlPlaneProvider()
+        let responder = makeResponder(log: log, workspace: workspace, provider: provider)
+        let secret = "review-secret-value-123"
+        let args = #"{"content":"Authorization: Bearer \#(secret)","path":"Sources/App.swift?token=\#(secret)"}"#
+        let intent = PermissionIntent(
+            action: "filesystem.write",
+            resources: [PermissionResource(
+                kind: .workspacePath,
+                value: "Sources/App.swift?token=\(secret)",
+                access: .readWrite)],
+            dataEffects: [.mutate],
+            risks: [.workspaceMutation],
+            replayPolicy: .requiresManualReconciliation)
+        let context = PermissionRequestContext(
+            normalizedArgs: args,
+            touchedPaths: ["Sources/App.swift?token=\(secret)"],
+            risksNetwork: false,
+            sideEffect: .write,
+            intent: intent,
+            gate: PermissionReviewGateSnapshot(
+                decision: .ask,
+                risk: .medium,
+                reason: "Authorization: Bearer \(secret)"))
+
+        let resolution = await responder.requestResolution(
+            permissionRequest(id: "req_redacted_preview", context: context))
+
+        XCTAssertEqual(resolution.decision, .allow)
+        let prompt = try XCTUnwrap(provider.requests.first)
+            .messages.compactMap(\.content).joined(separator: "\n")
+        XCTAssertFalse(prompt.contains(secret))
+        XCTAssertTrue(prompt.contains("[REDACTED]"))
+        XCTAssertTrue(prompt.contains("action_preview: kind=write_file"))
+        let replayed = await log.replay()
+        let requested = try XCTUnwrap(replayed.compactMap { envelope -> PermissionReviewTask? in
+            if case .permissionReviewRequested(let payload) = envelope.event { return payload.task }
+            return nil
+        }.last)
+        let preview = try XCTUnwrap(requested.authorization?.actionPreview)
+        XCTAssertTrue(preview.redacted)
+        XCTAssertFalse(preview.fields.values.joined().contains(secret))
+        XCTAssertTrue(requested.normalizedArgs.contains("digest="))
+        XCTAssertFalse(requested.normalizedArgs.contains(secret))
     }
 
     func testReviewerControlPlaneDoesNotConsumeOnlyDataPlaneSchedulerSlot() async throws {
@@ -387,8 +507,20 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
         XCTAssertEqual(enabled, AutomaticPermissionReviewResult.enabled(reviewerID))
 
         let result = await orchestrator.send("write single-slot.txt", to: main)
+        let permissionAudit = await log.replay().compactMap { envelope -> String? in
+            switch envelope.event {
+            case .permissionResolved(let payload):
+                return "resolved \(payload.tool) \(payload.decision.rawValue): \(payload.reason)"
+            case .permissionReviewSettled(let payload):
+                return "review \(payload.status.rawValue): \(payload.reason)"
+            case .toolResult(let payload):
+                return "tool \(payload.toolCallId): \(payload.observation)"
+            default:
+                return nil
+            }
+        }.joined(separator: " | ")
 
-        XCTAssertEqual(result, OrchestratorSendResult.sent)
+        XCTAssertEqual(result, OrchestratorSendResult.sent, permissionAudit)
         XCTAssertEqual(
             try String(contentsOf: workspace.appendingPathComponent("single-slot.txt"), encoding: .utf8),
             "ok")
@@ -433,6 +565,16 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
             capabilityLeaseID: capabilityLease.id,
             relatedAgents: [AgentID(rawValue: "lead")],
             relatedTasks: [rootTaskID])
+        let intent = PermissionIntent(
+            action: "filesystem.write",
+            resources: [PermissionResource(
+                kind: .workspacePath,
+                value: "Sources/App.swift",
+                access: .readWrite)],
+            metadata: ["operation": .string("create_or_overwrite")],
+            dataEffects: [.mutate],
+            risks: [.workspaceMutation],
+            replayPolicy: .requiresManualReconciliation)
         let context = PermissionRequestContext(
             taskID: taskID,
             rootTaskID: rootTaskID,
@@ -443,8 +585,9 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
             touchedPaths: ["Sources/App.swift"],
             risksNetwork: false,
             sideEffect: .write,
+            intent: intent,
             gate: PermissionReviewGateSnapshot(
-                decision: .ask,
+                decision: .pass,
                 risk: .medium,
                 reason: "write to workspace"),
             capabilityLease: capabilityLease,
@@ -458,12 +601,20 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
                 relatedAgents: contract.relatedAgents,
                 eventSequenceNumbers: [4, 7]),
             executionID: "exec_review_2",
-            replayPolicy: "requires_reconciliation")
-        let request = permissionRequest(id: "req_structured", context: context)
+            replayPolicy: ToolExecutionReplayPolicy.requiresManualReconciliation.rawValue)
+        let request = permissionRequest(
+            id: "req_structured",
+            context: context,
+            requiredCapabilities: [.applyPatch])
+        let authorization = try XCTUnwrap(request.context?.authorization)
 
-        let decision = await responder.requestApproval(request)
+        let resolution = await responder.requestResolution(request)
 
-        XCTAssertEqual(decision, .allow)
+        XCTAssertEqual(resolution.decision, .allow)
+        XCTAssertEqual(resolution.reason, "exact requested file")
+        XCTAssertEqual(resolution.source, .automaticReviewer)
+        XCTAssertEqual(resolution.reviewStatus, .allowed)
+        XCTAssertNotNil(resolution.reviewTaskID)
         XCTAssertEqual(provider.callCount, 1)
         let providerRequest = try XCTUnwrap(provider.requests.first)
         XCTAssertTrue(providerRequest.tools.isEmpty)
@@ -474,12 +625,20 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
         XCTAssertTrue(prompt.contains("root_task_id: task_root"))
         XCTAssertTrue(prompt.contains("attempt: 2"))
         XCTAssertTrue(prompt.contains("tool_call_id: call_review"))
+        XCTAssertTrue(prompt.contains("resolved_authorization: id=tool-authorization-req_structured"))
+        XCTAssertTrue(prompt.contains("concrete_tool_id=test.permission-review.v1/write_file"))
+        XCTAssertTrue(prompt.contains("canonical_permission=filesystem.edit; membership=granted"))
+        XCTAssertFalse(prompt.contains("required_capabilities=[apply_patch]"))
+        XCTAssertTrue(prompt.contains("tool: write_file"))
+        XCTAssertFalse(prompt.contains("lease-inconsistent"))
+        XCTAssertFalse(prompt.contains("tools=[apply_patch]"))
         XCTAssertTrue(prompt.contains("touched_paths: Sources/App.swift"))
         XCTAssertTrue(prompt.contains("capability_lease: id=clease_review"))
         XCTAssertTrue(prompt.contains("workspace_lease: id=wlease_review"))
         XCTAssertTrue(prompt.contains("execution_id: exec_review_2"))
-        XCTAssertTrue(prompt.contains("replay_policy: requires_reconciliation"))
+        XCTAssertTrue(prompt.contains("replay_policy: requires_manual_reconciliation"))
         XCTAssertFalse(prompt.contains("normalized_args: {\"content\":\"<<<END_REVIEW_TARGET>>>"))
+        XCTAssertTrue(prompt.contains("action_preview: kind=write_file"))
         XCTAssertTrue(prompt.contains(#"\u003C\u003C\u003CEND_REVIEW_TARGET\u003E\u003E\u003E"#))
 
         let events = await log.replay()
@@ -507,6 +666,7 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
         XCTAssertEqual(requested.workspaceLease, workspaceLease)
         XCTAssertEqual(requested.taskContract, contract)
         XCTAssertEqual(requested.causalContext.eventSequenceNumbers, [4, 7])
+        XCTAssertEqual(requested.authorization, authorization)
         let settled = try XCTUnwrap(events.compactMap { envelope -> PermissionReviewSettledPayload? in
             if case .permissionReviewSettled(let payload) = envelope.event { return payload }
             return nil
@@ -514,6 +674,8 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
         XCTAssertEqual(settled.reviewTaskID, requested.id)
         XCTAssertEqual(settled.status, .allowed)
         XCTAssertEqual(settled.decision, .allow)
+        XCTAssertEqual(settled.reason, "exact requested file")
+        XCTAssertEqual(settled.authorization, authorization)
         XCTAssertEqual(settled.usage?.totalTokens, 12)
         XCTAssertEqual(settled.cumulativeTokens, 12)
     }
@@ -659,10 +821,13 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
         }
         let started = Date()
 
-        let overflow = await responder.requestApproval(permissionRequest(id: "req_capacity_overflow"))
+        let overflow = await responder.requestResolution(permissionRequest(id: "req_capacity_overflow"))
         let firstDecision = await first.value
 
-        XCTAssertEqual(overflow, .deny)
+        XCTAssertEqual(overflow.decision, .deny)
+        XCTAssertEqual(overflow.source, .automaticReviewerFailure)
+        XCTAssertEqual(overflow.failureKind, .queueCapacity)
+        XCTAssertNotNil(overflow.reviewTaskID)
         XCTAssertEqual(firstDecision, .allow)
         XCTAssertLessThan(Date().timeIntervalSince(started), 0.25)
         XCTAssertEqual(provider.callCount, 1)
@@ -679,9 +844,11 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
             provider: provider,
             eventAppender: { event in try await appender.append(event, to: log) })
 
-        let decision = await responder.requestApproval(permissionRequest(id: "req_fail_requested"))
+        let resolution = await responder.requestResolution(permissionRequest(id: "req_fail_requested"))
 
-        XCTAssertEqual(decision, .deny)
+        XCTAssertEqual(resolution.decision, .deny)
+        XCTAssertEqual(resolution.source, .automaticReviewerFailure)
+        XCTAssertEqual(resolution.failureKind, .requestPersistenceFailure)
         XCTAssertEqual(provider.callCount, 0)
         let events = await log.replay()
         XCTAssertTrue(events.isEmpty)
@@ -698,9 +865,11 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
             provider: provider,
             eventAppender: { event in try await appender.append(event, to: log) })
 
-        let decision = await responder.requestApproval(permissionRequest(id: "req_fail_settled"))
+        let resolution = await responder.requestResolution(permissionRequest(id: "req_fail_settled"))
 
-        XCTAssertEqual(decision, .deny)
+        XCTAssertEqual(resolution.decision, .deny)
+        XCTAssertEqual(resolution.source, .automaticReviewerFailure)
+        XCTAssertEqual(resolution.failureKind, .settlementPersistenceFailure)
         XCTAssertEqual(provider.callCount, 1)
         let events = await log.replay()
         XCTAssertTrue(events.contains { if case .permissionReviewRequested = $0.event { return true }; return false })
@@ -727,12 +896,15 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
                 maxRecentEvents: 12))
         let start = Date()
 
-        let decision = await responder.requestApproval(permissionRequest(id: "req_timeout"))
-        let secondDecision = await responder.requestApproval(
+        let resolution = await responder.requestResolution(permissionRequest(id: "req_timeout"))
+        let secondResolution = await responder.requestResolution(
             permissionRequest(id: "req_while_timed_out_provider_stops"))
 
-        XCTAssertEqual(decision, .deny)
-        XCTAssertEqual(secondDecision, .deny)
+        XCTAssertEqual(resolution.decision, .deny)
+        XCTAssertEqual(resolution.reviewStatus, .timedOut)
+        XCTAssertEqual(resolution.failureKind, .reviewerTimedOut)
+        XCTAssertEqual(secondResolution.decision, .deny)
+        XCTAssertEqual(secondResolution.failureKind, .providerStillStopping)
         XCTAssertLessThan(Date().timeIntervalSince(start), 0.25)
         let fallbackRequestCount = await fallbackProbe.requests.count
         XCTAssertEqual(fallbackRequestCount, 0)
@@ -755,7 +927,7 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
         let provider = ReviewControlPlaneProvider(delayNanoseconds: 500_000_000)
         let responder = makeResponder(log: log, workspace: workspace, provider: provider)
         let task = Task {
-            await responder.requestApproval(permissionRequest(id: "req_cancel"))
+            await responder.requestResolution(permissionRequest(id: "req_cancel"))
         }
         for _ in 0..<100 where provider.callCount == 0 {
             try await Task.sleep(nanoseconds: 1_000_000)
@@ -763,9 +935,11 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
         let start = Date()
 
         task.cancel()
-        let decision = await task.value
+        let resolution = await task.value
 
-        XCTAssertEqual(decision, .deny)
+        XCTAssertEqual(resolution.decision, .deny)
+        XCTAssertEqual(resolution.reviewStatus, .cancelled)
+        XCTAssertEqual(resolution.failureKind, .reviewerCancelled)
         XCTAssertLessThan(Date().timeIntervalSince(start), 0.25)
         guard case .degraded(let reason) = await responder.health() else {
             return XCTFail("cancelled reviewer must remain visibly degraded")
@@ -835,24 +1009,81 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
                 risk: .high,
                 reason: "path escapes workspace"))
 
-        let denied = await responder.requestApproval(
+        let denied = await responder.requestResolution(
             permissionRequest(id: "req_hard_deny", context: hardDeny))
-        let selfReview = await responder.requestApproval(PermissionRequestPayload(
-            requestId: RequestID(rawValue: "req_self_review"),
-            agent: reviewerID,
-            tool: "write_file",
-            args: "{}",
-            risk: .high,
-            reason: "self review"))
+        let selfReview = await responder.requestResolution(
+            permissionRequest(id: "req_self_review", agent: reviewerID))
 
-        XCTAssertEqual(denied, .deny)
-        XCTAssertEqual(selfReview, .deny)
+        XCTAssertEqual(denied.decision, .deny)
+        XCTAssertEqual(denied.source, .deterministicPolicy)
+        XCTAssertEqual(selfReview.decision, .deny)
+        XCTAssertEqual(selfReview.failureKind, .reviewerContractViolation)
+        XCTAssertEqual(selfReview.reason, "reviewer agent cannot approve its own request")
         XCTAssertEqual(provider.callCount, 0)
         let settled = await log.replay().compactMap { envelope -> PermissionReviewSettledPayload? in
             if case .permissionReviewSettled(let payload) = envelope.event { return payload }
             return nil
         }
         XCTAssertEqual(settled.map(\.status), [.denied, .denied])
+    }
+
+    func testMissingHostAuthorizationIsDurablyDeniedBeforeProvider() async throws {
+        let (log, workspace) = try makeLogAndWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let provider = ReviewControlPlaneProvider()
+        let responder = makeResponder(log: log, workspace: workspace, provider: provider)
+        var request = permissionRequest(id: "req_missing_authorization")
+        request.context?.authorization = nil
+
+        let resolution = await responder.requestResolution(request)
+
+        XCTAssertEqual(resolution.decision, .deny)
+        XCTAssertEqual(resolution.source, .deterministicPolicy)
+        XCTAssertEqual(resolution.failureKind, .authorizationSnapshotInvalid)
+        XCTAssertEqual(provider.callCount, 0)
+        let settlements = await log.replay().compactMap { envelope -> PermissionReviewSettledPayload? in
+            guard case .permissionReviewSettled(let payload) = envelope.event else { return nil }
+            return payload
+        }
+        XCTAssertEqual(settlements.last?.failureKind, .authorizationSnapshotInvalid)
+        XCTAssertTrue(settlements.last?.reason.contains("snapshot is missing") == true)
+    }
+
+    func testPinnedLiveLeasesCannotBeRemovedBeforeAutomaticReview() async throws {
+        let (log, workspace) = try makeLogAndWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace.deletingLastPathComponent()) }
+        let provider = ReviewControlPlaneProvider()
+        let responder = makeResponder(log: log, workspace: workspace, provider: provider)
+
+        let capability = CapabilityLease(
+            id: CapabilityLeaseID(rawValue: "pinned-capability"),
+            tools: [.applyPatch],
+            expiresAtTaskCompletion: false)
+        var missingCapability = permissionRequest(
+            id: "req_missing_pinned_capability",
+            context: PermissionRequestContext(capabilityLease: capability))
+        missingCapability.context?.capabilityLease = nil
+
+        let workspaceLease = WorkspaceLease(
+            id: WorkspaceLeaseID(rawValue: "pinned-workspace"),
+            workspaceID: WorkspaceID(rawValue: "pinned-workspace-id"),
+            rootPath: workspace.path,
+            access: .readWrite)
+        var missingWorkspace = permissionRequest(
+            id: "req_missing_pinned_workspace",
+            context: PermissionRequestContext(workspaceLease: workspaceLease))
+        missingWorkspace.context?.workspaceLease = nil
+
+        let capabilityResolution = await responder.requestResolution(missingCapability)
+        let workspaceResolution = await responder.requestResolution(missingWorkspace)
+
+        XCTAssertEqual(capabilityResolution.decision, .deny)
+        XCTAssertEqual(capabilityResolution.failureKind, .authorizationSnapshotInvalid)
+        XCTAssertTrue(capabilityResolution.reason?.contains("missing capability lease") == true)
+        XCTAssertEqual(workspaceResolution.decision, .deny)
+        XCTAssertEqual(workspaceResolution.failureKind, .authorizationSnapshotInvalid)
+        XCTAssertTrue(workspaceResolution.reason?.contains("missing workspace lease") == true)
+        XCTAssertEqual(provider.callCount, 0)
     }
 
     func testReviewBudgetIsSoftAndCannotDisableAutomaticAllow() async throws {
@@ -904,11 +1135,14 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
                 reservedCompletionTokens: 64,
                 maxRecentEvents: 4))
 
-        let first = await responder.requestApproval(permissionRequest(id: "req_partial_usage_failure"))
-        let second = await responder.requestApproval(permissionRequest(id: "req_partial_usage_budget"))
+        let first = await responder.requestResolution(permissionRequest(id: "req_partial_usage_failure"))
+        let second = await responder.requestResolution(permissionRequest(id: "req_partial_usage_budget"))
 
-        XCTAssertEqual(first, .deny)
-        XCTAssertEqual(second, .deny)
+        XCTAssertEqual(first.decision, .deny)
+        XCTAssertEqual(first.failureKind, .providerFailure)
+        XCTAssertEqual(first.source, .automaticReviewerFailure)
+        XCTAssertEqual(second.decision, .deny)
+        XCTAssertEqual(second.failureKind, .providerFailure)
         XCTAssertEqual(provider.callCount, 2)
         guard case .degraded(let reason) = await responder.health() else {
             return XCTFail("provider failure or its restored budget must be visible in health")
@@ -1038,15 +1272,88 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
     }
 
     private func permissionRequest(id: String,
-                                   context: PermissionRequestContext? = nil) -> PermissionRequestPayload {
-        PermissionRequestPayload(
-            requestId: RequestID(rawValue: id),
-            agent: main,
-            tool: "write_file",
-            args: #"{"content":"ok","path":"Sources/App.swift"}"#,
+                                   context: PermissionRequestContext? = nil,
+                                   agent: AgentID? = nil,
+                                   requiredCapabilities: [ToolCapability] = []) -> PermissionRequestPayload {
+        let requestingAgent = agent ?? main
+        let args = #"{"content":"ok","path":"Sources/App.swift"}"#
+        let defaultIntent = PermissionIntent(
+            action: "filesystem.write",
+            resources: [PermissionResource(
+                kind: .workspacePath,
+                value: "Sources/App.swift",
+                access: .readWrite)],
+            dataEffects: [.mutate],
+            risks: [.workspaceMutation],
+            replayPolicy: .requiresManualReconciliation)
+        let defaultGate = PermissionReviewGateSnapshot(
+            decision: .ask,
             risk: .medium,
             reason: "write to workspace",
-            context: context)
+            policyVersion: "intatis.deterministic-policy.v1")
+        var resolvedContext = context ?? PermissionRequestContext()
+        let normalizedArgs = resolvedContext.normalizedArgs ?? args
+        let intent = resolvedContext.intent ?? defaultIntent
+        let gate = resolvedContext.gate ?? defaultGate
+        resolvedContext.normalizedArgs = normalizedArgs
+        resolvedContext.risksNetwork = resolvedContext.risksNetwork ?? false
+        resolvedContext.sideEffect = resolvedContext.sideEffect ?? .write
+        resolvedContext.intent = intent
+        resolvedContext.gate = gate
+        resolvedContext.replayPolicy = resolvedContext.replayPolicy
+            ?? ToolExecutionReplayPolicy.requiresManualReconciliation.rawValue
+        if resolvedContext.authorization == nil {
+            let capability = resolvedContext.capabilityLease
+            let workspace = resolvedContext.workspaceLease
+            resolvedContext.authorization = ResolvedToolAuthorization(
+                authorizationID: "tool-authorization-\(id)",
+                registryVersion: "test.permission-review.v1",
+                concreteToolID: "test.permission-review.v1/write_file",
+                descriptorFingerprint: ToolRegistry.authorizationDigest("write_file|v1"),
+                toolName: "write_file",
+                canonicalAction: intent.action,
+                canonicalPermission: "filesystem.edit",
+                actionPreview: WriteFileTool().permissionActionPreview(
+                    ToolArgs(raw: normalizedArgs)),
+                requiredCapabilities: requiredCapabilities,
+                membership: requiredCapabilities.isEmpty ? .notRequired : .granted,
+                capabilityLeaseID: capability?.id,
+                capabilityTaskID: capability?.taskID,
+                workspaceLeaseID: workspace?.id,
+                workspaceAccess: workspace?.access,
+                workspaceRootIdentity: workspace?.rootIdentity,
+                invocation: ToolAuthorizationInvocationContext(
+                    sessionID: SessionID(rawValue: "review_control"),
+                    agent: requestingAgent,
+                    taskID: resolvedContext.taskID,
+                    rootTaskID: resolvedContext.rootTaskID,
+                    parentTaskID: resolvedContext.parentTaskID,
+                    attempt: resolvedContext.attempt,
+                    toolCallID: resolvedContext.toolCallID,
+                    taskObjective: resolvedContext.taskContract.map {
+                        String($0.objective.prefix(1_200))
+                    }),
+                normalizedArgumentsDigest: ToolRegistry.authorizationDigest(normalizedArgs),
+                normalizedArgumentsCharacterCount: normalizedArgs.count,
+                intent: intent,
+                sideEffect: resolvedContext.sideEffect ?? .write,
+                risksNetwork: resolvedContext.risksNetwork ?? false,
+                replayPolicy: .requiresManualReconciliation,
+                deterministicGate: gate,
+                capabilityLeaseFingerprint: capability.map(ToolRegistry.authorizationFingerprint),
+                workspaceID: workspace?.workspaceID,
+                workspaceTaskID: workspace?.taskID,
+                workspaceRootPath: workspace?.rootPath,
+                workspaceLeaseFingerprint: workspace.map(ToolRegistry.authorizationFingerprint))
+        }
+        return PermissionRequestPayload(
+            requestId: RequestID(rawValue: id),
+            agent: requestingAgent,
+            tool: "write_file",
+            args: normalizedArgs,
+            risk: .medium,
+            reason: "write to workspace",
+            context: resolvedContext)
     }
 
     private func makeLogAndWorkspace() throws -> (EventLog, URL) {
