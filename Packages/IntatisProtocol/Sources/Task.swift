@@ -79,6 +79,10 @@ public struct TaskContract: Codable, Sendable, Hashable {
     public var workspaceID: WorkspaceID?
     public var workspaceLeaseID: WorkspaceLeaseID?
     public var capabilityLeaseID: CapabilityLeaseID?
+    /// Exact inference identity frozen when this invocation is admitted. It is
+    /// optional only so task contracts written before per-agent inference
+    /// bindings remain decodable; new Cowork invocations should always set it.
+    public var agentInferenceBinding: AgentInferenceBinding?
     public var relatedAgents: [AgentID]
     public var relatedTasks: [TaskID]
     public var constraints: [String]
@@ -100,6 +104,7 @@ public struct TaskContract: Codable, Sendable, Hashable {
                 workspaceID: WorkspaceID? = nil,
                 workspaceLeaseID: WorkspaceLeaseID? = nil,
                 capabilityLeaseID: CapabilityLeaseID? = nil,
+                agentInferenceBinding: AgentInferenceBinding? = nil,
                 relatedAgents: [AgentID] = [],
                 relatedTasks: [TaskID] = [],
                 constraints: [String] = [],
@@ -120,6 +125,7 @@ public struct TaskContract: Codable, Sendable, Hashable {
         self.workspaceID = workspaceID
         self.workspaceLeaseID = workspaceLeaseID
         self.capabilityLeaseID = capabilityLeaseID
+        self.agentInferenceBinding = agentInferenceBinding
         self.relatedAgents = relatedAgents
         self.relatedTasks = relatedTasks
         self.constraints = constraints

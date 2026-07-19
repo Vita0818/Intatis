@@ -41,6 +41,61 @@ final class CoworkProjectionRegressionTests: XCTestCase {
             reason: reason)
     }
 
+    private func inferenceBinding(profile: String,
+                                  revision: String = "rev-1") -> AgentInferenceBinding {
+        AgentInferenceBinding(
+            inferenceProfileRef: InferenceProfileRef(
+                inferenceProfileID: InferenceProfileID(rawValue: profile),
+                inferenceProfileRevision: InferenceProfileRevision(rawValue: revision)),
+            inferenceConnectionID: InferenceConnectionID(rawValue: "connection-\(profile)"),
+            inferenceConnectionRevision: InferenceConnectionRevision(rawValue: "connection-rev-1"),
+            modelID: ModelID(rawValue: "model-\(profile)"),
+            variantID: "high",
+            safeRouteLabel: "route-\(profile)",
+            immutableDefinitionFingerprint: "fingerprint-\(profile)-\(revision)")
+    }
+
+    func testAgentSpawnedDoesNotOverwriteAttachedInferenceBinding() throws {
+        let binding = inferenceBinding(profile: "profile-worker")
+        let attached = AgentAttachedPayload(
+            agent: worker,
+            path: "/workspace/approved",
+            model: binding.modelID,
+            profile: "reviewed",
+            agentInferenceBinding: binding,
+            metadata: CoworkEventMetadata(agentID: worker, scope: .agent))
+        let projection = CoworkProjection.build(from: [
+            envelope(0, .agentAttached(attached)),
+            envelope(1, .agentSpawned(.init(
+                requestedBy: main,
+                agent: worker,
+                path: "/workspace/spawn-event",
+                model: ModelID(rawValue: "different-model"),
+                agentInferenceBinding: inferenceBinding(profile: "different-profile")))),
+        ])
+
+        XCTAssertEqual(try XCTUnwrap(projection.agentRoster[worker]), attached)
+        XCTAssertEqual(projection.agentOwners[worker], main)
+    }
+
+    func testSpawnOnlyLegacyLogSynthesizesUnresolvedInferenceBinding() throws {
+        let projection = CoworkProjection.build(from: [
+            envelope(0, .agentSpawned(.init(
+                requestedBy: main,
+                agent: worker,
+                path: "/workspace/legacy",
+                model: ModelID(rawValue: "legacy-model")))),
+        ])
+
+        let attached = try XCTUnwrap(projection.agentRoster[worker])
+        XCTAssertEqual(attached.agent, worker)
+        XCTAssertEqual(attached.path, "/workspace/legacy")
+        XCTAssertEqual(attached.model, ModelID(rawValue: "legacy-model"))
+        XCTAssertEqual(attached.profile, "reviewed")
+        XCTAssertNil(attached.agentInferenceBinding)
+        XCTAssertEqual(projection.agentOwners[worker], main)
+    }
+
     func testTaskCancelledBecomesTerminalAndLeavesPendingMailbox() throws {
         let contract = contract(id: "task_cancelled")
         let report = TaskReportPayload(

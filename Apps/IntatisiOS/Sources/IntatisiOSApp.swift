@@ -172,6 +172,8 @@ struct IOSRootView: View {
     @State private var isTestingProvider = false
     @State private var providerHealthReport: ProviderHealthReport?
     @State private var recentSessions: [IOSSessionSummary] = []
+    @AppStorage(IntatisMessageRendererMode.defaultsKey)
+    private var rendererModeRawValue = IntatisMessageRendererMode.microsoft.rawValue
 
     var body: some View {
         // iOS uses the shared chat thread in single-column mode; Code/Cowork are
@@ -352,6 +354,24 @@ struct IOSRootView: View {
                     }
                 }
 
+                Section("Message Rendering") {
+                    Picker("Message rendering", selection: rendererModeSelection) {
+                        Text("Rich Markdown").tag(IntatisMessageRendererMode.microsoft.rawValue)
+                        Text("Plain text safe mode").tag(IntatisMessageRendererMode.plainSafe.rawValue)
+                    }
+                    Text(messageRendererHelpText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Section("Open Source") {
+                    NavigationLink("Third-party notices") {
+                        IntatisThirdPartyNoticesView()
+                            .navigationTitle("Open-source notices")
+                            .navigationBarTitleDisplayMode(.inline)
+                    }
+                }
+
                 if let settingsError {
                     Section {
                         Text(settingsError).font(.caption).foregroundStyle(.red)
@@ -377,6 +397,24 @@ struct IOSRootView: View {
                 }
             }
         }
+    }
+
+    private var messageRendererHelpText: String {
+        if let launchOverride = IntatisMessageRendererMode.launchOverride() {
+            let label = launchOverride == .plainSafe ? "Plain text safe mode" : "Rich Markdown"
+            return "Current launch is forced to \(label). This picker is saved immediately for the next launch without an override; Cancel only discards provider edits."
+        }
+        return "This choice is saved and applied immediately; Cancel only discards provider edits. Rich Markdown uses the audited upstream renderer with images, math typesetting, and syntax highlighting disabled for the first release. Plain text safe mode bypasses Markdown entirely without changing session data."
+    }
+
+    private var rendererModeSelection: Binding<String> {
+        Binding(
+            get: {
+                IntatisMessageRendererMode.resolve(
+                    persistedRawValue: rendererModeRawValue,
+                    arguments: []).rawValue
+            },
+            set: { rendererModeRawValue = $0 })
     }
 
     private var selectedProviderIndex: Int? {

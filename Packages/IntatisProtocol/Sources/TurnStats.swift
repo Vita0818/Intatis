@@ -21,6 +21,9 @@ public struct TurnStatsPayload: Codable, Equatable, Sendable {
     public var workTaskID: WorkTaskID?
     public var invocationTaskID: TaskID?
     public var agentID: AgentID?
+    /// Secret-free exact inference identity for per-profile usage, latency, and
+    /// failure attribution. Nil keeps legacy Chat/Code/Cowork events decodable.
+    public var agentInferenceBinding: AgentInferenceBinding?
     public init(promptTokens: Int? = nil,
                 cachedPromptTokens: Int? = nil,
                 completionTokens: Int? = nil,
@@ -33,7 +36,8 @@ public struct TurnStatsPayload: Codable, Equatable, Sendable {
                 continuationRunID: ContinuationRunID? = nil,
                 workTaskID: WorkTaskID? = nil,
                 invocationTaskID: TaskID? = nil,
-                agentID: AgentID? = nil) {
+                agentID: AgentID? = nil,
+                agentInferenceBinding: AgentInferenceBinding? = nil) {
         self.promptTokens = promptTokens
         self.cachedPromptTokens = cachedPromptTokens
         self.completionTokens = completionTokens
@@ -47,5 +51,6 @@ public struct TurnStatsPayload: Codable, Equatable, Sendable {
         self.workTaskID = workTaskID
         self.invocationTaskID = invocationTaskID
         self.agentID = agentID
+        self.agentInferenceBinding = agentInferenceBinding
     }
 }

@@ -94,6 +94,8 @@ public struct TurnStatsSnapshot: Identifiable, Equatable, Sendable {
     public var ttftMillis: Int?
     public var totalMillis: Int?
     public var model: String?
+    public var agentID: AgentID?
+    public var agentInferenceBinding: AgentInferenceBinding?
 
     public init(id: String, payload: TurnStatsPayload) {
         self.id = id
@@ -105,6 +107,8 @@ public struct TurnStatsSnapshot: Identifiable, Equatable, Sendable {
         self.ttftMillis = payload.ttftMillis
         self.totalMillis = payload.totalMillis
         self.model = payload.model
+        self.agentID = payload.agentID
+        self.agentInferenceBinding = payload.agentInferenceBinding
     }
 
     public var hasDisplayableMetrics: Bool {

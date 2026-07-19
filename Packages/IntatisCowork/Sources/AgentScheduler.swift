@@ -623,6 +623,7 @@ public struct AgentScheduler: Sendable {
             && lhs.contract.assignee == rhs.contract.assignee
             && lhs.contract.parentTaskID == rhs.contract.parentTaskID
             && lhs.contract.objective == rhs.contract.objective
+            && lhs.contract.agentInferenceBinding == rhs.contract.agentInferenceBinding
             && lhs.input == rhs.input
             && lhs.rootTaskID == rhs.rootTaskID
             && lhs.parentTaskID == rhs.parentTaskID

@@ -1,0 +1,532 @@
+#if canImport(SwiftUI) && canImport(SwiftStreamingMarkdown)
+import Foundation
+import SwiftUI
+import SwiftStreamingMarkdown
+
+enum IntatisMarkdownRendererLimits {
+    /// A syntax-agnostic admission limit. Inputs above this size remain exact,
+    /// selectable plain text and never enter the Markdown parser or layout tree.
+    static let maximumRichMessageUTF8Bytes = 64 * 1024
+    static let maximumConcurrentParses = 1
+    static let maximumPendingMessages = 32
+    static let incompleteMessageDebounce = Duration.milliseconds(50)
+    /// Raw text is the safety path, but rebuilding one ever-growing SwiftUI
+    /// `Text` for every token can still monopolize the main actor. Keep the
+    /// first/current/final source exact while bounding append-only projections.
+    static let rawTextProjectionIntervalNanoseconds: UInt64 = 100_000_000
+    static let configurationRevision = 1
+}
+
+enum IntatisMarkdownLinkPolicy {
+    static func allows(_ url: URL) -> Bool {
+        guard let scheme = url.scheme?.lowercased() else { return false }
+        return scheme == "https" || scheme == "http" || scheme == "mailto"
+    }
+}
+
+enum IntatisMarkdownAppearanceRevision: String, Hashable, Sendable {
+    case light
+    case dark
+
+    init(_ colorScheme: ColorScheme) {
+        self = colorScheme == .dark ? .dark : .light
+    }
+}
+
+/// Immutable colors used by one upstream parse/display request. Keeping this
+/// snapshot in request identity prevents a parse started under an old theme
+/// from publishing after the visible style changes.
+struct IntatisMarkdownStyleSnapshot: Hashable, Sendable {
+    let primaryText: Color
+    let secondaryText: Color
+    let tertiaryText: Color
+    let accent: Color
+    let stroke: Color
+    let cardStroke: Color
+    let error: Color
+
+    init(_ style: IntatisThreadStyle) {
+        primaryText = style.primaryText
+        secondaryText = style.secondaryText
+        tertiaryText = style.tertiaryText
+        accent = style.accent
+        stroke = style.stroke
+        cardStroke = style.cardStroke
+        error = style.error
+    }
+
+    var threadStyle: IntatisThreadStyle {
+        IntatisThreadStyle(
+            primaryText: primaryText,
+            secondaryText: secondaryText,
+            tertiaryText: tertiaryText,
+            accent: accent,
+            stroke: stroke,
+            cardStroke: cardStroke,
+            error: error)
+    }
+}
+
+struct IntatisMarkdownRenderRevision: Hashable, Sendable {
+    let messageID: String
+    let rawText: String
+    let isComplete: Bool
+    let appearance: IntatisMarkdownAppearanceRevision
+    let configurationRevision: Int
+
+    var isAdmitted: Bool {
+        !rawText.isEmpty
+            && rawText.utf8.count <= IntatisMarkdownRendererLimits.maximumRichMessageUTF8Bytes
+    }
+}
+
+struct IntatisMarkdownRenderRequest: Hashable, Sendable {
+    let revision: IntatisMarkdownRenderRevision
+    let style: IntatisMarkdownStyleSnapshot
+}
+
+enum IntatisRawTextProjectionLane: Hashable, Sendable {
+    case plain
+    case richFallback
+}
+
+struct IntatisRawTextProjectionActivation: Hashable, Sendable {
+    let messageID: String
+    let lane: IntatisRawTextProjectionLane
+}
+
+struct IntatisRawTextProjectionRevision: Hashable, Sendable {
+    let activation: IntatisRawTextProjectionActivation
+    let rawText: String
+    let isComplete: Bool
+
+    var displayText: String {
+        rawText.isEmpty && !isComplete ? "…" : rawText
+    }
+}
+
+/// Pure state machine behind the raw SwiftUI projection. It is deliberately
+/// independent of Markdown and wall-clock APIs so its exact-source, throttle,
+/// correction, final-flush, and stale-timer contracts can be tested directly.
+struct IntatisRawTextProjectionModel: Sendable {
+    struct Schedule: Equatable, Sendable {
+        let generation: UInt64
+        let delayNanoseconds: UInt64
+    }
+
+    struct Transition: Equatable, Sendable {
+        let didPublish: Bool
+        let cancelsScheduledPublication: Bool
+        let schedule: Schedule?
+
+        static let none = Transition(
+            didPublish: false,
+            cancelsScheduledPublication: false,
+            schedule: nil)
+    }
+
+    private(set) var displayedText: String
+    private(set) var latestRevision: IntatisRawTextProjectionRevision
+    private(set) var scheduledGeneration: UInt64?
+    private(set) var isActive = true
+
+    private var lastPublicationNanoseconds: UInt64
+    private var generation: UInt64 = 0
+
+    init(
+        revision: IntatisRawTextProjectionRevision,
+        nowNanoseconds: UInt64
+    ) {
+        displayedText = revision.displayText
+        latestRevision = revision
+        lastPublicationNanoseconds = nowNanoseconds
+    }
+
+    mutating func receive(
+        _ revision: IntatisRawTextProjectionRevision,
+        nowNanoseconds: UInt64
+    ) -> Transition {
+        if !isActive {
+            isActive = true
+            latestRevision = revision
+            return publishImmediately(
+                revision.displayText,
+                nowNanoseconds: nowNanoseconds)
+        }
+        if revision.activation != latestRevision.activation {
+            latestRevision = revision
+            return publishImmediately(
+                revision.displayText,
+                nowNanoseconds: nowNanoseconds)
+        }
+
+        let previousRevision = latestRevision
+        guard revision != previousRevision else { return .none }
+        latestRevision = revision
+
+        // A final snapshot, truncation, or correction is semantic state, not a
+        // cosmetic streaming update. Publish it synchronously and invalidate
+        // any timer that captured an older generation.
+        let isAppendOnly = revision.rawText.hasPrefix(previousRevision.rawText)
+        if revision.isComplete || !isAppendOnly {
+            return publishImmediately(
+                revision.displayText,
+                nowNanoseconds: nowNanoseconds)
+        }
+
+        let elapsed = nowNanoseconds >= lastPublicationNanoseconds
+            ? nowNanoseconds - lastPublicationNanoseconds
+            : UInt64.max
+        let interval = IntatisMarkdownRendererLimits.rawTextProjectionIntervalNanoseconds
+        if elapsed >= interval {
+            return publishImmediately(
+                revision.displayText,
+                nowNanoseconds: nowNanoseconds)
+        }
+
+        // This is a leading/trailing throttle, not a reset-on-every-token
+        // debounce: once armed, the timer keeps its original deadline and reads
+        // only the latest revision when it fires.
+        guard scheduledGeneration == nil else { return .none }
+        generation &+= 1
+        scheduledGeneration = generation
+        return Transition(
+            didPublish: false,
+            cancelsScheduledPublication: false,
+            schedule: Schedule(
+                generation: generation,
+                delayNanoseconds: interval - elapsed))
+    }
+
+    mutating func scheduledPublicationFired(
+        generation: UInt64,
+        nowNanoseconds: UInt64
+    ) -> Transition {
+        guard scheduledGeneration == generation else { return .none }
+        scheduledGeneration = nil
+        displayedText = latestRevision.displayText
+        lastPublicationNanoseconds = nowNanoseconds
+        return Transition(
+            didPublish: true,
+            cancelsScheduledPublication: false,
+            schedule: nil)
+    }
+
+    mutating func deactivate() {
+        generation &+= 1
+        scheduledGeneration = nil
+        isActive = false
+    }
+
+    private mutating func publishImmediately(
+        _ text: String,
+        nowNanoseconds: UInt64
+    ) -> Transition {
+        generation &+= 1
+        isActive = true
+        let cancelled = scheduledGeneration != nil
+        scheduledGeneration = nil
+        displayedText = text
+        lastPublicationNanoseconds = nowNanoseconds
+        return Transition(
+            didPublish: true,
+            cancelsScheduledPublication: cancelled,
+            schedule: nil)
+    }
+}
+
+/// Main-actor owner for one visible raw source projection. The task retains no
+/// document or history; it only waits for the current 100 ms trailing deadline.
+@MainActor
+final class IntatisRawTextProjectionState: ObservableObject {
+    @Published private(set) var displayedText: String
+
+    private var model: IntatisRawTextProjectionModel
+    private var scheduledTask: Task<Void, Never>?
+    private var scheduledTaskGeneration: UInt64?
+
+    init(revision: IntatisRawTextProjectionRevision) {
+        let now = DispatchTime.now().uptimeNanoseconds
+        model = IntatisRawTextProjectionModel(
+            revision: revision,
+            nowNanoseconds: now)
+        displayedText = revision.displayText
+    }
+
+    func submit(_ revision: IntatisRawTextProjectionRevision) {
+        let transition = model.receive(
+            revision,
+            nowNanoseconds: DispatchTime.now().uptimeNanoseconds)
+        apply(transition)
+    }
+
+    /// SwiftUI evaluates `body` before the facade lifecycle gate receives a
+    /// new revision. Semantic changes must therefore bypass a stale throttled
+    /// value for that first frame; pure append-only streaming remains bounded.
+    func text(for revision: IntatisRawTextProjectionRevision) -> String {
+        guard model.isActive else { return revision.displayText }
+        guard revision.activation == model.latestRevision.activation else {
+            return revision.displayText
+        }
+        if revision.isComplete
+            || !revision.rawText.hasPrefix(model.latestRevision.rawText) {
+            return revision.displayText
+        }
+        return displayedText
+    }
+
+    func deactivate() {
+        model.deactivate()
+        scheduledTask?.cancel()
+        scheduledTask = nil
+        scheduledTaskGeneration = nil
+    }
+
+    private func apply(_ transition: IntatisRawTextProjectionModel.Transition) {
+        if transition.cancelsScheduledPublication {
+            scheduledTask?.cancel()
+            scheduledTask = nil
+            scheduledTaskGeneration = nil
+        }
+        if transition.didPublish, displayedText != model.displayedText {
+            displayedText = model.displayedText
+        }
+        guard let schedule = transition.schedule else { return }
+
+        scheduledTask?.cancel()
+        scheduledTaskGeneration = schedule.generation
+        scheduledTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .nanoseconds(Int64(schedule.delayNanoseconds)))
+            } catch {
+                return
+            }
+            guard let self else { return }
+            guard self.scheduledTaskGeneration == schedule.generation else { return }
+            let transition = self.model.scheduledPublicationFired(
+                generation: schedule.generation,
+                nowNanoseconds: DispatchTime.now().uptimeNanoseconds)
+            self.scheduledTask = nil
+            self.scheduledTaskGeneration = nil
+            self.apply(transition)
+        }
+    }
+}
+
+/// Owns one visible message's upstream document on the main actor. The stream
+/// stores only the latest raw source request; the process-wide scheduler stores
+/// only permits and generations, never a parser, config, document, or result.
+private enum IntatisMarkdownParseBridge {
+    @concurrent
+    static func parse(
+        text: String,
+        style: IntatisMarkdownStyleSnapshot
+    ) async -> sending RenderableDocument {
+        // The non-Sendable render configuration is born in this concurrent
+        // task region and is consumed exactly once by the upstream `sending`
+        // boundary. No main-actor alias crosses into parser work.
+        let configuration = IntatisMicrosoftMarkdownRenderState.makeConfiguration(
+            style: style.threadStyle)
+        return await MarkdownDocumentParser.parse(
+            text: text,
+            config: configuration)
+    }
+}
+
+@MainActor
+final class IntatisMicrosoftMarkdownRenderState: ObservableObject {
+    struct PublishedDocument {
+        let request: IntatisMarkdownRenderRequest
+        let document: RenderableDocument
+        let displayConfiguration: MarkdownRenderConfig
+
+        var revision: IntatisMarkdownRenderRevision { request.revision }
+    }
+
+    @Published private(set) var publishedDocument: PublishedDocument?
+
+    private static let scheduler: IntatisLatestOnlyPermitScheduler<UUID> = {
+        do {
+            return try IntatisLatestOnlyPermitScheduler(
+                maxConcurrentPermits: IntatisMarkdownRendererLimits.maximumConcurrentParses,
+                maxPendingAcquires: IntatisMarkdownRendererLimits.maximumPendingMessages)
+        } catch {
+            preconditionFailure("Invalid fixed Markdown scheduler limits: \(error)")
+        }
+    }()
+
+    private let schedulerKey = UUID()
+    private var activationID: UUID?
+    private var currentRequest: IntatisMarkdownRenderRequest?
+    private var requestContinuation: AsyncStream<IntatisMarkdownRenderRequest>.Continuation?
+    private var consumerTask: Task<Void, Never>?
+
+    func submit(
+        revision: IntatisMarkdownRenderRevision,
+        style: IntatisThreadStyle
+    ) {
+        submit(request: IntatisMarkdownRenderRequest(
+            revision: revision,
+            style: IntatisMarkdownStyleSnapshot(style)))
+    }
+
+    func submit(request: IntatisMarkdownRenderRequest) {
+        guard request != currentRequest else { return }
+        if let published = publishedDocument, published.request != request {
+            // Release the old native view/document graph immediately. The view
+            // presents exact raw text until the latest rich projection is ready.
+            publishedDocument = nil
+        }
+        currentRequest = request
+
+        guard request.revision.isAdmitted else {
+            return
+        }
+        startConsumerIfNeeded()
+        requestContinuation?.yield(request)
+    }
+
+    func deactivate() {
+        guard currentRequest != nil
+                || publishedDocument != nil
+                || activationID != nil
+                || requestContinuation != nil
+                || consumerTask != nil else {
+            return
+        }
+        currentRequest = nil
+        if publishedDocument != nil {
+            publishedDocument = nil
+        }
+        activationID = nil
+        requestContinuation?.finish()
+        requestContinuation = nil
+        consumerTask?.cancel()
+        consumerTask = nil
+    }
+
+    private func startConsumerIfNeeded() {
+        guard consumerTask == nil else { return }
+
+        let activationID = UUID()
+        let pair = AsyncStream.makeStream(
+            of: IntatisMarkdownRenderRequest.self,
+            bufferingPolicy: .bufferingNewest(1))
+        self.activationID = activationID
+        requestContinuation = pair.continuation
+        consumerTask = Task { [weak self, stream = pair.stream] in
+            for await request in stream {
+                guard let self else { return }
+                await self.process(request, activationID: activationID)
+            }
+            guard let self, self.activationID == activationID else { return }
+            self.requestContinuation = nil
+            self.consumerTask = nil
+        }
+    }
+
+    private func process(
+        _ request: IntatisMarkdownRenderRequest,
+        activationID: UUID
+    ) async {
+        guard isCurrent(request, activationID: activationID) else { return }
+
+        if !request.revision.isComplete {
+            do {
+                try await Task.sleep(for: IntatisMarkdownRendererLimits.incompleteMessageDebounce)
+            } catch {
+                return
+            }
+            guard isCurrent(request, activationID: activationID) else { return }
+        }
+
+        guard let permit = await Self.scheduler.acquire(for: schedulerKey) else {
+            return
+        }
+        guard isCurrent(request, activationID: activationID) else {
+            _ = await Self.scheduler.finish(permit, outcome: .cancelled)
+            return
+        }
+
+        let document = await IntatisMarkdownParseBridge.parse(
+            text: request.revision.rawText,
+            style: request.style)
+
+        let isStillCurrent = isCurrent(request, activationID: activationID)
+            && !Task.isCancelled
+        let schedulerAllowsPublication = await Self.scheduler.finish(
+            permit,
+            outcome: isStillCurrent ? .success : .cancelled)
+        guard schedulerAllowsPublication,
+              isCurrent(request, activationID: activationID),
+              !Task.isCancelled else {
+            return
+        }
+
+        // This independent configuration is created only after the await and
+        // stays MainActor-owned with the returned non-Sendable document.
+        let displayConfiguration = Self.makeConfiguration(
+            style: request.style.threadStyle)
+        publishedDocument = PublishedDocument(
+            request: request,
+            document: document,
+            displayConfiguration: displayConfiguration)
+    }
+
+    private func isCurrent(
+        _ request: IntatisMarkdownRenderRequest,
+        activationID: UUID
+    ) -> Bool {
+        self.activationID == activationID && currentRequest == request
+    }
+
+    nonisolated static func makeConfiguration(
+        style: IntatisThreadStyle
+    ) -> MarkdownRenderConfig {
+        let defaults = MarkdownRenderConfig.default
+        return MarkdownRenderConfig(
+            shouldAnimateText: false,
+            blockQuoteStyle: .init(
+                textFonts: defaults.blockQuoteStyle.textFonts,
+                textColor: style.secondaryText),
+            headingStyle: .init(
+                h1Font: defaults.headingStyle.h1Font,
+                h2Font: defaults.headingStyle.h2Font,
+                h3Font: defaults.headingStyle.h3Font,
+                h4Font: defaults.headingStyle.h4Font,
+                h5Font: defaults.headingStyle.h5Font,
+                h6Font: defaults.headingStyle.h6Font,
+                textColor: style.primaryText),
+            orderedListStyle: .init(
+                textFonts: defaults.orderedListStyle.textFonts,
+                textColor: style.primaryText),
+            paragraphStyle: .init(
+                textFonts: defaults.paragraphStyle.textFonts,
+                textColor: style.primaryText),
+            tableStyle: .init(
+                textFonts: defaults.tableStyle.textFonts,
+                headerTextColor: style.primaryText,
+                regularTextColor: style.primaryText,
+                headerBackgroundColor: style.stroke.opacity(0.12),
+                borderColor: style.stroke,
+                actionButtonColor: style.secondaryText),
+            inlineStyle: .init(
+                boldTextColor: style.primaryText,
+                linkTextFont: defaults.inlineStyle.linkTextFont,
+                linkTextColor: style.accent,
+                codeTextFont: defaults.inlineStyle.codeTextFont,
+                codeTextColor: style.primaryText,
+                codeBackgroundColor: style.stroke.opacity(0.18),
+                codeUnderlineColor: style.stroke),
+            textContextMenu: nil,
+            citationConfig: .default,
+            codeBlockConfig: .init(
+                backgroundColor: style.stroke.opacity(0.14),
+                foregroundColor: style.secondaryText),
+            blockSpacing: 18,
+            textSelectionConfig: .init(isEnabled: true, backgroundColor: nil),
+            thematicBreakColor: style.stroke,
+            imageConfig: .disabled)
+    }
+}
+#endif

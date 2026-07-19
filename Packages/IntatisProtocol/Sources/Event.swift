@@ -88,12 +88,29 @@ public struct ToolCallPayload: Codable, Equatable, Sendable {
     public var toolCallId: String
     public var agent: AgentID?
     public var name: String
-    public var args: String   // raw JSON arguments string
-    public init(toolCallId: String, agent: AgentID? = nil, name: String, args: String) {
+    /// Bounded, secret-scrubbed display arguments. Older events may contain
+    /// raw JSON here; new writers may keep the identity of already validated,
+    /// non-redacted arguments in the optional digest. Rejected, sensitive, and
+    /// inference-control arguments deliberately carry no raw-value digest.
+    public var args: String
+    public var argsDigest: String?
+    public var argsCharacterCount: Int?
+    public var argsRedacted: Bool?
+
+    public init(toolCallId: String,
+                agent: AgentID? = nil,
+                name: String,
+                args: String,
+                argsDigest: String? = nil,
+                argsCharacterCount: Int? = nil,
+                argsRedacted: Bool? = nil) {
         self.toolCallId = toolCallId
         self.agent = agent
         self.name = name
         self.args = args
+        self.argsDigest = argsDigest
+        self.argsCharacterCount = argsCharacterCount
+        self.argsRedacted = argsRedacted
     }
 }
 

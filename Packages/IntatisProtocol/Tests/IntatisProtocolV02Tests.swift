@@ -38,6 +38,29 @@ final class IntatisProtocolV02Tests: XCTestCase {
         XCTAssertEqual(json["type"] as? String, "tool_call")
     }
 
+    func testToolCallAuditMetadataIsAdditiveAndRoundTrips() throws {
+        let payload = ToolCallPayload(
+            toolCallId: "tc-redacted",
+            name: "spawn_agent",
+            args: #"{"_intatis":"arguments_redacted"}"#,
+            argsDigest: nil,
+            argsCharacterCount: 241,
+            argsRedacted: true)
+        try roundTrip(Envelope(
+            seq: 1,
+            ts: Date(timeIntervalSince1970: 1),
+            session: SessionID(rawValue: "s"),
+            event: .toolCall(payload)))
+
+        let legacy = #"{"toolCallId":"legacy","name":"read_file","args":"{}"}"#
+        let decodedLegacy = try JSONDecoder().decode(
+            ToolCallPayload.self,
+            from: Data(legacy.utf8))
+        XCTAssertNil(decodedLegacy.argsDigest)
+        XCTAssertNil(decodedLegacy.argsCharacterCount)
+        XCTAssertNil(decodedLegacy.argsRedacted)
+    }
+
     func testV02CommandRoundTrips() throws {
         let cmds: [Command] = [
             .permissionRespond(.init(session: SessionID(rawValue: "s"),

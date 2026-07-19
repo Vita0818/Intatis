@@ -35,30 +35,9 @@ let package = Package(
         // built from SPM at all. See project.yml (XcodeGen) + README.
     ],
     dependencies: [
-        // Conversation rendering engines. Exact tags are paired with the
-        // resolved commits and provenance recorded in ThirdPartyNotices/.
-        .package(
-            url: "https://github.com/gonzalezreal/swift-markdown-ui.git",
-            exact: "2.4.1"
-        ),
-        // MarkdownUI declares these with open ranges. Direct exact constraints
-        // keep Intatis builds on the audited dependency graph.
-        .package(
-            url: "https://github.com/gonzalezreal/NetworkImage.git",
-            exact: "6.0.0"
-        ),
-        .package(
-            url: "https://github.com/swiftlang/swift-cmark.git",
-            exact: "0.5.0"
-        ),
-        .package(
-            url: "https://github.com/pointfreeco/swift-snapshot-testing.git",
-            exact: "1.12.0"
-        ),
-        .package(
-            url: "https://github.com/kostub/iosMath.git",
-            exact: "2.5.0"
-        ),
+        // Audited in-tree thin derivative of Microsoft SwiftStreamingMarkdown
+        // v0.6.0. Provenance and local patches live beside the vendored source.
+        .package(path: "Vendor/SwiftStreamingMarkdown"),
     ],
     targets: [
         // MARK: Library targets (module == target)
@@ -133,37 +112,12 @@ let package = Package(
                 "IntatisCore", "IntatisProtocol", "IntatisProviders",
                 "IntatisConversation", "IntatisArtifacts",
                 .product(
-                    name: "MarkdownUI",
-                    package: "swift-markdown-ui",
-                    condition: .when(platforms: [.macOS, .iOS])
-                ),
-                // The math adapter asks the same pinned CommonMark engine for
-                // source ranges so formulas are never rewritten inside code
-                // blocks. Markdown grammar remains upstream-owned.
-                .product(
-                    name: "cmark-gfm",
-                    package: "swift-cmark",
-                    condition: .when(platforms: [.macOS, .iOS])
-                ),
-                // Keep the complexity/source-range inspection parser in lockstep
-                // with MarkdownUI's GFM extension set.
-                .product(
-                    name: "cmark-gfm-extensions",
-                    package: "swift-cmark",
-                    condition: .when(platforms: [.macOS, .iOS])
-                ),
-                .product(
-                    name: "iosMath",
-                    package: "iosMath",
+                    name: "SwiftStreamingMarkdown",
+                    package: "SwiftStreamingMarkdown",
                     condition: .when(platforms: [.macOS, .iOS])
                 ),
             ],
-            path: "Packages/IntatisSharedUI/Sources",
-            resources: [
-                // Fixed upstream highlight.js 11.11.1 engine + the only two
-                // themes Intatis ships. See ThirdPartyNotices/SyntaxHighlighting.md.
-                .process("MessageRendering/Resources"),
-            ]
+            path: "Packages/IntatisSharedUI/Sources"
         ),
         // v0.6 — CLI: Swift-native `intatis` command (chat + code agent), talks to
         // any OpenAI-compatible endpoint via env vars.
@@ -242,7 +196,10 @@ let package = Package(
         .testTarget(
             name: "IntatisSharedUITests",
             dependencies: ["IntatisSharedUI"],
-            path: "Packages/IntatisSharedUI/Tests"
+            path: "Packages/IntatisSharedUI/Tests",
+            resources: [
+                .copy("Fixtures"),
+            ]
         ),
     ]
 )

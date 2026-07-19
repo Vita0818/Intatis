@@ -167,6 +167,7 @@ public struct OpenAIWireProvider: ChatProvider {
         root["model"] = .string(request.model.rawValue)
         root["messages"] = .array(request.messages.map(Self.chatMessageJSON))
         root["stream"] = .bool(true)
+        root["n"] = .number(1)
         if let t = request.temperature { root["temperature"] = .number(t) }
         if let reasoning = request.reasoningEffort { root["reasoning_effort"] = .string(reasoning.rawValue) }
         if request.includeUsage { root["stream_options"] = .object(["include_usage": .bool(true)]) }
@@ -180,7 +181,10 @@ public struct OpenAIWireProvider: ChatProvider {
     static func configuredRequestBody(endpoint: ProviderEndpoint,
                                       model: ModelID) -> [String: JSONValue] {
         var body = endpoint.requestOptions(for: model)
-        for key in ["model", "messages", "tools", "stream"] {
+        for key in [
+            "model", "messages", "tools", "stream", "stream_options",
+            "n", "best_of", "num_return_sequences", "candidate_count",
+        ] {
             body.removeValue(forKey: key)
         }
         return body
@@ -217,7 +221,7 @@ public struct URLSessionStreamingClient: HTTPByteStreaming {
             let task = Task {
                 #if canImport(Darwin)
                 do {
-                    let (bytes, response) = try await URLSession.shared.bytes(for: request)
+                    let (bytes, response) = try await ProviderURLSession.noRedirect.bytes(for: request)
                     if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
                         let body = try await ProviderErrorFormatting.cappedBody(from: bytes)
                         continuation.finish(throwing: ProviderErrorFormatting.httpStatus(

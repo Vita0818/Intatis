@@ -180,12 +180,20 @@ public struct CoworkProjection: Equatable, Sendable {
         case .agentAttached(let payload):
             agentRoster[payload.agent] = payload
         case .agentSpawned(let payload):
-            agentRoster[payload.agent] = AgentAttachedPayload(
-                agent: payload.agent,
-                path: payload.path,
-                model: payload.model,
-                profile: "reviewed",
-                metadata: payload.metadata)
+            // `agentAttached` is the durable admission fact and may carry the
+            // exact inference binding approved for this agent. New logs emit it
+            // before `agentSpawned`; never let the later lifecycle event erase
+            // that frozen identity. A spawn-only legacy log can still recover a
+            // roster entry, but its historical inference route is unresolved.
+            if agentRoster[payload.agent] == nil {
+                agentRoster[payload.agent] = AgentAttachedPayload(
+                    agent: payload.agent,
+                    path: payload.path,
+                    model: payload.model,
+                    profile: "reviewed",
+                    agentInferenceBinding: nil,
+                    metadata: payload.metadata)
+            }
             if let requestedBy = payload.requestedBy ?? payload.metadata?.sender {
                 agentOwners[payload.agent] = requestedBy
             }

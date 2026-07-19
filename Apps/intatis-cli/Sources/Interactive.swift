@@ -100,7 +100,9 @@ private let replHelp = """
 """
 
 private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async throws -> REPLExit {
-    let registry = ProviderRegistry(config: config.providerConfig(), resolver: StaticSecretResolver(key: config.apiKey))
+    let registry = ProviderRegistry(
+        config: config.providerConfig(),
+        resolver: CLIExactSecretResolver(config: config))
     var model = config.model
     var reasoning = config.reasoningEffort
     var pending = PendingAttachments()
@@ -111,7 +113,7 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
     var render = Task { await renderLoop(log, spinner: spinner, options: options) }
     defer { render.cancel(); spinner.stop() }
 
-    banner(mode: mode, model: model, host: config.baseURL.host ?? config.baseURL.absoluteString)
+    banner(mode: mode, model: model, host: config.selectedRouteLabel)
 
     while true {
         if !pending.isEmpty {
@@ -188,7 +190,7 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
                 render.cancel(); log = try sessionLog(); render = Task { await renderLoop(log, spinner: spinner, options: options) }
                 out("(new session)\n")
             case "config":
-                out("endpoint \(config.baseURL.absoluteString) · model \(model) · reasoning \(reasoning?.rawValue ?? "off")\n")
+                out("\(config.selectedRouteLabel) · endpoint hidden · model \(model) · reasoning \(reasoning?.rawValue ?? "off")\n")
             default:
                 out("unknown command /\(cmd) — /help\n")
             }
@@ -236,28 +238,39 @@ private let coworkHelp = """
   /goal status                         show the current Goal and verifier state
   /goal pause|resume|clear             control the current Goal
   /goal edit <objective>               revise the current Goal objective
-  /agent add <name> <path> [model]   manually attach an agent (optional model)
-  /agent remove <name>               detach an agent
-  /agents                            list attached agents
-  /auto                              re-enable automatic permission review
-  /default                           disable automatic permission review
-  /model [name]                      default model for newly added agents
-  /verbose [on|off]                  expand tool calls & terminal output
-  /attach <path>                     queue an image/text file for the next message
-  @name <message>                    send to a specific agent
-  <message>                          send to @main
-  /mode <chat|code|cowork>           switch mode
+  /profiles                           list safe, host-approved inference profiles
+  /profile [profile-id]               show/set the default for future agents
+  /agent add <name> <path> [--profile <profile-id>]
+                                      manually attach an exactly bound agent
+  /agent restore-main <path> <profile-id>
+                                      explicitly rebuild missing recovered @main
+  /agent profile <name>               show one agent's exact durable binding
+  /agent rebind <name> <profile-id>   idle-only, host-authorized durable rebind
+  /agent remove <name>                detach an agent
+  /agents                             list attached agents and binding status
+  /auto                               re-enable automatic permission review
+  /default                            disable automatic permission review
+  /model [name]                       compatibility display only; never rebinds
+  /verbose [on|off]                   expand tool calls & terminal output
+  /attach <path>                      queue an image/text file for the next message
+  @name <message>                     send to a specific agent
+  <message>                           send to @main
+  /mode <chat|code|cowork>            switch mode
   /help   /exit
 
   Keys: ←/→ cursor · Home/End jump · ↑/↓ history · Ctrl-U/K/W edit
-        Ctrl-A mode · Ctrl-L model · Ctrl-S settings · Ctrl-C quit
+        Ctrl-A mode · Ctrl-L default profile · Ctrl-S settings · Ctrl-C quit
 
 """
 
 private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REPLExit {
-    let registry = ProviderRegistry(config: config.providerConfig(), resolver: StaticSecretResolver(key: config.apiKey))
-    var defaultModel = config.model
-    let initialMainModel = ModelID(rawValue: defaultModel)
+    let inferenceProfiles = try await CLIInferenceProfiles.load(config: config)
+    let registry = ProviderRegistry(
+        config: config.providerConfig(),
+        resolver: CLIExactSecretResolver(config: config),
+        inferenceCatalogSnapshot: inferenceProfiles.snapshot)
+    var defaultProfile = inferenceProfiles.defaultBinding
+    let controlPlaneInference = CLIControlPlaneInferenceBinding()
     var pending = PendingAttachments()
     let log = try coworkSessionLog(workspace: workspace)
     let spinner = TurnSpinner()
@@ -268,10 +281,19 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
 
     let orchestrator = try Orchestrator.runtime(
         log: log, allowsShell: true, responder: TerminalResponder(),
-        reasoningEffort: config.reasoningEffort, includeUsage: config.includeUsage,
+        // Reasoning and arbitrary request options are frozen into each exact
+        // profile revision. A session-wide override must never drift agents.
+        reasoningEffort: nil, includeUsage: config.includeUsage,
         maxSteps: config.maxSteps,
-        imageGeneratorFor: { _ in ProviderImageGenerationToolService(registry: registry) }
-    ) { _ in try await registry.defaultAgentProvider() }
+        availableInferenceProfiles: inferenceProfiles.bindings,
+        requiresInferenceBindings: true,
+        imageGeneratorFor: { _ in ProviderImageGenerationToolService(registry: registry) },
+        resolvedInferenceFor: { agent in
+            guard let binding = agent.agentInferenceBinding else {
+                throw InferenceCatalogError.unresolvedProfile
+            }
+            return try await registry.agentInference(for: binding)
+        })
 
     let replayed = await log.replay()
     let restoredProjection = CoworkProjection.build(from: replayed)
@@ -280,15 +302,68 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
     let restoredEvents = await log.replay()
     let currentProjection = CoworkProjection.build(from: restoredEvents)
 
-    // A default agent so you can just talk; add more with /agent add.
-    let mainAttached: Bool
+    func safeProfileDescription(_ binding: AgentInferenceBinding) -> String {
+        let label = binding.safeRouteLabel.map { " · \($0)" } ?? ""
+        let variant = binding.variantID.map { " · variant \($0)" } ?? " · base"
+        return "\(binding.inferenceProfileID.rawValue)@\(binding.inferenceProfileRevision.rawValue) · \(binding.modelID.rawValue)\(variant)\(label)"
+    }
+
+    func option(profileID: String) -> CLIInferenceProfileOption? {
+        inferenceProfiles.option(profileID: unbracket(profileID))
+    }
+
+    func printProfiles() {
+        for profile in inferenceProfiles.options {
+            let marker = profile.binding == defaultProfile ? "*" : " "
+            out("\(marker) \(safeProfileDescription(profile.binding))\n")
+        }
+    }
+
+    func resolvableMainBinding() async -> AgentInferenceBinding? {
+        guard let main = await orchestrator.agentList().first(where: {
+            $0.name == Orchestrator.mainAgentID
+        }), let binding = main.agentInferenceBinding else { return nil }
+        do {
+            let resolved = try await registry.agentInference(for: binding)
+            guard resolved.binding == binding, resolved.model == main.model else { return nil }
+            return binding
+        } catch {
+            return nil
+        }
+    }
+
+    /// The first exact, resolvable @main binding owns both no-tools control
+    /// planes for this CLI process. A later data-plane rebind cannot retarget a
+    /// running reviewer or verifier mid-session.
+    func freezeControlPlaneInferenceIfPossible() async -> AgentInferenceBinding? {
+        if let frozen = await controlPlaneInference.binding() { return frozen }
+        guard let binding = await resolvableMainBinding() else { return nil }
+        return await controlPlaneInference.freeze(binding)
+    }
+
+    func enableAutomaticReview() async -> AutomaticPermissionReviewResult {
+        guard let binding = await freezeControlPlaneInferenceIfPossible() else {
+            return .failed("@main requires an exact, resolvable inference profile before automatic review can start")
+        }
+        return await orchestrator.enableAutomaticPermissionReview(
+            model: binding.modelID,
+            agentInferenceBinding: binding,
+            workspaceRoot: workspace)
+    }
+
+    // A default exactly-bound agent so you can just talk; add more with
+    // `/agent add`. Recovered legacy agents remain visible but deliberately do
+    // not receive a guessed variant or the current default binding.
+    var mainAttached: Bool
     let autoReviewResult: AutomaticPermissionReviewResult
     var mainBootstrapError: String? = nil
-    if currentProjection.agentRoster[Orchestrator.mainAgentID] != nil {
+    if let restoredMain = currentProjection.agentRoster[Orchestrator.mainAgentID] {
         mainAttached = true
-        autoReviewResult = await orchestrator.enableAutomaticPermissionReview(
-            model: ModelID(rawValue: defaultModel),
-            workspaceRoot: workspace)
+        if restoredMain.agentInferenceBinding == nil {
+            autoReviewResult = .failed("legacy @main has no exact inference profile; use /agent rebind main <profile-id>")
+        } else {
+            autoReviewResult = await enableAutomaticReview()
+        }
     } else if restoredEvents.isEmpty {
         // The workspace passed to `intatis cowork` is the user's explicit
         // initial-session authorization. Establish @main before enabling the
@@ -296,7 +371,8 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
         switch await orchestrator.bootstrapMainAgent(Agent(
             name: Orchestrator.mainAgentID,
             workspaceRoot: workspace,
-            model: ModelID(rawValue: defaultModel),
+            model: defaultProfile.modelID,
+            agentInferenceBinding: defaultProfile,
             profile: .reviewed,
             coordinationDepth: Agent.defaultCoordinationDepth)) {
         case .attached, .alreadyAttached:
@@ -305,23 +381,23 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
             mainAttached = false
             mainBootstrapError = message
         }
-        autoReviewResult = await orchestrator.enableAutomaticPermissionReview(
-            model: ModelID(rawValue: defaultModel),
-            workspaceRoot: workspace)
+        autoReviewResult = await enableAutomaticReview()
     } else {
-        // A non-empty recovered session is outside the initial bootstrap trust
-        // boundary, so a missing @main keeps the ordinary reviewed attach path.
-        autoReviewResult = await orchestrator.enableAutomaticPermissionReview(
-            model: ModelID(rawValue: defaultModel),
-            workspaceRoot: workspace)
-        mainAttached = await orchestrator.attach(Agent(
-            name: Orchestrator.mainAgentID,
-            workspaceRoot: workspace,
-            model: ModelID(rawValue: defaultModel),
-            profile: .reviewed,
-            coordinationDepth: Agent.defaultCoordinationDepth))
+        // A non-empty recovered session is outside initial bootstrap trust.
+        // Never use today's default profile to recreate a missing historical
+        // @main or start its control plane. The user must explicitly choose
+        // both workspace and exact profile through `/agent restore-main`.
+        mainAttached = false
+        mainBootstrapError = "recovered session has no @main; use /agent restore-main <path> <profile-id>"
+        autoReviewResult = .failed(
+            "recovered session has no @main; explicitly restore it before automatic review can start")
     }
-    banner(mode: .cowork, model: defaultModel, host: config.baseURL.host ?? config.baseURL.absoluteString)
+    banner(
+        mode: .cowork,
+        model: defaultProfile.modelID.rawValue,
+        host: "profile \(defaultProfile.inferenceProfileID.rawValue)")
+    let startupControlPlaneProfileID = await controlPlaneInference.binding()?
+        .inferenceProfileID.rawValue ?? "unresolved"
     var automaticReviewRequired = true
     var automaticReviewReady = false
     switch autoReviewResult {
@@ -330,7 +406,7 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
         if case .some(.degraded(let reason)) = await orchestrator.automaticPermissionReviewHealth() {
             out("\(S.yellow)automatic permission review is degraded but active (@\(id.rawValue)): \(reason)\(S.reset)\n")
         } else {
-            out("\(S.dim)automatic permission review is on (@\(id.rawValue), model \(defaultModel)); reviewer errors deny only the current tool call.\(S.reset)\n")
+            out("\(S.dim)automatic permission review is on (@\(id.rawValue), exact profile \(startupControlPlaneProfileID)); reviewer errors deny only the current tool call.\(S.reset)\n")
         }
     case .alreadyEnabled(let id):
         automaticReviewReady = true
@@ -353,11 +429,15 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
         sessionID: await log.sessionID,
         log: log,
         orchestrator: orchestrator,
-        verifierProvider: { try await registry.defaultAgentProvider() },
+        verifierProvider: {
+            guard let binding = await controlPlaneInference.binding() else {
+                throw InferenceCatalogError.unresolvedProfile
+            }
+            return try await registry.agentInference(for: binding).provider
+        },
         verifierModel: {
-            await orchestrator.agentList().first(where: {
-                $0.name == Orchestrator.mainAgentID
-            })?.model ?? initialMainModel
+            await controlPlaneInference.binding()?.modelID
+                ?? ModelID(rawValue: "unresolved-control-plane-profile")
         })
     var goalRuntimeStarted = false
     var dataPlaneResumed = false
@@ -365,6 +445,15 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
     func ensureGoalRuntimeStarted() async -> Bool {
         guard mainAttached else {
             errOut("@main is not attached; a durable Goal cannot run\n")
+            return false
+        }
+        guard await freezeControlPlaneInferenceIfPossible() != nil else {
+            errOut("@main has no exact, resolvable inference profile; use /profiles then /agent rebind main <profile-id>\n")
+            return false
+        }
+        let inferenceFailures = await orchestrator.inferenceResolutionFailures()
+        guard inferenceFailures[Orchestrator.mainAgentID] == nil else {
+            errOut("@main has an unresolved inference profile; use /profiles then /agent rebind main <profile-id> before resuming pending work.\n")
             return false
         }
         if automaticReviewRequired, !automaticReviewReady {
@@ -530,11 +619,15 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
         case .shortcut(.exit): return await finishCowork(.quit)
         case .shortcut(.cycleMode): return await finishCowork(.switchTo(nextMode(.cowork)))
         case .shortcut(.switchModel):
-            if case .text(let m) = editor.readLine(prompt: "\(S.green)model ❯\(S.reset) ") {
-                let name = unbracket(m.trimmingCharacters(in: .whitespaces))
-                if !name.isEmpty {
-                    defaultModel = name
-                    out("default model for new agents → \(defaultModel); GoalVerifier remains aligned with @main\n")
+            if case .text(let value) = editor.readLine(prompt: "\(S.green)profile ❯\(S.reset) ") {
+                let profileID = unbracket(value.trimmingCharacters(in: .whitespaces))
+                if !profileID.isEmpty {
+                    if let selected = option(profileID: profileID) {
+                        defaultProfile = selected.binding
+                        out("default profile for future agents → \(safeProfileDescription(defaultProfile)); control planes remain frozen\n")
+                    } else {
+                        out("unknown profile '\(profileID)' — use /profiles\n")
+                    }
                 }
             }
             continue
@@ -570,10 +663,24 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
                 else { out("usage: /mode chat|code|cowork\n") }
             case "model":
                 if parts.count > 1 {
-                    defaultModel = parts[1]
-                    out("default model for new agents → \(defaultModel); GoalVerifier remains aligned with @main\n")
+                    out("Cowork /model is read-only and never rewrites an agent route. Use /profiles, /profile <profile-id>, or /agent rebind <name> <profile-id>.\n")
                 }
-                else { out("default model for new agents: \(defaultModel)\n") }
+                else {
+                    out("default future-agent model: \(defaultProfile.modelID.rawValue) · profile \(defaultProfile.inferenceProfileID.rawValue)\n")
+                }
+            case "profiles":
+                printProfiles()
+            case "profile":
+                if parts.count == 1 {
+                    out("default future-agent profile: \(safeProfileDescription(defaultProfile))\n")
+                } else if parts.count == 2, let selected = option(profileID: parts[1]) {
+                    defaultProfile = selected.binding
+                    out("default profile for future agents → \(safeProfileDescription(defaultProfile)); existing agents and control planes are unchanged\n")
+                } else if parts.count == 2 {
+                    out("unknown profile '\(unbracket(parts[1]))' — use /profiles\n")
+                } else {
+                    out("usage: /profile [profile-id]\n")
+                }
             case "goal":
                 await handleGoalCommand(commandArgument)
             case "verbose":
@@ -583,12 +690,23 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
                 out("verbose → \(options.verbose ? "on" : "off")\n")
             case "agents":
                 let list = await orchestrator.agentList()
-                if list.isEmpty { out("(no agents attached)\n") }
-                else { for a in list { out("  @\(a.name.rawValue)  \(S.dim)\(a.model.rawValue) · \(a.workspaceRoot.path)\(S.reset)\n") } }
+                let failures = await orchestrator.inferenceResolutionFailures()
+                if list.isEmpty {
+                    out("(no agents attached)\n")
+                } else {
+                    for agent in list {
+                        let route: String
+                        if let binding = agent.agentInferenceBinding {
+                            let state = failures[agent.name].map { " · UNRESOLVED: \($0)" } ?? ""
+                            route = safeProfileDescription(binding) + state
+                        } else {
+                            route = "UNRESOLVED legacy binding; explicit rebind required"
+                        }
+                        out("  @\(agent.name.rawValue)  \(S.dim)\(route) · \(agent.workspaceRoot.path)\(S.reset)\n")
+                    }
+                }
             case "auto":
-                let result = await orchestrator.enableAutomaticPermissionReview(
-                    model: ModelID(rawValue: defaultModel),
-                    workspaceRoot: workspace)
+                let result = await enableAutomaticReview()
                 switch result {
                 case .enabled(let id):
                     automaticReviewRequired = true
@@ -597,7 +715,9 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
                     if case .some(.degraded(let reason)) = await orchestrator.automaticPermissionReviewHealth() {
                         out("automatic permission review is degraded but active (@\(id.rawValue)): \(reason)\n")
                     } else {
-                        out("automatic permission review → on (@\(id.rawValue), model \(defaultModel))\n")
+                        let frozenID = await controlPlaneInference.binding()?.inferenceProfileID.rawValue
+                            ?? "unresolved"
+                        out("automatic permission review → on (@\(id.rawValue), exact profile \(frozenID))\n")
                     }
                 case .alreadyEnabled(let id):
                     automaticReviewRequired = true
@@ -645,25 +765,107 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
                     }
                 }
             case "agent":
-                guard await ensureGoalRuntimeStarted() else { continue }
-                if parts.count >= 4, parts[1] == "add" {
+                if parts.count == 4, parts[1] == "restore-main" {
+                    guard !(await orchestrator.agentList().contains(where: {
+                        $0.name == Orchestrator.mainAgentID
+                    })) else {
+                        out("@main is already attached; use /agent rebind main <profile-id>\n")
+                        continue
+                    }
+                    guard let selected = option(profileID: parts[3]) else {
+                        out("unknown profile '\(unbracket(parts[3]))' — use /profiles\n")
+                        continue
+                    }
+                    let url = URL(
+                        fileURLWithPath: (parts[2] as NSString).expandingTildeInPath)
+                        .standardizedFileURL
+                    let attached = await orchestrator.attach(Agent(
+                        name: Orchestrator.mainAgentID,
+                        workspaceRoot: url,
+                        model: selected.binding.modelID,
+                        agentInferenceBinding: selected.binding,
+                        profile: .reviewed,
+                        coordinationDepth: Agent.defaultCoordinationDepth))
+                    if attached {
+                        mainAttached = true
+                        mainBootstrapError = nil
+                        _ = await freezeControlPlaneInferenceIfPossible()
+                        out("restored @main · \(safeProfileDescription(selected.binding)) · \(url.path); use /auto to start the frozen automatic reviewer\n")
+                    } else {
+                        out("@main was not restored · \(url.path)\n")
+                    }
+                } else if parts.count >= 4, parts[1] == "add" {
+                    guard await ensureGoalRuntimeStarted() else { continue }
                     let name = parts[2]
                     let path = parts[3]
-                    let model = parts.count >= 5 ? unbracket(parts[4]) : defaultModel
+                    let selectedBinding: AgentInferenceBinding
+                    if parts.count == 4 {
+                        selectedBinding = defaultProfile
+                    } else if parts.count == 6, parts[4] == "--profile",
+                              let selected = option(profileID: parts[5]) {
+                        selectedBinding = selected.binding
+                    } else if parts.count == 6, parts[4] == "--profile" {
+                        out("unknown profile '\(unbracket(parts[5]))' — use /profiles\n")
+                        continue
+                    } else {
+                        out("usage: /agent add <name> <path> [--profile <profile-id>]\n")
+                        continue
+                    }
                     let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardizedFileURL
-                    let attached = await orchestrator.attach(Agent(name: AgentID(rawValue: name), workspaceRoot: url,
-                                                                   model: ModelID(rawValue: model), profile: .reviewed,
-                                                                   coordinationDepth: 0))
+                    let attached = await orchestrator.attach(Agent(
+                        name: AgentID(rawValue: name),
+                        workspaceRoot: url,
+                        model: selectedBinding.modelID,
+                        agentInferenceBinding: selectedBinding,
+                        profile: .reviewed,
+                        coordinationDepth: 0))
                     out(attached
-                        ? "attached @\(name) · \(model) · \(url.path)\n"
+                        ? "attached @\(name) · \(safeProfileDescription(selectedBinding)) · \(url.path)\n"
                         : "not attached @\(name) · \(url.path)\n")
+                } else if parts.count == 3, parts[1] == "profile" {
+                    let agentID = AgentID(rawValue: parts[2])
+                    guard let agent = await orchestrator.agentList().first(where: {
+                        $0.name == agentID
+                    }) else {
+                        out("no agent named @\(parts[2])\n")
+                        continue
+                    }
+                    if let binding = agent.agentInferenceBinding {
+                        let failure = await orchestrator.inferenceResolutionFailures()[agentID]
+                        let state = failure.map { " · UNRESOLVED: \($0)" } ?? " · resolved"
+                        out("@\(parts[2]): \(safeProfileDescription(binding))\(state)\n")
+                    } else {
+                        out("@\(parts[2]): UNRESOLVED legacy binding; choose /profiles then explicitly rebind\n")
+                    }
+                } else if parts.count == 4, parts[1] == "rebind" {
+                    guard let selected = option(profileID: parts[3]) else {
+                        out("unknown profile '\(unbracket(parts[3]))' — use /profiles\n")
+                        continue
+                    }
+                    switch await orchestrator.rebindAgentInferenceProfile(
+                        agentID: AgentID(rawValue: parts[2]),
+                        binding: selected.binding,
+                        hostAuthorized: true) {
+                    case .rebound(let agentID, let binding):
+                        _ = await freezeControlPlaneInferenceIfPossible()
+                        out("rebound @\(agentID.rawValue) → \(safeProfileDescription(binding))\n")
+                        if agentID == Orchestrator.mainAgentID, !automaticReviewReady,
+                           automaticReviewRequired {
+                            out("@main is exactly bound; use /auto to start the frozen automatic reviewer\n")
+                        }
+                    case .unchanged(let agentID, let binding):
+                        out("@\(agentID.rawValue) already uses \(safeProfileDescription(binding))\n")
+                    case .failed(let message):
+                        out("not rebound @\(parts[2]): \(message)\n")
+                    }
                 } else if parts.count >= 3, parts[1] == "remove" {
+                    guard await ensureGoalRuntimeStarted() else { continue }
                     let removed = await orchestrator.detach(AgentID(rawValue: parts[2]))
                     out(removed
                         ? "removed @\(parts[2])\n"
                         : "not removed @\(parts[2]) (reserved, missing, or busy)\n")
                 } else {
-                    out("usage: /agent add <name> <path> [model]  |  /agent remove <name>\n")
+                    out("usage: /agent add <name> <path> [--profile <id>] | /agent restore-main <path> <profile-id> | /agent profile <name> | /agent rebind <name> <id> | /agent remove <name>\n")
                 }
             default:
                 out("unknown command /\(cmd) — /help\n")

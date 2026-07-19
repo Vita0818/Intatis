@@ -5,12 +5,29 @@ import IntatisCore
 import IntatisProtocol
 import IntatisConversation
 
+public enum CoworkInferenceResolution: String, Codable, Equatable, Sendable {
+    /// A legacy projection has no durable inference binding to resolve yet.
+    case legacy
+    case resolved
+    case unresolved
+    case incompatible
+
+    public var requiresAttention: Bool {
+        self != .resolved
+    }
+}
+
 public struct CoworkAgentInfo: Identifiable, Equatable, Sendable {
     public let id: String
     public let name: String
     public let workspace: String
     public let model: String
-    public let profile: String
+    public let permissionProfile: String
+    public let inferenceProfileLabel: String?
+    public let inferenceProfileRef: InferenceProfileRef?
+    public let inferenceConnectionLabel: String?
+    public let inferenceVariant: String?
+    public let inferenceResolution: CoworkInferenceResolution
     public let status: String
     public let role: String
     public let pendingTasks: Int
@@ -20,6 +37,50 @@ public struct CoworkAgentInfo: Identifiable, Equatable, Sendable {
     public let capabilityLease: String?
     public let canRemove: Bool
 
+    /// Compatibility alias for callers compiled before inference profiles made
+    /// the permission/inference distinction explicit.
+    public var profile: String { permissionProfile }
+
+    public init(id: String,
+                name: String,
+                workspace: String,
+                model: String,
+                permissionProfile: String,
+                inferenceProfileLabel: String? = nil,
+                inferenceProfileRef: InferenceProfileRef? = nil,
+                inferenceConnectionLabel: String? = nil,
+                inferenceVariant: String? = nil,
+                inferenceResolution: CoworkInferenceResolution = .legacy,
+                status: String = "idle",
+                role: String = "worker",
+                pendingTasks: Int = 0,
+                pendingMessages: Int = 0,
+                completedTasks: Int = 0,
+                workspaceLease: String? = nil,
+                capabilityLease: String? = nil,
+                canRemove: Bool = true) {
+        self.id = id
+        self.name = name
+        self.workspace = workspace
+        self.model = model
+        self.permissionProfile = permissionProfile
+        self.inferenceProfileLabel = inferenceProfileLabel
+        self.inferenceProfileRef = inferenceProfileRef
+        self.inferenceConnectionLabel = inferenceConnectionLabel
+        self.inferenceVariant = inferenceVariant
+        self.inferenceResolution = inferenceResolution
+        self.status = status
+        self.role = role
+        self.pendingTasks = pendingTasks
+        self.pendingMessages = pendingMessages
+        self.completedTasks = completedTasks
+        self.workspaceLease = workspaceLease
+        self.capabilityLease = capabilityLease
+        self.canRemove = canRemove
+    }
+
+    /// Source-compatible initializer for the existing CoworkViewModel. New
+    /// call sites should use `permissionProfile:` and the inference fields.
     public init(id: String,
                 name: String,
                 workspace: String,
@@ -33,19 +94,20 @@ public struct CoworkAgentInfo: Identifiable, Equatable, Sendable {
                 workspaceLease: String? = nil,
                 capabilityLease: String? = nil,
                 canRemove: Bool = true) {
-        self.id = id
-        self.name = name
-        self.workspace = workspace
-        self.model = model
-        self.profile = profile
-        self.status = status
-        self.role = role
-        self.pendingTasks = pendingTasks
-        self.pendingMessages = pendingMessages
-        self.completedTasks = completedTasks
-        self.workspaceLease = workspaceLease
-        self.capabilityLease = capabilityLease
-        self.canRemove = canRemove
+        self.init(
+            id: id,
+            name: name,
+            workspace: workspace,
+            model: model,
+            permissionProfile: profile,
+            status: status,
+            role: role,
+            pendingTasks: pendingTasks,
+            pendingMessages: pendingMessages,
+            completedTasks: completedTasks,
+            workspaceLease: workspaceLease,
+            capabilityLease: capabilityLease,
+            canRemove: canRemove)
     }
 
     public var statusLine: String {
@@ -57,6 +119,59 @@ public struct CoworkAgentInfo: Identifiable, Equatable, Sendable {
             return "\(status) · \(completedTasks) completed"
         }
         return status
+    }
+
+    /// Safe secondary roster text. Raw endpoints, raw request options, profile
+    /// identifiers, and credential references are never inputs to this string.
+    public var inferenceDisplayLabel: String? {
+        switch inferenceResolution {
+        case .unresolved:
+            return "Inference unavailable"
+        case .incompatible:
+            return "Inference incompatible"
+        case .legacy, .resolved:
+            break
+        }
+
+        if let explicit = Self.safeInferenceComponent(inferenceProfileLabel) {
+            return explicit
+        }
+        let components = [
+            Self.safeInferenceComponent(inferenceConnectionLabel),
+            Self.safeInferenceComponent(model),
+            Self.safeInferenceComponent(inferenceVariant),
+        ].compactMap { $0 }
+        if !components.isEmpty {
+            let label = components.joined(separator: " · ")
+            return inferenceResolution == .legacy ? "Legacy · \(label)" : label
+        }
+        return inferenceResolution == .resolved ? "Inference resolved" : "Legacy inference"
+    }
+
+    private static func safeInferenceComponent(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = trimmed.lowercased()
+        guard !trimmed.isEmpty,
+              !trimmed.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
+              !lower.contains("://"),
+              !lower.hasPrefix("www."),
+              !lower.hasPrefix("file:"),
+              !lower.hasPrefix("data:"),
+              !lower.hasPrefix("bearer "),
+              !lower.hasPrefix("basic "),
+              !lower.hasPrefix("sk-"),
+              !lower.hasPrefix("ghp_"),
+              !lower.hasPrefix("github_pat_"),
+              !lower.hasPrefix("glpat-"),
+              !lower.hasPrefix("xox"),
+              !lower.contains("api_key="),
+              !lower.contains("apikey="),
+              !lower.contains("access_token="),
+              !lower.contains("-----begin ") else {
+            return nil
+        }
+        return String(trimmed.prefix(96))
     }
 }
 
@@ -577,19 +692,39 @@ public struct CoworkShell: View {
     }
 
     private func agentStatusRow(_ agent: CoworkAgentInfo) -> some View {
-        HStack(spacing: 8) {
+        HStack(alignment: .top, spacing: 8) {
             Image(systemName: statusIconName(for: agent.status))
                 .font(.caption)
                 .foregroundStyle(statusColor(for: agent.status))
                 .frame(width: 18)
-            Text("@\(agent.name)")
-                .font(.caption.bold())
-                .foregroundStyle(threadStyle.primaryText)
-                .lineLimit(1)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("@\(agent.name)")
+                    .font(.caption.bold())
+                    .foregroundStyle(threadStyle.primaryText)
+                    .lineLimit(1)
+                if let inferenceLabel = agent.inferenceDisplayLabel {
+                    Text(inferenceLabel)
+                        .font(.caption2)
+                        .foregroundStyle(agent.inferenceResolution.requiresAttention
+                            ? threadStyle.accent
+                            : threadStyle.tertiaryText)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .accessibilityIdentifier("cowork.agent.\(agent.id).inference")
+                }
+            }
             Spacer(minLength: 8)
+            if agent.inferenceResolution.requiresAttention {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.caption2)
+                    .foregroundStyle(threadStyle.accent)
+                    .accessibilityLabel(agent.inferenceDisplayLabel ?? "Inference unavailable")
+            }
         }
         .padding(.vertical, 2)
-        .help("\(agent.name): \(agent.status)")
+        .help(["\(agent.name): \(agent.status)", agent.inferenceDisplayLabel]
+            .compactMap { $0 }
+            .joined(separator: " · "))
     }
 
     private var goalCardSection: some View {
@@ -1184,7 +1319,10 @@ public struct CoworkShell: View {
             Divider().opacity(0.35)
             agentDetailRow("Role", value: agent.role)
             agentDetailRow("Model", value: agent.model)
-            agentDetailRow("Permission", value: agent.profile)
+            if let inferenceLabel = agent.inferenceDisplayLabel {
+                agentDetailRow("Inference", value: inferenceLabel)
+            }
+            agentDetailRow("Permission", value: agent.permissionProfile)
             agentDetailRow("Queued", value: "\(agent.pendingTasks) tasks / \(agent.pendingMessages) messages")
             agentDetailRow("Completed", value: "\(agent.completedTasks) tasks")
             if let workspaceLease = agent.workspaceLease {
@@ -1375,7 +1513,10 @@ public struct CoworkShell: View {
                 .textSelection(.enabled)
             agentDetailRow("Role", value: agent.role)
             agentDetailRow("Model", value: agent.model)
-            agentDetailRow("Permission", value: agent.profile)
+            if let inferenceLabel = agent.inferenceDisplayLabel {
+                agentDetailRow("Inference", value: inferenceLabel)
+            }
+            agentDetailRow("Permission", value: agent.permissionProfile)
             agentDetailRow("Queued", value: "\(agent.pendingTasks) tasks / \(agent.pendingMessages) messages")
             agentDetailRow("Completed", value: "\(agent.completedTasks) tasks")
             if let workspaceLease = agent.workspaceLease {

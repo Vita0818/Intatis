@@ -128,7 +128,9 @@ struct IntatisMacRootView: View {
         .onChange(of: env.chatSessionID.rawValue) { _ in refreshChatSessions() }
         .onReceive(env.$registry) { registry in
             codeVM?.updateProviderRegistry(registry)
-            coworkVM?.updateProviderRegistry(registry)
+            coworkVM?.updateProviderRegistry(
+                registry,
+                inferenceProfileOptions: env.inferenceProfileOptions)
         }
         .sheet(item: $renameTarget) { target in
             SessionRenameSheet(initialName: target.title) { newName in
@@ -195,7 +197,6 @@ struct IntatisMacRootView: View {
             CoworkSessionView(
                 vm: vm,
                 catalog: env.providerCatalog,
-                onSelectModel: env.selectProviderModel(providerID:modelID:variantID:),
                 onShowSessions: showCoworkSessions,
                 onNewSession: startNewCoworkSession,
                 onSessionDidBecomeReady: refreshCoworkSessions)

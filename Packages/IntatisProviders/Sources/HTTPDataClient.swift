@@ -49,7 +49,7 @@ public struct URLSessionDataClient: HTTPDataClient {
 
     public func sendResponse(_ request: URLRequest) async throws -> HTTPDataResponse {
         #if canImport(Darwin)
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await ProviderURLSession.noRedirect.data(for: request)
         guard let http = response as? HTTPURLResponse else {
             return HTTPDataResponse(data: data, status: 0)
         }

@@ -30,10 +30,16 @@ public struct ProviderUsageLimitError: Error, LocalizedError, Equatable, Sendabl
         }
         parts.append("The provider account reached a hard usage limit.")
         if !signal.isEmpty {
-            parts.append("Provider signal: \(signal).")
+            let safeSignal = PermissionReviewTextSanitizer.sanitizeDiagnostic(
+                signal,
+                maxCharacters: 80).text
+            parts.append("Provider signal: \(safeSignal).")
         }
         if let providerMessage, !providerMessage.isEmpty {
-            parts.append("Provider said: \(providerMessage)")
+            let safeMessage = PermissionReviewTextSanitizer.sanitizeDiagnostic(
+                providerMessage,
+                maxCharacters: 360).text
+            parts.append("Provider said: \(safeMessage)")
         }
         return parts.joined(separator: " ")
     }
@@ -129,7 +135,7 @@ enum ProviderErrorFormatting {
             return usageLimit
         }
         if let intatis = error as? IntatisError {
-            return intatis
+            return sanitized(intatis)
         }
         if let urlError = error as? URLError {
             return IntatisError.provider(transportMessage(urlError))
@@ -152,7 +158,7 @@ enum ProviderErrorFormatting {
         let preview = clean(payload, maxCharacters: 180)
         return .decoding(
             "provider stream returned non-JSON SSE data. Check endpoint compatibility. " +
-            "Preview: \(preview). \(underlying.localizedDescription)")
+            "Preview: \(preview). Decoder said: \(clean(underlying.localizedDescription, maxCharacters: 180))")
     }
 
     static func incompleteStream(operation: String) -> IntatisError {
@@ -163,7 +169,7 @@ enum ProviderErrorFormatting {
 
     static func invalidToolCallStream(_ message: String) -> IntatisError {
         .decoding(
-            "provider tool-call stream was incomplete. \(message) " +
+            "provider tool-call stream was incomplete. \(clean(message)) " +
             "Check tool-calling compatibility for this endpoint/model.")
     }
 
@@ -451,8 +457,28 @@ enum ProviderErrorFormatting {
         let collapsed = value
             .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard collapsed.count > maxCharacters else { return collapsed }
-        return String(collapsed.prefix(maxCharacters)) + "..."
+        return PermissionReviewTextSanitizer.sanitizeDiagnostic(
+            collapsed,
+            maxCharacters: maxCharacters).text
+    }
+
+    private static func sanitized(_ error: IntatisError) -> IntatisError {
+        switch error {
+        case .config(let message):
+            return .config(clean(message))
+        case .provider(let message):
+            return .provider(clean(message))
+        case .decoding(let message):
+            return .decoding(clean(message))
+        case .io(let message):
+            return .io(clean(message))
+        case .notFound(let message):
+            return .notFound(clean(message))
+        case .permissionDenied(let message):
+            return .permissionDenied(clean(message))
+        case .cancelled:
+            return .cancelled
+        }
     }
 }
 

@@ -1,26 +1,94 @@
-#if canImport(SwiftUI) && canImport(MarkdownUI) && canImport(JavaScriptCore) && canImport(iosMath)
+#if canImport(SwiftUI) && canImport(SwiftStreamingMarkdown)
+import Combine
+import Foundation
 import SwiftUI
-import MarkdownUI
+import SwiftStreamingMarkdown
 
 public enum IntatisMessageRenderingPolicy: Sendable {
     case plainText
     case richText
 }
 
-public struct IntatisMessageContentView: View {
-    private struct Revision: Equatable {
-        let rawText: String
-        let isComplete: Bool
-        let policyIsRich: Bool
+/// A non-publishing lifecycle gate for one message facade. SwiftUI may rebuild
+/// the value view for changes emitted by either projection; those rebuilds must
+/// not resubmit the same raw snapshot or restart the same Markdown parse.
+@MainActor
+final class IntatisMessageProjectionLifecycleGate: ObservableObject {
+    private var isVisible = false
+    private var lastAppliedInput: IntatisMessageProjectionInput?
+
+    func activate(
+        _ input: IntatisMessageProjectionInput,
+        rawState: IntatisRawTextProjectionState,
+        richState: IntatisMicrosoftMarkdownRenderState
+    ) {
+        guard !isVisible else {
+            receive(input, rawState: rawState, richState: richState)
+            return
+        }
+        isVisible = true
+        lastAppliedInput = nil
+        apply(input, rawState: rawState, richState: richState)
     }
 
+    func receive(
+        _ input: IntatisMessageProjectionInput,
+        rawState: IntatisRawTextProjectionState,
+        richState: IntatisMicrosoftMarkdownRenderState
+    ) {
+        guard isVisible else { return }
+        apply(input, rawState: rawState, richState: richState)
+    }
+
+    func deactivate(
+        rawState: IntatisRawTextProjectionState,
+        richState: IntatisMicrosoftMarkdownRenderState
+    ) {
+        isVisible = false
+        lastAppliedInput = nil
+        richState.deactivate()
+        rawState.deactivate()
+    }
+
+    private func apply(
+        _ input: IntatisMessageProjectionInput,
+        rawState: IntatisRawTextProjectionState,
+        richState: IntatisMicrosoftMarkdownRenderState
+    ) {
+        guard input != lastAppliedInput else { return }
+        // Record before touching either ObservableObject so a SwiftUI rebuild
+        // caused by publication is already a no-op when its Just emits.
+        lastAppliedInput = input
+        rawState.submit(input.rawRevision)
+        if input.usesRichRenderer {
+            richState.submit(request: input.richRequest)
+        } else {
+            richState.deactivate()
+        }
+    }
+}
+
+struct IntatisMessageProjectionInput: Equatable {
+    let rawRevision: IntatisRawTextProjectionRevision
+    let richRequest: IntatisMarkdownRenderRequest
+    let usesRichRenderer: Bool
+}
+
+/// Renderer-neutral product facade shared by Chat, Code, Cowork, and iOS.
+/// Raw text remains visible until an admitted upstream projection is ready.
+public struct IntatisMessageContentView: View {
     let messageID: String
     let rawText: String
     let isComplete: Bool
     let policy: IntatisMessageRenderingPolicy
     let style: IntatisThreadStyle
 
-    @State private var document: IntatisRenderedDocument
+    @Environment(\.colorScheme) private var colorScheme
+    @StateObject private var lifecycleGate = IntatisMessageProjectionLifecycleGate()
+    @StateObject private var richState = IntatisMicrosoftMarkdownRenderState()
+    @StateObject private var rawState: IntatisRawTextProjectionState
+    @AppStorage(IntatisMessageRendererMode.defaultsKey)
+    private var persistedRendererMode = IntatisMessageRendererMode.microsoft.rawValue
 
     public init(
         messageID: String,
@@ -34,107 +102,101 @@ public struct IntatisMessageContentView: View {
         self.isComplete = isComplete
         self.policy = policy
         self.style = style
-        _document = State(initialValue: Self.makeDocument(
-            rawText: rawText,
-            isComplete: isComplete,
-            policy: policy))
-    }
-
-    private var revision: Revision {
-        Revision(
-            rawText: rawText,
-            isComplete: isComplete,
-            policyIsRich: policy == .richText)
+        _rawState = StateObject(wrappedValue: IntatisRawTextProjectionState(
+            revision: IntatisRawTextProjectionRevision(
+                activation: IntatisRawTextProjectionActivation(
+                    messageID: messageID,
+                    lane: policy == .richText ? .richFallback : .plain),
+                rawText: rawText,
+                isComplete: isComplete)))
     }
 
     public var body: some View {
         Group {
-            if policy == .richText, let markdown = document.markdownContent {
-                Markdown(markdown)
-                    .markdownTheme(markdownTheme)
-                    .markdownImageProvider(
-                        IntatisMarkdownImageProvider(expressions: document.mathExpressions))
-                    .markdownInlineImageProvider(
-                        IntatisMarkdownInlineImageProvider(expressions: document.mathExpressions))
+            if renderPlan.usesRichRenderer,
+               let published = richState.publishedDocument,
+               published.request == richRequest {
+                DocumentView(
+                    renderableDocument: published.document,
+                    config: published.displayConfiguration)
                     .environment(\.openURL, OpenURLAction { url in
-                        guard Self.isAllowedLink(url) else { return .discarded }
+                        guard IntatisMarkdownLinkPolicy.allows(url) else { return .discarded }
                         return .systemAction(url)
                     })
-                    .accessibilityIdentifier("intatis.message.rich.\(messageID)")
+                    .accessibilityIdentifier("intatis.message.microsoft.\(messageID)")
             } else {
-                Text(displayText)
+                Text(verbatim: rawState.text(for: rawProjectionRevision))
                     .font(.system(size: 15))
                     .foregroundStyle(style.primaryText)
+                    .textSelection(.enabled)
                     .accessibilityIdentifier("intatis.message.plain.\(messageID)")
             }
         }
-        .textSelection(.enabled)
         .fixedSize(horizontal: false, vertical: true)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .task(id: revision) {
-            guard policy == .richText else {
-                document = .plain(rawText)
-                return
-            }
-            if !isComplete {
-                try? await Task.sleep(for: .milliseconds(50))
-                guard !Task.isCancelled else { return }
-            }
-            let nextDocument = await IntatisRenderDocumentWorker.shared.build(
-                rawText: displayText,
-                cacheCompletedResult: isComplete)
-            guard !Task.isCancelled else { return }
-            document = nextDocument
+        .onReceive(Just(projectionInput)) { input in
+            lifecycleGate.receive(
+                input,
+                rawState: rawState,
+                richState: richState)
+        }
+        .onAppear {
+            // Keep one raw projection alive even while a rich document is on
+            // screen. A rich→fallback transition therefore inherits the same
+            // bounded stream instead of recreating an exact Text every token.
+            lifecycleGate.activate(
+                projectionInput,
+                rawState: rawState,
+                richState: richState)
+        }
+        .onDisappear {
+            lifecycleGate.deactivate(
+                rawState: rawState,
+                richState: richState)
         }
     }
 
-    private var displayText: String {
-        rawText.isEmpty && !isComplete ? "…" : rawText
+    private var rendererMode: IntatisMessageRendererMode {
+        IntatisMessageRendererMode.resolve(persistedRawValue: persistedRendererMode)
     }
 
-    private var markdownTheme: Theme {
-        Theme.basic
-            .text {
-                ForegroundColor(style.primaryText)
-            }
-            .link {
-                ForegroundColor(style.accent)
-            }
-            .code {
-                FontFamilyVariant(.monospaced)
-                FontSize(.em(0.94))
-                BackgroundColor(style.stroke.opacity(0.22))
-            }
-            .codeBlock { configuration in
-                IntatisCodeBlockView(
-                    source: configuration.content,
-                    language: configuration.language,
-                    isComplete: isComplete,
-                    style: style)
-                    .markdownMargin(top: .zero, bottom: .em(1))
-            }
+    private var renderPlan: IntatisMessageRenderPlan {
+        IntatisMessageRenderPlan.resolve(
+            rawText: rawText,
+            isComplete: isComplete,
+            policyIsRich: policy == .richText,
+            rendererMode: rendererMode)
     }
 
-    private static func makeDocument(
-        rawText: String,
-        isComplete: Bool,
-        policy: IntatisMessageRenderingPolicy
-    ) -> IntatisRenderedDocument {
-        let displayText = rawText.isEmpty && !isComplete ? "…" : rawText
-        guard policy == .richText else { return .plain(displayText) }
-        if isComplete,
-           let cached = IntatisRenderDocumentBuilder.cachedDocument(for: displayText) {
-            return cached
-        }
-        // First paint stays cheap and preserves the exact source. The view task
-        // replaces this with a pre-parsed MarkdownContent value from the serial
-        // render worker without blocking SwiftUI's main actor.
-        return .plain(displayText)
+    private var rawProjectionRevision: IntatisRawTextProjectionRevision {
+        IntatisRawTextProjectionRevision(
+            activation: IntatisRawTextProjectionActivation(
+                messageID: messageID,
+                lane: renderPlan.usesRichRenderer ? .richFallback : .plain),
+            rawText: rawText,
+            isComplete: isComplete)
     }
 
-    private static func isAllowedLink(_ url: URL) -> Bool {
-        guard let scheme = url.scheme?.lowercased() else { return false }
-        return scheme == "https" || scheme == "http" || scheme == "mailto"
+    private var renderRevision: IntatisMarkdownRenderRevision {
+        IntatisMarkdownRenderRevision(
+            messageID: messageID,
+            rawText: rawText,
+            isComplete: isComplete,
+            appearance: IntatisMarkdownAppearanceRevision(colorScheme),
+            configurationRevision: IntatisMarkdownRendererLimits.configurationRevision)
+    }
+
+    private var richRequest: IntatisMarkdownRenderRequest {
+        IntatisMarkdownRenderRequest(
+            revision: renderRevision,
+            style: IntatisMarkdownStyleSnapshot(style))
+    }
+
+    private var projectionInput: IntatisMessageProjectionInput {
+        IntatisMessageProjectionInput(
+            rawRevision: rawProjectionRevision,
+            richRequest: richRequest,
+            usesRichRenderer: renderPlan.usesRichRenderer)
     }
 }
 #endif

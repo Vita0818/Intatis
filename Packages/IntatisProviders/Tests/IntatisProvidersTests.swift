@@ -366,6 +366,87 @@ final class IntatisProvidersTests: XCTestCase {
         XCTAssertTrue(error.localizedDescription.contains("code=invalid_key"))
     }
 
+    func testProviderDiagnosticsRedactEchoedAuthorizationBeforePersistence() {
+        let secret = "opaque-credential-that-must-not-survive"
+        let body = Data(
+            #"{"error":{"message":"Authorization: Bearer \#(secret)","type":"auth"}}"#.utf8)
+        let httpError = ProviderErrorFormatting.httpStatus(
+            401,
+            body: body,
+            operation: "streaming request")
+        let streamError = ProviderErrorFormatting.streamErrorPayload(body)
+        let usageError = ProviderUsageLimitError(
+            signal: "insufficient_quota",
+            providerMessage: "api_key=\(secret)")
+
+        for message in [
+            httpError.localizedDescription,
+            streamError?.localizedDescription ?? "",
+            usageError.localizedDescription,
+        ] {
+            XCTAssertFalse(message.contains(secret))
+            XCTAssertTrue(message.contains("REDACTED"))
+        }
+    }
+
+    func testProviderDiagnosticsRedactPrivateURLsFromStructuredMessageAndDetail() throws {
+        let nestedURL = "http://10.24.8.9:8080/private/v1/chat/completions"
+        let nestedBody = Data(
+            #"{"error":{"message":"upstream \#(nestedURL) failed","type":"gateway","code":"upstream_502"}}"#.utf8)
+        let detailURL = "https://internal-gateway.example.test/provider/v1?token=opaque-token"
+        let detailBody = Data(#"{"detail":"proxy could not reach \#(detailURL)"}"#.utf8)
+
+        let httpMessage = ProviderErrorFormatting.httpStatus(
+            502,
+            body: nestedBody,
+            operation: "streaming request").localizedDescription
+        let streamMessage = try XCTUnwrap(
+            ProviderErrorFormatting.streamErrorPayload(detailBody)).localizedDescription
+        let transportedMessage = ProviderErrorFormatting.transport(
+            IntatisError.provider(
+                "custom runtime could not reach \(nestedURL); status=502")).localizedDescription
+
+        for message in [httpMessage, streamMessage, transportedMessage] {
+            XCTAssertTrue(message.contains("[REDACTED_URL]"))
+            XCTAssertFalse(message.contains("http://"))
+            XCTAssertFalse(message.contains("https://"))
+            XCTAssertFalse(message.contains("10.24.8.9"))
+            XCTAssertFalse(message.contains("internal-gateway"))
+            XCTAssertFalse(message.contains("opaque-token"))
+        }
+        XCTAssertTrue(httpMessage.contains("HTTP 502 Bad Gateway"))
+        XCTAssertTrue(httpMessage.contains("type=gateway"))
+        XCTAssertTrue(httpMessage.contains("code=upstream_502"))
+        XCTAssertTrue(streamMessage.contains("Provider rejected the streaming request"))
+        XCTAssertTrue(transportedMessage.contains("status=502"))
+    }
+
+    func testProviderTransportRejectsHTTPRedirectBeforeFollowingRoute() throws {
+        let original = try XCTUnwrap(URL(string: "https://approved.example/v1/chat/completions"))
+        let redirected = try XCTUnwrap(URL(string: "https://unreviewed.example/collect"))
+        let response = try XCTUnwrap(HTTPURLResponse(
+            url: original,
+            statusCode: 307,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Location": redirected.absoluteString]))
+        let session = ProviderURLSession.makeNoRedirectSession()
+        let task = session.dataTask(with: URLRequest(url: original))
+        var redirectDecision: URLRequest? = URLRequest(url: redirected)
+
+        ProviderNoRedirectURLSessionDelegate.shared.urlSession(
+            session,
+            task: task,
+            willPerformHTTPRedirection: response,
+            newRequest: URLRequest(url: redirected)) { request in
+                redirectDecision = request
+            }
+
+        XCTAssertNil(redirectDecision)
+        XCTAssertFalse(session.configuration.httpShouldSetCookies)
+        XCTAssertNil(session.configuration.urlCache)
+        session.invalidateAndCancel()
+    }
+
     func testProviderHTTPErrorUsesPreviewForUnstructuredBody() {
         let body = Data(#"<html><body>gateway generated an HTML error page</body></html>"#.utf8)
         let error = ProviderErrorFormatting.httpStatus(502, body: body, operation: "streaming request")
@@ -775,6 +856,11 @@ final class IntatisProvidersTests: XCTestCase {
                     "messages": .array([]),
                     "tools": .array([]),
                     "stream": .bool(false),
+                    "stream_options": .object(["include_usage": .bool(true)]),
+                    "n": .number(8),
+                    "best_of": .number(8),
+                    "num_return_sequences": .number(8),
+                    "candidate_count": .number(8),
                 ],
             ])
         let provider = OpenAIWireProvider(endpoint: endpoint, apiKey: "k", http: FakeHTTP(chunks: []))
@@ -796,6 +882,11 @@ final class IntatisProvidersTests: XCTestCase {
         XCTAssertEqual(body["temperature"], JSONValue.number(0.2))
         XCTAssertEqual(body["model"], JSONValue.string("vendor/model"))
         XCTAssertEqual(body["stream"], JSONValue.bool(true))
+        XCTAssertEqual(body["n"], JSONValue.number(1))
+        XCTAssertNil(body["best_of"])
+        XCTAssertNil(body["num_return_sequences"])
+        XCTAssertNil(body["candidate_count"])
+        XCTAssertNil(body["stream_options"])
         guard let messageValue = body["messages"],
               case .array(let messages) = messageValue else {
             return XCTFail("runtime messages were not encoded")

@@ -1,5 +1,22 @@
 import Foundation
 import IntatisCore
+import IntatisProtocol
+
+/// One atomically resolved tool-calling route. Provider, model, and durable
+/// binding always originate from the same exact catalog snapshot revision.
+public struct ResolvedInferenceProfile: Sendable {
+    public let binding: AgentInferenceBinding
+    public let model: ModelID
+    public let provider: ToolCallingProvider
+
+    public init(binding: AgentInferenceBinding,
+                model: ModelID,
+                provider: ToolCallingProvider) {
+        self.binding = binding
+        self.model = model
+        self.provider = provider
+    }
+}
 
 /// Resolves a `ModelRef` to a concrete provider for a capability. v0.1 only
 /// resolves `.chat`; the `switch endpoint.wire` is where new dialects plug in
@@ -10,15 +27,18 @@ public actor ProviderRegistry {
     private let resolver: SecretResolver
     private let http: HTTPByteStreaming
     private let dataClient: HTTPDataClient
+    private let inferenceCatalogSnapshot: InferenceCatalogSnapshot?
 
     public init(config: ProviderConfig,
                 resolver: SecretResolver,
                 http: HTTPByteStreaming = URLSessionStreamingClient(),
-                dataClient: HTTPDataClient = URLSessionDataClient()) {
+                dataClient: HTTPDataClient = URLSessionDataClient(),
+                inferenceCatalogSnapshot: InferenceCatalogSnapshot? = nil) {
         self.config = config
         self.resolver = resolver
         self.http = http
         self.dataClient = dataClient
+        self.inferenceCatalogSnapshot = inferenceCatalogSnapshot
     }
 
     public func chatProvider(for ref: ModelRef) async throws -> ChatProvider {
@@ -116,6 +136,27 @@ public actor ProviderRegistry {
         }
     }
 
+    /// Resolves an exact immutable profile revision. No current/default profile
+    /// is consulted, and credentials are requested only after exact resolution
+    /// and capability validation succeed.
+    public func agentInference(for ref: InferenceProfileRef) async throws -> ResolvedInferenceProfile {
+        guard let inferenceCatalogSnapshot else {
+            throw InferenceCatalogError.unresolvedProfile
+        }
+        let resolution = try inferenceCatalogSnapshot.resolve(ref)
+        return try await makeAgentInference(from: resolution)
+    }
+
+    /// Recovery path that additionally revalidates every durable binding field
+    /// and its immutable-definition fingerprint before resolving a credential.
+    public func agentInference(for binding: AgentInferenceBinding) async throws -> ResolvedInferenceProfile {
+        guard let inferenceCatalogSnapshot else {
+            throw InferenceCatalogError.unresolvedProfile
+        }
+        let resolution = try inferenceCatalogSnapshot.resolve(binding)
+        return try await makeAgentInference(from: resolution)
+    }
+
     /// The default agent provider, from `models.agent` (falling back to `models.chat`).
     public func defaultAgentProvider() async throws -> ToolCallingProvider {
         try await agentProvider(for: config.models.agent ?? config.models.chat)
@@ -123,6 +164,35 @@ public actor ProviderRegistry {
 
     public func agentModel() -> ModelID {
         (config.models.agent ?? config.models.chat).model
+    }
+
+    private func makeAgentInference(
+        from resolution: InferenceProfileResolution
+    ) async throws -> ResolvedInferenceProfile {
+        let profile = resolution.profile
+        if !profile.declaredCapabilities.isEmpty,
+           !profile.declaredCapabilities.contains(where: { $0 == .toolCalling }) {
+            throw InferenceCatalogError.incompatibleProfileCapability
+        }
+
+        let connection = resolution.connection
+        let apiKey = try await resolver.secret(for: connection.credentialRef)
+        let endpoint = ProviderEndpoint(
+            id: connection.connectionRef.inferenceConnectionID.rawValue,
+            baseURL: connection.baseURL,
+            chatEndpoint: connection.chatEndpoint,
+            apiKeyRef: connection.credentialRef,
+            wire: connection.wire,
+            modelRequestOptions: [profile.modelID.rawValue: profile.effectiveRequestOptions])
+        let provider: ToolCallingProvider
+        switch connection.wire {
+        case .openai:
+            provider = OpenAIWireProvider(endpoint: endpoint, apiKey: apiKey, http: http)
+        }
+        return ResolvedInferenceProfile(
+            binding: resolution.binding,
+            model: profile.modelID,
+            provider: provider)
     }
 
     // MARK: Multimodal (v0.4)

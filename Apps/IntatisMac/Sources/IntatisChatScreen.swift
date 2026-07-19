@@ -558,10 +558,25 @@ struct IntatisSettingsPanel: View {
     @State private var settingsError: String?
     @State private var isTestingProvider = false
     @State private var providerHealthReports: [ProviderHealthReport] = []
+    @State private var showThirdPartyNotices = false
+    @AppStorage(IntatisMessageRendererMode.defaultsKey)
+    private var rendererModeRawValue = IntatisMessageRendererMode.microsoft.rawValue
 
     var body: some View {
         GeometryReader { proxy in
             settingsContent(layout: IntatisMacScreenLayout(rawWidth: proxy.size.width))
+        }
+        .sheet(isPresented: $showThirdPartyNotices) {
+            NavigationStack {
+                IntatisThirdPartyNoticesView()
+                    .navigationTitle("Open-source notices")
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Done") { showThirdPartyNotices = false }
+                        }
+                    }
+            }
+            .frame(minWidth: 680, minHeight: 560)
         }
     }
 
@@ -571,6 +586,9 @@ struct IntatisSettingsPanel: View {
                 IntatisPageHeader(title: "Settings", subtitle: "Providers · models · API keys")
 
                 settingsCard(layout: layout)
+
+                messageRenderingCard
+                    .frame(maxWidth: layout.settingsCardMaxWidth, alignment: .leading)
 
                 Text(settingsStorageNote)
                     .font(IntatisType.caption(12, .regular))
@@ -600,6 +618,60 @@ struct IntatisSettingsPanel: View {
             .frame(maxWidth: .infinity, alignment: .center)
         }
         .scrollContentBackground(.hidden)
+    }
+
+    private var messageRenderingCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Message rendering")
+                .font(IntatisType.body(14, .semibold))
+            Picker("Message rendering", selection: rendererModeSelection) {
+                Text("Rich Markdown").tag(IntatisMessageRendererMode.microsoft.rawValue)
+                Text("Plain text safe mode").tag(IntatisMessageRendererMode.plainSafe.rawValue)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .accessibilityIdentifier("settings.message-renderer-mode")
+            Text(rendererModeHelpText)
+                .font(IntatisType.caption(12, .regular))
+                .foregroundStyle(IntatisTheme.softText(scheme))
+                .fixedSize(horizontal: false, vertical: true)
+            Divider().opacity(0.45)
+            Button {
+                showThirdPartyNotices = true
+            } label: {
+                Label("Open-source notices", systemImage: "doc.text")
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(IntatisTheme.accent(scheme))
+            .accessibilityIdentifier("settings.open-source-notices")
+        }
+        .padding(18)
+        .intatisCard(cornerRadius: 20)
+    }
+
+    private var rendererLaunchOverride: IntatisMessageRendererMode? {
+        IntatisMessageRendererMode.launchOverride()
+    }
+
+    /// The Phase 0 renderer stored `rich`. Render routing already migrates that
+    /// value to Microsoft; normalize the Picker view as well so an upgraded
+    /// user never sees an empty segmented selection.
+    private var rendererModeSelection: Binding<String> {
+        Binding(
+            get: {
+                IntatisMessageRendererMode.resolve(
+                    persistedRawValue: rendererModeRawValue,
+                    arguments: []).rawValue
+            },
+            set: { rendererModeRawValue = $0 })
+    }
+
+    private var rendererModeHelpText: String {
+        if let rendererLaunchOverride {
+            let label = rendererLaunchOverride == .plainSafe ? "Plain text safe mode" : "Rich Markdown"
+            return "Current launch is forced to \(label). This picker is saved immediately for the next launch without an override, so a rescued session can remain in safe mode."
+        }
+        return "This choice is saved and applied immediately; it is independent of provider Save. Rich Markdown uses the audited upstream renderer with images, math typesetting, and syntax highlighting disabled for the first release. Plain text safe mode bypasses Markdown entirely. Raw session data is unchanged."
     }
 
     @ViewBuilder private func settingsCard(layout: IntatisMacScreenLayout) -> some View {

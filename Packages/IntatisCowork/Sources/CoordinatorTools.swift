@@ -14,8 +14,9 @@ public struct SpawnAgentTool: Tool {
     public static let descriptor = ToolDescriptor(
         name: "spawn_agent",
         description: "Create a new sub-agent bound to a folder so you can delegate work to it. "
-            + "Give it a short name and an absolute folder path; model is optional (defaults to "
-            + "yours). Set canCoordinate only when this sub-agent must manage lower-level agents. "
+            + "Give it a short name and an absolute folder path. Omit inference_profile_id to inherit "
+            + "your exact profile revision, or choose an ID from list_inference_profiles. "
+            + "Set canCoordinate only when this sub-agent must manage lower-level agents. "
             + "New agents are read-only unless requestedAccess is explicitly read_write. "
             + "After spawning, assign work with delegate_task; the orchestrator recycles task-scoped agents when idle.",
         sideEffect: .write,
@@ -27,7 +28,11 @@ public struct SpawnAgentTool: Tool {
                 "path": .object(["type": .string("string"),
                                  "description": .string("absolute path to the agent's workspace folder")]),
                 "model": .object(["type": .string("string"),
-                                  "description": .string("optional model id; defaults to your model")]),
+                                  "description": .string("deprecated compatibility field; cannot change the parent profile")]),
+                "inference_profile_id": .object([
+                    "type": .string("string"),
+                    "description": .string("optional host-approved inference profile ID; omission inherits your exact revision"),
+                ]),
                 "requestedAccess": .object([
                     "type": .string("string"),
                     "enum": .array([.string("read_only"), .string("read_write")]),
@@ -45,8 +50,14 @@ public struct SpawnAgentTool: Tool {
         let name: String
         let path: String
         let model: String?
+        let inferenceProfileID: String?
         let requestedAccess: WorkspaceAccess?
         let canCoordinate: Bool?
+
+        private enum CodingKeys: String, CodingKey {
+            case name, path, model, requestedAccess, canCoordinate
+            case inferenceProfileID = "inference_profile_id"
+        }
     }
 
     public func touchedPaths(_ args: ToolArgs) -> [String] {
@@ -83,7 +94,13 @@ public struct SpawnAgentTool: Tool {
                 PermissionResource(kind: .workspace, value: targetURL.path, access: requestedAccess),
             ],
             metadata: [
-                "model": value.model.map(JSONValue.string) ?? .null,
+                // Raw model/profile strings are untrusted model output. The
+                // Orchestrator replaces these booleans with an exact
+                // host-catalog binding only after schema and catalog checks.
+                "modelCompatibilityFieldPresent": .bool(value.model != nil),
+                "inferenceProfileSelectionRequested": .bool(
+                    value.inferenceProfileID?.trimmingCharacters(
+                        in: .whitespacesAndNewlines).isEmpty == false),
                 "requestedAccess": .string(requestedAccess.rawValue),
                 "canCoordinate": .bool(value.canCoordinate ?? false),
                 "targetCanonicalPath": .string(targetURL.path),
@@ -106,9 +123,11 @@ public struct SpawnAgentTool: Tool {
             throw IntatisError.io("agent management is not available in this session")
         }
         let result = await manager.spawnAgent(
+            authorization: context.authorization,
             name: a.name,
             path: a.path,
             model: a.model,
+            inferenceProfileID: a.inferenceProfileID,
             requestedAccess: a.requestedAccess ?? .readOnly,
             canCoordinate: a.canCoordinate ?? false)
         let trimmed = result.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -151,6 +170,37 @@ public struct ListAgentsTool: Tool {
             return ToolObservation(text: "agent management is not available in this session")
         }
         return ToolObservation(text: await manager.listAgents())
+    }
+}
+
+/// Lists only host-approved, secret-free profile identities. It never exposes
+/// endpoint URLs, credential references, headers, or raw request options.
+public struct ListInferenceProfilesTool: Tool {
+    public init() {}
+
+    public static let descriptor = ToolDescriptor(
+        name: "list_inference_profiles",
+        description: "List inference profile IDs that may be selected for a new child agent. Omit a profile in spawn_agent to inherit your exact revision.",
+        sideEffect: .readOnly,
+        parameters: .object([
+            "type": .string("object"),
+            "properties": .object([:]),
+            "additionalProperties": .bool(false),
+        ]))
+
+    public func permissionIntent(_ args: ToolArgs, workspaceRoot: URL) -> PermissionIntent {
+        PermissionIntent(
+            action: "inference.profile.list",
+            resources: [PermissionResource(kind: .agent, value: "host-approved-profiles")],
+            dataEffects: [.read],
+            replayPolicy: .safeToReplay)
+    }
+
+    public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {
+        guard let manager = context.agentManager else {
+            return ToolObservation(text: "agent management is not available in this session")
+        }
+        return ToolObservation(text: await manager.listInferenceProfiles())
     }
 }
 

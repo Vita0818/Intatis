@@ -33,6 +33,34 @@ private struct DelegationAuthorizationArguments: Decodable {
     }
 }
 
+private struct SpawnAuthorizationArguments: Decodable {
+    var inferenceProfileID: String?
+    var model: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case inferenceProfileID = "inference_profile_id"
+        case model
+    }
+}
+
+/// Immutable executor-side snapshot for one already-reviewed delegation.
+/// `create_proposed` has no target fingerprint at review time, so its exact
+/// materialized identity is captured immediately after the authorized spawn
+/// transaction and carried through mediation to final task admission.
+private struct AuthorizedDelegationAdmission: Sendable {
+    var authorization: ResolvedToolAuthorization
+    var target: AgentID
+    var binding: AgentInferenceBinding?
+    var targetFingerprint: String
+    var materializedProposedTarget: Bool
+}
+
+private struct MaterializedDelegationTarget: Sendable {
+    var agentID: AgentID
+    var binding: AgentInferenceBinding?
+    var fingerprint: String
+}
+
 public enum AutomaticPermissionReviewDisableResult: Equatable, Sendable {
     case disabled(AgentID)
     case alreadyDisabled
@@ -42,6 +70,12 @@ public enum AutomaticPermissionReviewDisableResult: Equatable, Sendable {
 public enum CoworkSessionBootstrapResult: Equatable, Sendable {
     case attached(AgentID)
     case alreadyAttached(AgentID)
+    case failed(String)
+}
+
+public enum AgentInferenceRebindResult: Equatable, Sendable {
+    case rebound(AgentID, AgentInferenceBinding)
+    case unchanged(AgentID, AgentInferenceBinding)
     case failed(String)
 }
 
@@ -301,6 +335,14 @@ public actor Orchestrator {
     private let reasoningEffort: ReasoningEffort?
     private let includeUsage: Bool
     private let maxSteps: Int
+    /// Host-approved profiles that model-authored spawn requests may select.
+    /// Existing agents/tasks always retain their exact binding revision.
+    private var availableInferenceProfiles: [InferenceProfileID: AgentInferenceBinding]
+    private let requiresInferenceBindings: Bool
+    /// Shipping per-agent runtimes resolve one atomic route tuple. The
+    /// Orchestrator, rather than each app, validates that tuple against the
+    /// live Agent before exposing its provider to AgentLoop.
+    private let resolvedInferenceFor: (@Sendable (Agent) async throws -> ResolvedInferenceProfile)?
     private let providerFor: @Sendable (Agent) async throws -> ToolCallingProvider
     private let imageGeneratorFor: @Sendable (Agent) async -> ImageGenerationToolService?
     private var messageConsumptionAppender: (@Sendable (AgentMessageConsumedPayload) async throws -> Void)?
@@ -317,8 +359,9 @@ public actor Orchestrator {
     private var executionPolicyUpdateWaiters: [CheckedContinuation<Void, Never>]
     private var executionPolicyUpdateInProgress: Bool
 
-    /// The only shipping-runtime constructor. It atomically acquires and retains
-    /// the process-level EventLog writer lease before any scheduler exists.
+    /// Shipping constructor for legacy/session-wide provider routing. It
+    /// atomically acquires and retains the process-level EventLog writer lease
+    /// before any scheduler exists, but cannot enable exact per-agent bindings.
     public static func runtime(
         log: EventLog,
         mediator: Mediator = Mediator(),
@@ -330,8 +373,53 @@ public actor Orchestrator {
         maxSteps: Int = 50,
         executionPolicy: CoworkExecutionPolicy = .default,
         taskGraphPolicy: TaskGraphPolicy = .default,
+        availableInferenceProfiles: [AgentInferenceBinding] = [],
+        requiresInferenceBindings: Bool = false,
         imageGeneratorFor: @escaping @Sendable (Agent) async -> ImageGenerationToolService? = { _ in nil },
         providerFor: @escaping @Sendable (Agent) async throws -> ToolCallingProvider
+    ) throws -> Orchestrator {
+        guard !requiresInferenceBindings else {
+            throw IntatisError.config(
+                "exact per-agent inference requires the atomic resolvedInferenceFor runtime constructor")
+        }
+        let writerLease = try log.acquireWriterLease()
+        return Orchestrator(
+            log: log,
+            mediator: mediator,
+            engine: engine,
+            allowsShell: allowsShell,
+            responder: responder,
+            reasoningEffort: reasoningEffort,
+            includeUsage: includeUsage,
+            maxSteps: maxSteps,
+            executionPolicy: executionPolicy,
+            taskGraphPolicy: taskGraphPolicy,
+            availableInferenceProfiles: availableInferenceProfiles,
+            requiresInferenceBindings: requiresInferenceBindings,
+            imageGeneratorFor: imageGeneratorFor,
+            writerLease: writerLease,
+            providerFor: providerFor)
+    }
+
+    /// Shipping constructor for exact per-agent inference. Each resolution
+    /// must atomically carry the immutable binding, model, and provider. The
+    /// Orchestrator revalidates all three fields at every admission/preflight
+    /// and immediately before AgentLoop receives the provider.
+    public static func runtime(
+        log: EventLog,
+        mediator: Mediator = Mediator(),
+        engine: PermissionEngine = PermissionEngine(),
+        allowsShell: Bool,
+        responder: PermissionResponder,
+        reasoningEffort: ReasoningEffort? = nil,
+        includeUsage: Bool = false,
+        maxSteps: Int = 50,
+        executionPolicy: CoworkExecutionPolicy = .default,
+        taskGraphPolicy: TaskGraphPolicy = .default,
+        availableInferenceProfiles: [AgentInferenceBinding] = [],
+        requiresInferenceBindings: Bool = true,
+        imageGeneratorFor: @escaping @Sendable (Agent) async -> ImageGenerationToolService? = { _ in nil },
+        resolvedInferenceFor: @escaping @Sendable (Agent) async throws -> ResolvedInferenceProfile
     ) throws -> Orchestrator {
         let writerLease = try log.acquireWriterLease()
         return Orchestrator(
@@ -345,9 +433,14 @@ public actor Orchestrator {
             maxSteps: maxSteps,
             executionPolicy: executionPolicy,
             taskGraphPolicy: taskGraphPolicy,
+            availableInferenceProfiles: availableInferenceProfiles,
+            requiresInferenceBindings: requiresInferenceBindings,
             imageGeneratorFor: imageGeneratorFor,
             writerLease: writerLease,
-            providerFor: providerFor)
+            resolvedInferenceFor: resolvedInferenceFor,
+            providerFor: { agent in
+                try await resolvedInferenceFor(agent).provider
+            })
     }
 
     /// Internal unlocked constructor for isolated `@testable` unit tests.
@@ -363,8 +456,11 @@ public actor Orchestrator {
                 maxSteps: Int = 50,
                 executionPolicy: CoworkExecutionPolicy = .default,
                 taskGraphPolicy: TaskGraphPolicy = .default,
+                availableInferenceProfiles: [AgentInferenceBinding] = [],
+                requiresInferenceBindings: Bool = false,
                 imageGeneratorFor: @escaping @Sendable (Agent) async -> ImageGenerationToolService? = { _ in nil },
                 writerLease: EventLogWriterLease? = nil,
+                resolvedInferenceFor: (@Sendable (Agent) async throws -> ResolvedInferenceProfile)? = nil,
                 providerFor: @escaping @Sendable (Agent) async throws -> ToolCallingProvider) {
         self.log = log
         self.writerLease = writerLease
@@ -410,6 +506,11 @@ public actor Orchestrator {
         self.reasoningEffort = reasoningEffort
         self.includeUsage = includeUsage || executionPolicy.tokenBudget != nil
         self.maxSteps = maxSteps
+        self.availableInferenceProfiles = Dictionary(
+            availableInferenceProfiles.map { ($0.inferenceProfileID, $0) },
+            uniquingKeysWith: { _, newest in newest })
+        self.requiresInferenceBindings = requiresInferenceBindings
+        self.resolvedInferenceFor = resolvedInferenceFor
         self.providerFor = providerFor
         self.imageGeneratorFor = imageGeneratorFor
         self.messageConsumptionAppender = nil
@@ -427,11 +528,39 @@ public actor Orchestrator {
         self.executionPolicyUpdateInProgress = false
     }
 
+    /// Returns the provider only after an atomic exact-profile resolution has
+    /// been proven to describe this same live Agent. Internal tests that use
+    /// the unlocked initializer retain the legacy provider seam; public
+    /// runtimes that require bindings cannot enter through that seam.
+    private func resolvedProvider(for agent: Agent) async throws -> ToolCallingProvider {
+        guard let resolvedInferenceFor else {
+            return try await providerFor(agent)
+        }
+        guard let binding = agent.agentInferenceBinding,
+              binding.modelID == agent.model else {
+            throw IntatisError.config(
+                "configurationUnresolved: agent inference binding and model differ")
+        }
+        let resolved = try await resolvedInferenceFor(agent)
+        guard resolved.binding == binding,
+              resolved.model == agent.model else {
+            throw IntatisError.config(
+                "configurationUnresolved: resolved inference profile does not match the agent binding and model")
+        }
+        return resolved.provider
+    }
+
     @discardableResult
     public func attach(_ agent: Agent,
                        admissionIssuer: AgentID? = nil,
                        causalParentTaskID: TaskID? = nil) async -> Bool {
         let id = agent.name
+        guard !requiresInferenceBindings || agent.agentInferenceBinding != nil else {
+            try? await log.append(.error(ErrorPayload(
+                code: "inference_profile_unresolved",
+                message: "@\(id.rawValue) requires an exact inference profile binding")))
+            return false
+        }
         if let validationError = Self.agentNameValidationError(id.rawValue) {
             try? await log.append(.error(ErrorPayload(
                 code: "invalid_agent_name",
@@ -454,6 +583,28 @@ public actor Orchestrator {
         var proposedAgent = agent
         if let canonical = assessment.canonical {
             proposedAgent.workspaceRoot = canonical
+        }
+        if requiresInferenceBindings {
+            do {
+                // Exact resolution is a creation invariant, not a first-turn
+                // best effort. This performs no model request; it only proves
+                // that the immutable revision, capability, and lazy credential
+                // can be resolved before any admission fact becomes durable.
+                _ = try await resolvedProvider(for: proposedAgent)
+            } catch {
+                try? await log.append(.error(ErrorPayload(
+                    code: "inference_profile_unresolved",
+                    message: "@\(id.rawValue) exact inference profile revision is unavailable or incompatible")))
+                return false
+            }
+        }
+        // This is only the target profile's host-catalog snapshot. A direct
+        // host attach may legitimately use a retained exact revision that is
+        // not a future-agent choice, so nil is meaningful and must remain nil
+        // throughout review/revalidation rather than being treated as a
+        // fallback to the catalog's current entry.
+        let reviewedCatalogBinding = proposedAgent.agentInferenceBinding.flatMap {
+            availableInferenceProfiles[$0.inferenceProfileID]
         }
         // Freeze the exact leases before review. The same values are embedded in
         // the durable review task and committed after allow; regenerating them
@@ -480,6 +631,7 @@ public actor Orchestrator {
             workspaceID: proposedLeases.workspace.workspaceID,
             workspaceLeaseID: proposedLeases.workspace.id,
             capabilityLeaseID: proposedLeases.capability.id,
+            agentInferenceBinding: proposedAgent.agentInferenceBinding,
             relatedAgents: admissionIssuer.map { [$0] } ?? [],
             relatedTasks: causalParentTaskID.map { [$0] } ?? [],
             constraints: [
@@ -514,7 +666,7 @@ public actor Orchestrator {
             metadata: [
                 "model": .string(proposedAgent.model.rawValue),
                 "canCoordinate": .bool(canCoordinate),
-            ],
+            ].merging(Self.inferenceMetadata(proposedAgent.agentInferenceBinding)) { _, profile in profile },
             dataEffects: [.none],
             controlEffects: [.attachWorkspace, .grantCapability],
             risks: [.controlPlaneMutation, .capabilityGrant, .workspaceExpansion],
@@ -561,7 +713,8 @@ public actor Orchestrator {
             workspaceTaskID: proposedLeases.workspace.taskID,
             workspaceRootPath: proposedLeases.workspace.rootPath,
             workspaceLeaseFingerprint: ToolRegistry.authorizationFingerprint(
-                proposedLeases.workspace))
+                proposedLeases.workspace),
+            targetAgentInferenceBinding: proposedAgent.agentInferenceBinding)
         let request = PermissionRequestPayload(
             requestId: requestID,
             agent: proposedAgent.name,
@@ -685,7 +838,59 @@ public actor Orchestrator {
         let approvalReason = (suppliedApprovalReason?.isEmpty == false
             ? suppliedApprovalReason
             : nil) ?? "permission approved workspace attach"
+
+        // Permission review is an async boundary. Resolve the exact tuple
+        // again after allow, then compare the target profile's live host
+        // catalog snapshot after the await. The custom admission lock is not
+        // held across resolver work, avoiding a resolver -> Orchestrator lock
+        // cycle while still preventing a catalog mutation from crossing the
+        // durable admission boundary.
+        var catalogBindingBeforeResolution: AgentInferenceBinding?
+        if requiresInferenceBindings {
+            await acquireAdmissionLock()
+            catalogBindingBeforeResolution = proposedAgent.agentInferenceBinding.flatMap {
+                availableInferenceProfiles[$0.inferenceProfileID]
+            }
+            releaseAdmissionLock()
+            do {
+                _ = try await resolvedProvider(for: proposedAgent)
+            } catch {
+                await persistAttachAuthorizationRevalidationDenial(
+                    requestID: requestID,
+                    proposedAgent: proposedAgent,
+                    assessedPath: assessedPath,
+                    reason: "exact inference profile changed or became unavailable during permission review",
+                    risk: resolution.risk ?? assessment.risk,
+                    intent: attachIntent,
+                    authorization: attachAuthorization,
+                    workspaceMetadata: workspaceMetadata,
+                    reviewResolution: resolution)
+                return false
+            }
+        }
+
         await acquireAdmissionLock()
+        if requiresInferenceBindings {
+            let liveCatalogBinding = proposedAgent.agentInferenceBinding.flatMap {
+                availableInferenceProfiles[$0.inferenceProfileID]
+            }
+            guard reviewedCatalogBinding == catalogBindingBeforeResolution,
+                  catalogBindingBeforeResolution == liveCatalogBinding else {
+                let reason = "host-approved inference profile changed during permission review"
+                await persistAttachAuthorizationRevalidationDenial(
+                    requestID: requestID,
+                    proposedAgent: proposedAgent,
+                    assessedPath: assessedPath,
+                    reason: reason,
+                    risk: resolution.risk ?? assessment.risk,
+                    intent: attachIntent,
+                    authorization: attachAuthorization,
+                    workspaceMetadata: workspaceMetadata,
+                    reviewResolution: resolution)
+                releaseAdmissionLock()
+                return false
+            }
+        }
         guard registry.agent(id) == nil else {
             try? await log.append(.permissionResolved(PermissionResolvedPayload(
                 requestId: requestID, tool: "agent.attach", decision: .deny,
@@ -749,6 +954,7 @@ public actor Orchestrator {
                 .agentAttached(AgentAttachedPayload(
                     agent: proposedAgent.name, path: proposedAgent.workspaceRoot.path, model: proposedAgent.model,
                     profile: proposedAgent.profile.rawValue,
+                    agentInferenceBinding: proposedAgent.agentInferenceBinding,
                     metadata: agentMetadata)),
             ])
         } catch {
@@ -781,6 +987,9 @@ public actor Orchestrator {
         if let validationError = Self.agentNameValidationError(agent.name.rawValue) {
             return .failed(validationError)
         }
+        guard !requiresInferenceBindings || agent.agentInferenceBinding != nil else {
+            return .failed("@main requires an exact inference profile binding.")
+        }
 
         let assessment = assessWorkspaceAttach(agent.workspaceRoot)
         guard assessment.canAskUser, let canonical = assessment.canonical else {
@@ -788,11 +997,58 @@ public actor Orchestrator {
         }
         var proposedAgent = agent
         proposedAgent.workspaceRoot = canonical
+        if requiresInferenceBindings {
+            do {
+                _ = try await resolvedProvider(for: proposedAgent)
+            } catch {
+                return .failed("@main exact inference profile revision is unavailable or incompatible.")
+            }
+        }
+        let reviewedCatalogBinding = proposedAgent.agentInferenceBinding.flatMap {
+            availableInferenceProfiles[$0.inferenceProfileID]
+        }
         let proposedLeases = prepareDefaultLeases(for: proposedAgent)
+
+        // First wait for all earlier admissions to settle, then re-resolve the
+        // exact route outside the custom lock. A second locked preflight below
+        // verifies that neither the empty-session facts nor the target catalog
+        // entry changed across that await. This closes the admission-wait race
+        // without holding the lock across an external resolver.
+        await acquireAdmissionLock()
+        if registry.agent(Self.mainAgentID) != nil {
+            releaseAdmissionLock()
+            return .alreadyAttached(Self.mainAgentID)
+        }
+        guard registry.isEmpty else {
+            releaseAdmissionLock()
+            return .failed("Initial @main bootstrap requires an empty agent roster.")
+        }
+        do {
+            guard try await log.isEmptyChecked() else {
+                releaseAdmissionLock()
+                return .failed("Initial @main bootstrap is only available for an empty Cowork session.")
+            }
+        } catch {
+            releaseAdmissionLock()
+            return .failed(
+                "Initial @main bootstrap could not verify an empty Cowork event log: \(error.localizedDescription)")
+        }
+        let catalogBindingBeforeResolution = proposedAgent.agentInferenceBinding.flatMap {
+            availableInferenceProfiles[$0.inferenceProfileID]
+        }
+        releaseAdmissionLock()
+
+        if requiresInferenceBindings {
+            do {
+                _ = try await resolvedProvider(for: proposedAgent)
+            } catch {
+                return .failed(
+                    "@main exact inference profile changed or became unavailable before durable admission.")
+            }
+        }
 
         await acquireAdmissionLock()
         defer { releaseAdmissionLock() }
-
         if registry.agent(Self.mainAgentID) != nil {
             return .alreadyAttached(Self.mainAgentID)
         }
@@ -806,6 +1062,15 @@ public actor Orchestrator {
         } catch {
             return .failed(
                 "Initial @main bootstrap could not verify an empty Cowork event log: \(error.localizedDescription)")
+        }
+        if requiresInferenceBindings {
+            let liveCatalogBinding = proposedAgent.agentInferenceBinding.flatMap {
+                availableInferenceProfiles[$0.inferenceProfileID]
+            }
+            guard reviewedCatalogBinding == catalogBindingBeforeResolution,
+                  catalogBindingBeforeResolution == liveCatalogBinding else {
+                return .failed("@main host-approved inference profile changed before durable admission.")
+            }
         }
 
         let agentMetadata = CoworkEventMetadata(
@@ -839,6 +1104,7 @@ public actor Orchestrator {
                     path: proposedAgent.workspaceRoot.path,
                     model: proposedAgent.model,
                     profile: proposedAgent.profile.rawValue,
+                    agentInferenceBinding: proposedAgent.agentInferenceBinding,
                     metadata: agentMetadata)),
             ])
         } catch {
@@ -932,6 +1198,115 @@ public actor Orchestrator {
 
     public func agentNames() -> [AgentID] { registry.names }
     public func agentList() -> [Agent] { registry.all() }
+
+    /// Resolves every data-plane binding without issuing a model request.
+    /// Error details are intentionally collapsed so endpoint/credential
+    /// configuration cannot leak into roster or UI state.
+    public func inferenceResolutionFailures() async -> [AgentID: String] {
+        var failures: [AgentID: String] = [:]
+        for agent in registry.all() where agent.name != Self.automaticPermissionReviewerID {
+            if requiresInferenceBindings, agent.agentInferenceBinding == nil {
+                failures[agent.name] = "legacy session requires an explicit inference profile rebind"
+                continue
+            }
+            do {
+                _ = try await resolvedProvider(for: agent)
+            } catch {
+                failures[agent.name] = "exact inference profile revision is unavailable or incompatible"
+            }
+        }
+        return failures
+    }
+
+    /// Replaces only the host-approved choices for future spawn/rebind
+    /// operations. Existing agent and TaskContract bindings are exact values
+    /// and are deliberately not rewritten.
+    public func updateAvailableInferenceProfiles(
+        _ profiles: [AgentInferenceBinding],
+        hostAuthorized: Bool
+    ) async {
+        guard hostAuthorized else { return }
+        await acquireAdmissionLock()
+        defer { releaseAdmissionLock() }
+        availableInferenceProfiles = Dictionary(
+            profiles.map { ($0.inferenceProfileID, $0) },
+            uniquingKeysWith: { _, newest in newest })
+    }
+
+    /// Host-only, durable rebind. An active/queued invocation is a hard fence:
+    /// a profile revision can change only between tasks, never mid-request or
+    /// across an already-admitted retry.
+    public func rebindAgentInferenceProfile(
+        agentID: AgentID,
+        binding: AgentInferenceBinding,
+        hostAuthorized: Bool
+    ) async -> AgentInferenceRebindResult {
+        guard hostAuthorized else {
+            return .failed("changing an inference profile is reserved for the user/host control plane")
+        }
+        guard agentID != Self.automaticPermissionReviewerID else {
+            return .failed("the automatic permission reviewer uses a reserved control-plane binding")
+        }
+        guard availableInferenceProfiles[binding.inferenceProfileID] == binding else {
+            return .failed("the selected inference profile revision is not in the host-approved catalog")
+        }
+        guard let current = registry.agent(agentID) else {
+            return .failed("no agent named @\(agentID.rawValue)")
+        }
+        if current.agentInferenceBinding == binding {
+            return .unchanged(agentID, binding)
+        }
+        guard !automaticDelegationReservations.contains(agentID) else {
+            return .failed("@\(agentID.rawValue) is reserved by a reviewed delegation")
+        }
+        guard !taskGraph.nodes.values.contains(where: {
+            $0.assignee == agentID && Self.isActiveTaskStatus($0.status)
+        }), !scheduler.queuedTasks().contains(where: { $0.assignee == agentID }) else {
+            return .failed("@\(agentID.rawValue) has an active or queued invocation")
+        }
+
+        var candidate = current
+        candidate.model = binding.modelID
+        candidate.agentInferenceBinding = binding
+        do {
+            _ = try await resolvedProvider(for: candidate)
+        } catch {
+            return .failed("the selected inference profile revision is unavailable or incompatible")
+        }
+
+        await acquireAdmissionLock()
+        defer { releaseAdmissionLock() }
+        guard availableInferenceProfiles[binding.inferenceProfileID] == binding else {
+            return .failed("the selected inference profile revision is no longer in the host-approved catalog")
+        }
+        guard let live = registry.agent(agentID),
+              live.agentInferenceBinding == current.agentInferenceBinding,
+              !automaticDelegationReservations.contains(agentID),
+              !taskGraph.nodes.values.contains(where: {
+                  $0.assignee == agentID && Self.isActiveTaskStatus($0.status)
+              }), !scheduler.queuedTasks().contains(where: { $0.assignee == agentID }) else {
+            return .failed("@\(agentID.rawValue) changed or became busy before rebind")
+        }
+        do {
+            try await appendAdmissionEvent(.agentAttached(AgentAttachedPayload(
+                agent: candidate.name,
+                path: candidate.workspaceRoot.path,
+                model: candidate.model,
+                profile: candidate.profile.rawValue,
+                agentInferenceBinding: candidate.agentInferenceBinding,
+                previousAgentInferenceBinding: current.agentInferenceBinding,
+                inferenceBindingChangeReason: "rebound by user/host control plane",
+                metadata: CoworkEventMetadata(
+                    agentID: candidate.name,
+                    scope: .agent,
+                    visibility: .global))))
+        } catch {
+            return .failed("the inference profile rebind could not be persisted")
+        }
+        registry.add(candidate)
+        return .rebound(agentID, binding)
+    }
+
     public func automaticPermissionReviewEnabled() -> Bool {
         automaticPermissionResponder != nil && !automaticPermissionReviewDisabling
     }
@@ -984,6 +1359,7 @@ public actor Orchestrator {
 
     @discardableResult
     public func enableAutomaticPermissionReview(model: ModelID,
+                                                 agentInferenceBinding: AgentInferenceBinding? = nil,
                                                  workspaceRoot: URL,
                                                  name: AgentID = Orchestrator.automaticPermissionReviewerID,
                                                  policy: PermissionReviewControlPlanePolicy = PermissionReviewControlPlanePolicy()) async -> AutomaticPermissionReviewResult {
@@ -999,6 +1375,9 @@ public actor Orchestrator {
         guard registry.agent(name) == nil else {
             return .failed("@\(name.rawValue) already exists; the automatic reviewer identity is reserved")
         }
+        guard !requiresInferenceBindings || agentInferenceBinding != nil else {
+            return .failed("automatic permission reviewer requires an exact inference profile binding")
+        }
 
         let assessment = assessWorkspaceAttach(workspaceRoot)
         guard assessment.canAskUser, let canonical = assessment.canonical else {
@@ -1009,14 +1388,15 @@ public actor Orchestrator {
             name: name,
             workspaceRoot: canonical,
             model: model,
+            agentInferenceBinding: agentInferenceBinding,
             profile: .readOnly,
             coordinationDepth: 0)
 
         let provider: ToolCallingProvider
         do {
-            provider = try await providerFor(reviewer)
+            provider = try await resolvedProvider(for: reviewer)
         } catch {
-            return .failed(error.localizedDescription)
+            return .failed("automatic permission reviewer inference profile is unavailable or incompatible")
         }
 
         let workspaceLease = WorkspaceLease(rootPath: reviewer.workspaceRoot.path, access: .readOnly)
@@ -1056,6 +1436,7 @@ public actor Orchestrator {
                     path: reviewer.workspaceRoot.path,
                     model: reviewer.model,
                     profile: reviewer.profile.rawValue,
+                    agentInferenceBinding: reviewer.agentInferenceBinding,
                     metadata: CoworkEventMetadata(agentID: reviewer.name, scope: .agent))),
             ])
         } catch {
@@ -1341,6 +1722,7 @@ public actor Orchestrator {
                 name: payload.agent,
                 workspaceRoot: URL(fileURLWithPath: payload.path),
                 model: payload.model,
+                agentInferenceBinding: payload.agentInferenceBinding,
                 profile: profile,
                 coordinationDepth: payload.agent == Self.mainAgentID
                     ? Agent.defaultCoordinationDepth
@@ -2648,6 +3030,7 @@ public actor Orchestrator {
             workspaceID: workspaceLease.workspaceID,
             workspaceLeaseID: workspaceLeaseID,
             capabilityLeaseID: capabilityLeaseID,
+            agentInferenceBinding: agent.agentInferenceBinding,
             relatedAgents: agentVisibleNames(excluding: agent.name),
             replyMode: TaskReplyMode.none,
             executionTimeoutSeconds: executionPolicy.taskTimeoutSeconds,
@@ -2741,12 +3124,25 @@ public actor Orchestrator {
         }
         automaticDelegationReservations.insert(target)
         defer { automaticDelegationReservations.remove(target) }
+        if let failure = authorizationRevalidationFailure(
+            authorization,
+            allowingDelegationReservationFor: target
+        ) {
+            return "error: \(failure)"
+        }
         let createdForDelegation: Bool
+        let targetFingerprint: String
         switch targetResolution {
         case "reuse_existing":
-            guard registry.agent(target) != nil else {
+            guard let existing = registry.agent(target) else {
                 return "error: reviewed delegation target is no longer attached"
             }
+            guard case .string(let reviewedFingerprint)? =
+                    authorization.intent.metadata["targetFingerprint"],
+                  delegationTargetFingerprint(existing) == reviewedFingerprint else {
+                return "error: reviewed delegation target identity changed"
+            }
+            targetFingerprint = reviewedFingerprint
             createdForDelegation = false
         case "create_proposed":
             guard let requester = registry.agent(from) else {
@@ -2758,16 +3154,27 @@ public actor Orchestrator {
                 name: target.rawValue,
                 path: requester.workspaceRoot.path,
                 model: requester.model.rawValue,
+                agentInferenceBinding: authorization.targetAgentInferenceBinding,
+                delegationAuthorization: authorization,
                 canCoordinate: false)
-            guard spawned.hasPrefix("spawned @"), registry.agent(target) != nil else {
+            guard spawned.hasPrefix("spawned @"),
+                  let materialized = registry.agent(target) else {
                 return spawned.lowercased().hasPrefix("error:")
                     ? spawned
                     : "error: reviewed delegation worker could not be created"
             }
+            targetFingerprint = delegationTargetFingerprint(materialized)
             createdForDelegation = true
         default:
             return "error: delegate_task target resolution is invalid"
         }
+
+        let authorizedAdmission = AuthorizedDelegationAdmission(
+            authorization: authorization,
+            target: target,
+            binding: authorization.targetAgentInferenceBinding,
+            targetFingerprint: targetFingerprint,
+            materializedProposedTarget: createdForDelegation)
 
         let queued = await enqueueDelegatedTask(
             from: from,
@@ -2781,7 +3188,8 @@ public actor Orchestrator {
                     : $0.acceptanceCriteria.joined(separator: "; ")
             },
             parentTaskID: parentTaskID,
-            replyMode: .taskReport)
+            replyMode: .taskReport,
+            authorizedAdmission: authorizedAdmission)
         guard let taskID = queued.taskID else {
             if createdForDelegation {
                 _ = await detach(
@@ -2870,7 +3278,8 @@ public actor Orchestrator {
             let requestedID = AgentID(rawValue: normalized)
             guard requestedID != Self.mainAgentID,
                   requestedID != Self.automaticPermissionReviewerID else { return nil }
-            if registry.agent(requestedID) != nil {
+            if let existing = registry.agent(requestedID),
+               inferenceBindingIsReady(existing) {
                 return (requestedID, false, false)
             }
             let spawned = await spawnFromTool(
@@ -2890,6 +3299,7 @@ public actor Orchestrator {
                 candidate.name != requestedBy
                     && candidate.name != Self.mainAgentID
                     && candidate.name != Self.automaticPermissionReviewerID
+                    && inferenceBindingIsReady(candidate)
                     && candidate.workspaceRoot.standardizedFileURL.path
                         == requester.workspaceRoot.standardizedFileURL.path
                     && !automaticDelegationReservations.contains(candidate.name)
@@ -2950,12 +3360,44 @@ public actor Orchestrator {
                               expectedDeliverable: String? = nil,
                               parentTaskID: TaskID? = nil,
                               replyMode: TaskReplyMode = .taskReport) async -> (taskID: TaskID?, message: String) {
+        await enqueueDelegatedTask(
+            from: from,
+            to: toName,
+            workTaskID: workTaskID,
+            objective: objective,
+            roleHint: roleHint,
+            expectedDeliverable: expectedDeliverable,
+            parentTaskID: parentTaskID,
+            replyMode: replyMode,
+            authorizedAdmission: nil)
+    }
+
+    private func enqueueDelegatedTask(
+        from: AgentID,
+        to toName: String,
+        workTaskID: WorkTaskID? = nil,
+        objective: String,
+        roleHint: String? = nil,
+        expectedDeliverable: String? = nil,
+        parentTaskID: TaskID? = nil,
+        replyMode: TaskReplyMode = .taskReport,
+        authorizedAdmission: AuthorizedDelegationAdmission?
+    ) async -> (taskID: TaskID?, message: String) {
         let normalizedName = Self.normalizedAgentName(toName)
         let to = AgentID(rawValue: normalizedName)
         guard to != Self.automaticPermissionReviewerID else {
             return (nil, "@\(Self.automaticPermissionReviewerID.rawValue) is reserved for automatic permission review")
         }
         guard let toAgent = registry.agent(to) else { return (nil, "no such agent: \(toName)") }
+        if let authorizedAdmission,
+           let failure = finalDelegationAuthorizationFailure(
+               authorizedAdmission,
+               expectedFrom: from,
+               expectedTaskID: parentTaskID,
+               allowingReservationFor: to
+           ) {
+            return (nil, "error: \(failure)")
+        }
         if let delegationFailure = delegationFailure(
             from: from,
             to: to,
@@ -2969,6 +3411,21 @@ public actor Orchestrator {
             return (nil, "your delegated task was blocked by the mediator")
         }
 
+        // Mediation is an actor-reentrant await. Resolve the exact target again
+        // outside the admission lock, then compare the same immutable route and
+        // authorization snapshot under the lock before any task fact is made
+        // durable or visible to the scheduler.
+        if authorizedAdmission != nil, requiresInferenceBindings {
+            guard let targetBeforeAdmission = registry.agent(to) else {
+                return (nil, "error: reviewed delegation target is no longer attached")
+            }
+            do {
+                _ = try await resolvedProvider(for: targetBeforeAdmission)
+            } catch {
+                return (nil, "error: selected inference profile revision is unavailable or incompatible")
+            }
+        }
+
         await acquireAdmissionLock()
         defer { releaseAdmissionLock() }
         if workTaskID != nil, let workTaskRecoveryFailure {
@@ -2976,6 +3433,15 @@ public actor Orchestrator {
         }
         guard let currentTarget = registry.agent(to) else {
             return (nil, "no such agent: \(toName)")
+        }
+        if let authorizedAdmission,
+           let failure = finalDelegationAuthorizationFailure(
+               authorizedAdmission,
+               expectedFrom: from,
+               expectedTaskID: parentTaskID,
+               allowingReservationFor: to
+           ) {
+            return (nil, "error: \(failure)")
         }
         if let delegationFailure = delegationFailure(
             from: from,
@@ -3032,6 +3498,10 @@ public actor Orchestrator {
             },
             replyMode: replyMode)
         let contract = prepared.contract
+        if let authorizedAdmission,
+           contract.agentInferenceBinding != authorizedAdmission.binding {
+            return (nil, "error: delegated task inference profile differs from the reviewed authorization")
+        }
         guard !isGoalRunCancellationRequested(
             goalID: contract.goalID,
             continuationRunID: contract.continuationRunID) else {
@@ -4313,6 +4783,10 @@ public actor Orchestrator {
                        name: String,
                        path: String,
                        model: String,
+                       inferenceProfileID: String? = nil,
+                       agentInferenceBinding: AgentInferenceBinding? = nil,
+                       authorization: ResolvedToolAuthorization? = nil,
+                       delegationAuthorization: ResolvedToolAuthorization? = nil,
                        requestedAccess: WorkspaceAccess = .readOnly,
                        canCoordinate: Bool = false) async -> String {
         if let validationError = Self.agentNameValidationError(name) {
@@ -4349,6 +4823,59 @@ public actor Orchestrator {
             return "error: active agent limit reached (\(taskGraph.policy.maxActiveAgentsPerThread))"
         }
         if registry.agent(id) != nil { return "error: an agent named @\(name) already exists" }
+        guard authorization == nil || delegationAuthorization == nil else {
+            return "error: spawn admission cannot combine two authorization snapshots"
+        }
+        if let authorization {
+            guard authorization.toolName == "spawn_agent",
+                  authorization.agent == requestedBy,
+                  authorization.taskID == currentTaskID else {
+                return "error: spawn_agent authorization binding is invalid"
+            }
+            if let failure = authorizationRevalidationFailure(authorization) {
+                return "error: \(failure)"
+            }
+        }
+        if let delegationAuthorization {
+            guard delegationAuthorization.toolName == "delegate_task",
+                  delegationAuthorization.agent == requestedBy,
+                  delegationAuthorization.taskID == currentTaskID,
+                  case .string(let targetResolution)? =
+                    delegationAuthorization.intent.metadata["targetResolution"],
+                  targetResolution == "create_proposed",
+                  delegationAuthorization.intent.resources.first(where: {
+                      $0.kind == .agent
+                  })?.value == id.rawValue,
+                  automaticDelegationReservations.contains(id) else {
+                return "error: delegate_task spawn authorization binding is invalid"
+            }
+            if let failure = authorizationRevalidationFailure(
+                delegationAuthorization,
+                allowingDelegationReservationFor: id
+            ) {
+                return "error: \(failure)"
+            }
+            guard delegationAuthorization.capabilityLeaseID == lease.id,
+                  delegationAuthorization.capabilityLeaseFingerprint
+                    == ToolRegistry.authorizationFingerprint(lease),
+                  delegationAuthorization.workspaceLeaseID == parentWorkspaceLease.id,
+                  delegationAuthorization.workspaceLeaseFingerprint
+                    == ToolRegistry.authorizationFingerprint(parentWorkspaceLease) else {
+                return "error: delegate_task spawn lease derivation differs from authorization"
+            }
+        }
+        let selectedBinding = authorization?.targetAgentInferenceBinding
+            ?? delegationAuthorization?.targetAgentInferenceBinding
+            ?? agentInferenceBinding
+            ?? registry.agent(requestedBy)?.agentInferenceBinding
+        if let inferenceProfileID,
+           !inferenceProfileID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           selectedBinding?.inferenceProfileID.rawValue != inferenceProfileID {
+            return "error: spawn_agent profile differs from the reviewed authorization"
+        }
+        guard !requiresInferenceBindings || selectedBinding != nil else {
+            return "error: spawn target has no exact inference profile binding"
+        }
         let assessment = assessWorkspaceAttach(url)
         guard assessment.canAskUser, let canonical = assessment.canonical else {
             return "error: \(assessment.reason)"
@@ -4357,9 +4884,17 @@ public actor Orchestrator {
         let proposedAgent = Agent(
             name: id,
             workspaceRoot: canonical,
-            model: ModelID(rawValue: model),
+            model: selectedBinding?.modelID ?? ModelID(rawValue: model),
+            agentInferenceBinding: selectedBinding,
             profile: .reviewed,
             coordinationDepth: coordinationDepth)
+        if requiresInferenceBindings {
+            do {
+                _ = try await resolvedProvider(for: proposedAgent)
+            } catch {
+                return "error: selected inference profile revision is unavailable or incompatible"
+            }
+        }
         let proposedLeases = prepareSpawnLeases(
             for: proposedAgent,
             parentCapabilityLease: lease,
@@ -4419,6 +4954,22 @@ public actor Orchestrator {
         guard registry.agent(id) == nil else {
             return "error: an agent named @\(name) already exists"
         }
+        if let authorization,
+           let failure = authorizationRevalidationFailure(authorization) {
+            return "error: \(failure)"
+        }
+        if let delegationAuthorization,
+           let failure = authorizationRevalidationFailure(
+               delegationAuthorization,
+               allowingDelegationReservationFor: id
+           ) {
+            return "error: \(failure)"
+        }
+        if let delegationAuthorization,
+           proposedAgent.agentInferenceBinding
+                != delegationAuthorization.targetAgentInferenceBinding {
+            return "error: delegate_task spawn inference profile changed before admission"
+        }
         guard let rootIdentity = proposedLeases.workspace.rootIdentity,
               rootIdentity.matchesCurrentDirectory(rootPath: proposedLeases.workspace.rootPath) else {
             return "error: workspace root identity changed before spawn admission"
@@ -4430,12 +4981,14 @@ public actor Orchestrator {
                     agent: id,
                     path: canonical.path,
                     model: proposedAgent.model,
+                    agentInferenceBinding: proposedAgent.agentInferenceBinding,
                     metadata: baseMetadata)),
                 .agentAttachRequested(AgentAttachRequestedPayload(
                     agent: id,
                     path: canonical.path,
                     model: proposedAgent.model,
                     profile: proposedAgent.profile.rawValue,
+                    agentInferenceBinding: proposedAgent.agentInferenceBinding,
                     metadata: baseMetadata)),
                 .workspaceLeaseRequested(WorkspaceLeaseRequestedPayload(
                     agent: id,
@@ -4456,12 +5009,14 @@ public actor Orchestrator {
                     path: canonical.path,
                     model: proposedAgent.model,
                     profile: proposedAgent.profile.rawValue,
+                    agentInferenceBinding: proposedAgent.agentInferenceBinding,
                     metadata: baseMetadata)),
                 .agentSpawned(AgentSpawnedPayload(
                     requestedBy: requestedBy,
                     agent: id,
                     path: canonical.path,
                     model: proposedAgent.model,
+                    agentInferenceBinding: proposedAgent.agentInferenceBinding,
                     metadata: baseMetadata)),
             ])
         } catch {
@@ -4470,7 +5025,10 @@ public actor Orchestrator {
         registry.add(proposedAgent)
         commitDefaultLeases(proposedLeases, for: id)
         spawnedAgentOwners[id] = requestedBy
-        return "spawned @\(name) · model \(model) · \(canCoordinate ? "coordinator" : "worker") · \(requestedAccess.rawValue) · \(canonical.path)"
+        let inference = proposedAgent.agentInferenceBinding.map {
+            "profile \($0.inferenceProfileID.rawValue)@\($0.inferenceProfileRevision.rawValue)"
+        } ?? "legacy model \(proposedAgent.model.rawValue)"
+        return "spawned @\(name) · \(inference) · \(canCoordinate ? "coordinator" : "worker") · \(requestedAccess.rawValue) · \(canonical.path)"
     }
 
     /// One line per active agent, for the coordinator to read.
@@ -4480,15 +5038,36 @@ public actor Orchestrator {
             .sorted { $0.name.rawValue < $1.name.rawValue }
         guard !all.isEmpty else { return "(no agents)" }
         return all.map {
-            [
+            let inference = $0.agentInferenceBinding.map { binding in
+                let variant = binding.variantID.map { " variant=\($0)" } ?? ""
+                return "profile=\(binding.inferenceProfileID.rawValue)@\(binding.inferenceProfileRevision.rawValue) connection=\(binding.inferenceConnectionID.rawValue)\(variant)"
+            } ?? "profile=legacy-unresolved"
+            return [
                 "@\($0.name.rawValue)",
                 $0.model.rawValue,
                 agentListRole(for: $0),
+                inference,
                 agentListTaskState(for: $0.name),
                 $0.workspaceRoot.path,
             ].joined(separator: " · ")
         }
             .joined(separator: "\n")
+    }
+
+    func listInferenceProfilesForTool() -> String {
+        let profiles = availableInferenceProfiles.values.sorted {
+            if $0.safeRouteLabel == $1.safeRouteLabel {
+                return $0.inferenceProfileID.rawValue < $1.inferenceProfileID.rawValue
+            }
+            return ($0.safeRouteLabel ?? $0.inferenceProfileID.rawValue)
+                < ($1.safeRouteLabel ?? $1.inferenceProfileID.rawValue)
+        }
+        guard !profiles.isEmpty else { return "(no host-approved inference profiles)" }
+        return profiles.map { binding in
+            let label = binding.safeRouteLabel ?? binding.inferenceProfileID.rawValue
+            let variant = binding.variantID.map { " · variant \($0)" } ?? ""
+            return "\(binding.inferenceProfileID.rawValue) · \(label) · model \(binding.modelID.rawValue)\(variant)"
+        }.joined(separator: "\n")
     }
 
     private func agentListRole(for agent: Agent) -> String {
@@ -4560,9 +5139,27 @@ public actor Orchestrator {
                      taskContract: TaskContract? = nil,
                      rootTaskID: TaskID? = nil,
                      taskAttempt: Int? = nil) async throws -> AgentRunResult {
+        if requiresInferenceBindings {
+            guard let liveBinding = agent.agentInferenceBinding else {
+                throw IntatisError.config(
+                    "configurationUnresolved: @\(agent.name.rawValue) has no exact inference profile binding")
+            }
+            guard let frozenBinding = taskContract?.agentInferenceBinding else {
+                throw IntatisError.config(
+                    "configurationUnresolved: task \(taskContract?.id.rawValue ?? "unknown") has no frozen inference profile binding")
+            }
+            guard frozenBinding == liveBinding else {
+                throw IntatisError.config(
+                    "configurationUnresolved: task and @\(agent.name.rawValue) inference profile revisions differ")
+            }
+        } else if let frozenBinding = taskContract?.agentInferenceBinding,
+                  frozenBinding != agent.agentInferenceBinding {
+            throw IntatisError.config(
+                "configurationUnresolved: task and agent inference profile revisions differ")
+        }
         let capabilityLease = try capabilityLease(for: agent, taskContract: taskContract)
         let workspaceLease = try workspaceLease(for: agent, taskContract: taskContract)
-        let provider = try await providerFor(agent)
+        let provider = try await resolvedProvider(for: agent)
         let messenger = BusMessenger(from: agent.name, currentTaskID: taskContract?.id, orchestrator: self)
         let manager = OrchestratorManager(
             orchestrator: self,
@@ -4602,7 +5199,10 @@ public actor Orchestrator {
             registry: toolRegistry,
             engine: engine,
             allowsShell: allowsShell,
-            reasoningEffort: reasoningEffort,
+            // Bound profiles already contain the exact provider-native
+            // reasoning/thinking options. Applying the session-wide typed
+            // value here would overwrite that per-agent revision.
+            reasoningEffort: agent.agentInferenceBinding == nil ? reasoningEffort : nil,
             includeUsage: includeUsage || executionPolicy.tokenBudget != nil,
             maxIterations: maxSteps)
         let loop = runtime.makeLoop(
@@ -4631,10 +5231,10 @@ public actor Orchestrator {
                 agentID: agent.name),
             tokenBudgetMeter: tokenBudgetMeter,
             authorizationPreparer: { [self] request in
-                try await prepareAuthorizationIntent(request)
+                try await prepareAuthorization(request)
             },
             authorizationRevalidator: { [self] authorization in
-                await authorizationRevalidationFailure(authorization)
+                await toolExecutionAuthorizationRevalidationFailure(authorization)
             }
         )
         let output = try await loop.send(
@@ -4647,11 +5247,14 @@ public actor Orchestrator {
             presentedMessageIDs: contextBundle.directMessages.compactMap(\.messageID))
     }
 
-    private func prepareAuthorizationIntent(
+    private func prepareAuthorization(
         _ request: ToolAuthorizationPreparationRequest
-    ) throws -> PermissionIntent {
+    ) throws -> ToolAuthorizationPreparation {
+        if request.toolName == "spawn_agent" {
+            return try prepareSpawnAuthorization(request)
+        }
         guard request.toolName == "delegate_task" else {
-            return request.baseIntent
+            return ToolAuthorizationPreparation(intent: request.baseIntent)
         }
         guard let requesterID = request.invocation.agent,
               let requester = registry.agent(requesterID) else {
@@ -4669,6 +5272,7 @@ public actor Orchestrator {
         let targetResolution: String
         let targetFingerprint: String?
         let targetModel: ModelID
+        let targetInferenceBinding: AgentInferenceBinding?
         let targetWorkspace: String
 
         if let suppliedTarget {
@@ -4683,6 +5287,7 @@ public actor Orchestrator {
                 targetResolution = "reuse_existing"
                 targetFingerprint = delegationTargetFingerprint(existing)
                 targetModel = existing.model
+                targetInferenceBinding = existing.agentInferenceBinding
                 targetWorkspace = existing.workspaceRoot.resolvingSymlinksInPath()
                     .standardizedFileURL.path
             } else {
@@ -4698,6 +5303,7 @@ public actor Orchestrator {
                 targetResolution = "create_proposed"
                 targetFingerprint = nil
                 targetModel = requester.model
+                targetInferenceBinding = requester.agentInferenceBinding
                 targetWorkspace = requester.workspaceRoot.resolvingSymlinksInPath()
                     .standardizedFileURL.path
             }
@@ -4706,6 +5312,7 @@ public actor Orchestrator {
                 candidate.name != requesterID
                     && candidate.name != Self.mainAgentID
                     && candidate.name != Self.automaticPermissionReviewerID
+                    && inferenceBindingIsReady(candidate)
                     && candidate.workspaceRoot.standardizedFileURL.path
                         == requester.workspaceRoot.standardizedFileURL.path
                     && !automaticDelegationReservations.contains(candidate.name)
@@ -4717,6 +5324,7 @@ public actor Orchestrator {
             targetResolution = "reuse_existing"
             targetFingerprint = delegationTargetFingerprint(idle)
             targetModel = idle.model
+            targetInferenceBinding = idle.agentInferenceBinding
             targetWorkspace = idle.workspaceRoot.resolvingSymlinksInPath()
                 .standardizedFileURL.path
         } else {
@@ -4730,6 +5338,7 @@ public actor Orchestrator {
             targetResolution = "create_proposed"
             targetFingerprint = nil
             targetModel = requester.model
+            targetInferenceBinding = requester.agentInferenceBinding
             targetWorkspace = requester.workspaceRoot.resolvingSymlinksInPath()
                 .standardizedFileURL.path
         }
@@ -4758,12 +5367,77 @@ public actor Orchestrator {
         intent.metadata["requestedAccess"] = .string(WorkspaceAccess.readOnly.rawValue)
         intent.metadata["canCoordinate"] = .bool(false)
         intent.metadata["mayCreateWorker"] = .bool(targetResolution == "create_proposed")
+        intent.metadata.merge(Self.inferenceMetadata(targetInferenceBinding)) { _, profile in profile }
+        if let targetInferenceBinding,
+           let catalogBinding = availableInferenceProfiles[
+               targetInferenceBinding.inferenceProfileID
+           ] {
+            intent.metadata["targetInferenceCatalogFingerprint"] = .string(
+                ToolRegistry.authorizationFingerprint(catalogBinding))
+        } else {
+            // `nil` is a meaningful snapshot for a retained historical
+            // binding. A later host catalog insertion/removal is still a route
+            // authorization change and must not cross this ToolCall.
+            intent.metadata["targetInferenceCatalogFingerprint"] = .null
+        }
         if let targetFingerprint {
             intent.metadata["targetFingerprint"] = .string(targetFingerprint)
         } else {
             intent.metadata.removeValue(forKey: "targetFingerprint")
         }
-        return intent
+        if requiresInferenceBindings, targetInferenceBinding == nil {
+            throw IntatisError.permissionDenied(
+                "delegation target has no exact inference profile binding")
+        }
+        return ToolAuthorizationPreparation(
+            intent: intent,
+            targetAgentInferenceBinding: targetInferenceBinding)
+    }
+
+    private func prepareSpawnAuthorization(
+        _ request: ToolAuthorizationPreparationRequest
+    ) throws -> ToolAuthorizationPreparation {
+        guard let requesterID = request.invocation.agent,
+              let requester = registry.agent(requesterID) else {
+            throw IntatisError.permissionDenied("spawning agent is not attached")
+        }
+        let arguments = try JSONDecoder().decode(
+            SpawnAuthorizationArguments.self,
+            from: Data(request.normalizedArguments.utf8))
+        let requestedProfileID = arguments.inferenceProfileID?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let binding: AgentInferenceBinding?
+        if let requestedProfileID, !requestedProfileID.isEmpty {
+            guard arguments.model == nil else {
+                throw IntatisError.permissionDenied(
+                    "spawn_agent cannot combine a raw model with inference_profile_id")
+            }
+            let profileID = InferenceProfileID(rawValue: requestedProfileID)
+            guard let approved = availableInferenceProfiles[profileID] else {
+                throw IntatisError.permissionDenied(
+                    "requested inference profile is not in the host-approved session catalog")
+            }
+            binding = approved
+        } else {
+            if requiresInferenceBindings,
+               let rawModel = arguments.model,
+               rawModel != requester.model.rawValue {
+                throw IntatisError.permissionDenied(
+                    "raw model selection is not allowed; choose a host-approved inference_profile_id")
+            }
+            binding = requester.agentInferenceBinding
+        }
+        if requiresInferenceBindings, binding == nil {
+            throw IntatisError.permissionDenied(
+                "spawn target has no exact inference profile binding")
+        }
+        var intent = request.baseIntent
+        intent.metadata.merge(Self.inferenceMetadata(binding)) { _, profile in profile }
+        intent.metadata["profileSelection"] = .string(
+            requestedProfileID?.isEmpty == false ? "explicit_host_catalog" : "inherit_parent_exact")
+        return ToolAuthorizationPreparation(
+            intent: intent,
+            targetAgentInferenceBinding: binding)
     }
 
     private func validateProposedDelegationTarget(
@@ -4809,6 +5483,7 @@ public actor Orchestrator {
             agent.name.rawValue,
             agent.workspaceRoot.resolvingSymlinksInPath().standardizedFileURL.path,
             agent.model.rawValue,
+            agent.agentInferenceBinding.map(ToolRegistry.authorizationFingerprint) ?? "",
             agent.profile.rawValue,
             String(agent.coordinationDepth),
             capabilityLeaseID?.rawValue ?? "",
@@ -4820,13 +5495,50 @@ public actor Orchestrator {
         ].joined(separator: "\u{001F}"))
     }
 
+    private static func inferenceMetadata(
+        _ binding: AgentInferenceBinding?
+    ) -> [String: JSONValue] {
+        guard let binding else {
+            return ["targetInferenceProfile": .null]
+        }
+        return [
+            "targetInferenceProfileID": .string(binding.inferenceProfileID.rawValue),
+            "targetInferenceProfileRevision": .string(binding.inferenceProfileRevision.rawValue),
+            "targetInferenceConnectionID": .string(binding.inferenceConnectionID.rawValue),
+            "targetInferenceConnectionRevision": .string(binding.inferenceConnectionRevision.rawValue),
+            "targetInferenceModel": .string(binding.modelID.rawValue),
+            "targetInferenceVariant": binding.variantID.map(JSONValue.string) ?? .null,
+            "targetInferenceRouteLabel": binding.safeRouteLabel.map(JSONValue.string) ?? .null,
+            "targetInferenceTrustDomain": binding.trustDomain.map(JSONValue.string) ?? .null,
+            "targetInferenceEgressClassification": binding.egressClassification.map(JSONValue.string) ?? .null,
+            "targetInferenceFingerprint": .string(
+                ToolRegistry.authorizationFingerprint(binding)),
+        ]
+    }
+
     /// Live actor-isolated lease check used immediately after review and again
     /// after the durable execution prepare boundary. A captured lease value is
     /// not enough: task completion, detach, or cancellation may revoke it while
     /// the reviewer is awaiting its provider.
     private func authorizationRevalidationFailure(
-        _ authorization: ResolvedToolAuthorization
+        _ authorization: ResolvedToolAuthorization,
+        allowingDelegationReservationFor reservedTarget: AgentID? = nil,
+        materializedDelegationTarget: MaterializedDelegationTarget? = nil
     ) -> String? {
+        if let binding = authorization.targetAgentInferenceBinding {
+            guard case .string(let reviewedFingerprint)? =
+                    authorization.intent.metadata["targetInferenceFingerprint"],
+                  reviewedFingerprint == ToolRegistry.authorizationFingerprint(binding) else {
+                return "target inference profile authorization fingerprint is missing or changed"
+            }
+        } else if requiresInferenceBindings,
+                  authorization.toolName == "delegate_task"
+                    || authorization.toolName == "spawn_agent" {
+            return "target inference profile binding is missing from authorization"
+        }
+        if let failure = delegationInferenceCatalogAuthorizationFailure(authorization) {
+            return failure
+        }
         if authorization.capabilityLeaseID != nil
             || !authorization.requiredCapabilities.isEmpty
             || authorization.requiredCommunication != .none
@@ -4880,11 +5592,165 @@ public actor Orchestrator {
                 return "workspace root identity changed before tool execution"
             }
         }
-        return semanticAuthorizationFailure(authorization)
+        return semanticAuthorizationFailure(
+            authorization,
+            allowingDelegationReservationFor: reservedTarget,
+            materializedDelegationTarget: materializedDelegationTarget)
+    }
+
+    private func delegationInferenceCatalogAuthorizationFailure(
+        _ authorization: ResolvedToolAuthorization
+    ) -> String? {
+        guard requiresInferenceBindings,
+              authorization.toolName == "delegate_task",
+              let binding = authorization.targetAgentInferenceBinding else {
+            return nil
+        }
+        guard let reviewedCatalogFingerprint =
+                authorization.intent.metadata["targetInferenceCatalogFingerprint"] else {
+            return "delegation authorization has no inference catalog snapshot"
+        }
+        let liveCatalogBinding = availableInferenceProfiles[binding.inferenceProfileID]
+        switch reviewedCatalogFingerprint {
+        case .null:
+            guard liveCatalogBinding == nil else {
+                return "host-approved inference profile catalog changed before delegation admission"
+            }
+        case .string(let fingerprint):
+            guard let liveCatalogBinding,
+                  ToolRegistry.authorizationFingerprint(liveCatalogBinding) == fingerprint else {
+                return "host-approved inference profile catalog changed before delegation admission"
+            }
+        default:
+            return "delegation authorization inference catalog snapshot is invalid"
+        }
+        return nil
+    }
+
+    /// Final executor-side check for an already-reviewed delegation. This is
+    /// deliberately distinct from proposed-target preflight: after an
+    /// authorized `create_proposed` spawn, the target must exist, but only as
+    /// the exact materialized child owned by this requester.
+    private func finalDelegationAuthorizationFailure(
+        _ admission: AuthorizedDelegationAdmission,
+        expectedFrom: AgentID,
+        expectedTaskID: TaskID?,
+        allowingReservationFor reservedTarget: AgentID
+    ) -> String? {
+        let authorization = admission.authorization
+        guard authorization.toolName == "delegate_task",
+              authorization.agent == expectedFrom,
+              authorization.taskID == expectedTaskID,
+              admission.target == reservedTarget,
+              authorization.targetAgentInferenceBinding == admission.binding,
+              let targetValue = authorization.intent.resources.first(where: {
+                  $0.kind == .agent
+              })?.value,
+              AgentID(rawValue: Self.normalizedAgentName(targetValue)) == admission.target else {
+            return "delegate_task authorization binding changed before task admission"
+        }
+        guard automaticDelegationReservations.contains(reservedTarget) else {
+            return "reviewed delegation reservation was lost before task admission"
+        }
+        let materializedTarget = admission.materializedProposedTarget
+            ? MaterializedDelegationTarget(
+                agentID: admission.target,
+                binding: admission.binding,
+                fingerprint: admission.targetFingerprint)
+            : nil
+        if let failure = authorizationRevalidationFailure(
+            authorization,
+            allowingDelegationReservationFor: reservedTarget,
+            materializedDelegationTarget: materializedTarget
+        ) {
+            return failure
+        }
+        guard let currentTarget = registry.agent(admission.target),
+              currentTarget.agentInferenceBinding == admission.binding,
+              currentTarget.model == (admission.binding?.modelID ?? currentTarget.model),
+              delegationTargetFingerprint(currentTarget) == admission.targetFingerprint else {
+            return "reviewed delegation target route or identity changed before task admission"
+        }
+        guard case .string(let resolution)? =
+                authorization.intent.metadata["targetResolution"],
+              (resolution == "create_proposed") == admission.materializedProposedTarget else {
+            return "delegate_task target resolution changed before task admission"
+        }
+        if !admission.materializedProposedTarget {
+            guard case .string(let reviewedFingerprint)? =
+                    authorization.intent.metadata["targetFingerprint"],
+                  reviewedFingerprint == admission.targetFingerprint else {
+                return "reviewed delegation target fingerprint changed before task admission"
+            }
+        }
+        return nil
+    }
+
+    /// The synchronous authorization checks above protect the live roster,
+    /// leases, and host-approved profile set. Exact inference resolution is an
+    /// async boundary of its own (for example, lazy credential lookup). Run it
+    /// from AgentLoop's pre-execution revalidation hook so a suspended resolver
+    /// cannot move the first failure past the durable tool-execution boundary.
+    /// Re-run the synchronous checks after the await to close catalog/roster
+    /// TOCTOU without holding the admission lock across external resolution.
+    private func toolExecutionAuthorizationRevalidationFailure(
+        _ authorization: ResolvedToolAuthorization
+    ) async -> String? {
+        if let failure = authorizationRevalidationFailure(authorization) {
+            return failure
+        }
+        guard requiresInferenceBindings,
+              authorization.toolName == "spawn_agent"
+                || authorization.toolName == "delegate_task",
+              let binding = authorization.targetAgentInferenceBinding else {
+            return nil
+        }
+        guard let targetValue = authorization.intent.resources.first(where: {
+            $0.kind == .agent
+        })?.value else {
+            return "target inference profile authorization has no concrete agent"
+        }
+        let targetID = AgentID(rawValue: Self.normalizedAgentName(targetValue))
+        let candidate: Agent
+        if let live = registry.agent(targetID) {
+            guard live.agentInferenceBinding == binding,
+                  live.model == binding.modelID else {
+                return "target agent inference profile changed before tool execution"
+            }
+            candidate = live
+        } else {
+            let workspacePath = authorization.intent.resources.first(where: {
+                $0.kind == .workspace
+            })?.value ?? {
+                guard case .string(let value)? =
+                    authorization.intent.metadata["targetWorkspace"] else {
+                    return ""
+                }
+                return value
+            }()
+            guard !workspacePath.isEmpty else {
+                return "target inference profile authorization has no concrete workspace"
+            }
+            candidate = Agent(
+                name: targetID,
+                workspaceRoot: URL(fileURLWithPath: workspacePath).standardizedFileURL,
+                model: binding.modelID,
+                agentInferenceBinding: binding,
+                profile: .reviewed,
+                coordinationDepth: 0)
+        }
+        do {
+            _ = try await resolvedProvider(for: candidate)
+        } catch {
+            return "selected inference profile revision is unavailable or incompatible"
+        }
+        return authorizationRevalidationFailure(authorization)
     }
 
     private func semanticAuthorizationFailure(
-        _ authorization: ResolvedToolAuthorization
+        _ authorization: ResolvedToolAuthorization,
+        allowingDelegationReservationFor reservedTarget: AgentID? = nil,
+        materializedDelegationTarget: MaterializedDelegationTarget? = nil
     ) -> String? {
         guard let from = authorization.agent else {
             return "authorization snapshot has no requesting agent"
@@ -4956,6 +5822,10 @@ public actor Orchestrator {
                 guard let existing = registry.agent(target) else {
                     return "reviewed delegation target is no longer attached"
                 }
+                guard existing.agentInferenceBinding
+                        == authorization.targetAgentInferenceBinding else {
+                    return "reviewed delegation target inference profile changed"
+                }
                 guard existing.workspaceRoot.resolvingSymlinksInPath()
                     .standardizedFileURL.path == reviewedWorkspace else {
                     return "reviewed delegation target workspace changed"
@@ -4967,22 +5837,46 @@ public actor Orchestrator {
                 }
                 if !targetWasExplicit,
                    (!isAgentAvailableForDelegation(target)
-                    || automaticDelegationReservations.contains(target)) {
+                    || (automaticDelegationReservations.contains(target)
+                        && reservedTarget != target)) {
                     return "automatically selected delegation target is no longer available"
                 }
             case "create_proposed":
+                guard requester.agentInferenceBinding
+                        == authorization.targetAgentInferenceBinding else {
+                    return "delegation worker inherited inference profile changed"
+                }
                 guard reviewedWorkspace == requester.workspaceRoot.resolvingSymlinksInPath()
                     .standardizedFileURL.path else {
                     return "proposed delegation workspace changed before execution"
                 }
-                do {
-                    try validateProposedDelegationTarget(
-                        requester: requester,
-                        requesterID: from,
-                        taskID: authorization.taskID,
-                        target: target)
-                } catch {
-                    return error.localizedDescription
+                if let materializedDelegationTarget {
+                    guard materializedDelegationTarget.agentID == target,
+                          materializedDelegationTarget.binding
+                            == authorization.targetAgentInferenceBinding,
+                          let existing = registry.agent(target),
+                          existing.agentInferenceBinding
+                            == materializedDelegationTarget.binding,
+                          existing.model
+                            == (materializedDelegationTarget.binding?.modelID
+                                ?? existing.model),
+                          existing.workspaceRoot.resolvingSymlinksInPath()
+                            .standardizedFileURL.path == reviewedWorkspace,
+                          delegationTargetFingerprint(existing)
+                            == materializedDelegationTarget.fingerprint,
+                          spawnedAgentOwners[target] == from else {
+                        return "materialized delegation target changed before task admission"
+                    }
+                } else {
+                    do {
+                        try validateProposedDelegationTarget(
+                            requester: requester,
+                            requesterID: from,
+                            taskID: authorization.taskID,
+                            target: target)
+                    } catch {
+                        return error.localizedDescription
+                    }
                 }
             default:
                 return "delegation authorization target resolution is invalid"
@@ -5039,6 +5933,24 @@ public actor Orchestrator {
             }
             if canCoordinate, budget.maxDepth < 1 {
                 return "coordinator spawning exceeds the delegation depth budget"
+            }
+            if case .string(let selection)? = authorization.intent.metadata["profileSelection"] {
+                switch selection {
+                case "inherit_parent_exact":
+                    guard registry.agent(from)?.agentInferenceBinding
+                            == authorization.targetAgentInferenceBinding else {
+                        return "parent inference profile changed before spawn execution"
+                    }
+                case "explicit_host_catalog":
+                    guard let binding = authorization.targetAgentInferenceBinding,
+                          availableInferenceProfiles[binding.inferenceProfileID] == binding else {
+                        return "host-approved inference profile changed before spawn execution"
+                    }
+                default:
+                    return "agent spawn profile selection is invalid"
+                }
+            } else if requiresInferenceBindings {
+                return "agent spawn authorization has no profile selection"
             }
             let activeAgentCount = registry.names.filter {
                 $0 != Self.automaticPermissionReviewerID
@@ -5211,8 +6123,15 @@ public actor Orchestrator {
 
     private func agentVisibleNames(excluding excluded: AgentID) -> [AgentID] {
         registry.names.filter {
-            $0 != excluded && $0 != Self.automaticPermissionReviewerID
+            guard $0 != excluded, $0 != Self.automaticPermissionReviewerID else {
+                return false
+            }
+            return registry.agent($0).map(inferenceBindingIsReady) ?? false
         }
+    }
+
+    private func inferenceBindingIsReady(_ agent: Agent) -> Bool {
+        !requiresInferenceBindings || agent.agentInferenceBinding != nil
     }
 
     private func prepareDelegatedTask(issuer: AgentID,
@@ -5263,6 +6182,7 @@ public actor Orchestrator {
             workspaceID: workspaceLease.workspaceID,
             workspaceLeaseID: workspaceLease.id,
             capabilityLeaseID: capabilityLease.id,
+            agentInferenceBinding: assignee.agentInferenceBinding,
             relatedAgents: relatedAgents,
             relatedTasks: [],
             constraints: Self.canCoordinate(capabilityLease) ? [] : Self.defaultWorkerConstraints,
@@ -5797,18 +6717,19 @@ public actor Orchestrator {
                 await finishCancelledTask(task, reason: reason, metadata: metadata)
             } else {
                 let usageLimit = error as? ProviderUsageLimitError
+                let durableMessage = RuntimeErrorPresentation.message(for: error)
                 let failurePersisted = await finishFailedTask(
                     task,
-                    message: error.localizedDescription,
+                    message: durableMessage,
                     metadata: metadata,
                     failureCode: usageLimit == nil ? nil : .providerUsageLimit)
                 if failurePersisted,
-                   let usageLimit,
+                   usageLimit != nil,
                    let goalID = task.contract.goalID,
                    let runID = task.contract.continuationRunID {
                     providerUsageLimitFailures[runID] = (
                         goalID,
-                        usageLimit.localizedDescription)
+                        durableMessage)
                 }
             }
         }
@@ -6134,6 +7055,47 @@ public actor Orchestrator {
             // Invocation settlement must remain durable even if a stale or
             // externally settled WorkTask no longer accepts a progress note.
             return nil
+        }
+    }
+
+    /// Closes an already-durable attach request after its exact inference
+    /// authorization becomes stale. Failure to persist this denial remains
+    /// fail-closed: the caller never commits leases or adds the agent.
+    private func persistAttachAuthorizationRevalidationDenial(
+        requestID: RequestID,
+        proposedAgent: Agent,
+        assessedPath: String,
+        reason: String,
+        risk: RiskLevel,
+        intent: PermissionIntent,
+        authorization: ResolvedToolAuthorization,
+        workspaceMetadata: CoworkEventMetadata,
+        reviewResolution: PermissionApprovalResolution
+    ) async {
+        do {
+            try await appendAdmissionEvents([
+                .permissionResolved(PermissionResolvedPayload(
+                    requestId: requestID,
+                    tool: "agent.attach",
+                    decision: .deny,
+                    risk: risk,
+                    reason: reason,
+                    intent: intent,
+                    authorization: authorization,
+                    source: .authorizationRevalidation,
+                    reviewTaskID: reviewResolution.reviewTaskID,
+                    reviewStatus: reviewResolution.reviewStatus,
+                    failureKind: .authorizationSnapshotInvalid)),
+                .workspaceLeaseDenied(WorkspaceLeaseDeniedPayload(
+                    agent: proposedAgent.name,
+                    rootPath: assessedPath,
+                    reason: reason,
+                    metadata: workspaceMetadata)),
+            ])
+        } catch {
+            try? await log.append(.error(ErrorPayload(
+                code: "agent_attach_authorization_denial_persistence_failed",
+                message: error.localizedDescription)))
         }
     }
 
@@ -7096,7 +8058,7 @@ public actor Orchestrator {
         }
         if hasDelegationGrant, lease.tools.contains(.attachWorkspace) {
             register(
-                [SpawnAgentTool()],
+                [SpawnAgentTool(), ListInferenceProfilesTool()],
                 granting: [.attachWorkspace],
                 delegation: .granted)
         }
@@ -7222,7 +8184,7 @@ private func attachArgs(agent: Agent,
                         admissionTaskID: TaskID,
                         capabilityLease: CapabilityLease,
                         workspaceLease: WorkspaceLease) -> String {
-    let object: [String: Any] = [
+    var object: [String: Any] = [
         "agent": agent.name.rawValue,
         "path": canonicalPath,
         "model": agent.model.rawValue,
@@ -7235,6 +8197,13 @@ private func attachArgs(agent: Agent,
         "workspaceAccess": workspaceLease.access.rawValue,
         "capabilities": capabilityLease.tools.map(\.rawValue).sorted(),
     ]
+    if let binding = agent.agentInferenceBinding {
+        object["inferenceProfileID"] = binding.inferenceProfileID.rawValue
+        object["inferenceProfileRevision"] = binding.inferenceProfileRevision.rawValue
+        object["inferenceConnectionID"] = binding.inferenceConnectionID.rawValue
+        object["inferenceConnectionRevision"] = binding.inferenceConnectionRevision.rawValue
+        object["inferenceBindingFingerprint"] = ToolRegistry.authorizationFingerprint(binding)
+    }
     guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else {
         return "{}"
     }
@@ -7302,9 +8271,11 @@ struct OrchestratorManager: AgentManager {
     let currentTaskID: TaskID?
     let defaultModel: String
 
-    func spawnAgent(name: String,
+    func spawnAgent(authorization: ResolvedToolAuthorization?,
+                    name: String,
                     path: String,
                     model: String?,
+                    inferenceProfileID: String?,
                     requestedAccess: WorkspaceAccess,
                     canCoordinate: Bool) async -> String {
         await orchestrator.spawnFromTool(
@@ -7313,10 +8284,15 @@ struct OrchestratorManager: AgentManager {
             name: name,
             path: path,
             model: model ?? defaultModel,
+            inferenceProfileID: inferenceProfileID,
+            authorization: authorization,
             requestedAccess: requestedAccess,
             canCoordinate: canCoordinate)
     }
     func listAgents() async -> String { await orchestrator.listForTool() }
+    func listInferenceProfiles() async -> String {
+        await orchestrator.listInferenceProfilesForTool()
+    }
     func removeAgent(name: String) async -> String {
         await orchestrator.removeFromTool(
             requestedBy: requester,

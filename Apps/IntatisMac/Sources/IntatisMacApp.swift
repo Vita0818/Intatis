@@ -15,6 +15,8 @@ import IntatisSharedUI
 final class AppEnvironment: ObservableObject {
     @Published private(set) var registry: ProviderRegistry
     @Published private(set) var providerCatalog: AppProviderCatalog
+    @Published private(set) var inferenceProfileOptions: [AppInferenceProfileOption]
+    @Published private(set) var inferenceCatalogError: String?
     @Published private(set) var chatSessionID: SessionID
     @Published private(set) var viewModel: ChatViewModel
     @Published private(set) var chatSessionError: String?
@@ -23,13 +25,23 @@ final class AppEnvironment: ObservableObject {
     @Published var needsAPIKey: Bool
 
     private let secrets: ConfigSecretResolver
+    private let inferenceCatalogStore: InferenceCatalogStore
+    private var inferenceCatalogSnapshot: InferenceCatalogSnapshot?
 
     init() {
         PlatformProfile.current = AppConfig.platformProfile
 
         self.secrets = ConfigSecretResolver()
+        self.inferenceCatalogStore = InferenceCatalogStore(
+            fileURL: AppConfig.appSupportDir()
+                .appendingPathComponent("inference-catalog-v1.json"))
+        self.inferenceCatalogSnapshot = nil
+        self.inferenceProfileOptions = []
+        self.inferenceCatalogError = nil
         self.providerCatalog = AppConfig.providerCatalog
-        let initialRegistry = Self.makeProviderRegistry(resolver: secrets)
+        let initialRegistry = Self.makeProviderRegistry(
+            resolver: secrets,
+            inferenceCatalogSnapshot: nil)
         self.registry = initialRegistry
         let initialSession = AppConfig.recentSessions(kind: .chat).first?.id ?? AppConfig.defaultSession
         self.chatSessionID = initialSession
@@ -50,6 +62,9 @@ final class AppEnvironment: ObservableObject {
         self.needsAPIKey = !Self.hasAPIKey(ref: AppConfig.selectedAPIKeyRef)
 
         wireImageGeneration()
+        Task { [weak self] in
+            await self?.refreshInferenceCatalog()
+        }
     }
 
     func startNewChatSession() {
@@ -102,6 +117,7 @@ final class AppEnvironment: ObservableObject {
         providerCatalog = AppConfig.providerCatalog
         needsAPIKey = false
         refreshProviderRegistry()
+        scheduleInferenceCatalogRefresh()
     }
 
     func hasAPIKey(account: String) -> Bool {
@@ -137,6 +153,7 @@ final class AppEnvironment: ObservableObject {
                                       ?? .authFile(providerID: "default"))
 
         refreshProviderRegistry()
+        scheduleInferenceCatalogRefresh()
     }
 
     func selectProviderModel(providerID: String, modelID: String, variantID: String?) {
@@ -148,6 +165,9 @@ final class AppEnvironment: ObservableObject {
         needsAPIKey = !Self.hasAPIKey(ref: catalog.selectedProvider.map(AppConfig.apiKeyRef(for:))
                                       ?? .authFile(providerID: "default"))
         refreshProviderRegistry()
+        if inferenceCatalogSnapshot == nil {
+            scheduleInferenceCatalogRefresh()
+        }
     }
 
     func healthCheckSelectedProvider() async -> [ProviderHealthReport] {
@@ -172,28 +192,46 @@ final class AppEnvironment: ObservableObject {
 
     /// Build a fresh multi-agent Cowork project session bound to a primary workspace.
     func makeCoworkViewModel(primaryWorkspace: URL) throws -> CoworkViewModel {
+        guard let inferenceCatalogSnapshot else {
+            throw IntatisError.config(
+                inferenceCatalogError ?? "Inference profiles are still loading. Try again in a moment.")
+        }
         let session = SessionID(rawValue: IDGen.random(prefix: "cowork"))
         WorkspaceAccess.remember(primaryWorkspace, for: session)
         let settings = CoworkProjectSettings.fresh(
             sessionID: session,
             primaryWorkspace: primaryWorkspace,
-            catalog: providerCatalog)
+            catalog: providerCatalog,
+            defaultInferenceProfileBinding: AppInferenceCatalogCompiler.selectedBinding(
+                catalog: providerCatalog,
+                snapshot: inferenceCatalogSnapshot))
         CoworkProjectSettingsStore.save(settings)
         return try makeCoworkViewModel(session: session, projectSettings: settings)
     }
 
     func makeCoworkViewModel(session: SessionID) throws -> CoworkViewModel {
-        let settings = CoworkProjectSettingsStore.load(sessionID: session, catalog: providerCatalog)
+        guard let inferenceCatalogSnapshot else {
+            throw IntatisError.config(
+                inferenceCatalogError ?? "Inference profiles are still loading. Try again in a moment.")
+        }
+        let settings = CoworkProjectSettingsStore.load(
+            sessionID: session,
+            catalog: providerCatalog,
+            inferenceCatalogSnapshot: inferenceCatalogSnapshot)
         return try makeCoworkViewModel(session: session, projectSettings: settings)
     }
 
     private func makeCoworkViewModel(session: SessionID,
                                      projectSettings: CoworkProjectSettings) throws -> CoworkViewModel {
+        guard let inferenceCatalogSnapshot else {
+            throw IntatisError.config("The versioned inference catalog is unavailable.")
+        }
         let coworkLog = try EventLog(session: session, fileURL: AppConfig.sessionFile(session))
         return CoworkViewModel(
             sessionID: session,
             log: coworkLog,
             registry: registry,
+            inferenceProfileOptions: inferenceProfileOptions,
             projectSettings: projectSettings)
     }
 
@@ -219,16 +257,53 @@ final class AppEnvironment: ObservableObject {
         model.start()
     }
 
-    private static func makeProviderRegistry(resolver: ConfigSecretResolver) -> ProviderRegistry {
-        ProviderRegistry(config: AppConfig.providerConfig(), resolver: resolver)
+    private static func makeProviderRegistry(
+        resolver: ConfigSecretResolver,
+        inferenceCatalogSnapshot: InferenceCatalogSnapshot?
+    ) -> ProviderRegistry {
+        ProviderRegistry(
+            config: AppConfig.providerConfig(),
+            resolver: resolver,
+            inferenceCatalogSnapshot: inferenceCatalogSnapshot)
     }
 
     private func refreshProviderRegistry() {
         secrets.clearCache()
-        let updated = Self.makeProviderRegistry(resolver: secrets)
+        let updated = Self.makeProviderRegistry(
+            resolver: secrets,
+            inferenceCatalogSnapshot: inferenceCatalogSnapshot)
         registry = updated
         viewModel.updateProviderRegistry(updated)
         wireImageGeneration()
+    }
+
+    private func scheduleInferenceCatalogRefresh() {
+        Task { [weak self] in
+            await self?.refreshInferenceCatalog()
+        }
+    }
+
+    private func refreshInferenceCatalog() async {
+        let sourceCatalog = providerCatalog
+        do {
+            let draft = try AppInferenceCatalogCompiler.compile(catalog: sourceCatalog)
+            let snapshot = try await inferenceCatalogStore.reconcile(draft)
+            guard sourceCatalog == providerCatalog else {
+                scheduleInferenceCatalogRefresh()
+                return
+            }
+            inferenceCatalogSnapshot = snapshot
+            inferenceProfileOptions = AppInferenceCatalogCompiler.options(
+                catalog: sourceCatalog,
+                snapshot: snapshot)
+            inferenceCatalogError = nil
+            refreshProviderRegistry()
+        } catch {
+            // Keep a previously valid snapshot/registry alive for exact
+            // bindings. Initial startup remains fail-closed until a valid
+            // durable catalog can be loaded or reconciled.
+            inferenceCatalogError = "Versioned inference profiles are unavailable: \(error.localizedDescription)"
+        }
     }
 
     private static func hasAPIKey(ref: KeychainRef) -> Bool {
@@ -456,7 +531,6 @@ struct CodeSessionView: View {
 struct CoworkSessionView: View {
     @ObservedObject var vm: CoworkViewModel
     let catalog: AppProviderCatalog
-    let onSelectModel: (String, String, String?) -> Void
     let onShowSessions: () -> Void
     let onNewSession: () -> Void
     let onSessionDidBecomeReady: () -> Void
@@ -490,20 +564,20 @@ struct CoworkSessionView: View {
                         project: vm.project,
                         goal: vm.goal,
                         workTasks: vm.workTasks,
-                        composerError: vm.composerError ?? vm.projectionError,
+                        composerError: vm.composerError
+                            ?? vm.inferenceComposerError
+                            ?? vm.projectionError,
                         isWorking: isCoworkBusy,
                         isComposerAvailable: vm.isAutomaticPermissionReviewReady
-                            && vm.isGoalRuntimeReady,
+                            && vm.isGoalRuntimeReady
+                            && vm.isMainInferenceReady,
                         threadStyle: .intatisMac(scheme),
                         onShowSessions: onShowSessions,
                         onNewSession: onNewSession,
                         onShowProjectSettings: { showProjectSettings = true },
-                        composerAccessory: AnyView(IntatisComposerAccessory(
-                            catalog: catalog,
-                            isBusy: isCoworkBusy,
-                            latestTurnStats: vm.latestTurnStats,
-                            contextLabel: contextLabel,
-                            onSelectModel: onSelectModel)),
+                        composerAccessory: AnyView(CoworkInferenceAccessory(
+                            profileLabel: vm.mainInferenceDisplayLabel,
+                            contextLabel: contextLabel)),
                         input: $vm.input,
                         onSend: { vm.send() },
                         onCancelCurrent: vm.isWorking ? { vm.cancelCurrentTask() } : nil,
@@ -661,6 +735,7 @@ struct CoworkSessionView: View {
         CoworkProjectSettingsSheet(
             vm: vm,
             catalog: catalog,
+            inferenceProfileOptions: vm.inferenceProfileOptions,
             onAddWorkspace: {
                 if let url = WorkspaceAccess.choose(prompt: "Choose Project Workspace") {
                     vm.addProjectWorkspace(url)
@@ -782,10 +857,36 @@ struct CoworkSessionView: View {
     }
 }
 
+private struct CoworkInferenceAccessory: View {
+    let profileLabel: String
+    let contextLabel: String?
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "point.3.connected.trianglepath.dotted")
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+            Text(profileLabel)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .accessibilityIdentifier("cowork.main.inference-profile")
+            if let contextLabel {
+                Divider().frame(height: 12)
+                Text(contextLabel)
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .help("Existing agents keep their exact inference profile revision. Change defaults or explicitly rebind agents in Cowork Project settings.")
+    }
+}
+
 @main
 struct IntatisMacApp: App {
     private var launchAppearance: ColorScheme? {
-        #if DEBUG
+        #if DEBUG || INTATIS_RENDERER_VALIDATION
         let arguments = ProcessInfo.processInfo.arguments
         if arguments.contains("-IntatisAppearanceDark") { return .dark }
         if arguments.contains("-IntatisAppearanceLight") { return .light }
@@ -795,7 +896,7 @@ struct IntatisMacApp: App {
 
     var body: some Scene {
         WindowGroup {
-            #if DEBUG
+            #if DEBUG || INTATIS_RENDERER_VALIDATION
             if ProcessInfo.processInfo.arguments.contains("-IntatisRendererFixture") {
                 RendererFixtureView()
                     .preferredColorScheme(launchAppearance)

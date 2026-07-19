@@ -40,6 +40,11 @@ targets:
     platform: macOS
     sources:
       - Apps/IntatisMac/Sources
+      - path: NOTICE.md
+        buildPhase: resources
+      - path: ThirdPartyNotices
+        type: folder
+        buildPhase: resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.Vita0818.IntatisMac
@@ -82,6 +87,12 @@ targets:
     platform: iOS
     sources:
       - Apps/IntatisiOS/Sources
+      - Apps/IntatisiOS/Resources
+      - path: NOTICE.md
+        buildPhase: resources
+      - path: ThirdPartyNotices
+        type: folder
+        buildPhase: resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.Vita0818.Intatis

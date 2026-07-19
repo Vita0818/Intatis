@@ -140,12 +140,15 @@ public protocol AgentMessenger: Sendable {
 /// list, and remove sub-agents through tools. Like `AgentMessenger`, the real
 /// work happens in the orchestrator/registry — tools are just thin executors.
 public protocol AgentManager: Sendable {
-    func spawnAgent(name: String,
+    func spawnAgent(authorization: ResolvedToolAuthorization?,
+                    name: String,
                     path: String,
                     model: String?,
+                    inferenceProfileID: String?,
                     requestedAccess: WorkspaceAccess,
                     canCoordinate: Bool) async -> String
     func listAgents() async -> String
+    func listInferenceProfiles() async -> String
     func removeAgent(name: String) async -> String
 }
 
@@ -482,7 +485,8 @@ public struct ToolRegistry: Sendable {
                                      authorizationID: String? = nil,
                                      invocation: ToolAuthorizationInvocationContext = .init(),
                                      capabilityLease: CapabilityLease?,
-                                     workspaceLease: WorkspaceLease?) throws -> ResolvedToolAuthorization {
+                                     workspaceLease: WorkspaceLease?,
+                                     targetAgentInferenceBinding: AgentInferenceBinding? = nil) throws -> ResolvedToolAuthorization {
         guard let registration = registrations[toolName] else {
             if conflictedNames.contains(toolName) {
                 throw ToolRegistryAuthorizationError.duplicateRegistration(toolName)
@@ -563,7 +567,8 @@ public struct ToolRegistry: Sendable {
             workspaceID: workspaceLease?.workspaceID,
             workspaceTaskID: workspaceLease?.taskID,
             workspaceRootPath: workspaceLease?.rootPath,
-            workspaceLeaseFingerprint: workspaceLease.map(Self.authorizationFingerprint))
+            workspaceLeaseFingerprint: workspaceLease.map(Self.authorizationFingerprint),
+            targetAgentInferenceBinding: targetAgentInferenceBinding)
     }
 
     /// Rechecks the immutable authorization identity against the exact
@@ -736,6 +741,25 @@ public struct ToolRegistry: Sendable {
             lease.allowedPathRules.map(\.pattern).sorted().joined(separator: "\u{1f}"),
             lease.deniedPatterns.sorted().joined(separator: "\u{1f}"),
             lease.expiresAtTaskCompletion ? "1" : "0",
+        ]
+        return sha256(Data(framed(fields).utf8))
+    }
+
+    /// Stable secret-free identity used to bind a reviewed control-plane
+    /// action to the exact target inference route. Raw endpoint/options and
+    /// credential references are intentionally absent from this protocol type.
+    public static func authorizationFingerprint(_ binding: AgentInferenceBinding) -> String {
+        let fields = [
+            binding.inferenceProfileID.rawValue,
+            binding.inferenceProfileRevision.rawValue,
+            binding.inferenceConnectionID.rawValue,
+            binding.inferenceConnectionRevision.rawValue,
+            binding.modelID.rawValue,
+            binding.variantID ?? "",
+            binding.trustDomain ?? "",
+            binding.egressClassification ?? "",
+            binding.safeRouteLabel ?? "",
+            binding.immutableDefinitionFingerprint,
         ]
         return sha256(Data(framed(fields).utf8))
     }

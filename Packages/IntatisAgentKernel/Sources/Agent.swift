@@ -1,6 +1,7 @@
 import Foundation
 import IntatisCore
 import IntatisPermission
+import IntatisProtocol
 
 /// A single agent: a workspace-bound, tool-using loop with its own permission
 /// profile. It has no awareness of whether it is alone (Code) or one of many
@@ -9,6 +10,9 @@ public struct Agent: Sendable {
     public var name: AgentID
     public var workspaceRoot: URL
     public var model: ModelID
+    /// Exact, durable inference identity for Cowork. Nil is retained for Code
+    /// and legacy sessions until their host explicitly binds a profile.
+    public var agentInferenceBinding: AgentInferenceBinding?
     public var profile: PermissionProfile
     /// Temporary compatibility fuse for Cowork coordination tools. Explicit
     /// coordinators get the coordination tools while this is > 0; tool-spawned
@@ -20,10 +24,15 @@ public struct Agent: Sendable {
     public static let defaultCoordinationDepth = 2
 
     public init(name: AgentID, workspaceRoot: URL, model: ModelID,
+                agentInferenceBinding: AgentInferenceBinding? = nil,
                 profile: PermissionProfile = .reviewed, coordinationDepth: Int = 0) {
         self.name = name
         self.workspaceRoot = workspaceRoot
-        self.model = model
+        // The exact binding is authoritative when present. Normalizing here
+        // prevents a caller from constructing an Agent whose compatibility
+        // model field disagrees with the durable inference identity.
+        self.model = agentInferenceBinding?.modelID ?? model
+        self.agentInferenceBinding = agentInferenceBinding
         self.profile = profile
         self.coordinationDepth = coordinationDepth
     }

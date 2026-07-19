@@ -1,462 +1,639 @@
-#if canImport(SwiftUI) && canImport(MarkdownUI) && canImport(JavaScriptCore) && canImport(iosMath)
+#if os(macOS)
+import Combine
+import CryptoKit
+import SwiftUI
+import SwiftStreamingMarkdown
 import XCTest
 @testable import IntatisSharedUI
 
+private enum MarkdownRenderingTestError: Error {
+    case timedOut
+}
+
+private struct SanitizedIncidentFixture: Decodable {
+    struct Message: Decodable {
+        let id: String
+        let agent: String
+        let deltas: [String]
+    }
+
+    let schema: Int
+    let sourceDeltaCount: Int
+    let sanitizer: String
+    let messages: [Message]
+}
+
+@MainActor
+private func waitForPublishedMarkdown(
+    _ state: IntatisMicrosoftMarkdownRenderState,
+    revision: IntatisMarkdownRenderRevision,
+    attempts: Int = 4_000
+) async throws -> IntatisMicrosoftMarkdownRenderState.PublishedDocument {
+    for _ in 0..<attempts {
+        if let published = state.publishedDocument, published.revision == revision {
+            return published
+        }
+        try await Task.sleep(for: .milliseconds(1))
+    }
+    throw MarkdownRenderingTestError.timedOut
+}
+
+@MainActor
+private func waitForPublishedMarkdown(
+    _ state: IntatisMicrosoftMarkdownRenderState,
+    request: IntatisMarkdownRenderRequest,
+    attempts: Int = 4_000
+) async throws -> IntatisMicrosoftMarkdownRenderState.PublishedDocument {
+    for _ in 0..<attempts {
+        if let published = state.publishedDocument, published.request == request {
+            return published
+        }
+        try await Task.sleep(for: .milliseconds(1))
+    }
+    throw MarkdownRenderingTestError.timedOut
+}
+
 final class MessageRenderingTests: XCTestCase {
-    func testPlainMarkdownPassesThroughWithoutAHomegrownParser() {
-        let source = "# Heading\n\n- **one**\n- two"
-        let result = IntatisMathDelimiterAdapter.transform(source)
-
-        XCTAssertEqual(result.markdown, source)
-        XCTAssertTrue(result.expressions.isEmpty)
+    private func rawRevision(
+        messageID: String = "raw",
+        lane: IntatisRawTextProjectionLane = .plain,
+        text: String,
+        isComplete: Bool = false
+    ) -> IntatisRawTextProjectionRevision {
+        IntatisRawTextProjectionRevision(
+            activation: IntatisRawTextProjectionActivation(
+                messageID: messageID,
+                lane: lane),
+            rawText: text,
+            isComplete: isComplete)
     }
 
-    func testExplicitInlineAndDisplayMathAreRoutedIndependently() {
-        let source = #"""
-        Energy \(E = mc^2\).
-
-        \[\sum_{i=1}^{n} i = \frac{n(n+1)}{2}\]
-        """#
-        let result = IntatisMathDelimiterAdapter.transform(source)
-
-        XCTAssertEqual(result.expressions.count, 2)
-        let inline = result.expressions.values.first { $0.presentation == .inline }
-        let display = result.expressions.values.first { $0.presentation == .display }
-        XCTAssertEqual(inline?.source, "E = mc^2")
-        XCTAssertEqual(display?.source, #"\sum_{i=1}^{n} i = \frac{n(n+1)}{2}"#)
-        XCTAssertTrue(result.markdown.contains("intatis-math://inline/"))
-        XCTAssertTrue(result.markdown.contains("intatis-math://display/"))
+    private func renderRequest(
+        messageID: String,
+        text: String,
+        isComplete: Bool = true,
+        appearance: IntatisMarkdownAppearanceRevision = .light,
+        style: IntatisThreadStyle = .standard(.light)
+    ) -> IntatisMarkdownRenderRequest {
+        IntatisMarkdownRenderRequest(
+            revision: IntatisMarkdownRenderRevision(
+                messageID: messageID,
+                rawText: text,
+                isComplete: isComplete,
+                appearance: appearance,
+                configurationRevision: IntatisMarkdownRendererLimits.configurationRevision),
+            style: IntatisMarkdownStyleSnapshot(style))
     }
 
-    func testDollarMathUsesDisplayDelimitersButLeavesCurrencyAlone() {
-        let source = "Price is $25.00.\n\n$$x^2 + y^2 = z^2$$"
-        let result = IntatisMathDelimiterAdapter.transform(source)
+    func testRichFacadeDoesNotWrapDocumentInASecondSelectionOverlay() throws {
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: packageRoot.appendingPathComponent(
+                "Sources/MessageRendering/IntatisMessageContentView.swift"),
+            encoding: .utf8)
+        let richStart = try XCTUnwrap(source.range(of: "DocumentView("))
+        let plainStart = try XCTUnwrap(
+            source.range(of: "Text(verbatim:", range: richStart.upperBound..<source.endIndex))
+        let richBranch = source[richStart.lowerBound..<plainStart.lowerBound]
+        let plainEnd = try XCTUnwrap(
+            source.range(
+                of: ".accessibilityIdentifier(\"intatis.message.plain.",
+                range: plainStart.lowerBound..<source.endIndex))
+        let plainBranch = source[plainStart.lowerBound..<plainEnd.upperBound]
 
-        XCTAssertTrue(result.markdown.contains("Price is $25.00."))
-        XCTAssertEqual(result.expressions.count, 1)
-        XCTAssertEqual(result.expressions.values.first?.presentation, .display)
+        XCTAssertFalse(richBranch.contains(".textSelection(.enabled)"))
+        XCTAssertTrue(plainBranch.contains(".textSelection(.enabled)"))
     }
 
-    func testMathInsideInlineCodeAndFencedCodeIsNeverIntercepted() {
-        let source = #"""
-        Use `\(notMath\)` here.
+    @MainActor
+    func testProjectionLifecycleGateDeduplicatesAndRejectsLateInvisibleInput() {
+        let initial = rawRevision(text: "initial", isComplete: true)
+        let rawState = IntatisRawTextProjectionState(revision: initial)
+        let richState = IntatisMicrosoftMarkdownRenderState()
+        let gate = IntatisMessageProjectionLifecycleGate()
+        let first = IntatisMessageProjectionInput(
+            rawRevision: rawRevision(text: "first", isComplete: true),
+            richRequest: renderRequest(messageID: "raw", text: "first"),
+            usesRichRenderer: false)
+        let late = IntatisMessageProjectionInput(
+            rawRevision: rawRevision(text: "late", isComplete: true),
+            richRequest: renderRequest(messageID: "raw", text: "late"),
+            usesRichRenderer: false)
 
-        ```swift
-        let value = "$$stillCode$$"
-        ```
+        gate.receive(first, rawState: rawState, richState: richState)
+        XCTAssertEqual(rawState.displayedText, "initial")
 
-        Then \(x + 1\).
-        """#
-        let result = IntatisMathDelimiterAdapter.transform(source)
+        gate.activate(first, rawState: rawState, richState: richState)
+        XCTAssertEqual(rawState.displayedText, "first")
 
-        XCTAssertTrue(result.markdown.contains(#"`\(notMath\)`"#))
-        XCTAssertTrue(result.markdown.contains(#""$$stillCode$$""#))
-        XCTAssertEqual(result.expressions.count, 1)
-        XCTAssertEqual(result.expressions.values.first?.source, "x + 1")
+        var rawChanges = 0
+        let observation = rawState.objectWillChange.sink { rawChanges += 1 }
+        gate.receive(first, rawState: rawState, richState: richState)
+        XCTAssertEqual(rawChanges, 0)
+
+        gate.deactivate(rawState: rawState, richState: richState)
+        gate.receive(late, rawState: rawState, richState: richState)
+        XCTAssertEqual(rawState.displayedText, "first")
+
+        gate.activate(late, rawState: rawState, richState: richState)
+        XCTAssertEqual(rawState.displayedText, "late")
+        gate.deactivate(rawState: rawState, richState: richState)
+        withExtendedLifetime(observation) {}
     }
 
-    func testUnicodeAndMultilineInlineCodeUseCmarkSourceRanges() {
-        let rootSource = #"""
-        Prefix 漢字 `first
-        \(notMath\)
-        last` then \(realMath\).
-        """#
-        let rootResult = IntatisMathDelimiterAdapter.transform(rootSource)
+    @MainActor
+    func testProjectionLifecycleGateRichToPlainSwitchDropsPublishedDocument() async throws {
+        let initial = rawRevision(lane: .richFallback, text: "# rich", isComplete: true)
+        let rawState = IntatisRawTextProjectionState(revision: initial)
+        let richState = IntatisMicrosoftMarkdownRenderState()
+        let gate = IntatisMessageProjectionLifecycleGate()
+        let richRequest = renderRequest(messageID: "switch", text: "# rich")
+        let richInput = IntatisMessageProjectionInput(
+            rawRevision: initial,
+            richRequest: richRequest,
+            usesRichRenderer: true)
 
-        XCTAssertTrue(rootResult.markdown.contains(#"\(notMath\)"#))
-        XCTAssertEqual(rootResult.expressions.values.map(\.source), ["realMath"])
+        gate.activate(richInput, rawState: rawState, richState: richState)
+        _ = try await waitForPublishedMarkdown(richState, request: richRequest)
 
-        // cmark reports multiline inline-code continuation columns after
-        // stripping blockquote/list prefixes. The protected source range must
-        // still cover the raw continuation line through the closing backtick.
-        for lineEnding in ["\n", "\r", "\r\n"] {
-            let nestedSource = [
-                #"> - alpha ``first"#,
-                #">   `shorter run` \(containerNotMath\)`` omega"#,
-                "",
-                #"Outside \(nestedRealMath\)."#,
-            ].joined(separator: lineEnding)
-            let nestedResult = IntatisMathDelimiterAdapter.transform(nestedSource)
+        let plainInput = IntatisMessageProjectionInput(
+            rawRevision: rawRevision(
+                messageID: "raw",
+                lane: .plain,
+                text: "# rich",
+                isComplete: true),
+            richRequest: richRequest,
+            usesRichRenderer: false)
+        gate.receive(plainInput, rawState: rawState, richState: richState)
 
-            XCTAssertTrue(
-                nestedResult.markdown.contains(#"\(containerNotMath\)"#),
-                "line ending: \(lineEnding.debugDescription)")
-            XCTAssertEqual(
-                nestedResult.expressions.values.map(\.source),
-                ["nestedRealMath"],
-                "line ending: \(lineEnding.debugDescription)")
-        }
+        XCTAssertNil(richState.publishedDocument)
+        XCTAssertEqual(rawState.displayedText, "# rich")
+        gate.deactivate(rawState: rawState, richState: richState)
     }
 
-    func testUnmatchedBacktickCannotPairAcrossParagraphOrFencedBlock() {
-        let source = #"""
-        Unmatched ` then \(firstMath\).
+    @MainActor
+    func testStyleOnlyRequestChangeSupersedesOldParseAndDuplicateIsNoOp() async throws {
+        let text = String(repeating: "paragraph\n\n", count: 1_000)
+        let revision = IntatisMarkdownRenderRevision(
+            messageID: "style",
+            rawText: text,
+            isComplete: false,
+            appearance: .light,
+            configurationRevision: IntatisMarkdownRendererLimits.configurationRevision)
+        let first = IntatisMarkdownRenderRequest(
+            revision: revision,
+            style: IntatisMarkdownStyleSnapshot(.standard(.light)))
+        let replacementStyle = IntatisThreadStyle(
+            primaryText: .red,
+            secondaryText: .green,
+            tertiaryText: .blue,
+            accent: .orange,
+            stroke: .purple,
+            cardStroke: .yellow,
+            error: .pink)
+        let replacement = IntatisMarkdownRenderRequest(
+            revision: revision,
+            style: IntatisMarkdownStyleSnapshot(replacementStyle))
+        XCTAssertNotEqual(first, replacement)
 
-        ```text
-        A single ` and \(fencedLiteral\).
-        ```
+        let state = IntatisMicrosoftMarkdownRenderState()
+        state.submit(request: first)
+        state.submit(request: replacement)
+        let published = try await waitForPublishedMarkdown(
+            state,
+            request: replacement,
+            attempts: 10_000)
+        XCTAssertEqual(published.request, replacement)
 
-        After \(secondMath\).
-        """#
-        let result = IntatisMathDelimiterAdapter.transform(source)
+        var objectChanges = 0
+        let observation = state.objectWillChange.sink { objectChanges += 1 }
+        state.submit(request: replacement)
+        try await Task.sleep(for: .milliseconds(75))
+        XCTAssertEqual(objectChanges, 0)
+        XCTAssertEqual(state.publishedDocument?.request, replacement)
+        state.deactivate()
+        withExtendedLifetime(observation) {}
+    }
 
-        XCTAssertTrue(result.markdown.contains(#"\(fencedLiteral\)"#))
+    func testRawProjectionUsesLeadingTrailingThrottleWithoutResettingDeadline() throws {
+        var model = IntatisRawTextProjectionModel(
+            revision: rawRevision(text: "a"),
+            nowNanoseconds: 0)
+
+        let first = model.receive(
+            rawRevision(text: "ab"),
+            nowNanoseconds: 10_000_000)
+        let schedule = try XCTUnwrap(first.schedule)
+        XCTAssertEqual(schedule.delayNanoseconds, 90_000_000)
+        XCTAssertEqual(model.displayedText, "a")
+
+        let second = model.receive(
+            rawRevision(text: "abc"),
+            nowNanoseconds: 40_000_000)
+        XCTAssertEqual(second, .none)
+        XCTAssertEqual(model.scheduledGeneration, schedule.generation)
+        XCTAssertEqual(model.displayedText, "a")
+
+        let trailing = model.scheduledPublicationFired(
+            generation: schedule.generation,
+            nowNanoseconds: 100_000_000)
+        XCTAssertTrue(trailing.didPublish)
+        XCTAssertEqual(model.displayedText, "abc")
+
+        let leading = model.receive(
+            rawRevision(text: "abcd"),
+            nowNanoseconds: 200_000_000)
+        XCTAssertTrue(leading.didPublish)
+        XCTAssertNil(leading.schedule)
+        XCTAssertEqual(model.displayedText, "abcd")
+    }
+
+    func testRawProjectionFinalFlushIsExactAndInvalidatesOldTimer() throws {
+        let final = "  **done**\r\n| a | b |\r\n第三行  "
+        var model = IntatisRawTextProjectionModel(
+            revision: rawRevision(text: "  **"),
+            nowNanoseconds: 0)
+        let pending = model.receive(
+            rawRevision(text: "  **done"),
+            nowNanoseconds: 1_000_000)
+        let generation = try XCTUnwrap(pending.schedule?.generation)
+
+        let flushed = model.receive(
+            rawRevision(text: final, isComplete: true),
+            nowNanoseconds: 2_000_000)
+        XCTAssertTrue(flushed.didPublish)
+        XCTAssertTrue(flushed.cancelsScheduledPublication)
+        XCTAssertEqual(Data(model.displayedText.utf8), Data(final.utf8))
+
+        let stale = model.scheduledPublicationFired(
+            generation: generation,
+            nowNanoseconds: 100_000_000)
+        XCTAssertEqual(stale, .none)
+        XCTAssertEqual(Data(model.displayedText.utf8), Data(final.utf8))
+    }
+
+    func testRawProjectionCorrectionAndTruncationPublishSynchronously() {
+        var model = IntatisRawTextProjectionModel(
+            revision: rawRevision(text: "abc"),
+            nowNanoseconds: 0)
+        _ = model.receive(
+            rawRevision(text: "abcd"),
+            nowNanoseconds: 1_000_000)
+
+        let correction = model.receive(
+            rawRevision(text: "abX"),
+            nowNanoseconds: 2_000_000)
+        XCTAssertTrue(correction.didPublish)
+        XCTAssertTrue(correction.cancelsScheduledPublication)
+        XCTAssertEqual(model.displayedText, "abX")
+
+        let truncation = model.receive(
+            rawRevision(text: "a"),
+            nowNanoseconds: 3_000_000)
+        XCTAssertTrue(truncation.didPublish)
+        XCTAssertEqual(model.displayedText, "a")
+    }
+
+    func testRawProjectionActivationChangePaintsCurrentSourceImmediately() {
+        var model = IntatisRawTextProjectionModel(
+            revision: rawRevision(messageID: "old", text: "old"),
+            nowNanoseconds: 0)
+        _ = model.receive(
+            rawRevision(messageID: "old", text: "older pending"),
+            nowNanoseconds: 1_000_000)
+
+        let replacement = rawRevision(
+            messageID: "new",
+            lane: .richFallback,
+            text: "# current",
+            isComplete: true)
+        let transition = model.receive(
+            replacement,
+            nowNanoseconds: 2_000_000)
+
+        XCTAssertTrue(transition.didPublish)
+        XCTAssertTrue(transition.cancelsScheduledPublication)
+        XCTAssertEqual(model.latestRevision, replacement)
+        XCTAssertEqual(model.displayedText, "# current")
+    }
+
+    func testRawProjectionInitialHistoryAndStreamingPlaceholderAreImmediate() {
+        let history = "# 历史\r\n\r\nexact"
+        let historyModel = IntatisRawTextProjectionModel(
+            revision: rawRevision(text: history, isComplete: true),
+            nowNanoseconds: 0)
+        XCTAssertEqual(Data(historyModel.displayedText.utf8), Data(history.utf8))
+
+        let streamingModel = IntatisRawTextProjectionModel(
+            revision: rawRevision(text: "", isComplete: false),
+            nowNanoseconds: 0)
+        XCTAssertEqual(streamingModel.displayedText, "…")
+    }
+
+    func testRawProjectionSameActivationReentryPublishesImmediatelyAndRejectsOldTimer() throws {
+        var model = IntatisRawTextProjectionModel(
+            revision: rawRevision(text: "a"),
+            nowNanoseconds: 0)
+        let pending = model.receive(
+            rawRevision(text: "ab"),
+            nowNanoseconds: 1_000_000)
+        let oldGeneration = try XCTUnwrap(pending.schedule?.generation)
+
+        model.deactivate()
+        XCTAssertFalse(model.isActive)
+        let reactivated = model.receive(
+            rawRevision(text: "abc"),
+            nowNanoseconds: 2_000_000)
+        XCTAssertTrue(reactivated.didPublish)
+        XCTAssertTrue(model.isActive)
+        XCTAssertEqual(model.displayedText, "abc")
+
         XCTAssertEqual(
-            Set(result.expressions.values.map(\.source)),
-            Set(["firstMath", "secondMath"]))
+            model.scheduledPublicationFired(
+                generation: oldGeneration,
+                nowNanoseconds: 100_000_000),
+            .none)
+        XCTAssertEqual(model.displayedText, "abc")
     }
 
-    func testMathInsideEveryCommonMarkCodeBlockShapeIsNeverIntercepted() {
-        let source = #"""
-            \(indentedCode\)
+    @MainActor
+    func testRawStateFirstFrameBypassesThrottleForSemanticChangesAndReentry() {
+        let initial = rawRevision(
+            lane: .richFallback,
+            text: "stream")
+        let state = IntatisRawTextProjectionState(revision: initial)
 
-        > ```swift
-        > let nested = "\(blockquoteCode\)"
-        > ```not-a-close
-        > \(stillBlockquoteCode\)
-        > ```
+        let append = rawRevision(
+            lane: .richFallback,
+            text: "streaming")
+        XCTAssertEqual(state.text(for: append), "stream")
 
-        Outside \(realMath\).
-        """#
-        let result = IntatisMathDelimiterAdapter.transform(source)
+        let correction = rawRevision(
+            lane: .richFallback,
+            text: "corrected")
+        XCTAssertEqual(state.text(for: correction), "corrected")
 
-        XCTAssertTrue(result.markdown.contains(#"\(indentedCode\)"#))
-        XCTAssertTrue(result.markdown.contains(#"\(blockquoteCode\)"#))
-        XCTAssertTrue(result.markdown.contains(#"\(stillBlockquoteCode\)"#))
-        XCTAssertEqual(result.expressions.count, 1)
-        XCTAssertEqual(result.expressions.values.first?.source, "realMath")
+        let final = rawRevision(
+            lane: .richFallback,
+            text: "streaming final",
+            isComplete: true)
+        XCTAssertEqual(state.text(for: final), "streaming final")
+
+        state.deactivate()
+        let reentry = rawRevision(
+            lane: .richFallback,
+            text: "streaming after reentry")
+        XCTAssertEqual(state.text(for: reentry), "streaming after reentry")
+        state.submit(reentry)
+        XCTAssertEqual(state.displayedText, "streaming after reentry")
+        state.deactivate()
     }
 
-    func testCodeBlockRangesProtectMathAcrossEveryCommonMarkLineEnding() {
-        for lineEnding in ["\n", "\r", "\r\n"] {
-            let source = [
-                "```swift",
-                #"let literal = "\(notMath\)""#,
-                "```",
-                #"Outside \(realMath\)."#,
-            ].joined(separator: lineEnding)
-            let result = IntatisMathDelimiterAdapter.transform(source)
+    func testRawProjectionOversizeFallbackFinalRemainsByteExact() throws {
+        let oversized = String(repeating: "中", count: 22_000)
+        var model = IntatisRawTextProjectionModel(
+            revision: rawRevision(lane: .richFallback, text: oversized),
+            nowNanoseconds: 0)
+        let pendingText = oversized + "\r\n**tail"
+        let pending = model.receive(
+            rawRevision(lane: .richFallback, text: pendingText),
+            nowNanoseconds: 1_000_000)
+        XCTAssertNotNil(pending.schedule)
 
-            XCTAssertFalse(result.exceededLimits, "line ending: \(lineEnding.debugDescription)")
-            XCTAssertTrue(
-                result.markdown.contains(#"\(notMath\)"#),
-                "line ending: \(lineEnding.debugDescription)")
-            XCTAssertEqual(
-                result.expressions.values.map(\.source),
-                ["realMath"],
-                "line ending: \(lineEnding.debugDescription)")
+        let final = pendingText + "**\r\n"
+        let flushed = model.receive(
+            rawRevision(
+                lane: .richFallback,
+                text: final,
+                isComplete: true),
+            nowNanoseconds: 2_000_000)
+        XCTAssertTrue(flushed.didPublish)
+        XCTAssertEqual(Data(model.displayedText.utf8), Data(final.utf8))
+    }
+
+    func testWholeMessageAdmissionIsSyntaxAgnosticAndUTF8Bounded() {
+        let exact = IntatisMarkdownRenderRevision(
+            messageID: "exact",
+            rawText: String(repeating: "a", count: 64 * 1024),
+            isComplete: true,
+            appearance: .light,
+            configurationRevision: 1)
+        let oversized = IntatisMarkdownRenderRevision(
+            messageID: "oversized",
+            rawText: String(repeating: "a", count: 64 * 1024 + 1),
+            isComplete: true,
+            appearance: .light,
+            configurationRevision: 1)
+        let multiByteOversized = IntatisMarkdownRenderRevision(
+            messageID: "multibyte",
+            rawText: String(repeating: "中", count: 22_000),
+            isComplete: true,
+            appearance: .light,
+            configurationRevision: 1)
+        let empty = IntatisMarkdownRenderRevision(
+            messageID: "empty",
+            rawText: "",
+            isComplete: false,
+            appearance: .light,
+            configurationRevision: 1)
+
+        XCTAssertTrue(exact.isAdmitted)
+        XCTAssertFalse(oversized.isAdmitted)
+        XCTAssertFalse(multiByteOversized.isAdmitted)
+        XCTAssertFalse(empty.isAdmitted)
+    }
+
+    @MainActor
+    func testFirstReleaseConfigurationDisablesOptionalUnboundedFeatures() {
+        let configuration = IntatisMicrosoftMarkdownRenderState.makeConfiguration(
+            style: .standard(.light))
+
+        XCTAssertFalse(configuration.shouldAnimateText)
+        XCTAssertFalse(configuration.citationConfig.isEnabled)
+        XCTAssertFalse(configuration.imageConfig.enabled)
+        XCTAssertNil(configuration.textContextMenu)
+        XCTAssertEqual(configuration.blockSpacing, 18)
+    }
+
+    func testLinkPolicyAllowsOnlyProductSchemes() throws {
+        XCTAssertTrue(IntatisMarkdownLinkPolicy.allows(try XCTUnwrap(URL(string: "https://example.com"))))
+        XCTAssertTrue(IntatisMarkdownLinkPolicy.allows(try XCTUnwrap(URL(string: "http://example.com"))))
+        XCTAssertTrue(IntatisMarkdownLinkPolicy.allows(try XCTUnwrap(URL(string: "mailto:test@example.com"))))
+        XCTAssertFalse(IntatisMarkdownLinkPolicy.allows(try XCTUnwrap(URL(string: "file:///tmp/message"))))
+        XCTAssertFalse(IntatisMarkdownLinkPolicy.allows(try XCTUnwrap(URL(string: "data:text/plain,hello"))))
+        XCTAssertFalse(IntatisMarkdownLinkPolicy.allows(try XCTUnwrap(URL(string: "javascript:alert(1)"))))
+        XCTAssertFalse(IntatisMarkdownLinkPolicy.allows(try XCTUnwrap(URL(string: "relative/path"))))
+    }
+
+    @MainActor
+    func testPipelinePublishesTheExactFinalSourceRevision() async throws {
+        let state = IntatisMicrosoftMarkdownRenderState()
+        let raw = "# 标题\r\n\r\n| a | b |\r\n|---|---|\r\n| 1 | 2 |\r\n\r\n```swift\nprint(\"x\")\n```"
+        let revision = IntatisMarkdownRenderRevision(
+            messageID: "final",
+            rawText: raw,
+            isComplete: true,
+            appearance: .light,
+            configurationRevision: IntatisMarkdownRendererLimits.configurationRevision)
+
+        state.submit(revision: revision, style: .standard(.light))
+        let published = try await waitForPublishedMarkdown(state, revision: revision)
+
+        XCTAssertEqual(Data(published.revision.rawText.utf8), Data(raw.utf8))
+        XCTAssertEqual(published.revision, revision)
+        state.deactivate()
+    }
+
+    @MainActor
+    func testSingleConsumerKeepsOnlyTheLatestStreamingSnapshot() async throws {
+        let state = IntatisMicrosoftMarkdownRenderState()
+        let messageID = "stream"
+        for index in 1...200 {
+            let revision = IntatisMarkdownRenderRevision(
+                messageID: messageID,
+                rawText: String(repeating: "x", count: index),
+                isComplete: false,
+                appearance: .dark,
+                configurationRevision: IntatisMarkdownRendererLimits.configurationRevision)
+            state.submit(revision: revision, style: .standard(.dark))
         }
+        let finalText = String(repeating: "x", count: 200) + "\n\n| a | b |\n|---|---|\n| 1 | 2 |"
+        let finalRevision = IntatisMarkdownRenderRevision(
+            messageID: messageID,
+            rawText: finalText,
+            isComplete: true,
+            appearance: .dark,
+            configurationRevision: IntatisMarkdownRendererLimits.configurationRevision)
+        state.submit(revision: finalRevision, style: .standard(.dark))
+
+        let published = try await waitForPublishedMarkdown(state, revision: finalRevision)
+        XCTAssertEqual(published.revision.rawText, finalText)
+        XCTAssertTrue(published.revision.isComplete)
+        state.deactivate()
     }
 
-    func testStandaloneDisplayMathRecognizesEveryCommonMarkLineEnding() {
-        for lineEnding in ["\n", "\r", "\r\n"] {
-            let source = "before\(lineEnding)\\[x + 1\\]\(lineEnding)after"
-            let result = IntatisMathDelimiterAdapter.transform(source)
+    @MainActor
+    func testDeactivatePreventsAQueuedDocumentFromPublishing() async throws {
+        let state = IntatisMicrosoftMarkdownRenderState()
+        let revision = IntatisMarkdownRenderRevision(
+            messageID: "cancel",
+            rawText: String(repeating: "paragraph\n\n", count: 2_000),
+            isComplete: false,
+            appearance: .light,
+            configurationRevision: IntatisMarkdownRendererLimits.configurationRevision)
 
-            XCTAssertFalse(result.exceededLimits, "line ending: \(lineEnding.debugDescription)")
-            XCTAssertEqual(
-                result.expressions.values.map(\.source),
-                ["x + 1"],
-                "line ending: \(lineEnding.debugDescription)")
-            XCTAssertTrue(
-                result.markdown.contains("intatis-math://display/"),
-                "line ending: \(lineEnding.debugDescription)")
+        state.submit(revision: revision, style: .standard(.light))
+        state.deactivate()
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertNil(state.publishedDocument)
+    }
+
+    @MainActor
+    func testUnadmittedStreamingDoesNotPublishRepeatedNilDocuments() {
+        let state = IntatisMicrosoftMarkdownRenderState()
+        var objectChanges = 0
+        let observation = state.objectWillChange.sink {
+            objectChanges += 1
         }
+        let oversized = String(repeating: "x", count: 64 * 1024 + 1)
+
+        for index in 0..<10 {
+            state.submit(
+                revision: IntatisMarkdownRenderRevision(
+                    messageID: "oversized-stream",
+                    rawText: oversized + String(index),
+                    isComplete: false,
+                    appearance: .light,
+                    configurationRevision: IntatisMarkdownRendererLimits.configurationRevision),
+                style: .standard(.light))
+        }
+        state.deactivate()
+
+        XCTAssertEqual(objectChanges, 0)
+        withExtendedLifetime(observation) {}
     }
 
-    func testEscapedMathOpenersAndClosersRemainLiteral() {
-        let source = #"Escaped \\(literal\) then \(x + \\) + 1\)."#
-        let result = IntatisMathDelimiterAdapter.transform(source)
+    @MainActor
+    func testMalformedTableCorpusCompletesWithoutCustomParserFallback() async throws {
+        let corpus = [
+            "||||",
+            "| a | b |\n|---|---|\n| 1 | 2 | 3 |",
+            "| a | b |\n|---|---|\n| 1 |",
+            "| a | b |\nnot a separator\n| 1 | 2 |",
+            "| a | b |\n|---|---|\n| partial",
+        ].joined(separator: "\n\n")
+        let state = IntatisMicrosoftMarkdownRenderState()
+        let revision = IntatisMarkdownRenderRevision(
+            messageID: "tables",
+            rawText: corpus,
+            isComplete: true,
+            appearance: .light,
+            configurationRevision: IntatisMarkdownRendererLimits.configurationRevision)
 
-        XCTAssertTrue(result.markdown.contains(#"\\(literal\)"#))
-        XCTAssertEqual(result.expressions.count, 1)
-        XCTAssertEqual(result.expressions.values.first?.source, #"x + \\) + 1"#)
+        state.submit(revision: revision, style: .standard(.light))
+        let published = try await waitForPublishedMarkdown(state, revision: revision)
+        XCTAssertEqual(published.revision.rawText, corpus)
+        state.deactivate()
     }
 
-    func testDisplayMathInsideMarkdownContainersRemainsLiteral() {
-        let source = #"""
-        - derivation:
-          \[nestedListFormula\]
-          next
-
-        > $$blockquoteFormula$$
-
-        \[topLevelFormula\]
-        """#
-        let result = IntatisMathDelimiterAdapter.transform(source)
-
-        XCTAssertTrue(result.markdown.contains(#"\\[nestedListFormula\\]"#))
-        XCTAssertTrue(result.markdown.contains(#"$$blockquoteFormula$$"#))
-        XCTAssertEqual(result.expressions.count, 1)
-        XCTAssertEqual(result.expressions.values.first?.source, "topLevelFormula")
-    }
-
-    func testUnclosedAndInvalidMathRemainCopyableSource() {
-        let invalid = #"Invalid \(\notARealCommand{x}\) and unclosed \(x + 1"#
-        let result = IntatisMathDelimiterAdapter.transform(invalid)
-
-        XCTAssertEqual(result.markdown, #"Invalid \\(\notARealCommand{x}\\) and unclosed \\(x + 1"#)
-        XCTAssertTrue(result.expressions.isEmpty)
-    }
-
-    func testStreamingFormulaContentChangesInternalImageIdentity() {
-        let first = IntatisMathDelimiterAdapter.transform(#"Value \(x\)."#)
-        let second = IntatisMathDelimiterAdapter.transform(#"Value \(y\)."#)
-
-        XCTAssertNotEqual(first.markdown, second.markdown)
-        XCTAssertNotEqual(Set(first.expressions.keys), Set(second.expressions.keys))
-        XCTAssertEqual(first.expressions.values.first?.source, "x")
-        XCTAssertEqual(second.expressions.values.first?.source, "y")
-    }
-
-    func testSoleInlineFormulaRoutesThroughBlockImageProviderAsMath() throws {
-        let transformed = IntatisMathDelimiterAdapter.transform(#"\(x + 1\)"#)
-        let entry = try XCTUnwrap(transformed.expressions.first)
-        let url = try XCTUnwrap(URL(string: "intatis-math://\(entry.key)"))
-
+    @MainActor
+    func testSanitizedIncidentReplaysAll1249DeltasInOriginalOrder() async throws {
+        let fixtureURL = try XCTUnwrap(Bundle.module.url(
+            forResource: "incident-1249-sanitized-v1",
+            withExtension: "json",
+            subdirectory: "Fixtures"))
+        let data = try Data(contentsOf: fixtureURL)
+        let digest = SHA256.hash(data: data)
+            .map { String(format: "%02x", $0) }
+            .joined()
         XCTAssertEqual(
-            IntatisMathURL.route(for: url, in: transformed.expressions),
-            .inline(entry.value))
-    }
+            digest,
+            "fb548849d0b708d31e8c6d055805f29f5c09ee4c8306bf9adc537a48e95707f1")
 
-    func testRenderedDocumentAlwaysRetainsRawTruth() {
-        let source = #"**Markdown** plus \(a^2+b^2=c^2\)"#
-        let document = IntatisRenderDocumentBuilder.build(
-            rawText: source,
-            cacheCompletedResult: true)
+        let fixture = try JSONDecoder().decode(SanitizedIncidentFixture.self, from: data)
+        XCTAssertEqual(fixture.schema, 1)
+        XCTAssertEqual(fixture.messages.count, 17)
+        XCTAssertEqual(fixture.sourceDeltaCount, 1_249)
+        XCTAssertEqual(fixture.messages.reduce(0) { $0 + $1.deltas.count }, 1_249)
+        XCTAssertTrue(fixture.sanitizer.contains("delta-boundaries-preserved"))
 
-        XCTAssertEqual(document.rawText, source)
-        XCTAssertNotNil(document.markdownText)
-        XCTAssertEqual(document.mathExpressions.count, 1)
-    }
-
-    func testOversizedMessagesFailClosedToPlainText() {
-        let source = String(
-            repeating: "x",
-            count: IntatisRenderDocumentBuilder.maximumRichTextBytes + 1)
-        let document = IntatisRenderDocumentBuilder.build(
-            rawText: source,
-            cacheCompletedResult: false)
-
-        XCTAssertEqual(document, .plain(source))
-    }
-
-    func testFormulaOccurrenceLimitFailsClosedToPlainText() {
-        let source = String(
-            repeating: #"\(x\) "#,
-            count: IntatisRenderDocumentBuilder.maximumFormulaCount + 1)
-        let transformed = IntatisMathDelimiterAdapter.transform(source)
-        let document = IntatisRenderDocumentBuilder.build(
-            rawText: source,
-            cacheCompletedResult: false)
-
-        XCTAssertTrue(transformed.exceededLimits)
-        XCTAssertEqual(transformed.markdown, source)
-        XCTAssertEqual(document, .plain(source))
-    }
-
-    func testRepeatedUnclosedOpenersRemainBoundedLiteralSource() {
-        let source = String(repeating: #"\( "#, count: 4_096)
-        let transformed = IntatisMathDelimiterAdapter.transform(source)
-
-        XCTAssertFalse(transformed.exceededLimits)
-        XCTAssertTrue(transformed.expressions.isEmpty)
-        XCTAssertEqual(transformed.markdown.filter { $0 == "(" }.count, 4_096)
-    }
-
-    func testIncreasingUnmatchedBacktickRunsAreScannedInBoundedTime() {
-        let runs = (1...1_000)
-            .map { String(repeating: "`", count: $0) + "x" }
-            .joined(separator: " ")
-        let source = #"\("# + runs
-        XCTAssertLessThan(source.utf8.count, IntatisRenderDocumentBuilder.maximumRichTextBytes)
-
-        let clock = ContinuousClock()
-        let started = clock.now
-        let transformed = IntatisMathDelimiterAdapter.transform(
-            source,
-            protectedRanges: [])
-        let elapsed = started.duration(to: clock.now)
-
-        XCTAssertFalse(transformed.exceededLimits)
-        XCTAssertTrue(transformed.expressions.isEmpty)
-        XCTAssertTrue(transformed.markdown.hasSuffix(runs))
-        XCTAssertLessThan(elapsed, .seconds(5))
-    }
-
-    func testMarkdownComplexityGateAllows128BreaksAndRejects129() {
-        let atLimit = (0...128)
-            .map { "line \($0)" }
-            .joined(separator: "\n")
-        let overLimit = (0...129)
-            .map { "line \($0)" }
-            .joined(separator: "\n")
-        let knownCrashShape = (0..<500)
-            .map { "line \($0)" }
-            .joined(separator: "\n")
-        let allowed = IntatisRenderDocumentBuilder.build(
-            rawText: atLimit,
-            cacheCompletedResult: false)
-        let rejected = IntatisRenderDocumentBuilder.build(
-            rawText: overLimit,
-            cacheCompletedResult: false)
-        let rejectedKnownCrashShape = IntatisRenderDocumentBuilder.build(
-            rawText: knownCrashShape,
-            cacheCompletedResult: false)
-
-        XCTAssertNotNil(allowed.markdownContent)
-        XCTAssertEqual(rejected, .plain(overLimit))
-        XCTAssertEqual(rejectedKnownCrashShape, .plain(knownCrashShape))
-    }
-
-    func testMarkdownComplexityGateAllowsEightListLevelsAndRejectsNine() {
-        func nestedList(levels: Int) -> String {
-            (0..<levels).map { depth in
-                let marker = depth.isMultiple(of: 2) ? "- " : "1. "
-                return String(repeating: "    ", count: depth) + marker + "level \(depth)"
+        var states: [IntatisMicrosoftMarkdownRenderState] = []
+        var expectedRevisions: [IntatisMarkdownRenderRevision] = []
+        var yieldedDeltas = 0
+        for message in fixture.messages {
+            let state = IntatisMicrosoftMarkdownRenderState()
+            states.append(state)
+            var snapshot = ""
+            for (index, delta) in message.deltas.enumerated() {
+                snapshot += delta
+                yieldedDeltas += 1
+                let revision = IntatisMarkdownRenderRevision(
+                    messageID: message.id,
+                    rawText: snapshot,
+                    isComplete: index == message.deltas.index(before: message.deltas.endIndex),
+                    appearance: .light,
+                    configurationRevision: IntatisMarkdownRendererLimits.configurationRevision)
+                state.submit(revision: revision, style: .standard(.light))
+                if revision.isComplete {
+                    expectedRevisions.append(revision)
+                }
             }
-            .joined(separator: "\n")
         }
+        XCTAssertEqual(yieldedDeltas, 1_249)
+        XCTAssertEqual(expectedRevisions.count, 17)
 
-        let atLimit = nestedList(levels: 8)
-        let overLimit = nestedList(levels: 9)
-        let allowed = IntatisRenderDocumentBuilder.build(
-            rawText: atLimit,
-            cacheCompletedResult: false)
-        let rejected = IntatisRenderDocumentBuilder.build(
-            rawText: overLimit,
-            cacheCompletedResult: false)
-
-        XCTAssertNotNil(allowed.markdownContent)
-        XCTAssertEqual(rejected, .plain(overLimit))
-    }
-
-    func testMarkdownComplexityGateRejectsLargeGFMTableAST() {
-        let columns = 25
-        let header = "| " + (0..<columns).map { "h\($0)" }.joined(separator: " | ") + " |"
-        let delimiter = "| " + Array(repeating: "---", count: columns).joined(separator: " | ") + " |"
-        let row = "| " + Array(repeating: "x", count: columns).joined(separator: " | ") + " |"
-        let source = ([header, delimiter] + Array(repeating: row, count: 100))
-            .joined(separator: "\n")
-        let document = IntatisRenderDocumentBuilder.build(
-            rawText: source,
-            cacheCompletedResult: false)
-
-        XCTAssertEqual(document, .plain(source))
-    }
-
-    func testMarkdownComplexityGateRejectsWideInlineTree() {
-        let source = (0..<300)
-            .map { "*item\($0)*" }
-            .joined(separator: " ")
-        let document = IntatisRenderDocumentBuilder.build(
-            rawText: source,
-            cacheCompletedResult: false)
-
-        XCTAssertEqual(document, .plain(source))
-    }
-
-    func testMarkdownComplexityGateAllowsOrdinaryGFMContent() {
-        let source = #"""
-        # Heading
-
-        A short paragraph with **strong**, *emphasis*, and [a link](https://example.com).
-
-        GFM keeps ~~strikethrough~~ and <https://example.com>.
-
-        - one
-          - nested
-        - [x] completed task
-
-        | Name | Value |
-        | --- | ---: |
-        | alpha | 1 |
-        """#
-        let document = IntatisRenderDocumentBuilder.build(
-            rawText: source,
-            cacheCompletedResult: false)
-
-        XCTAssertEqual(document.rawText, source)
-        XCTAssertNotNil(document.markdownText)
-        XCTAssertNotNil(document.markdownContent)
-    }
-
-    func testMathRasterPolicyRejectsInvalidAndOversizedBitmaps() {
-        XCTAssertTrue(IntatisMathRasterPolicy.allows(
-            size: CGSize(width: 400, height: 40),
-            scale: 2))
-        XCTAssertFalse(IntatisMathRasterPolicy.allows(
-            size: CGSize(width: 1_025, height: 40),
-            scale: 2))
-        XCTAssertFalse(IntatisMathRasterPolicy.allows(
-            size: CGSize(width: CGFloat.infinity, height: 40),
-            scale: 1))
-    }
-
-    func testCodeLanguageAliasesAndUnknownLanguageHandling() {
-        XCTAssertEqual(IntatisCodeLanguage.normalize(" Swift "), "swift")
-        XCTAssertEqual(IntatisCodeLanguage.normalize("js"), "javascript")
-        XCTAssertEqual(IntatisCodeLanguage.normalize("C++"), "cpp")
-        XCTAssertEqual(IntatisCodeLanguage.normalize("zsh"), "bash")
-        XCTAssertEqual(IntatisCodeLanguage.normalize("future-lang"), "future-lang")
-        XCTAssertNil(IntatisCodeLanguage.normalize("  "))
-        XCTAssertNil(IntatisCodeLanguage.normalize(nil))
-    }
-
-    @MainActor
-    func testBundledHighlightJSEngineReturnsTheExactSource() async {
-        let source = "for index in 0..<3 { print(index) }"
-        let result = await IntatisSyntaxHighlightingService.shared.highlight(
-            source,
-            language: "swift",
-            colorScheme: .light)
-
-        XCTAssertNotNil(result)
-        XCTAssertEqual(result.map { String($0.characters) }, source)
-    }
-
-    @MainActor
-    func testAffectedCGrammarsFailClosedToPlaintext() async {
-        for language in ["c", "cpp"] {
-            let result = await IntatisSyntaxHighlightingService.shared.highlight(
-                "int main(void) { while (1) {} }",
-                language: language,
-                colorScheme: .light)
-            XCTAssertNil(result, "\(language) must remain plaintext until upstream issue #4362 is fixed")
+        for (state, expected) in zip(states, expectedRevisions) {
+            let published = try await waitForPublishedMarkdown(
+                state,
+                revision: expected,
+                attempts: 10_000)
+            XCTAssertEqual(
+                Data(published.revision.rawText.utf8),
+                Data(expected.rawText.utf8))
+            state.deactivate()
         }
-    }
-
-    func testHighlightAndRenderKeysCannotCollideAcrossFieldBoundaries() {
-        let cacheA = IntatisSyntaxHighlightCacheKey(
-            theme: "a11y-light",
-            language: "swift",
-            source: "foo:bar")
-        let cacheB = IntatisSyntaxHighlightCacheKey(
-            theme: "a11y-light",
-            language: "swift:foo",
-            source: "bar")
-        let revisionA = IntatisCodeRenderRevision(
-            isDark: false,
-            isComplete: true,
-            language: "swift",
-            source: "foo:bar")
-        let revisionB = IntatisCodeRenderRevision(
-            isDark: false,
-            isComplete: true,
-            language: "swift:foo",
-            source: "bar")
-        let composed = IntatisSyntaxHighlightCacheKey(
-            theme: "a11y-light",
-            language: "swift",
-            source: "caf\u{00E9}")
-        let decomposed = IntatisSyntaxHighlightCacheKey(
-            theme: "a11y-light",
-            language: "swift",
-            source: "cafe\u{0301}")
-
-        XCTAssertNotEqual(cacheA, cacheB)
-        XCTAssertNotEqual(revisionA, revisionB)
-        XCTAssertNotEqual(composed, decomposed)
     }
 }
 #endif

@@ -1,13 +1,35 @@
-#if DEBUG && canImport(SwiftUI)
-import SwiftUI
+#if (DEBUG || INTATIS_RENDERER_VALIDATION) && canImport(SwiftUI)
+import CryptoKit
+import Foundation
 import IntatisSharedUI
+import SwiftUI
+#if canImport(AppKit)
+import AppKit
+#endif
 
 /// Offline, deterministic renderer fixture used by visual verification.
 /// It never creates an AppEnvironment, provider, session, or credential resolver.
+///
+/// The fixture is deliberately staged: only one workload is materialized at a
+/// time. This lets the external watchdog establish a minimal containment
+/// baseline before table, code-selection, stream replacement, or incident
+/// replay is attempted.
 struct RendererFixtureView: View {
     @Environment(\.colorScheme) private var colorScheme
+    @StateObject private var incidentReplay: RendererIncidentReplayModel
+    @State private var fixtureStage: RendererFixtureStage
     @State private var streamStage = 0
-    @State private var copiedValue = "Nothing copied"
+    private let autoExitSeconds: Double?
+    @AppStorage(IntatisMessageRendererMode.defaultsKey)
+    private var rendererModeRawValue = IntatisMessageRendererMode.microsoft.rawValue
+
+    init(arguments: [String] = ProcessInfo.processInfo.arguments) {
+        let configuration = RendererFixtureLaunchConfiguration(arguments: arguments)
+        _fixtureStage = State(initialValue: configuration.stage)
+        _incidentReplay = StateObject(
+            wrappedValue: RendererIncidentReplayModel(fixturePath: configuration.incidentFixturePath))
+        autoExitSeconds = configuration.autoExitSeconds
+    }
 
     private var style: IntatisThreadStyle {
         .intatisMac(colorScheme)
@@ -17,73 +39,200 @@ struct RendererFixtureView: View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 18) {
                 fixtureHeader
-                fixtureSection("Markdown + code + LaTeX", identifier: "renderer.fixture.markdown") {
-                    IntatisMessageContentView(
-                        messageID: "fixture-combined",
-                        rawText: Self.combinedSource,
-                        isComplete: true,
-                        policy: .richText,
-                        style: style)
-                }
-                fixtureSection("Long code line", identifier: "renderer.fixture.code.swift") {
-                    IntatisMessageContentView(
-                        messageID: "fixture-long-code",
-                        rawText: Self.longCodeSource,
-                        isComplete: true,
-                        policy: .richText,
-                        style: style)
-                }
-                fixtureSection("Streaming", identifier: "renderer.fixture.streaming") {
-                    VStack(alignment: .leading, spacing: 10) {
-                        Button("Advance stream") {
-                            streamStage = (streamStage + 1) % Self.streamingSources.count
-                        }
-                        .accessibilityIdentifier("renderer.fixture.advance")
-                        Text("Stage \(streamStage + 1) / \(Self.streamingSources.count)")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        IntatisMessageContentView(
-                            messageID: "fixture-streaming",
-                            rawText: Self.streamingSources[streamStage],
-                            isComplete: streamStage == Self.streamingSources.count - 1,
-                            policy: .richText,
-                            style: style)
-                    }
-                }
-                fixtureSection("Safe fallbacks", identifier: "renderer.fixture.fallback") {
-                    IntatisMessageContentView(
-                        messageID: "fixture-fallback",
-                        rawText: Self.fallbackSource,
-                        isComplete: true,
-                        policy: .richText,
-                        style: style)
-                }
+                stagedFixture
             }
             .padding(24)
             .frame(maxWidth: 920, alignment: .leading)
             .frame(maxWidth: .infinity, alignment: .top)
         }
         .background(Color(nsColor: .windowBackgroundColor))
-        .intatisCodeCopyAction { source in
-            copiedValue = source.contains("END_OF_LONG_LINE")
-                ? "Copied END_OF_LONG_LINE"
-                : "Copied \(source.utf8.count) bytes"
-        }
         .accessibilityIdentifier("renderer.fixture")
+        .task(id: autoExitSeconds) {
+            guard let autoExitSeconds else { return }
+            let nanoseconds = UInt64(autoExitSeconds * 1_000_000_000)
+            do {
+                try await Task.sleep(nanoseconds: nanoseconds)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            NSApplication.shared.terminate(nil)
+        }
     }
 
     private var fixtureHeader: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 8) {
             Text("Intatis renderer fixture")
                 .font(.title.bold())
-            Text("Offline · MarkdownUI 2.4.1 · highlight.js 11.11.1 · iosMath 2.5.0")
+            Text("Offline · SwiftStreamingMarkdown derivative · swift-markdown 0.8.0")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
-            Text(copiedValue)
+
+            Picker("Renderer", selection: rendererModeSelection) {
+                Text("Rich Markdown").tag(IntatisMessageRendererMode.microsoft.rawValue)
+                Text("Plain safe").tag(IntatisMessageRendererMode.plainSafe.rawValue)
+            }
+            .pickerStyle(.segmented)
+            .frame(maxWidth: 360)
+            .accessibilityIdentifier("renderer.fixture.mode")
+
+            Picker("Isolated workload", selection: $fixtureStage) {
+                ForEach(RendererFixtureStage.allCases) { stage in
+                    Text(stage.title).tag(stage)
+                }
+            }
+            .pickerStyle(.menu)
+            .accessibilityIdentifier("renderer.fixture.stage")
+
+            Text("Active workload: \(fixtureStage.title)")
                 .font(.caption.monospaced())
-                .foregroundStyle(style.accent)
-                .accessibilityIdentifier("renderer.fixture.copyResult")
+                .foregroundStyle(.secondary)
+                .accessibilityIdentifier("renderer.fixture.stage-status")
+
+            if let rendererLaunchOverride {
+                Text("Current launch override: \(rendererLaunchOverride == .plainSafe ? "Plain safe" : "Rich Markdown"). Picker stores the next unforced launch mode.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("renderer.fixture.mode-override")
+            }
         }
+    }
+
+    @ViewBuilder
+    private var stagedFixture: some View {
+        switch fixtureStage {
+        case .minimal:
+            fixtureSection("Minimal paragraph", identifier: "renderer.fixture.minimal") {
+                message(
+                    id: "fixture-minimal",
+                    source: Self.minimalSource,
+                    isComplete: true)
+            }
+        case .table:
+            fixtureSection("Table only", identifier: "renderer.fixture.table") {
+                message(
+                    id: "fixture-table",
+                    source: Self.tableSource,
+                    isComplete: true)
+            }
+        case .codeSelection:
+            fixtureSection("Code and selection", identifier: "renderer.fixture.code") {
+                message(
+                    id: "fixture-code",
+                    source: Self.codeSelectionSource,
+                    isComplete: true)
+            }
+        case .streamReplacement:
+            fixtureSection("Stream replacement", identifier: "renderer.fixture.streaming") {
+                VStack(alignment: .leading, spacing: 10) {
+                    Button("Advance stream") {
+                        streamStage = (streamStage + 1) % Self.streamingSources.count
+                    }
+                    .accessibilityIdentifier("renderer.fixture.advance")
+                    Text("Stage \(streamStage + 1) / \(Self.streamingSources.count)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .accessibilityIdentifier("renderer.fixture.stream-status")
+                    message(
+                        id: "fixture-streaming",
+                        source: Self.streamingSources[streamStage],
+                        isComplete: streamStage == Self.streamingSources.count - 1)
+                }
+            }
+        case .incidentReplay:
+            incidentReplaySection
+        case .fullStatic:
+            fixtureSection("Full static document", identifier: "renderer.fixture.full") {
+                message(
+                    id: "fixture-combined",
+                    source: Self.combinedSource,
+                    isComplete: true)
+            }
+            fixtureSection("Long code line", identifier: "renderer.fixture.long-code") {
+                message(
+                    id: "fixture-long-code",
+                    source: Self.longCodeSource,
+                    isComplete: true)
+            }
+            fixtureSection("Safe fallbacks", identifier: "renderer.fixture.fallback") {
+                message(
+                    id: "fixture-fallback",
+                    source: Self.fallbackSource,
+                    isComplete: true)
+            }
+        }
+    }
+
+    private var incidentReplaySection: some View {
+        fixtureSection("Sanitized 1,249-delta incident replay", identifier: "renderer.fixture.incident") {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 10) {
+                    Button("Start exact replay") {
+                        incidentReplay.start()
+                    }
+                    .disabled(!incidentReplay.canStart)
+                    .accessibilityIdentifier("renderer.fixture.incident.start")
+
+                    Button("Cancel replay") {
+                        incidentReplay.cancel()
+                    }
+                    .disabled(!incidentReplay.isRunning)
+                    .accessibilityIdentifier("renderer.fixture.incident.cancel")
+                }
+
+                Text(incidentReplay.status)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(incidentReplay.hasFailed ? .red : .secondary)
+                    .textSelection(.enabled)
+                    .accessibilityIdentifier("renderer.fixture.incident.status")
+
+                LazyVStack(alignment: .leading, spacing: 12) {
+                    ForEach(incidentReplay.rows) { row in
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text("@\(row.agent)")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            message(
+                                id: row.id,
+                                source: row.rawText,
+                                isComplete: row.isComplete)
+                        }
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(.quaternary.opacity(0.2), in: RoundedRectangle(cornerRadius: 10))
+                    }
+                }
+            }
+            .task {
+                incidentReplay.loadIfNeeded()
+            }
+            .onDisappear {
+                incidentReplay.cancel()
+            }
+        }
+    }
+
+    private func message(id: String, source: String, isComplete: Bool) -> some View {
+        IntatisMessageContentView(
+            messageID: id,
+            rawText: source,
+            isComplete: isComplete,
+            policy: .richText,
+            style: style)
+    }
+
+    private var rendererLaunchOverride: IntatisMessageRendererMode? {
+        IntatisMessageRendererMode.launchOverride()
+    }
+
+    private var rendererModeSelection: Binding<String> {
+        Binding(
+            get: {
+                IntatisMessageRendererMode.resolve(
+                    persistedRawValue: rendererModeRawValue,
+                    arguments: []).rawValue
+            },
+            set: { rendererModeRawValue = $0 })
     }
 
     private func fixtureSection<Content: View>(
@@ -103,10 +252,54 @@ struct RendererFixtureView: View {
         .accessibilityIdentifier(identifier)
     }
 
+    private static let minimalSource = #"""
+    # Minimal containment
+
+    One paragraph with **emphasis**, *italics*, `inline code`, and a [safe link](https://example.com).
+    """#
+
+    private static let tableSource = #"""
+    # Table isolation
+
+    | Component | Responsibility | Status |
+    | --- | --- | --- |
+    | SwiftStreamingMarkdown derivative | Native Markdown presentation | active |
+    | swift-markdown | GFM structure | active |
+    | Intatis facade | Latest-only admission and raw fallback | active |
+
+    Malformed pipe input remains bounded and readable:
+
+    ||||
+
+    | too few |
+    | --- | --- | --- |
+    | one | two | three | extra |
+    """#
+
+    private static let codeSelectionSource = #"""
+    # Code and selection isolation
+
+    Select this paragraph, the inline token `literal`, and the complete code block below.
+
+    ```swift
+    struct Fibonacci {
+        static func values(upTo limit: Int) -> [Int] {
+            var result = [0, 1]
+            for index in 2..<limit {
+                result.append(result[index - 1] + result[index - 2])
+            }
+            return result
+        }
+    }
+    ```
+
+    Delimiters inside code remain literal: `\(literalCode)`, `$$literalCode$$`, and `\[literalCode\]`.
+    """#
+
     private static let combinedSource = #"""
     # Rendering that behaves like a chat answer
 
-    MarkdownUI owns the **Markdown parser**. This fixture covers *emphasis*, [a safe link](https://example.com), quotes, lists, tasks, and a table.
+    The upstream renderer owns the **Markdown parser and layout**. This fixture covers *emphasis*, [a safe link](https://example.com), quotes, lists, tasks, and a table.
 
     > Rich content stays selectable and falls back to its original source.
 
@@ -115,14 +308,14 @@ struct RendererFixtureView: View {
     2. Second item
 
     - [x] Markdown renderer
-    - [x] Code-block renderer
-    - [x] LaTeX renderer
+    - [x] Plain, selectable code blocks
+    - [x] Raw-text safe mode
 
-    | Engine | Responsibility |
+    | Component | Responsibility |
     | --- | --- |
-    | MarkdownUI | GFM structure |
-    | highlight.js | Language tokens |
-    | iosMath | TeX layout |
+    | SwiftStreamingMarkdown derivative | Native Markdown presentation |
+    | swift-markdown | GFM structure |
+    | Intatis facade | Backpressure and safe fallback |
 
     ```swift
     struct Fibonacci {
@@ -136,15 +329,9 @@ struct RendererFixtureView: View {
     }
     ```
 
-    Inline math is routed separately: \(E = mc^2\).
+    Math typesetting is deliberately disabled in the first release: $E = mc^2$ remains readable source text.
 
-    A sole inline formula remains math when MarkdownUI promotes its paragraph:
-
-    \(a + b\)
-
-    \[
-      \sum_{i=1}^{n} i = \frac{n(n+1)}{2}
-    \]
+    Delimiters inside code are never rewritten: `\(literalCode)` and `$$literalCode$$`.
     """#
 
     private static let longCodeSource = #"""
@@ -171,12 +358,12 @@ struct RendererFixtureView: View {
         }
         ```
 
-        Final inline formula: \(x^2 + y^2 = z^2\).
+        Final math source remains plain: $x^2 + y^2 = z^2$.
         """#,
     ]
 
     private static let fallbackSource = #"""
-    Invalid TeX remains source text: \(\notAnIosMathCommand{x}\)
+    Math source remains text: $not-typeset(x)$
 
     Unknown languages still get a complete, selectable code container:
 
@@ -186,5 +373,209 @@ struct RendererFixtureView: View {
 
     Remote images are blocked: ![tracking pixel](https://example.com/tracker.png)
     """#
+}
+
+private enum RendererFixtureStage: String, CaseIterable, Identifiable {
+    case minimal
+    case table
+    case codeSelection = "code-selection"
+    case streamReplacement = "stream-replacement"
+    case incidentReplay = "incident-replay"
+    case fullStatic = "full-static"
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .minimal: "Minimal paragraph"
+        case .table: "Table only"
+        case .codeSelection: "Code and selection"
+        case .streamReplacement: "Stream replacement"
+        case .incidentReplay: "1,249-delta replay"
+        case .fullStatic: "Full static document"
+        }
+    }
+}
+
+private struct RendererFixtureLaunchConfiguration {
+    static let stageFlag = "-IntatisRendererFixtureStage"
+    static let incidentFixtureFlag = "-IntatisRendererIncidentFixture"
+    static let autoExitFlag = "-IntatisRendererFixtureAutoExitSeconds"
+
+    let stage: RendererFixtureStage
+    let incidentFixturePath: String?
+    let autoExitSeconds: Double?
+
+    init(arguments: [String]) {
+        stage = Self.value(after: Self.stageFlag, arguments: arguments)
+            .flatMap(RendererFixtureStage.init(rawValue:))
+            ?? .minimal
+        incidentFixturePath = Self.value(after: Self.incidentFixtureFlag, arguments: arguments)
+        autoExitSeconds = Self.value(after: Self.autoExitFlag, arguments: arguments)
+            .flatMap(Double.init)
+            .flatMap { (1...300).contains($0) ? $0 : nil }
+    }
+
+    private static func value(after flag: String, arguments: [String]) -> String? {
+        guard let index = arguments.firstIndex(of: flag),
+              arguments.indices.contains(index + 1)
+        else { return nil }
+        return arguments[index + 1]
+    }
+}
+
+private struct RendererIncidentFixture: Decodable {
+    struct Message: Decodable {
+        let id: String
+        let agent: String
+        let deltas: [String]
+
+        var finalText: String { deltas.joined() }
+    }
+
+    let schema: Int
+    let sourceDeltaCount: Int
+    let messages: [Message]
+}
+
+@MainActor
+private final class RendererIncidentReplayModel: ObservableObject {
+    struct Row: Identifiable {
+        let id: String
+        let agent: String
+        var rawText: String
+        var isComplete: Bool
+    }
+
+    static let expectedFixtureSHA256 = "fb548849d0b708d31e8c6d055805f29f5c09ee4c8306bf9adc537a48e95707f1"
+    static let expectedMessageCount = 17
+    static let expectedDeltaCount = 1_249
+
+    @Published private(set) var rows: [Row] = []
+    @Published private(set) var status = "Fixture not loaded"
+    @Published private(set) var isRunning = false
+    @Published private(set) var hasFailed = false
+
+    private let fixturePath: String?
+    private var fixture: RendererIncidentFixture?
+    private var replayTask: Task<Void, Never>?
+
+    init(fixturePath: String?) {
+        self.fixturePath = fixturePath
+    }
+
+    var canStart: Bool {
+        fixture != nil && !isRunning
+    }
+
+    func loadIfNeeded() {
+        guard fixture == nil, !hasFailed else { return }
+        guard let fixturePath else {
+            fail("Missing -IntatisRendererIncidentFixture PATH")
+            return
+        }
+
+        do {
+            let data = try Data(contentsOf: URL(fileURLWithPath: fixturePath))
+            let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+            guard digest == Self.expectedFixtureSHA256 else {
+                fail("Fixture SHA-256 mismatch")
+                return
+            }
+
+            let decoded = try JSONDecoder().decode(RendererIncidentFixture.self, from: data)
+            let deltaCount = decoded.messages.reduce(0) { $0 + $1.deltas.count }
+            guard decoded.schema == 1,
+                  decoded.messages.count == Self.expectedMessageCount,
+                  decoded.sourceDeltaCount == Self.expectedDeltaCount,
+                  deltaCount == Self.expectedDeltaCount,
+                  Set(decoded.messages.map(\.id)).count == Self.expectedMessageCount
+            else {
+                fail("Fixture shape mismatch; expected 17 messages / 1,249 deltas")
+                return
+            }
+
+            fixture = decoded
+            rows = Self.emptyRows(for: decoded)
+            status = "Ready · SHA-256 verified · 17 messages / 1,249 deltas"
+        } catch {
+            fail("Fixture load failed: \(error.localizedDescription)")
+        }
+    }
+
+    func start() {
+        loadIfNeeded()
+        guard let fixture, !isRunning else { return }
+
+        replayTask?.cancel()
+        rows = Self.emptyRows(for: fixture)
+        hasFailed = false
+        isRunning = true
+        status = "Replaying 0 / 1,249 deltas"
+
+        replayTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            var applied = 0
+
+            for messageIndex in fixture.messages.indices {
+                let message = fixture.messages[messageIndex]
+                for deltaIndex in message.deltas.indices {
+                    guard !Task.isCancelled else {
+                        self.isRunning = false
+                        self.status = "Replay cancelled at \(applied) / 1,249 deltas"
+                        return
+                    }
+
+                    self.rows[messageIndex].rawText += message.deltas[deltaIndex]
+                    self.rows[messageIndex].isComplete = deltaIndex == message.deltas.index(before: message.deltas.endIndex)
+                    applied += 1
+                    if applied == 1 || applied.isMultiple(of: 50) || applied == Self.expectedDeltaCount {
+                        self.status = "Replaying \(applied) / 1,249 deltas"
+                    }
+
+                    try? await Task.sleep(nanoseconds: 1_000_000)
+                }
+            }
+
+            let finalInputsAreExact = fixture.messages.indices.allSatisfy {
+                self.rows[$0].rawText == fixture.messages[$0].finalText
+                    && self.rows[$0].isComplete
+            }
+            self.isRunning = false
+            if finalInputsAreExact {
+                self.status = "Complete · 1,249 / 1,249 deltas · final raw inputs 17 / 17 exact"
+            } else {
+                self.fail("Replay completed but final raw inputs were not exact")
+            }
+        }
+    }
+
+    func cancel() {
+        guard replayTask != nil else { return }
+        replayTask?.cancel()
+        replayTask = nil
+        if isRunning {
+            isRunning = false
+            status = "Replay cancelled"
+        }
+    }
+
+    private func fail(_ message: String) {
+        replayTask?.cancel()
+        replayTask = nil
+        isRunning = false
+        hasFailed = true
+        status = message
+    }
+
+    private static func emptyRows(for fixture: RendererIncidentFixture) -> [Row] {
+        fixture.messages.enumerated().map { index, message in
+            Row(
+                id: "fixture-incident-\(index + 1)",
+                agent: message.agent,
+                rawText: "",
+                isComplete: false)
+        }
+    }
 }
 #endif

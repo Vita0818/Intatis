@@ -203,6 +203,27 @@ final class PermissionReviewProtocolTests: XCTestCase {
         XCTAssertTrue(preview.fields["url"]?.contains("[REDACTED]") == true)
     }
 
+    func testDiagnosticSanitizerRedactsCompleteURLsWithoutChangingOrdinaryURLText() {
+        let diagnostic =
+            "upstream https://[fd00::24]:8443/private/v1/chat/completions failed with HTTP 502"
+
+        let ordinary = PermissionReviewTextSanitizer.sanitize(
+            diagnostic,
+            maxCharacters: 1_024)
+        let scrubbed = PermissionReviewTextSanitizer.sanitizeDiagnostic(
+            diagnostic,
+            maxCharacters: 1_024)
+
+        XCTAssertEqual(ordinary.text, diagnostic)
+        XCTAssertFalse(ordinary.redacted)
+        XCTAssertEqual(
+            scrubbed.text,
+            "upstream [REDACTED_URL] failed with HTTP 502")
+        XCTAssertTrue(scrubbed.redacted)
+        XCTAssertFalse(scrubbed.text.contains("fd00"))
+        XCTAssertFalse(scrubbed.text.contains("/private/v1"))
+    }
+
     func testPermissionActionPreviewDecodeEnforcesFieldAndCharacterBounds() throws {
         let longKind = String(repeating: "k", count: 100)
         let longValue = String(repeating: "v", count: 1_000)

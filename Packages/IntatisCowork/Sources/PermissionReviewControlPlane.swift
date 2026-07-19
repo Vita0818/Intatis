@@ -1395,7 +1395,9 @@ public actor PermissionReviewControlPlane {
         case .messageCompleted(let payload):
             return "seq \(seq) message_completed \(payload.agent?.rawValue ?? payload.role.rawValue): \(safeReviewText(payload.text, maxCharacters: 420))"
         case .toolCall(let payload):
-            return "seq \(seq) tool_call \(payload.agent?.rawValue ?? "none") \(payload.name): args_sha256=\(ToolRegistry.authorizationDigest(payload.args)); args_chars=\(payload.args.count)"
+            let digest = payload.argsDigest ?? ToolRegistry.authorizationDigest(payload.args)
+            let count = payload.argsCharacterCount ?? payload.args.count
+            return "seq \(seq) tool_call \(payload.agent?.rawValue ?? "none") \(payload.name): args_sha256=\(digest); args_chars=\(count)"
         case .toolResult(let payload):
             return "seq \(seq) tool_result \(payload.toolCallId): observation_sha256=\(ToolRegistry.authorizationDigest(payload.observation)); observation_chars=\(payload.observation.count)"
         case .permissionRequest(let payload):

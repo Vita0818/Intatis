@@ -57,7 +57,13 @@ public enum RuntimeErrorPresentation {
         if error is CancellationError {
             return IntatisError.cancelled.localizedDescription
         }
-        return error.localizedDescription
+        // Provider, decoder, and plug-in errors are untrusted strings. This is
+        // the last common boundary before messages become durable EventLog or
+        // task-failure facts, so sanitize even when an upstream formatter was
+        // bypassed by a custom provider implementation.
+        return PermissionReviewTextSanitizer.sanitizeDiagnostic(
+            error.localizedDescription,
+            maxCharacters: 1_024).text
     }
 
     public static func recoveryAdvice(for payload: ErrorPayload) -> RuntimeRecoveryAdvice? {

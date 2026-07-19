@@ -3,6 +3,8 @@ import SwiftUI
 import Foundation
 import IntatisCore
 import IntatisPermission
+import IntatisProtocol
+import IntatisProviders
 import IntatisSharedUI
 
 struct CoworkProjectWorkspace: Identifiable, Codable, Equatable {
@@ -29,6 +31,9 @@ struct CoworkProjectSettings: Codable, Equatable {
     var mainAgentName: String
     var defaultProviderID: String?
     var defaultModelID: String?
+    /// Exact, secret-free default used only when creating future agents. The
+    /// legacy provider/model fields remain additive compatibility mirrors.
+    var defaultInferenceProfileBinding: AgentInferenceBinding?
     var defaultPermissionProfile: String
     var tokenBudget: Int?
     var workspaces: [CoworkProjectWorkspace]
@@ -37,6 +42,7 @@ struct CoworkProjectSettings: Codable, Equatable {
          mainAgentName: String = "main",
          defaultProviderID: String? = nil,
          defaultModelID: String? = nil,
+         defaultInferenceProfileBinding: AgentInferenceBinding? = nil,
          defaultPermissionProfile: String = PermissionProfile.reviewed.rawValue,
          tokenBudget: Int? = nil,
          workspaces: [CoworkProjectWorkspace] = []) {
@@ -44,6 +50,7 @@ struct CoworkProjectSettings: Codable, Equatable {
         self.mainAgentName = mainAgentName
         self.defaultProviderID = defaultProviderID
         self.defaultModelID = defaultModelID
+        self.defaultInferenceProfileBinding = defaultInferenceProfileBinding
         self.defaultPermissionProfile = defaultPermissionProfile
         self.tokenBudget = tokenBudget
         self.workspaces = workspaces
@@ -51,11 +58,17 @@ struct CoworkProjectSettings: Codable, Equatable {
 
     static func fresh(sessionID: SessionID,
                       primaryWorkspace: URL,
-                      catalog: AppProviderCatalog) -> CoworkProjectSettings {
+                      catalog: AppProviderCatalog,
+                      defaultInferenceProfileBinding: AgentInferenceBinding? = nil,
+                      inferenceCatalogSnapshot: InferenceCatalogSnapshot? = nil) -> CoworkProjectSettings {
         CoworkProjectSettings(
             sessionID: sessionID,
             defaultProviderID: catalog.selectedProviderID,
             defaultModelID: catalog.selectedModelID,
+            defaultInferenceProfileBinding: defaultInferenceProfileBinding
+                ?? inferenceCatalogSnapshot.flatMap {
+                    AppInferenceCatalogCompiler.selectedBinding(catalog: catalog, snapshot: $0)
+                },
             workspaces: [
                 CoworkProjectWorkspace(
                     path: primaryWorkspace.standardizedFileURL.path,
@@ -65,11 +78,15 @@ struct CoworkProjectSettings: Codable, Equatable {
     }
 
     static func restored(sessionID: SessionID,
-                         catalog: AppProviderCatalog) -> CoworkProjectSettings {
+                         catalog: AppProviderCatalog,
+                         inferenceCatalogSnapshot: InferenceCatalogSnapshot? = nil) -> CoworkProjectSettings {
         CoworkProjectSettings(
             sessionID: sessionID,
             defaultProviderID: catalog.selectedProviderID,
-            defaultModelID: catalog.selectedModelID)
+            defaultModelID: catalog.selectedModelID,
+            defaultInferenceProfileBinding: inferenceCatalogSnapshot.flatMap {
+                AppInferenceCatalogCompiler.selectedBinding(catalog: catalog, snapshot: $0)
+            })
     }
 
     var defaultProfile: PermissionProfile {
@@ -112,10 +129,14 @@ struct CoworkProjectSettings: Codable, Equatable {
 
 enum CoworkProjectSettingsStore {
     static func load(sessionID: SessionID,
-                     catalog: AppProviderCatalog) -> CoworkProjectSettings {
+                     catalog: AppProviderCatalog,
+                     inferenceCatalogSnapshot: InferenceCatalogSnapshot? = nil) -> CoworkProjectSettings {
         guard let data = UserDefaults.standard.data(forKey: key(sessionID)),
               let decoded = try? decoder.decode(CoworkProjectSettings.self, from: data) else {
-            return CoworkProjectSettings.restored(sessionID: sessionID, catalog: catalog)
+            return CoworkProjectSettings.restored(
+                sessionID: sessionID,
+                catalog: catalog,
+                inferenceCatalogSnapshot: inferenceCatalogSnapshot)
         }
         var settings = decoded
         settings.sessionID = sessionID
@@ -127,6 +148,19 @@ enum CoworkProjectSettingsStore {
         }
         if settings.defaultModelID == nil {
             settings.defaultModelID = catalog.selectedModelID
+        }
+        if settings.defaultInferenceProfileBinding == nil,
+           let snapshot = inferenceCatalogSnapshot,
+           let providerID = settings.defaultProviderID,
+           let modelID = settings.defaultModelID {
+            // Legacy settings never recorded a variant. Resolve the base
+            // profile only; guessing the app's current variant would silently
+            // change the recovered request configuration.
+            settings.defaultInferenceProfileBinding = AppInferenceCatalogCompiler.binding(
+                providerID: providerID,
+                modelID: modelID,
+                variantID: nil,
+                snapshot: snapshot)
         }
         return settings
     }
@@ -168,6 +202,7 @@ enum CoworkProjectSettingsStore {
 struct CoworkProjectSettingsSheet: View {
     @ObservedObject var vm: CoworkViewModel
     let catalog: AppProviderCatalog
+    let inferenceProfileOptions: [AppInferenceProfileOption]
     let onAddWorkspace: () -> Void
 
     @Environment(\.dismiss) private var dismiss
@@ -178,11 +213,36 @@ struct CoworkProjectSettingsSheet: View {
 
     init(vm: CoworkViewModel,
          catalog: AppProviderCatalog,
+         inferenceCatalogSnapshot: InferenceCatalogSnapshot? = nil,
+         inferenceProfileOptions explicitInferenceProfileOptions: [AppInferenceProfileOption]? = nil,
          onAddWorkspace: @escaping () -> Void) {
         self.vm = vm
         self.catalog = catalog
+        let resolvedInferenceProfileOptions = explicitInferenceProfileOptions ?? inferenceCatalogSnapshot.map {
+            AppInferenceCatalogCompiler.options(catalog: catalog, snapshot: $0)
+        } ?? []
+        self.inferenceProfileOptions = resolvedInferenceProfileOptions
         self.onAddWorkspace = onAddWorkspace
-        _draft = State(initialValue: vm.projectSettings)
+        var initialDraft = vm.projectSettings
+        if initialDraft.defaultInferenceProfileBinding == nil {
+            if let snapshot = inferenceCatalogSnapshot,
+               let providerID = initialDraft.defaultProviderID,
+               let modelID = initialDraft.defaultModelID {
+                initialDraft.defaultInferenceProfileBinding = AppInferenceCatalogCompiler.binding(
+                    providerID: providerID,
+                    modelID: modelID,
+                    variantID: nil,
+                    snapshot: snapshot)
+            } else if let providerID = initialDraft.defaultProviderID,
+                      let modelID = initialDraft.defaultModelID {
+                initialDraft.defaultInferenceProfileBinding = resolvedInferenceProfileOptions.first {
+                    $0.providerID == providerID
+                        && $0.modelID == modelID
+                        && $0.variantID == nil
+                }?.binding
+            }
+        }
+        _draft = State(initialValue: initialDraft)
         _tokenBudgetText = State(initialValue: vm.projectSettings.tokenBudget.map(String.init) ?? "")
     }
 
@@ -207,6 +267,8 @@ struct CoworkProjectSettingsSheet: View {
             }
 
             settingsGrid
+
+            agentInferenceSection
 
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
@@ -240,10 +302,66 @@ struct CoworkProjectSettingsSheet: View {
             }
         }
         .padding(20)
-        .frame(minWidth: 420, idealWidth: 520, maxWidth: 620)
+        .frame(minWidth: 560, idealWidth: 680, maxWidth: 780)
         .onChange(of: vm.projectSettings) { updated in
             draft = updated
             tokenBudgetText = updated.tokenBudget.map(String.init) ?? ""
+        }
+    }
+
+    private var ordinaryAgents: [CoworkAgentInfo] {
+        vm.agents.filter { $0.name != "permission-reviewer" }
+    }
+
+    @ViewBuilder private var agentInferenceSection: some View {
+        if !ordinaryAgents.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text("Agent inference profiles")
+                        .font(.caption.bold())
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text("Rebind applies after the current invocation boundary")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(ordinaryAgents) { agent in
+                    HStack(spacing: 10) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("@\(agent.name)")
+                                .font(.caption.bold())
+                            Text(agent.inferenceDisplayLabel ?? "Inference profile unavailable")
+                                .font(.caption2)
+                                .foregroundStyle(agent.inferenceResolution.requiresAttention
+                                    ? IntatisTheme.accent(scheme)
+                                    : .secondary)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                        }
+                        Spacer(minLength: 8)
+                        Menu("Rebind…") {
+                            ForEach(inferenceProfileOptions) { option in
+                                Button(option.title) {
+                                    vm.rebindAgentInferenceProfile(
+                                        name: agent.name,
+                                        binding: option.binding)
+                                }
+                                .disabled(vm.agentInferenceBinding(
+                                    name: agent.name) == option.binding)
+                            }
+                        }
+                        .menuStyle(.borderlessButton)
+                        .fixedSize()
+                        .disabled(vm.isWorking || inferenceProfileOptions.isEmpty)
+                        .accessibilityIdentifier("cowork.agent.\(agent.id).rebind")
+                    }
+                    .padding(8)
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .stroke(IntatisTheme.separator(scheme), lineWidth: 1)
+                    }
+                }
+            }
         }
     }
 
@@ -254,20 +372,29 @@ struct CoworkProjectSettingsSheet: View {
                     .font(.body.weight(.medium))
                     .foregroundStyle(.primary)
             }
-            formRow("Default model") {
-                Picker("", selection: modelSelectionBinding) {
-                    ForEach(catalog.providers) { provider in
-                        Section(provider.title) {
-                            ForEach(provider.models) { model in
-                                IntatisModelTitleLabel(model: model)
-                                    .tag(modelSelectionKey(providerID: provider.id, modelID: model.id))
+            formRow("Default inference profile (new agents)") {
+                VStack(alignment: .leading, spacing: 4) {
+                    if inferenceProfileOptions.isEmpty {
+                        legacyModelPicker
+                        Text("Exact inference profiles are unavailable; the legacy provider/model default is retained.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        Picker("", selection: inferenceProfileSelectionBinding) {
+                            if let retained = retainedDefaultBinding,
+                               !inferenceProfileOptions.contains(where: { $0.id == retained.key }) {
+                                Text(retained.title).tag(retained.key)
+                            }
+                            ForEach(inferenceProfileOptions) { option in
+                                Text(option.title).tag(option.id)
                             }
                         }
+                        .labelsHidden()
+                        .pickerStyle(.menu)
+                        .frame(maxWidth: 360, alignment: .leading)
                     }
                 }
-                .labelsHidden()
-                .pickerStyle(.menu)
-                .frame(maxWidth: 260, alignment: .leading)
             }
             formRow("Default permission") {
                 Picker("", selection: $draft.defaultPermissionProfile) {
@@ -304,7 +431,7 @@ struct CoworkProjectSettingsSheet: View {
             Text(title)
                 .font(.caption.bold())
                 .foregroundStyle(.secondary)
-                .frame(width: 128, alignment: .leading)
+                .frame(width: 210, alignment: .leading)
             content()
             Spacer(minLength: 0)
         }
@@ -357,6 +484,63 @@ struct CoworkProjectSettingsSheet: View {
                 }
             }
         }
+    }
+
+    private var inferenceProfileSelectionBinding: Binding<String> {
+        Binding(
+            get: {
+                if let binding = draft.defaultInferenceProfileBinding {
+                    return bindingSelectionKey(binding)
+                }
+                return legacyMatchingOption?.id ?? inferenceProfileOptions.first?.id ?? ""
+            },
+            set: { value in
+                guard let option = inferenceProfileOptions.first(where: { $0.id == value }) else {
+                    return
+                }
+                draft.defaultInferenceProfileBinding = option.binding
+                // Keep these fields as a compatibility mirror for older builds.
+                draft.defaultProviderID = option.providerID
+                draft.defaultModelID = option.modelID
+            })
+    }
+
+    private var legacyMatchingOption: AppInferenceProfileOption? {
+        guard let providerID = draft.defaultProviderID,
+              let modelID = draft.defaultModelID else {
+            return nil
+        }
+        return inferenceProfileOptions.first {
+            $0.providerID == providerID && $0.modelID == modelID && $0.variantID == nil
+        }
+    }
+
+    private var retainedDefaultBinding: (key: String, title: String)? {
+        guard let binding = draft.defaultInferenceProfileBinding else { return nil }
+        return (
+            bindingSelectionKey(binding),
+            "Saved inference profile (retained revision)")
+    }
+
+    private func bindingSelectionKey(_ binding: AgentInferenceBinding) -> String {
+        let ref = binding.inferenceProfileRef
+        return "\(ref.inferenceProfileID.rawValue)\u{001F}\(ref.inferenceProfileRevision.rawValue)"
+    }
+
+    private var legacyModelPicker: some View {
+        Picker("", selection: modelSelectionBinding) {
+            ForEach(catalog.providers) { provider in
+                Section(AppInferenceCatalogCompiler.safeProviderTitle(provider)) {
+                    ForEach(provider.models) { model in
+                        Text(AppInferenceCatalogCompiler.safeModelTitle(model))
+                            .tag(modelSelectionKey(providerID: provider.id, modelID: model.id))
+                    }
+                }
+            }
+        }
+        .labelsHidden()
+        .pickerStyle(.menu)
+        .frame(maxWidth: 360, alignment: .leading)
     }
 
     private var modelSelectionBinding: Binding<String> {

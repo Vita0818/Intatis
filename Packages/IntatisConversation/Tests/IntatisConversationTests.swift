@@ -37,6 +37,20 @@ private struct SplitUsageProvider: ChatProvider {
     }
 }
 
+private struct URLLeakingProviderError: LocalizedError {
+    var errorDescription: String? {
+        "upstream http://10.20.30.40:8123/private/chat/completions?token=opaque-token failed; status=502; retry later"
+    }
+}
+
+private struct URLLeakingProvider: ChatProvider {
+    func stream(_ request: ChatRequest) -> AsyncThrowingStream<ChatChunk, Error> {
+        AsyncThrowingStream { continuation in
+            continuation.finish(throwing: URLLeakingProviderError())
+        }
+    }
+}
+
 final class IntatisConversationTests: XCTestCase {
 
     private func tmpFile() -> URL {
@@ -632,6 +646,41 @@ final class IntatisConversationTests: XCTestCase {
         XCTAssertEqual(projection.messages[1].recoveryAdvice?.title, "Response stopped before completion")
         XCTAssertEqual(projection.messages[2].role, .system)
         XCTAssertEqual(projection.messages[2].recoveryAdvice?.title, "Check endpoint compatibility")
+    }
+
+    func testChatLoopEventLogRedactsURLFromUnformattedProviderError() async throws {
+        let url = tmpFile()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let log = try EventLog(session: SessionID(rawValue: "sess_url_error"), fileURL: url)
+        let loop = ChatLoop(
+            log: log,
+            provider: URLLeakingProvider(),
+            model: ModelID(rawValue: "m"))
+
+        do {
+            try await loop.send("hi")
+            XCTFail("expected provider failure")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("10.20.30.40"))
+        }
+
+        let replayed = await log.replay()
+        let payload = try XCTUnwrap(replayed.compactMap { envelope -> ErrorPayload? in
+            guard case .error(let payload) = envelope.event else { return nil }
+            return payload
+        }.last)
+        let persisted = try XCTUnwrap(String(data: Data(contentsOf: url), encoding: .utf8))
+
+        XCTAssertEqual(payload.code, "provider")
+        XCTAssertTrue(payload.message.contains("[REDACTED_URL]"))
+        XCTAssertTrue(payload.message.contains("status=502"))
+        XCTAssertTrue(payload.message.contains("retry later"))
+        for text in [payload.message, persisted] {
+            XCTAssertFalse(text.contains("http://"))
+            XCTAssertFalse(text.contains("10.20.30.40"))
+            XCTAssertFalse(text.contains("/private/chat/completions"))
+            XCTAssertFalse(text.contains("opaque-token"))
+        }
     }
 
     func testChatLoopMergesSplitUsageChunksIntoTurnStats() async throws {

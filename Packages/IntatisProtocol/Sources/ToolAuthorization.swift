@@ -23,8 +23,9 @@ public enum ToolDelegationRequirement: String, Codable, Equatable, Sendable {
 
 /// Result of bounding and redacting text before it is persisted as a semantic
 /// approval preview or sent to the automatic reviewer. This is deliberately
-/// separate from the raw tool arguments, whose only durable representation is
-/// a digest plus character count.
+/// separate from raw tool arguments: rejected or sensitive values have no
+/// durable raw-value representation, while validated non-sensitive calls may
+/// retain a digest plus character count.
 public struct PermissionReviewTextSanitization: Equatable, Sendable {
     public let text: String
     public let redacted: Bool
@@ -42,6 +43,13 @@ public struct PermissionReviewTextSanitization: Equatable, Sendable {
 /// token formats and authorization-like key/value syntax (including URL query
 /// parameters); callers still retain exact raw-argument identity via a digest.
 public enum PermissionReviewTextSanitizer {
+    /// HTTP(S) locations are not secrets by definition, so ordinary permission
+    /// previews keep using `sanitize`. Diagnostics opt in to this additional
+    /// rule because provider endpoints can identify private infrastructure and
+    /// must not survive into EventLog or task-failure text.
+    private static let diagnosticURLPattern =
+        #"(?i)\bhttps?://(?:[^\s/@<>\"'\\]+@)?(?:\[[0-9a-f:.%]+\]|[^\s/:?#<>\"'\\\[\]{}()]+)(?::[0-9]{1,5})?(?:[/?#][^\s<>\"'\\]*)?"#
+
     private static let replacementPatterns: [(pattern: String, replacement: String)] = [
         (
             #"(?i)(authorization\s*[:=]\s*)(?:bearer\s+)?[^\s,;"'\]}]+"#,
@@ -67,6 +75,21 @@ public enum PermissionReviewTextSanitizer {
 
     public static func sanitize(_ value: String,
                                 maxCharacters: Int) -> PermissionReviewTextSanitization {
+        sanitize(value, maxCharacters: maxCharacters, redactingDiagnosticURLs: false)
+    }
+
+    /// Scrubs untrusted error/audit diagnostics, including complete HTTP(S)
+    /// URLs even when they contain no query or credential-shaped component.
+    /// This is intentionally opt-in so normal provider configuration and UI
+    /// values are never rewritten by a global URL policy.
+    public static func sanitizeDiagnostic(_ value: String,
+                                          maxCharacters: Int) -> PermissionReviewTextSanitization {
+        sanitize(value, maxCharacters: maxCharacters, redactingDiagnosticURLs: true)
+    }
+
+    private static func sanitize(_ value: String,
+                                 maxCharacters: Int,
+                                 redactingDiagnosticURLs: Bool) -> PermissionReviewTextSanitization {
         let boundedLimit = max(0, maxCharacters)
         let lower = value.lowercased()
         if lower.contains("-----begin"), lower.contains("private key") {
@@ -78,6 +101,14 @@ public enum PermissionReviewTextSanitizer {
 
         var output = value
         var redacted = false
+        if redactingDiagnosticURLs {
+            let replaced = output.replacingOccurrences(
+                of: diagnosticURLPattern,
+                with: "[REDACTED_URL]",
+                options: .regularExpression)
+            if replaced != output { redacted = true }
+            output = replaced
+        }
         for entry in replacementPatterns {
             let replaced = output.replacingOccurrences(
                 of: entry.pattern,
@@ -259,6 +290,11 @@ public struct ResolvedToolAuthorization: Codable, Equatable, Sendable {
     public let attempt: Int?
     public let toolCallID: String?
     public let taskObjective: String?
+    /// Exact, secret-free inference identity of a host-resolved target agent.
+    /// This is populated for control-plane actions such as delegate/spawn so
+    /// permission review and durable execution revalidation bind the route as
+    /// well as the agent/workspace identity.
+    public let targetAgentInferenceBinding: AgentInferenceBinding?
     public let normalizedArgumentsDigest: String
     public let normalizedArgumentsCharacterCount: Int
     public let intent: PermissionIntent
@@ -297,7 +333,8 @@ public struct ResolvedToolAuthorization: Codable, Equatable, Sendable {
                 workspaceID: WorkspaceID? = nil,
                 workspaceTaskID: TaskID? = nil,
                 workspaceRootPath: String? = nil,
-                workspaceLeaseFingerprint: String? = nil) {
+                workspaceLeaseFingerprint: String? = nil,
+                targetAgentInferenceBinding: AgentInferenceBinding? = nil) {
         self.schemaVersion = schemaVersion
         self.authorizationID = authorizationID
         self.registryVersion = registryVersion
@@ -329,6 +366,7 @@ public struct ResolvedToolAuthorization: Codable, Equatable, Sendable {
         self.attempt = invocation.attempt
         self.toolCallID = invocation.toolCallID
         self.taskObjective = invocation.taskObjective
+        self.targetAgentInferenceBinding = targetAgentInferenceBinding
         self.normalizedArgumentsDigest = normalizedArgumentsDigest
         self.normalizedArgumentsCharacterCount = normalizedArgumentsCharacterCount
         self.intent = intent
@@ -378,7 +416,8 @@ public struct ResolvedToolAuthorization: Codable, Equatable, Sendable {
             workspaceID: workspaceID,
             workspaceTaskID: workspaceTaskID,
             workspaceRootPath: workspaceRootPath,
-            workspaceLeaseFingerprint: workspaceLeaseFingerprint)
+            workspaceLeaseFingerprint: workspaceLeaseFingerprint,
+            targetAgentInferenceBinding: targetAgentInferenceBinding)
     }
 }
 

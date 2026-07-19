@@ -1,6 +1,6 @@
 # COWORK_PRINCIPLES
 
-本文提炼自仓内 `docs/COWORK_AGENT_ARCHITECTURE.md` / `COWORK_TASK_CONTEXT_MODEL.md` / `COWORK_CURRENT_FINDINGS.md` / `COWORK_MIGRATION_PLAN.md` / `COWORK_AGENT_INVOCATION_MODEL.md` 及原 `AGENTS.md` 的英文原则。它是 Cowork 架构的原则基准，**不是**当前完成度声明。修改 Cowork / AgentKernel / MessageBus / 权限 / agent 编排前必读。
+本文提炼自仓内 `docs/COWORK_AGENT_ARCHITECTURE.md` / `COWORK_TASK_CONTEXT_MODEL.md` / `COWORK_CURRENT_FINDINGS.md` / `COWORK_MIGRATION_PLAN.md` / `COWORK_AGENT_INVOCATION_MODEL.md` / `PER_AGENT_INFERENCE_PROFILES.md` 及原 `AGENTS.md` 的英文原则。它是 Cowork 架构的原则基准，**不是**当前完成度声明。修改 Cowork / AgentKernel / MessageBus / 权限 / agent 编排前必读。
 
 ## 1. 核心原则
 
@@ -37,7 +37,7 @@ AgentInvocation  现有 TaskContract + TaskGraph + AgentScheduler 的一次 agen
 上述四层与以下五个协作抽象正交。Cowork 仍围绕这些边界构建：
 
 ```text
-Agent Identity          持久本地身份（id/displayName/model/workspace lease/mailbox/status）
+Agent Identity          持久本地身份（id/displayName/exact inference binding/workspace lease/mailbox/status）
 Task Contract           每 AgentInvocation 分派的角色与交付物
 Scoped Context          上下文按作用域投影，非全量原始 transcript
 Capability Lease        能力按租约授予，非永久继承
@@ -45,7 +45,7 @@ Task Graph + Scheduler  任务图 + 调度器驱动协作
 ```
 
 ### 2.1 Agent Identity
-Agent 是持久本地身份。应含 `id` / `displayName` / `model` / `workspace lease or default workspace` / `local memory or mailbox` / `status`。**不应**含永久 "leaf" 或 "coordinator" 角色。
+Agent 是持久本地身份。应含 `id` / `displayName` / exact `AgentInferenceBinding` / `workspace lease or default workspace` / `local memory or mailbox` / `status`。兼容 `model` 字段不能覆盖 exact binding。**不应**含永久 "leaf" 或 "coordinator" 角色。
 
 ### 2.2 Task Contract（AgentInvocation 层）
 角色按 AgentInvocation 分派。Task contract 应告诉 agent 它为何存在于当前工作流、预期交付什么；它不是用户可见 WorkTask。建议 shape：
@@ -62,10 +62,11 @@ struct TaskContract {
     let relatedAgentIDs: [AgentID]
     let workspaceLease: WorkspaceLease?
     let capabilityLease: CapabilityLease
+    let agentInferenceBinding: AgentInferenceBinding? // legacy decode 可为空；strict live runtime 必须解析
     let contextScopes: Set<ContextScope>
 }
 ```
-好的 task contract 回答：为什么创建、谁指派、交付什么、相关任务/agent、血缘。
+好的 task contract 回答：为什么创建、谁指派、交付什么、相关任务/agent、血缘，并冻结本次 invocation 使用的 exact inference binding。运行中的 task 不得被 future-agent default、catalog current refresh 或 host rebind 改写。
 
 ### 2.3 Scoped Context
 每个 agent 应知道**为什么**它在运行。收到 task 时，其上下文应含：
@@ -89,6 +90,27 @@ agent-local history
 explicitly shared artifacts
 workspace-relevant observations
 ```
+
+### 2.3a Inference Binding
+
+推理配置属于 agent identity 的 durable route snapshot，但与权限/工具/工作区 lease 正交。`AgentInferenceBinding` 必须指向 versioned immutable connection/profile revision，并固定 model、opaque durable variant、安全 route label/trust domain/egress classification 与 opaque definition digest；macOS/CLI raw variant config key 只属于 local presentation selector，不能进入 binding/EventLog。同一个 model ID 的不同 effort、connection、credential reference 或 endpoint 是不同 profile。Catalog current/default 只是未来 agent 的创建模板，不能成为已有 agent 的动态指针。
+
+- fresh `@main` 使用 host 当前选择的 exact default；恢复必须使用 durable roster binding。
+- `spawn_agent` 未指定 profile 时精确继承 issuer binding；显式 profile 必须 host-approved，不能让模型直接提交 raw endpoint/model/options。
+- `delegate_task` 不改变目标 binding，权限 target 必须包含其安全快照并在执行前复核。
+- rebind 是 host-only、idle-only、durable-first 的显式状态迁移，只影响未来 invocation；reviewer 不参与普通 rebind。
+- legacy 无 binding、missing revision、definition mismatch、unsupported wire 或显式能力不兼容一律 fail closed，不得回退 current/default/同名 model。
+- GUI/CLI recovery 的 startup gate 只要求 `@main` exact-resolved、reviewer/control plane ready，并先完成 Goal recovery；non-empty CLI session 缺失 `@main` 时只能由 host `/agent restore-main <path> <profile-id>` 显式恢复，不能套用 today default。ordinary worker unresolved 不得冻结全局 scheduler：它自己的 queued invocation 必须在 provider request 前 durable fail closed 并清除 active/queued fence，其他 agents 继续运行，随后 host 才可在该 worker idle 时 rebind。
+- Modern CLI unqualified model 只有唯一 route match 时才选择该 route；explicit reasoning 必须命中 configured variant/base effort，否则 fail closed，不能合成 synthetic profile。
+- reviewer 与 GoalVerifier 是控制面；其 provider 从首次 exact `@main` binding 冻结，data-plane rebind 不能静默 retarget。
+- binding、EventLog、permission preview、roster/UI 只显示安全 identity/revision/model/variant/route label/trust/egress 分类与不可逆 digest；不得暴露 raw endpoint、credential、headers/query/options 或完整实际 digest。Permission target fingerprint 必须绑定这些安全分类并在 review/prepare/executor 边界复核。
+- Cowork durable profile options 只接受显式 allowlisted schema；unknown key、错误 shape/size/depth、secret/auth/header/query/URL/endpoint-like container、runtime structural/stream/multi-candidate fields 全部 fail closed。Chat/Code 兼容 `ProviderEndpoint` 仍可 lossless 保留 arbitrary model JSON，但所有 OpenAI-compatible Chat/Agent request 都必须移除配置 `stream_options`/候选控制并固定 `n = 1`；host output-token ceiling 另移除竞争 aliases。Provider/custom runtime diagnostic 在成为 durable 事实前必须统一把完整 HTTP(S) URL 与 secret 脱敏并限长；ordinary permission preview 不使用该 URL-wide diagnostic rule。所有 provider transport 对 HTTP 30x 都 fail closed，不得自动跟随到未进入 exact binding/trust review 的 endpoint。
+
+Inference catalog 的 immutable revision 也需要可并发恢复：reconcile 的完整旧值读取、revision allocation、snapshot 校验和原子替换必须在同一 mutation lock 内；同进程多个 store instance 与多个进程都不能丢失历史 revision 或分配碰撞。跨进程锁必须锚定稳定、owner-only、no-follow 的普通单链接 sidecar inode；未知平台或不安全 lock state fail closed，不得无锁降级。
+
+Provider resolution 也必须是原子的：shipping resolver 一次返回 exact binding、model 与 provider；Orchestrator 统一与 live agent/task snapshot 复核。Strict runtime 不能走 provider-only factory，也不能允许 app 在多个 mutable lookup 间拼接 route tuple；任一 binding/model/route/trust/egress mismatch 必须在 durable admission 或真实 provider request 前关闭。Catalog candidate update 与 attach/spawn/delegate/rebind 共享 admission lock；如果 exact resolver 在锁外 `await` suspension，返回后必须重检 approved map、roster/current binding 与 fingerprint。AgentLoop execution revalidation hook 还必须在 durable prepare 前 resolve，并在 await 后再次校验，不能让旧授权越过 catalog/roster TOCTOU。Ordinary attach 的 permission-review await 也不能成为豁免：allow 后、durable admission 前必须再次 exact-resolve，并比较 review/resolve/commit 三个 catalog snapshot。Fresh `bootstrapMainAgent` 没有模型 review，但 admission wait 前后必须分别复核 empty-session facts，以锁外二次 resolve + 锁内 catalog/empty-session recheck 关闭同类竞态。
+
+当前 shipped resolver 只有 OpenAI-compatible wire，且没有独立 `InferenceRouteLease`、per-task route approval、跨 trust-domain 专用审批或完整 app model capability metadata。不能把 `CapabilityLease`、`WorkspaceLease`、host-approved catalog 或现有 permission snapshot 宣称为上述未实现能力。详细契约见 `docs/PER_AGENT_INFERENCE_PROFILES.md`。
 
 ### 2.4 Capability Lease
 工具应按 capability lease 暴露。普通 worker task 不应收到 coordinator 工具（`spawn_agent` / `remove_agent` / `delegate_task`）。若 task 需委派，经 `CapabilityLease.delegation` 显式授予。子 agent 不应仅因被 spawn 就获得 coordinator 能力。Git、文档/媒体与网络/浏览器工具同样按 lease 收窄：新 spawn 的 worker 默认 `read_only`，只能获得安全只读能力；用户/上级显式请求 `read_write` 且不超过 issuer WorkspaceLease ceiling 时，worker 可获得不含 coordinator 工具的 Code/data-plane 写入能力。`canCoordinate` 与 workspace access 正交：只读 coordinator 可调度但不能写 workspace，read-write worker 可执行文件工作但不能 spawn/delegate 下级。
@@ -149,7 +171,7 @@ unbounded agent spawning
 
 ## 5. 工作区与安全规则
 
-Cowork 可以采用项目制：一个 session 绑定一个或多个用户选择的工作目录，并有一个 `@main` 主 agent。用户默认只向 `@main` 下达项目任务；`@main` 通过工具创建、委派、调取、删除子 agent，并管理任务、上下文、权限 profile、token budget 等 project metadata。但 project/session settings 只是本地元数据与 UI 投影，不得替代 task contract、capability lease、workspace lease 或权限门。
+Cowork 可以采用项目制：一个 session 绑定一个或多个用户选择的工作目录，并有一个 `@main` 主 agent。用户默认只向 `@main` 下达项目任务；`@main` 通过工具创建、委派、调取、删除子 agent，并管理任务、上下文、未来-agent inference default、权限 profile、token budget 等 project metadata。但 project/session settings 只是本地元数据与 UI 投影；future default 不得重写现有 agent，也不得替代 task contract、exact inference binding、capability lease、workspace lease 或权限门。
 
 工作区扩展**绝非**只读。创建或附加 agent 到新目录是能力/工作区扩展，必须经权限。唯一例外是 brand-new session 的初始 bootstrap：用户在 New Cowork Session 文件选择器或 CLI workspace 参数中明确选定 primary workspace 后，这次显式选择本身授权固定 `@main` 在该 canonical root 建立默认 workspace/capability lease；该路径必须同时要求空 EventLog、空 roster、固定 `@main` 身份、敏感/过宽根目录拒绝和 admission batch durable-first，不能被普通 attach/spawn/tool/recovery 复用。初始 `@permission-reviewer` 可随后用其固定 read_only + 空工具 lease 挂载；两者之间不得再让模型审批同一次 primary-workspace 选择。
 
@@ -194,6 +216,8 @@ hard deny remains final before the reviewer can see anything
 - task-scoped lease fields are descriptive but unenforced or leak after terminal state
 - task context grows without request budgets or places dynamic event data in system role
 - max-iteration/incomplete provider responses can be reported as completed
+- session-global provider/model selection makes existing agents drift together
+- recovery silently substitutes a current/default model for an unresolved exact binding
 
 仍需持续关注：
 - priorHistory/global context projection must stay scoped for task runs
@@ -206,6 +230,10 @@ hard deny remains final before the reviewer can see anything
 - cancellation is cooperative; provider/tool implementations need their own bounded cancellation/watchdog behavior
 - real-provider crash/restart and long-running Goal/WorkTask multi-agent GUI/CLI matrices remain device-level validation work
 - EventLog-derived context/recovery index remains a future long-session performance optimization; request context itself must remain bounded even before such an index exists
+- immutable inference revisions and exact agent/task bindings must never be collapsed back to mutable current/default pointers
+- future-agent default changes must not rewrite existing agents; implicit spawn inherits exactly, explicit profile stays host-approved, and rebind remains host-only/idle-only/durable-first
+- permission/control-plane audit must retain a safe target-binding snapshot without leaking endpoint, credential or options
+- non-OpenAI-compatible wires, route leases/cross-trust-domain approval, complete capability metadata and real multi-upstream E2E remain explicit future work rather than implied current behavior
 ```
 
 处理 Cowork 时把上述条目当作回归清单；若源码与本清单冲突，以当前源码和 `docs/DO_NOT_BREAK.md` 的更具体禁区为准。
@@ -229,6 +257,7 @@ hard deny remains final before the reviewer can see anything
 8. Expand semantic event schema and tests.
 9. Add Goal / WorkTask / ContinuationRun above the existing AgentInvocation layer without renaming old durable event types.
 10. Add host-driven continuation and an independent GoalVerifier; never let an agent self-certify Goal completion.
+11. Add versioned immutable inference catalog + exact per-agent binding before adding multi-wire, route-lease or fallback policy; do not retrofit a mutable session-global model pointer into agent identity.
 ```
 
 ## 8. 测试期望
@@ -244,7 +273,7 @@ capability lease controls tool registry
 worker receives only read-only document/media tools and no git-control/git-remote/browser/network tools by default
 delegation cycle is rejected
 workspace expansion requires permission
-fresh-session bootstrap attaches fixed @main without model review and cannot be reused after any durable session state exists
+fresh-session bootstrap attaches fixed @main with a host-selected exact inference binding, without model review, and cannot be reused after any durable session state exists
 agent-to-agent event records caller, target, task, and causal chain
 automatic permission reviewer cannot override hard deny
 automatic permission reviewer can be enabled/disabled without becoming a normal worker
@@ -271,6 +300,24 @@ only actually presented mailbox messages are consumed; cancelled-run messages ar
 late scoped mailbox sends after cancellation are durably discarded rather than consumed, including across restore and a later run
 task-scoped capability/workspace leases are enforced, revoked, and safely renewed on retry
 dynamic task/message/event text stays in a bounded, escaped user-role context block
+inference catalog reuses semantically equal revisions, appends on semantic change, retains old revisions, and rejects unsafe/corrupt/insecure definitions without overwriting the store
+Cowork durable options accept only the explicit bounded schema; unknown/shape/secret/auth/header/query/URL/endpoint/structural/stream/multi-candidate fields fail closed, while Chat/Code arbitrary ProviderEndpoint options remain lossless
+every OpenAI-compatible Chat/Agent request strips config stream_options/candidate controls and forces n=1; host includeUsage alone rebuilds the usage shape and a host token ceiling also strips competing token aliases
+legacy inference fields decode as unresolved; exact resolver never falls back to current/default and fails before secret/network access on missing/mismatched revisions
+same model with different variants/connections/credential references remains isolated across two agents in one session
+implicit spawn inherits the issuer's complete exact binding; explicit profile is host-approved and raw model/profile ambiguity is rejected
+TaskContract freezes inference binding; live roster mismatch fails before provider dispatch
+busy rebind is rejected; host-only idle rebind persists previous/new binding before memory change and affects only future invocations
+delegate authorization snapshots the target's exact safe inference binding including route/trust/egress classification and revalidates its derived fingerprint after review and prepare
+catalog update and admission/rebind share a lock; spawn/rebind and AgentLoop pre-prepare execution revalidation reject catalog/roster changes that occur while an async exact resolver is suspended
+ordinary attach revalidates the exact approved profile after permission-review await; bootstrapMain revalidates exact profile plus empty-session facts around its admission wait before durable admission
+reviewer/GoalVerifier provider stays frozen when a data-plane agent is rebound
+CLI compiles multiple routes/models/variants, retains old exact revisions, and resolves each connection revision with its own credential reference rather than the selected route's key
+CLI selects an unqualified model's route only when unique, rejects missing reasoning variants, and requires explicit restore-main for a non-empty session with no durable @main
+GUI/CLI gate startup only on exact-resolved @main plus reviewer/control-plane readiness; an unresolved ordinary worker durably fails only its own queued invocation before provider dispatch, clears its busy fence, and does not pause other agents
+macOS raw variant config keys never enter durable bindings/events; diagnostic URLs are redacted and provider HTTP 30x redirects are never followed
+roster/UI/CLI inference presentation never exposes raw endpoint, credential, options, secret-shaped labels, or a complete actual digest
+provider/custom runtime diagnostics are secret-redacted again before durable ErrorPayload/task failure persistence
 unknown future events do not cause EventLog sequence reuse
 ```
 

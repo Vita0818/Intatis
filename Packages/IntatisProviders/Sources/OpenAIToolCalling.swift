@@ -307,6 +307,7 @@ extension OpenAIWireProvider: ToolCallingProvider {
         root["model"] = .string(request.model.rawValue)
         root["messages"] = .array(request.messages.map(Self.messageJSON))
         root["stream"] = .bool(true)
+        root["n"] = .number(1)
         if !request.tools.isEmpty {
             root["tools"] = .array(request.tools.map(Self.toolJSON))
         }
@@ -317,6 +318,13 @@ extension OpenAIWireProvider: ToolCallingProvider {
             root["reasoning_effort"] = .string(r.rawValue)
         }
         if let maxOutputTokens = request.maxOutputTokens {
+            // The invocation ceiling is host-owned. A durable inference profile
+            // may carry a provider-native limit when no host ceiling is set,
+            // but it must not leave a competing alias that an upstream could
+            // prefer over the narrower runtime value.
+            for key in Array(root.keys) where Self.isOutputTokenCeilingKey(key) {
+                root.removeValue(forKey: key)
+            }
             root["max_tokens"] = .number(Double(maxOutputTokens))
         }
         if request.includeUsage {
@@ -332,6 +340,19 @@ extension OpenAIWireProvider: ToolCallingProvider {
                    forHTTPHeaderField: "Authorization")
         r.httpBody = try JSONEncoder().encode(JSONValue.object(root))
         return r
+    }
+
+    private static func isOutputTokenCeilingKey(_ rawKey: String) -> Bool {
+        let normalized = rawKey.lowercased().unicodeScalars
+            .filter { CharacterSet.alphanumerics.contains($0) }
+            .map(String.init)
+            .joined()
+        return [
+            "maxtokens",
+            "maxcompletiontokens",
+            "maxoutputtokens",
+            "maxnewtokens",
+        ].contains(normalized)
     }
 
     static func messageJSON(_ m: AgentMessage) -> JSONValue {

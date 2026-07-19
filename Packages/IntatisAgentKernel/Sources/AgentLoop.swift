@@ -34,9 +34,24 @@ public struct ToolAuthorizationPreparationRequest: Sendable {
     }
 }
 
+/// Host-resolved authorization facts produced before the immutable registry
+/// snapshot is created. `targetAgentInferenceBinding` is deliberately a
+/// structured protocol value rather than free-form metadata so the exact
+/// route/profile revision survives review and durable execution tickets.
+public struct ToolAuthorizationPreparation: Sendable {
+    public var intent: PermissionIntent
+    public var targetAgentInferenceBinding: AgentInferenceBinding?
+
+    public init(intent: PermissionIntent,
+                targetAgentInferenceBinding: AgentInferenceBinding? = nil) {
+        self.intent = intent
+        self.targetAgentInferenceBinding = targetAgentInferenceBinding
+    }
+}
+
 public typealias ToolAuthorizationPreparer = @Sendable (
     ToolAuthorizationPreparationRequest
-) async throws -> PermissionIntent
+) async throws -> ToolAuthorizationPreparation
 
 /// Terminal failures produced by the agent loop itself, rather than by a
 /// provider or tool. Callers can distinguish these from a successful (possibly
@@ -820,7 +835,9 @@ public struct AgentLoop: Sendable {
             continuationRunID: executionScope?.continuationRunID ?? context.taskContract?.continuationRunID,
             workTaskID: executionScope?.workTaskID ?? context.taskContract?.workTaskID,
             invocationTaskID: executionScope?.invocationTaskID ?? rootTaskID ?? context.taskContract?.id,
-            agentID: executionScope?.agentID ?? agent.name)))
+            agentID: executionScope?.agentID ?? agent.name,
+            agentInferenceBinding: context.taskContract?.agentInferenceBinding
+                ?? agent.agentInferenceBinding)))
     }
 
     // MARK: - Tool execution with permission
@@ -863,10 +880,16 @@ public struct AgentLoop: Sendable {
                          denialCircuitBreaker: ToolDenialCircuitBreaker,
                          sideEffectEvidence: SideEffectEvidenceLedger) async throws -> String {
         try Task.checkCancellation()
-        try await log.append(.toolCall(ToolCallPayload(
-            toolCallId: toolCall.id, agent: agent.name, name: toolCall.name, args: toolCall.arguments)))
 
         guard let tool = registry.tool(named: toolCall.name) else {
+            let safeUnknownToolName = PermissionReviewTextSanitizer.sanitizeDiagnostic(
+                toolCall.name,
+                maxCharacters: 128).text
+            try await appendDurableToolCall(
+                toolCall,
+                canonicalName: safeUnknownToolName,
+                validatedArguments: nil,
+                forceRedaction: true)
             let denialSignature = "unknown\u{001F}\(toolCall.name)\u{001F}\(toolCall.arguments.trimmingCharacters(in: .whitespacesAndNewlines))"
             if let repeatedAttempt = await denialCircuitBreaker.noteRepeatedAttempt(
                 signature: denialSignature),
@@ -875,8 +898,8 @@ public struct AgentLoop: Sendable {
             }
             let available = registry.descriptors().map(\.name).sorted().joined(separator: ", ")
             let message = available.isEmpty
-                ? "unknown tool: \(toolCall.name)"
-                : "unknown tool: \(toolCall.name). Available tools: \(available)"
+                ? "unknown tool: \(safeUnknownToolName)"
+                : "unknown tool: \(safeUnknownToolName). Available tools: \(available)"
             try await log.append(.toolResult(ToolResultPayload(toolCallId: toolCall.id, observation: message)))
             await denialCircuitBreaker.recordDenial(signature: denialSignature)
             return message
@@ -889,7 +912,17 @@ public struct AgentLoop: Sendable {
         switch normalizeToolArguments(toolCall.arguments, descriptor: descriptor) {
         case .valid(let arguments):
             normalizedArguments = arguments
+            try await appendDurableToolCall(
+                toolCall,
+                canonicalName: descriptor.name,
+                validatedArguments: arguments,
+                forceRedaction: Self.redactsDurableArguments(for: descriptor.name))
         case .invalid(let message):
+            try await appendDurableToolCall(
+                toolCall,
+                canonicalName: descriptor.name,
+                validatedArguments: nil,
+                forceRedaction: true)
             let denialSignature = "invalid\u{001F}\(descriptor.name)\u{001F}\(toolCall.arguments.trimmingCharacters(in: .whitespacesAndNewlines))"
             if let repeatedAttempt = await denialCircuitBreaker.noteRepeatedAttempt(
                 signature: denialSignature),
@@ -953,10 +986,10 @@ public struct AgentLoop: Sendable {
         }
 
         let authorizationID = IDGen.random(prefix: "tool-authorization")
-        let intent: PermissionIntent
+        let preparation: ToolAuthorizationPreparation
         do {
             if let authorizationPreparer {
-                intent = try await authorizationPreparer(
+                preparation = try await authorizationPreparer(
                     ToolAuthorizationPreparationRequest(
                         authorizationID: authorizationID,
                         toolName: descriptor.name,
@@ -964,7 +997,7 @@ public struct AgentLoop: Sendable {
                         baseIntent: baseIntent,
                         invocation: authorizationInvocation))
             } else {
-                intent = baseIntent
+                preparation = ToolAuthorizationPreparation(intent: baseIntent)
             }
         } catch {
             let reason = "authorization preflight failed: \(error.localizedDescription)"
@@ -989,6 +1022,7 @@ public struct AgentLoop: Sendable {
                 authorization: nil)
             return message
         }
+        let intent = preparation.intent
 
         var authorization: ResolvedToolAuthorization
         do {
@@ -1000,7 +1034,8 @@ public struct AgentLoop: Sendable {
                 authorizationID: authorizationID,
                 invocation: authorizationInvocation,
                 capabilityLease: capabilityLease,
-                workspaceLease: workspaceLease)
+                workspaceLease: workspaceLease,
+                targetAgentInferenceBinding: preparation.targetAgentInferenceBinding)
         } catch {
             let reason = error.localizedDescription
             let message = Self.permissionDeniedMessage(reason)
@@ -1351,6 +1386,55 @@ public struct AgentLoop: Sendable {
         // Persist completed side effects before surfacing a concurrent cancel.
         try Task.checkCancellation()
         return observation.text
+    }
+
+    /// Durable tool-call events are an audit/display surface, not a raw model
+    /// argument store. Unknown or schema-invalid calls are never persisted
+    /// verbatim. Inference-control calls are also fully redacted because even
+    /// a valid string field could otherwise smuggle an endpoint, header,
+    /// credential, or provider-native option into EventLog before the
+    /// authorization layer rejects it. Other validated tools retain a bounded,
+    /// secret-scrubbed display value while their exact identity is carried by
+    /// the additive digest and character count.
+    private func appendDurableToolCall(
+        _ toolCall: ToolCall,
+        canonicalName: String,
+        validatedArguments: String?,
+        forceRedaction: Bool
+    ) async throws {
+        let rawArguments = toolCall.arguments
+        let displayArguments: String
+        let redacted: Bool
+        let durableDigest: String?
+        if forceRedaction || validatedArguments == nil {
+            displayArguments = #"{"_intatis":"arguments_redacted"}"#
+            redacted = true
+            // Never turn rejected/inference-control secret material into an
+            // offline verifier. A plain digest of low-entropy endpoints,
+            // headers, or credentials is still sensitive.
+            durableDigest = nil
+        } else {
+            let sanitized = PermissionReviewTextSanitizer.sanitize(
+                validatedArguments!,
+                maxCharacters: 8_192)
+            displayArguments = sanitized.text
+            redacted = sanitized.redacted || sanitized.truncated
+            durableDigest = redacted
+                ? nil
+                : ToolRegistry.authorizationDigest(validatedArguments!)
+        }
+        try await log.append(.toolCall(ToolCallPayload(
+            toolCallId: toolCall.id,
+            agent: agent.name,
+            name: canonicalName,
+            args: displayArguments,
+            argsDigest: durableDigest,
+            argsCharacterCount: rawArguments.count,
+            argsRedacted: redacted)))
+    }
+
+    private static func redactsDurableArguments(for toolName: String) -> Bool {
+        toolName == "spawn_agent"
     }
 
     private enum ToolArgumentNormalization {

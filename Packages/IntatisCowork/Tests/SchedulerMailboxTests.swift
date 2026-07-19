@@ -59,7 +59,8 @@ private func schedulerUnitTask(_ id: String,
                                issuer: AgentID = AgentID(rawValue: "main"),
                                parentTaskID: TaskID? = nil,
                                input: String? = nil,
-                               attempt: Int? = 1) -> ScheduledTask {
+                               attempt: Int? = 1,
+                               agentInferenceBinding: AgentInferenceBinding? = nil) -> ScheduledTask {
     let taskID = TaskID(rawValue: id)
     let contract = TaskContract(
         id: taskID,
@@ -68,7 +69,8 @@ private func schedulerUnitTask(_ id: String,
         parentTaskID: parentTaskID,
         objective: "Objective for \(id)",
         roleHint: "scheduler test worker",
-        expectedDeliverable: "scheduler test result")
+        expectedDeliverable: "scheduler test result",
+        agentInferenceBinding: agentInferenceBinding)
     return ScheduledTask(
         contract: contract,
         input: input ?? contract.objective,
@@ -80,6 +82,20 @@ private func schedulerUnitTask(_ id: String,
         hopCount: 1,
         visitedAgents: [issuer, assignee],
         attempt: attempt)
+}
+
+private func schedulerInferenceBinding(_ profile: String,
+                                       revision: String = "rev-1") -> AgentInferenceBinding {
+    AgentInferenceBinding(
+        inferenceProfileRef: InferenceProfileRef(
+            inferenceProfileID: InferenceProfileID(rawValue: profile),
+            inferenceProfileRevision: InferenceProfileRevision(rawValue: revision)),
+        inferenceConnectionID: InferenceConnectionID(rawValue: "connection-\(profile)"),
+        inferenceConnectionRevision: InferenceConnectionRevision(rawValue: "connection-rev-1"),
+        modelID: ModelID(rawValue: "model-\(profile)"),
+        variantID: "high",
+        safeRouteLabel: "route-\(profile)",
+        immutableDefinitionFingerprint: "fingerprint-\(profile)-\(revision)")
 }
 
 final class SchedulerMailboxTests: XCTestCase {
@@ -340,6 +356,36 @@ final class SchedulerMailboxTests: XCTestCase {
             .rejected(task.contract.id, .retryAttemptLimitExceeded))
     }
 
+    func testSchedulerRetryRejectsChangedInferenceBinding() {
+        let worker = AgentID(rawValue: "worker")
+        let originalBinding = schedulerInferenceBinding("profile-original")
+        let task = schedulerUnitTask(
+            "task_binding_retry",
+            assignee: worker,
+            agentInferenceBinding: originalBinding)
+        var scheduler = AgentScheduler()
+        XCTAssertEqual(scheduler.enqueue(task, mode: .newTask), .enqueued(task.contract.id))
+        XCTAssertEqual(scheduler.claimNext(), task)
+        XCTAssertTrue(scheduler.recordStarted(task: task))
+        scheduler.recordFailed(task: task, error: "retry me")
+
+        var changedBindingRetry = task
+        changedBindingRetry.attempt = 2
+        changedBindingRetry.contract.agentInferenceBinding = schedulerInferenceBinding("profile-changed")
+        XCTAssertEqual(
+            scheduler.enqueue(changedBindingRetry, mode: .retry),
+            .rejected(task.contract.id, .retryTaskMismatch))
+
+        var exactBindingRetry = task
+        exactBindingRetry.attempt = 2
+        XCTAssertEqual(
+            scheduler.enqueue(exactBindingRetry, mode: .retry),
+            .retryReplaced(task.contract.id))
+        XCTAssertEqual(
+            scheduler.queuedTask(taskID: task.contract.id)?.contract.agentInferenceBinding,
+            originalBinding)
+    }
+
     func testSchedulerClaimsAtMostOneTaskPerAgentButDifferentAgentsCanRunTogether() {
         let workerA = AgentID(rawValue: "worker-a")
         let workerB = AgentID(rawValue: "worker-b")
@@ -396,8 +442,16 @@ final class SchedulerMailboxTests: XCTestCase {
     func testSchedulerSnapshotRestoreRequeuesClaimedWorkAndPreservesMailbox() throws {
         let workerA = AgentID(rawValue: "worker-a")
         let workerB = AgentID(rawValue: "worker-b")
-        let running = schedulerUnitTask("task_running", assignee: workerA)
-        let queued = schedulerUnitTask("task_queued", assignee: workerB)
+        let runningBinding = schedulerInferenceBinding("profile-running")
+        let queuedBinding = schedulerInferenceBinding("profile-queued", revision: "rev-7")
+        let running = schedulerUnitTask(
+            "task_running",
+            assignee: workerA,
+            agentInferenceBinding: runningBinding)
+        let queued = schedulerUnitTask(
+            "task_queued",
+            assignee: workerB,
+            agentInferenceBinding: queuedBinding)
         let message = PendingAgentMessage(
             id: MessageID(rawValue: "msg_snapshot"),
             sender: workerB,
@@ -419,6 +473,12 @@ final class SchedulerMailboxTests: XCTestCase {
 
         XCTAssertFalse(restored.isAgentBusy(workerA))
         XCTAssertEqual(restored.queuedTasks(), [running, queued])
+        XCTAssertEqual(
+            restored.queuedTask(taskID: running.contract.id)?.contract.agentInferenceBinding,
+            runningBinding)
+        XCTAssertEqual(
+            restored.knownTask(taskID: queued.contract.id)?.contract.agentInferenceBinding,
+            queuedBinding)
         XCTAssertEqual(restored.record(for: running.contract.id)?.status, .queued)
         XCTAssertEqual(restored.mailbox(for: workerA).pendingTasks, [running.contract.id])
         XCTAssertEqual(restored.peekMessage(for: workerA), message)

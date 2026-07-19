@@ -52,6 +52,27 @@ private func leaseTaskCreatedContracts(_ events: [Envelope]) -> [TaskContract] {
 }
 
 final class ToolRegistryLeaseTests: XCTestCase {
+    func testInferenceAuthorizationFingerprintChangesAcrossTrustDomains() {
+        let ref = InferenceProfileRef(
+            inferenceProfileID: InferenceProfileID(rawValue: "same-profile"),
+            inferenceProfileRevision: InferenceProfileRevision(rawValue: "rev-1"))
+        let first = AgentInferenceBinding(
+            inferenceProfileRef: ref,
+            inferenceConnectionID: InferenceConnectionID(rawValue: "same-connection"),
+            inferenceConnectionRevision: InferenceConnectionRevision(rawValue: "connection-rev-1"),
+            modelID: ModelID(rawValue: "same-model"),
+            safeRouteLabel: "Route A",
+            trustDomain: "trust-a",
+            egressClassification: "external",
+            immutableDefinitionFingerprint: "same-immutable-digest")
+        var second = first
+        second.trustDomain = "trust-b"
+
+        XCTAssertNotEqual(
+            ToolRegistry.authorizationFingerprint(first),
+            ToolRegistry.authorizationFingerprint(second))
+    }
+
     func testApplyPatchCapabilityRegistersBothConcreteEditToolsFromOneSource() throws {
         let lease = CapabilityLease(tools: [.applyPatch])
         let registry = Orchestrator.toolRegistry(for: lease)

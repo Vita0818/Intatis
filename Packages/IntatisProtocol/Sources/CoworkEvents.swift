@@ -77,17 +77,22 @@ public struct AgentAttachRequestedPayload: Codable, Equatable, Sendable {
     public var path: String
     public var model: ModelID
     public var profile: String
+    /// Exact inference identity proposed for this admission. Nil identifies a
+    /// legacy request that predates per-agent inference bindings.
+    public var agentInferenceBinding: AgentInferenceBinding?
     public var metadata: CoworkEventMetadata?
 
     public init(agent: AgentID,
                 path: String,
                 model: ModelID,
                 profile: String,
+                agentInferenceBinding: AgentInferenceBinding? = nil,
                 metadata: CoworkEventMetadata? = nil) {
         self.agent = agent
         self.path = path
         self.model = model
         self.profile = profile
+        self.agentInferenceBinding = agentInferenceBinding
         self.metadata = metadata
     }
 }
@@ -97,13 +102,27 @@ public struct AgentAttachedPayload: Codable, Equatable, Sendable {
     public var path: String
     public var model: ModelID
     public var profile: String
+    /// Durable inference identity of the admitted agent. Nil is preserved as a
+    /// legacy/unresolved fact rather than being replaced by a current default.
+    public var agentInferenceBinding: AgentInferenceBinding?
+    /// Present only when this roster snapshot durably settles a host rebind.
+    /// Keeping both identities in the same additive event makes replay and
+    /// audit explicit without exposing any profile definition or secret.
+    public var previousAgentInferenceBinding: AgentInferenceBinding?
+    public var inferenceBindingChangeReason: String?
     public var metadata: CoworkEventMetadata?
     public init(agent: AgentID, path: String, model: ModelID, profile: String,
+                agentInferenceBinding: AgentInferenceBinding? = nil,
+                previousAgentInferenceBinding: AgentInferenceBinding? = nil,
+                inferenceBindingChangeReason: String? = nil,
                 metadata: CoworkEventMetadata? = nil) {
         self.agent = agent
         self.path = path
         self.model = model
         self.profile = profile
+        self.agentInferenceBinding = agentInferenceBinding
+        self.previousAgentInferenceBinding = previousAgentInferenceBinding
+        self.inferenceBindingChangeReason = inferenceBindingChangeReason
         self.metadata = metadata
     }
 }
@@ -124,17 +143,20 @@ public struct AgentSpawnRequestedPayload: Codable, Equatable, Sendable {
     public var agent: AgentID
     public var path: String
     public var model: ModelID?
+    public var agentInferenceBinding: AgentInferenceBinding?
     public var metadata: CoworkEventMetadata?
 
     public init(requestedBy: AgentID? = nil,
                 agent: AgentID,
                 path: String,
                 model: ModelID? = nil,
+                agentInferenceBinding: AgentInferenceBinding? = nil,
                 metadata: CoworkEventMetadata? = nil) {
         self.requestedBy = requestedBy
         self.agent = agent
         self.path = path
         self.model = model
+        self.agentInferenceBinding = agentInferenceBinding
         self.metadata = metadata
     }
 }
@@ -144,17 +166,20 @@ public struct AgentSpawnedPayload: Codable, Equatable, Sendable {
     public var agent: AgentID
     public var path: String
     public var model: ModelID
+    public var agentInferenceBinding: AgentInferenceBinding?
     public var metadata: CoworkEventMetadata?
 
     public init(requestedBy: AgentID? = nil,
                 agent: AgentID,
                 path: String,
                 model: ModelID,
+                agentInferenceBinding: AgentInferenceBinding? = nil,
                 metadata: CoworkEventMetadata? = nil) {
         self.requestedBy = requestedBy
         self.agent = agent
         self.path = path
         self.model = model
+        self.agentInferenceBinding = agentInferenceBinding
         self.metadata = metadata
     }
 }

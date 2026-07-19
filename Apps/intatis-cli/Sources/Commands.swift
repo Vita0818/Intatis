@@ -3,13 +3,14 @@ import IntatisProviders
 
 func printConfig(_ config: CLIConfig) {
     out("""
-    endpoint : \(config.baseURL.absoluteString)
+    endpoint : (configured, hidden) · \(config.selectedRouteLabel)
     model    : \(config.model)
     wire     : \(config.wire.rawValue)
     reasoning: \(config.reasoningEffort?.rawValue ?? "off")
     mode     : \(config.mode.rawValue)
-    api key  : \(config.apiKey.isEmpty ? "(unset)" : "(set, hidden)")
-    config   : \(ConfigFile.url.path)
+    api key  : \(config.hasConfiguredCredential ? "(configured, hidden)" : "(unset)")
+    routes   : \(config.providerRoutes.count)
+    config   : \(config.configurationFileURL == nil ? ConfigFile.url.path : "(advanced Intatis config, path hidden)")
 
     """)
 }
@@ -28,7 +29,8 @@ func printHelp() {
       intatis selftest        Offline smoke test (no key)
       intatis help
 
-    CONFIG  (env var > ~/.config/intatis/config.json > default)
+    CONFIG  (env var > advanced Intatis config > legacy config > default)
+      INTATIS_CONFIG     optional intatis.json/jsonc using model + enabled_providers + provider map
       INTATIS_BASE_URL   default https://api.openai.com/v1
       INTATIS_API_KEY    required (any non-empty for local servers)
       INTATIS_MODEL      default gpt-4o-mini

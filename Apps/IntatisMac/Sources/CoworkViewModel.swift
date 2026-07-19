@@ -13,61 +13,78 @@ import IntatisSharedUI
 
 private actor ProviderRegistryBox {
     private var registry: ProviderRegistry
-    private var defaultProviderID: String?
-    private var defaultModelID: String?
+    private var controlPlaneBinding: AgentInferenceBinding?
 
     init(_ registry: ProviderRegistry,
-         defaultProviderID: String?,
-         defaultModelID: String?) {
+         controlPlaneBinding: AgentInferenceBinding?) {
         self.registry = registry
-        self.defaultProviderID = defaultProviderID
-        self.defaultModelID = defaultModelID
+        self.controlPlaneBinding = controlPlaneBinding
     }
 
     func update(_ registry: ProviderRegistry) {
         self.registry = registry
     }
 
-    func updateSessionDefaults(providerID: String?,
-                               modelID: String?) {
-        defaultProviderID = providerID
-        defaultModelID = modelID
+    func freezeControlPlaneBinding(
+        _ binding: AgentInferenceBinding
+    ) -> AgentInferenceBinding {
+        if let controlPlaneBinding { return controlPlaneBinding }
+        controlPlaneBinding = binding
+        return binding
     }
 
-    func defaultAgentProvider() async throws -> ToolCallingProvider {
-        if let ref = await sessionAgentRef() {
-            return try await registry.agentProvider(for: ref)
+    /// Resolves the exact revision before it is allowed to become the sticky
+    /// control-plane route. A legacy/corrupt roster binding must remain
+    /// replaceable by a later explicit rebind instead of poisoning the
+    /// reviewer for the rest of the process lifetime.
+    func freezeResolvableControlPlaneBinding(
+        _ binding: AgentInferenceBinding
+    ) async -> AgentInferenceBinding? {
+        if let controlPlaneBinding {
+            guard (try? await registry.agentInference(for: controlPlaneBinding)) != nil else {
+                return nil
+            }
+            return controlPlaneBinding
         }
-        return try await registry.defaultAgentProvider()
+        guard (try? await registry.agentInference(for: binding)) != nil else {
+            return nil
+        }
+        controlPlaneBinding = binding
+        return binding
     }
 
-    func agentModel() async -> ModelID {
-        if let modelID = Self.normalized(defaultModelID) {
-            return ModelID(rawValue: modelID)
+    func resolvedInference(for agent: Agent) async throws -> ResolvedInferenceProfile {
+        guard let binding = agent.agentInferenceBinding else {
+            throw IntatisError.config(
+                "configurationUnresolved: agent has no exact inference profile binding")
         }
-        return await registry.agentModel()
+        return try await registry.agentInference(for: binding)
+    }
+
+    func provider(for binding: AgentInferenceBinding) async throws -> ToolCallingProvider {
+        try await registry.agentInference(for: binding).provider
+    }
+
+    func controlPlaneProvider() async throws -> ToolCallingProvider {
+        guard let controlPlaneBinding else {
+            throw IntatisError.config(
+                "configurationUnresolved: control-plane inference profile is not frozen")
+        }
+        return try await provider(for: controlPlaneBinding)
+    }
+
+    func controlPlaneModel(fallback: ModelID) -> ModelID {
+        controlPlaneBinding?.modelID ?? fallback
+    }
+
+    func exactBindingIsResolvable(_ binding: AgentInferenceBinding) async -> Bool {
+        (try? await registry.agentInference(for: binding)) != nil
     }
 
     func imageToolService() async -> ProviderImageGenerationToolService {
         ProviderImageGenerationToolService(registry: registry)
     }
 
-    private func sessionAgentRef() async -> ModelRef? {
-        guard let modelID = Self.normalized(defaultModelID) else { return nil }
-        if let providerID = Self.normalized(defaultProviderID) {
-            return ModelRef(endpoint: providerID, model: ModelID(rawValue: modelID))
-        }
-        let models = await registry.models()
-        return ModelRef(
-            endpoint: (models.agent ?? models.chat).endpoint,
-            model: ModelID(rawValue: modelID))
-    }
-
-    private static func normalized(_ value: String?) -> String? {
-        guard let value else { return nil }
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
 }
 
 /// Bridges a nonisolated permission request into the MainActor UI without
@@ -148,6 +165,8 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
     @Published private(set) var projectionError: String?
     @Published private(set) var addAgentStatus: CoworkAddAgentStatus = .idle
     @Published private(set) var permissionReviewerStatus: CoworkPermissionReviewerStatus = .disabled
+    @Published private(set) var inferenceProfileOptions: [AppInferenceProfileOption]
+    @Published private(set) var inferenceResolutionFailures: [String: String] = [:]
 
     var isAutomaticPermissionReviewReady: Bool {
         switch permissionReviewerStatus {
@@ -156,6 +175,26 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         case .disabled, .enabling, .fallback, .failed:
             return false
         }
+    }
+
+    var isMainInferenceReady: Bool {
+        agents.first(where: { $0.name == projectSettings.mainAgentName })?
+            .inferenceResolution == .resolved
+    }
+
+    var mainInferenceDisplayLabel: String {
+        guard let main = agents.first(where: { $0.name == projectSettings.mainAgentName }) else {
+            return "@\(projectSettings.mainAgentName) inference not attached"
+        }
+        return main.inferenceDisplayLabel ?? "@\(main.name) inference unavailable"
+    }
+
+    var inferenceComposerError: String? {
+        guard agents.contains(where: { $0.name == projectSettings.mainAgentName }),
+              !isMainInferenceReady else {
+            return nil
+        }
+        return "@\(projectSettings.mainAgentName) needs an explicit, resolvable inference profile rebind before Cowork can run."
     }
 
     private let log: EventLog
@@ -177,13 +216,14 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
     init(sessionID: SessionID,
          log: EventLog,
          registry: ProviderRegistry,
+         inferenceProfileOptions: [AppInferenceProfileOption],
          projectSettings: CoworkProjectSettings) {
         self.sessionID = sessionID
         self.log = log
         self.registryBox = ProviderRegistryBox(
             registry,
-            defaultProviderID: projectSettings.defaultProviderID,
-            defaultModelID: projectSettings.defaultModelID)
+            controlPlaneBinding: nil)
+        self.inferenceProfileOptions = inferenceProfileOptions
         self.projectSettings = projectSettings
         self.project = Self.makeProjectInfo(
             sessionID: sessionID,
@@ -195,8 +235,21 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         subscription?.cancel()
     }
 
-    func updateProviderRegistry(_ registry: ProviderRegistry) {
-        Task { await registryBox.update(registry) }
+    func updateProviderRegistry(
+        _ registry: ProviderRegistry,
+        inferenceProfileOptions: [AppInferenceProfileOption]? = nil
+    ) {
+        if let inferenceProfileOptions {
+            self.inferenceProfileOptions = inferenceProfileOptions
+        }
+        let bindings = (inferenceProfileOptions ?? self.inferenceProfileOptions).map(\.binding)
+        Task {
+            await registryBox.update(registry)
+            await orchestrator?.updateAvailableInferenceProfiles(
+                bindings,
+                hostAuthorized: true)
+            await refreshInferenceResolutionState()
+        }
     }
 
     func start() {
@@ -209,23 +262,23 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                 allowsShell: PlatformProfile.current.allowsShell,
                 responder: self,
                 executionPolicy: CoworkExecutionPolicy(tokenBudget: projectSettings.tokenBudget),
-                imageGeneratorFor: { _ in await registryBox.imageToolService() }
-            ) { _ in
-                try await registryBox.defaultAgentProvider()
-            }
+                availableInferenceProfiles: inferenceProfileOptions.map(\.binding),
+                requiresInferenceBindings: true,
+                imageGeneratorFor: { _ in await registryBox.imageToolService() },
+                resolvedInferenceFor: { agent in
+                    try await registryBox.resolvedInference(for: agent)
+                })
             orchestrator = runtime
+            let verifierFallbackModel = projectSettings.defaultInferenceProfileBinding?.modelID
+                ?? inferenceProfileOptions.first?.binding.modelID
+                ?? ModelID(rawValue: AppConfig.defaultModel)
             goalRuntime = GoalRuntimeController(
                 sessionID: sessionID,
                 log: log,
                 orchestrator: runtime,
-                verifierProvider: { try await registryBox.defaultAgentProvider() },
+                verifierProvider: { try await registryBox.controlPlaneProvider() },
                 verifierModel: {
-                    if let model = await runtime.agentList().first(where: {
-                        $0.name == Orchestrator.mainAgentID
-                    })?.model {
-                        return model
-                    }
-                    return await registryBox.agentModel()
+                    await registryBox.controlPlaneModel(fallback: verifierFallbackModel)
                 })
         } catch {
             let message = RuntimeErrorPresentation.message(for: error)
@@ -242,6 +295,7 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             var turnStats = TurnStatsProjection.build(from: replayed)
             self.restoreWorkspaceAccess(for: coworkProjection)
             await self.orchestrator?.restore(from: coworkProjection)
+            await self.refreshInferenceResolutionState()
 
             // Restore may durably reconcile stale control-plane state. Rebuild
             // every projection from that authoritative tail before starting
@@ -362,39 +416,19 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         } else {
             isGoalContinuing = false
         }
-        agents = projection.agentRoster.values
-            .sorted { $0.agent.rawValue < $1.agent.rawValue }
-            .map { payload in
-                let mailbox = projection.mailboxes[payload.agent] ?? CoworkMailboxView()
-                let capabilityLeases = projection.capabilityLeaseAgents
-                    .filter { $0.value == payload.agent }
-                    .compactMap { projection.capabilityLeases[$0.key] }
-                let workspaceLeaseCount = projection.workspaceLeaseAgents.values.filter { $0 == payload.agent }.count
-                let capabilityLeaseCount = capabilityLeases.count
-                let isMain = payload.agent.rawValue == projectSettings.mainAgentName
-                return CoworkAgentInfo(
-                    id: payload.agent.rawValue,
-                    name: payload.agent.rawValue,
-                    workspace: payload.path,
-                    model: payload.model.rawValue,
-                    profile: payload.profile,
-                    status: agentStatus(for: payload.agent, in: projection),
-                    role: isMain ? "main" : Self.role(for: capabilityLeases),
-                    pendingTasks: mailbox.pendingTasks.count,
-                    pendingMessages: mailbox.pendingMessages.count,
-                    completedTasks: mailbox.completedTasks.count,
-                    workspaceLease: workspaceLeaseCount > 0 ? "\(workspaceLeaseCount) workspace lease" : nil,
-                    capabilityLease: capabilityLeaseCount > 0 ? "\(capabilityLeaseCount) capability lease" : nil,
-                    canRemove: !isMain && payload.agent != Orchestrator.automaticPermissionReviewerID)
-            }
+        agents = agentPresentation(from: projection)
 
         summary = CoworkStatusSummary(
             activeCount: projection.activeTasks.count,
             runningCount: projection.runningTasks.count,
             completedCount: projection.completedTasks.count,
             failedCount: projection.failedTasks.count,
-            pendingMailboxCount: projection.mailboxes.values.reduce(0) { $0 + $1.pendingMessages.count + $1.pendingTasks.count },
-            completedMailboxCount: projection.mailboxes.values.reduce(0) { $0 + $1.completedTasks.count },
+            pendingMailboxCount: projection.mailboxes.values.reduce(0) {
+                $0 + $1.pendingMessages.count + $1.pendingTasks.count
+            },
+            completedMailboxCount: projection.mailboxes.values.reduce(0) {
+                $0 + $1.completedTasks.count
+            },
             workspaceLeaseCount: projection.workspaceLeases.count,
             capabilityLeaseCount: projection.capabilityLeases.count,
             runningTasks: projection.runningTasks.map(taskLine),
@@ -407,6 +441,63 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         let retryable = projection.failedTasks + projection.cancelledTasks
         retryableTasks = Dictionary(uniqueKeysWithValues: retryable.map { ($0.id.rawValue, $0) })
         projectionError = nil
+    }
+
+    private func agentPresentation(from projection: CoworkProjection) -> [CoworkAgentInfo] {
+        projection.agentRoster.values
+            .sorted { $0.agent.rawValue < $1.agent.rawValue }
+            .map { payload in
+                let mailbox = projection.mailboxes[payload.agent] ?? CoworkMailboxView()
+                let capabilityLeases = projection.capabilityLeaseAgents
+                    .filter { $0.value == payload.agent }
+                    .compactMap { projection.capabilityLeases[$0.key] }
+                let workspaceLeaseCount = projection.workspaceLeaseAgents.values.filter { $0 == payload.agent }.count
+                let capabilityLeaseCount = capabilityLeases.count
+                let isMain = payload.agent.rawValue == projectSettings.mainAgentName
+                let binding = payload.agentInferenceBinding
+                let inferenceOption = binding.flatMap { binding in
+                    inferenceProfileOptions.first(where: { $0.binding == binding })
+                }
+                let inferenceResolution: CoworkInferenceResolution
+                if binding == nil {
+                    inferenceResolution = .legacy
+                } else if inferenceResolutionFailures[payload.agent.rawValue] != nil {
+                    inferenceResolution = .unresolved
+                } else {
+                    inferenceResolution = .resolved
+                }
+                return CoworkAgentInfo(
+                    id: payload.agent.rawValue,
+                    name: payload.agent.rawValue,
+                    workspace: payload.path,
+                    model: payload.model.rawValue,
+                    permissionProfile: payload.profile,
+                    inferenceProfileLabel: inferenceOption?.title,
+                    inferenceProfileRef: binding?.inferenceProfileRef,
+                    inferenceConnectionLabel: binding?.safeRouteLabel,
+                    inferenceVariant: inferenceOption?.variantTitle ?? binding?.variantID,
+                    inferenceResolution: inferenceResolution,
+                    status: agentStatus(for: payload.agent, in: projection),
+                    role: isMain ? "main" : Self.role(for: capabilityLeases),
+                    pendingTasks: mailbox.pendingTasks.count,
+                    pendingMessages: mailbox.pendingMessages.count,
+                    completedTasks: mailbox.completedTasks.count,
+                    workspaceLease: workspaceLeaseCount > 0 ? "\(workspaceLeaseCount) workspace lease" : nil,
+                    capabilityLease: capabilityLeaseCount > 0 ? "\(capabilityLeaseCount) capability lease" : nil,
+                    canRemove: !isMain && payload.agent != Orchestrator.automaticPermissionReviewerID)
+            }
+    }
+
+    private func refreshInferenceResolutionState() async {
+        guard let orchestrator else {
+            inferenceResolutionFailures = [:]
+            return
+        }
+        let failures = await orchestrator.inferenceResolutionFailures()
+        inferenceResolutionFailures = Dictionary(uniqueKeysWithValues: failures.map {
+            ($0.key.rawValue, $0.value)
+        })
+        agents = agentPresentation(from: latestCoworkProjection)
     }
 
     private static func goalPresentation(
@@ -548,15 +639,25 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         }
         setPermissionReviewerStatus(.enabling)
         let mainID = AgentID(rawValue: projectSettings.mainAgentName)
-        let model: ModelID
         let workspaceURL: URL
+        guard let mainAgent = await orchestrator.agentList().first(where: {
+            $0.name == mainID
+        }), let mainBinding = mainAgent.agentInferenceBinding else {
+            setPermissionReviewerStatus(.failed(
+                "@\(mainID.rawValue) has no resolved inference profile for the control plane."))
+            return
+        }
+        guard let controlPlaneBinding = await registryBox
+            .freezeResolvableControlPlaneBinding(mainBinding) else {
+            setPermissionReviewerStatus(.failed(
+                "@\(mainID.rawValue) exact inference profile revision is unavailable or incompatible."))
+            return
+        }
 
         if let main = projection.agentRoster[mainID] {
-            model = main.model
             workspaceURL = WorkspaceAccess.restoreAccess(forPath: main.path)
                 ?? URL(fileURLWithPath: main.path)
         } else if let workspace = projectSettings.primaryWorkspace {
-            model = await defaultAgentModel()
             workspaceURL = WorkspaceAccess.restoreAccess(forPath: workspace.path)
                 ?? URL(fileURLWithPath: workspace.path)
         } else {
@@ -566,7 +667,8 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         }
 
         let result = await orchestrator.enableAutomaticPermissionReview(
-            model: model,
+            model: controlPlaneBinding.modelID,
+            agentInferenceBinding: controlPlaneBinding,
             workspaceRoot: workspaceURL)
         guard !Task.isCancelled, self.orchestrator != nil else {
             setPermissionReviewerStatus(.disabled)
@@ -632,6 +734,11 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         guard await orchestrator.agentList().contains(where: { $0.name == mainID }) else {
             return
         }
+        await refreshInferenceResolutionState()
+        guard inferenceResolutionFailures[mainID.rawValue] == nil else {
+            projectionError = "@\(mainID.rawValue) has an unresolved inference profile. Rebind it before resuming Cowork."
+            return
+        }
         isGoalRuntimeReady = false
         goal = Self.goalPresentation(
             from: latestCoworkProjection,
@@ -672,11 +779,15 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         didRequestMainAgentAttach = true
         let url = WorkspaceAccess.restoreAccess(forPath: workspace.path)
             ?? URL(fileURLWithPath: workspace.path)
-        let model = await defaultAgentModel()
+        guard let binding = projectSettings.defaultInferenceProfileBinding else {
+            composerError = "Choose a default inference profile before attaching @\(mainID.rawValue)."
+            return
+        }
         let main = Agent(
             name: mainID,
             workspaceRoot: url,
-            model: model,
+            model: binding.modelID,
+            agentInferenceBinding: binding,
             profile: projectSettings.defaultProfile,
             coordinationDepth: Agent.defaultCoordinationDepth)
         let attached: Bool
@@ -730,9 +841,6 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         normalized.mainAgentName = trimmedMainAgentName.isEmpty ? "main" : trimmedMainAgentName
         projectSettings = normalized
         Task {
-            await registryBox.updateSessionDefaults(
-                providerID: normalized.defaultProviderID,
-                modelID: normalized.defaultModelID)
             await orchestrator?.updateExecutionPolicy(
                 CoworkExecutionPolicy(tokenBudget: normalized.tokenBudget))
         }
@@ -780,6 +888,46 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         activeOperations[operationID] = operation
     }
 
+    func agentInferenceBinding(name rawName: String) -> AgentInferenceBinding? {
+        let name = Self.normalizedAgentName(rawName)
+        return latestCoworkProjection.agentRoster[AgentID(rawValue: name)]?
+            .agentInferenceBinding
+    }
+
+    func rebindAgentInferenceProfile(
+        name rawName: String,
+        binding: AgentInferenceBinding
+    ) {
+        guard !isWorking, let orchestrator else { return }
+        let name = Self.normalizedAgentName(rawName)
+        guard !name.isEmpty else { return }
+        isWorking = true
+        composerError = nil
+        let operationID = UUID()
+        let operation = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.activeOperations.removeValue(forKey: operationID) }
+            let result = await orchestrator.rebindAgentInferenceProfile(
+                agentID: AgentID(rawValue: name),
+                binding: binding,
+                hostAuthorized: true)
+            switch result {
+            case .rebound, .unchanged:
+                await self.refreshInferenceResolutionState()
+                if name == self.projectSettings.mainAgentName,
+                   !self.isAutomaticPermissionReviewReady {
+                    await self.ensureAutomaticPermissionReview(
+                        existingProjection: self.latestCoworkProjection)
+                }
+                await self.resumeRuntimeIfReady()
+            case .failed(let message):
+                self.composerError = message
+            }
+            self.isWorking = false
+        }
+        activeOperations[operationID] = operation
+    }
+
     func removeWorkspace(path: String) {
         var settings = projectSettings
         settings.removeWorkspace(path: path)
@@ -814,9 +962,14 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             guard let self else { return }
             let replayed = await self.log.replay()
             let startSeq = replayed.last?.seq ?? -1
-            let model = await self.defaultAgentModel()
+            guard let binding = self.projectSettings.defaultInferenceProfileBinding else {
+                self.addAgentStatus = .failed("Choose a default inference profile for new agents.")
+                return
+            }
             let attached = await orchestrator.attach(Agent(name: AgentID(rawValue: normalizedName), workspaceRoot: workspace,
-                                            model: model, profile: self.projectSettings.defaultProfile,
+                                            model: binding.modelID,
+                                            agentInferenceBinding: binding,
+                                            profile: self.projectSettings.defaultProfile,
                                             coordinationDepth: 0))
             await self.synchronizePermissionReviewerHealth(using: orchestrator)
             if attached {
@@ -1241,14 +1394,6 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             return .failed(error.message)
         }
         return .failed("Could not attach @\(agentName).")
-    }
-
-    private func defaultAgentModel() async -> ModelID {
-        if let modelID = projectSettings.defaultModelID?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !modelID.isEmpty {
-            return ModelID(rawValue: modelID)
-        }
-        return await registryBox.agentModel()
     }
 
     private func rememberWorkspace(_ url: URL, agentName: String, isPrimary: Bool) {

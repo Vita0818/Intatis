@@ -1,119 +1,94 @@
 # NOTICE
 
-## Project origin and source reuse policy
+## Project origin and source-reuse policy
 
 Intatis is an Apple-first, Swift-native-first local AI workbench. Project-owned
-code and assets are original unless an upstream source is explicitly identified.
-Intatis may copy, translate, modify, link, vendor, or run compatible open-source
-implementations when their licenses and provenance have been reviewed and the
-required copyright and license notices are preserved.
-
-Intatis does **not** use leaked or private source code/prompts and does not copy
-third-party product names, logos, icons, screenshots, UI assets, trademarks, or
-brand copy as its product identity. Open-source reuse must not bypass Intatis'
-permission, workspace, event-log, secret, or Apple platform boundaries.
-
-The operational policy and provenance requirements are documented in
+code and assets are original unless an upstream source is identified here.
+Compatible open-source work may be linked, vendored, or modified only after
+its provenance and licenses have been reviewed under
 `docs/OPEN_SOURCE_REUSE.md`.
 
-## Current upstream source status
+Intatis does not use leaked or private source code or prompts, and does not use
+third-party names, logos, icons, screenshots, UI assets, trademarks, or brand
+copy as its product identity. Open-source reuse does not bypass Intatis'
+permission, workspace, event-log, secret, or Apple-platform boundaries.
 
-- OpenCode (`anomalyco/opencode`, MIT): research-only as of 2026-07-12. No
-  OpenCode source files, public prompts, UI assets, or runtime are currently
-  vendored, translated, linked, or bundled in Intatis.
-- Conversation rendering uses exact SwiftPM dependencies plus a deliberately
-  restricted set of vendored highlight.js resources as described below.
-  Intatis owns the SwiftUI integration and safety policy; parsing, syntax
-  highlighting, TeX layout, and bundled font data remain upstream work.
-- `CodeEditor` (`mchakravarty/CodeEditor`) was evaluated for the code-block UI
-  but is **not adopted, linked, vendored, or copied**.
-- HighlighterSwift 3.0.3 and 3.1.0 were evaluated, but their Swift package and
-  wrapper are **not adopted or linked**. The full resource bundle includes
-  themes with CC BY-SA licensing (`nnfx` / `kimbie`), so Intatis instead
-  vendors only the three audited files and preserves their split provenance.
+## Current Markdown renderer integration
 
-## Third-party dependencies and vendored assets
+The current working tree replaces the former MarkdownUI/highlight.js/iosMath
+stack with an in-tree, thin derivative of Microsoft's SwiftStreamingMarkdown.
+The complete buildable derivative is vendored at
+`Vendor/SwiftStreamingMarkdown`; the containing Intatis Git revision versions
+the source, tests, Microsoft MIT license, and adjacent patch/provenance ledger
+together. No separately published Intatis fork is required for reproducible
+resolution of this package.
 
-### Conversation rendering (adopted 2026-07-15)
+- **SwiftStreamingMarkdown 0.6.0**
+  (`microsoft/SwiftStreamingMarkdown`), upstream tag `v0.6.0`, commit
+  `c7b12f7b3d77caa188fd1fc056d0f7ce305ef5cd`: MIT. The Intatis candidate is a
+  modified derivative that removes optional runtimes and branded assets,
+  hardens the ownership/concurrency boundary, and retains the upstream
+  Markdown parser and SwiftUI/AppKit/UIKit rendering structure.
+  **Derivative location: `Vendor/SwiftStreamingMarkdown` in the Intatis root
+  revision being built or distributed.**
+- **swift-markdown 0.8.0** (`swiftlang/swift-markdown`), revision
+  `3c6f9523da3a1ec2fd829673e472d95b8097a3b8`: Apache License 2.0 with the
+  Swift Runtime Library Exception. Direct dependency of the derivative.
+- **swift-cmark 0.8.0** (`swiftlang/swift-cmark`), revision
+  `924936d0427cb25a61169739a7660230bffa6ea6`: BSD-2-Clause core with the
+  MIT-derived runtime portions identified by upstream `COPYING`. Transitive
+  parser dependency through swift-markdown.
 
-SwiftPM entries use exact version constraints, and vendored resources use exact
-SHA-256 checksums. The commit IDs below are the audited provenance points for
-those tags/assets; upgrades require a fresh license, dependency, asset, and
-security review.
+Copyright, license, exact upstream/parser versions, distribution requirements,
+and the current high-level modification summary are in
+`ThirdPartyNotices/MarkdownRendering.md`. The persistent modified-file and
+patch ledger is stored beside the vendored source at
+`Vendor/SwiftStreamingMarkdown/INTATIS_PATCH_LEDGER.md`.
 
-- **MarkdownUI 2.4.1** (`gonzalezreal/swift-markdown-ui`), commit
-  `5f613358148239d0292c0cef674a3c2314737f9e`: Markdown parsing and SwiftUI
-  rendering. MIT. Runtime dependency of `IntatisSharedUI` on macOS and iOS.
-- **NetworkImage 6.0.0** (`gonzalezreal/NetworkImage`), commit
-  `7aff8d1b31148d32c5933d75557d42f6323ee3d1`: exact pin for MarkdownUI's
-  dependency graph. MIT. Intatis overrides Markdown image providers so remote
-  content is not fetched implicitly.
-- **swift-cmark 0.5.0** (`swiftlang/swift-cmark`), commit
-  `3ccff77b2dc5b96b77db3da0d68d28068593fa53`: CommonMark parser used by
-  MarkdownUI. BSD-2-Clause with identified MIT-derived runtime portions.
-- **swift-snapshot-testing 1.12.0** (`pointfreeco/swift-snapshot-testing`),
-  commit `26ed3a2b4a2df47917ca9b790a57f91285b923fb`: exact test-side dependency
-  pin from MarkdownUI's package graph. MIT. It is not linked into an Intatis
-  application product.
-- **highlight.js 11.11.1 engine**, exact generated byte source
-  `highlightjs/cdn-release` tag `11.11.1`, commit
-  `91724c0adaf7bea7e5c5c85e4ea1d672f6c0ed23`, path
-  `build/highlight.min.js` (header source revision `08cb242e7d`):
-  BSD-3-Clause. Intatis vendors that common-language release build only.
-- **a11y light/dark theme adaptations**, byte source HighlighterSwift 3.1.0
-  commit `fe7aae9c9b31d3b296fd3d2dd575e1a207bb29e0`: the two selected files adapt
-  highlight.js 11.11.1 themes and retain their `@ericwbailey` headers. The
-  applicable provenance chain is HighlighterSwift MIT modifications plus
-  highlight.js BSD-3-Clause. Exact paths, hashes, copyrights, and both license
-  texts are in the detailed syntax notice; all other themes are excluded.
-- **iosMath 2.5.0** (`kostub/iosMath`), commit
-  `838cddc01fdd67efd530f8bb67959ad2715f9b06`: TeX math parser/layout engine.
-  MIT. `IntatisMathView.swift` also adapts the MIT-licensed upstream sample
-  `SwiftMathExample/MathLabel.swift` as the thin SwiftUI bridge; the parser and
-  layout engine remain package code. The package copies eight bundled OpenType
-  math fonts into its resource bundle; those fonts remain under the GUST Font
-  License / LPPL 1.3c-or-later or SIL Open Font License 1.1, as mapped in the
-  detailed notice.
+## Features and assets not distributed by the current renderer
 
-Complete copyright, license, asset, and distribution-scope details are in:
+- Syntax highlighting is disabled. The current root dependency graph contains
+  no HighlightSwift or highlight.js package, and the former vendored
+  `highlight.min.js` and a11y CSS resources are removed. See
+  `ThirdPartyNotices/SyntaxHighlighting.md`.
+- TeX/math rendering is disabled. The current root dependency graph contains
+  no iosMath package, and no iosMath fonts or math resources are bundled. See
+  `ThirdPartyNotices/MathRendering.md`.
+- The derivative also removes Shimmer, SnapshotTesting, upstream branded color
+  and media asset catalogs, and their associated first-release surface. Its
+  retained package resource is the localization catalog only.
 
-- `ThirdPartyNotices/MarkdownRendering.md`
-- `ThirdPartyNotices/SyntaxHighlighting.md`
-- `ThirdPartyNotices/MathRendering.md`
+## Integration and distribution boundary
 
-### Integration and distribution boundary
+- Markdown rendering is linked only through `IntatisSharedUI` on Apple
+  platforms. It does not add shell, Git, workspace-agent, or Cowork execution
+  capabilities to iOS or to the CLI/headless graph.
+- Rendering operates on projected message text and does not own or mutate
+  EventLog records, capability leases, permission decisions, workspace paths,
+  credentials, or provider requests.
+- The current first-release profile disables images, citations, animation,
+  syntax highlighting, and math. Code blocks remain plain text with a native
+  copy control.
+- Distributed macOS and iOS artifacts must make this file and the referenced
+  detailed notices readable in the application. Merely keeping them in the
+  source tree is not sufficient.
+- A distributed source or binary must be traceable to an Intatis root revision
+  containing the vendored package, its Microsoft `LICENSE`, and the adjacent
+  patch ledger. Uncommitted local edits are not a release identity.
 
-- The rendering packages and vendored assets are used only through
-  `IntatisSharedUI` on Apple platforms. They do not enter the CLI/headless
-  execution graph and do not add shell, Git, workspace-agent, or Cowork
-  capabilities to iOS.
-- All three engines run in-process over projected message text. They do not
-  own or mutate EventLog records, capability leases, permission decisions,
-  workspace paths, credentials, or provider requests.
-- No external runtime or helper process is added. Syntax highlighting runs
-  in-process through the platform JavaScriptCore framework and a thin
-  project-owned adapter.
-  The adapter keeps C/C++ blocks in plaintext because upstream highlight.js
-  issue #4362 affects those 11.11.1 grammars; Intatis does not fork the engine.
-  NetworkImage remains in the fixed MarkdownUI dependency graph, but Intatis'
-  rendering adapter blocks its default remote-image path.
-- The three selected highlight.js resources total 129,157 bytes in the
-  source tree, while iosMath's font directory is about 7.0 MiB before
-  application packaging. Release artifact size must be remeasured whenever
-  either upstream is upgraded.
-- Release packaging must make this NOTICE and the referenced detailed notices
-  available with the distributed binary. Their presence in the source tree is
-  the provenance record, but does not by itself verify that an App Store or
-  Developer ID artifact exposes all required notices.
+## Other source status
 
-The Swift standard library, Foundation, SwiftUI, AppKit, UIKit, JavaScriptCore,
-and Security are provided by the Apple/system toolchain and are not vendored
+- OpenCode (`anomalyco/opencode`, MIT) remains research-only. No OpenCode
+  source, public prompt, UI asset, or runtime is currently linked, vendored, or
+  copied into Intatis.
+- `CodeEditor` (`mchakravarty/CodeEditor`) was evaluated but is not adopted,
+  linked, vendored, or copied.
+- libgit2 / SwiftGit2 remain planned candidates only and require a separate
+  license and integration review before adoption.
+
+The Swift standard library, Foundation, SwiftUI, AppKit, UIKit, and other Apple
+system frameworks are provided by the Apple toolchain and are not vendored
 third-party packages in this repository.
 
-### Planned (later milestones — listed for transparency, not yet vendored)
-- **libgit2 / SwiftGit2** (v0.2): in-process git so `git_status` / `git_diff` /
-  `apply_patch` work inside the App Store sandbox without spawning `git`.
-  License: libgit2 is GPLv2-with-linking-exception. To be reviewed before adoption.
-
-Update this file whenever upstream source, a dependency, a bundled runtime, or a
-licensed asset is added or upgraded.
+Update this file whenever an upstream source, dependency, bundled runtime,
+licensed asset, or immutable renderer revision changes.
