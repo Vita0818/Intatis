@@ -5,12 +5,17 @@ import Foundation
 import IntatisCore
 import IntatisProviders
 import IntatisConversation
+import IntatisAgentKernel
 import IntatisArtifacts
 import IntatisMultimodal
 import IntatisSharedUI
+import UniformTypeIdentifiers
+#if canImport(AppKit)
+import AppKit
+#endif
 
-/// Wires provider config + per-session event log + chat view model. Held by
-/// the App as a `@StateObject`.
+/// Wires process-wide provider configuration to the application-owned session
+/// runtime registry. Window views only select which retained runtime to show.
 @MainActor
 final class AppEnvironment: ObservableObject {
     @Published private(set) var registry: ProviderRegistry
@@ -20,17 +25,18 @@ final class AppEnvironment: ObservableObject {
     @Published private(set) var chatSessionID: SessionID
     @Published private(set) var viewModel: ChatViewModel
     @Published private(set) var chatSessionError: String?
-    private(set) var log: EventLog
-    private(set) var multimodal: MultimodalService
     @Published var needsAPIKey: Bool
 
+    let runtimeManager: AppSessionRuntimeManager
+    private var chatRuntime: AppChatSessionRuntime
     private let secrets: ConfigSecretResolver
     private let inferenceCatalogStore: InferenceCatalogStore
     private var inferenceCatalogSnapshot: InferenceCatalogSnapshot?
 
-    init() {
+    init(runtimeManager: AppSessionRuntimeManager) {
         PlatformProfile.current = AppConfig.platformProfile
 
+        self.runtimeManager = runtimeManager
         self.secrets = ConfigSecretResolver()
         self.inferenceCatalogStore = InferenceCatalogStore(
             fileURL: AppConfig.appSupportDir()
@@ -45,25 +51,24 @@ final class AppEnvironment: ObservableObject {
         self.registry = initialRegistry
         let initialSession = AppConfig.recentSessions(kind: .chat).first?.id ?? AppConfig.defaultSession
         self.chatSessionID = initialSession
+        let initialChatRuntime: AppChatSessionRuntime
         do {
-            self.log = try EventLog(session: initialSession,
-                                    fileURL: AppConfig.sessionFile(initialSession))
+            initialChatRuntime = try runtimeManager.chatRuntime(
+                sessionID: initialSession,
+                registry: initialRegistry)
         } catch {
             fatalError("Failed to open event log: \(error)")
         }
-        let store: ArtifactStore
-        do {
-            store = try ArtifactStore(root: AppConfig.artifactsDir(initialSession))
-        } catch {
-            fatalError("Failed to open artifact store: \(error)")
-        }
-        self.multimodal = MultimodalService(log: log, store: store)
-        self.viewModel = ChatViewModel(log: log, registry: initialRegistry)
+        self.chatRuntime = initialChatRuntime
+        self.viewModel = initialChatRuntime.viewModel
         self.needsAPIKey = !Self.hasAPIKey(ref: AppConfig.selectedAPIKeyRef)
 
-        wireImageGeneration()
         Task { [weak self] in
-            await self?.refreshInferenceCatalog()
+            guard let self else { return }
+            _ = try? await SessionProjectionStore.migrateLegacyDisplayName(
+                in: self.chatRuntime.log,
+                kind: .chat)
+            await self.refreshInferenceCatalog()
         }
     }
 
@@ -87,19 +92,35 @@ final class AppEnvironment: ObservableObject {
         AppConfig.recentSessions(kind: .chat)
     }
 
-    func deleteChatSession(_ session: SessionID) throws {
+    func deleteChatSession(_ session: SessionID) async throws {
+        guard !runtimeManager.isBusy(kind: .chat, sessionID: session) else {
+            throw IntatisError.io("Wait for the Chat response to finish before deleting this session.")
+        }
         if session == chatSessionID {
-            guard !viewModel.isBusy else {
-                throw IntatisError.io("Wait for the current Chat response to finish before deleting this session.")
-            }
             let replacement = recentChatSessions()
                 .first(where: { $0.id != session })?.id
                 ?? SessionID.new()
             try switchChatSession(to: replacement)
         }
+        try await runtimeManager.removeRuntime(
+            kind: .chat,
+            sessionID: session,
+            reason: "Chat session deleted by user")
         try SessionHistoryStore.deleteSession(
             root: AppConfig.appSupportDir(),
             session: session)
+    }
+
+    func handleRemovedChatRuntime(sessionID: SessionID) {
+        guard chatSessionID == sessionID else { return }
+        let replacement = recentChatSessions()
+            .first(where: { $0.id != sessionID })?.id
+            ?? SessionID.new()
+        do {
+            try switchChatSession(to: replacement)
+        } catch {
+            chatSessionError = "The removed Chat session could not be replaced: \(error.localizedDescription)"
+        }
     }
 
     func saveAPIKey(_ key: String) {
@@ -178,61 +199,224 @@ final class AppEnvironment: ObservableObject {
     }
 
     /// Build a fresh Code session bound to the chosen workspace folder.
-    func makeCodeViewModel(workspace: URL) throws -> CodeViewModel {
+    func makeCodeViewModel(workspace: WorkspaceAccessLease) throws -> CodeViewModel {
         let session = SessionID(rawValue: IDGen.random(prefix: "code"))
-        WorkspaceAccess.remember(workspace, for: session)
         return try makeCodeViewModel(session: session, workspace: workspace)
     }
 
-    func makeCodeViewModel(session: SessionID, workspace: URL) throws -> CodeViewModel {
-        WorkspaceAccess.remember(workspace, for: session)
-        let codeLog = try EventLog(session: session, fileURL: AppConfig.sessionFile(session))
-        return CodeViewModel(sessionID: session, workspaceRoot: workspace, log: codeLog, registry: registry)
+    func makeCodeViewModel(session: SessionID,
+                           workspace: WorkspaceAccessLease) throws -> CodeViewModel {
+        if let existing = runtimeManager.cachedCodeRuntime(sessionID: session) {
+            workspace.release()
+            return existing
+        }
+        let hadRememberedAccess = try WorkspaceAccess.hasRememberedAccess(
+            forPath: workspace.canonicalPath,
+            in: session)
+        do {
+            try WorkspaceAccess.remember(
+                workspace.scopedURL,
+                for: session,
+                isPrimary: true)
+            let codeLog = try EventLog(session: session, fileURL: AppConfig.sessionFile(session))
+            Task {
+                _ = try? await SessionProjectionStore.migrateLegacyDisplayName(
+                    in: codeLog,
+                    kind: .code)
+            }
+            let runtime = CodeViewModel(
+                sessionID: session,
+                workspaceAccess: workspace,
+                log: codeLog,
+                sessionNaming: makeSessionNamingService(log: codeLog, kind: .code),
+                registry: registry)
+            return try runtimeManager.registerCodeRuntime(runtime)
+        } catch {
+            if !hadRememberedAccess {
+                try? WorkspaceAccess.forget(
+                    path: workspace.canonicalPath,
+                    in: session,
+                    allowPrimaryRemoval: true)
+            }
+            workspace.release()
+            throw error
+        }
     }
 
     /// Build a fresh multi-agent Cowork project session bound to a primary workspace.
-    func makeCoworkViewModel(primaryWorkspace: URL) throws -> CoworkViewModel {
+    func makeCoworkViewModel(primaryWorkspace: WorkspaceAccessLease) async throws -> CoworkViewModel {
         guard let inferenceCatalogSnapshot else {
+            primaryWorkspace.release()
             throw IntatisError.config(
                 inferenceCatalogError ?? "Inference profiles are still loading. Try again in a moment.")
+        }
+        guard let selectedBinding = AppInferenceCatalogCompiler.selectedBinding(
+            catalog: providerCatalog,
+            snapshot: inferenceCatalogSnapshot) else {
+            primaryWorkspace.release()
+            throw IntatisError.config("Choose a resolvable default inference profile before creating Cowork.")
         }
         let session = SessionID(rawValue: IDGen.random(prefix: "cowork"))
-        WorkspaceAccess.remember(primaryWorkspace, for: session)
-        let settings = CoworkProjectSettings.fresh(
-            sessionID: session,
-            primaryWorkspace: primaryWorkspace,
-            catalog: providerCatalog,
-            defaultInferenceProfileBinding: AppInferenceCatalogCompiler.selectedBinding(
+        do {
+            try WorkspaceAccess.remember(
+                primaryWorkspace.scopedURL,
+                for: session,
+                isPrimary: true)
+            let settings = CoworkProjectSettings.fresh(
+                sessionID: session,
+                primaryWorkspace: primaryWorkspace.canonicalURL,
                 catalog: providerCatalog,
-                snapshot: inferenceCatalogSnapshot))
-        CoworkProjectSettingsStore.save(settings)
-        return try makeCoworkViewModel(session: session, projectSettings: settings)
+                defaultInferenceProfileBinding: selectedBinding)
+            let coworkLog = try EventLog(session: session, fileURL: AppConfig.sessionFile(session))
+            return try await runtimeManager.coworkRuntime(sessionID: session) { [self] in
+                try makeCoworkViewModel(
+                    session: session,
+                    log: coworkLog,
+                    projectSettings: settings,
+                    launchMode: .fresh,
+                    initialWorkspaceAccess: primaryWorkspace)
+            }
+        } catch {
+            try? WorkspaceAccess.forget(
+                path: primaryWorkspace.canonicalPath,
+                in: session,
+                allowPrimaryRemoval: true)
+            primaryWorkspace.release()
+            throw error
+        }
     }
 
-    func makeCoworkViewModel(session: SessionID) throws -> CoworkViewModel {
+    func makeCoworkViewModel(session: SessionID) async throws -> CoworkViewModel {
         guard let inferenceCatalogSnapshot else {
             throw IntatisError.config(
                 inferenceCatalogError ?? "Inference profiles are still loading. Try again in a moment.")
         }
-        let settings = CoworkProjectSettingsStore.load(
+        return try await runtimeManager.coworkRuntime(sessionID: session) { [self] in
+        let coworkLog = try EventLog(session: session, fileURL: AppConfig.sessionFile(session))
+        let legacyOwnedWorkspacePaths = CoworkProjectSettingsStore
+            .legacyOwnedWorkspacePaths(sessionID: session)
+        let loaded = await CoworkProjectSettingsStore.loadAndMigrate(
             sessionID: session,
-            catalog: providerCatalog,
+            log: coworkLog,
             inferenceCatalogSnapshot: inferenceCatalogSnapshot)
-        return try makeCoworkViewModel(session: session, projectSettings: settings)
+        var projectSettings = loaded.settings
+        var warning = loaded.warning
+        do {
+            let projection = try await SessionProjectionStore.rebuild(from: coworkLog)
+            let migrationAlreadyCompleted = projection.completedMigrations.contains {
+                $0.migrationID == SessionProjectionStore.legacyWorkspaceAccessMigrationID
+            }
+            if migrationAlreadyCompleted {
+                // Older/interrupted Phase S builds could have persisted a
+                // symbolic-link spelling in EventLog while correctly keying
+                // the capability plist by the canonical directory. Repair
+                // only aliases proven through a live session bookmark.
+                let mappings = try WorkspaceAccess.validatedCanonicalPathMappings(
+                    for: projectSettings.workspaces.map(\.path),
+                    in: session)
+                projectSettings = try await persistValidatedWorkspacePathMappings(
+                    mappings,
+                    settings: projectSettings,
+                    log: coworkLog)
+                // The marker is appended only after the session-owned file was
+                // read back successfully. Retrying cleanup here closes the
+                // crash window between that durable marker and UserDefaults
+                // deletion without ever re-importing shared capabilities.
+                WorkspaceAccess.clearLegacySessionStorage(for: session)
+                if loaded.legacySettingsCleanupEligible {
+                    CoworkProjectSettingsStore.clearLegacyStorage(sessionID: session)
+                }
+            } else {
+                let migration = try WorkspaceAccess.migrateLegacyBookmarks(
+                    for: session,
+                    workspacePaths: projectSettings.workspaces.map(\.path),
+                    primaryPath: projectSettings.primaryWorkspace?.path,
+                    sharedLegacyPaths: legacyOwnedWorkspacePaths)
+                if migration.didMigrate {
+                    projectSettings = try await persistValidatedWorkspacePathMappings(
+                        migration.canonicalPathsByStoredPath,
+                        settings: projectSettings,
+                        log: coworkLog)
+                    _ = try await SessionProjectionStore.recordMigration(
+                        in: coworkLog,
+                        migrationID: SessionProjectionStore.legacyWorkspaceAccessMigrationID,
+                        source: .legacyWorkspaceUserDefaults)
+                    WorkspaceAccess.clearLegacySessionStorage(for: session)
+                    if loaded.legacySettingsCleanupEligible {
+                        CoworkProjectSettingsStore.clearLegacyStorage(sessionID: session)
+                    }
+                }
+            }
+        } catch {
+            let message = "Legacy workspace access remains in compatibility mode: \(error.localizedDescription)"
+            warning = warning.map { "\($0) \(message)" } ?? message
+        }
+        return try makeCoworkViewModel(
+            session: session,
+            log: coworkLog,
+            projectSettings: projectSettings,
+            launchMode: .restored,
+            sessionStorageWarning: warning)
+        }
     }
 
-    private func makeCoworkViewModel(session: SessionID,
-                                     projectSettings: CoworkProjectSettings) throws -> CoworkViewModel {
-        guard let inferenceCatalogSnapshot else {
-            throw IntatisError.config("The versioned inference catalog is unavailable.")
+    private func persistValidatedWorkspacePathMappings(
+        _ mappings: [String: String],
+        settings: CoworkProjectSettings,
+        log: EventLog
+    ) async throws -> CoworkProjectSettings {
+        guard !mappings.isEmpty else { return settings }
+        var canonical = settings
+        canonical.applyValidatedWorkspacePathMappings(mappings)
+        guard canonical != settings else { return settings }
+        let document = try await SessionProjectionStore.updateSettings(
+            in: log,
+            kind: .cowork,
+            coworkSettings: canonical,
+            changeKind: .migrated)
+        guard let persisted = document.coworkSettings else {
+            throw IntatisError.io(
+                "Canonical workspace aliases were not persisted in session settings.")
         }
-        let coworkLog = try EventLog(session: session, fileURL: AppConfig.sessionFile(session))
+        return persisted
+    }
+
+    private func makeCoworkViewModel(
+        session: SessionID,
+        log coworkLog: EventLog,
+        projectSettings: CoworkProjectSettings,
+        launchMode: CoworkSessionLaunchMode,
+        sessionStorageWarning: String? = nil,
+        initialWorkspaceAccess: WorkspaceAccessLease? = nil
+    ) throws -> CoworkViewModel {
+        let artifactStore = try ArtifactStore(root: AppConfig.artifactsDir(session))
         return CoworkViewModel(
             sessionID: session,
             log: coworkLog,
+            artifactStore: artifactStore,
+            sessionNaming: makeSessionNamingService(log: coworkLog, kind: .cowork),
             registry: registry,
             inferenceProfileOptions: inferenceProfileOptions,
-            projectSettings: projectSettings)
+            projectSettings: projectSettings,
+            launchMode: launchMode,
+            sessionStorageWarning: sessionStorageWarning,
+            initialWorkspaceAccess: initialWorkspaceAccess)
+    }
+
+    private func makeSessionNamingService(
+        log: EventLog,
+        kind: SessionKind
+    ) -> EventLogSessionNamingService {
+        let manager = runtimeManager
+        return EventLogSessionNamingService(log: log, kind: kind) { commit in
+            await manager.publishSessionDisplayNameChange(AppSessionDisplayNameChange(
+                key: AppSessionRuntimeKey(
+                    kind: commit.kind,
+                    sessionID: commit.sessionID),
+                displayName: commit.displayName,
+                settingsRevision: commit.settingsRevision,
+                projectedThroughSeq: commit.projectedThroughSeq))
+        }
     }
 
     func recentCodeSessions() -> [AppSessionSummary] {
@@ -244,17 +428,18 @@ final class AppEnvironment: ObservableObject {
     }
 
     private func switchChatSession(to session: SessionID) throws {
-        viewModel.stop()
-        let log = try EventLog(session: session, fileURL: AppConfig.sessionFile(session))
-        let store = try ArtifactStore(root: AppConfig.artifactsDir(session))
-        let model = ChatViewModel(log: log, registry: registry)
-        self.log = log
-        self.multimodal = MultimodalService(log: log, store: store)
-        self.viewModel = model
+        let runtime = try runtimeManager.chatRuntime(
+            sessionID: session,
+            registry: registry)
+        self.chatRuntime = runtime
+        self.viewModel = runtime.viewModel
         self.chatSessionID = session
         self.chatSessionError = nil
-        wireImageGeneration()
-        model.start()
+        Task {
+            _ = try? await SessionProjectionStore.migrateLegacyDisplayName(
+                in: runtime.log,
+                kind: .chat)
+        }
     }
 
     private static func makeProviderRegistry(
@@ -273,8 +458,9 @@ final class AppEnvironment: ObservableObject {
             resolver: secrets,
             inferenceCatalogSnapshot: inferenceCatalogSnapshot)
         registry = updated
-        viewModel.updateProviderRegistry(updated)
-        wireImageGeneration()
+        runtimeManager.updateProviderRegistry(
+            updated,
+            inferenceProfileOptions: inferenceProfileOptions)
     }
 
     private func scheduleInferenceCatalogRefresh() {
@@ -310,16 +496,6 @@ final class AppEnvironment: ObservableObject {
         ConfigSecretResolver.exists(ref)
     }
 
-    private func wireImageGeneration() {
-        viewModel.onGenerateImage = { [weak self] prompt in
-            guard let self else { throw IntatisError.cancelled }
-            guard let provider = try await self.registry.defaultImageProvider(),
-                  let model = await self.registry.imageModel() else {
-                throw IntatisError.config("image generation is not configured")
-            }
-            _ = try await self.multimodal.generateImage(using: provider, model: model, prompt: prompt)
-        }
-    }
 }
 
 // The shell lives in IntatisMacRootView; root-owned session state feeds the
@@ -512,7 +688,6 @@ struct CodeSessionView: View {
                   input: $vm.input,
                   onSend: { vm.send() },
                   onResolve: { vm.resolvePermission($0) })
-            .task { vm.start() }
     }
 
     private var contextLabel: String? {
@@ -542,6 +717,7 @@ struct CoworkSessionView: View {
     @State private var goalConstraintsDraft = ""
     @State private var goalTokenBudgetDraft = ""
     @State private var goalEditorSubmissionError: String?
+    @State private var showAttachmentImporter = false
     @Environment(\.colorScheme) private var scheme
 
     private var hasMainAgent: Bool {
@@ -566,24 +742,47 @@ struct CoworkSessionView: View {
                         workTasks: vm.workTasks,
                         composerError: vm.composerError
                             ?? vm.inferenceComposerError
-                            ?? vm.projectionError,
+                            ?? vm.projectionError
+                            ?? vm.sessionStorageWarning,
                         isWorking: isCoworkBusy,
-                        isComposerAvailable: vm.isAutomaticPermissionReviewReady
-                            && vm.isGoalRuntimeReady
-                            && vm.isMainInferenceReady,
+                        isAcceptingSubmission: vm.isAcceptingSubmission,
+                        hasDraftAttachments: !vm.draftAttachments.isEmpty,
                         threadStyle: .intatisMac(scheme),
                         onShowSessions: onShowSessions,
                         onNewSession: onNewSession,
                         onShowProjectSettings: { showProjectSettings = true },
-                        composerAccessory: AnyView(CoworkInferenceAccessory(
-                            profileLabel: vm.mainInferenceDisplayLabel,
-                            contextLabel: contextLabel)),
+                        composerAccessory: AnyView(HStack(spacing: 8) {
+                            Button {
+                                showAttachmentImporter = true
+                            } label: {
+                                Image(systemName: "paperclip")
+                            }
+                            .buttonStyle(.borderless)
+                            .help("Attach files")
+                            .accessibilityLabel("Attach files")
+                            .accessibilityIdentifier("cowork.composer.attach")
+                            if !vm.draftAttachments.isEmpty {
+                                Menu("\(vm.draftAttachments.count) attached") {
+                                    ForEach(vm.draftAttachments) { attachment in
+                                        Button("Remove \(attachment.name)") {
+                                            vm.removeDraftAttachment(attachment.id)
+                                        }
+                                    }
+                                }
+                                .menuStyle(.borderlessButton)
+                                .accessibilityIdentifier("cowork.composer.attachments")
+                            }
+                            CoworkInferenceAccessory(
+                                profileLabel: vm.mainInferenceDisplayLabel,
+                                contextLabel: contextLabel)
+                        }),
                         input: $vm.input,
                         onSend: { vm.send() },
                         onCancelCurrent: vm.isWorking ? { vm.cancelCurrentTask() } : nil,
                         onResolve: { vm.resolvePermission($0) },
                         onRemoveAgent: { vm.removeAgent(name: $0) },
                         onRetryTask: { vm.retryFailedTask(id: $0) },
+                        onRetrySubmission: { vm.retrySubmission($0) },
                         onPauseGoal: { vm.pauseGoal() },
                         onResumeGoal: { vm.resumeGoal() },
                         onEditGoal: { presentGoalEditor() },
@@ -592,7 +791,6 @@ struct CoworkSessionView: View {
         // SwiftUI preserves this view's structural identity when one Cowork
         // session replaces another. Key startup to the durable session ID so
         // the new view model cannot inherit the completed task of the old one.
-        .task(id: vm.sessionID.rawValue) { vm.start() }
         .onChange(of: hasMainAgent) { isReady in
             guard isReady else { return }
             // The first @main projection also means events.jsonl now exists,
@@ -601,6 +799,23 @@ struct CoworkSessionView: View {
         }
         .sheet(isPresented: $showProjectSettings) { projectSettingsSheet }
         .sheet(isPresented: $showGoalEditor) { goalEditorSheet }
+        .fileImporter(
+            isPresented: $showAttachmentImporter,
+            allowedContentTypes: [.data, .content],
+            allowsMultipleSelection: true
+        ) { result in
+            switch result {
+            case .success(let urls):
+                vm.importDraftAttachments(urls)
+            case .failure(let error):
+                vm.reportAttachmentImportFailure(error)
+            }
+        }
+        .dropDestination(for: URL.self) { urls, _ in
+            guard !urls.isEmpty else { return false }
+            vm.importDraftAttachments(urls)
+            return true
+        }
         .alert("Clear this Goal?", isPresented: $showGoalClearConfirmation) {
             Button("Clear", role: .destructive) { vm.clearGoal() }
             Button("Cancel", role: .cancel) {}
@@ -631,6 +846,14 @@ struct CoworkSessionView: View {
                 .foregroundStyle(.secondary)
                 .lineLimit(2)
             Spacer(minLength: 8)
+            if vm.needsPrimaryWorkspaceAuthorization {
+                Button("Reauthorize Workspace") {
+                    vm.reauthorizePrimaryWorkspace()
+                }
+                .buttonStyle(.borderless)
+                .font(.caption.bold())
+                .accessibilityIdentifier("cowork.workspace.reauthorize")
+            }
             if vm.permissionReviewerStatus.canRetry {
                 Button("Retry") { vm.retryAutomaticPermissionReview() }
                     .buttonStyle(.borderless)
@@ -655,14 +878,14 @@ struct CoworkSessionView: View {
         case .disabled:
             return (
                 "Permission reviewer disabled",
-                "Cowork input stays unavailable until automatic review is active.",
+                "You can keep editing and submitting; ask-class tools fail closed until automatic review is active.",
                 "shield.slash",
                 .secondary,
                 false)
         case .enabling:
             return (
                 "Starting permission reviewer…",
-                "Automatic review is not active until startup succeeds.",
+                "Ordinary work can proceed; ask-class tools wait for or fail closed without automatic review.",
                 "shield",
                 .secondary,
                 true)
@@ -690,7 +913,7 @@ struct CoworkSessionView: View {
         case .failed(let reason):
             return (
                 "Permission reviewer failed",
-                "\(reason) Cowork input is locked until automatic review starts.",
+                "\(reason) Input remains available; ask-class tools fail closed until automatic review starts.",
                 "exclamationmark.shield.fill",
                 .red,
                 false)
@@ -883,8 +1106,58 @@ private struct CoworkInferenceAccessory: View {
     }
 }
 
+#if canImport(AppKit)
+@MainActor
+final class IntatisApplicationDelegate: NSObject, NSApplicationDelegate {
+    private var terminationTask: Task<Void, Never>?
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        let manager = AppSessionRuntimeManager.shared
+        if manager.state == .stopped {
+            return .terminateNow
+        }
+        guard terminationTask == nil else { return .terminateLater }
+        let deadline: SessionRuntimeShutdownDeadline
+        #if DEBUG
+        if let raw = Self.argumentValue(after: "-IntatisShutdownDeadlineMilliseconds"),
+           let milliseconds = Int64(raw), milliseconds >= 0 {
+            deadline = .after(.milliseconds(milliseconds))
+        } else {
+            deadline = .after(.seconds(8))
+        }
+        #else
+        deadline = .after(.seconds(8))
+        #endif
+        terminationTask = Task { @MainActor [weak self] in
+            _ = await manager.shutdownAll(
+                reason: "Application quit requested",
+                deadline: deadline)
+            sender.reply(toApplicationShouldTerminate: true)
+            self?.terminationTask = nil
+        }
+        return .terminateLater
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
+    }
+
+    private static func argumentValue(after flag: String) -> String? {
+        let arguments = ProcessInfo.processInfo.arguments
+        guard let index = arguments.firstIndex(of: flag),
+              arguments.indices.contains(index + 1) else { return nil }
+        return arguments[index + 1]
+    }
+}
+#endif
+
 @main
 struct IntatisMacApp: App {
+    #if canImport(AppKit)
+    @NSApplicationDelegateAdaptor(IntatisApplicationDelegate.self)
+    private var applicationDelegate
+    #endif
+
     private var launchAppearance: ColorScheme? {
         #if DEBUG || INTATIS_RENDERER_VALIDATION
         let arguments = ProcessInfo.processInfo.arguments
@@ -897,12 +1170,27 @@ struct IntatisMacApp: App {
     var body: some Scene {
         WindowGroup {
             #if DEBUG || INTATIS_RENDERER_VALIDATION
+            #if DEBUG
+            if ProcessInfo.processInfo.arguments.contains("-IntatisPhaseLLifecycleFixture") {
+                PhaseLSessionLifecycleFixtureView()
+                    .preferredColorScheme(launchAppearance)
+            } else if ProcessInfo.processInfo.arguments.contains("-IntatisPhaseCPermissionFixture") {
+                PhaseCPermissionFixtureView()
+                    .preferredColorScheme(launchAppearance)
+            } else if ProcessInfo.processInfo.arguments.contains("-IntatisRendererFixture") {
+                RendererFixtureView()
+                    .preferredColorScheme(launchAppearance)
+            } else {
+                IntatisProductionRootView(launchAppearance: launchAppearance)
+            }
+            #else
             if ProcessInfo.processInfo.arguments.contains("-IntatisRendererFixture") {
                 RendererFixtureView()
                     .preferredColorScheme(launchAppearance)
             } else {
                 IntatisProductionRootView(launchAppearance: launchAppearance)
             }
+            #endif
             #else
             IntatisProductionRootView(launchAppearance: launchAppearance)
             #endif
@@ -911,12 +1199,18 @@ struct IntatisMacApp: App {
     }
 }
 
+@MainActor
 private struct IntatisProductionRootView: View {
-    @StateObject private var env = AppEnvironment()
+    @StateObject private var env: AppEnvironment
     let launchAppearance: ColorScheme?
 
+    init(launchAppearance: ColorScheme?) {
+        self.launchAppearance = launchAppearance
+        _env = StateObject(wrappedValue: AppEnvironment(runtimeManager: .shared))
+    }
+
     var body: some View {
-        IntatisMacRootView()
+        IntatisMacRootView(runtimeManager: env.runtimeManager)
             .environmentObject(env)
             .preferredColorScheme(launchAppearance)
     }

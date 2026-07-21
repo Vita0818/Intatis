@@ -52,6 +52,89 @@ private func leaseTaskCreatedContracts(_ events: [Envelope]) -> [TaskContract] {
 }
 
 final class ToolRegistryLeaseTests: XCTestCase {
+    func testRenameSessionRegistryRequiresBothMainIdentityAndDedicatedCapability() {
+        let granted = CapabilityLease(tools: [.renameSession])
+        let mainRegistry = Orchestrator.toolRegistry(
+            for: granted,
+            agentID: Orchestrator.mainAgentID)
+        XCTAssertNotNil(mainRegistry.tool(named: "rename_session"))
+        XCTAssertEqual(
+            mainRegistry.registration(named: "rename_session")?.grantingCapabilities,
+            [.renameSession])
+
+        let workerRegistry = Orchestrator.toolRegistry(
+            for: granted,
+            agentID: AgentID(rawValue: "worker"))
+        XCTAssertNil(workerRegistry.tool(named: "rename_session"))
+        XCTAssertNil(Orchestrator.toolRegistry(for: granted).tool(named: "rename_session"))
+
+        let missingCapability = Orchestrator.toolRegistry(
+            for: CapabilityLease(tools: []),
+            agentID: Orchestrator.mainAgentID)
+        XCTAssertNil(missingCapability.tool(named: "rename_session"))
+    }
+
+    func testRestoreDurablyUpgradesLegacyMainDefaultRenameCapabilityOnce() async throws {
+        let log = try leaseTempLog()
+        let workspace = try leaseTempWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let main = Orchestrator.mainAgentID
+        var legacyCapability = CapabilityLease.coordinator()
+        legacyCapability.tools.remove(.renameSession)
+        legacyCapability.expiresAtTaskCompletion = false
+        let workspaceLease = WorkspaceLease(
+            rootPath: workspace.path,
+            access: .readWrite,
+            expiresAtTaskCompletion: false)
+        try await log.append([
+            .workspaceLeaseGranted(WorkspaceLeaseGrantedPayload(
+                agent: main,
+                lease: workspaceLease)),
+            .capabilityLeaseCreated(CapabilityLeaseCreatedPayload(
+                agent: main,
+                lease: legacyCapability)),
+            .agentAttached(AgentAttachedPayload(
+                agent: main,
+                path: workspace.path,
+                model: ModelID(rawValue: "m"),
+                profile: PermissionProfile.reviewed.rawValue)),
+        ])
+
+        let first = Orchestrator(
+            log: log,
+            allowsShell: true,
+            responder: FixedResponder(.deny)) { _ in LeaseCapturingProvider() }
+        await first.restore(from: CoworkProjection.build(from: await log.replay()))
+
+        let afterFirst = CoworkProjection.build(from: await log.replay())
+        XCTAssertNil(afterFirst.capabilityLeases[legacyCapability.id])
+        let upgraded = afterFirst.capabilityLeaseAgents.compactMap { leaseID, agent in
+            agent == main ? afterFirst.capabilityLeases[leaseID] : nil
+        }
+        XCTAssertEqual(upgraded.count, 1)
+        let upgradedLease = try XCTUnwrap(upgraded.first)
+        XCTAssertTrue(upgradedLease.tools.contains(.renameSession))
+        let firstEvents = await log.replay()
+        let firstCreatedCount = firstEvents.filter {
+            if case .capabilityLeaseCreated(let payload) = $0.event,
+               payload.agent == main { return true }
+            return false
+        }.count
+
+        let second = Orchestrator(
+            log: log,
+            allowsShell: true,
+            responder: FixedResponder(.deny)) { _ in LeaseCapturingProvider() }
+        await second.restore(from: afterFirst)
+        let secondEvents = await log.replay()
+        let secondCreatedCount = secondEvents.filter {
+            if case .capabilityLeaseCreated(let payload) = $0.event,
+               payload.agent == main { return true }
+            return false
+        }.count
+        XCTAssertEqual(secondCreatedCount, firstCreatedCount)
+    }
+
     func testInferenceAuthorizationFingerprintChangesAcrossTrustDomains() {
         let ref = InferenceProfileRef(
             inferenceProfileID: InferenceProfileID(rawValue: "same-profile"),

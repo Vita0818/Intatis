@@ -122,7 +122,7 @@ public actor GoalRuntimeController {
     private let consumeProviderUsageLimit: @Sendable (GoalID, ContinuationRunID) async -> String?
     /// Internal-only deterministic seam for the post-launch startup
     /// cancellation window. Shipping construction always leaves it nil.
-    private let startupPostLaunchHook: (@Sendable () async -> Void)?
+    private let startupPostRecoveryHook: (@Sendable () async -> Void)?
 
     private var eventWatcher: Task<Void, Never>?
     private var continuationTask: Task<Void, Never>?
@@ -200,7 +200,7 @@ public actor GoalRuntimeController {
                 goalID: goalID,
                 continuationRunID: runID)
         }
-        self.startupPostLaunchHook = nil
+        self.startupPostRecoveryHook = nil
     }
 
     /// Internal seam used by focused tests without constructing a production
@@ -218,7 +218,7 @@ public actor GoalRuntimeController {
          cancelGoalInvocations: (@Sendable (GoalID, ContinuationRunID?, String) async -> Bool)? = nil,
          carryForwardWorkTasks: @escaping @Sendable (GoalID, ContinuationRunID) async throws -> [WorkTask] = { _, _ in [] },
          consumeProviderUsageLimit: @escaping @Sendable (GoalID, ContinuationRunID) async -> String? = { _, _ in nil },
-         startupPostLaunchHook: (@Sendable () async -> Void)? = nil,
+         startupPostRecoveryHook: (@Sendable () async -> Void)? = nil,
          eventAppender: (@Sendable ([Event]) async throws -> Void)? = nil) {
         self.sessionID = sessionID
         self.log = log
@@ -240,7 +240,7 @@ public actor GoalRuntimeController {
         }
         self.carryForwardWorkTasks = carryForwardWorkTasks
         self.consumeProviderUsageLimit = consumeProviderUsageLimit
-        self.startupPostLaunchHook = startupPostLaunchHook
+        self.startupPostRecoveryHook = startupPostRecoveryHook
     }
 
     deinit {
@@ -248,9 +248,13 @@ public actor GoalRuntimeController {
         continuationTask?.cancel()
     }
 
-    /// Starts durable event observation and safely resumes an active Goal.
-    /// Recovered unsafe tool executions prevent automatic continuation until a
-    /// later explicit Resume/start attempt observes a settled projection.
+    /// Starts durable event observation and reconciles any interrupted Goal.
+    ///
+    /// Process startup is deliberately recovery-only: an active Goal is
+    /// cancelled/checkpointed, conservatively audited, and then durably paused.
+    /// Only an explicit ``resumeCurrentGoal()`` may create the next
+    /// continuation. This keeps reopening a session distinct from resuming it.
+    /// Recovered unsafe tool executions keep the data plane fail closed.
     @discardableResult
     public func start() async -> Bool {
         // `start()` may be retried after a fail-closed persistence/cancellation
@@ -291,7 +295,15 @@ public actor GoalRuntimeController {
             }
         }
         releaseStopLock()
-        let replayed = await log.replay()
+        let replayed: [Envelope]
+        do {
+            let replay = try await log.replayForProjectionChecked()
+            guard replay.hasCompleteKnownHistory else { throw EventLogError.unsupportedEventTypes }
+            replayed = replay.envelopes
+        } catch {
+            launchInProgress = false
+            return finishStartupAttempt(false)
+        }
         guard startupMayProceed else { return await abortStartupAttempt() }
         if eventWatcher == nil {
             let nextSequence = (replayed.last?.seq ?? -1) + 1
@@ -347,11 +359,21 @@ public actor GoalRuntimeController {
             launchInProgress = false
             return finishStartupAttempt(false)
         }
-        let recoveredProjection = CoworkProjection.build(from: await log.replay())
+        let recoveredEvents: [Envelope]
+        do {
+            let replay = try await log.replayForProjectionChecked()
+            guard replay.hasCompleteKnownHistory else { throw EventLogError.unsupportedEventTypes }
+            recoveredEvents = replay.envelopes
+        } catch {
+            launchInProgress = false
+            return finishStartupAttempt(false)
+        }
+        let recoveredProjection = CoworkProjection.build(from: recoveredEvents)
         let recoveryDisposition: RecoveryDisposition
         if interruptedScopeSafe {
             recoveryDisposition = await recoverInterruptedRunIfNeeded(
-                from: recoveredProjection)
+                from: recoveredProjection,
+                events: recoveredEvents)
         } else {
             recoveryDisposition = .failed
         }
@@ -364,19 +386,20 @@ public actor GoalRuntimeController {
         }
         guard startupMayProceed else { return await abortStartupAttempt() }
         launchInProgress = false
+        let startupDisposition: RecoveryDisposition
         if case .continueGoal = reconciledDisposition {
-            startupRecoveryComplete = true
-            await launchCurrentGoalIfEligible()
-            if let startupPostLaunchHook {
-                await startupPostLaunchHook()
+            startupDisposition = await pauseRecoveredActiveGoalIfNeeded()
+            if let startupPostRecoveryHook {
+                await startupPostRecoveryHook()
             }
             guard startupMayProceed else { return await abortStartupAttempt() }
-        } else if case .safeWithoutContinuation = reconciledDisposition {
-            startupRecoveryComplete = true
+        } else {
+            startupDisposition = reconciledDisposition
         }
-        if case .failed = reconciledDisposition {
+        if case .failed = startupDisposition {
             return finishStartupAttempt(false)
         }
+        startupRecoveryComplete = true
         return finishStartupAttempt(true)
     }
 
@@ -674,6 +697,7 @@ public actor GoalRuntimeController {
                              to target: AgentID? = nil,
                              images: [ImageAttachment] = [],
                              userMessage: UserMessagePayload? = nil,
+                             recordUserMessage: Bool = true,
                              explicitGoalIntent: Bool = false) async -> OrchestratorSendResult {
         await acquireGoalMutationLock()
         defer { releaseGoalMutationLock() }
@@ -720,7 +744,14 @@ public actor GoalRuntimeController {
                 return .failed("Cowork runtime stopped before provider dispatch.")
             }
             let result = await sendOperation(
-                text, target, images, userMessage, nil, run.id, true, explicitGoalIntent)
+                text,
+                target,
+                images,
+                userMessage,
+                nil,
+                run.id,
+                recordUserMessage,
+                explicitGoalIntent)
             await waitForSchedulerIdle()
             switch result {
             case .sent:
@@ -842,10 +873,27 @@ public actor GoalRuntimeController {
     }
 
     private func recoverInterruptedRunIfNeeded(
-        from projection: CoworkProjection
+        from projection: CoworkProjection,
+        events: [Envelope]
     ) async -> RecoveryDisposition {
-        guard projection.unresolvedNonReplayableToolExecutions.isEmpty else { return .failed }
-        guard let goal = projection.currentGoal else { return .safeWithoutContinuation }
+        let uncertainNonReplayable = projection.uncertainNonReplayableToolExecutions
+        guard let goal = projection.currentGoal else {
+            // A non-replayable executor outcome remains an audit/retry concern
+            // for its owning task, but a durably terminal task cannot be replayed
+            // by this Goal runtime. Keep fail-closed behavior for legacy/unscoped
+            // tickets, missing task history, and every nonterminal task because
+            // their execution scope cannot be proven inert.
+            let allExecutionsAreConfinedToTerminalTasks = uncertainNonReplayable.allSatisfy {
+                Self.isExecutionConfinedToTerminalTask(
+                    $0,
+                    projection: projection,
+                    events: events)
+            }
+            return allExecutionsAreConfinedToTerminalTasks
+                ? .safeWithoutContinuation
+                : .failed
+        }
+        guard uncertainNonReplayable.isEmpty else { return .failed }
         let interrupted = projection.continuationRuns.values
             .filter { $0.goalID == goal.id && ($0.status == .created || $0.status == .running) }
             .sorted { lhs, rhs in
@@ -870,6 +918,111 @@ public actor GoalRuntimeController {
         return goal.status == .active ? .continueGoal : .safeWithoutContinuation
     }
 
+    /// Converts a cold-restored active Goal into an explicit paused state after
+    /// all interrupted runs and unaudited checkpoints have been reconciled.
+    /// The exact revision is read from complete-known durable history and the
+    /// authority CAS must succeed before startup can release the data plane.
+    private func pauseRecoveredActiveGoalIfNeeded() async -> RecoveryDisposition {
+        let projection: CoworkProjection
+        do {
+            let replay = try await log.replayForProjectionChecked()
+            guard replay.hasCompleteKnownHistory else {
+                throw EventLogError.unsupportedEventTypes
+            }
+            projection = CoworkProjection.build(from: replay.envelopes)
+        } catch {
+            return .failed
+        }
+        guard let current = projection.currentGoal else {
+            return .safeWithoutContinuation
+        }
+        guard current.status == .active else {
+            return .safeWithoutContinuation
+        }
+        let recoveredStatus: GoalStatus
+        if let budget = current.tokenBudget, current.tokensUsed >= budget {
+            // Startup previously reached this durable limit through the launch
+            // gate. Recovery-only startup must preserve the same hard stop
+            // without momentarily presenting the Goal as resumable.
+            recoveredStatus = .budgetLimited
+        } else {
+            recoveredStatus = .paused
+        }
+        do {
+            if let goalAuthority {
+                _ = try await goalAuthority.transitionGoal(
+                    current.id,
+                    expectedRevision: current.revision,
+                    to: recoveredStatus,
+                    canSubmitVerdict: false,
+                    hostAuthorized: true)
+            } else {
+                let recovered: Goal
+                switch current.transitioning(
+                    to: recoveredStatus,
+                    expectedRevision: current.revision) {
+                case .success(let value):
+                    recovered = value
+                case .failure(let violation):
+                    throw Self.runtimeError(violation)
+                }
+                switch recoveredStatus {
+                case .paused:
+                    try await append(.goalPaused(GoalPausedPayload(goal: recovered)))
+                case .budgetLimited:
+                    try await append(.goalBudgetLimited(
+                        GoalBudgetLimitedPayload(goal: recovered)))
+                default:
+                    preconditionFailure("Unexpected recovered Goal status")
+                }
+            }
+            return .safeWithoutContinuation
+        } catch {
+            await recordRuntimeError(
+                code: "goal_startup_pause",
+                message: "Could not pause the recovered Goal: \(error.localizedDescription)")
+            return .failed
+        }
+    }
+
+    private static func isExecutionConfinedToTerminalTask(
+        _ execution: CoworkToolExecutionView,
+        projection: CoworkProjection,
+        events: [Envelope]
+    ) -> Bool {
+        guard let taskID = execution.prepared.taskID,
+              let preparedAttempt = execution.prepared.attempt,
+              preparedAttempt > 0,
+              let task = projection.tasks[taskID],
+              let contract = task.contract,
+              contract.id == taskID,
+              task.status.isTerminal,
+              task.attempt == preparedAttempt else { return false }
+
+        let contractExistedBeforePrepare = events.contains { envelope in
+            guard envelope.seq < execution.preparedSeq,
+                  case .taskCreated(let payload) = envelope.event else {
+                return false
+            }
+            return payload.contract == contract
+        }
+        guard contractExistedBeforePrepare else { return false }
+
+        return events.contains { envelope in
+            guard envelope.seq > execution.preparedSeq else { return false }
+            switch envelope.event {
+            case .taskCompleted(let payload):
+                return payload.taskID == taskID && payload.attempt == preparedAttempt
+            case .taskFailed(let payload):
+                return payload.taskID == taskID && payload.attempt == preparedAttempt
+            case .taskCancelled(let payload):
+                return payload.taskID == taskID && payload.attempt == preparedAttempt
+            default:
+                return false
+            }
+        }
+    }
+
     /// A checkpoint is a safe execution boundary but not a completed run. If a
     /// process stopped between checkpoint and atomic audit settlement, close
     /// that run conservatively before launching another one. This prevents
@@ -877,7 +1030,16 @@ public actor GoalRuntimeController {
     /// hard-limit signals.
     private func reconcileCheckpointedRunsIfNeeded() async -> RecoveryDisposition {
         while true {
-            let replayed = await log.replay()
+            let replayed: [Envelope]
+            do {
+                let replay = try await log.replayForProjectionChecked()
+                guard replay.hasCompleteKnownHistory else {
+                    throw EventLogError.unsupportedEventTypes
+                }
+                replayed = replay.envelopes
+            } catch {
+                return .failed
+            }
             let projection = CoworkProjection.build(from: replayed)
             guard let currentGoal = projection.currentGoal else {
                 return .safeWithoutContinuation
@@ -990,13 +1152,22 @@ public actor GoalRuntimeController {
               !launchInProgress else { return }
         launchInProgress = true
         defer { launchInProgress = false }
-        let initialProjection = CoworkProjection.build(from: await log.replay())
+        let initialProjection: CoworkProjection
+        do {
+            let replay = try await log.replayForProjectionChecked()
+            guard replay.hasCompleteKnownHistory else {
+                throw EventLogError.unsupportedEventTypes
+            }
+            initialProjection = CoworkProjection.build(from: replay.envelopes)
+        } catch {
+            return
+        }
         guard !shutdownRequested,
               !Task.isCancelled,
               pendingStop == nil,
               !stopLockHeld,
               (!goalMutationLockHeld || allowDuringGoalMutation) else { return }
-        guard initialProjection.unresolvedNonReplayableToolExecutions.isEmpty,
+        guard initialProjection.uncertainNonReplayableToolExecutions.isEmpty,
               initialProjection.currentGoal?.status == .active else { return }
         // Pause/edit/shutdown can create a safe checkpoint without restarting
         // the process. Reconcile it through the same once-per-run settlement
@@ -1007,14 +1178,23 @@ public actor GoalRuntimeController {
               pendingStop == nil,
               !stopLockHeld,
               (!goalMutationLockHeld || allowDuringGoalMutation) else { return }
-        let projection = CoworkProjection.build(from: await log.replay())
+        let projection: CoworkProjection
+        do {
+            let replay = try await log.replayForProjectionChecked()
+            guard replay.hasCompleteKnownHistory else {
+                throw EventLogError.unsupportedEventTypes
+            }
+            projection = CoworkProjection.build(from: replay.envelopes)
+        } catch {
+            return
+        }
         guard !shutdownRequested,
               !Task.isCancelled,
               pendingStop == nil,
               !stopLockHeld,
               (!goalMutationLockHeld || allowDuringGoalMutation),
               continuationTask == nil else { return }
-        guard projection.unresolvedNonReplayableToolExecutions.isEmpty,
+        guard projection.uncertainNonReplayableToolExecutions.isEmpty,
               let goal = projection.currentGoal,
               goal.status == .active else { return }
         let isAccumulatingRequiredBlockerProof = goal.latestAudit?.verdict == .blockedCandidate

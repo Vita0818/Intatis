@@ -75,14 +75,15 @@ func renderLoop(_ log: EventLog, showAgentLabels: Bool = false, spinner: TurnSpi
             let args = options.verbose ? truncate(p.args, 800) : oneLine(p.args, 72)
             out("\n  \(cyan)· \(p.name)\(reset) \(dim)\(args)\(reset)\n")
         case .toolResult(let p):
-            let color = isFailureObservation(p.observation) ? red : dim
+            let color = p.outcome.map { $0 == .succeeded ? dim : red }
+                ?? (isFailureObservation(p.observation) ? red : dim)
             if options.verbose {
                 out("  \(color)⎿\(reset) \(truncate(p.observation, 4000))\n")
             } else {
                 out("  \(color)⎿ \(summary(p.observation))\(reset)\n")
             }
         case .permissionResolved(let p):
-            out("  \(yellow)[\(p.decision.rawValue): \(p.tool) — \(p.reason)]\(reset)\n")
+            out("  \(yellow)[\(permissionResolutionLabel(p)): \(p.tool) — \(p.reason)]\(reset)\n")
         case .permissionReview(let p):
             out("  \(yellow)[review \(p.decision.rawValue): \(p.tool) by \(p.reviewerModel) — \(p.reason)]\(reset)\n")
         case .patchProposed(let p):
@@ -114,7 +115,13 @@ func renderLoop(_ log: EventLog, showAgentLabels: Bool = false, spinner: TurnSpi
 /// Terminal approval for `ask_user` decisions (Code mode).
 struct TerminalResponder: PermissionResponder {
     func requestApproval(_ request: PermissionRequestPayload) async -> PermissionDecision {
-        await TerminalPermissionPromptQueue.shared.requestApproval(request)
+        await requestResolution(request).decision
+    }
+
+    func requestResolution(
+        _ request: PermissionRequestPayload
+    ) async -> PermissionApprovalResolution {
+        await TerminalPermissionPromptQueue.shared.requestResolution(request)
     }
 }
 
@@ -124,10 +131,62 @@ struct TerminalResponder: PermissionResponder {
 private actor TerminalPermissionPromptQueue {
     static let shared = TerminalPermissionPromptQueue()
 
-    func requestApproval(_ request: PermissionRequestPayload) -> PermissionDecision {
-        out("\n  \(yellow)⚠ [\(request.requestId.rawValue)] \(request.tool) (\(request.risk.rawValue)) — \(request.reason)\(reset)\n  approve this request? [y/N] ")
-        guard let line = readLine() else { return .deny }
-        let answer = line.trimmingCharacters(in: .whitespaces).lowercased()
-        return (answer == "y" || answer == "yes") ? .allow : .deny
+    func requestResolution(
+        _ request: PermissionRequestPayload
+    ) -> PermissionApprovalResolution {
+        while true {
+            out("\n  \(yellow)⚠ [\(request.requestId.rawValue)] \(request.tool) (\(request.risk.rawValue)) — \(request.reason)\(reset)\n  [a]pprove call / [d]ecline call / [c]ancel turn: ")
+            guard let line = readLine() else {
+                return PermissionApprovalResolution(
+                    decision: .deny,
+                    action: .cancelTurn,
+                    reason: "Turn cancelled because permission input closed",
+                    risk: request.risk,
+                    source: .user,
+                    failureSource: .userCancelled)
+            }
+            switch line.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            case "a", "approve", "y", "yes":
+                return PermissionApprovalResolution(
+                    decision: .allow,
+                    action: .approve,
+                    reason: "Permission approved by user",
+                    risk: request.risk,
+                    source: .user)
+            case "d", "decline", "n", "no":
+                return PermissionApprovalResolution(
+                    decision: .deny,
+                    action: .decline,
+                    reason: "Permission declined by user",
+                    risk: request.risk,
+                    source: .user,
+                    failureSource: .userDenied)
+            case "c", "cancel", "cancel turn":
+                return PermissionApprovalResolution(
+                    decision: .deny,
+                    action: .cancelTurn,
+                    reason: "Turn cancelled by user",
+                    risk: request.risk,
+                    source: .user,
+                    failureSource: .userCancelled)
+            default:
+                out("  Enter a, d, or c.\n")
+            }
+        }
+    }
+}
+
+private func permissionResolutionLabel(_ payload: PermissionResolvedPayload) -> String {
+    if payload.decision == .allow { return "approved" }
+    if payload.action == .cancelTurn { return "turn cancelled" }
+    switch payload.failureSource {
+    case .userDenied: return "call declined"
+    case .userCancelled, .turnCancelled: return "turn cancelled"
+    case .policyDenied: return "policy denied"
+    case .reviewerTimedOut: return "review timed out"
+    case .reviewerFailed: return "review failed"
+    case .sandboxDenied: return "sandbox denied"
+    case .runtimeFailed: return "runtime failed"
+    case nil: return "denied"
     }
 }

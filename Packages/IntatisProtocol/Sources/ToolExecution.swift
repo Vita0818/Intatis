@@ -37,6 +37,20 @@ public enum ToolExecutionOutcome: String, Codable, Equatable, Sendable {
     case denied
 }
 
+/// Whether the declared side effect crossed its durable mutation boundary.
+/// Missing values come from legacy events. A legacy success still proves the
+/// call completed (and remains non-replayable); missing disposition on every
+/// failed, cancelled, or denied outcome must be treated as unknown.
+public enum ToolExecutionEffectDisposition: String, Codable, Equatable, Sendable {
+    /// The executor may have been entered, but the declared side effect is
+    /// proven not to have started and therefore cannot need reconciliation.
+    case notStarted = "not_started"
+    /// The declared side effect is known to have committed.
+    case committed
+    /// The executor outcome cannot prove whether the side effect occurred.
+    case unknown
+}
+
 /// Written immediately before invoking a tool executor. A prepared event with
 /// no matching settled event is evidence that a crash may have interrupted an
 /// execution. Callers must consult `replayPolicy` before retrying the task.
@@ -98,6 +112,7 @@ public struct ToolExecutionSettledPayload: Codable, Equatable, Sendable {
     public var authorization: ResolvedToolAuthorization?
     public var replayPolicy: ToolExecutionReplayPolicy
     public var outcome: ToolExecutionOutcome
+    public var effectDisposition: ToolExecutionEffectDisposition?
     public var reason: String?
 
     public init(executionID: String,
@@ -111,6 +126,7 @@ public struct ToolExecutionSettledPayload: Codable, Equatable, Sendable {
                 authorization: ResolvedToolAuthorization? = nil,
                 replayPolicy: ToolExecutionReplayPolicy? = nil,
                 outcome: ToolExecutionOutcome,
+                effectDisposition: ToolExecutionEffectDisposition? = nil,
                 reason: String? = nil) {
         self.executionID = executionID
         self.taskID = taskID
@@ -123,11 +139,13 @@ public struct ToolExecutionSettledPayload: Codable, Equatable, Sendable {
         self.authorization = authorization
         self.replayPolicy = replayPolicy ?? .conservative(for: sideEffect, tool: tool)
         self.outcome = outcome
+        self.effectDisposition = effectDisposition
         self.reason = reason
     }
 
     public init(prepared: ToolExecutionPreparedPayload,
                 outcome: ToolExecutionOutcome,
+                effectDisposition: ToolExecutionEffectDisposition? = nil,
                 reason: String? = nil) {
         self.init(
             executionID: prepared.executionID,
@@ -141,6 +159,7 @@ public struct ToolExecutionSettledPayload: Codable, Equatable, Sendable {
             authorization: prepared.authorization,
             replayPolicy: prepared.replayPolicy,
             outcome: outcome,
+            effectDisposition: effectDisposition,
             reason: reason)
     }
 

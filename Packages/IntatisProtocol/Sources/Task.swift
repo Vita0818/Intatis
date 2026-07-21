@@ -71,6 +71,10 @@ public struct TaskContract: Codable, Sendable, Hashable {
     public var workTaskID: WorkTaskID?
     public var continuationRunID: ContinuationRunID?
     public var goalID: GoalID?
+    /// Stable user-submission identity for a root invocation admitted through
+    /// the durable submitted-intent path. Optional for legacy and internally
+    /// generated tasks.
+    public var submissionID: SubmissionID?
 
     public var objective: String
     public var roleHint: String
@@ -98,6 +102,7 @@ public struct TaskContract: Codable, Sendable, Hashable {
                 workTaskID: WorkTaskID? = nil,
                 continuationRunID: ContinuationRunID? = nil,
                 goalID: GoalID? = nil,
+                submissionID: SubmissionID? = nil,
                 objective: String,
                 roleHint: String,
                 expectedDeliverable: String,
@@ -119,6 +124,7 @@ public struct TaskContract: Codable, Sendable, Hashable {
         self.workTaskID = workTaskID
         self.continuationRunID = continuationRunID
         self.goalID = goalID
+        self.submissionID = submissionID
         self.objective = objective
         self.roleHint = roleHint
         self.expectedDeliverable = expectedDeliverable

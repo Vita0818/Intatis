@@ -30,6 +30,220 @@ final class IntatisConversationCodeTests: XCTestCase {
         XCTAssertEqual(result?.isFailure, false)
     }
 
+    func testCodeProjectionMarksMatchingTaskCompletionAsExecutionTraceForMainAndWorker() {
+        let session = SessionID(rawValue: "task_completion_mirror")
+        let main = AgentID(rawValue: "main")
+        let worker = AgentID(rawValue: "worker")
+        let mainTask = TaskID(rawValue: "task_main")
+        let workerTask = TaskID(rawValue: "task_worker")
+        func env(_ seq: Int, _ event: Event) -> Envelope {
+            Envelope(
+                seq: seq,
+                ts: Date(timeIntervalSince1970: Double(seq)),
+                session: session,
+                event: event)
+        }
+
+        let envelopes: [Envelope] = [
+            env(15, .taskStarted(.init(taskID: mainTask, agent: main, attempt: 1))),
+            env(1_552, .messageDelta(.init(
+                messageId: MessageID(rawValue: "main_message"),
+                role: .agent,
+                agent: main,
+                textDelta: "Main"))),
+            env(1_553, .messageCompleted(.init(
+                messageId: MessageID(rawValue: "main_message"),
+                role: .agent,
+                agent: main,
+                text: "Main answer"))),
+            env(1_555, .turnStats(.init(
+                promptTokens: 10,
+                invocationTaskID: mainTask,
+                agentID: main))),
+            env(1_557, .taskCompleted(.init(
+                taskID: mainTask,
+                agent: main,
+                result: "Main answer",
+                attempt: 1))),
+            env(1_600, .taskStarted(.init(taskID: workerTask, agent: worker, attempt: 1))),
+            env(1_601, .messageCompleted(.init(
+                messageId: MessageID(rawValue: "worker_message"),
+                role: .agent,
+                agent: worker,
+                text: "Worker answer"))),
+            env(1_602, .taskCompleted(.init(
+                taskID: workerTask,
+                agent: worker,
+                result: "Worker answer",
+                attempt: 1))),
+        ]
+
+        let agentItems = CodeProjection.build(from: envelopes).items.filter { $0.kind == .agent }
+
+        XCTAssertEqual(agentItems.map(\.id), [
+            "main_message",
+            "task_main:completed",
+            "worker_message",
+            "task_worker:completed",
+        ])
+        XCTAssertEqual(agentItems.map(\.presentationSource), [
+            .conversation,
+            .executionTrace,
+            .conversation,
+            .executionTrace,
+        ])
+    }
+
+    func testCodeProjectionKeepsTaskOnlyAndDifferentTaskResultAsConversationFallbacks() {
+        let session = SessionID(rawValue: "task_completion_fallback")
+        let agent = AgentID(rawValue: "worker")
+        let taskOnly = TaskID(rawValue: "task_only")
+        let different = TaskID(rawValue: "task_different")
+        func env(_ seq: Int, _ event: Event) -> Envelope {
+            Envelope(
+                seq: seq,
+                ts: Date(timeIntervalSince1970: Double(seq)),
+                session: session,
+                event: event)
+        }
+
+        let envelopes: [Envelope] = [
+            env(0, .taskStarted(.init(taskID: taskOnly, agent: agent))),
+            env(1, .taskCompleted(.init(taskID: taskOnly, agent: agent, result: "Only durable result"))),
+            env(2, .taskStarted(.init(taskID: different, agent: agent))),
+            env(3, .messageCompleted(.init(
+                messageId: MessageID(rawValue: "different_message"),
+                role: .agent,
+                agent: agent,
+                text: "Presented answer"))),
+            env(4, .taskCompleted(.init(
+                taskID: different,
+                agent: agent,
+                result: "Different lifecycle result"))),
+        ]
+
+        let completed = CodeProjection.build(from: envelopes).items.filter {
+            $0.id.hasSuffix(":completed")
+        }
+
+        XCTAssertEqual(completed.map(\.presentationSource), [.conversation, .conversation])
+    }
+
+    func testCodeProjectionDoesNotPairIdenticalTextAcrossSequentialTasks() {
+        let session = SessionID(rawValue: "task_completion_scope")
+        let agent = AgentID(rawValue: "worker")
+        let firstTask = TaskID(rawValue: "task_first")
+        let secondTask = TaskID(rawValue: "task_second")
+        func env(_ seq: Int, _ event: Event) -> Envelope {
+            Envelope(
+                seq: seq,
+                ts: Date(timeIntervalSince1970: Double(seq)),
+                session: session,
+                event: event)
+        }
+
+        let envelopes: [Envelope] = [
+            env(0, .taskStarted(.init(taskID: firstTask, agent: agent))),
+            env(1, .messageCompleted(.init(
+                messageId: MessageID(rawValue: "first_message"),
+                role: .agent,
+                agent: agent,
+                text: "Same text"))),
+            env(2, .taskCompleted(.init(taskID: firstTask, agent: agent, result: "Same text"))),
+            env(3, .taskStarted(.init(taskID: secondTask, agent: agent))),
+            env(4, .taskCompleted(.init(taskID: secondTask, agent: agent, result: "Same text"))),
+        ]
+
+        let completed = CodeProjection.build(from: envelopes).items.filter {
+            $0.id.hasSuffix(":completed")
+        }
+
+        XCTAssertEqual(completed.map(\.presentationSource), [.executionTrace, .conversation])
+    }
+
+    func testCodeProjectionDoesNotReuseCompletedMessageAcrossTaskRetry() {
+        let session = SessionID(rawValue: "task_completion_retry")
+        let agent = AgentID(rawValue: "worker")
+        let task = TaskID(rawValue: "task_retry")
+        func env(_ seq: Int, _ event: Event) -> Envelope {
+            Envelope(
+                seq: seq,
+                ts: Date(timeIntervalSince1970: Double(seq)),
+                session: session,
+                event: event)
+        }
+
+        let envelopes: [Envelope] = [
+            env(0, .taskStarted(.init(taskID: task, agent: agent, attempt: 1))),
+            env(1, .messageCompleted(.init(
+                messageId: MessageID(rawValue: "first_attempt_message"),
+                role: .agent,
+                agent: agent,
+                text: "Same text"))),
+            env(2, .taskFailed(.init(
+                taskID: task,
+                agent: agent,
+                error: "retry",
+                attempt: 1))),
+            env(3, .taskStarted(.init(taskID: task, agent: agent, attempt: 2))),
+            env(4, .taskCompleted(.init(
+                taskID: task,
+                agent: agent,
+                result: "Same text",
+                attempt: 2))),
+        ]
+
+        let completed = CodeProjection.build(from: envelopes).items.first {
+            $0.id == "task_retry:completed"
+        }
+
+        XCTAssertEqual(completed?.presentationSource, .conversation)
+    }
+
+    func testCodeProjectionScopesLateTerminalToExactTaskAttempt() {
+        let session = SessionID(rawValue: "task_completion_late_attempt")
+        let agent = AgentID(rawValue: "worker")
+        let task = TaskID(rawValue: "task_late_attempt")
+        func env(_ seq: Int, _ event: Event) -> Envelope {
+            Envelope(
+                seq: seq,
+                ts: Date(timeIntervalSince1970: Double(seq)),
+                session: session,
+                event: event)
+        }
+
+        let envelopes: [Envelope] = [
+            env(0, .taskStarted(.init(taskID: task, agent: agent, attempt: 1))),
+            env(1, .messageCompleted(.init(
+                messageId: MessageID(rawValue: "attempt_one_message"),
+                role: .agent,
+                agent: agent,
+                text: "Same text"))),
+            env(2, .taskStarted(.init(taskID: task, agent: agent, attempt: 2))),
+            env(3, .messageCompleted(.init(
+                messageId: MessageID(rawValue: "attempt_two_message"),
+                role: .agent,
+                agent: agent,
+                text: "Same text"))),
+            env(4, .taskCompleted(.init(
+                taskID: task,
+                agent: agent,
+                result: "Same text",
+                attempt: 1))),
+            env(5, .taskCompleted(.init(
+                taskID: task,
+                agent: agent,
+                result: "Same text",
+                attempt: 2))),
+        ]
+
+        let completed = CodeProjection.build(from: envelopes).items.filter {
+            $0.id == "task_late_attempt:completed"
+        }
+
+        XCTAssertEqual(completed.map(\.presentationSource), [.executionTrace, .executionTrace])
+    }
+
     func testCodeProjectionMarksFailedToolResults() {
         let s = SessionID(rawValue: "tool_failure")
         func env(_ seq: Int, _ e: Event) -> Envelope {
@@ -66,6 +280,32 @@ final class IntatisConversationCodeTests: XCTestCase {
         XCTAssertEqual(result?.isFailure, true)
         XCTAssertEqual(result?.recoveryAdvice?.title, "Fix tool input")
         XCTAssertEqual(result?.recoveryAdvice?.retryable, true)
+    }
+
+    func testCodeProjectionPrefersTypedToolOutcomeOverPresentationText() {
+        let session = SessionID(rawValue: "typed_tool_outcome")
+        func env(_ seq: Int, _ event: Event) -> Envelope {
+            Envelope(
+                seq: seq,
+                ts: Date(timeIntervalSince1970: Double(seq)),
+                session: session,
+                event: event)
+        }
+        let envelopes: [Envelope] = [
+            env(0, .toolResult(.init(
+                toolCallId: "failed",
+                observation: "operation unavailable",
+                outcome: .failed,
+                failureSource: .runtimeFailed))),
+            env(1, .toolResult(.init(
+                toolCallId: "succeeded",
+                observation: "permission denied: literal file contents",
+                outcome: .succeeded))),
+        ]
+
+        let results = CodeProjection.build(from: envelopes).items
+
+        XCTAssertEqual(results.map(\.isFailure), [true, false])
     }
 
     func testCodeProjectionAddsRecoveryAdviceForRetryableProviderErrors() {

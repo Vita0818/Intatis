@@ -9,6 +9,7 @@
 #if canImport(SwiftUI)
 import SwiftUI
 import IntatisCore
+import IntatisConversation
 import IntatisSharedUI
 
 enum IntatisNavItem: String, CaseIterable, Identifiable, Hashable {
@@ -67,6 +68,7 @@ private struct SessionActionTarget: Identifiable {
 
 struct IntatisMacRootView: View {
     @EnvironmentObject var env: AppEnvironment
+    @ObservedObject private var runtimeManager: AppSessionRuntimeManager
     @Environment(\.colorScheme) private var scheme
     @State private var selection: IntatisNavItem = .chat
     @State private var isSettings = false
@@ -82,6 +84,10 @@ struct IntatisMacRootView: View {
     @State private var renameTarget: SessionActionTarget?
     @State private var deleteTarget: SessionActionTarget?
     @State private var sessionActionError: String?
+
+    init(runtimeManager: AppSessionRuntimeManager) {
+        _runtimeManager = ObservedObject(wrappedValue: runtimeManager)
+    }
 
     private var items: [IntatisNavItem] {
         IntatisNavItem.allCases.filter { item in
@@ -126,15 +132,15 @@ struct IntatisMacRootView: View {
         }
         .onChange(of: selection) { _ in refreshAllSessions() }
         .onChange(of: env.chatSessionID.rawValue) { _ in refreshChatSessions() }
-        .onReceive(env.$registry) { registry in
-            codeVM?.updateProviderRegistry(registry)
-            coworkVM?.updateProviderRegistry(
-                registry,
-                inferenceProfileOptions: env.inferenceProfileOptions)
+        .onReceive(runtimeManager.runtimeRemoved) { key in
+            handleRemovedRuntime(key)
+        }
+        .onReceive(runtimeManager.sessionDisplayNameChanged) { change in
+            handleSessionDisplayNameChange(change)
         }
         .sheet(item: $renameTarget) { target in
             SessionRenameSheet(initialName: target.title) { newName in
-                try renameSession(target, to: newName)
+                try await renameSession(target, to: newName)
             }
         }
         .alert("Delete Session?", isPresented: deleteAlertPresented, presenting: deleteTarget) { target in
@@ -235,13 +241,12 @@ struct IntatisMacRootView: View {
     }
 
     private var newSessionDisabled: Bool {
+        guard env.runtimeManager.acceptsNewRuntimes else { return true }
         switch selection {
-        case .chat:
-            return env.viewModel.isBusy
-        case .code:
-            return codeVM?.isWorking == true
+        case .chat, .code:
+            return false
         case .cowork:
-            return coworkVM?.isWorking == true
+            return coworkTransitionID != nil
         }
     }
 
@@ -258,14 +263,7 @@ struct IntatisMacRootView: View {
     }
 
     private func isDeleteDisabled(_ session: AppSessionSummary) -> Bool {
-        switch session.kind {
-        case .chat:
-            return session.id == env.chatSessionID && env.viewModel.isBusy
-        case .code:
-            return session.id == codeVM?.sessionID && codeVM?.isWorking == true
-        case .cowork:
-            return session.id == coworkVM?.sessionID && coworkVM?.isWorking == true
-        }
+        env.runtimeManager.isBusy(kind: session.kind, sessionID: session.id)
     }
 
     private func sessionDetail(_ session: AppSessionSummary) -> String {
@@ -282,7 +280,10 @@ struct IntatisMacRootView: View {
         case .chat:
             workspace = ""
         }
-        return "\(count) · \(timestamp)\(workspace)"
+        let runtimeState = env.runtimeManager.statusLabel(
+            kind: session.kind,
+            sessionID: session.id).map { " · \($0)" } ?? ""
+        return "\(count) · \(timestamp)\(workspace)\(runtimeState)"
     }
 
     private func refreshAllSessions() {
@@ -301,6 +302,72 @@ struct IntatisMacRootView: View {
 
     private func refreshCoworkSessions() {
         recentCoworkSessions = env.recentCoworkSessions()
+    }
+
+    private func handleRemovedRuntime(_ key: AppSessionRuntimeKey) {
+        switch key.kind {
+        case .chat:
+            env.handleRemovedChatRuntime(sessionID: key.sessionID)
+        case .code:
+            if codeVM?.sessionID == key.sessionID {
+                codeVM = nil
+            }
+        case .cowork:
+            if coworkVM?.sessionID == key.sessionID {
+                coworkVM = nil
+            }
+        }
+        refreshAllSessions()
+    }
+
+    private func handleSessionDisplayNameChange(_ change: AppSessionDisplayNameChange) {
+        switch change.key.kind {
+        case .chat:
+            guard let updated = replacingDisplayName(
+                in: recentChatSessions,
+                with: change) else {
+                refreshChatSessions()
+                return
+            }
+            recentChatSessions = updated
+        case .code:
+            guard let updated = replacingDisplayName(
+                in: recentCodeSessions,
+                with: change) else {
+                refreshCodeSessions()
+                return
+            }
+            recentCodeSessions = updated
+        case .cowork:
+            guard let updated = replacingDisplayName(
+                in: recentCoworkSessions,
+                with: change) else {
+                refreshCoworkSessions()
+                return
+            }
+            recentCoworkSessions = updated
+        }
+    }
+
+    private func replacingDisplayName(
+        in sessions: [AppSessionSummary],
+        with change: AppSessionDisplayNameChange
+    ) -> [AppSessionSummary]? {
+        guard let index = sessions.firstIndex(where: {
+            $0.id == change.key.sessionID &&
+                $0.kind.rawValue == change.key.kind.rawValue
+        }) else {
+            return nil
+        }
+        var updated = sessions
+        let current = updated[index]
+        updated[index] = AppSessionSummary(
+            id: current.id,
+            kind: current.kind,
+            updatedAt: current.updatedAt,
+            eventCount: current.eventCount,
+            displayName: change.displayName)
+        return updated
     }
 
     private func startNewSelectedSession() {
@@ -368,12 +435,29 @@ struct IntatisMacRootView: View {
         }
     }
 
-    private func renameSession(_ target: SessionActionTarget, to newName: String) throws {
-        try SessionHistoryStore.setDisplayName(
-            newName,
-            root: AppConfig.appSupportDir(),
-            session: target.sessionID)
-        refreshAllSessions()
+    private func renameSession(_ target: SessionActionTarget, to newName: String) async throws {
+        let log = try EventLog(
+            session: target.sessionID,
+            fileURL: AppConfig.sessionFile(target.sessionID))
+        let update = try await SessionProjectionStore.renameDisplayName(
+            in: log,
+            kind: target.kind,
+            displayName: newName,
+            source: .userInterface)
+        let projection = update.projection
+        guard projection.sessionID == target.sessionID,
+              projection.kind.rawValue == target.kind.rawValue,
+              let displayName = projection.displayName,
+              let settingsRevision = projection.settingsRevision else {
+            throw SessionProjectionStoreError.verificationFailed
+        }
+        runtimeManager.publishSessionDisplayNameChange(AppSessionDisplayNameChange(
+            key: AppSessionRuntimeKey(
+                kind: projection.kind,
+                sessionID: projection.sessionID),
+            displayName: displayName,
+            settingsRevision: settingsRevision,
+            projectedThroughSeq: projection.projectedThroughSeq))
     }
 
     private func deleteSession(_ target: SessionActionTarget) {
@@ -381,13 +465,13 @@ struct IntatisMacRootView: View {
             do {
                 switch target.kind {
                 case .chat:
-                    try env.deleteChatSession(target.sessionID)
+                    try await env.deleteChatSession(target.sessionID)
                 case .code:
-                    if let active = codeVM, active.sessionID == target.sessionID {
-                        guard !active.isWorking else {
-                            throw IntatisError.io("Wait for the current Code task to finish before deleting this session.")
-                        }
-                        active.stop()
+                    try await env.runtimeManager.removeRuntime(
+                        kind: .code,
+                        sessionID: target.sessionID,
+                        reason: "Code session deleted by user")
+                    if codeVM?.sessionID == target.sessionID {
                         codeVM = nil
                     }
                     try SessionHistoryStore.deleteSession(
@@ -395,14 +479,11 @@ struct IntatisMacRootView: View {
                         session: target.sessionID)
                     WorkspaceAccess.forget(session: target.sessionID)
                 case .cowork:
-                    if let active = coworkVM, active.sessionID == target.sessionID {
-                        guard !active.isWorking else {
-                            throw IntatisError.io("Wait for the current Cowork task to finish before deleting this session.")
-                        }
-                        let transitionID = UUID()
-                        coworkTransitionID = transitionID
-                        await active.stop()
-                        guard coworkTransitionID == transitionID else { return }
+                    try await env.runtimeManager.removeRuntime(
+                        kind: .cowork,
+                        sessionID: target.sessionID,
+                        reason: "Cowork session deleted by user")
+                    if coworkVM?.sessionID == target.sessionID {
                         coworkVM = nil
                     }
                     try SessionHistoryStore.deleteSession(
@@ -419,12 +500,11 @@ struct IntatisMacRootView: View {
     }
 
     private func startNewCodeSession() {
-        guard let url = WorkspaceAccess.choose() else { return }
+        guard let authorization = WorkspaceAccess.choose() else { return }
         selection = .code
         isSettings = false
-        codeVM?.stop()
         do {
-            codeVM = try env.makeCodeViewModel(workspace: url)
+            codeVM = try env.makeCodeViewModel(workspace: authorization)
             codeSessionError = nil
             refreshCodeSessions()
         } catch {
@@ -433,18 +513,37 @@ struct IntatisMacRootView: View {
     }
 
     private func showCodeSessions() {
-        codeVM?.stop()
         codeVM = nil
         refreshCodeSessions()
     }
 
     private func resumeCodeSession(_ sessionID: SessionID) {
-        guard let workspace = WorkspaceAccess.restoredWorkspace(for: sessionID) ?? WorkspaceAccess.choose() else {
+        let workspace: WorkspaceAccessLease
+        do {
+            if let restored = try WorkspaceAccess.restoredWorkspace(for: sessionID) {
+                workspace = restored
+            } else {
+                guard let expectedPath = try WorkspaceAccess.workspacePathChecked(for: sessionID),
+                      let selected = WorkspaceAccess.choose(prompt: "Reauthorize Code Workspace") else {
+                    codeSessionError = "The original Code workspace identity is unavailable; this session was not rebound."
+                    return
+                }
+                let expected = URL(fileURLWithPath: expectedPath)
+                    .standardizedFileURL
+                    .resolvingSymlinksInPath()
+                guard selected.canonicalURL == expected else {
+                    selected.release()
+                    codeSessionError = "Choose the original Code workspace at \(expectedPath)."
+                    return
+                }
+                workspace = selected
+            }
+        } catch {
+            codeSessionError = "Code workspace access could not be read safely: \(error.localizedDescription)"
             return
         }
         selection = .code
         isSettings = false
-        codeVM?.stop()
         do {
             codeVM = try env.makeCodeViewModel(session: sessionID, workspace: workspace)
             codeSessionError = nil
@@ -460,30 +559,30 @@ struct IntatisMacRootView: View {
         isSettings = false
         let transitionID = UUID()
         coworkTransitionID = transitionID
-        let previous = coworkVM
         Task { @MainActor in
-            await previous?.stop()
-            guard coworkTransitionID == transitionID else { return }
+            guard coworkTransitionID == transitionID else {
+                workspace.release()
+                return
+            }
             do {
-                coworkVM = try env.makeCoworkViewModel(primaryWorkspace: workspace)
+                let runtime = try await env.makeCoworkViewModel(primaryWorkspace: workspace)
+                guard coworkTransitionID == transitionID else { return }
+                coworkVM = runtime
                 coworkSessionError = nil
                 refreshCoworkSessions()
             } catch {
                 coworkSessionError = "Could not start Cowork session: \(error.localizedDescription)"
             }
+            if coworkTransitionID == transitionID {
+                coworkTransitionID = nil
+            }
         }
     }
 
     private func showCoworkSessions() {
-        let transitionID = UUID()
-        coworkTransitionID = transitionID
-        let previous = coworkVM
-        Task { @MainActor in
-            await previous?.stop()
-            guard coworkTransitionID == transitionID else { return }
-            coworkVM = nil
-            refreshCoworkSessions()
-        }
+        coworkTransitionID = nil
+        coworkVM = nil
+        refreshCoworkSessions()
     }
 
     private func resumeCoworkSession(_ sessionID: SessionID) {
@@ -491,16 +590,19 @@ struct IntatisMacRootView: View {
         isSettings = false
         let transitionID = UUID()
         coworkTransitionID = transitionID
-        let previous = coworkVM
         Task { @MainActor in
-            await previous?.stop()
             guard coworkTransitionID == transitionID else { return }
             do {
-                coworkVM = try env.makeCoworkViewModel(session: sessionID)
+                let runtime = try await env.makeCoworkViewModel(session: sessionID)
+                guard coworkTransitionID == transitionID else { return }
+                coworkVM = runtime
                 coworkSessionError = nil
                 refreshCoworkSessions()
             } catch {
                 coworkSessionError = "Could not resume Cowork session: \(error.localizedDescription)"
+            }
+            if coworkTransitionID == transitionID {
+                coworkTransitionID = nil
             }
         }
     }
@@ -510,10 +612,11 @@ private struct SessionRenameSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var name: String
     @State private var errorText: String?
-    private let onRename: (String) throws -> Void
+    @State private var isRenaming = false
+    private let onRename: (String) async throws -> Void
 
     init(initialName: String,
-         onRename: @escaping (String) throws -> Void) {
+         onRename: @escaping (String) async throws -> Void) {
         _name = State(initialValue: initialName)
         self.onRename = onRename
     }
@@ -546,7 +649,7 @@ private struct SessionRenameSheet: View {
                 Button("Cancel", action: dismiss.callAsFunction)
                 Button("Rename", action: rename)
                     .keyboardShortcut(.defaultAction)
-                    .disabled(!canRename)
+                    .disabled(!canRename || isRenaming)
             }
         }
         .padding(20)
@@ -555,11 +658,15 @@ private struct SessionRenameSheet: View {
 
     private func rename() {
         guard canRename else { return }
-        do {
-            try onRename(trimmedName)
-            dismiss()
-        } catch {
-            errorText = error.localizedDescription
+        isRenaming = true
+        Task { @MainActor in
+            do {
+                try await onRename(trimmedName)
+                dismiss()
+            } catch {
+                errorText = error.localizedDescription
+                isRenaming = false
+            }
         }
     }
 }

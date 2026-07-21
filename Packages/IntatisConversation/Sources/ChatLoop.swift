@@ -33,6 +33,8 @@ public struct ChatLoop: Sendable {
     public func send(_ userText: String,
                      images: [ImageAttachment] = [],
                      userMessage: UserMessagePayload? = nil) async throws {
+        let turnID = TurnID.new()
+        let submissionID = userMessage?.submissionID
         let history = await buildHistory()
         try await log.append(.userMessage(userMessage ?? UserMessagePayload(text: userText)))
 
@@ -65,8 +67,36 @@ public struct ChatLoop: Sendable {
             try await log.append(.messageCompleted(
                 MessageCompletedPayload(messageId: assistantID, role: .assistant, text: full)))
             await appendTurnStats(start: start, firstTokenAt: firstTokenAt, usage: usage)
+            try await log.append(.turnOutcome(TurnOutcomePayload(
+                turnID: turnID,
+                outcome: .completed,
+                submissionID: submissionID)))
         } catch {
-            try await log.append(.error(RuntimeErrorPresentation.payload(for: error, fallbackCode: "provider")))
+            let interrupted = error is CancellationError && Task.isCancelled
+            if !interrupted {
+                let payload: ErrorPayload
+                if error is CancellationError {
+                    // A provider-originated CancellationError is not evidence
+                    // that the user cancelled this turn.
+                    payload = ErrorPayload(
+                        code: "runtime_failed",
+                        message: "The provider or runtime ended with an unexpected cancellation signal.")
+                } else {
+                    payload = RuntimeErrorPresentation.payload(
+                        for: error,
+                        fallbackCode: "provider")
+                }
+                _ = try? await log.append(.error(payload))
+            }
+            let diagnostic = PermissionReviewTextSanitizer.sanitizeDiagnostic(
+                error.localizedDescription,
+                maxCharacters: 512).text
+            _ = try? await log.append(.turnOutcome(TurnOutcomePayload(
+                turnID: turnID,
+                outcome: interrupted ? .interrupted : .failed,
+                failureSource: interrupted ? .turnCancelled : .runtimeFailed,
+                reason: diagnostic,
+                submissionID: submissionID)))
             throw error
         }
     }

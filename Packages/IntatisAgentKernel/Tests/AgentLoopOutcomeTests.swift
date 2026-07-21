@@ -60,6 +60,24 @@ private actor SuspendedApprovalResponder: PermissionResponder {
     }
 }
 
+private struct CancelTurnOutcomeResponder: PermissionResponder {
+    func requestApproval(_ request: PermissionRequestPayload) async -> PermissionDecision {
+        .deny
+    }
+
+    func requestResolution(
+        _ request: PermissionRequestPayload
+    ) async -> PermissionApprovalResolution {
+        PermissionApprovalResolution(
+            decision: .deny,
+            action: .cancelTurn,
+            reason: "Turn cancelled by user",
+            risk: request.risk,
+            source: .user,
+            failureSource: .userCancelled)
+    }
+}
+
 final class AgentLoopOutcomeTests: XCTestCase {
     private func makeLoop(provider: ToolCallingProvider,
                           maxIterations: Int = 50,
@@ -117,7 +135,7 @@ final class AgentLoopOutcomeTests: XCTestCase {
         XCTAssertTrue(errors.first?.message.contains("maximum of 1 tool iterations") == true)
     }
 
-    func testProviderCancellationPropagatesAndLogsCancelledOnce() async throws {
+    func testProviderSelfCancellationIsRuntimeFailureNotTurnCancellation() async throws {
         let (loop, log, workspace) = try makeLoop(provider: CancelledOutcomeProvider())
         defer { try? FileManager.default.removeItem(at: workspace) }
 
@@ -130,7 +148,13 @@ final class AgentLoopOutcomeTests: XCTestCase {
 
         let errors = await errorPayloads(in: log)
         XCTAssertEqual(errors.count, 1)
-        XCTAssertEqual(errors.first?.code, "cancelled")
+        XCTAssertEqual(errors.first?.code, "runtime_failed")
+        let outcomes = await log.replay().compactMap { envelope -> TurnOutcomePayload? in
+            if case .turnOutcome(let payload) = envelope.event { return payload }
+            return nil
+        }
+        XCTAssertEqual(outcomes.map(\.outcome), [.failed])
+        XCTAssertEqual(outcomes.first?.failureSource, .runtimeFailed)
     }
 
     func testExplicitCompletionWithoutToolCallsReturnsFinalText() async throws {
@@ -152,6 +176,11 @@ final class AgentLoopOutcomeTests: XCTestCase {
         }
         XCTAssertEqual(completed.count, 1)
         XCTAssertEqual(completed.first?.text, "Finished.")
+        let outcomes = await log.replay().compactMap { envelope -> TurnOutcomePayload? in
+            if case .turnOutcome(let payload) = envelope.event { return payload }
+            return nil
+        }
+        XCTAssertEqual(outcomes.map(\.outcome), [.completed])
     }
 
     func testHostControlInputCanSkipUserMessageRecording() async throws {
@@ -315,7 +344,16 @@ final class AgentLoopOutcomeTests: XCTestCase {
         }
         XCTAssertEqual(resolutions.last?.decision, .deny)
         XCTAssertEqual(resolutions.last?.reason, "permission request cancelled")
+        XCTAssertEqual(resolutions.last?.failureSource, .turnCancelled)
         XCTAssertFalse(events.contains { if case .toolResult = $0.event { return true } else { return false } })
+        let outcomes = events.compactMap { envelope -> TurnOutcomePayload? in
+            if case .turnOutcome(let payload) = envelope.event { return payload }
+            return nil
+        }
+        XCTAssertEqual(outcomes.map(\.outcome), [.interrupted])
+        XCTAssertEqual(outcomes.first?.failureSource, .turnCancelled)
+        let cancellationErrors = await errorPayloads(in: log)
+        XCTAssertTrue(cancellationErrors.isEmpty)
 
         // Release the deliberately non-cooperative responder after verifying the
         // AgentLoop no longer depends on it. A late allow must remain ineffectual.
@@ -324,5 +362,51 @@ final class AgentLoopOutcomeTests: XCTestCase {
         await Task.yield()
         XCTAssertFalse(FileManager.default.fileExists(
             atPath: workspace.appendingPathComponent("cancelled.txt").path))
+    }
+
+    func testExplicitCancelTurnInterruptsWithoutDeniedToolResult() async throws {
+        let provider = OutcomeProvider(chunks: [
+            .toolCalls([ToolCall(
+                id: "cancel-turn-call",
+                name: "write_file",
+                arguments: #"{"path":"must-not-exist.txt","content":"no"}"#)]),
+            .done(finishReason: "tool_calls"),
+        ])
+        let (loop, log, workspace) = try makeLoop(
+            provider: provider,
+            registry: ToolRegistry([WriteFileTool()]),
+            responder: CancelTurnOutcomeResponder())
+        defer { try? FileManager.default.removeItem(at: workspace) }
+
+        do {
+            _ = try await loop.send("Request a write then cancel the turn.")
+            XCTFail("Cancel Turn must interrupt the enclosing turn.")
+        } catch let error as AgentTurnInterruptedError {
+            XCTAssertEqual(error.failureSource, .userCancelled)
+        } catch {
+            XCTFail("Expected AgentTurnInterruptedError, got \(error)")
+        }
+
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: workspace.appendingPathComponent("must-not-exist.txt").path))
+        let events = await log.replay()
+        XCTAssertFalse(events.contains {
+            if case .toolResult = $0.event { return true }
+            return false
+        })
+        let resolution = try XCTUnwrap(events.compactMap { envelope -> PermissionResolvedPayload? in
+            if case .permissionResolved(let payload) = envelope.event { return payload }
+            return nil
+        }.last)
+        XCTAssertEqual(resolution.action, .cancelTurn)
+        XCTAssertEqual(resolution.failureSource, .userCancelled)
+        let outcome = try XCTUnwrap(events.compactMap { envelope -> TurnOutcomePayload? in
+            if case .turnOutcome(let payload) = envelope.event { return payload }
+            return nil
+        }.last)
+        XCTAssertEqual(outcome.outcome, .interrupted)
+        XCTAssertEqual(outcome.failureSource, .userCancelled)
+        let cancellationErrors = await errorPayloads(in: log)
+        XCTAssertTrue(cancellationErrors.isEmpty)
     }
 }

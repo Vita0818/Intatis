@@ -70,6 +70,29 @@ private func workTaskWorkspace() throws -> URL {
     return url
 }
 
+private struct UntrustedStaleWorkTaskManager: WorkTaskManager {
+    func createWorkTask(_ request: WorkTaskCreateRequest) async throws -> WorkTaskDetail {
+        throw WorkTaskGraphViolation(kind: .missingTask, message: "unused test operation")
+    }
+
+    func updateWorkTask(_ request: WorkTaskUpdateRequest) async throws -> WorkTaskDetail {
+        throw WorkTaskGraphViolation(
+            kind: .staleRevision,
+            message: "expected revision \(request.expectedRevision), actual 4",
+            taskID: request.taskID,
+            expectedRevision: request.expectedRevision,
+            actualRevision: 4)
+    }
+
+    func getWorkTask(_ taskID: WorkTaskID) async throws -> WorkTaskDetail {
+        throw WorkTaskGraphViolation(kind: .missingTask, message: "unused test operation")
+    }
+
+    func listWorkTasks(_ request: WorkTaskListRequest) async throws -> [WorkTaskDetail] {
+        throw WorkTaskGraphViolation(kind: .missingTask, message: "unused test operation")
+    }
+}
+
 final class WorkTaskRuntimeTests: XCTestCase {
     private let main = AgentID(rawValue: "main")
     private let worker = AgentID(rawValue: "worker")
@@ -112,6 +135,74 @@ final class WorkTaskRuntimeTests: XCTestCase {
             coordinationDepth: workerCoordinationDepth))
         XCTAssertTrue(workerAttached)
         return (orchestrator, log)
+    }
+
+    func testTaskUpdateToolDoesNotInventNoEffectForArbitraryManager() async throws {
+        let workspace = try workTaskWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let context = ToolContext(
+            workspaceRoot: workspace,
+            workTaskManager: UntrustedStaleWorkTaskManager())
+
+        do {
+            _ = try await TaskUpdateTool().execute(
+                ToolArgs(raw: #"{"task_id":"task-stale-tool","expected_revision":3}"#),
+                in: context)
+            XCTFail("The manager's stale violation must propagate without an invented proof.")
+        } catch let violation as WorkTaskGraphViolation {
+            XCTAssertEqual(violation.kind, .staleRevision)
+            XCTAssertEqual(violation.taskID, WorkTaskID(rawValue: "task-stale-tool"))
+            XCTAssertEqual(violation.expectedRevision, 3)
+            XCTAssertEqual(violation.actualRevision, 4)
+        }
+    }
+
+    func testOrchestratorManagerProvesStaleRevisionBeforeMutation() async throws {
+        let workspace = try workTaskWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let (orchestrator, _) = try await makeOrchestrator(workspace: workspace)
+        let runID = ContinuationRunID.new()
+        let created = try await orchestrator.createWorkTask(
+            requestedBy: main,
+            currentRunID: runID,
+            currentGoalID: nil,
+            canManage: true,
+            request: WorkTaskCreateRequest(
+                title: "Authoritative stale boundary",
+                description: "Prove the preflight graph is unchanged"))
+        XCTAssertGreaterThan(created.task.revision, 0)
+
+        let manager = OrchestratorWorkTaskManager(
+            orchestrator: orchestrator,
+            requester: main,
+            currentWorkTaskID: nil,
+            currentRunID: runID,
+            currentGoalID: nil,
+            canManage: true,
+            canUpdateOwned: false)
+        let context = ToolContext(
+            workspaceRoot: workspace,
+            workTaskManager: manager)
+        let rawArgs = #"{"task_id":"\#(created.task.id.rawValue)","expected_revision":0,"progress_note":"stale overwrite"}"#
+
+        do {
+            _ = try await TaskUpdateTool().execute(ToolArgs(raw: rawArgs), in: context)
+            XCTFail("The authoritative stale update must provide a no-effect proof.")
+        } catch let rejection as ToolExecutionRejectedWithoutSideEffect {
+            XCTAssertEqual(rejection.code, "stale_revision")
+            XCTAssertTrue(rejection.message.contains("without applying changes"))
+            XCTAssertTrue(rejection.message.contains("current revision is \(created.task.revision)"))
+            XCTAssertTrue(rejection.message.contains("Call task_get for task_id \"\(created.task.id.rawValue)\""))
+        }
+
+        let unchanged = try await orchestrator.getWorkTask(
+            requestedBy: main,
+            currentWorkTaskID: nil,
+            currentRunID: runID,
+            currentGoalID: nil,
+            canManage: true,
+            taskID: created.task.id)
+        XCTAssertEqual(unchanged.task, created.task)
     }
 
     func testConcurrentCreatesPreserveBothTasksAcrossPersistenceAwait() async throws {

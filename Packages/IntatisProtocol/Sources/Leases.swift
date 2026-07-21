@@ -28,6 +28,7 @@ public enum ToolCapability: String, Codable, Sendable, Hashable {
     case readGoal = "read_goal"
     case createGoal = "create_goal"
     case submitGoalVerdict = "submit_goal_verdict"
+    case renameSession = "rename_session"
 }
 
 public struct DelegationBudget: Codable, Sendable, Hashable {

@@ -239,6 +239,107 @@ private struct PolicyUncertainWriteTool: Tool {
     }
 }
 
+private struct PolicyTaskUpdateArguments: Decodable {
+    var taskID: String
+    var expectedRevision: Int
+
+    enum CodingKeys: String, CodingKey {
+        case taskID = "task_id"
+        case expectedRevision = "expected_revision"
+    }
+}
+
+private actor PolicyStaleThenSuccessfulTaskUpdateState {
+    private var attemptedRevisions: [Int] = []
+
+    func execute(expectedRevision: Int) throws -> ToolObservation {
+        attemptedRevisions.append(expectedRevision)
+        if attemptedRevisions.count == 1 {
+            throw ToolExecutionRejectedWithoutSideEffect(
+                code: "stale_revision",
+                message: "task_update rejected without applying changes: expected_revision \(expectedRevision) is stale; the current revision is 2. Call task_get for task_id \"task-retry\", merge against the authoritative task state, then retry task_update using that revision as expected_revision.")
+        }
+        return ToolObservation(text: "task updated at revision \(expectedRevision)")
+    }
+
+    func revisions() -> [Int] { attemptedRevisions }
+}
+
+private struct PolicyStaleThenSuccessfulTaskUpdateTool: Tool {
+    static let descriptor = ToolDescriptor(
+        name: "task_update",
+        description: "Test-only optimistic task update.",
+        sideEffect: .write,
+        parameters: .object([
+            "type": .string("object"),
+            "properties": .object([
+                "task_id": .object([
+                    "type": .string("string"),
+                    "minLength": .number(1),
+                ]),
+                "expected_revision": .object([
+                    "type": .string("integer"),
+                    "minimum": .number(0),
+                ]),
+            ]),
+            "required": .array([.string("task_id"), .string("expected_revision")]),
+            "additionalProperties": .bool(false),
+        ]))
+
+    let state: PolicyStaleThenSuccessfulTaskUpdateState
+
+    func permissionIntent(_ args: ToolArgs, workspaceRoot: URL) -> PermissionIntent {
+        let value = try? args.decode(PolicyTaskUpdateArguments.self)
+        return PermissionIntent(
+            action: "task.update",
+            resources: [PermissionResource(kind: .task, value: value?.taskID ?? "unknown")],
+            metadata: [
+                "expectedRevision": .number(Double(value?.expectedRevision ?? -1)),
+            ],
+            dataEffects: [.none],
+            controlEffects: [.updateTask],
+            risks: [.controlPlaneMutation],
+            replayPolicy: .requiresManualReconciliation)
+    }
+
+    func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {
+        let value = try args.decode(PolicyTaskUpdateArguments.self)
+        return try await state.execute(expectedRevision: value.expectedRevision)
+    }
+}
+
+private actor PolicyPostPrepareCancellationGate {
+    private var callCount = 0
+    private var entered = false
+    private var enteredWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    func revalidate() async -> String? {
+        callCount += 1
+        guard callCount == 3 else { return nil }
+        entered = true
+        let waiters = enteredWaiters
+        enteredWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+        await withCheckedContinuation { continuation in
+            releaseContinuation = continuation
+        }
+        return nil
+    }
+
+    func waitUntilEntered() async {
+        if entered { return }
+        await withCheckedContinuation { continuation in
+            enteredWaiters.append(continuation)
+        }
+    }
+
+    func release() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
+    }
+}
+
 private actor PolicyCancellationGate {
     private var entered = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
@@ -593,6 +694,7 @@ final class AgentLoopPolicyTests: XCTestCase {
         XCTAssertEqual(prepared.count, 1)
         XCTAssertEqual(settled.count, 1)
         XCTAssertEqual(settled.first?.outcome, .denied)
+        XCTAssertEqual(settled.first?.effectDisposition, .notStarted)
         XCTAssertEqual(settled.first?.authorization, prepared.first?.authorization)
     }
 
@@ -929,6 +1031,145 @@ final class AgentLoopPolicyTests: XCTestCase {
             return payload.toolCallId == "uncertain-call"
                 && payload.observation.contains("manual reconciliation required")
         })
+    }
+
+    func testRejectedWithoutSideEffectSettlesAndReturnsRecoveryToModel() async throws {
+        let (workspace, log) = try makeWorkspaceAndLog("rejected-without-side-effect")
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let taskID = TaskID(rawValue: "task-no-effect-retry")
+        let contract = TaskContract(
+            id: taskID,
+            issuer: AgentID(rawValue: "main"),
+            assignee: AgentID(rawValue: "policy-agent"),
+            objective: "Retry an optimistic task update.",
+            roleHint: "worker",
+            expectedDeliverable: "updated task")
+        let provider = PolicyScriptedProvider([
+            [
+                .toolCalls([ToolCall(
+                    id: "stale-update",
+                    name: "task_update",
+                    arguments: json(["task_id": "task-retry", "expected_revision": 1]))]),
+                .done(finishReason: "tool_calls"),
+            ],
+            [
+                .toolCalls([ToolCall(
+                    id: "retried-update",
+                    name: "task_update",
+                    arguments: json(["task_id": "task-retry", "expected_revision": 2]))]),
+                .done(finishReason: "tool_calls"),
+            ],
+            [.textDelta("The task update succeeded after refreshing its revision."),
+             .done(finishReason: "stop")],
+        ])
+        let state = PolicyStaleThenSuccessfulTaskUpdateState()
+        let loop = makeLoop(
+            workspace: workspace,
+            log: log,
+            provider: provider,
+            registry: ToolRegistry([PolicyStaleThenSuccessfulTaskUpdateTool(state: state)]),
+            context: ContextBuilder(
+                taskContract: contract,
+                runtimeEnvironment: .cowork),
+            taskAttempt: 1)
+
+        let answer = try await loop.send("Update the task.")
+
+        XCTAssertEqual(answer, "The task update succeeded after refreshing its revision.")
+        let attemptedRevisions = await state.revisions()
+        XCTAssertEqual(attemptedRevisions, [1, 2])
+        XCTAssertEqual(provider.requests.count, 3)
+        let recoveryRequest = try XCTUnwrap(provider.requests.dropFirst().first)
+        XCTAssertTrue(recoveryRequest.messages.contains { message in
+            message.content?.contains("Call task_get for task_id \"task-retry\"") == true
+                && message.content?.contains("current revision is 2") == true
+        })
+
+        let events = await log.replay()
+        let stalePrepared = try XCTUnwrap(events.compactMap { envelope -> ToolExecutionPreparedPayload? in
+            guard case .toolExecutionPrepared(let payload) = envelope.event,
+                  payload.toolCallID == "stale-update" else { return nil }
+            return payload
+        }.first)
+        let staleSettled = try XCTUnwrap(events.compactMap { envelope -> ToolExecutionSettledPayload? in
+            guard case .toolExecutionSettled(let payload) = envelope.event,
+                  payload.executionID == stalePrepared.executionID else { return nil }
+            return payload
+        }.first)
+        XCTAssertEqual(staleSettled.outcome, .failed)
+        XCTAssertEqual(staleSettled.effectDisposition, .notStarted)
+        XCTAssertTrue(events.contains { envelope in
+            guard case .toolResult(let payload) = envelope.event else { return false }
+            return payload.toolCallId == "stale-update"
+                && payload.observation.contains("Call task_get")
+        })
+        XCTAssertFalse(CoworkProjection.build(from: events)
+            .unresolvedNonReplayableToolExecutions
+            .contains { $0.id == stalePrepared.executionID })
+        let successfulSettlement = try XCTUnwrap(events.compactMap { envelope -> ToolExecutionSettledPayload? in
+            guard case .toolExecutionSettled(let payload) = envelope.event,
+                  payload.toolCallID == "retried-update" else { return nil }
+            return payload
+        }.first)
+        XCTAssertEqual(successfulSettlement.outcome, .succeeded)
+        XCTAssertEqual(successfulSettlement.effectDisposition, .committed)
+        XCTAssertFalse(events.contains { envelope in
+            guard case .error(let payload) = envelope.event else { return false }
+            return payload.code == "manual_reconciliation"
+        })
+    }
+
+    func testCancellationAfterPrepareBeforeExecutorSettlesNotStarted() async throws {
+        let (workspace, log) = try makeWorkspaceAndLog("cancel-before-executor")
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let provider = PolicyScriptedProvider([[
+            .toolCalls([ToolCall(
+                id: "cancelled-before-executor",
+                name: "write_file",
+                arguments: json(["path": "must-not-exist.txt", "content": "blocked"]))]),
+            .done(finishReason: "tool_calls"),
+        ]])
+        let gate = PolicyPostPrepareCancellationGate()
+        let loop = makeLoop(
+            workspace: workspace,
+            log: log,
+            provider: provider,
+            registry: ToolRegistry([WriteFileTool()]),
+            authorizationRevalidator: { _ in await gate.revalidate() })
+        let execution = Task { try await loop.send("Cancel after prepare.") }
+        await gate.waitUntilEntered()
+
+        execution.cancel()
+        await gate.release()
+        do {
+            _ = try await execution.value
+            XCTFail("Cancellation before executor entry must propagate.")
+        } catch is CancellationError {
+            // Expected.
+        }
+
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: workspace.appendingPathComponent("must-not-exist.txt").path))
+        let events = await log.replay()
+        let prepared = try XCTUnwrap(events.compactMap { envelope -> ToolExecutionPreparedPayload? in
+            guard case .toolExecutionPrepared(let payload) = envelope.event else { return nil }
+            return payload
+        }.first)
+        let settled = try XCTUnwrap(events.compactMap { envelope -> ToolExecutionSettledPayload? in
+            guard case .toolExecutionSettled(let payload) = envelope.event,
+                  payload.executionID == prepared.executionID else { return nil }
+            return payload
+        }.first)
+        XCTAssertEqual(settled.outcome, .cancelled)
+        XCTAssertEqual(settled.effectDisposition, .notStarted)
+        XCTAssertTrue(events.contains { envelope in
+            guard case .toolResult(let payload) = envelope.event else { return false }
+            return payload.toolCallId == "cancelled-before-executor"
+                && payload.observation == "tool cancelled before execution started"
+        })
+        XCTAssertFalse(CoworkProjection.build(from: events)
+            .unresolvedNonReplayableToolExecutions
+            .contains { $0.id == prepared.executionID })
     }
 
     func testCancelledNonReplayableToolLeavesExecutionUnsettledForManualReconciliation() async throws {

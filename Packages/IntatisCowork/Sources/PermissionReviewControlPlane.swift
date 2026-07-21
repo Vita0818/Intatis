@@ -8,6 +8,7 @@ import IntatisTools
 import IntatisPermission
 
 public typealias PermissionReviewEventAppender = @Sendable (Event) async throws -> Void
+public typealias PermissionReviewProviderFactory = @Sendable () async throws -> ToolCallingProvider
 
 public struct PermissionReviewControlPlanePolicy: Equatable, Sendable {
     public var timeoutSeconds: Double
@@ -44,14 +45,58 @@ public enum PermissionReviewControlPlaneHealth: Equatable, Sendable {
 /// reentrancy alone is not a single-flight guarantee, so requests are admitted
 /// to an explicit FIFO and only one provider race may be active at a time.
 public actor PermissionReviewControlPlane {
+    private enum JobState: Equatable {
+        case queued
+        case running
+        case reviewing(PermissionReviewProviderGenerationID)
+        case terminalClaimed
+    }
+
+    /// The submitter's cancellation handler cannot synchronously mutate actor
+    /// state. Keep one request-owned token so cancellation becomes visible
+    /// before the handler's follow-up actor hop can race a resumed settlement.
+    private final class JobCancellation: @unchecked Sendable {
+        private let lock = NSLock()
+        private var storedReason: String?
+
+        func cancel(reason: String) {
+            lock.lock()
+            if storedReason == nil {
+                storedReason = reason
+            }
+            lock.unlock()
+        }
+
+        func snapshot() -> (isCancelled: Bool, reason: String?) {
+            lock.lock()
+            let reason = storedReason
+            lock.unlock()
+            return (reason != nil, reason)
+        }
+    }
+
     private struct Job {
         var id: PermissionReviewTaskID
         var request: PermissionRequestPayload
-        var continuation: CheckedContinuation<PermissionApprovalResolution, Never>
+        var ownerWaiterID: UUID
+        var waiters: [UUID: JobWaiter]
         var createdAt: Date
         var deadline: Date
-        var cancelled: Bool
-        var cancellationReason: String?
+        var cancellation: JobCancellation
+        var state: JobState
+    }
+
+    private struct JobWaiter {
+        var continuation: CheckedContinuation<PermissionApprovalResolution, Never>
+        var cancellation: JobCancellation
+    }
+
+    private struct CompletedReview {
+        var request: PermissionRequestPayload
+        var resolution: PermissionApprovalResolution
+        /// Retained after terminal claim so an owner cancellation which races
+        /// continuation resumption also fences reconnect/duplicate delivery.
+        var ownerCancellation: JobCancellation
     }
 
     private enum Completion {
@@ -71,7 +116,16 @@ public actor PermissionReviewControlPlane {
         case failed(ProviderOutput)
         case timedOut
         case cancelled
-        case previousCallStillStopping
+    }
+
+    fileprivate struct PermissionReviewProviderGenerationID: Hashable, Sendable {
+        var reviewTaskID: PermissionReviewTaskID
+        var nonce: UUID
+
+        init(reviewTaskID: PermissionReviewTaskID) {
+            self.reviewTaskID = reviewTaskID
+            self.nonce = UUID()
+        }
     }
 
     private struct ParsedDecision {
@@ -88,13 +142,20 @@ public actor PermissionReviewControlPlane {
 
     private let log: EventLog
     private let reviewerAgent: Agent
-    private let provider: ToolCallingProvider
+    private let providerFactory: PermissionReviewProviderFactory
     private let policy: PermissionReviewControlPlanePolicy
     private let appendEvent: PermissionReviewEventAppender
-    private let providerActivity: PermissionReviewProviderActivity
 
     private var queue: [PermissionReviewTaskID] = []
     private var jobs: [PermissionReviewTaskID: Job] = [:]
+    /// Stable request identity is the public idempotency key. A reviewer task
+    /// id is allocated only for the first exact submission.
+    private var activeReviewByRequestID: [RequestID: PermissionReviewTaskID] = [:]
+    private var completedReviewByRequestID: [RequestID: CompletedReview] = [:]
+    private var durableRequestByID: [RequestID: PermissionRequestPayload] = [:]
+    private var registrationTasks: [RequestID: (PermissionRequestPayload, Task<Bool, Never>)] = [:]
+    private var reconciliationInProgress = false
+    private var reconciliationWaiters: [CheckedContinuation<Bool, Never>] = []
     private var draining = false
     private var runningJobID: PermissionReviewTaskID?
     private var runningExecution: Task<Completion, Never>?
@@ -110,21 +171,28 @@ public actor PermissionReviewControlPlane {
     public init(log: EventLog,
                 reviewerAgent: Agent,
                 provider: ToolCallingProvider,
+                fallback: PermissionResponder,
+                policy: PermissionReviewControlPlanePolicy = PermissionReviewControlPlanePolicy(),
+                eventAppender: PermissionReviewEventAppender? = nil) {
+        self.init(
+            log: log,
+            reviewerAgent: reviewerAgent,
+            providerFactory: { provider },
+            fallback: fallback,
+            policy: policy,
+            eventAppender: eventAppender)
+    }
+
+    public init(log: EventLog,
+                reviewerAgent: Agent,
+                providerFactory: @escaping PermissionReviewProviderFactory,
                 fallback _: PermissionResponder,
                 policy: PermissionReviewControlPlanePolicy = PermissionReviewControlPlanePolicy(),
                 eventAppender: PermissionReviewEventAppender? = nil) {
         self.log = log
         self.reviewerAgent = reviewerAgent
-        self.provider = provider
+        self.providerFactory = providerFactory
         self.policy = policy
-        let providerActivity = PermissionReviewProviderActivityRegistry.shared.activity(
-            for: log.coordinationKey)
-        self.providerActivity = providerActivity
-        if providerActivity.isActive() {
-            self.healthState = .degraded(
-                "A previous automatic reviewer provider call did not prove termination. "
-                    + "Automatic review is quarantined for this session; restart Intatis to recover safely.")
-        }
         self.appendEvent = eventAppender ?? { event in
             _ = try await log.append(event)
         }
@@ -135,19 +203,90 @@ public actor PermissionReviewControlPlane {
     }
 
     public func submitResolution(_ request: PermissionRequestPayload) async -> PermissionApprovalResolution {
-        if isShuttingDown || Task.isCancelled {
+        if Task.isCancelled {
+            return PermissionApprovalResolution(
+                decision: .deny,
+                reason: "permission review caller cancelled before submission",
+                risk: request.risk,
+                source: .callerCancellation,
+                reviewStatus: .cancelled,
+                failureKind: .callerCancelled,
+                failureSource: .userCancelled)
+        }
+        if isShuttingDown {
             return PermissionApprovalResolution(
                 decision: .deny,
                 reason: "automatic permission reviewer is shutting down",
                 risk: request.risk,
                 source: .automaticReviewerFailure,
                 reviewStatus: .cancelled,
-                failureKind: .controlPlaneShutdown)
+                failureKind: .controlPlaneShutdown,
+                failureSource: .reviewerFailed)
         }
+
+        guard await reconcileDurableReviewsIfNeeded() else {
+            return PermissionApprovalResolution(
+                decision: .deny,
+                reason: "automatic permission reviewer could not reconcile durable review state",
+                risk: request.risk,
+                source: .automaticReviewerFailure,
+                reviewStatus: .failed,
+                failureKind: .reconciliationFailure,
+                failureSource: .reviewerFailed)
+        }
+        guard await ensureDurablePermissionRequest(request) else {
+            return PermissionApprovalResolution(
+                decision: .deny,
+                reason: "permission request identity conflicts with durable state",
+                risk: request.risk,
+                source: .automaticReviewerFailure,
+                reviewStatus: .failed,
+                failureKind: .reconciliationFailure,
+                failureSource: .reviewerFailed)
+        }
+        if let completed = completedReviewByRequestID[request.requestId] {
+            guard completed.request == request else {
+                return PermissionApprovalResolution(
+                    decision: .deny,
+                    reason: "permission request identity was reused with a different payload",
+                    risk: request.risk,
+                    source: .automaticReviewerFailure,
+                    reviewTaskID: completed.resolution.reviewTaskID,
+                    reviewStatus: .failed,
+                    failureKind: .reconciliationFailure,
+                    failureSource: .reviewerFailed)
+            }
+            let ownerCancellation = completed.ownerCancellation.snapshot()
+            return Task.isCancelled || ownerCancellation.isCancelled
+                ? Self.cancelledDelivery(
+                    request: request,
+                    reviewTaskID: completed.resolution.reviewTaskID,
+                    reason: ownerCancellation.reason
+                        ?? "permission review caller cancelled before authorization delivery")
+                : completed.resolution
+        }
+
+        let waiterID = UUID()
+        let waiterCancellation = JobCancellation()
+        if let activeID = activeReviewByRequestID[request.requestId],
+           let active = jobs[activeID],
+           active.request != request {
+            return PermissionApprovalResolution(
+                decision: .deny,
+                reason: "permission request identity was reused with a different payload",
+                risk: request.risk,
+                source: .automaticReviewerFailure,
+                reviewTaskID: activeID,
+                reviewStatus: .failed,
+                failureKind: .reconciliationFailure,
+                failureSource: .reviewerFailed)
+        }
+
+        let isNewReview = activeReviewByRequestID[request.requestId] == nil
         let id = PermissionReviewTaskID.new()
         let createdAt = Date()
         let deadline = createdAt.addingTimeInterval(policy.timeoutSeconds)
-        guard jobs.count < policy.maxPendingReviews else {
+        guard !isNewReview || jobs.count < policy.maxPendingReviews else {
             healthState = .degraded(
                 "Automatic reviewer queue capacity was reached; the request was denied without automatic approval.")
             return PermissionApprovalResolution(
@@ -157,24 +296,61 @@ public actor PermissionReviewControlPlane {
                 source: .automaticReviewerFailure,
                 reviewTaskID: id,
                 reviewStatus: .failed,
-                failureKind: .queueCapacity)
+                failureKind: .queueCapacity,
+                failureSource: .reviewerFailed)
         }
-        return await withTaskCancellationHandler(operation: {
+        let resolution = await withTaskCancellationHandler(operation: {
             await withCheckedContinuation { continuation in
-                jobs[id] = Job(
-                    id: id,
-                    request: request,
+                let waiter = JobWaiter(
                     continuation: continuation,
-                    createdAt: createdAt,
-                    deadline: deadline,
-                    cancelled: false,
-                    cancellationReason: nil)
-                queue.append(id)
+                    cancellation: waiterCancellation)
+                if let activeID = activeReviewByRequestID[request.requestId],
+                   var active = jobs[activeID] {
+                    active.waiters[waiterID] = waiter
+                    jobs[activeID] = active
+                } else {
+                    // The first waiter owns authorization delivery, so its
+                    // request-scoped token is also the Job token. The
+                    // cancellation handler can then revoke every duplicate
+                    // delivery synchronously, before its actor follow-up has
+                    // a chance to race terminal resolution.
+                    jobs[id] = Job(
+                        id: id,
+                        request: request,
+                        ownerWaiterID: waiterID,
+                        waiters: [waiterID: waiter],
+                        createdAt: createdAt,
+                        deadline: deadline,
+                        cancellation: waiterCancellation,
+                        state: .queued)
+                    activeReviewByRequestID[request.requestId] = id
+                    queue.append(id)
+                }
                 scheduleDrainIfNeeded()
             }
         }, onCancel: {
-            Task { await self.cancel(id, reason: "permission review caller cancelled") }
+            let reason = "permission review caller cancelled"
+            waiterCancellation.cancel(reason: reason)
+            Task {
+                await self.cancelWaiter(
+                    requestID: request.requestId,
+                    waiterID: waiterID,
+                    reason: reason)
+            }
         })
+        guard !Task.isCancelled else {
+            return PermissionApprovalResolution(
+                decision: .deny,
+                reason: waiterCancellation.snapshot().reason
+                    ?? "permission review caller cancelled before authorization delivery",
+                risk: resolution.risk ?? request.risk,
+                source: .automaticReviewerFailure,
+                reviewTaskID: resolution.reviewTaskID,
+                reviewStatus: .cancelled,
+                failureKind: .reviewerCancelled,
+                failureSource: .reviewerFailed)
+        }
+        return resolution
     }
 
     /// Reversible half of reviewer shutdown. Once this returns, no queued or
@@ -198,20 +374,13 @@ public actor PermissionReviewControlPlane {
         }
     }
 
-    /// Rolls back a quiesce whose durable detach transaction failed. If a
-    /// cancelled provider did not prove actual termination, the shared activity
-    /// gate keeps the resumed reviewer quarantined and all later requests fail
-    /// closed instead of starting another provider call.
+    /// Rolls back a quiesce whose durable detach transaction failed. Any
+    /// cancelled provider generation remains retired; later reviews receive a
+    /// fresh generation and cannot observe a late result from the old one.
     public func resumeAfterFailedQuiesce() {
         guard isShuttingDown, !shutdownCommitted else { return }
         isShuttingDown = false
-        if providerActivity.isActive() {
-            healthState = .degraded(
-                "Automatic reviewer shutdown was rolled back, but an earlier provider call did not prove termination. "
-                    + "Automatic review is quarantined for this session; restart Intatis to recover safely.")
-        } else {
-            healthState = healthBeforeQuiesce ?? .healthy
-        }
+        healthState = healthBeforeQuiesce ?? .healthy
         healthBeforeQuiesce = nil
     }
 
@@ -237,18 +406,73 @@ public actor PermissionReviewControlPlane {
         healthState
     }
 
-    private func cancel(_ id: PermissionReviewTaskID, reason: String) {
-        markCancelled(id, reason: reason)
-        if runningJobID == id {
-            runningExecution?.cancel()
+    private func cancelWaiter(requestID: RequestID,
+                              waiterID: UUID,
+                              reason: String) {
+        guard let id = activeReviewByRequestID[requestID],
+              var job = jobs[id],
+              let waiter = job.waiters[waiterID] else { return }
+        if job.ownerWaiterID == waiterID {
+            // The first submitter owns the live authorization request. Its
+            // cancellation revokes delivery for the whole shared review while
+            // duplicate observers still receive the same fail-closed terminal.
+            markCancelled(id, reason: reason)
+            if runningJobID == id {
+                runningExecution?.cancel()
+            }
+            return
         }
+
+        // A reconnect/duplicate caller owns only its waiter. Cancelling it must
+        // never cancel the underlying request or deliver a later allow to that
+        // cancelled caller.
+        job.waiters.removeValue(forKey: waiterID)
+        jobs[id] = job
+        waiter.continuation.resume(returning: Self.cancelledDelivery(
+            request: job.request,
+            reviewTaskID: id,
+            reason: reason))
     }
 
     private func markCancelled(_ id: PermissionReviewTaskID, reason: String) {
-        guard var job = jobs[id] else { return }
-        job.cancelled = true
-        job.cancellationReason = reason
-        jobs[id] = job
+        jobs[id]?.cancellation.cancel(reason: reason)
+    }
+
+    /// AgentLoop normally registers the generic request before invoking the
+    /// responder. Keeping this check here makes RequestID idempotency explicit
+    /// and safely supports recovery/tests that enter at the control-plane edge.
+    private func ensureDurablePermissionRequest(
+        _ request: PermissionRequestPayload
+    ) async -> Bool {
+        if let durable = durableRequestByID[request.requestId] {
+            return durable == request
+        }
+        if let (pendingRequest, task) = registrationTasks[request.requestId] {
+            guard pendingRequest == request else { return false }
+            let success = await task.value
+            if success { durableRequestByID[request.requestId] = request }
+            return success
+        }
+
+        let log = log
+        let task = Task<Bool, Never> {
+            do {
+                _ = try await log.registerPermissionRequest(request)
+                return true
+            } catch {
+                return false
+            }
+        }
+        registrationTasks[request.requestId] = (request, task)
+        let success = await task.value
+        registrationTasks.removeValue(forKey: request.requestId)
+        if success {
+            durableRequestByID[request.requestId] = request
+        } else {
+            healthState = .degraded(
+                "The permission request could not be registered durably; automatic approval is disabled for that request.")
+        }
+        return success
     }
 
     private func scheduleDrainIfNeeded() {
@@ -263,7 +487,9 @@ public actor PermissionReviewControlPlane {
     private func drain() async {
         while !queue.isEmpty {
             let id = queue.removeFirst()
-            guard let job = jobs[id] else { continue }
+            guard var job = jobs[id] else { continue }
+            job.state = .running
+            jobs[id] = job
             runningJobID = id
             let execution = Task { await self.process(job) }
             runningExecution = execution
@@ -273,19 +499,22 @@ public actor PermissionReviewControlPlane {
 
             switch completion {
             case .direct(let resolution):
+                let normalizedResolution = Self.normalizedResolution(resolution)
                 let effectiveResolution: PermissionApprovalResolution
-                if isShuttingDown || jobs[id]?.cancelled == true {
+                let cancellation = jobs[id]?.cancellation.snapshot()
+                if isShuttingDown || cancellation?.isCancelled == true {
                     effectiveResolution = PermissionApprovalResolution(
                         decision: .deny,
-                        reason: jobs[id]?.cancellationReason
+                        reason: cancellation?.reason
                             ?? "permission review cancelled before returning authorization",
                         risk: resolution.risk,
                         source: .automaticReviewerFailure,
-                        reviewTaskID: resolution.reviewTaskID,
+                        reviewTaskID: normalizedResolution.reviewTaskID,
                         reviewStatus: .cancelled,
-                        failureKind: .reviewerCancelled)
+                        failureKind: .reviewerCancelled,
+                        failureSource: .reviewerFailed)
                 } else {
-                    effectiveResolution = resolution
+                    effectiveResolution = normalizedResolution
                 }
                 resolve(id, resolution: effectiveResolution)
             }
@@ -298,8 +527,47 @@ public actor PermissionReviewControlPlane {
                          resolution: PermissionApprovalResolution) {
         guard let job = jobs.removeValue(forKey: id) else { return }
         queue.removeAll { $0 == id }
-        job.continuation.resume(returning: resolution)
+        activeReviewByRequestID.removeValue(forKey: job.request.requestId)
+        completedReviewByRequestID[job.request.requestId] = CompletedReview(
+            request: job.request,
+            resolution: resolution,
+            ownerCancellation: job.cancellation)
+        for waiter in job.waiters.values {
+            let waiterResolution = waiter.cancellation.snapshot().isCancelled
+                ? Self.cancelledDelivery(
+                    request: job.request,
+                    reviewTaskID: resolution.reviewTaskID ?? id,
+                    reason: waiter.cancellation.snapshot().reason
+                        ?? "permission review caller cancelled")
+                : resolution
+            waiter.continuation.resume(returning: waiterResolution)
+        }
         finishShutdownIfIdle()
+    }
+
+    private static func cancelledDelivery(request: PermissionRequestPayload,
+                                          reviewTaskID: PermissionReviewTaskID?,
+                                          reason: String) -> PermissionApprovalResolution {
+        PermissionApprovalResolution(
+            decision: .deny,
+            reason: reason,
+            risk: request.risk,
+            source: .automaticReviewerFailure,
+            reviewTaskID: reviewTaskID,
+            reviewStatus: .cancelled,
+            failureKind: .reviewerCancelled,
+            failureSource: .reviewerFailed)
+    }
+
+    private static func normalizedResolution(
+        _ resolution: PermissionApprovalResolution
+    ) -> PermissionApprovalResolution {
+        guard resolution.failureSource == nil else { return resolution }
+        var normalized = resolution
+        normalized.failureSource = failureSource(
+            decision: resolution.decision,
+            failureKind: resolution.failureKind)
+        return normalized
     }
 
     private func finishShutdownIfIdle() {
@@ -376,13 +644,14 @@ public actor PermissionReviewControlPlane {
                 resolutionSource: .deterministicPolicy)
         }
 
-        if admittedJob.cancelled || Task.isCancelled || isShuttingDown {
+        let admissionCancellation = admittedJob.cancellation.snapshot()
+        if admissionCancellation.isCancelled || Task.isCancelled || isShuttingDown {
             return await persistTerminal(
                 task: task,
                 decision: .deny,
                 risk: task.gate.risk,
                 status: .cancelled,
-                reason: admittedJob.cancellationReason ?? "permission review cancelled",
+                reason: admissionCancellation.reason ?? "permission review cancelled",
                 usage: nil,
                 startedAt: startedAt,
                 fallbackRequest: nil,
@@ -417,7 +686,7 @@ public actor PermissionReviewControlPlane {
 
         guard task.deadline.timeIntervalSinceNow > 0 else {
             healthState = .degraded(
-                "Automatic reviewer queue wait exceeded the end-to-end deadline; new permission requests are denied until review recovers.")
+                "Automatic reviewer queue wait exceeded this request's end-to-end deadline; that review was denied while later reviews remain available.")
             return await persistTerminal(
                 task: task,
                 decision: .deny,
@@ -458,7 +727,7 @@ public actor PermissionReviewControlPlane {
         let remainingSeconds = task.deadline.timeIntervalSinceNow
         guard remainingSeconds > 0 else {
             healthState = .degraded(
-                "Automatic reviewer queue wait exceeded the end-to-end deadline; new permission requests are denied until review recovers.")
+                "Automatic reviewer queue wait exceeded this request's end-to-end deadline; that review was denied while later reviews remain available.")
             return await persistTerminal(
                 task: task,
                 decision: .deny,
@@ -470,8 +739,11 @@ public actor PermissionReviewControlPlane {
                 fallbackRequest: nil,
                 failureKind: .reviewerTimedOut)
         }
+        let providerGeneration = PermissionReviewProviderGenerationID(
+            reviewTaskID: task.id)
         let providerResult = await runProvider(
             providerRequest,
+            generation: providerGeneration,
             timeoutSeconds: remainingSeconds,
             maxOutputCharacters: policy.maxOutputCharacters)
         switch providerResult {
@@ -487,7 +759,8 @@ public actor PermissionReviewControlPlane {
                 usage: usage,
                 startedAt: startedAt,
                 fallbackRequest: nil,
-                failureKind: .reviewerCancelled)
+                failureKind: .reviewerCancelled,
+                expectedProviderGeneration: providerGeneration)
         case .timedOut:
             let usage = chargeEstimatedDispatchUsage(
                 estimatedPromptTokens: estimatedPromptTokens)
@@ -500,18 +773,8 @@ public actor PermissionReviewControlPlane {
                 usage: usage,
                 startedAt: startedAt,
                 fallbackRequest: nil,
-                failureKind: .reviewerTimedOut)
-        case .previousCallStillStopping:
-            return await persistTerminal(
-                task: task,
-                decision: .deny,
-                risk: task.gate.risk,
-                status: .failed,
-                reason: "previous automatic reviewer provider call is still stopping; automatic mode denied the request",
-                usage: nil,
-                startedAt: startedAt,
-                fallbackRequest: nil,
-                failureKind: .providerStillStopping)
+                failureKind: .reviewerTimedOut,
+                expectedProviderGeneration: providerGeneration)
         case .failed(let output):
             let usage = chargeReviewUsage(
                 output,
@@ -523,7 +786,7 @@ public actor PermissionReviewControlPlane {
                 failureReason = "permission reviewer failed; automatic mode denied the request"
             }
             healthState = .degraded(
-                "Automatic reviewer provider failed after dispatch: \(failureReason).")
+                "Automatic reviewer provider generation failed: \(failureReason).")
             return await persistTerminal(
                 task: task,
                 decision: .deny,
@@ -533,11 +796,10 @@ public actor PermissionReviewControlPlane {
                 usage: usage,
                 startedAt: startedAt,
                 fallbackRequest: nil,
-                failureKind: .providerFailure)
+                failureKind: .providerFailure,
+                expectedProviderGeneration: providerGeneration)
         case .output(let output):
-            if !providerActivity.isActive() {
-                healthState = .healthy
-            }
+            healthState = .healthy
             let usage = chargeReviewUsage(
                 output,
                 estimatedPromptTokens: estimatedPromptTokens)
@@ -557,7 +819,8 @@ public actor PermissionReviewControlPlane {
                     usage: usage,
                     startedAt: startedAt,
                     fallbackRequest: nil,
-                    failureKind: .reviewerContractViolation)
+                    failureKind: .reviewerContractViolation,
+                    expectedProviderGeneration: providerGeneration)
             }
             guard let parsed = Self.parse(output.text, fallbackRisk: task.gate.risk) else {
                 let reason = Self.invalidVerdictReason(
@@ -573,7 +836,8 @@ public actor PermissionReviewControlPlane {
                     usage: usage,
                     startedAt: startedAt,
                     fallbackRequest: nil,
-                    failureKind: .malformedVerdict)
+                    failureKind: .malformedVerdict,
+                    expectedProviderGeneration: providerGeneration)
             }
             if PermissionReviewTextSanitizer.containsSensitiveMaterial(parsed.reason) {
                 let reason = "permission reviewer returned a secret-bearing reason; automatic mode denied the request"
@@ -587,11 +851,13 @@ public actor PermissionReviewControlPlane {
                     usage: usage,
                     startedAt: startedAt,
                     fallbackRequest: nil,
-                    failureKind: .reviewerContractViolation)
+                    failureKind: .reviewerContractViolation,
+                    expectedProviderGeneration: providerGeneration)
             }
             let effectiveRisk = Self.maximumRisk(task.gate.risk, parsed.risk)
+            let cancellation = jobs[task.id]?.cancellation.snapshot()
             if parsed.decision == .allow,
-               (Task.isCancelled || isShuttingDown || jobs[task.id]?.cancelled == true) {
+               (Task.isCancelled || isShuttingDown || cancellation?.isCancelled == true) {
                 return await persistTerminal(
                     task: task,
                     decision: .deny,
@@ -601,7 +867,8 @@ public actor PermissionReviewControlPlane {
                     usage: usage,
                     startedAt: startedAt,
                     fallbackRequest: nil,
-                    failureKind: .reviewerCancelled)
+                    failureKind: .reviewerCancelled,
+                    expectedProviderGeneration: providerGeneration)
             }
             let status: PermissionReviewStatus
             switch parsed.decision {
@@ -617,7 +884,8 @@ public actor PermissionReviewControlPlane {
                 reason: parsed.reason,
                 usage: usage,
                 startedAt: startedAt,
-                fallbackRequest: nil)
+                fallbackRequest: nil,
+                expectedProviderGeneration: providerGeneration)
         }
     }
 
@@ -632,23 +900,52 @@ public actor PermissionReviewControlPlane {
                                  startedAt: Date,
                                  fallbackRequest _: PermissionRequestPayload?,
                                  failureKind: PermissionApprovalFailureKind? = nil,
-                                 resolutionSource: PermissionApprovalSource = .automaticReviewer) async -> Completion {
+                                 resolutionSource: PermissionApprovalSource = .automaticReviewer,
+                                 expectedProviderGeneration: PermissionReviewProviderGenerationID? = nil) async -> Completion {
+        var terminalDecision = decision
+        var terminalStatus = status
+        var terminalReason = reason
+        var terminalFailureKind = failureKind
+        let cancellationBeforeClaim = jobs[task.id]?.cancellation.snapshot()
+        if decision == .allow,
+           (Task.isCancelled || isShuttingDown || cancellationBeforeClaim?.isCancelled == true) {
+            terminalDecision = .deny
+            terminalStatus = .cancelled
+            terminalReason = cancellationBeforeClaim?.reason
+                ?? "permission review cancelled before authorization commit"
+            terminalFailureKind = .reviewerCancelled
+        }
+        guard claimTerminal(
+            task.id,
+            expectedProviderGeneration: expectedProviderGeneration) else {
+            healthState = .degraded(
+                "Automatic reviewer rejected a stale or duplicate terminal result; the request was denied.")
+            return .direct(PermissionApprovalResolution(
+                decision: .deny,
+                reason: "permission review terminal state did not match its active request generation",
+                risk: risk,
+                source: .automaticReviewerFailure,
+                reviewTaskID: task.id,
+                reviewStatus: .failed,
+                failureKind: .reconciliationFailure))
+        }
         let effectiveResolutionSource: PermissionApprovalSource =
-            resolutionSource == .automaticReviewer && failureKind != nil
+            resolutionSource == .automaticReviewer && terminalFailureKind != nil
                 ? .automaticReviewerFailure
                 : resolutionSource
         let settled = PermissionReviewSettledPayload(
             reviewTaskID: task.id,
             requestID: task.requestID,
+            turnID: task.turnID,
             requestingAgent: task.requestingAgent,
             reviewerAgent: reviewerAgent.name,
             reviewerModel: reviewerAgent.model,
             tool: task.tool,
-            decision: decision,
+            decision: terminalDecision,
             risk: risk,
-            status: status,
-            reason: Self.compact(reason, maxCharacters: 500),
-            failureKind: failureKind,
+            status: terminalStatus,
+            reason: Self.compact(terminalReason, maxCharacters: 500),
+            failureKind: terminalFailureKind,
             authorization: task.authorization,
             usage: usage,
             cumulativeTokens: consumedTokens,
@@ -666,17 +963,19 @@ public actor PermissionReviewControlPlane {
                 failureKind: .settlementPersistenceFailure))
         }
 
-        if decision == .allow,
-           (Task.isCancelled || isShuttingDown || jobs[task.id]?.cancelled == true) {
+        let cancellationAfterSettlement = jobs[task.id]?.cancellation.snapshot()
+        if terminalDecision == .allow,
+           (Task.isCancelled || isShuttingDown || cancellationAfterSettlement?.isCancelled == true) {
             return .direct(PermissionApprovalResolution(
                 decision: .deny,
-                reason: jobs[task.id]?.cancellationReason
+                reason: cancellationAfterSettlement?.reason
                     ?? "permission review cancelled after settlement",
                 risk: risk,
                 source: .automaticReviewerFailure,
                 reviewTaskID: task.id,
                 reviewStatus: .cancelled,
-                failureKind: .reviewerCancelled))
+                failureKind: .reviewerCancelled,
+                failureSource: .reviewerFailed))
         }
 
         // Preserve the original generic audit event for old projections and
@@ -685,30 +984,69 @@ public actor PermissionReviewControlPlane {
             agent: task.requestingAgent,
             tool: task.tool,
             reviewerModel: "@\(reviewerAgent.name.rawValue):\(reviewerAgent.model.rawValue)",
-            decision: decision,
+            decision: terminalDecision,
             risk: risk,
             reason: settled.reason)))
 
         return .direct(PermissionApprovalResolution(
-            decision: decision,
+            decision: terminalDecision,
             reason: settled.reason,
             risk: settled.risk,
             source: effectiveResolutionSource,
             reviewTaskID: task.id,
-            reviewStatus: status,
-            failureKind: failureKind))
+            reviewStatus: terminalStatus,
+            failureKind: terminalFailureKind,
+            failureSource: Self.failureSource(
+                decision: terminalDecision,
+                failureKind: terminalFailureKind)))
     }
 
-    private func runProvider(_ request: AgentRequest,
-                             timeoutSeconds: Double,
-                             maxOutputCharacters: Int) async -> ProviderResult {
-        guard providerActivity.tryBegin() else {
-            return .previousCallStillStopping
+    private static func failureSource(
+        decision: PermissionDecision,
+        failureKind: PermissionApprovalFailureKind?
+    ) -> ExecutionFailureSource? {
+        if failureKind == .reviewerTimedOut { return .reviewerTimedOut }
+        if failureKind != nil { return .reviewerFailed }
+        return decision == .deny ? .policyDenied : nil
+    }
+
+    private func claimTerminal(
+        _ id: PermissionReviewTaskID,
+        expectedProviderGeneration: PermissionReviewProviderGenerationID?
+    ) -> Bool {
+        guard var job = jobs[id] else { return false }
+        switch (job.state, expectedProviderGeneration) {
+        case (.running, nil):
+            break
+        case (.reviewing(let active), .some(let expected)) where active == expected:
+            break
+        default:
+            return false
         }
-        let race = PermissionReviewProviderRace()
-        let provider = self.provider
-        let providerActivity = providerActivity
-        let providerTask = Task {
+        job.state = .terminalClaimed
+        jobs[id] = job
+        return true
+    }
+
+    private func runProvider(
+        _ request: AgentRequest,
+        generation: PermissionReviewProviderGenerationID,
+        timeoutSeconds: Double,
+        maxOutputCharacters: Int
+    ) async -> ProviderResult {
+        guard var job = jobs[generation.reviewTaskID], job.state == .running else {
+            return .cancelled
+        }
+        job.state = .reviewing(generation)
+        jobs[generation.reviewTaskID] = job
+
+        let race = PermissionReviewProviderRace(generation: generation)
+        let providerFactory = providerFactory
+        // Detached ownership prevents provider work from inheriting the
+        // control-plane actor executor. ToolCallingProvider.stream must still
+        // return promptly; the shipped OpenAI adapter owns I/O in a per-request
+        // producer and propagates stream termination down to URLSession.
+        let providerTask = Task.detached(priority: nil) {
             var output = ProviderOutput(
                 text: "",
                 sawToolCall: false,
@@ -717,6 +1055,8 @@ public actor PermissionReviewControlPlane {
                 exceededOutputCharacterLimit: false)
             let result: ProviderResult
             do {
+                try Task.checkCancellation()
+                let provider = try await providerFactory()
                 try Task.checkCancellation()
                 var exceededOutputLimit = false
                 stream: for try await chunk in provider.stream(request) {
@@ -743,42 +1083,38 @@ public actor PermissionReviewControlPlane {
             } catch {
                 result = .failed(output)
             }
-            if case .cancelled = result {
-                // Cancellation cannot prove that an implementation-owned
-                // producer stopped, even if the consumer task returned first.
-                race.resolve(result)
-            } else {
-                race.resolve(result, onWin: { providerActivity.end() })
-            }
+            race.resolve(generation: generation, result: result)
         }
-        let timeoutNanoseconds = UInt64(max(0.001, timeoutSeconds) * 1_000_000_000)
-        let timeoutTask = Task {
+        let boundedSeconds = min(
+            max(0.001, timeoutSeconds),
+            Double(UInt64.max) / 1_000_000_000)
+        let timeoutNanoseconds = UInt64(boundedSeconds * 1_000_000_000)
+        let timeoutTask = Task.detached(priority: nil) {
             do {
                 try await Task.sleep(nanoseconds: timeoutNanoseconds)
-                race.resolve(.timedOut)
+                race.resolve(generation: generation, result: .timedOut)
             } catch {
                 // The provider won the race.
             }
         }
-        race.setTasks(provider: providerTask, timeout: timeoutTask)
+        race.setTasks(
+            generation: generation,
+            provider: providerTask,
+            timeout: timeoutTask)
         let result = await withTaskCancellationHandler(operation: {
-            await race.wait()
+            await race.wait(generation: generation)
         }, onCancel: {
-            race.resolve(.cancelled)
+            race.resolve(generation: generation, result: .cancelled)
         })
         switch result {
         case .timedOut:
             healthState = .degraded(
-                "Automatic reviewer timed out and its provider did not prove termination. "
-                    + "Automatic review is quarantined for this session; restart Intatis to recover safely.")
+                "Automatic reviewer timed out; that review generation was retired and denied. "
+                    + "Later requests use a fresh provider generation.")
         case .cancelled where !isShuttingDown:
             healthState = .degraded(
-                "Automatic reviewer was cancelled while its provider was active and termination could not be proven. "
-                    + "Automatic review is quarantined for this session; restart Intatis to recover safely.")
-        case .previousCallStillStopping:
-            healthState = .degraded(
-                "A previous automatic reviewer provider call did not prove termination. "
-                    + "Automatic review is quarantined for this session; restart Intatis to recover safely.")
+                "Automatic reviewer was cancelled; that review generation was retired and denied. "
+                    + "Later requests use a fresh provider generation.")
         default:
             break
         }
@@ -837,6 +1173,7 @@ public actor PermissionReviewControlPlane {
             id: id,
             sessionID: sessionID,
             requestID: request.requestId,
+            turnID: supplied?.turnID,
             requestingAgent: request.agent,
             reviewerAgent: reviewer.name,
             taskID: taskID,
@@ -1227,67 +1564,233 @@ public actor PermissionReviewControlPlane {
             estimated: true)
     }
 
-    /// Closes review jobs that were durably requested by an earlier process but
-    /// never reached a terminal record. There is no live permission continuation
-    /// to resume after restart, so recovery records a denial and leaves the
-    /// original permission request for the normal task-rerun/manual workflow.
+    /// Rebuilds RequestID idempotency and closes crash gaps before admitting a
+    /// new provider generation. A reviewer verdict is not proof that an allow
+    /// reached its live caller, so `review_settled -> permission_resolved` gaps
+    /// always recover as a generic denial.
     private func reconcileDurableReviewsIfNeeded() async -> Bool {
         guard !reconciledDurableReviews else { return true }
+        if reconciliationInProgress {
+            return await withCheckedContinuation { continuation in
+                reconciliationWaiters.append(continuation)
+            }
+        }
+        reconciliationInProgress = true
+        let succeeded = await performDurableReviewReconciliation()
+        reconciliationInProgress = false
+        if succeeded { reconciledDurableReviews = true }
+        let waiters = reconciliationWaiters
+        reconciliationWaiters.removeAll()
+        for waiter in waiters { waiter.resume(returning: succeeded) }
+        return succeeded
+    }
+
+    private func performDurableReviewReconciliation() async -> Bool {
         let events: [Envelope]
         do {
-            events = try await log.replayChecked()
+            let replay = try await log.replayForProjectionChecked()
+            guard replay.hasCompleteKnownHistory else {
+                healthState = .degraded(
+                    "The permission event history is incomplete or contains newer event types; automatic approval is disabled for safety.")
+                return false
+            }
+            events = replay.envelopes
         } catch {
             healthState = .degraded(
                 "The permission event log could not be verified; automatic approval is disabled for safety.")
             return false
         }
+        var requests: [RequestID: PermissionRequestPayload] = [:]
+        var genericTerminals: [RequestID: PermissionResolvedPayload] = [:]
         var requested: [PermissionReviewTaskID: PermissionReviewTask] = [:]
-        var settled = Set<PermissionReviewTaskID>()
+        var reviewIDByRequestID: [RequestID: PermissionReviewTaskID] = [:]
+        var settled: [PermissionReviewTaskID: PermissionReviewSettledPayload] = [:]
         for envelope in events {
             switch envelope.event {
+            case .permissionRequest(let payload):
+                if let prior = requests[payload.requestId], prior != payload {
+                    return reconciliationConflict(
+                        "A permission RequestID has conflicting durable request payloads.")
+                }
+                requests[payload.requestId] = payload
+            case .permissionResolved(let payload):
+                guard let requestID = payload.requestId else { break }
+                if let prior = genericTerminals[requestID], prior != payload {
+                    return reconciliationConflict(
+                        "A permission RequestID has conflicting durable terminal payloads.")
+                }
+                genericTerminals[requestID] = payload
             case .permissionReviewRequested(let payload):
+                if let prior = requested[payload.task.id], prior != payload.task {
+                    return reconciliationConflict(
+                        "A reviewer task identity has conflicting durable payloads.")
+                }
+                if let priorID = reviewIDByRequestID[payload.task.requestID],
+                   priorID != payload.task.id {
+                    return reconciliationConflict(
+                        "A permission RequestID was assigned more than one reviewer identity.")
+                }
                 requested[payload.task.id] = payload.task
+                reviewIDByRequestID[payload.task.requestID] = payload.task.id
             case .permissionReviewSettled(let payload):
-                settled.insert(payload.reviewTaskID)
+                if let prior = settled[payload.reviewTaskID], prior != payload {
+                    return reconciliationConflict(
+                        "A reviewer task identity has conflicting durable settlements.")
+                }
+                settled[payload.reviewTaskID] = payload
             default:
                 break
             }
         }
-        let orphaned = requested.values
-            .filter { !settled.contains($0.id) }
-            .sorted {
-                if $0.createdAt == $1.createdAt { return $0.id.rawValue < $1.id.rawValue }
-                return $0.createdAt < $1.createdAt
-            }
+
+        for (reviewID, settlement) in settled where requested[reviewID] == nil {
+            return reconciliationConflict(
+                "Reviewer settlement \(settlement.reviewTaskID.rawValue) has no durable request.")
+        }
+
+        let ordered = requested.values.sorted {
+            if $0.createdAt == $1.createdAt { return $0.id.rawValue < $1.id.rawValue }
+            return $0.createdAt < $1.createdAt
+        }
         do {
-            for task in orphaned {
-                let elapsedMillis = max(
-                    0,
-                    min(
-                        Double(Int.max),
-                        Date().timeIntervalSince(task.createdAt) * 1_000))
-                try await appendEvent(.permissionReviewSettled(.init(
-                    reviewTaskID: task.id,
-                    requestID: task.requestID,
-                    requestingAgent: task.requestingAgent,
-                    reviewerAgent: reviewerAgent.name,
-                    reviewerModel: reviewerAgent.model,
-                    tool: task.tool,
-                    decision: .deny,
-                    risk: task.gate.risk,
-                    status: .cancelled,
-                    reason: "permission review was interrupted by session restart; rerun or approve the request again",
-                    failureKind: .reviewerCancelled,
-                    authorization: task.authorization,
-                    durationMillis: Int(elapsedMillis))))
+            for reviewTask in ordered {
+                if requests[reviewTask.requestID] == nil {
+                    let recovered = Self.recoveredPermissionRequest(from: reviewTask)
+                    _ = try await log.append(.permissionRequest(recovered))
+                    requests[reviewTask.requestID] = recovered
+                }
+
+                let settlement: PermissionReviewSettledPayload
+                if let existing = settled[reviewTask.id] {
+                    settlement = existing
+                } else {
+                    let elapsedMillis = max(
+                        0,
+                        min(
+                            Double(Int.max),
+                            Date().timeIntervalSince(reviewTask.createdAt) * 1_000))
+                    settlement = PermissionReviewSettledPayload(
+                        reviewTaskID: reviewTask.id,
+                        requestID: reviewTask.requestID,
+                        turnID: reviewTask.turnID,
+                        requestingAgent: reviewTask.requestingAgent,
+                        reviewerAgent: reviewerAgent.name,
+                        reviewerModel: reviewerAgent.model,
+                        tool: reviewTask.tool,
+                        decision: .deny,
+                        risk: reviewTask.gate.risk,
+                        status: .cancelled,
+                        reason: "permission review was interrupted by session restart; rerun the request",
+                        failureKind: .reviewerCancelled,
+                        authorization: reviewTask.authorization,
+                        durationMillis: Int(elapsedMillis))
+                    try await appendEvent(.permissionReviewSettled(settlement))
+                    settled[reviewTask.id] = settlement
+                }
+
+                guard genericTerminals[reviewTask.requestID] == nil else { continue }
+                let recovery = Self.recoveredGenericDenial(
+                    task: reviewTask,
+                    settlement: settlement,
+                    wasOrphaned: settlement.failureKind == .reviewerCancelled
+                        && settlement.status == .cancelled)
+                let result = try await log.settlePermissionRequest(recovery)
+                genericTerminals[reviewTask.requestID] = result.resolution
             }
         } catch {
             healthState = .degraded(
                 "Interrupted permission reviews could not be reconciled durably; automatic approval is disabled for safety.")
             return false
         }
-        reconciledDurableReviews = true
+
+        durableRequestByID = requests
+        for (requestID, terminal) in genericTerminals {
+            guard let request = requests[requestID] else {
+                return reconciliationConflict(
+                    "A generic permission terminal has no durable request.")
+            }
+            completedReviewByRequestID[requestID] = CompletedReview(
+                request: request,
+                resolution: Self.approvalResolution(from: terminal),
+                ownerCancellation: JobCancellation())
+        }
         return true
+    }
+
+    private func reconciliationConflict(_ reason: String) -> Bool {
+        healthState = .degraded(reason + " Automatic approval is disabled for safety.")
+        return false
+    }
+
+    private static func recoveredPermissionRequest(
+        from task: PermissionReviewTask
+    ) -> PermissionRequestPayload {
+        PermissionRequestPayload(
+            requestId: task.requestID,
+            agent: task.requestingAgent,
+            tool: task.tool,
+            args: task.normalizedArgs,
+            risk: task.gate.risk,
+            reason: task.gate.reason,
+            context: PermissionRequestContext(
+                turnID: task.turnID,
+                taskID: task.taskID,
+                rootTaskID: task.rootTaskID,
+                parentTaskID: task.parentTaskID,
+                attempt: task.attempt,
+                toolCallID: task.toolCallID,
+                normalizedArgs: task.normalizedArgs,
+                touchedPaths: task.touchedPaths,
+                risksNetwork: task.risksNetwork,
+                sideEffect: task.sideEffect,
+                intent: task.intent,
+                gate: task.gate,
+                capabilityLease: task.capabilityLease,
+                workspaceLease: task.workspaceLease,
+                taskContract: task.taskContract,
+                causalContext: task.causalContext,
+                authorization: task.authorization,
+                executionID: task.executionID,
+                replayPolicy: task.replayPolicy),
+            approvalMode: .automaticReviewer)
+    }
+
+    private static func recoveredGenericDenial(
+        task: PermissionReviewTask,
+        settlement: PermissionReviewSettledPayload,
+        wasOrphaned: Bool
+    ) -> PermissionResolvedPayload {
+        PermissionResolvedPayload(
+            requestId: task.requestID,
+            turnID: task.turnID,
+            toolCallID: task.toolCallID,
+            tool: task.tool,
+            decision: .deny,
+            risk: settlement.risk,
+            reason: wasOrphaned
+                ? "permission review was interrupted by session restart; rerun the request"
+                : "permission review finished without a live authorization delivery; rerun the request",
+            intent: task.intent,
+            authorization: settlement.authorization ?? task.authorization,
+            source: .automaticReviewerFailure,
+            reviewTaskID: task.id,
+            reviewStatus: .cancelled,
+            failureKind: wasOrphaned ? .reviewerCancelled : .reconciliationFailure,
+            failureSource: .reviewerFailed)
+    }
+
+    private static func approvalResolution(
+        from terminal: PermissionResolvedPayload
+    ) -> PermissionApprovalResolution {
+        PermissionApprovalResolution(
+            decision: terminal.decision,
+            reason: terminal.reason,
+            risk: terminal.risk,
+            source: terminal.source ?? .automaticReviewerFailure,
+            reviewTaskID: terminal.reviewTaskID,
+            reviewStatus: terminal.reviewStatus,
+            failureKind: terminal.failureKind,
+            failureSource: terminal.failureSource)
     }
 
     private func restoreBudgetIfNeeded(from events: [Envelope]) {
@@ -1434,69 +1937,29 @@ public actor PermissionReviewControlPlane {
     }
 }
 
-/// Tracks the lifetime of the underlying provider stream, not merely the
-/// timeout race. A provider that ignores cancellation therefore cannot overlap
-/// a later automatic review; later jobs fail closed while the session remains
-/// quarantined.
-private final class PermissionReviewProviderActivity: @unchecked Sendable {
-    private let lock = NSLock()
-    private var active = false
-
-    func tryBegin() -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        guard !active else { return false }
-        active = true
-        return true
-    }
-
-    func end() {
-        lock.lock()
-        active = false
-        lock.unlock()
-    }
-
-    func isActive() -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return active
-    }
-}
-
-/// Shares the activity gate across control-plane lifetimes for the same
-/// session. Disabling/re-enabling automatic review or reopening a Cowork view
-/// in the same process therefore cannot overlap a provider call whose actual
-/// termination was never proven. A process restart is the recovery boundary.
-private final class PermissionReviewProviderActivityRegistry: @unchecked Sendable {
-    static let shared = PermissionReviewProviderActivityRegistry()
-
-    private let lock = NSLock()
-    private var activities: [String: PermissionReviewProviderActivity] = [:]
-
-    func activity(for coordinationKey: String) -> PermissionReviewProviderActivity {
-        lock.lock()
-        defer { lock.unlock() }
-        if let activity = activities[coordinationKey] {
-            return activity
-        }
-        let activity = PermissionReviewProviderActivity()
-        activities[coordinationKey] = activity
-        return activity
-    }
-}
-
-/// A non-blocking race: after timeout/cancellation the control plane moves on
-/// without awaiting a provider implementation that ignores Task cancellation.
+/// One request-scoped provider generation. The first matching terminal result
+/// wins; late or duplicate results from a retired generation are ignored. The
+/// gate owns no actor, EventLog, health, or authorization state, so a detached
+/// producer that ignores cancellation cannot affect a later review generation.
 private final class PermissionReviewProviderRace: @unchecked Sendable {
+    typealias GenerationID = PermissionReviewControlPlane.PermissionReviewProviderGenerationID
+
     private let lock = NSLock()
+    private let generation: GenerationID
     private var continuation: CheckedContinuation<PermissionReviewControlPlane.ProviderResult, Never>?
     private var result: PermissionReviewControlPlane.ProviderResult?
     private var providerTask: Task<Void, Never>?
     private var timeoutTask: Task<Void, Never>?
 
-    func setTasks(provider: Task<Void, Never>, timeout: Task<Void, Never>) {
+    init(generation: GenerationID) {
+        self.generation = generation
+    }
+
+    func setTasks(generation: GenerationID,
+                  provider: Task<Void, Never>,
+                  timeout: Task<Void, Never>) {
         lock.lock()
-        let alreadyResolved = result != nil
+        let alreadyResolved = generation != self.generation || result != nil
         if !alreadyResolved {
             providerTask = provider
             timeoutTask = timeout
@@ -1508,9 +1971,14 @@ private final class PermissionReviewProviderRace: @unchecked Sendable {
         }
     }
 
-    func wait() async -> PermissionReviewControlPlane.ProviderResult {
+    func wait(generation: GenerationID) async -> PermissionReviewControlPlane.ProviderResult {
         await withCheckedContinuation { continuation in
             lock.lock()
+            guard generation == self.generation else {
+                lock.unlock()
+                continuation.resume(returning: .cancelled)
+                return
+            }
             if let result {
                 lock.unlock()
                 continuation.resume(returning: result)
@@ -1522,10 +1990,10 @@ private final class PermissionReviewProviderRace: @unchecked Sendable {
     }
 
     @discardableResult
-    func resolve(_ result: PermissionReviewControlPlane.ProviderResult,
-                 onWin: (() -> Void)? = nil) -> Bool {
+    func resolve(generation: GenerationID,
+                 result: PermissionReviewControlPlane.ProviderResult) -> Bool {
         lock.lock()
-        guard self.result == nil else {
+        guard generation == self.generation, self.result == nil else {
             lock.unlock()
             return false
         }
@@ -1537,12 +2005,6 @@ private final class PermissionReviewProviderRace: @unchecked Sendable {
         self.providerTask = nil
         self.timeoutTask = nil
         lock.unlock()
-        // Release provider activity only when the provider itself won the
-        // race. If timeout/cancellation won first, the implementation cannot
-        // prove that an internal producer stopped, so the permit remains held
-        // and later reviews fail closed for the rest of this control-plane
-        // lifetime.
-        onWin?()
         providerTask?.cancel()
         timeoutTask?.cancel()
         continuation?.resume(returning: result)

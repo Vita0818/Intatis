@@ -449,28 +449,51 @@ public enum PermissionApprovalFailureKind: String, Codable, Equatable, Sendable 
     case authorizationSnapshotInvalid = "authorization_snapshot_invalid"
 }
 
+/// Explicit user/control-plane response to one permission request. `decline`
+/// denies only the current call, while `cancelTurn` interrupts its enclosing
+/// turn and must not be represented to the model as a fabricated denied tool
+/// result.
+public enum PermissionResponseAction: String, Codable, Equatable, Sendable {
+    case approve
+    case decline
+    case cancelTurn = "cancel_turn"
+}
+
 public struct PermissionApprovalResolution: Codable, Equatable, Sendable {
     public var decision: PermissionDecision
+    /// Additive explicit response semantics. Nil denotes a legacy responder;
+    /// use `effectiveAction` to derive approve/decline from its decision.
+    public var action: PermissionResponseAction?
     public var reason: String?
     public var risk: RiskLevel?
     public var source: PermissionApprovalSource
     public var reviewTaskID: PermissionReviewTaskID?
     public var reviewStatus: PermissionReviewStatus?
     public var failureKind: PermissionApprovalFailureKind?
+    public var failureSource: ExecutionFailureSource?
 
     public init(decision: PermissionDecision,
+                action: PermissionResponseAction? = nil,
                 reason: String? = nil,
                 risk: RiskLevel? = nil,
                 source: PermissionApprovalSource,
                 reviewTaskID: PermissionReviewTaskID? = nil,
                 reviewStatus: PermissionReviewStatus? = nil,
-                failureKind: PermissionApprovalFailureKind? = nil) {
+                failureKind: PermissionApprovalFailureKind? = nil,
+                failureSource: ExecutionFailureSource? = nil) {
         self.decision = decision
+        self.action = action
         self.reason = reason
         self.risk = risk
         self.source = source
         self.reviewTaskID = reviewTaskID
         self.reviewStatus = reviewStatus
         self.failureKind = failureKind
+        self.failureSource = failureSource
+    }
+
+    public var effectiveAction: PermissionResponseAction {
+        if let action { return action }
+        return decision == .allow ? .approve : .decline
     }
 }

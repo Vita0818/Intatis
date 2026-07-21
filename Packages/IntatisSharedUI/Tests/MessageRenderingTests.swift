@@ -445,6 +445,21 @@ final class MessageRenderingTests: XCTestCase {
         XCTAssertFalse(empty.isAdmitted)
     }
 
+    func testAdaptiveThreadStackKeepsOnlySmallTopLevelThreadsEager() {
+        XCTAssertEqual(
+            IntatisThreadStackLayoutMode.resolve(visibleRowCount: 2),
+            .eager)
+        XCTAssertEqual(
+            IntatisThreadStackLayoutMode.resolve(visibleRowCount: 4),
+            .eager)
+        XCTAssertEqual(
+            IntatisThreadStackLayoutMode.resolve(visibleRowCount: 5),
+            .lazy)
+        XCTAssertEqual(
+            IntatisThreadStackLayoutMode.resolve(visibleRowCount: 17),
+            .lazy)
+    }
+
     @MainActor
     func testFirstReleaseConfigurationDisablesOptionalUnboundedFeatures() {
         let configuration = IntatisMicrosoftMarkdownRenderState.makeConfiguration(

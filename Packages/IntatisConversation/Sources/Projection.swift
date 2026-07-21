@@ -88,7 +88,8 @@ public struct ConversationProjection: Equatable, Sendable {
                                             text: "📎 \(p.kind) artifact" + (p.prompt.map { ": \($0)" } ?? ""),
                                             isComplete: true))
 
-        case .toolCall, .toolResult, .toolExecutionPrepared, .toolExecutionSettled,
+        case .sessionSettingsUpdated, .sessionStorageMigrated, .submissionStatusChanged,
+             .toolCall, .toolResult, .toolExecutionPrepared, .toolExecutionSettled,
              .permissionRequest, .permissionResolved, .patchProposed, .agentStatus,
              .agentAttached, .agentAttachRequested, .agentDetached, .agentSpawnRequested, .agentSpawned,
              .agentMessage, .agentMessageConsumed, .agentMessageDiscarded,
@@ -108,7 +109,7 @@ public struct ConversationProjection: Equatable, Sendable {
              .goalBudgetLimited, .goalUsageLimited, .goalCompleted, .goalCleared,
              .continuationRunCreated, .continuationRunStarted, .continuationRunCheckpointed,
              .continuationRunCompleted, .continuationRunCancelled, .continuationRunRecovered,
-             .artifactProgress, .turnStats:
+             .artifactProgress, .turnStats, .turnOutcome:
             break   // tool/permission/agent/task/progress/stats events are not shown in the chat text view
         }
     }
@@ -128,6 +129,35 @@ public struct ConversationProjection: Equatable, Sendable {
             messages[index].recoveryAdvice = RuntimeErrorPresentation.partialResponseAdvice(for: payload)
         case .user, .system:
             break
+        }
+    }
+}
+
+/// Shared validation for the additive submission-status folds. The EventLog is
+/// append-only, so malformed or stale status records are ignored rather than
+/// allowed to regress a user-visible submission.
+enum SubmissionStatusFold {
+    static func accepts(currentStatus: SubmissionStatus?,
+                        currentAttempt: Int?,
+                        next: SubmissionStatusChangedPayload) -> Bool {
+        guard next.attempt > 0 else { return false }
+        guard let currentAttempt else {
+            return next.attempt == 1 && next.status == .queued
+        }
+        guard next.attempt >= currentAttempt else { return false }
+        if next.attempt > currentAttempt {
+            return next.attempt == currentAttempt + 1 && next.status == .queued
+        }
+        guard let currentStatus else { return true }
+        guard next.status != currentStatus else { return false }
+
+        switch currentStatus {
+        case .queued:
+            return next.status == .running || next.status.isTerminal
+        case .running:
+            return next.status.isTerminal
+        case .completed, .failed, .cancelled:
+            return false
         }
     }
 }

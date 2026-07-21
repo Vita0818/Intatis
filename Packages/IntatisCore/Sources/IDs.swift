@@ -51,6 +51,17 @@ public struct MessageID: TypedID {
     public static func new() -> MessageID { MessageID(rawValue: IDGen.random(prefix: "msg")) }
 }
 
+/// Stable identity of one user-submitted intent across queueing and retries.
+///
+/// This is deliberately distinct from ``MessageID``: a submission can produce
+/// multiple streamed assistant messages and multiple execution attempts while
+/// retaining one immutable user payload.
+public struct SubmissionID: TypedID {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public static func new() -> SubmissionID { SubmissionID(rawValue: IDGen.random(prefix: "sub")) }
+}
+
 public struct AgentID: TypedID {
     public let rawValue: String
     public init(rawValue: String) { self.rawValue = rawValue }

@@ -65,11 +65,34 @@ private final class AutoReviewCapturingProvider: ToolCallingProvider, @unchecked
     }
 }
 
+private final class AutoReviewProviderResolutionSequence: @unchecked Sendable {
+    private let lock = NSLock()
+    private let providers: [ToolCallingProvider]
+    private var index = 0
+
+    init(_ providers: [ToolCallingProvider]) {
+        precondition(!providers.isEmpty)
+        self.providers = providers
+    }
+
+    var resolutionCount: Int { lock.withLock { index } }
+
+    func next() -> ToolCallingProvider {
+        lock.withLock {
+            let provider = providers[min(index, providers.count - 1)]
+            index += 1
+            return provider
+        }
+    }
+}
+
 private actor AutoReviewPendingAllowGate {
     private var started = false
     private var released = false
+    private var finished = false
     private var startedWaiters: [CheckedContinuation<Void, Never>] = []
     private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+    private var finishedWaiters: [CheckedContinuation<Void, Never>] = []
 
     func startAndWaitForRelease() async {
         started = true
@@ -95,6 +118,55 @@ private actor AutoReviewPendingAllowGate {
         releaseWaiters.removeAll()
         for waiter in waiters { waiter.resume() }
     }
+
+    func markFinished() {
+        finished = true
+        let waiters = finishedWaiters
+        finishedWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+    }
+
+    func waitUntilFinished() async {
+        if finished { return }
+        await withCheckedContinuation { continuation in
+            finishedWaiters.append(continuation)
+        }
+    }
+}
+
+private actor AutoReviewSecondResolutionGate {
+    private var resolutionCount = 0
+    private var secondResolutionStarted = false
+    private var released = false
+    private var startedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func pauseSecondResolution() async {
+        resolutionCount += 1
+        guard resolutionCount == 2 else { return }
+        secondResolutionStarted = true
+        let waiters = startedWaiters
+        startedWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+        if released { return }
+        await withCheckedContinuation { continuation in
+            releaseWaiters.append(continuation)
+        }
+    }
+
+    func waitUntilSecondResolutionStarts() async {
+        if secondResolutionStarted { return }
+        await withCheckedContinuation { continuation in
+            startedWaiters.append(continuation)
+        }
+    }
+
+    func releaseSecondResolution() {
+        released = true
+        let waiters = releaseWaiters
+        releaseWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+    }
 }
 
 private final class AutoReviewPendingAllowProvider: ToolCallingProvider, @unchecked Sendable {
@@ -108,12 +180,13 @@ private final class AutoReviewPendingAllowProvider: ToolCallingProvider, @unchec
         let gate = gate
         return AsyncThrowingStream { continuation in
             // Deliberately implementation-owned: consumer cancellation does
-            // not stop this producer, exercising the quarantine/barrier path.
+            // not stop this producer, exercising retired-generation/quiesce guards.
             Task.detached {
                 await gate.startAndWaitForRelease()
                 continuation.yield(.textDelta(#"{"decision":"allow","reason":"late allow"}"#))
                 continuation.yield(.done(finishReason: "stop"))
                 continuation.finish()
+                await gate.markFinished()
             }
         }
     }
@@ -189,6 +262,17 @@ private func autoReviewWriteArgs(path: String, content: String) -> String {
 final class AutomaticPermissionReviewTests: XCTestCase {
     private let main = AgentID(rawValue: "main")
     private let reviewer = Orchestrator.automaticPermissionReviewerID
+
+    private func phaseSBinding() -> AgentInferenceBinding {
+        AgentInferenceBinding(
+            inferenceProfileRef: InferenceProfileRef(
+                inferenceProfileID: InferenceProfileID(rawValue: "phase-s-profile"),
+                inferenceProfileRevision: InferenceProfileRevision(rawValue: "revision-1")),
+            inferenceConnectionID: InferenceConnectionID(rawValue: "phase-s-connection"),
+            inferenceConnectionRevision: InferenceConnectionRevision(rawValue: "connection-revision-1"),
+            modelID: ModelID(rawValue: "phase-s-model"),
+            immutableDefinitionFingerprint: "sha256:phase-s-safe-fingerprint")
+    }
 
     func testAutoCreatesReadonlyReviewerAndDefaultRemovesIt() async throws {
         let log = try autoReviewTempLog()
@@ -282,6 +366,425 @@ final class AutomaticPermissionReviewTests: XCTestCase {
         XCTAssertEqual(
             reviewerWorkspaceLeases.keys.first.flatMap { projection.workspaceLeases[$0]?.access },
             .readOnly)
+    }
+
+    func testPhaseSFreshBootstrapPersistsSettingsAndBothRegistrationsInOneBatch() async throws {
+        let log = try autoReviewTempLog()
+        let ws = try autoReviewWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let provider = AutoReviewCapturingProvider([.done(finishReason: "stop")])
+        let binding = phaseSBinding()
+        let orch = Orchestrator(
+            log: log,
+            allowsShell: true,
+            responder: DenyAllResponder()) { _ in provider }
+        let settings = CoworkSessionSettings(
+            sessionID: await log.sessionID,
+            defaultModelID: binding.modelID.rawValue,
+            defaultInferenceProfileBinding: binding,
+            workspaces: [
+                CoworkSessionWorkspace(
+                    path: ws.path,
+                    agentName: main.rawValue,
+                    isPrimary: true,
+                    addedAt: Date(timeIntervalSince1970: 0)),
+            ])
+
+        let result = await orch.bootstrapFreshSession(
+            main: Agent(
+                name: main,
+                workspaceRoot: ws,
+                model: binding.modelID,
+                agentInferenceBinding: binding,
+                profile: .reviewed,
+                coordinationDepth: Agent.defaultCoordinationDepth),
+            settings: settings)
+
+        XCTAssertEqual(result, .attached(main))
+        XCTAssertTrue(provider.requests.isEmpty, "local registration must not issue a model request")
+        let events = try await log.replayChecked()
+        XCTAssertEqual(events.count, 7)
+        XCTAssertTrue({ if case .sessionSettingsUpdated = events[0].event { return true }; return false }())
+        XCTAssertTrue({ if case .workspaceLeaseGranted = events[1].event { return true }; return false }())
+        XCTAssertTrue({ if case .capabilityLeaseCreated = events[2].event { return true }; return false }())
+        XCTAssertTrue({ if case .agentAttached = events[3].event { return true }; return false }())
+        XCTAssertTrue({ if case .workspaceLeaseGranted = events[4].event { return true }; return false }())
+        XCTAssertTrue({ if case .capabilityLeaseCreated = events[5].event { return true }; return false }())
+        XCTAssertTrue({ if case .agentAttached = events[6].event { return true }; return false }())
+
+        let projection = CoworkProjection.build(from: events)
+        XCTAssertEqual(Set(projection.agentRoster.keys), Set([main, reviewer]))
+        XCTAssertEqual(projection.agentRoster[main]?.agentInferenceBinding, binding)
+        XCTAssertEqual(projection.agentRoster[reviewer]?.agentInferenceBinding, binding)
+        XCTAssertEqual(projection.agentRoster[reviewer]?.profile, PermissionProfile.readOnly.rawValue)
+        let mainCapabilities = projection.capabilityLeaseAgents.compactMap { leaseID, agent in
+            agent == main ? projection.capabilityLeases[leaseID] : nil
+        }
+        XCTAssertEqual(mainCapabilities.count, 1)
+        XCTAssertTrue(mainCapabilities[0].tools.contains(.renameSession))
+        let reviewerCapabilities = projection.capabilityLeaseAgents.compactMap { leaseID, agent in
+            agent == reviewer ? projection.capabilityLeases[leaseID] : nil
+        }
+        XCTAssertEqual(reviewerCapabilities.count, 1)
+        XCTAssertEqual(reviewerCapabilities[0].tools, [])
+        let mainWorkspaceID = try XCTUnwrap(projection.workspaceLeaseAgents.first {
+            $0.value == main
+        }?.key)
+        let reviewerWorkspaceID = try XCTUnwrap(projection.workspaceLeaseAgents.first {
+            $0.value == reviewer
+        }?.key)
+        XCTAssertNotEqual(mainWorkspaceID, reviewerWorkspaceID)
+        XCTAssertEqual(projection.workspaceLeases[mainWorkspaceID]?.access, .readWrite)
+        XCTAssertEqual(projection.workspaceLeases[reviewerWorkspaceID]?.access, .readOnly)
+        let automaticReviewEnabled = await orch.automaticPermissionReviewEnabled()
+        XCTAssertTrue(automaticReviewEnabled)
+
+        let document = try SessionProjectionStore.load(
+            from: SessionProjectionStore.fileURL(for: log),
+            expectedSession: await log.sessionID)
+        XCTAssertEqual(document.projectedThroughSeq, 6)
+        XCTAssertEqual(document.coworkSettings, settings)
+    }
+
+    func testPhaseSFreshBootstrapRejectsPermissionProfileDriftBeforePersistenceOrModelUse() async throws {
+        let log = try autoReviewTempLog()
+        let ws = try autoReviewWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let binding = phaseSBinding()
+        let provider = AutoReviewCapturingProvider([.done(finishReason: "stop")])
+        let orch = Orchestrator(
+            log: log,
+            allowsShell: true,
+            responder: DenyAllResponder()) { _ in provider }
+        let settings = CoworkSessionSettings(
+            sessionID: await log.sessionID,
+            defaultModelID: binding.modelID.rawValue,
+            defaultInferenceProfileBinding: binding,
+            defaultPermissionProfile: PermissionProfile.readOnly.rawValue,
+            workspaces: [CoworkSessionWorkspace(
+                path: ws.path,
+                agentName: main.rawValue,
+                isPrimary: true)])
+
+        let result = await orch.bootstrapFreshSession(
+            main: Agent(
+                name: main,
+                workspaceRoot: ws,
+                model: binding.modelID,
+                agentInferenceBinding: binding,
+                profile: .reviewed,
+                coordinationDepth: Agent.defaultCoordinationDepth),
+            settings: settings)
+
+        guard case .failed = result else {
+            return XCTFail("profile drift must reject the fixed local registration")
+        }
+        XCTAssertTrue(provider.requests.isEmpty)
+        let replayed = try await log.replayChecked()
+        let agents = await orch.agentList()
+        XCTAssertTrue(replayed.isEmpty)
+        XCTAssertTrue(agents.isEmpty)
+    }
+
+    func testPhaseSFreshBootstrapBatchFailureLeavesNoGhostState() async throws {
+        let log = try autoReviewTempLog()
+        let ws = try autoReviewWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let binding = phaseSBinding()
+        let orch = Orchestrator(
+            log: log,
+            allowsShell: true,
+            responder: DenyAllResponder()) { _ in
+                AutoReviewCapturingProvider([.done(finishReason: "stop")])
+            }
+        await orch.setAdmissionEventsAppender { events in
+            XCTAssertEqual(events.count, 7)
+            throw AutoReviewPersistenceError.forcedBatchFailure
+        }
+        let settings = CoworkSessionSettings(
+            sessionID: await log.sessionID,
+            defaultModelID: binding.modelID.rawValue,
+            defaultInferenceProfileBinding: binding,
+            workspaces: [CoworkSessionWorkspace(
+                path: ws.path,
+                agentName: main.rawValue,
+                isPrimary: true)])
+
+        let result = await orch.bootstrapFreshSession(
+            main: Agent(
+                name: main,
+                workspaceRoot: ws,
+                model: binding.modelID,
+                agentInferenceBinding: binding,
+                profile: .reviewed,
+                coordinationDepth: Agent.defaultCoordinationDepth),
+            settings: settings)
+
+        guard case .failed = result else { return XCTFail("forced batch failure must fail") }
+        let replayed = await log.replay()
+        let agents = await orch.agentList()
+        let workspaceLeases = await orch.workspaceLeaseList()
+        let capabilityLeases = await orch.capabilityLeaseList()
+        XCTAssertTrue(replayed.isEmpty)
+        XCTAssertTrue(agents.isEmpty)
+        XCTAssertTrue(workspaceLeases.isEmpty)
+        XCTAssertTrue(capabilityLeases.isEmpty)
+        let automaticReviewEnabled = await orch.automaticPermissionReviewEnabled()
+        XCTAssertFalse(automaticReviewEnabled)
+    }
+
+    func testPhaseSTwoEventLogInstancesCannotBothBootstrapTheSameFreshSession() async throws {
+        let firstLog = try autoReviewTempLog()
+        let secondLog = try EventLog(
+            session: await firstLog.sessionID,
+            fileURL: firstLog.sessionDirectoryURL.appendingPathComponent("events.jsonl"))
+        let ws = try autoReviewWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let binding = phaseSBinding()
+        let firstProvider = AutoReviewCapturingProvider([.done(finishReason: "stop")])
+        let secondProvider = AutoReviewCapturingProvider([.done(finishReason: "stop")])
+        let first = Orchestrator(
+            log: firstLog,
+            allowsShell: true,
+            responder: DenyAllResponder()) { _ in firstProvider }
+        let second = Orchestrator(
+            log: secondLog,
+            allowsShell: true,
+            responder: DenyAllResponder()) { _ in secondProvider }
+        let settings = CoworkSessionSettings(
+            sessionID: await firstLog.sessionID,
+            defaultModelID: binding.modelID.rawValue,
+            defaultInferenceProfileBinding: binding,
+            workspaces: [CoworkSessionWorkspace(
+                path: ws.path,
+                agentName: main.rawValue,
+                isPrimary: true)])
+        let mainAgent = Agent(
+            name: main,
+            workspaceRoot: ws,
+            model: binding.modelID,
+            agentInferenceBinding: binding,
+            profile: .reviewed,
+            coordinationDepth: Agent.defaultCoordinationDepth)
+
+        async let firstResult = first.bootstrapFreshSession(
+            main: mainAgent,
+            settings: settings)
+        async let secondResult = second.bootstrapFreshSession(
+            main: mainAgent,
+            settings: settings)
+        let (resolvedFirst, resolvedSecond) = await (firstResult, secondResult)
+        let results = [resolvedFirst, resolvedSecond]
+
+        XCTAssertEqual(results.filter {
+            if case .attached = $0 { return true }
+            return false
+        }.count, 1)
+        XCTAssertEqual(results.filter {
+            if case .failed = $0 { return true }
+            return false
+        }.count, 1)
+        let durableEvents = try await firstLog.replayChecked()
+        XCTAssertEqual(durableEvents.count, 7)
+        XCTAssertTrue(firstProvider.requests.isEmpty)
+        XCTAssertTrue(secondProvider.requests.isEmpty)
+        let firstAgents = await first.agentList()
+        let secondAgents = await second.agentList()
+        let totalRuntimeAgents = firstAgents.count + secondAgents.count
+        XCTAssertEqual(totalRuntimeAgents, 2, "only the winning runtime may register @main and reviewer")
+    }
+
+    func testPhaseSHistoricalMainRecoveryUsesCanonicalSettingsWithoutModelReview() async throws {
+        let log = try autoReviewTempLog()
+        let ws = try autoReviewWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let binding = phaseSBinding()
+        let settings = CoworkSessionSettings(
+            sessionID: await log.sessionID,
+            defaultModelID: binding.modelID.rawValue,
+            defaultInferenceProfileBinding: binding,
+            workspaces: [CoworkSessionWorkspace(
+                path: ws.path,
+                agentName: main.rawValue,
+                isPrimary: true)])
+        try await log.append(.sessionSettingsUpdated(SessionSettingsUpdatedPayload(
+            revision: 1,
+            changeKind: .migrated,
+            kind: .cowork,
+            cowork: settings)))
+        let provider = AutoReviewCapturingProvider([.done(finishReason: "stop")])
+        let orch = Orchestrator(
+            log: log,
+            allowsShell: true,
+            responder: DenyAllResponder()) { _ in provider }
+        let agent = Agent(
+            name: main,
+            workspaceRoot: ws,
+            model: binding.modelID,
+            agentInferenceBinding: binding,
+            profile: .reviewed,
+            coordinationDepth: Agent.defaultCoordinationDepth)
+
+        let denied = await orch.restoreHistoricalMainAgent(
+            agent,
+            settings: settings,
+            hostAuthorized: false)
+        XCTAssertEqual(
+            denied,
+            .failed("Historical @main recovery requires explicit host authorization."))
+        let deniedEvents = try await log.replayChecked()
+        XCTAssertEqual(deniedEvents.count, 1)
+
+        let recovered = await orch.restoreHistoricalMainAgent(
+            agent,
+            settings: settings,
+            hostAuthorized: true)
+
+        XCTAssertEqual(recovered, .attached(main))
+        XCTAssertTrue(provider.requests.isEmpty)
+        let events = try await log.replayChecked()
+        XCTAssertEqual(events.count, 4)
+        XCTAssertFalse(events.contains {
+            if case .permissionRequest = $0.event { return true }
+            if case .permissionReviewRequested = $0.event { return true }
+            return false
+        })
+        let projection = CoworkProjection.build(from: events)
+        XCTAssertEqual(projection.agentRoster[main]?.agentInferenceBinding, binding)
+        XCTAssertEqual(projection.workspaceLeaseAgents.values.filter { $0 == main }.count, 1)
+        XCTAssertEqual(projection.capabilityLeaseAgents.values.filter { $0 == main }.count, 1)
+        let repeated = await orch.restoreHistoricalMainAgent(
+            agent,
+            settings: settings,
+            hostAuthorized: true)
+        XCTAssertEqual(repeated, .alreadyAttached(main))
+    }
+
+    func testPhaseSHistoricalMainRecoveryCASRejectsInvalidSettingsRevisionChain() async throws {
+        let log = try autoReviewTempLog()
+        let ws = try autoReviewWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let binding = phaseSBinding()
+        let settings = CoworkSessionSettings(
+            sessionID: await log.sessionID,
+            defaultModelID: binding.modelID.rawValue,
+            defaultInferenceProfileBinding: binding,
+            workspaces: [CoworkSessionWorkspace(
+                path: ws.path,
+                agentName: main.rawValue,
+                isPrimary: true)])
+        try await log.append(.sessionSettingsUpdated(SessionSettingsUpdatedPayload(
+            revision: 1,
+            changeKind: .migrated,
+            kind: .cowork,
+            cowork: settings)))
+
+        let provider = AutoReviewCapturingProvider([.done(finishReason: "stop")])
+        let resolutionGate = AutoReviewSecondResolutionGate()
+        let orch = Orchestrator(
+            log: log,
+            allowsShell: true,
+            responder: DenyAllResponder(),
+            availableInferenceProfiles: [binding],
+            requiresInferenceBindings: true,
+            resolvedInferenceFor: { agent in
+                await resolutionGate.pauseSecondResolution()
+                guard let resolvedBinding = agent.agentInferenceBinding else {
+                    throw InferenceCatalogError.unresolvedProfile
+                }
+                return ResolvedInferenceProfile(
+                    binding: resolvedBinding,
+                    model: agent.model,
+                    provider: provider)
+            },
+            providerFor: { _ in provider })
+        let mainAgent = Agent(
+            name: main,
+            workspaceRoot: ws,
+            model: binding.modelID,
+            agentInferenceBinding: binding,
+            profile: .reviewed,
+            coordinationDepth: Agent.defaultCoordinationDepth)
+
+        let restoreTask = Task {
+            await orch.restoreHistoricalMainAgent(
+                mainAgent,
+                settings: settings,
+                hostAuthorized: true)
+        }
+        await resolutionGate.waitUntilSecondResolutionStarts()
+        try await log.append(.sessionSettingsUpdated(SessionSettingsUpdatedPayload(
+            revision: 3,
+            previousRevision: 1,
+            changeKind: .updated,
+            kind: .cowork,
+            cowork: settings)))
+        await resolutionGate.releaseSecondResolution()
+
+        let result = await restoreTask.value
+        guard case .failed = result else {
+            return XCTFail("invalid settings history must fail the final recovery CAS")
+        }
+        XCTAssertTrue(provider.requests.isEmpty)
+        let replayed = try await log.replayChecked()
+        XCTAssertEqual(replayed.count, 2)
+        XCTAssertFalse(replayed.contains {
+            switch $0.event {
+            case .workspaceLeaseGranted, .capabilityLeaseCreated, .agentAttached:
+                return true
+            default:
+                return false
+            }
+        })
+        let agents = await orch.agentList()
+        XCTAssertTrue(agents.isEmpty)
+    }
+
+    func testPhaseSHistoricalMainRecoveryRejectsPermissionProfileDrift() async throws {
+        let log = try autoReviewTempLog()
+        let ws = try autoReviewWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let binding = phaseSBinding()
+        let canonical = CoworkSessionSettings(
+            sessionID: await log.sessionID,
+            defaultModelID: binding.modelID.rawValue,
+            defaultInferenceProfileBinding: binding,
+            workspaces: [CoworkSessionWorkspace(
+                path: ws.path,
+                agentName: main.rawValue,
+                isPrimary: true)])
+        try await log.append(.sessionSettingsUpdated(SessionSettingsUpdatedPayload(
+            revision: 1,
+            changeKind: .migrated,
+            kind: .cowork,
+            cowork: canonical)))
+        var drifted = canonical
+        drifted.defaultPermissionProfile = PermissionProfile.readOnly.rawValue
+        let provider = AutoReviewCapturingProvider([.done(finishReason: "stop")])
+        let orch = Orchestrator(
+            log: log,
+            allowsShell: true,
+            responder: DenyAllResponder()) { _ in provider }
+
+        let result = await orch.restoreHistoricalMainAgent(
+            Agent(
+                name: main,
+                workspaceRoot: ws,
+                model: binding.modelID,
+                agentInferenceBinding: binding,
+                profile: .reviewed,
+                coordinationDepth: Agent.defaultCoordinationDepth),
+            settings: drifted,
+            hostAuthorized: true)
+
+        guard case .failed = result else {
+            return XCTFail("historical profile drift must fail closed")
+        }
+        XCTAssertTrue(provider.requests.isEmpty)
+        let replayed = try await log.replayChecked()
+        let agents = await orch.agentList()
+        XCTAssertEqual(replayed.count, 1)
+        XCTAssertTrue(agents.isEmpty)
     }
 
     func testMainBootstrapFailsClosedForNonemptySession() async throws {
@@ -567,6 +1070,113 @@ final class AutomaticPermissionReviewTests: XCTestCase {
         XCTAssertNotNil(projection.workspaceLeases[reviewerWorkspaceLease.id])
     }
 
+    func testFailedDisableResumesWithFreshGenerationWhileRetiredAllowArrivesLate() async throws {
+        let log = try autoReviewTempLog()
+        let ws = try autoReviewWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let preflightProvider = AutoReviewCapturingProvider([
+            .done(finishReason: "stop"),
+        ])
+        let lateGate = AutoReviewPendingAllowGate()
+        let lateProvider = AutoReviewPendingAllowProvider(gate: lateGate)
+        let recoveredProvider = AutoReviewCapturingProvider([
+            .textDelta(#"{"decision":"allow","reason":"fresh review after failed disable"}"#),
+            .done(finishReason: "stop"),
+        ])
+        let reviewerProviders = AutoReviewProviderResolutionSequence([
+            preflightProvider,
+            lateProvider,
+            recoveredProvider,
+        ])
+        let reviewerID = reviewer
+        let orch = Orchestrator(
+            log: log,
+            allowsShell: true,
+            responder: AttachOnlyResponder()) { agent -> any ToolCallingProvider in
+                if agent.name == reviewerID { return reviewerProviders.next() }
+                return AutoReviewScriptedProvider([[
+                    .textDelta("unused"),
+                    .done(finishReason: "stop"),
+                ]])
+            }
+        let mainAttached = await orch.attach(Agent(
+            name: main,
+            workspaceRoot: ws,
+            model: ModelID(rawValue: "main-model"),
+            profile: .reviewed,
+            coordinationDepth: Agent.defaultCoordinationDepth))
+        XCTAssertTrue(mainAttached)
+        let enableResult = await orch.enableAutomaticPermissionReview(
+            model: ModelID(rawValue: "reviewer-model"),
+            workspaceRoot: ws)
+        XCTAssertEqual(enableResult, .enabled(reviewer))
+
+        let firstWorker = AgentID(rawValue: "worker-before-resume")
+        let firstAttach = Task {
+            await orch.attach(Agent(
+                name: firstWorker,
+                workspaceRoot: ws,
+                model: ModelID(rawValue: "worker-model"),
+                profile: .reviewed,
+                coordinationDepth: 0))
+        }
+        await lateGate.waitUntilStarted()
+        await orch.setAdmissionEventsAppender { events in
+            if events.contains(where: { event in
+                guard case .agentDetached(let payload) = event else { return false }
+                return payload.agent == reviewerID
+            }) {
+                throw AutoReviewPersistenceError.forcedBatchFailure
+            }
+            try await log.append(events)
+        }
+
+        let disableResult = await orch.disableAutomaticPermissionReview()
+        let firstAttached = await firstAttach.value
+        guard case .failed(let message) = disableResult else {
+            return XCTFail("failed reviewer detach must roll quiesce back")
+        }
+        XCTAssertTrue(message.contains("remains enabled"))
+        XCTAssertFalse(firstAttached)
+        let stillEnabled = await orch.automaticPermissionReviewEnabled()
+        XCTAssertTrue(stillEnabled)
+
+        let secondWorker = AgentID(rawValue: "worker-after-resume")
+        let secondAttached = await orch.attach(Agent(
+            name: secondWorker,
+            workspaceRoot: ws,
+            model: ModelID(rawValue: "worker-model"),
+            profile: .reviewed,
+            coordinationDepth: 0))
+        XCTAssertTrue(secondAttached)
+        XCTAssertEqual(reviewerProviders.resolutionCount, 3)
+        XCTAssertTrue(preflightProvider.requests.isEmpty)
+        XCTAssertEqual(recoveredProvider.requests.count, 1)
+        let recoveredHealth = await orch.automaticPermissionReviewHealth()
+        XCTAssertEqual(recoveredHealth, .healthy)
+        let eventsBeforeLateAllow = await log.replay()
+        let settlementsBeforeLateAllow = eventsBeforeLateAllow.compactMap { envelope -> PermissionReviewSettledPayload? in
+            if case .permissionReviewSettled(let payload) = envelope.event { return payload }
+            return nil
+        }
+        XCTAssertEqual(settlementsBeforeLateAllow.map(\.status), [.cancelled, .allowed])
+        let rosterBeforeLateAllow = CoworkProjection.build(from: eventsBeforeLateAllow).agentRoster
+        XCTAssertNil(rosterBeforeLateAllow[firstWorker])
+        XCTAssertNotNil(rosterBeforeLateAllow[secondWorker])
+
+        await lateGate.release()
+        await lateGate.waitUntilFinished()
+        let eventsAfterLateAllow = await log.replay()
+        let settlementsAfterLateAllow = eventsAfterLateAllow.compactMap { envelope -> PermissionReviewSettledPayload? in
+            if case .permissionReviewSettled(let payload) = envelope.event { return payload }
+            return nil
+        }
+        XCTAssertEqual(settlementsAfterLateAllow, settlementsBeforeLateAllow)
+        let rosterAfterLateAllow = CoworkProjection.build(from: eventsAfterLateAllow).agentRoster
+        XCTAssertNil(rosterAfterLateAllow[firstWorker])
+        XCTAssertNotNil(rosterAfterLateAllow[secondWorker])
+    }
+
     func testDisableQuiescesPendingAllowBeforeDurableDetach() async throws {
         let log = try autoReviewTempLog()
         let ws = try autoReviewWorkspace()
@@ -613,6 +1223,7 @@ final class AutomaticPermissionReviewTests: XCTestCase {
         await batchGate.release()
         let disabled = await disableTask.value
         await allowGate.release()
+        await allowGate.waitUntilFinished()
         let attached = await attachTask.value
 
         XCTAssertEqual(disabled, .disabled(reviewer))
@@ -634,6 +1245,137 @@ final class AutomaticPermissionReviewTests: XCTestCase {
         let projection = CoworkProjection.build(from: events)
         XCTAssertNil(projection.agentRoster[reviewer])
         XCTAssertNil(projection.agentRoster[main])
+    }
+
+    func testCallerCancellationCannotAttachAfterLateReviewerAllow() async throws {
+        let log = try autoReviewTempLog()
+        let ws = try autoReviewWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let allowGate = AutoReviewPendingAllowGate()
+        let reviewerProvider = AutoReviewPendingAllowProvider(gate: allowGate)
+        let reviewerID = reviewer
+        let orch = Orchestrator(
+            log: log,
+            allowsShell: true,
+            responder: AttachOnlyResponder()) { agent in
+                if agent.name == reviewerID { return reviewerProvider }
+                return AutoReviewScriptedProvider([[
+                    .textDelta("unused"),
+                    .done(finishReason: "stop"),
+                ]])
+            }
+        let mainAttached = await orch.attach(Agent(
+            name: main,
+            workspaceRoot: ws,
+            model: ModelID(rawValue: "main-model"),
+            profile: .reviewed,
+            coordinationDepth: Agent.defaultCoordinationDepth))
+        XCTAssertTrue(mainAttached)
+        let enabled = await orch.enableAutomaticPermissionReview(
+            model: ModelID(rawValue: "reviewer-model"),
+            workspaceRoot: ws)
+        XCTAssertEqual(enabled, .enabled(reviewer))
+
+        let worker = AgentID(rawValue: "worker-cancelled-before-late-allow")
+        let attachTask = Task {
+            await orch.attach(Agent(
+                name: worker,
+                workspaceRoot: ws,
+                model: ModelID(rawValue: "worker-model"),
+                profile: .reviewed,
+                coordinationDepth: 0))
+        }
+        await allowGate.waitUntilStarted()
+
+        attachTask.cancel()
+        await allowGate.release()
+        await allowGate.waitUntilFinished()
+        let attached = await attachTask.value
+
+        XCTAssertFalse(attached)
+        let events = await log.replay()
+        let projection = CoworkProjection.build(from: events)
+        XCTAssertNil(projection.agentRoster[worker])
+        let settlements = events.compactMap { envelope -> PermissionReviewSettledPayload? in
+            if case .permissionReviewSettled(let payload) = envelope.event { return payload }
+            return nil
+        }
+        XCTAssertEqual(settlements.last?.status, .cancelled)
+        XCTAssertEqual(settlements.last?.decision, .deny)
+        let attachDecisions = events.compactMap { envelope -> PermissionResolvedPayload? in
+            guard case .permissionResolved(let payload) = envelope.event,
+                  payload.tool == "agent.attach" else { return nil }
+            return payload
+        }
+        XCTAssertEqual(attachDecisions.last?.decision, .deny)
+    }
+
+    func testCallerCancellationDuringPostReviewInferenceResolutionCannotCommitAttach() async throws {
+        let log = try autoReviewTempLog()
+        let ws = try autoReviewWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let binding = phaseSBinding()
+        let provider = AutoReviewCapturingProvider([.done(finishReason: "stop")])
+        let resolutionGate = AutoReviewSecondResolutionGate()
+        let orch = Orchestrator(
+            log: log,
+            allowsShell: true,
+            responder: AttachOnlyResponder(),
+            availableInferenceProfiles: [binding],
+            requiresInferenceBindings: true,
+            resolvedInferenceFor: { agent in
+                await resolutionGate.pauseSecondResolution()
+                guard let resolvedBinding = agent.agentInferenceBinding else {
+                    throw InferenceCatalogError.unresolvedProfile
+                }
+                return ResolvedInferenceProfile(
+                    binding: resolvedBinding,
+                    model: agent.model,
+                    provider: provider)
+            },
+            providerFor: { _ in provider })
+        let worker = AgentID(rawValue: "worker-cancelled-during-post-review-resolution")
+        let attachTask = Task {
+            await orch.attach(Agent(
+                name: worker,
+                workspaceRoot: ws,
+                model: binding.modelID,
+                agentInferenceBinding: binding,
+                profile: .reviewed,
+                coordinationDepth: 0))
+        }
+        await resolutionGate.waitUntilSecondResolutionStarts()
+
+        attachTask.cancel()
+        await resolutionGate.releaseSecondResolution()
+        let attached = await attachTask.value
+
+        XCTAssertFalse(attached)
+        XCTAssertTrue(provider.requests.isEmpty)
+        let events = try await log.replayChecked()
+        let projection = CoworkProjection.build(from: events)
+        XCTAssertNil(projection.agentRoster[worker])
+        XCTAssertFalse(events.contains { envelope in
+            if case .workspaceLeaseGranted(let payload) = envelope.event {
+                return payload.agent == worker
+            }
+            if case .capabilityLeaseCreated(let payload) = envelope.event {
+                return payload.agent == worker
+            }
+            if case .agentAttached(let payload) = envelope.event {
+                return payload.agent == worker
+            }
+            return false
+        })
+        let attachDecisions = events.compactMap { envelope -> PermissionResolvedPayload? in
+            guard case .permissionResolved(let payload) = envelope.event,
+                  payload.tool == "agent.attach" else { return nil }
+            return payload
+        }
+        XCTAssertEqual(attachDecisions.last?.decision, .deny)
+        XCTAssertEqual(attachDecisions.last?.source, .callerCancellation)
+        XCTAssertEqual(attachDecisions.last?.reviewStatus, .cancelled)
+        XCTAssertEqual(attachDecisions.last?.failureKind, .callerCancelled)
     }
 
     func testAttachRejectsWorkspaceRootReplacedWhileReviewIsPending() async throws {
@@ -1022,6 +1764,121 @@ final class AutomaticPermissionReviewTests: XCTestCase {
         XCTAssertEqual(resolved.source, .automaticReviewer)
         XCTAssertEqual(resolved.reviewTaskID, requested.id)
         XCTAssertEqual(resolved.reviewStatus, .allowed)
+    }
+
+    func testTimedOutReviewDeniesOnlyItsToolAndFreshGenerationCanExecuteNextTool() async throws {
+        let log = try autoReviewTempLog()
+        let ws = try autoReviewWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let mainProvider = AutoReviewScriptedProvider([
+            [.toolCalls([ToolCall(
+                id: "write-timed-out-generation",
+                name: "write_file",
+                arguments: autoReviewWriteArgs(
+                    path: "timed-out.txt",
+                    content: "must not be written"))]),
+             .done(finishReason: "tool_calls")],
+            [.textDelta("first write was denied"), .done(finishReason: "stop")],
+            [.toolCalls([ToolCall(
+                id: "write-fresh-generation",
+                name: "write_file",
+                arguments: autoReviewWriteArgs(
+                    path: "fresh.txt",
+                    content: "fresh generation approved"))]),
+             .done(finishReason: "tool_calls")],
+            [.textDelta("second write completed"), .done(finishReason: "stop")],
+        ])
+        let lateGate = AutoReviewPendingAllowGate()
+        let lateProvider = AutoReviewPendingAllowProvider(gate: lateGate)
+        let preflightProvider = AutoReviewCapturingProvider([
+            .done(finishReason: "stop"),
+        ])
+        let recoveredProvider = AutoReviewCapturingProvider([
+            .textDelta(#"{"decision":"allow","reason":"fresh generation matches the second request"}"#),
+            .done(finishReason: "stop"),
+        ])
+        let reviewerProviders = AutoReviewProviderResolutionSequence([
+            preflightProvider,
+            lateProvider,
+            recoveredProvider,
+        ])
+        let reviewerID = reviewer
+        let orch = Orchestrator(
+            log: log,
+            allowsShell: true,
+            responder: AttachOnlyResponder()) { agent -> any ToolCallingProvider in
+                if agent.name == reviewerID { return reviewerProviders.next() }
+                return mainProvider
+            }
+        let attached = await orch.attach(Agent(
+            name: main,
+            workspaceRoot: ws,
+            model: ModelID(rawValue: "main-model"),
+            profile: .reviewed,
+            coordinationDepth: Agent.defaultCoordinationDepth))
+        XCTAssertTrue(attached)
+        let enabled = await orch.enableAutomaticPermissionReview(
+            model: ModelID(rawValue: "reviewer-model"),
+            workspaceRoot: ws,
+            policy: PermissionReviewControlPlanePolicy(
+                timeoutSeconds: 0.03,
+                tokenBudget: 50_000,
+                reservedCompletionTokens: 64,
+                maxRecentEvents: 12))
+        XCTAssertEqual(enabled, .enabled(reviewer))
+
+        let first = await orch.send("write timed-out.txt", to: main)
+        let firstPath = ws.appendingPathComponent("timed-out.txt")
+        guard case .failed(let firstFailure) = first else {
+            return XCTFail("the invocation whose required write timed out must fail")
+        }
+        XCTAssertTrue(firstFailure.contains("required side effects remain denied or failed"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: firstPath.path))
+
+        let second = await orch.send("write fresh.txt", to: main)
+        let secondPath = ws.appendingPathComponent("fresh.txt")
+        XCTAssertEqual(second, .sent)
+        XCTAssertEqual(
+            try String(contentsOf: secondPath, encoding: .utf8),
+            "fresh generation approved")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: firstPath.path))
+        XCTAssertEqual(reviewerProviders.resolutionCount, 3)
+        XCTAssertTrue(preflightProvider.requests.isEmpty)
+        XCTAssertEqual(recoveredProvider.requests.count, 1)
+
+        let eventsBeforeLateAllow = await log.replay()
+        let reviewSettlements = eventsBeforeLateAllow.compactMap { envelope -> PermissionReviewSettledPayload? in
+            if case .permissionReviewSettled(let payload) = envelope.event { return payload }
+            return nil
+        }
+        XCTAssertEqual(reviewSettlements.map(\.status), [.timedOut, .allowed])
+        XCTAssertEqual(reviewSettlements.map(\.decision), [.deny, .allow])
+        let permissionDecisions = eventsBeforeLateAllow.compactMap { envelope -> PermissionResolvedPayload? in
+            guard case .permissionResolved(let payload) = envelope.event,
+                  payload.tool == "write_file" else { return nil }
+            return payload
+        }
+        XCTAssertEqual(permissionDecisions.map(\.decision), [.deny, .allow])
+        let executionSettlements = eventsBeforeLateAllow.compactMap { envelope -> ToolExecutionSettledPayload? in
+            guard case .toolExecutionSettled(let payload) = envelope.event else { return nil }
+            return payload
+        }
+        XCTAssertFalse(executionSettlements.contains {
+            $0.toolCallID == "write-timed-out-generation" && $0.outcome == .succeeded
+        })
+        XCTAssertEqual(executionSettlements.filter {
+            $0.toolCallID == "write-fresh-generation" && $0.outcome == .succeeded
+        }.count, 1)
+
+        await lateGate.release()
+        await lateGate.waitUntilFinished()
+        let eventsAfterLateAllow = await log.replay()
+        let settlementsAfterLateAllow = eventsAfterLateAllow.compactMap { envelope -> PermissionReviewSettledPayload? in
+            if case .permissionReviewSettled(let payload) = envelope.event { return payload }
+            return nil
+        }
+        XCTAssertEqual(settlementsAfterLateAllow, reviewSettlements)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: firstPath.path))
     }
 
     func testCancellingActiveTasksKeepsAutomaticReviewerAvailableForNextRequest() async throws {

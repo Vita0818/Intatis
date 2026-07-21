@@ -144,6 +144,52 @@ final class IntatisPermissionTests: XCTestCase {
         }
     }
 
+    func testGateAllowsOnlyExactCurrentSessionRenameIntent() {
+        let intent = PermissionIntent(
+            action: "session.rename",
+            resources: [PermissionResource(kind: .tool, value: "current_session")],
+            dataEffects: [.none],
+            controlEffects: [],
+            risks: [.controlPlaneMutation],
+            replayPolicy: .requiresManualReconciliation)
+        guard case .allow(_, let risk) = gate.evaluate(
+            call("rename_session", .write, intent: intent),
+            ctx(profile: .reviewed)) else {
+            return XCTFail("the host-bound current-session rename should be deterministic low risk")
+        }
+        XCTAssertEqual(risk, .low)
+    }
+
+    func testGateDoesNotAutoAllowNearMissSessionRenameIntent() {
+        let intent = PermissionIntent(
+            action: "session.rename",
+            resources: [PermissionResource(kind: .tool, value: "another_session")],
+            dataEffects: [.none],
+            controlEffects: [],
+            risks: [.controlPlaneMutation],
+            replayPolicy: .requiresManualReconciliation)
+        guard case .pass = gate.evaluate(
+            call("rename_session", .write, intent: intent),
+            ctx(profile: .reviewed)) else {
+            return XCTFail("a non-current target must not use the deterministic rename exception")
+        }
+    }
+
+    func testGateLockedDeniesExactCurrentSessionRenameIntent() {
+        let intent = PermissionIntent(
+            action: "session.rename",
+            resources: [PermissionResource(kind: .tool, value: "current_session")],
+            dataEffects: [.none],
+            controlEffects: [],
+            risks: [.controlPlaneMutation],
+            replayPolicy: .requiresManualReconciliation)
+        guard case .deny = gate.evaluate(
+            call("rename_session", .write, intent: intent),
+            ctx(profile: .locked)) else {
+            return XCTFail("locked remains a hard deny")
+        }
+    }
+
     // MARK: Engine
 
     func testEngineWriteWithoutAutomaticResponderAsks() async {

@@ -50,6 +50,7 @@ final class ToolExecutionProtocolTests: XCTestCase {
         let settled = ToolExecutionSettledPayload(
             prepared: prepared,
             outcome: .succeeded,
+            effectDisposition: .committed,
             reason: "result persisted")
         let envelopes = [
             Envelope(
@@ -75,6 +76,7 @@ final class ToolExecutionProtocolTests: XCTestCase {
         XCTAssertEqual(wireTypes, ["tool_execution_prepared", "tool_execution_settled"])
         XCTAssertEqual(try encoded.map { try decoder.decode(Envelope.self, from: $0) }, envelopes)
         XCTAssertEqual(settled.prepared, prepared)
+        XCTAssertEqual(settled.effectDisposition, .committed)
     }
 
     func testLegacyToolResultStillDecodesWithoutExecutionEvents() throws {
@@ -98,5 +100,17 @@ final class ToolExecutionProtocolTests: XCTestCase {
         XCTAssertNil(payload.intent)
         XCTAssertNil(payload.authorization)
         XCTAssertEqual(payload.replayPolicy, .safeToReplay)
+    }
+
+    func testLegacySettledExecutionWithoutEffectDispositionDecodesConservatively() throws {
+        let json = #"{"executionID":"exec_legacy","toolCallID":"call_legacy","tool":"task_update","sideEffect":"write","replayPolicy":"requires_manual_reconciliation","outcome":"failed","reason":"expected revision 1, actual 2"}"#
+
+        let payload = try JSONDecoder().decode(
+            ToolExecutionSettledPayload.self,
+            from: Data(json.utf8))
+
+        XCTAssertEqual(payload.outcome, .failed)
+        XCTAssertNil(payload.effectDisposition)
+        XCTAssertTrue(payload.prepared.requiresTaskReplayReconciliation)
     }
 }

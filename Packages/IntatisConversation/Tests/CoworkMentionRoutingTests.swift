@@ -49,4 +49,43 @@ final class CoworkMentionRoutingTests: XCTestCase {
             CoworkMentionRouter.route(input: "   ", attachedAgents: [alpha]).outcome,
             .blocked(.emptyMessage))
     }
+
+    func testSubmittedIntentFreezesUnknownButSyntacticallyValidTarget() {
+        let route = CoworkMentionRouter.routeSubmittedIntent(
+            input: "  @Future_worker-2   inspect the file  ",
+            defaultTarget: alpha)
+
+        XCTAssertEqual(route.originalInput, "  @Future_worker-2   inspect the file  ")
+        XCTAssertEqual(
+            route.outcome,
+            .send(
+                text: "inspect the file",
+                target: AgentID(rawValue: "Future_worker-2")))
+    }
+
+    func testSubmittedIntentUsesFrozenDefaultWithoutConsultingRoster() {
+        let route = CoworkMentionRouter.routeSubmittedIntent(
+            input: "  inspect the file  ",
+            defaultTarget: beta)
+
+        XCTAssertEqual(route.outcome, .send(text: "inspect the file", target: beta))
+    }
+
+    func testSubmittedIntentRejectsInvalidMentionSyntax() {
+        XCTAssertEqual(
+            CoworkMentionRouter.routeSubmittedIntent(
+                input: "@bad/name inspect",
+                defaultTarget: alpha).outcome,
+            .blocked(.invalidMention("bad/name")))
+        XCTAssertEqual(
+            CoworkMentionRouter.routeSubmittedIntent(
+                input: "@未来 inspect",
+                defaultTarget: alpha).outcome,
+            .blocked(.invalidMention("未来")))
+        XCTAssertEqual(
+            CoworkMentionRouter.routeSubmittedIntent(
+                input: "@-starts-with-dash inspect",
+                defaultTarget: alpha).outcome,
+            .blocked(.invalidMention("-starts-with-dash")))
+    }
 }

@@ -38,10 +38,22 @@ public struct PermissionRespondParams: Codable, Equatable, Sendable {
     public var session: SessionID
     public var requestId: RequestID
     public var decision: PermissionDecision   // allow / deny
-    public init(session: SessionID, requestId: RequestID, decision: PermissionDecision) {
+    /// Additive explicit response semantics. Nil remains the legacy wire shape
+    /// and derives approve/decline from `decision`.
+    public var action: PermissionResponseAction?
+    public init(session: SessionID,
+                requestId: RequestID,
+                decision: PermissionDecision,
+                action: PermissionResponseAction? = nil) {
         self.session = session
         self.requestId = requestId
         self.decision = decision
+        self.action = action
+    }
+
+    public var effectiveAction: PermissionResponseAction {
+        if let action { return action }
+        return decision == .allow ? .approve : .decline
     }
 }
 

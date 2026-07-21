@@ -257,6 +257,16 @@ final class IntatisAgentKernelTests: XCTestCase {
             return nil
         }.first
         XCTAssertTrue(result?.observation.contains("permission denied") == true)
+        XCTAssertEqual(result?.toolCallId, "c1")
+        XCTAssertEqual(result?.outcome, .denied)
+        XCTAssertEqual(result?.failureSource, .userDenied)
+        XCTAssertNotNil(result?.turnID)
+        XCTAssertNotNil(result?.permissionRequestID)
+        let turnOutcomes = events.compactMap { envelope -> TurnOutcomePayload? in
+            if case .turnOutcome(let payload) = envelope.event { return payload }
+            return nil
+        }
+        XCTAssertEqual(turnOutcomes.map(\.outcome), [.completed])
     }
 
     func testReadOnlyToolNeedsNoApproval() async throws {

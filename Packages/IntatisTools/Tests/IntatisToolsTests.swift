@@ -3178,7 +3178,7 @@ final class IntatisToolsTests: XCTestCase {
 
     func testStandardRegistry() {
         let reg = ToolRegistry.standard()
-        XCTAssertEqual(reg.descriptors().count, 57)
+        XCTAssertEqual(reg.descriptors().count, 58)
         XCTAssertNotNil(reg.tool(named: "read_file"))
         XCTAssertNotNil(reg.tool(named: "apply_patch"))
         XCTAssertNil(reg.tool(named: "run_shell"))
@@ -3234,6 +3234,7 @@ final class IntatisToolsTests: XCTestCase {
         XCTAssertNotNil(reg.tool(named: "browser_download"))
         XCTAssertNotNil(reg.tool(named: "browser_downloads"))
         XCTAssertNotNil(reg.tool(named: "browser_search"))
+        XCTAssertNotNil(reg.tool(named: "rename_session"))
         XCTAssertNil(reg.tool(named: "nonexistent"))
         XCTAssertEqual(ReadFileTool.descriptor.sideEffect, .readOnly)
         XCTAssertEqual(WriteFileTool.descriptor.sideEffect, .write)

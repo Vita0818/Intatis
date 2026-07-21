@@ -70,6 +70,7 @@ public struct PermissionReviewCausalContext: Codable, Equatable, Sendable {
 /// Every field is additive/optional so old JSONL and non-Cowork responders keep
 /// decoding and constructing PermissionRequestPayload exactly as before.
 public struct PermissionRequestContext: Codable, Equatable, Sendable {
+    public var turnID: TurnID?
     public var taskID: TaskID?
     public var rootTaskID: TaskID?
     public var parentTaskID: TaskID?
@@ -94,7 +95,8 @@ public struct PermissionRequestContext: Codable, Equatable, Sendable {
     /// `requires_reconciliation`; interpretation remains in AgentKernel.
     public var replayPolicy: String?
 
-    public init(taskID: TaskID? = nil,
+    public init(turnID: TurnID? = nil,
+                taskID: TaskID? = nil,
                 rootTaskID: TaskID? = nil,
                 parentTaskID: TaskID? = nil,
                 attempt: Int? = nil,
@@ -112,6 +114,7 @@ public struct PermissionRequestContext: Codable, Equatable, Sendable {
                 authorization: ResolvedToolAuthorization? = nil,
                 executionID: String? = nil,
                 replayPolicy: String? = nil) {
+        self.turnID = turnID
         self.taskID = taskID
         self.rootTaskID = rootTaskID
         self.parentTaskID = parentTaskID
@@ -133,13 +136,14 @@ public struct PermissionRequestContext: Codable, Equatable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case taskID, rootTaskID, parentTaskID, attempt, toolCallID, normalizedArgs
+        case turnID, taskID, rootTaskID, parentTaskID, attempt, toolCallID, normalizedArgs
         case touchedPaths, risksNetwork, sideEffect, intent, gate, capabilityLease
         case workspaceLease, taskContract, causalContext, authorization, executionID, replayPolicy
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        turnID = try container.decodeIfPresent(TurnID.self, forKey: .turnID)
         taskID = try container.decodeIfPresent(TaskID.self, forKey: .taskID)
         rootTaskID = try container.decodeIfPresent(TaskID.self, forKey: .rootTaskID)
         parentTaskID = try container.decodeIfPresent(TaskID.self, forKey: .parentTaskID)
@@ -162,6 +166,7 @@ public struct PermissionRequestContext: Codable, Equatable, Sendable {
 
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(turnID, forKey: .turnID)
         try container.encodeIfPresent(taskID, forKey: .taskID)
         try container.encodeIfPresent(rootTaskID, forKey: .rootTaskID)
         try container.encodeIfPresent(parentTaskID, forKey: .parentTaskID)
@@ -190,6 +195,7 @@ public struct PermissionReviewTask: Codable, Equatable, Sendable {
     public var id: PermissionReviewTaskID
     public var sessionID: SessionID
     public var requestID: RequestID
+    public var turnID: TurnID?
     public var requestingAgent: AgentID?
     public var reviewerAgent: AgentID
     public var taskID: TaskID?
@@ -217,6 +223,7 @@ public struct PermissionReviewTask: Codable, Equatable, Sendable {
     public init(id: PermissionReviewTaskID = .new(),
                 sessionID: SessionID,
                 requestID: RequestID,
+                turnID: TurnID? = nil,
                 requestingAgent: AgentID?,
                 reviewerAgent: AgentID,
                 taskID: TaskID? = nil,
@@ -243,6 +250,7 @@ public struct PermissionReviewTask: Codable, Equatable, Sendable {
         self.id = id
         self.sessionID = sessionID
         self.requestID = requestID
+        self.turnID = turnID
         self.requestingAgent = requestingAgent
         self.reviewerAgent = reviewerAgent
         self.taskID = taskID
@@ -307,6 +315,7 @@ public struct PermissionReviewUsage: Codable, Equatable, Sendable {
 public struct PermissionReviewSettledPayload: Codable, Equatable, Sendable {
     public var reviewTaskID: PermissionReviewTaskID
     public var requestID: RequestID
+    public var turnID: TurnID?
     public var requestingAgent: AgentID?
     public var reviewerAgent: AgentID
     public var reviewerModel: ModelID
@@ -324,6 +333,7 @@ public struct PermissionReviewSettledPayload: Codable, Equatable, Sendable {
 
     public init(reviewTaskID: PermissionReviewTaskID,
                 requestID: RequestID,
+                turnID: TurnID? = nil,
                 requestingAgent: AgentID?,
                 reviewerAgent: AgentID,
                 reviewerModel: ModelID,
@@ -340,6 +350,7 @@ public struct PermissionReviewSettledPayload: Codable, Equatable, Sendable {
                 settledAt: Date = Date()) {
         self.reviewTaskID = reviewTaskID
         self.requestID = requestID
+        self.turnID = turnID
         self.requestingAgent = requestingAgent
         self.reviewerAgent = reviewerAgent
         self.reviewerModel = reviewerModel

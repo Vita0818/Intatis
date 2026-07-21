@@ -208,6 +208,261 @@ final class ContextProjectionTests: XCTestCase {
         XCTAssertTrue(projectedText.contains("macOS count is in progress."))
     }
 
+    func testRootContextUsesExactSubmissionInsteadOfLaterQueuedIntent() {
+        let firstID = SubmissionID(rawValue: "submission_a")
+        let secondID = SubmissionID(rawValue: "submission_b")
+        let contract = TaskContract(
+            id: rootTaskID,
+            kind: .root,
+            issuer: nil,
+            assignee: main,
+            submissionID: firstID,
+            objective: "First request",
+            roleHint: "root",
+            expectedDeliverable: "answer")
+        let events = [
+            envelope(1, .userMessage(UserMessagePayload(
+                text: "First request",
+                to: main,
+                submissionID: firstID))),
+            envelope(2, .userMessage(UserMessagePayload(
+                text: "Later queued request must not leak",
+                to: main,
+                submissionID: secondID))),
+            envelope(3, .taskCreated(TaskCreatedPayload(contract: contract))),
+        ]
+
+        let bundle = ContextProjector().project(
+            agentID: main,
+            taskContract: contract,
+            events: events,
+            allowedToolNames: [],
+            workspaceRoot: nil)
+
+        XCTAssertEqual(bundle.globalBrief, "First request")
+        XCTAssertFalse(bundle.globalBrief.contains("Later queued request"))
+    }
+
+    func testAttachmentOnlySubmissionNeverFallsBackToLaterQueuedText() {
+        let firstID = SubmissionID(rawValue: "submission_image")
+        let secondID = SubmissionID(rawValue: "submission_later")
+        let contract = TaskContract(
+            id: rootTaskID,
+            kind: .root,
+            issuer: nil,
+            assignee: main,
+            submissionID: firstID,
+            objective: "Coordinate the cowork task.",
+            roleHint: "root",
+            expectedDeliverable: "answer")
+        let events = [
+            envelope(1, .userMessage(UserMessagePayload(
+                text: "",
+                attachments: [ArtifactID(rawValue: "art_image")],
+                to: main,
+                submissionID: firstID))),
+            envelope(2, .userMessage(UserMessagePayload(
+                text: "Later queued request must not leak",
+                to: main,
+                submissionID: secondID))),
+            envelope(3, .taskCreated(TaskCreatedPayload(contract: contract))),
+        ]
+
+        let bundle = ContextProjector().project(
+            agentID: main,
+            taskContract: contract,
+            events: events,
+            allowedToolNames: [],
+            workspaceRoot: nil)
+
+        XCTAssertTrue(bundle.globalBrief.contains("1 attachment"))
+        XCTAssertFalse(bundle.globalBrief.contains("Later queued request"))
+    }
+
+    func testSubmissionBoundContextIncludesOnlyEarlierCorrelatedOutput() {
+        let priorSubmission = SubmissionID(rawValue: "submission_prior")
+        let currentSubmission = SubmissionID(rawValue: "submission_current")
+        let laterSubmission = SubmissionID(rawValue: "submission_later")
+        let priorTask = TaskContract(
+            id: TaskID(rawValue: "task_prior"),
+            kind: .root,
+            issuer: nil,
+            assignee: main,
+            submissionID: priorSubmission,
+            objective: "Prior request",
+            roleHint: "root",
+            expectedDeliverable: "answer")
+        let currentTask = TaskContract(
+            id: TaskID(rawValue: "task_current"),
+            kind: .root,
+            issuer: nil,
+            assignee: main,
+            submissionID: currentSubmission,
+            objective: "Current request",
+            roleHint: "root",
+            expectedDeliverable: "answer")
+        let laterTask = TaskContract(
+            id: TaskID(rawValue: "task_later"),
+            kind: .root,
+            issuer: nil,
+            assignee: main,
+            submissionID: laterSubmission,
+            objective: "Later request",
+            roleHint: "root",
+            expectedDeliverable: "answer")
+
+        func prepared(_ callID: String, taskID: TaskID) -> ToolExecutionPreparedPayload {
+            ToolExecutionPreparedPayload(
+                executionID: "execution_\(callID)",
+                taskID: taskID,
+                attempt: 1,
+                toolCallID: callID,
+                agent: main,
+                tool: "read_file",
+                sideEffect: .readOnly)
+        }
+
+        let events: [Envelope] = [
+            // Even an unscoped record with a raw sequence before the current
+            // acceptance is not safe to infer into a durable submission.
+            envelope(0, .messageCompleted(MessageCompletedPayload(
+                messageId: MessageID(rawValue: "unscoped_before"),
+                role: .agent,
+                agent: main,
+                text: "UNSCOPED BEFORE MUST NOT LEAK"))),
+            envelope(1, .userMessage(UserMessagePayload(
+                text: "Prior request",
+                to: main,
+                submissionID: priorSubmission))),
+            envelope(2, .userMessage(UserMessagePayload(
+                text: "Current request",
+                to: main,
+                submissionID: currentSubmission))),
+            envelope(3, .userMessage(UserMessagePayload(
+                text: "Later request",
+                to: main,
+                submissionID: laterSubmission))),
+            envelope(4, .taskCreated(TaskCreatedPayload(contract: currentTask))),
+            envelope(5, .taskCreated(TaskCreatedPayload(contract: priorTask))),
+            envelope(6, .taskCreated(TaskCreatedPayload(contract: laterTask))),
+            // The prior output lands after both later submissions were
+            // accepted. Logical accepted order, not append order, must win.
+            envelope(7, .messageCompleted(MessageCompletedPayload(
+                messageId: MessageID(rawValue: "prior_answer"),
+                role: .agent,
+                agent: main,
+                text: "PRIOR ANSWER INCLUDED",
+                submissionID: priorSubmission))),
+            envelope(8, .messageCompleted(MessageCompletedPayload(
+                messageId: MessageID(rawValue: "current_old_attempt"),
+                role: .agent,
+                agent: main,
+                text: "CURRENT OLD ATTEMPT MUST NOT LEAK",
+                submissionID: currentSubmission))),
+            envelope(9, .messageCompleted(MessageCompletedPayload(
+                messageId: MessageID(rawValue: "later_answer"),
+                role: .agent,
+                agent: main,
+                text: "LATER ANSWER MUST NOT LEAK",
+                submissionID: laterSubmission))),
+            envelope(10, .agentToAgentMessage(AgentToAgentMessagePayload(
+                from: main,
+                to: macos,
+                content: "UNSCOPED AGENT MESSAGE MUST NOT LEAK",
+                mediated: true))),
+            envelope(11, .toolCall(ToolCallPayload(
+                toolCallId: "prior_call",
+                agent: main,
+                name: "read_file",
+                args: "PRIOR TOOL CALL INCLUDED"))),
+            envelope(12, .toolExecutionPrepared(prepared("prior_call", taskID: priorTask.id))),
+            envelope(13, .toolResult(ToolResultPayload(
+                toolCallId: "prior_call",
+                observation: "PRIOR TOOL RESULT INCLUDED"))),
+            envelope(14, .toolCall(ToolCallPayload(
+                toolCallId: "current_call",
+                agent: main,
+                name: "read_file",
+                args: "CURRENT TOOL CALL MUST NOT LEAK"))),
+            envelope(15, .toolExecutionPrepared(prepared("current_call", taskID: currentTask.id))),
+            envelope(16, .toolResult(ToolResultPayload(
+                toolCallId: "current_call",
+                observation: "CURRENT TOOL RESULT MUST NOT LEAK"))),
+            envelope(17, .toolCall(ToolCallPayload(
+                toolCallId: "later_call",
+                agent: main,
+                name: "read_file",
+                args: "LATER TOOL CALL MUST NOT LEAK"))),
+            envelope(18, .toolExecutionPrepared(prepared("later_call", taskID: laterTask.id))),
+            envelope(19, .toolResult(ToolResultPayload(
+                toolCallId: "later_call",
+                observation: "LATER TOOL RESULT MUST NOT LEAK"))),
+            envelope(20, .toolCall(ToolCallPayload(
+                toolCallId: "unscoped_call",
+                agent: main,
+                name: "read_file",
+                args: "UNSCOPED TOOL CALL MUST NOT LEAK"))),
+            envelope(21, .toolResult(ToolResultPayload(
+                toolCallId: "unscoped_call",
+                observation: "UNSCOPED TOOL RESULT MUST NOT LEAK"))),
+        ]
+
+        let bundle = ContextProjector().project(
+            agentID: main,
+            taskContract: currentTask,
+            events: events,
+            allowedToolNames: [],
+            workspaceRoot: nil)
+        let local = bundle.agentLocalEvents.map(\.content).joined(separator: "\n")
+        let direct = bundle.directMessages.map(\.content).joined(separator: "\n")
+
+        XCTAssertEqual(bundle.globalBrief, "Current request")
+        XCTAssertTrue(local.contains("PRIOR ANSWER INCLUDED"))
+        XCTAssertTrue(local.contains("PRIOR TOOL CALL INCLUDED"))
+        XCTAssertTrue(local.contains("PRIOR TOOL RESULT INCLUDED"))
+        XCTAssertFalse(local.contains("CURRENT"))
+        XCTAssertFalse(local.contains("LATER"))
+        XCTAssertFalse(local.contains("UNSCOPED"))
+        XCTAssertFalse(direct.contains("UNSCOPED"))
+    }
+
+    func testSubmissionBoundaryFailsClosedWhenAcceptedAnchorIsMissing() {
+        let submissionID = SubmissionID(rawValue: "submission_missing_anchor")
+        let contract = TaskContract(
+            id: rootTaskID,
+            kind: .root,
+            issuer: nil,
+            assignee: main,
+            submissionID: submissionID,
+            objective: "Recover current request",
+            roleHint: "root",
+            expectedDeliverable: "answer")
+        let events: [Envelope] = [
+            envelope(1, .taskCreated(TaskCreatedPayload(contract: contract))),
+            envelope(2, .messageCompleted(MessageCompletedPayload(
+                messageId: MessageID(rawValue: "same_submission_without_anchor"),
+                role: .agent,
+                agent: main,
+                text: "MUST NOT LEAK",
+                submissionID: submissionID))),
+            envelope(3, .messageCompleted(MessageCompletedPayload(
+                messageId: MessageID(rawValue: "unscoped_without_anchor"),
+                role: .agent,
+                agent: main,
+                text: "UNSCOPED MUST NOT LEAK"))),
+        ]
+
+        let bundle = ContextProjector().project(
+            agentID: main,
+            taskContract: contract,
+            events: events,
+            allowedToolNames: [],
+            workspaceRoot: nil)
+
+        XCTAssertEqual(bundle.globalBrief, "Recover current request")
+        XCTAssertTrue(bundle.agentLocalEvents.isEmpty)
+    }
+
     func testMacOSCounterProjectionMentionsSiblingWithoutIOSWorkspaceDetails() {
         let contract = macosContract()
         let bundle = ContextProjector().project(

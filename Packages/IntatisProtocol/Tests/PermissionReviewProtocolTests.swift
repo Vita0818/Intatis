@@ -92,6 +92,16 @@ final class PermissionReviewProtocolTests: XCTestCase {
         XCTAssertNil(settled.failureKind)
     }
 
+    func testLegacyProviderStillStoppingFailureKindRemainsDecodable() throws {
+        let data = Data(#""provider_still_stopping""#.utf8)
+
+        let failureKind = try JSONDecoder().decode(
+            PermissionApprovalFailureKind.self,
+            from: data)
+
+        XCTAssertEqual(failureKind, .providerStillStopping)
+    }
+
     func testResolvedToolAuthorizationRoundTripsAllPinnedFacts() throws {
         let intent = PermissionIntent(
             action: "filesystem.patch",

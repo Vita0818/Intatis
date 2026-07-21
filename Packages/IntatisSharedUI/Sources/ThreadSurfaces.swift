@@ -47,6 +47,54 @@ public struct IntatisThreadStyle {
     }
 }
 
+enum IntatisThreadStackLayoutMode: Equatable {
+    case eager
+    case lazy
+
+    static let eagerRowLimit = 4
+
+    static func resolve(visibleRowCount: Int) -> Self {
+        visibleRowCount <= eagerRowLimit ? .eager : .lazy
+    }
+}
+
+/// A small thread does not benefit from top-level row virtualization, and a
+/// single very tall row can make `LazyVStack` expose only estimated scroll
+/// ranges. Larger threads retain the production lazy layout and its measured
+/// interaction characteristics.
+public struct IntatisAdaptiveThreadStack<Content: View>: View {
+    private let visibleRowCount: Int
+    private let alignment: HorizontalAlignment
+    private let spacing: CGFloat?
+    private let content: Content
+
+    public init(
+        visibleRowCount: Int,
+        alignment: HorizontalAlignment = .center,
+        spacing: CGFloat? = nil,
+        @ViewBuilder content: () -> Content
+    ) {
+        self.visibleRowCount = visibleRowCount
+        self.alignment = alignment
+        self.spacing = spacing
+        self.content = content()
+    }
+
+    @ViewBuilder public var body: some View {
+        switch IntatisThreadStackLayoutMode.resolve(
+            visibleRowCount: visibleRowCount) {
+        case .eager:
+            VStack(alignment: alignment, spacing: spacing) {
+                content
+            }
+        case .lazy:
+            LazyVStack(alignment: alignment, spacing: spacing) {
+                content
+            }
+        }
+    }
+}
+
 // MARK: - System materials and Liquid Glass
 
 private var intatisPlatformSeparator: Color {
@@ -591,8 +639,12 @@ public struct IntatisThreadComposer: View {
                 .foregroundStyle(.primary)
                 .lineLimit(1...6)
                 .focused($focused)
-                .onSubmit(onSend)
+                .onSubmit {
+                    guard canSend else { return }
+                    onSend()
+                }
                 .disabled(isInputDisabled)
+                .accessibilityIdentifier("thread.composer.input")
 
             if let secondaryAction {
                 Button(action: secondaryAction.action) {
@@ -624,6 +676,7 @@ public struct IntatisThreadComposer: View {
         .intatisGlassButton(prominent: true)
         .disabled(!canSend)
         .accessibilityLabel("Send")
+        .accessibilityIdentifier("thread.composer.send")
     }
 
 }

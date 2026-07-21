@@ -37,8 +37,14 @@ public struct Envelope: Codable, Equatable, Sendable {
         v = try c.decode(Int.self, forKey: .v)
         let tag = try c.decode(Event.TypeTag.self, forKey: .type)
         switch tag {
+        case .sessionSettingsUpdated:
+            event = .sessionSettingsUpdated(try c.decode(SessionSettingsUpdatedPayload.self, forKey: .payload))
+        case .sessionStorageMigrated:
+            event = .sessionStorageMigrated(try c.decode(SessionStorageMigratedPayload.self, forKey: .payload))
         case .userMessage:
             event = .userMessage(try c.decode(UserMessagePayload.self, forKey: .payload))
+        case .submissionStatusChanged:
+            event = .submissionStatusChanged(try c.decode(SubmissionStatusChangedPayload.self, forKey: .payload))
         case .messageDelta:
             event = .messageDelta(try c.decode(MessageDeltaPayload.self, forKey: .payload))
         case .messageCompleted:
@@ -195,6 +201,8 @@ public struct Envelope: Codable, Equatable, Sendable {
             event = .artifactProgress(try c.decode(ArtifactProgressPayload.self, forKey: .payload))
         case .turnStats:
             event = .turnStats(try c.decode(TurnStatsPayload.self, forKey: .payload))
+        case .turnOutcome:
+            event = .turnOutcome(try c.decode(TurnOutcomePayload.self, forKey: .payload))
         }
     }
 
@@ -206,7 +214,10 @@ public struct Envelope: Codable, Equatable, Sendable {
         try c.encode(v, forKey: .v)
         try c.encode(event.type, forKey: .type)
         switch event {
+        case .sessionSettingsUpdated(let p): try c.encode(p, forKey: .payload)
+        case .sessionStorageMigrated(let p): try c.encode(p, forKey: .payload)
         case .userMessage(let p):        try c.encode(p, forKey: .payload)
+        case .submissionStatusChanged(let p): try c.encode(p, forKey: .payload)
         case .messageDelta(let p):       try c.encode(p, forKey: .payload)
         case .messageCompleted(let p):   try c.encode(p, forKey: .payload)
         case .error(let p):              try c.encode(p, forKey: .payload)
@@ -285,6 +296,7 @@ public struct Envelope: Codable, Equatable, Sendable {
         case .artifactAdded(let p):       try c.encode(p, forKey: .payload)
         case .artifactProgress(let p):    try c.encode(p, forKey: .payload)
         case .turnStats(let p):           try c.encode(p, forKey: .payload)
+        case .turnOutcome(let p):         try c.encode(p, forKey: .payload)
         }
     }
 }

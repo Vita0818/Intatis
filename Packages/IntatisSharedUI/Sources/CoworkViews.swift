@@ -445,7 +445,7 @@ public struct CoworkStatusSummary: Equatable, Sendable {
 /// the roster/inspector exposes the sub-agent activity Main schedules.
 public struct CoworkShell: View {
     private static let bottomAnchorID = "intatis-cowork-thread-bottom"
-    private let items: [CodeItem]
+    private let displayedItems: [CodeItem]
     private let agents: [CoworkAgentInfo]
     private let pending: PendingPermission?
     private let permissionNotice: PermissionResolutionNotice?
@@ -456,7 +456,8 @@ public struct CoworkShell: View {
     private let workTasks: CoworkWorkTaskSummary
     private let composerError: String?
     private let isWorking: Bool
-    private let isComposerAvailable: Bool
+    private let isAcceptingSubmission: Bool
+    private let hasDraftAttachments: Bool
     private let threadStyle: IntatisThreadStyle
     private let onShowSessions: (() -> Void)?
     private let onNewSession: (() -> Void)?
@@ -465,10 +466,11 @@ public struct CoworkShell: View {
     @Binding private var input: String
     private let onSend: () -> Void
     private let onCancelCurrent: (() -> Void)?
-    private let onResolve: (PermissionDecision) -> Void
+    private let onResolve: (PermissionResponseAction) -> Void
     private let onAddAgent: (() -> Void)?
     private let onRemoveAgent: ((String) -> Void)?
     private let onRetryTask: ((String) -> Void)?
+    private let onRetrySubmission: ((SubmissionID) -> Void)?
     private let onPauseGoal: (() -> Void)?
     private let onResumeGoal: (() -> Void)?
     private let onEditGoal: (() -> Void)?
@@ -487,7 +489,8 @@ public struct CoworkShell: View {
                 workTasks: CoworkWorkTaskSummary = CoworkWorkTaskSummary(),
                 composerError: String?,
                 isWorking: Bool,
-                isComposerAvailable: Bool = true,
+                isAcceptingSubmission: Bool = false,
+                hasDraftAttachments: Bool = false,
                 threadStyle: IntatisThreadStyle = .standard(.light),
                 splitLayout: IntatisSplitColumnLayout = .workspace,
                 onShowSessions: (() -> Void)? = nil,
@@ -497,15 +500,16 @@ public struct CoworkShell: View {
                 input: Binding<String>,
                 onSend: @escaping () -> Void,
                 onCancelCurrent: (() -> Void)? = nil,
-                onResolve: @escaping (PermissionDecision) -> Void,
+                onResolve: @escaping (PermissionResponseAction) -> Void,
                 onAddAgent: (() -> Void)? = nil,
                 onRemoveAgent: ((String) -> Void)? = nil,
                 onRetryTask: ((String) -> Void)? = nil,
+                onRetrySubmission: ((SubmissionID) -> Void)? = nil,
                 onPauseGoal: (() -> Void)? = nil,
                 onResumeGoal: (() -> Void)? = nil,
                 onEditGoal: (() -> Void)? = nil,
                 onClearGoal: (() -> Void)? = nil) {
-        self.items = items
+        self.displayedItems = IntatisExecutionTracePresentation.displayedItems(items)
         self.agents = agents
         self.pending = pending
         self.permissionNotice = permissionNotice
@@ -516,7 +520,8 @@ public struct CoworkShell: View {
         self.workTasks = workTasks
         self.composerError = composerError
         self.isWorking = isWorking
-        self.isComposerAvailable = isComposerAvailable
+        self.isAcceptingSubmission = isAcceptingSubmission
+        self.hasDraftAttachments = hasDraftAttachments
         self.threadStyle = threadStyle
         self.onShowSessions = onShowSessions
         self.onNewSession = onNewSession
@@ -529,6 +534,7 @@ public struct CoworkShell: View {
         self.onAddAgent = onAddAgent
         self.onRemoveAgent = onRemoveAgent
         self.onRetryTask = onRetryTask
+        self.onRetrySubmission = onRetrySubmission
         self.onPauseGoal = onPauseGoal
         self.onResumeGoal = onResumeGoal
         self.onEditGoal = onEditGoal
@@ -1578,16 +1584,23 @@ public struct CoworkShell: View {
     }
 
     @ViewBuilder private func thread(layout: IntatisThreadContentLayout) -> some View {
-        if items.isEmpty && !showsThinkingIndicator {
+        if displayedItems.isEmpty && !showsThinkingIndicator {
             CoworkEmptyThreadView(style: threadStyle)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .padding(.horizontal, layout.horizontalPadding)
         } else {
             ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 10) {
-                        ForEach(items) { item in
-                            CodeItemRow(item: item, style: threadStyle, layout: layout)
+                    IntatisAdaptiveThreadStack(
+                        visibleRowCount: displayedItems.count + (showsThinkingIndicator ? 1 : 0),
+                        alignment: .leading,
+                        spacing: 10) {
+                        ForEach(displayedItems) { item in
+                            CodeItemRow(
+                                item: item,
+                                style: threadStyle,
+                                layout: layout,
+                                onRetrySubmission: onRetrySubmission)
                                 .id(item.id)
                         }
                         if showsThinkingIndicator {
@@ -1596,12 +1609,13 @@ public struct CoworkShell: View {
                         }
                         Color.clear
                             .frame(height: 1)
+                            .padding(.bottom, 16)
                             .id(Self.bottomAnchorID)
                     }
                     .frame(width: layout.contentWidth)
                     .frame(maxWidth: .infinity)
                     .padding(.horizontal, layout.horizontalPadding)
-                    .padding(.vertical, 16)
+                    .padding(.top, 16)
                 }
                 .scrollContentBackground(.hidden)
                 .onAppear {
@@ -1616,15 +1630,15 @@ public struct CoworkShell: View {
 
     private var showsThinkingIndicator: Bool {
         IntatisThreadActivity.isAwaitingModelOutput(
-            items: items,
+            items: displayedItems,
             isWorking: isWorking && summary.runningCount > 0,
             permissionBlocksResponse: permissionBlocksComposer)
     }
 
     private var itemScrollSignature: String {
-        guard let last = items.last else { return "0" }
+        guard let last = displayedItems.last else { return "0" }
         return [
-            "\(items.count)",
+            "\(displayedItems.count)",
             last.id,
             "\(last.body.count)",
             "\(last.complete)",
@@ -1668,15 +1682,10 @@ public struct CoworkShell: View {
             IntatisThreadComposer(
                 placeholder: "Give Main a project task...",
                 input: $input,
-                canSend: !isWorking
-                    && isComposerAvailable
-                    && !permissionBlocksComposer
-                    && hasMainAgent
-                    && !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                isInputDisabled: isWorking
-                    || !isComposerAvailable
-                    || permissionBlocksComposer
-                    || !hasMainAgent,
+                canSend: !isAcceptingSubmission
+                    && (!input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        || hasDraftAttachments),
+                isInputDisabled: false,
                 style: threadStyle,
                 accessory: {
                     HStack(spacing: 10) {

@@ -39,6 +39,10 @@ public final class ChatViewModel: ObservableObject {
     private let log: EventLog
     private var registry: ProviderRegistry
     private var subscription: Task<Void, Never>?
+    private var runningOperation: Task<Void, Never>?
+    private var imageGenerationOperation: Task<Void, Never>?
+    private var shutdownTask: Task<Void, Never>?
+    private var isShutdown = false
 
     public init(log: EventLog, registry: ProviderRegistry) {
         self.log = log
@@ -55,7 +59,7 @@ public final class ChatViewModel: ObservableObject {
 
     /// Begin folding the log into `messages`. Call once (e.g. from `.task`).
     public func start() {
-        guard subscription == nil else { return }
+        guard !isShutdown, subscription == nil else { return }
         subscription = Task { @MainActor [weak self] in
             guard let self else { return }
             let stream = await self.log.stream(from: 0)
@@ -82,9 +86,41 @@ public final class ChatViewModel: ObservableObject {
         subscription = nil
     }
 
+    /// Permanently stops this session runtime and waits for provider-backed
+    /// work to unwind. Hiding or switching a page must not call this method;
+    /// the application-level runtime owner uses it only for deletion or quit.
+    public func shutdown(reason: String = "Chat session stopped") async {
+        if let shutdownTask {
+            await shutdownTask.value
+            return
+        }
+        isShutdown = true
+        let runningSubscription = subscription
+        subscription = nil
+        runningSubscription?.cancel()
+        let runningOperation = runningOperation
+        let imageGenerationOperation = imageGenerationOperation
+        runningOperation?.cancel()
+        imageGenerationOperation?.cancel()
+        let task = Task<Void, Never> {
+            if let runningOperation { await runningOperation.value }
+            if let imageGenerationOperation { await imageGenerationOperation.value }
+            if let runningSubscription { await runningSubscription.value }
+        }
+        shutdownTask = task
+        await task.value
+        self.runningOperation = nil
+        self.imageGenerationOperation = nil
+        isStreaming = false
+        if imageGenerationState.isRunning {
+            imageGenerationState = .idle
+        }
+        _ = reason
+    }
+
     /// Send the composed message. Streaming output arrives via the log subscription.
     public func send() {
-        guard !isBusy else { return }
+        guard !isShutdown, !isBusy else { return }
         let originalInput = input
         let parsed: ParsedUserInput
         switch GoalInputParser.parse(originalInput) {
@@ -99,7 +135,7 @@ public final class ChatViewModel: ObservableObject {
         input = ""
         isStreaming = true
         errorText = nil
-        Task { @MainActor [weak self] in
+        let operation = Task { @MainActor [weak self] in
             guard let self else { return }
             let startSeq = await self.log.replay().last?.seq ?? -1
             do {
@@ -112,7 +148,9 @@ public final class ChatViewModel: ObservableObject {
                 self.errorText = loggedError ? nil : error.localizedDescription
             }
             self.isStreaming = false
+            self.runningOperation = nil
         }
+        runningOperation = operation
     }
 
     private func hasLoggedError(after seq: Int) async -> Bool {
@@ -128,7 +166,7 @@ public final class ChatViewModel: ObservableObject {
     /// Generate an image from the current composer text (wired by the app).
     public func generateImage() {
         let prompt = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !prompt.isEmpty, !isBusy else { return }
+        guard !isShutdown, !prompt.isEmpty, !isBusy else { return }
         guard let onGenerateImage else {
             let message = "Image generation is not available."
             imageGenerationState = .failed(message)
@@ -138,7 +176,7 @@ public final class ChatViewModel: ObservableObject {
         input = ""
         errorText = nil
         imageGenerationState = .running
-        Task { @MainActor [weak self] in
+        let operation = Task { @MainActor [weak self] in
             guard let self else { return }
             do {
                 try await onGenerateImage(prompt)
@@ -151,7 +189,9 @@ public final class ChatViewModel: ObservableObject {
                     self.input = prompt
                 }
             }
+            self.imageGenerationOperation = nil
         }
+        imageGenerationOperation = operation
     }
 }
 #endif

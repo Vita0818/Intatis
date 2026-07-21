@@ -104,6 +104,126 @@ private final class ReviewScriptedProvider: ToolCallingProvider, @unchecked Send
     }
 }
 
+private actor ReviewLateProviderGate {
+    private var started = false
+    private var released = false
+    private var finished = false
+    private var startedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+    private var finishedWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func startAndWaitForRelease() async {
+        started = true
+        let waiters = startedWaiters
+        startedWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+        guard !released else { return }
+        await withCheckedContinuation { continuation in
+            releaseWaiters.append(continuation)
+        }
+    }
+
+    func waitUntilStarted() async {
+        if started { return }
+        await withCheckedContinuation { continuation in
+            startedWaiters.append(continuation)
+        }
+    }
+
+    func release() {
+        released = true
+        let waiters = releaseWaiters
+        releaseWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+    }
+
+    func markFinished() {
+        finished = true
+        let waiters = finishedWaiters
+        finishedWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+    }
+
+    func waitUntilFinished() async {
+        if finished { return }
+        await withCheckedContinuation { continuation in
+            finishedWaiters.append(continuation)
+        }
+    }
+}
+
+private final class ReviewLateAllowProvider: ToolCallingProvider, @unchecked Sendable {
+    private let lock = NSLock()
+    private let gate: ReviewLateProviderGate
+    private var calls = 0
+
+    init(gate: ReviewLateProviderGate) {
+        self.gate = gate
+    }
+
+    var callCount: Int { lock.withLock { calls } }
+
+    func stream(_ request: AgentRequest) -> AsyncThrowingStream<AgentChunk, Error> {
+        lock.withLock { calls += 1 }
+        let gate = gate
+        return AsyncThrowingStream { continuation in
+            // No onTermination hook: this deliberately models a producer that
+            // outlives consumer cancellation and emits an allow after retirement.
+            Task.detached {
+                await gate.startAndWaitForRelease()
+                continuation.yield(.textDelta(
+                    #"{"decision":"allow","reason":"late retired generation"}"#))
+                continuation.yield(.done(finishReason: "stop"))
+                continuation.finish()
+                await gate.markFinished()
+            }
+        }
+    }
+}
+
+private final class ReviewProviderFactorySequence: @unchecked Sendable {
+    private let lock = NSLock()
+    private let providers: [ToolCallingProvider]
+    private var index = 0
+
+    init(_ providers: [ToolCallingProvider]) {
+        precondition(!providers.isEmpty)
+        self.providers = providers
+    }
+
+    var callCount: Int { lock.withLock { index } }
+
+    func next() -> ToolCallingProvider {
+        lock.withLock {
+            let provider = providers[min(index, providers.count - 1)]
+            index += 1
+            return provider
+        }
+    }
+}
+
+private final class ReviewRecoveringProviderFactory: @unchecked Sendable {
+    enum Failure: Error { case unavailable }
+
+    private let lock = NSLock()
+    private let recoveredProvider: ToolCallingProvider
+    private var attempts = 0
+
+    init(recoveredProvider: ToolCallingProvider) {
+        self.recoveredProvider = recoveredProvider
+    }
+
+    var callCount: Int { lock.withLock { attempts } }
+
+    func next() throws -> ToolCallingProvider {
+        try lock.withLock {
+            attempts += 1
+            if attempts == 1 { throw Failure.unavailable }
+            return recoveredProvider
+        }
+    }
+}
+
 private struct ReviewAttachOnlyResponder: PermissionResponder {
     func requestApproval(_ request: PermissionRequestPayload) async -> PermissionDecision {
         request.tool == "agent.attach" ? .allow : .deny
@@ -283,6 +403,74 @@ private actor ReviewFailingAppender {
         default:
             _ = try await log.append(event)
         }
+    }
+}
+
+private actor ReviewPausingSettledAppender {
+    private var entered = false
+    private var released = false
+    private var enteredWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func append(_ event: Event, to log: EventLog) async throws {
+        if case .permissionReviewSettled = event {
+            entered = true
+            let waiters = enteredWaiters
+            enteredWaiters.removeAll()
+            for waiter in waiters { waiter.resume() }
+            if !released {
+                await withCheckedContinuation { continuation in
+                    releaseWaiters.append(continuation)
+                }
+            }
+        }
+        _ = try await log.append(event)
+    }
+
+    func waitUntilSettledAppendEntered() async {
+        if entered { return }
+        await withCheckedContinuation { continuation in
+            enteredWaiters.append(continuation)
+        }
+    }
+
+    func release() {
+        released = true
+        let waiters = releaseWaiters
+        releaseWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+    }
+}
+
+private final class ReviewCancellationTrigger: @unchecked Sendable {
+    private let lock = NSLock()
+    private var action: (@Sendable () -> Void)?
+
+    func install(_ action: @escaping @Sendable () -> Void) {
+        lock.withLock { self.action = action }
+    }
+
+    func cancel() {
+        let storedAction = lock.withLock { self.action }
+        storedAction?()
+    }
+}
+
+private actor ReviewCancelAfterSettledAppender {
+    private let trigger: ReviewCancellationTrigger
+    private var didCancel = false
+
+    init(trigger: ReviewCancellationTrigger) {
+        self.trigger = trigger
+    }
+
+    func append(_ event: Event, to log: EventLog) async throws {
+        _ = try await log.append(event)
+        guard case .permissionReviewSettled = event, !didCancel else { return }
+        didCancel = true
+        // Cancel only after the allow settlement is durable, but before the
+        // control plane resumes to deliver it to the shared waiters.
+        trigger.cancel()
     }
 }
 
@@ -716,6 +904,187 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
         ])
     }
 
+    func testConcurrentExactDuplicateSharesOneProviderGenerationAndTerminal() async throws {
+        let (log, workspace) = try makeLogAndWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let provider = ReviewControlPlaneProvider(delayNanoseconds: 50_000_000)
+        let responder = makeResponder(log: log, workspace: workspace, provider: provider)
+        let request = permissionRequest(id: "req_exact_duplicate_concurrent")
+
+        async let first = responder.requestResolution(request)
+        try await Task.sleep(nanoseconds: 5_000_000)
+        async let duplicate = responder.requestResolution(request)
+        let resolutions = await [first, duplicate]
+
+        XCTAssertEqual(resolutions[0], resolutions[1])
+        XCTAssertEqual(resolutions[0].decision, .allow)
+        XCTAssertNotNil(resolutions[0].reviewTaskID)
+        XCTAssertEqual(provider.callCount, 1)
+        let lifecycle = await log.replay().compactMap { envelope -> String? in
+            switch envelope.event {
+            case .permissionReviewRequested(let payload):
+                return "requested:\(payload.task.requestID.rawValue)"
+            case .permissionReviewSettled(let payload):
+                return "settled:\(payload.requestID.rawValue)"
+            default:
+                return nil
+            }
+        }
+        XCTAssertEqual(lifecycle, [
+            "requested:req_exact_duplicate_concurrent",
+            "settled:req_exact_duplicate_concurrent",
+        ])
+    }
+
+    func testCompletedExactDuplicateReturnsCachedTerminalWithoutProviderDispatch() async throws {
+        let (log, workspace) = try makeLogAndWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let provider = ReviewControlPlaneProvider()
+        let responder = makeResponder(log: log, workspace: workspace, provider: provider)
+        let request = permissionRequest(id: "req_exact_duplicate_completed")
+
+        let first = await responder.requestResolution(request)
+        let duplicate = await responder.requestResolution(request)
+
+        XCTAssertEqual(first, duplicate)
+        XCTAssertEqual(first.decision, .allow)
+        XCTAssertEqual(provider.callCount, 1)
+        let events = await log.replay()
+        XCTAssertEqual(events.filter {
+            if case .permissionRequest(let payload) = $0.event {
+                return payload.requestId == request.requestId
+            }
+            return false
+        }.count, 1)
+        XCTAssertEqual(events.filter {
+            if case .permissionReviewRequested(let payload) = $0.event {
+                return payload.task.requestID == request.requestId
+            }
+            return false
+        }.count, 1)
+        XCTAssertEqual(events.filter {
+            if case .permissionReviewSettled(let payload) = $0.event {
+                return payload.requestID == request.requestId
+            }
+            return false
+        }.count, 1)
+    }
+
+    func testConflictingPayloadForActiveRequestIDFailsClosedWithoutReplacingOwner() async throws {
+        let (log, workspace) = try makeLogAndWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let gate = ReviewLateProviderGate()
+        let provider = ReviewLateAllowProvider(gate: gate)
+        let responder = makeResponder(log: log, workspace: workspace, provider: provider)
+        let request = permissionRequest(id: "req_payload_conflict")
+        var conflictingRequest = request
+        conflictingRequest.reason = "conflicting permission payload"
+        let owner = Task { await responder.requestResolution(request) }
+        await gate.waitUntilStarted()
+
+        let conflict = await responder.requestResolution(conflictingRequest)
+
+        XCTAssertEqual(conflict.decision, .deny)
+        XCTAssertEqual(conflict.source, .automaticReviewerFailure)
+        XCTAssertEqual(conflict.reviewStatus, .failed)
+        XCTAssertEqual(conflict.failureKind, .reconciliationFailure)
+        XCTAssertEqual(provider.callCount, 1)
+        await gate.release()
+        let ownerResolution = await owner.value
+        await gate.waitUntilFinished()
+        XCTAssertEqual(ownerResolution.decision, .allow)
+        let events = await log.replay()
+        let durableRequests = events.compactMap { envelope -> PermissionRequestPayload? in
+            if case .permissionRequest(let payload) = envelope.event,
+               payload.requestId == request.requestId {
+                return payload
+            }
+            return nil
+        }
+        XCTAssertEqual(durableRequests, [request])
+        XCTAssertEqual(events.filter {
+            if case .permissionReviewSettled(let payload) = $0.event {
+                return payload.requestID == request.requestId
+            }
+            return false
+        }.count, 1)
+    }
+
+    func testCancellingDuplicateWaiterDoesNotCancelOwnerReview() async throws {
+        let (log, workspace) = try makeLogAndWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let gate = ReviewLateProviderGate()
+        let provider = ReviewLateAllowProvider(gate: gate)
+        let responder = makeResponder(log: log, workspace: workspace, provider: provider)
+        let request = permissionRequest(id: "req_duplicate_waiter_cancel")
+        let owner = Task { await responder.requestResolution(request) }
+        await gate.waitUntilStarted()
+        let duplicate = Task { await responder.requestResolution(request) }
+        try await Task.sleep(nanoseconds: 20_000_000)
+
+        duplicate.cancel()
+        try await Task.sleep(nanoseconds: 20_000_000)
+        await gate.release()
+        let duplicateResolution = await duplicate.value
+        let ownerResolution = await owner.value
+        await gate.waitUntilFinished()
+
+        XCTAssertEqual(ownerResolution.decision, .allow)
+        XCTAssertEqual(ownerResolution.reviewStatus, .allowed)
+        XCTAssertEqual(duplicateResolution.decision, .deny)
+        XCTAssertEqual(duplicateResolution.reviewStatus, .cancelled)
+        XCTAssertEqual(duplicateResolution.failureKind, .reviewerCancelled)
+        XCTAssertEqual(duplicateResolution.reviewTaskID, ownerResolution.reviewTaskID)
+        XCTAssertEqual(provider.callCount, 1)
+        let settlements = await log.replay().compactMap { envelope -> PermissionReviewSettledPayload? in
+            if case .permissionReviewSettled(let payload) = envelope.event { return payload }
+            return nil
+        }
+        XCTAssertEqual(settlements.count, 1)
+        XCTAssertEqual(settlements.first?.decision, .allow)
+    }
+
+    func testOwnerCancellationAfterDurableSettlementFailsClosedForAllSharedDeliveries() async throws {
+        let (log, workspace) = try makeLogAndWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let gate = ReviewLateProviderGate()
+        let provider = ReviewLateAllowProvider(gate: gate)
+        let trigger = ReviewCancellationTrigger()
+        let appender = ReviewCancelAfterSettledAppender(trigger: trigger)
+        let responder = makeResponder(
+            log: log,
+            workspace: workspace,
+            provider: provider,
+            eventAppender: { event in try await appender.append(event, to: log) })
+        let request = permissionRequest(id: "req_owner_cancel_shared_delivery")
+        let owner = Task { await responder.requestResolution(request) }
+        trigger.install { owner.cancel() }
+        await gate.waitUntilStarted()
+        let duplicate = Task { await responder.requestResolution(request) }
+        try await Task.sleep(nanoseconds: 20_000_000)
+
+        await gate.release()
+        let ownerResolution = await owner.value
+        let duplicateResolution = await duplicate.value
+        await gate.waitUntilFinished()
+
+        XCTAssertEqual(ownerResolution.decision, .deny)
+        XCTAssertEqual(ownerResolution.reviewStatus, .cancelled)
+        XCTAssertEqual(ownerResolution.failureKind, .reviewerCancelled)
+        XCTAssertEqual(duplicateResolution.decision, .deny)
+        XCTAssertEqual(duplicateResolution.reviewStatus, .cancelled)
+        XCTAssertEqual(duplicateResolution.failureKind, .reviewerCancelled)
+        XCTAssertEqual(duplicateResolution.reviewTaskID, ownerResolution.reviewTaskID)
+        XCTAssertEqual(provider.callCount, 1)
+        let settlements = await log.replay().compactMap { envelope -> PermissionReviewSettledPayload? in
+            if case .permissionReviewSettled(let payload) = envelope.event { return payload }
+            return nil
+        }
+        XCTAssertEqual(settlements.count, 1)
+        XCTAssertEqual(settlements.first?.decision, .allow)
+        XCTAssertEqual(settlements.first?.status, .allowed)
+    }
+
     func testAskUserIsDeniedWithoutHumanFallbackAndReviewRemainsFIFO() async throws {
         let (log, workspace) = try makeLogAndWorkspace()
         defer { try? FileManager.default.removeItem(at: workspace) }
@@ -844,14 +1213,19 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
             provider: provider,
             eventAppender: { event in try await appender.append(event, to: log) })
 
-        let resolution = await responder.requestResolution(permissionRequest(id: "req_fail_requested"))
+        let request = permissionRequest(id: "req_fail_requested")
+        let resolution = await responder.requestResolution(request)
 
         XCTAssertEqual(resolution.decision, .deny)
         XCTAssertEqual(resolution.source, .automaticReviewerFailure)
         XCTAssertEqual(resolution.failureKind, .requestPersistenceFailure)
         XCTAssertEqual(provider.callCount, 0)
         let events = await log.replay()
-        XCTAssertTrue(events.isEmpty)
+        XCTAssertEqual(events.count, 1)
+        guard case .permissionRequest(let persistedRequest) = events.first?.event else {
+            return XCTFail("the generic permission request must remain durable")
+        }
+        XCTAssertEqual(persistedRequest, request)
     }
 
     func testSettledPersistenceFailureConvertsModelAllowToDeny() async throws {
@@ -877,17 +1251,83 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
         XCTAssertFalse(events.contains { if case .permissionReview = $0.event { return true }; return false })
     }
 
-    func testTimeoutDoesNotWaitForUncooperativeProviderAndNeverFallsBack() async throws {
+    func testCancellationAfterTerminalClaimDeniesDeliveryWithoutDuplicateSettlement() async throws {
         let (log, workspace) = try makeLogAndWorkspace()
         defer { try? FileManager.default.removeItem(at: workspace) }
-        let provider = ReviewControlPlaneProvider(
-            delayNanoseconds: 500_000_000,
-            ignoresConsumerCancellation: true)
-        let fallbackProbe = ReviewFallbackProbe()
+        let provider = ReviewControlPlaneProvider()
+        let appender = ReviewPausingSettledAppender()
         let responder = makeResponder(
             log: log,
             workspace: workspace,
             provider: provider,
+            eventAppender: { event in try await appender.append(event, to: log) })
+        let requestTask = Task {
+            await responder.requestResolution(
+                permissionRequest(id: "req_cancel_after_terminal_claim"))
+        }
+        await appender.waitUntilSettledAppendEntered()
+
+        requestTask.cancel()
+        await appender.release()
+        let resolution = await requestTask.value
+
+        XCTAssertEqual(resolution.decision, .deny)
+        XCTAssertEqual(resolution.reviewStatus, .cancelled)
+        XCTAssertEqual(resolution.failureKind, .reviewerCancelled)
+        let events = await log.replay()
+        let settlements = events.compactMap { envelope -> PermissionReviewSettledPayload? in
+            if case .permissionReviewSettled(let payload) = envelope.event { return payload }
+            return nil
+        }
+        // The reviewer verdict was already terminal-claimed before caller
+        // cancellation. Delivery is denied by the separate liveness gate; no
+        // second settlement rewrites the durable verdict.
+        XCTAssertEqual(settlements.count, 1)
+        XCTAssertEqual(settlements.first?.decision, .allow)
+        XCTAssertEqual(settlements.first?.status, .allowed)
+    }
+
+    func testAlreadyCancelledCallerBeforeSubmitIsNotClassifiedAsControlPlaneShutdown() async throws {
+        let (log, workspace) = try makeLogAndWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let provider = ReviewControlPlaneProvider()
+        let responder = makeResponder(log: log, workspace: workspace, provider: provider)
+        let gate = ReviewLateProviderGate()
+        let requestTask = Task {
+            await gate.startAndWaitForRelease()
+            return await responder.requestResolution(
+                permissionRequest(id: "req_cancelled_before_submit"))
+        }
+        await gate.waitUntilStarted()
+
+        requestTask.cancel()
+        await gate.release()
+        let resolution = await requestTask.value
+
+        XCTAssertEqual(resolution.decision, .deny)
+        XCTAssertEqual(resolution.source, .callerCancellation)
+        XCTAssertEqual(resolution.reviewStatus, .cancelled)
+        XCTAssertEqual(resolution.failureKind, .callerCancelled)
+        XCTAssertFalse(resolution.reason?.contains("shutting down") == true)
+        XCTAssertEqual(provider.callCount, 0)
+        let events = await log.replay()
+        XCTAssertTrue(events.isEmpty)
+        let health = await responder.health()
+        XCTAssertEqual(health, .healthy)
+    }
+
+    func testTimeoutRetiresGenerationAndLateAllowCannotAffectFreshReview() async throws {
+        let (log, workspace) = try makeLogAndWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let lateGate = ReviewLateProviderGate()
+        let firstProvider = ReviewLateAllowProvider(gate: lateGate)
+        let secondProvider = ReviewControlPlaneProvider()
+        let providers = ReviewProviderFactorySequence([firstProvider, secondProvider])
+        let fallbackProbe = ReviewFallbackProbe()
+        let responder = makeResponder(
+            log: log,
+            workspace: workspace,
+            providerFactory: { providers.next() },
             fallback: ReviewFallbackResponder(.deny, probe: fallbackProbe),
             policy: PermissionReviewControlPlanePolicy(
                 timeoutSeconds: 0.03,
@@ -898,67 +1338,93 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
 
         let resolution = await responder.requestResolution(permissionRequest(id: "req_timeout"))
         let secondResolution = await responder.requestResolution(
-            permissionRequest(id: "req_while_timed_out_provider_stops"))
+            permissionRequest(id: "req_after_retired_generation"))
 
         XCTAssertEqual(resolution.decision, .deny)
         XCTAssertEqual(resolution.reviewStatus, .timedOut)
         XCTAssertEqual(resolution.failureKind, .reviewerTimedOut)
-        XCTAssertEqual(secondResolution.decision, .deny)
-        XCTAssertEqual(secondResolution.failureKind, .providerStillStopping)
+        XCTAssertEqual(secondResolution.decision, .allow)
+        XCTAssertEqual(secondResolution.reviewStatus, .allowed)
+        XCTAssertNil(secondResolution.failureKind)
+        XCTAssertNotEqual(resolution.reviewTaskID, secondResolution.reviewTaskID)
         XCTAssertLessThan(Date().timeIntervalSince(start), 0.25)
         let fallbackRequestCount = await fallbackProbe.requests.count
         XCTAssertEqual(fallbackRequestCount, 0)
-        XCTAssertEqual(provider.callCount, 1)
-        guard case .degraded(let reason) = await responder.health() else {
-            return XCTFail("timed-out reviewer must remain visibly degraded")
-        }
-        XCTAssertTrue(reason.contains("quarantined"))
-        let settled = await log.replay().compactMap { envelope -> PermissionReviewSettledPayload? in
+        XCTAssertEqual(providers.callCount, 2)
+        XCTAssertEqual(firstProvider.callCount, 1)
+        XCTAssertEqual(secondProvider.callCount, 1)
+        let recoveredHealth = await responder.health()
+        XCTAssertEqual(recoveredHealth, .healthy)
+        let settledBeforeLateOutput = await log.replay().compactMap { envelope -> PermissionReviewSettledPayload? in
             if case .permissionReviewSettled(let payload) = envelope.event { return payload }
             return nil
         }
-        XCTAssertEqual(settled.map(\.status), [.timedOut, .failed])
-        XCTAssertTrue(settled.allSatisfy { $0.decision == .deny })
+        XCTAssertEqual(
+            settledBeforeLateOutput.map { "\($0.requestID.rawValue):\($0.status.rawValue):\($0.decision.rawValue)" },
+            ["req_timeout:timed_out:deny", "req_after_retired_generation:allowed:allow"])
+
+        await lateGate.release()
+        await lateGate.waitUntilFinished()
+        let settledAfterLateOutput = await log.replay().compactMap { envelope -> PermissionReviewSettledPayload? in
+            if case .permissionReviewSettled(let payload) = envelope.event { return payload }
+            return nil
+        }
+        XCTAssertEqual(settledAfterLateOutput, settledBeforeLateOutput)
     }
 
-    func testCancellationSettlesDenyAndDoesNotWaitForProvider() async throws {
+    func testCancellationRetiresGenerationAndNextReviewUsesFreshProvider() async throws {
         let (log, workspace) = try makeLogAndWorkspace()
         defer { try? FileManager.default.removeItem(at: workspace) }
-        let provider = ReviewControlPlaneProvider(delayNanoseconds: 500_000_000)
-        let responder = makeResponder(log: log, workspace: workspace, provider: provider)
+        let lateGate = ReviewLateProviderGate()
+        let firstProvider = ReviewLateAllowProvider(gate: lateGate)
+        let secondProvider = ReviewControlPlaneProvider()
+        let providers = ReviewProviderFactorySequence([firstProvider, secondProvider])
+        let responder = makeResponder(
+            log: log,
+            workspace: workspace,
+            providerFactory: { providers.next() })
         let task = Task {
             await responder.requestResolution(permissionRequest(id: "req_cancel"))
         }
-        for _ in 0..<100 where provider.callCount == 0 {
-            try await Task.sleep(nanoseconds: 1_000_000)
-        }
+        await lateGate.waitUntilStarted()
         let start = Date()
 
         task.cancel()
         let resolution = await task.value
+        let secondResolution = await responder.requestResolution(
+            permissionRequest(id: "req_after_cancelled_generation"))
 
         XCTAssertEqual(resolution.decision, .deny)
         XCTAssertEqual(resolution.reviewStatus, .cancelled)
         XCTAssertEqual(resolution.failureKind, .reviewerCancelled)
+        XCTAssertEqual(secondResolution.decision, .allow)
+        XCTAssertEqual(secondResolution.reviewStatus, .allowed)
+        XCTAssertNil(secondResolution.failureKind)
         XCTAssertLessThan(Date().timeIntervalSince(start), 0.25)
-        guard case .degraded(let reason) = await responder.health() else {
-            return XCTFail("cancelled reviewer must remain visibly degraded")
-        }
-        XCTAssertTrue(reason.contains("quarantined"))
-        let settled = await log.replay().compactMap { envelope -> PermissionReviewSettledPayload? in
+        XCTAssertEqual(providers.callCount, 2)
+        let recoveredHealth = await responder.health()
+        XCTAssertEqual(recoveredHealth, .healthy)
+        let settledBeforeLateOutput = await log.replay().compactMap { envelope -> PermissionReviewSettledPayload? in
             if case .permissionReviewSettled(let payload) = envelope.event { return payload }
             return nil
         }
-        XCTAssertEqual(settled.last?.status, .cancelled)
-        XCTAssertEqual(settled.last?.decision, .deny)
+        XCTAssertEqual(settledBeforeLateOutput.map(\.status), [.cancelled, .allowed])
+        XCTAssertEqual(settledBeforeLateOutput.map(\.decision), [.deny, .allow])
+
+        await lateGate.release()
+        await lateGate.waitUntilFinished()
+        let settledAfterLateOutput = await log.replay().compactMap { envelope -> PermissionReviewSettledPayload? in
+            if case .permissionReviewSettled(let payload) = envelope.event { return payload }
+            return nil
+        }
+        XCTAssertEqual(settledAfterLateOutput, settledBeforeLateOutput)
     }
 
-    func testTimedOutProviderQuarantineSurvivesControlPlaneReplacementForSession() async throws {
+    func testReplacementControlPlaneDoesNotInheritRetiredProviderGeneration() async throws {
         let (log, workspace) = try makeLogAndWorkspace()
         defer { try? FileManager.default.removeItem(at: workspace) }
-        let firstProvider = ReviewControlPlaneProvider(
-            delayNanoseconds: 500_000_000,
-            ignoresConsumerCancellation: true)
+        let lateGate = ReviewLateProviderGate()
+        let firstProvider = ReviewLateAllowProvider(gate: lateGate)
         let firstResponder = makeResponder(
             log: log,
             workspace: workspace,
@@ -982,20 +1448,61 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
             workspace: workspace,
             provider: replacementProvider,
             fallback: ReviewFallbackResponder(.deny, probe: fallbackProbe))
-        guard case .degraded(let initialReason) = await replacement.health() else {
-            return XCTFail("replacement control plane must start in the inherited session quarantine")
-        }
-        XCTAssertTrue(initialReason.contains("restart Intatis"))
+        let initialReplacementHealth = await replacement.health()
+        XCTAssertEqual(initialReplacementHealth, .healthy)
         let replacementDecision = await replacement.requestApproval(
             permissionRequest(id: "req_after_replacement"))
-        XCTAssertEqual(replacementDecision, .deny)
-        XCTAssertEqual(replacementProvider.callCount, 0)
+        XCTAssertEqual(replacementDecision, .allow)
+        XCTAssertEqual(replacementProvider.callCount, 1)
         let fallbackRequestCount = await fallbackProbe.requests.count
         XCTAssertEqual(fallbackRequestCount, 0)
-        guard case .degraded(let reason) = await replacement.health() else {
-            return XCTFail("replacement control plane must inherit the session quarantine")
+        let replacementHealth = await replacement.health()
+        XCTAssertEqual(replacementHealth, .healthy)
+        let settledBeforeLateOutput = await log.replay().compactMap { envelope -> PermissionReviewSettledPayload? in
+            if case .permissionReviewSettled(let payload) = envelope.event { return payload }
+            return nil
         }
-        XCTAssertTrue(reason.contains("restart Intatis"))
+        XCTAssertEqual(settledBeforeLateOutput.map(\.status), [.timedOut, .allowed])
+
+        await lateGate.release()
+        await lateGate.waitUntilFinished()
+        let settledAfterLateOutput = await log.replay().compactMap { envelope -> PermissionReviewSettledPayload? in
+            if case .permissionReviewSettled(let payload) = envelope.event { return payload }
+            return nil
+        }
+        XCTAssertEqual(settledAfterLateOutput, settledBeforeLateOutput)
+    }
+
+    func testProviderFactoryFailureDeniesOnlyCurrentReviewAndNextGenerationRecovers() async throws {
+        let (log, workspace) = try makeLogAndWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let recoveredProvider = ReviewControlPlaneProvider()
+        let factory = ReviewRecoveringProviderFactory(
+            recoveredProvider: recoveredProvider)
+        let responder = makeResponder(
+            log: log,
+            workspace: workspace,
+            providerFactory: { try factory.next() })
+
+        let failed = await responder.requestResolution(
+            permissionRequest(id: "req_factory_unavailable"))
+        let recovered = await responder.requestResolution(
+            permissionRequest(id: "req_factory_recovered"))
+
+        XCTAssertEqual(failed.decision, .deny)
+        XCTAssertEqual(failed.reviewStatus, .failed)
+        XCTAssertEqual(failed.failureKind, .providerFailure)
+        XCTAssertEqual(recovered.decision, .allow)
+        XCTAssertEqual(recovered.reviewStatus, .allowed)
+        XCTAssertNil(recovered.failureKind)
+        XCTAssertEqual(factory.callCount, 2)
+        XCTAssertEqual(recoveredProvider.callCount, 1)
+        let settlements = await log.replay().compactMap { envelope -> PermissionReviewSettledPayload? in
+            if case .permissionReviewSettled(let payload) = envelope.event { return payload }
+            return nil
+        }
+        XCTAssertEqual(settlements.map(\.status), [.failed, .allowed])
+        XCTAssertEqual(settlements.map(\.decision), [.deny, .allow])
     }
 
     func testHardDenyAndSelfReviewNeverReachProvider() async throws {
@@ -1257,6 +1764,27 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
                                 reservedCompletionTokens: 64,
                                 maxRecentEvents: 12),
                                eventAppender: PermissionReviewEventAppender? = nil) -> AgentPermissionResponder {
+        makeResponder(
+            log: log,
+            workspace: workspace,
+            providerFactory: { provider },
+            fallback: fallback,
+            policy: policy,
+            eventAppender: eventAppender)
+    }
+
+    private func makeResponder(
+        log: EventLog,
+        workspace: URL,
+        providerFactory: @escaping PermissionReviewProviderFactory,
+        fallback: PermissionResponder = ReviewFallbackResponder(.deny),
+        policy: PermissionReviewControlPlanePolicy = PermissionReviewControlPlanePolicy(
+            timeoutSeconds: 1,
+            tokenBudget: 100_000,
+            reservedCompletionTokens: 64,
+            maxRecentEvents: 12),
+        eventAppender: PermissionReviewEventAppender? = nil
+    ) -> AgentPermissionResponder {
         AgentPermissionResponder(
             log: log,
             reviewerAgent: Agent(
@@ -1265,7 +1793,7 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
                 model: ModelID(rawValue: "reviewer-model"),
                 profile: .readOnly,
                 coordinationDepth: 0),
-            provider: provider,
+            providerFactory: providerFactory,
             fallback: fallback,
             policy: policy,
             eventAppender: eventAppender)

@@ -51,6 +51,14 @@ private struct URLLeakingProvider: ChatProvider {
     }
 }
 
+private struct SelfCancellingChatProvider: ChatProvider {
+    func stream(_ request: ChatRequest) -> AsyncThrowingStream<ChatChunk, Error> {
+        AsyncThrowingStream { continuation in
+            continuation.finish(throwing: CancellationError())
+        }
+    }
+}
+
 final class IntatisConversationTests: XCTestCase {
 
     private func tmpFile() -> URL {
@@ -123,6 +131,56 @@ final class IntatisConversationTests: XCTestCase {
         XCTAssertEqual(all.map { $0.seq }, [0, 1])
         let next = try await reloaded.append(.userMessage(.init(text: "c")))
         XCTAssertEqual(next.seq, 2)
+    }
+
+    func testAppendReturnsAndPublishesCanonicalPersistedEnvelopes() async throws {
+        let url = tmpFile()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let session = SessionID(rawValue: "cowork_canonical_append")
+        let log = try EventLog(session: session, fileURL: url)
+        let stream = await log.stream(from: 0)
+        var iterator = stream.makeAsyncIterator()
+        let timestamp = Date(timeIntervalSince1970: 1_234_567_890.987_654)
+        let settings = CoworkSessionSettings(
+            sessionID: session,
+            defaultProviderID: "provider-must-remain-decode-only",
+            defaultModelID: "model",
+            workspaces: [])
+        let update = SessionSettingsUpdatedPayload(
+            revision: 7,
+            previousRevision: 6,
+            changeKind: .updated,
+            kind: .cowork,
+            cowork: settings)
+        let marker = SessionStorageMigratedPayload(
+            migrationID: "canonical-envelope-test",
+            source: .legacySessionMetadata,
+            settingsRevision: 7)
+
+        let appended = try await log.append([
+            .sessionSettingsUpdated(update),
+            .sessionStorageMigrated(marker),
+        ], ts: timestamp)
+        let streamed = [await iterator.next(), await iterator.next()].compactMap { $0 }
+        let replayed = try await log.replayChecked()
+        let persisted = try Data(contentsOf: url)
+            .split(separator: 0x0A)
+            .map { try Envelope.makeDecoder().decode(Envelope.self, from: Data($0)) }
+
+        XCTAssertEqual(appended, persisted)
+        XCTAssertEqual(streamed, persisted)
+        XCTAssertEqual(replayed, persisted)
+        XCTAssertEqual(appended.map(\.ts), [persisted[0].ts, persisted[1].ts])
+        guard case .sessionSettingsUpdated(let canonicalUpdate) = appended[0].event else {
+            return XCTFail("the first canonical event must remain a settings update")
+        }
+        XCTAssertEqual(canonicalUpdate.revision, 7)
+        XCTAssertEqual(canonicalUpdate.previousRevision, 6)
+        XCTAssertNil(canonicalUpdate.cowork?.defaultProviderID)
+        guard case .sessionStorageMigrated(let canonicalMarker) = appended[1].event else {
+            return XCTFail("the second canonical event must remain a migration marker")
+        }
+        XCTAssertEqual(canonicalMarker.settingsRevision, 7)
     }
 
     func testConcurrentEventLogInstancesAssignUniqueMonotonicSequences() async throws {
@@ -620,6 +678,12 @@ final class IntatisConversationTests: XCTestCase {
         XCTAssertEqual(projection.messages[1].role, .assistant)
         XCTAssertEqual(projection.messages[1].text, "Hello")
         XCTAssertTrue(projection.messages[1].isComplete)
+        let outcomes = await log.replay().compactMap { envelope -> TurnOutcomePayload? in
+            guard case .turnOutcome(let payload) = envelope.event else { return nil }
+            return payload
+        }
+        XCTAssertEqual(outcomes.count, 1)
+        XCTAssertEqual(outcomes.first?.outcome, .completed)
     }
 
     func testChatLoopPreservesPartialTextWhenStreamEndsWithoutCompletionMarker() async throws {
@@ -646,6 +710,46 @@ final class IntatisConversationTests: XCTestCase {
         XCTAssertEqual(projection.messages[1].recoveryAdvice?.title, "Response stopped before completion")
         XCTAssertEqual(projection.messages[2].role, .system)
         XCTAssertEqual(projection.messages[2].recoveryAdvice?.title, "Check endpoint compatibility")
+        let outcomes = await log.replay().compactMap { envelope -> TurnOutcomePayload? in
+            guard case .turnOutcome(let payload) = envelope.event else { return nil }
+            return payload
+        }
+        XCTAssertEqual(outcomes.count, 1)
+        XCTAssertEqual(outcomes.first?.outcome, .failed)
+        XCTAssertEqual(outcomes.first?.failureSource, .runtimeFailed)
+    }
+
+    func testChatProviderSelfCancellationIsRuntimeFailureNotTurnCancellation() async throws {
+        let url = tmpFile()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let log = try EventLog(
+            session: SessionID(rawValue: "sess_provider_self_cancel"),
+            fileURL: url)
+        let loop = ChatLoop(
+            log: log,
+            provider: SelfCancellingChatProvider(),
+            model: ModelID(rawValue: "m"))
+
+        do {
+            try await loop.send("hi")
+            XCTFail("expected provider cancellation")
+        } catch is CancellationError {
+            // A provider-originated CancellationError is still a runtime
+            // failure because this caller task was never cancelled.
+        }
+
+        let replayed = await log.replay()
+        let outcomes = replayed.compactMap { envelope -> TurnOutcomePayload? in
+            guard case .turnOutcome(let payload) = envelope.event else { return nil }
+            return payload
+        }
+        XCTAssertEqual(outcomes.count, 1)
+        XCTAssertEqual(outcomes.first?.outcome, .failed)
+        XCTAssertEqual(outcomes.first?.failureSource, .runtimeFailed)
+        XCTAssertTrue(replayed.contains { envelope in
+            guard case .error(let payload) = envelope.event else { return false }
+            return payload.code == "runtime_failed"
+        })
     }
 
     func testChatLoopEventLogRedactsURLFromUnformattedProviderError() async throws {

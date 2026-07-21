@@ -13,6 +13,7 @@ final class TaskContractTests: XCTestCase {
             issuer: AgentID(rawValue: "main"),
             assignee: AgentID(rawValue: "macos-counter"),
             parentTaskID: TaskID(rawValue: "task_root"),
+            submissionID: SubmissionID(rawValue: "sub_root_request"),
             objective: "Recursively count macOS Swift files.",
             roleHint: "macOS Swift file counter",
             expectedDeliverable: "File count and path list.",
@@ -32,6 +33,7 @@ final class TaskContractTests: XCTestCase {
         XCTAssertEqual(decoded, contract)
         XCTAssertEqual(decoded.workspaceLeaseID, WorkspaceLeaseID(rawValue: "wlease_macos"))
         XCTAssertEqual(decoded.capabilityLeaseID, CapabilityLeaseID(rawValue: "clease_macos"))
+        XCTAssertEqual(decoded.submissionID, SubmissionID(rawValue: "sub_root_request"))
         XCTAssertEqual(decoded.replyMode, .taskReport)
         XCTAssertEqual(decoded.executionTimeoutSeconds, 45)
         XCTAssertEqual(decoded.maxAttempts, 3)
@@ -65,6 +67,7 @@ final class TaskContractTests: XCTestCase {
         XCTAssertNil(decoded.replyMode)
         XCTAssertNil(decoded.executionTimeoutSeconds)
         XCTAssertNil(decoded.maxAttempts)
+        XCTAssertNil(decoded.submissionID)
     }
 
     func testAgentAdmissionTaskKindRoundTrips() throws {

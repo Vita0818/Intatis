@@ -2,59 +2,17 @@
 import SwiftUI
 import Foundation
 import IntatisCore
+import IntatisConversation
+import IntatisCowork
 import IntatisPermission
 import IntatisProtocol
 import IntatisProviders
 import IntatisSharedUI
 
-struct CoworkProjectWorkspace: Identifiable, Codable, Equatable {
-    var path: String
-    var agentName: String?
-    var isPrimary: Bool
-    var addedAt: Date
+typealias CoworkProjectWorkspace = CoworkSessionWorkspace
+typealias CoworkProjectSettings = CoworkSessionSettings
 
-    var id: String { path }
-
-    init(path: String,
-         agentName: String? = nil,
-         isPrimary: Bool = false,
-         addedAt: Date = Date()) {
-        self.path = path
-        self.agentName = agentName
-        self.isPrimary = isPrimary
-        self.addedAt = addedAt
-    }
-}
-
-struct CoworkProjectSettings: Codable, Equatable {
-    var sessionID: SessionID
-    var mainAgentName: String
-    var defaultProviderID: String?
-    var defaultModelID: String?
-    /// Exact, secret-free default used only when creating future agents. The
-    /// legacy provider/model fields remain additive compatibility mirrors.
-    var defaultInferenceProfileBinding: AgentInferenceBinding?
-    var defaultPermissionProfile: String
-    var tokenBudget: Int?
-    var workspaces: [CoworkProjectWorkspace]
-
-    init(sessionID: SessionID,
-         mainAgentName: String = "main",
-         defaultProviderID: String? = nil,
-         defaultModelID: String? = nil,
-         defaultInferenceProfileBinding: AgentInferenceBinding? = nil,
-         defaultPermissionProfile: String = PermissionProfile.reviewed.rawValue,
-         tokenBudget: Int? = nil,
-         workspaces: [CoworkProjectWorkspace] = []) {
-        self.sessionID = sessionID
-        self.mainAgentName = mainAgentName
-        self.defaultProviderID = defaultProviderID
-        self.defaultModelID = defaultModelID
-        self.defaultInferenceProfileBinding = defaultInferenceProfileBinding
-        self.defaultPermissionProfile = defaultPermissionProfile
-        self.tokenBudget = tokenBudget
-        self.workspaces = workspaces
-    }
+extension CoworkSessionSettings {
 
     static func fresh(sessionID: SessionID,
                       primaryWorkspace: URL,
@@ -106,8 +64,18 @@ struct CoworkProjectSettings: Codable, Equatable {
                 workspaces[index].isPrimary = false
             }
         }
-        if let index = workspaces.firstIndex(where: { $0.path == normalizedPath }) {
-            workspaces[index].agentName = agentName ?? workspaces[index].agentName
+        if let index = workspaces.firstIndex(where: {
+            Self.storedWorkspacePath($0.path) == normalizedPath
+        }) {
+            workspaces[index].path = normalizedPath
+            // One path can be used by a project entry and any number of
+            // agents. `agentName` is therefore an optional *exclusive* owner,
+            // not a last-writer-wins roster projection. Once a second owner
+            // (or a project-level entry) references the same path, retain the
+            // path as shared metadata instead of attributing it to one agent.
+            workspaces[index].agentName = Self.mergedWorkspaceOwner(
+                workspaces[index].agentName,
+                agentName)
             workspaces[index].isPrimary = isPrimary || workspaces[index].isPrimary
             return
         }
@@ -122,40 +90,293 @@ struct CoworkProjectSettings: Codable, Equatable {
         workspaces.removeAll { $0.path == normalizedPath }
     }
 
-    mutating func removeWorkspaces(forAgent agentName: String) {
-        workspaces.removeAll { $0.agentName == agentName && !$0.isPrimary }
+    mutating func removeWorkspaces(
+        forAgent agentName: String,
+        retainingPaths: Set<String> = []
+    ) {
+        let normalizedRetainingPaths = Set(retainingPaths.map(Self.storedWorkspacePath))
+        workspaces = workspaces.compactMap { workspace in
+            guard workspace.agentName == agentName else { return workspace }
+            let path = Self.storedWorkspacePath(workspace.path)
+            if workspace.isPrimary || normalizedRetainingPaths.contains(path) {
+                var shared = workspace
+                shared.agentName = nil
+                return shared
+            }
+            return nil
+        }
+    }
+
+    /// Replaces only aliases whose canonical identity was already proven while
+    /// their security scope was active. Collisions are merged as shared project
+    /// metadata rather than assigning the path to whichever record was last.
+    mutating func applyValidatedWorkspacePathMappings(_ mappings: [String: String]) {
+        guard !mappings.isEmpty else { return }
+        var merged: [CoworkProjectWorkspace] = []
+        for workspace in workspaces {
+            var canonical = workspace
+            let key = Self.storedWorkspacePath(workspace.path)
+            canonical.path = mappings[key].map(Self.storedWorkspacePath) ?? key
+            if let index = merged.firstIndex(where: { $0.path == canonical.path }) {
+                merged[index].agentName = Self.mergedWorkspaceOwner(
+                    merged[index].agentName,
+                    canonical.agentName)
+                merged[index].isPrimary = merged[index].isPrimary || canonical.isPrimary
+                merged[index].addedAt = min(merged[index].addedAt, canonical.addedAt)
+            } else {
+                merged.append(canonical)
+            }
+        }
+        workspaces = merged
+    }
+
+    private static func mergedWorkspaceOwner(_ existing: String?, _ incoming: String?) -> String? {
+        guard let existing, let incoming, existing == incoming else { return nil }
+        return existing
+    }
+
+    private static func storedWorkspacePath(_ path: String) -> String {
+        URL(fileURLWithPath: path).standardizedFileURL.path
     }
 }
 
 enum CoworkProjectSettingsStore {
-    static func load(sessionID: SessionID,
-                     catalog: AppProviderCatalog,
-                     inferenceCatalogSnapshot: InferenceCatalogSnapshot? = nil) -> CoworkProjectSettings {
+    struct LoadResult {
+        var settings: CoworkProjectSettings
+        var warning: String?
+        /// True only after the exact legacy inference binding has been written
+        /// to EventLog and the matching migration marker was read back. This
+        /// prevents workspace-bookmark migration from deleting unresolved
+        /// provider/model evidence.
+        var legacySettingsCleanupEligible: Bool
+    }
+
+    static func loadAndMigrate(
+        sessionID: SessionID,
+        log: EventLog,
+        inferenceCatalogSnapshot: InferenceCatalogSnapshot? = nil
+    ) async -> LoadResult {
+        let document: SessionProjectionDocument
+        do {
+            // Capture and durably migrate a projection-only legacy name before
+            // any schema-v2 rebuild can replace the old session.json. This is
+            // the Cowork equivalent of the Chat/Code startup migration path.
+            document = try await SessionProjectionStore.migrateLegacyDisplayName(
+                in: log,
+                kind: .cowork)
+        } catch {
+            let fallback: CoworkProjectSettings
+            let legacyWarning: String?
+            do {
+                fallback = try legacySettings(
+                    sessionID: sessionID,
+                    inferenceCatalogSnapshot: inferenceCatalogSnapshot)
+                    ?? recoveredSettings(sessionID: sessionID, document: nil)
+                legacyWarning = nil
+            } catch {
+                fallback = recoveredSettings(sessionID: sessionID, document: nil)
+                legacyWarning = " Legacy settings were retained but could not be decoded safely: \(error.localizedDescription)"
+            }
+            return LoadResult(
+                settings: fallback,
+                warning: "Session settings projection could not be rebuilt: \(error.localizedDescription)\(legacyWarning ?? "")",
+                legacySettingsCleanupEligible: false)
+        }
+        if let canonical = document.coworkSettings {
+            let hasVerifiedLegacyMigration = document.completedMigrations.contains {
+                $0.migrationID == SessionProjectionStore.legacyCoworkSettingsMigrationID
+            }
+            return LoadResult(
+                settings: normalized(
+                    canonical,
+                    sessionID: sessionID,
+                    inferenceCatalogSnapshot: inferenceCatalogSnapshot),
+                warning: nil,
+                legacySettingsCleanupEligible:
+                    hasVerifiedLegacyMigration
+                    && canonical.defaultInferenceProfileBinding != nil)
+        }
+
+        let legacy: CoworkProjectSettings?
+        do {
+            legacy = try legacySettings(
+                sessionID: sessionID,
+                inferenceCatalogSnapshot: inferenceCatalogSnapshot)
+        } catch {
+            // A present-but-invalid legacy value is not equivalent to absence.
+            // Keep it untouched and do not manufacture canonical state from a
+            // current global selection.
+            return LoadResult(
+                settings: recoveredSettings(sessionID: sessionID, document: document),
+                warning: "Legacy session settings could not be migrated safely and were retained: \(error.localizedDescription)",
+                legacySettingsCleanupEligible: false)
+        }
+        let settings = legacy
+            ?? recoveredSettings(sessionID: sessionID, document: document)
+        if legacy != nil, settings.defaultInferenceProfileBinding == nil {
+            return LoadResult(
+                settings: settings,
+                warning: "Legacy session settings were retained because their provider/model cannot be resolved to an exact inference profile yet.",
+                legacySettingsCleanupEligible: false)
+        }
+        do {
+            let migrated: SessionProjectionDocument
+            if legacy != nil {
+                migrated = try await SessionProjectionStore.migrateLegacyCoworkSettings(
+                    in: log,
+                    settings: settings,
+                    displayName: document.displayName)
+            } else {
+                migrated = try await SessionProjectionStore.updateSettings(
+                    in: log,
+                    kind: .cowork,
+                    coworkSettings: settings,
+                    displayName: document.displayName,
+                    changeKind: .migrated)
+            }
+            guard let canonical = migrated.coworkSettings else {
+                return LoadResult(
+                    settings: settings,
+                    warning: "Session settings migration did not produce a canonical snapshot.",
+                    legacySettingsCleanupEligible: false)
+            }
+            return LoadResult(
+                settings: canonical,
+                warning: nil,
+                legacySettingsCleanupEligible:
+                    legacy != nil
+                    && canonical.defaultInferenceProfileBinding != nil
+                    && migrated.completedMigrations.contains {
+                        $0.migrationID == SessionProjectionStore.legacyCoworkSettingsMigrationID
+                    })
+        } catch {
+            // Compatibility fallback is intentional: the old key remains and
+            // the next open can retry the same idempotent migration.
+            return LoadResult(
+                settings: settings,
+                warning: "Legacy session settings are in use because migration failed: \(error.localizedDescription)",
+                legacySettingsCleanupEligible: false)
+        }
+    }
+
+    static func primaryWorkspacePath(sessionID: SessionID) -> String? {
+        let projectionURL = AppConfig.appSupportDir()
+            .appendingPathComponent(sessionID.rawValue, isDirectory: true)
+            .appendingPathComponent(SessionProjectionStore.fileName)
+        if let document = try? SessionProjectionStore.load(
+            from: projectionURL,
+            expectedSession: sessionID),
+           let path = document.coworkSettings?.primaryWorkspace?.path {
+            return path
+        }
+        if let data = UserDefaults.standard.data(forKey: key(sessionID)),
+           let decoded = try? decoder.decode(CoworkProjectSettings.self, from: data) {
+            return decoded.primaryWorkspace?.path ?? WorkspaceAccess.workspacePath(for: sessionID)
+        }
+        return WorkspaceAccess.workspacePath(for: sessionID)
+    }
+
+    static func remove(sessionID: SessionID) {
+        UserDefaults.standard.removeObject(forKey: key(sessionID))
+    }
+
+    /// Returns only the concrete workspace paths that a validated legacy
+    /// settings record assigned to this session. Callers may use this set to
+    /// authorize a one-time lookup in the old process-global bookmark map;
+    /// the mere presence of any legacy record is deliberately insufficient.
+    static func legacyOwnedWorkspacePaths(sessionID: SessionID) -> Set<String> {
         guard let data = UserDefaults.standard.data(forKey: key(sessionID)),
               let decoded = try? decoder.decode(CoworkProjectSettings.self, from: data) else {
-            return CoworkProjectSettings.restored(
-                sessionID: sessionID,
-                catalog: catalog,
-                inferenceCatalogSnapshot: inferenceCatalogSnapshot)
+            return []
         }
-        var settings = decoded
+        guard decoded.sessionID == sessionID,
+              decoded.schemaVersion <= CoworkSessionSettings.currentSchemaVersion,
+              decoded.workspaces.allSatisfy({ NSString(string: $0.path).isAbsolutePath }) else {
+            return []
+        }
+        return Set(decoded.workspaces.map {
+            URL(fileURLWithPath: $0.path).standardizedFileURL.path
+        })
+    }
+
+    static func clearLegacyStorage(sessionID: SessionID) {
+        UserDefaults.standard.removeObject(forKey: key(sessionID))
+    }
+
+    private static func key(_ sessionID: SessionID) -> String {
+        "intatis.cowork.projectSettings.\(sessionID.rawValue)"
+    }
+
+    private static func legacySettings(
+        sessionID: SessionID,
+        inferenceCatalogSnapshot: InferenceCatalogSnapshot?
+    ) throws -> CoworkProjectSettings? {
+        guard let data = UserDefaults.standard.data(forKey: key(sessionID)) else {
+            return nil
+        }
+        let decoded = try decoder.decode(CoworkProjectSettings.self, from: data)
+        guard decoded.sessionID == sessionID else {
+            throw IntatisError.config("Legacy Cowork settings belong to another session.")
+        }
+        guard decoded.schemaVersion <= CoworkSessionSettings.currentSchemaVersion else {
+            throw IntatisError.config("Legacy Cowork settings use a newer unsupported schema.")
+        }
+        guard decoded.workspaces.allSatisfy({ NSString(string: $0.path).isAbsolutePath }) else {
+            throw IntatisError.config("Legacy Cowork settings contain a non-absolute workspace path.")
+        }
+        return normalized(
+            decoded,
+            sessionID: sessionID,
+            inferenceCatalogSnapshot: inferenceCatalogSnapshot)
+    }
+
+    private static func recoveredSettings(
+        sessionID: SessionID,
+        document: SessionProjectionDocument?
+    ) -> CoworkProjectSettings {
+        let main = document?.agentRegistrations.first(where: {
+            $0.agent == Orchestrator.mainAgentID
+        })
+        let registrations = (document?.agentRegistrations ?? [])
+            .filter { $0.agent != Orchestrator.automaticPermissionReviewerID }
+            .sorted { lhs, rhs in
+                if lhs.agent == Orchestrator.mainAgentID { return true }
+                if rhs.agent == Orchestrator.mainAgentID { return false }
+                return lhs.agent.rawValue < rhs.agent.rawValue
+            }
+        var seenPaths: Set<String> = []
+        let workspaces = registrations.compactMap { registration -> CoworkProjectWorkspace? in
+            let path = URL(fileURLWithPath: registration.path).standardizedFileURL.path
+            guard seenPaths.insert(path).inserted else { return nil }
+            return CoworkProjectWorkspace(
+                path: path,
+                agentName: registration.agent.rawValue,
+                isPrimary: registration.agent == Orchestrator.mainAgentID)
+        }
+        return CoworkProjectSettings(
+            sessionID: sessionID,
+            mainAgentName: Orchestrator.mainAgentID.rawValue,
+            defaultModelID: main?.model.rawValue,
+            defaultInferenceProfileBinding: main?.agentInferenceBinding,
+            defaultPermissionProfile: main?.profile ?? PermissionProfile.reviewed.rawValue,
+            workspaces: workspaces)
+    }
+
+    private static func normalized(
+        _ value: CoworkProjectSettings,
+        sessionID: SessionID,
+        inferenceCatalogSnapshot: InferenceCatalogSnapshot?
+    ) -> CoworkProjectSettings {
+        var settings = value
+        settings.schemaVersion = CoworkSessionSettings.currentSchemaVersion
         settings.sessionID = sessionID
         if settings.mainAgentName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            settings.mainAgentName = "main"
-        }
-        if settings.defaultProviderID == nil {
-            settings.defaultProviderID = catalog.selectedProviderID
-        }
-        if settings.defaultModelID == nil {
-            settings.defaultModelID = catalog.selectedModelID
+            settings.mainAgentName = Orchestrator.mainAgentID.rawValue
         }
         if settings.defaultInferenceProfileBinding == nil,
            let snapshot = inferenceCatalogSnapshot,
            let providerID = settings.defaultProviderID,
            let modelID = settings.defaultModelID {
-            // Legacy settings never recorded a variant. Resolve the base
-            // profile only; guessing the app's current variant would silently
-            // change the recovered request configuration.
             settings.defaultInferenceProfileBinding = AppInferenceCatalogCompiler.binding(
                 providerID: providerID,
                 modelID: modelID,
@@ -164,33 +385,6 @@ enum CoworkProjectSettingsStore {
         }
         return settings
     }
-
-    static func save(_ settings: CoworkProjectSettings) {
-        guard let data = try? encoder.encode(settings) else { return }
-        UserDefaults.standard.set(data, forKey: key(settings.sessionID))
-    }
-
-    static func primaryWorkspacePath(sessionID: SessionID) -> String? {
-        guard let data = UserDefaults.standard.data(forKey: key(sessionID)),
-              let decoded = try? decoder.decode(CoworkProjectSettings.self, from: data) else {
-            return WorkspaceAccess.workspacePath(for: sessionID)
-        }
-        return decoded.primaryWorkspace?.path ?? WorkspaceAccess.workspacePath(for: sessionID)
-    }
-
-    static func remove(sessionID: SessionID) {
-        UserDefaults.standard.removeObject(forKey: key(sessionID))
-    }
-
-    private static func key(_ sessionID: SessionID) -> String {
-        "intatis.cowork.projectSettings.\(sessionID.rawValue)"
-    }
-
-    private static let encoder: JSONEncoder = {
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        return encoder
-    }()
 
     private static let decoder: JSONDecoder = {
         let decoder = JSONDecoder()
@@ -210,6 +404,7 @@ struct CoworkProjectSettingsSheet: View {
     @State private var draft: CoworkProjectSettings
     @State private var tokenBudgetText: String
     @State private var settingsError: String?
+    @State private var isSaving = false
 
     init(vm: CoworkViewModel,
          catalog: AppProviderCatalog,
@@ -299,6 +494,7 @@ struct CoworkProjectSettingsSheet: View {
                     save()
                 }
                 .keyboardShortcut(.defaultAction)
+                .disabled(isSaving)
             }
         }
         .padding(20)
@@ -595,8 +791,16 @@ struct CoworkProjectSettingsSheet: View {
             return
         }
         settingsError = nil
-        vm.updateProjectSettings(draft)
-        dismiss()
+        isSaving = true
+        Task { @MainActor in
+            let saved = await vm.updateProjectSettings(draft)
+            isSaving = false
+            if saved {
+                dismiss()
+            } else {
+                settingsError = vm.composerError ?? "Session settings could not be saved."
+            }
+        }
     }
 }
 #endif

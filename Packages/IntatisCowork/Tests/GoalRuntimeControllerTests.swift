@@ -398,6 +398,128 @@ private func appendCompletedRuntimeWorkTask(
 }
 
 final class GoalRuntimeControllerTests: XCTestCase {
+    func testColdStartPausesCleanActiveGoalUntilExplicitResume() async throws {
+        let log = try runtimeLog("cold-active-explicit-resume")
+        let sessionID = await log.sessionID
+        let goal = Goal(sessionID: sessionID, objective: "Wait for explicit Resume")
+        try await log.append(.goalCreated(GoalCreatedPayload(goal: goal)))
+
+        let sendCalls = RuntimeCallCounter()
+        let verifier = RuntimeVerifierProvider([
+            continuingRuntimeAudit(objective: goal.objective),
+        ])
+        let controller = GoalRuntimeController(
+            sessionID: sessionID,
+            log: log,
+            verifierProvider: { verifier },
+            verifierModel: { ModelID(rawValue: "verifier") },
+            sendOperation: { _, _, _, _, _, _, _, _ in
+                await sendCalls.increment()
+                do {
+                    try await Task.sleep(nanoseconds: 5_000_000_000)
+                    return .sent
+                } catch {
+                    return .failed("stopped")
+                }
+            })
+
+        let startupSafe = await controller.start()
+        XCTAssertTrue(startupSafe)
+        var projection = CoworkProjection.build(from: await log.replay())
+        XCTAssertEqual(projection.goals[goal.id]?.status, .paused)
+        XCTAssertTrue(projection.continuationRuns.isEmpty)
+        let startupSendCalls = await sendCalls.value()
+        XCTAssertEqual(startupSendCalls, 0)
+        XCTAssertEqual(verifier.callCount(), 0)
+
+        _ = try await controller.resumeCurrentGoal()
+        projection = try await waitForRuntimeProjection(log, label: "explicit cold resume") {
+            $0.goals[goal.id]?.status == .active
+                && $0.continuationRuns.values.contains {
+                    $0.goalID == goal.id && $0.status == .running
+                }
+        }
+        XCTAssertEqual(projection.goals[goal.id]?.status, .active)
+        let resumedSendCalls = await sendCalls.value()
+        XCTAssertEqual(resumedSendCalls, 1)
+        await controller.shutdown()
+    }
+
+    func testColdStartAtTokenBudgetBecomesBudgetLimitedWithoutProvider() async throws {
+        let log = try runtimeLog("cold-budget-limited")
+        let sessionID = await log.sessionID
+        let goal = Goal(
+            sessionID: sessionID,
+            objective: "Respect the durable budget",
+            tokenBudget: 7,
+            tokensUsed: 7)
+        try await log.append(.goalCreated(GoalCreatedPayload(goal: goal)))
+
+        let sendCalls = RuntimeCallCounter()
+        let verifier = RuntimeVerifierProvider([
+            continuingRuntimeAudit(objective: goal.objective),
+        ])
+        let controller = GoalRuntimeController(
+            sessionID: sessionID,
+            log: log,
+            verifierProvider: { verifier },
+            verifierModel: { ModelID(rawValue: "verifier") },
+            sendOperation: { _, _, _, _, _, _, _, _ in
+                await sendCalls.increment()
+                return .sent
+            })
+
+        let startupSafe = await controller.start()
+        XCTAssertTrue(startupSafe)
+        let projection = CoworkProjection.build(from: await log.replay())
+        XCTAssertEqual(projection.goals[goal.id]?.status, .budgetLimited)
+        XCTAssertTrue(projection.continuationRuns.isEmpty)
+        let sendCallCount = await sendCalls.value()
+        XCTAssertEqual(sendCallCount, 0)
+        XCTAssertEqual(verifier.callCount(), 0)
+        await controller.shutdown()
+    }
+
+    func testColdStartPausePersistenceFailureFailsClosedWithoutProvider() async throws {
+        let log = try runtimeLog("cold-pause-persistence-failure")
+        let sessionID = await log.sessionID
+        let goal = Goal(sessionID: sessionID, objective: "Fail closed on pause append")
+        try await log.append(.goalCreated(GoalCreatedPayload(goal: goal)))
+
+        let sendCalls = RuntimeCallCounter()
+        let verifier = RuntimeVerifierProvider([
+            continuingRuntimeAudit(objective: goal.objective),
+        ])
+        let controller = GoalRuntimeController(
+            sessionID: sessionID,
+            log: log,
+            verifierProvider: { verifier },
+            verifierModel: { ModelID(rawValue: "verifier") },
+            sendOperation: { _, _, _, _, _, _, _, _ in
+                await sendCalls.increment()
+                return .sent
+            },
+            eventAppender: { events in
+                if events.contains(where: { event in
+                    guard case .goalPaused = event else { return false }
+                    return true
+                }) {
+                    throw GoalRuntimeTestFailure.injectedCheckpointFailure
+                }
+                try await log.append(events)
+            })
+
+        let startupSafe = await controller.start()
+        XCTAssertFalse(startupSafe)
+        let projection = CoworkProjection.build(from: await log.replay())
+        XCTAssertEqual(projection.goals[goal.id]?.status, .active)
+        XCTAssertTrue(projection.continuationRuns.isEmpty)
+        let sendCallCount = await sendCalls.value()
+        XCTAssertEqual(sendCallCount, 0)
+        XCTAssertEqual(verifier.callCount(), 0)
+        await controller.shutdown()
+    }
+
     func testPausedInterruptedRunIsCancelledAndRecoveredWithoutExecuting() async throws {
         let log = try runtimeLog("paused-interrupted-recovery")
         let sessionID = await log.sessionID
@@ -836,20 +958,32 @@ final class GoalRuntimeControllerTests: XCTestCase {
         let events = await log.replay()
         let projection = CoworkProjection.build(from: events)
         XCTAssertNotEqual(projection.continuationRuns[initialRunID]?.status, .running)
+        XCTAssertEqual(projection.goals[goal.id]?.status, .paused)
         let checkpointIndex = try XCTUnwrap(events.firstIndex { envelope in
             guard case .continuationRunCheckpointed(let payload) = envelope.event else {
                 return false
             }
             return payload.run.id == initialRunID
         })
-        if let nextRunIndex = events.firstIndex(where: { envelope in
+        XCTAssertFalse(events.contains { envelope in
             guard case .continuationRunCreated(let payload) = envelope.event else {
                 return false
             }
             return payload.run.goalID == goal.id && payload.run.id != initialRunID
-        }) {
-            XCTAssertLessThan(checkpointIndex, nextRunIndex)
+        })
+        let pauseIndex = try XCTUnwrap(events.firstIndex { envelope in
+            guard case .goalPaused(let payload) = envelope.event else { return false }
+            return payload.goal.id == goal.id
+        })
+        XCTAssertLessThan(checkpointIndex, pauseIndex)
+
+        _ = try await controller.resumeCurrentGoal()
+        let resumed = try await waitForRuntimeProjection(log, label: "explicit resume after pending stop") {
+            $0.continuationRuns.values.contains {
+                $0.goalID == goal.id && $0.id != initialRunID
+            }
         }
+        XCTAssertEqual(resumed.goals[goal.id]?.status, .active)
         await controller.shutdown()
     }
 
@@ -1210,6 +1344,9 @@ final class GoalRuntimeControllerTests: XCTestCase {
         let afterRelease = await log.replay()
         let afterProjection = CoworkProjection.build(from: afterRelease)
         XCTAssertEqual(afterProjection.continuationRuns[createdRun.id]?.status, .completed)
+        XCTAssertEqual(afterProjection.goals[goal.id]?.status, .paused)
+        XCTAssertEqual(afterProjection.continuationRuns.count, 1)
+        XCTAssertEqual(verifier.callCount(), 0)
         XCTAssertTrue(afterRelease.contains { envelope in
             guard case .continuationRunRecovered(let payload) = envelope.event else { return false }
             return payload.run.id == createdRun.id
@@ -1222,17 +1359,16 @@ final class GoalRuntimeControllerTests: XCTestCase {
         await controller.shutdown()
     }
 
-    func testCancelledStartStopsPostLaunchContinuationBeforeReturningUnsafe() async throws {
-        let log = try runtimeLog("cancelled-start-post-launch")
+    func testCancelledStartAfterRecoveryPauseReturnsUnsafeWithoutLaunching() async throws {
+        let log = try runtimeLog("cancelled-start-after-pause")
         let sessionID = await log.sessionID
         let goal = Goal(
             sessionID: sessionID,
-            objective: "Cancel startup after launching continuation")
+            objective: "Cancel startup after recovery pause")
         try await log.append(.goalCreated(GoalCreatedPayload(goal: goal)))
 
-        let postLaunchBarrier = RuntimeAsyncBarrier()
-        let sendEntered = RuntimeCallCounter()
-        let sendExited = RuntimeCallCounter()
+        let postRecoveryBarrier = RuntimeAsyncBarrier()
+        let sendCalls = RuntimeCallCounter()
         let cancellationCalls = RuntimeCallCounter()
         let verifier = RuntimeVerifierProvider([
             continuingRuntimeAudit(objective: goal.objective),
@@ -1243,57 +1379,40 @@ final class GoalRuntimeControllerTests: XCTestCase {
             verifierProvider: { verifier },
             verifierModel: { ModelID(rawValue: "verifier") },
             sendOperation: { _, _, _, _, _, _, _, _ in
-                await sendEntered.increment()
-                do {
-                    try await Task.sleep(nanoseconds: 5_000_000_000)
-                    await sendExited.increment()
-                    return .sent
-                } catch {
-                    await sendExited.increment()
-                    return .failed("cancelled during startup rollback")
-                }
+                await sendCalls.increment()
+                return .sent
             },
             cancelGoalInvocations: { cancelledGoalID, _, _ in
                 XCTAssertEqual(cancelledGoalID, goal.id)
                 await cancellationCalls.increment()
                 return true
             },
-            startupPostLaunchHook: {
-                await postLaunchBarrier.wait()
+            startupPostRecoveryHook: {
+                await postRecoveryBarrier.wait()
             })
 
         let startTask = Task { await controller.start() }
-        await postLaunchBarrier.waitUntilEntered()
-        _ = try await waitForRuntimeProjection(log, label: "post-launch startup run") {
-            $0.continuationRuns.values.contains {
-                $0.goalID == goal.id && $0.status == .running
-            }
-        }
-        var enteredCount = await sendEntered.value()
-        for _ in 0..<100 where enteredCount == 0 {
-            try await Task.sleep(nanoseconds: 5_000_000)
-            enteredCount = await sendEntered.value()
-        }
-        XCTAssertEqual(enteredCount, 1)
+        await postRecoveryBarrier.waitUntilEntered()
+        let pausedProjection = CoworkProjection.build(from: await log.replay())
+        XCTAssertEqual(pausedProjection.goals[goal.id]?.status, .paused)
+        XCTAssertTrue(pausedProjection.continuationRuns.isEmpty)
+        let preCancelSendCalls = await sendCalls.value()
+        XCTAssertEqual(preCancelSendCalls, 0)
+        XCTAssertEqual(verifier.callCount(), 0)
 
         startTask.cancel()
-        await postLaunchBarrier.release()
+        await postRecoveryBarrier.release()
         let startupSafe = await startTask.value
         XCTAssertFalse(startupSafe)
 
         let cancellationCallCount = await cancellationCalls.value()
-        let sendExitedCount = await sendExited.value()
-        XCTAssertEqual(cancellationCallCount, 1)
-        XCTAssertEqual(sendExitedCount, 1)
+        let finalSendCalls = await sendCalls.value()
+        XCTAssertEqual(cancellationCallCount, 0)
+        XCTAssertEqual(finalSendCalls, 0)
         let replayed = await log.replay()
         let projection = CoworkProjection.build(from: replayed)
-        XCTAssertFalse(projection.continuationRuns.values.contains {
-            $0.goalID == goal.id
-                && ($0.status == .created || $0.status == .running)
-        })
-        XCTAssertTrue(projection.continuationRuns.values.contains {
-            $0.goalID == goal.id && $0.status == .checkpointed
-        })
+        XCTAssertEqual(projection.goals[goal.id]?.status, .paused)
+        XCTAssertTrue(projection.continuationRuns.isEmpty)
         await controller.shutdown()
     }
 
@@ -1914,6 +2033,292 @@ final class GoalRuntimeControllerTests: XCTestCase {
         }.count, 1)
     }
 
+    func testRecoveryWithoutGoalOnlyAllowsUnresolvedTicketScopedToTerminalTask() async throws {
+        let scenarios: [(
+            label: String,
+            recordsTask: Bool,
+            recordsTerminalTask: Bool,
+            ticketHasTaskID: Bool,
+            preparedAttempt: Int?,
+            terminalAttempt: Int?,
+            terminalBeforePrepare: Bool,
+            expectedStartupSafe: Bool
+        )] = [
+            ("terminal-task", true, true, true, 1, 1, false, true),
+            ("nonterminal-task", true, false, true, 1, nil, false, false),
+            ("missing-task", false, false, true, 1, nil, false, false),
+            ("orphan-terminal", false, true, true, 1, 1, false, false),
+            ("attempt-mismatch", true, true, true, 1, 2, false, false),
+            ("terminal-before-prepare", true, true, true, 1, 1, true, false),
+            ("legacy-attempt-missing", true, true, true, nil, 1, false, false),
+            ("unscoped", false, false, false, 1, nil, false, false),
+        ]
+
+        for scenario in scenarios {
+            let log = try runtimeLog("recover-no-goal-\(scenario.label)")
+            let sessionID = await log.sessionID
+            let taskID = TaskID(rawValue: "task-\(scenario.label)")
+            let contract = TaskContract(
+                id: taskID,
+                kind: .root,
+                issuer: nil,
+                assignee: Orchestrator.mainAgentID,
+                objective: "Historical task for \(scenario.label)",
+                roleHint: "root",
+                expectedDeliverable: "Historical result",
+                replyMode: TaskReplyMode.none,
+                maxAttempts: 1)
+            let prepared = ToolExecutionPreparedPayload(
+                executionID: "unresolved-\(scenario.label)",
+                taskID: scenario.ticketHasTaskID ? taskID : nil,
+                attempt: scenario.preparedAttempt,
+                toolCallID: "call-\(scenario.label)",
+                agent: Orchestrator.mainAgentID,
+                tool: "write_file",
+                sideEffect: .write,
+                replayPolicy: .requiresManualReconciliation)
+            var events: [Event] = []
+            if scenario.recordsTask {
+                events.append(.taskCreated(TaskCreatedPayload(contract: contract)))
+            }
+            let terminalEvent: Event? = scenario.recordsTerminalTask
+                ? .taskFailed(TaskFailedPayload(
+                    taskID: taskID,
+                    agent: Orchestrator.mainAgentID,
+                    error: "manual reconciliation required",
+                    attempt: scenario.terminalAttempt))
+                : nil
+            if scenario.terminalBeforePrepare, let terminalEvent {
+                events.append(terminalEvent)
+            }
+            events.append(.toolExecutionPrepared(prepared))
+            if !scenario.terminalBeforePrepare, let terminalEvent {
+                events.append(terminalEvent)
+            }
+            try await log.append(events)
+
+            let sendCalls = RuntimeCallCounter()
+            let verifier = RuntimeVerifierProvider([
+                continuingRuntimeAudit(objective: "unused"),
+            ])
+            let controller = GoalRuntimeController(
+                sessionID: sessionID,
+                log: log,
+                verifierProvider: { verifier },
+                verifierModel: { ModelID(rawValue: "verifier") },
+                sendOperation: { _, _, _, _, _, _, _, _ in
+                    await sendCalls.increment()
+                    return .sent
+                })
+
+            let startupSafe = await controller.start()
+            XCTAssertEqual(startupSafe, scenario.expectedStartupSafe, scenario.label)
+
+            let turnResult = await controller.sendUserTurn("new work after recovery")
+            if scenario.expectedStartupSafe {
+                XCTAssertEqual(turnResult, .sent, scenario.label)
+            } else {
+                guard case .failed(let message) = turnResult else {
+                    await controller.shutdown()
+                    XCTFail("\(scenario.label) must keep ordinary turns fail-closed")
+                    continue
+                }
+                XCTAssertTrue(message.contains("incomplete"), scenario.label)
+            }
+            let sendCallCount = await sendCalls.value()
+            XCTAssertEqual(sendCallCount, scenario.expectedStartupSafe ? 1 : 0, scenario.label)
+            await controller.shutdown()
+        }
+    }
+
+    func testRecoveryWithCurrentGoalRejectsSettledUnknownEffects() async throws {
+        let cases: [(
+            label: String,
+            outcome: ToolExecutionOutcome,
+            disposition: ToolExecutionEffectDisposition?
+        )] = [
+            ("explicit-unknown", .failed, .unknown),
+            ("legacy-failed", .failed, nil),
+            ("contradictory-success-not-started", .succeeded, .notStarted),
+        ]
+
+        for item in cases {
+            let log = try runtimeLog("recover-goal-\(item.label)")
+            let sessionID = await log.sessionID
+            let goal = Goal(sessionID: sessionID, objective: "Do not resume unknown effects")
+            let prepared = ToolExecutionPreparedPayload(
+                executionID: "unknown-effect-\(item.label)",
+                toolCallID: "unknown-call-\(item.label)",
+                agent: Orchestrator.mainAgentID,
+                tool: "write_file",
+                sideEffect: .write,
+                replayPolicy: .requiresManualReconciliation)
+            try await log.append([
+                .goalCreated(GoalCreatedPayload(goal: goal)),
+                .toolExecutionPrepared(prepared),
+                .toolExecutionSettled(ToolExecutionSettledPayload(
+                    prepared: prepared,
+                    outcome: item.outcome,
+                    effectDisposition: item.disposition,
+                    reason: "outcome cannot prove whether the write occurred")),
+            ])
+
+            let sendCalls = RuntimeCallCounter()
+            let verifier = RuntimeVerifierProvider([
+                continuingRuntimeAudit(objective: goal.objective),
+            ])
+            let controller = GoalRuntimeController(
+                sessionID: sessionID,
+                log: log,
+                verifierProvider: { verifier },
+                verifierModel: { ModelID(rawValue: "verifier") },
+                sendOperation: { _, _, _, _, _, _, _, _ in
+                    await sendCalls.increment()
+                    return .sent
+                })
+
+            let startupSafe = await controller.start()
+            let callCount = await sendCalls.value()
+            XCTAssertFalse(startupSafe, item.label)
+            XCTAssertEqual(callCount, 0, item.label)
+            await controller.shutdown()
+        }
+    }
+
+    func testInProcessGoalLaunchRejectsSettledUnknownEffects() async throws {
+        let log = try runtimeLog("live-goal-unknown-effect")
+        let sessionID = await log.sessionID
+        let sendCalls = RuntimeCallCounter()
+        let verifier = RuntimeVerifierProvider([
+            continuingRuntimeAudit(objective: "Do not launch through unknown effects"),
+        ])
+        let controller = GoalRuntimeController(
+            sessionID: sessionID,
+            log: log,
+            verifierProvider: { verifier },
+            verifierModel: { ModelID(rawValue: "verifier") },
+            sendOperation: { _, _, _, _, _, _, _, _ in
+                await sendCalls.increment()
+                return .sent
+            })
+        let startupSafe = await controller.start()
+        XCTAssertTrue(startupSafe)
+
+        let goal = Goal(
+            sessionID: sessionID,
+            objective: "Do not launch through unknown effects")
+        let prepared = ToolExecutionPreparedPayload(
+            executionID: "live-goal-unknown-effect",
+            toolCallID: "live-goal-unknown-call",
+            agent: Orchestrator.mainAgentID,
+            tool: "write_file",
+            sideEffect: .write,
+            replayPolicy: .requiresManualReconciliation)
+        try await log.append([
+            .goalCreated(GoalCreatedPayload(goal: goal)),
+            .toolExecutionPrepared(prepared),
+            .toolExecutionSettled(ToolExecutionSettledPayload(
+                prepared: prepared,
+                outcome: .failed,
+                effectDisposition: .unknown,
+                reason: "the side effect cannot be reconstructed")),
+        ])
+
+        try await Task.sleep(nanoseconds: 100_000_000)
+        let sendCallCount = await sendCalls.value()
+        let finalProjection = CoworkProjection.build(from: await log.replay())
+        XCTAssertEqual(sendCallCount, 0)
+        XCTAssertTrue(finalProjection.continuationRuns.isEmpty)
+        await controller.shutdown()
+    }
+
+    func testStartupRejectsCorruptedKnownEventInsteadOfTreatingItAsEmpty() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("intatis-goal-runtime-corrupt-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("events.jsonl")
+        let sessionID = SessionID(rawValue: "goal-runtime-corrupt")
+        let log = try EventLog(session: sessionID, fileURL: file)
+        let malformedKnownEvent = #"{"seq":0,"ts":0,"session":"goal-runtime-corrupt","v":1,"type":"task_failed","payload":{}}"#
+        try Data((malformedKnownEvent + "\n").utf8).write(to: file, options: .atomic)
+
+        let sendCalls = RuntimeCallCounter()
+        let verifier = RuntimeVerifierProvider([
+            continuingRuntimeAudit(objective: "unused"),
+        ])
+        let controller = GoalRuntimeController(
+            sessionID: sessionID,
+            log: log,
+            verifierProvider: { verifier },
+            verifierModel: { ModelID(rawValue: "verifier") },
+            sendOperation: { _, _, _, _, _, _, _, _ in
+                await sendCalls.increment()
+                return .sent
+            })
+
+        let startupSafe = await controller.start()
+        let callCount = await sendCalls.value()
+        XCTAssertFalse(startupSafe)
+        XCTAssertEqual(callCount, 0)
+        await controller.shutdown()
+    }
+
+    func testStartupRejectsUnknownFutureEventsAndSequenceGaps() async throws {
+        for scenario in ["unknown-future", "sequence-gap"] {
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent(
+                    "intatis-goal-runtime-\(scenario)-\(UUID().uuidString)",
+                    isDirectory: true)
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let file = root.appendingPathComponent("events.jsonl")
+            let sessionID = SessionID(rawValue: "goal-runtime-\(scenario)")
+            let log = try EventLog(session: sessionID, fileURL: file)
+            _ = try await log.append(.userMessage(.init(text: "known prefix")))
+
+            let nextSequence = scenario == "sequence-gap" ? 2 : 1
+            let encoder = Envelope.makeEncoder()
+            let placeholder = try encoder.encode(Envelope(
+                seq: nextSequence,
+                ts: Date(timeIntervalSince1970: Double(nextSequence)),
+                session: sessionID,
+                event: .userMessage(.init(text: "placeholder"))))
+            var object = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: placeholder) as? [String: Any])
+            if scenario == "unknown-future" {
+                object["type"] = "future_goal_runtime_event"
+                object["payload"] = ["futureField": true]
+            }
+            var raw = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+            raw.append(0x0A)
+            let handle = try FileHandle(forWritingTo: file)
+            try handle.seekToEnd()
+            try handle.write(contentsOf: raw)
+            try handle.close()
+
+            let sendCalls = RuntimeCallCounter()
+            let verifier = RuntimeVerifierProvider([
+                continuingRuntimeAudit(objective: "unused"),
+            ])
+            let controller = GoalRuntimeController(
+                sessionID: sessionID,
+                log: log,
+                verifierProvider: { verifier },
+                verifierModel: { ModelID(rawValue: "verifier") },
+                sendOperation: { _, _, _, _, _, _, _, _ in
+                    await sendCalls.increment()
+                    return .sent
+                })
+
+            let startupSafe = await controller.start()
+            let sendCallCount = await sendCalls.value()
+            XCTAssertFalse(startupSafe, scenario)
+            XCTAssertEqual(sendCallCount, 0, scenario)
+            await controller.shutdown()
+        }
+    }
+
     func testRecoveryCheckpointsActiveRunButUnresolvedNonReplayableToolStopsRecovery() async throws {
         let activeLog = try runtimeLog("recover-active")
         let activeSession = await activeLog.sessionID
@@ -1944,18 +2349,29 @@ final class GoalRuntimeControllerTests: XCTestCase {
                     return .failed("stopped")
                 }
             })
-        await activeController.start()
+        let activeStartupSafe = await activeController.start()
+        XCTAssertTrue(activeStartupSafe)
         let recoveredProjection = try await waitForRuntimeProjection(
             activeLog,
             label: "active recovery") {
                 $0.continuationRuns[createdRun.id]?.status == .completed
-                    && $0.continuationRuns.values.contains {
-                        $0.goalID == activeGoal.id && $0.id != createdRun.id
-                            && $0.status == .running
-                    }
+                    && $0.goals[activeGoal.id]?.status == .paused
             }
         XCTAssertTrue(recoveredProjection.continuationRuns[createdRun.id]?.progressSummary?
             .contains("Recovered checkpoint had no durable Goal audit") == true)
+        XCTAssertEqual(recoveredProjection.continuationRuns.count, 1)
+        XCTAssertEqual(activeVerifier.callCount(), 0)
+
+        _ = try await activeController.resumeCurrentGoal()
+        let resumedProjection = try await waitForRuntimeProjection(
+            activeLog,
+            label: "explicitly resumed active recovery") {
+                $0.continuationRuns.values.contains {
+                    $0.goalID == activeGoal.id && $0.id != createdRun.id
+                        && $0.status == .running
+                }
+            }
+        XCTAssertEqual(resumedProjection.goals[activeGoal.id]?.status, .active)
         await activeController.shutdown()
 
         let unsafeLog = try runtimeLog("recover-unsafe")
@@ -1997,7 +2413,8 @@ final class GoalRuntimeControllerTests: XCTestCase {
                     explicitGoalIntent: explicitGoalIntent)
                 return .sent
             })
-        await unsafeController.start()
+        let unsafeStartupSafe = await unsafeController.start()
+        XCTAssertFalse(unsafeStartupSafe)
         try await Task.sleep(nanoseconds: 100_000_000)
         let unsafeProjection = CoworkProjection.build(from: await unsafeLog.replay())
         XCTAssertEqual(unsafeProjection.continuationRuns[unsafeCreatedRun.id]?.status, .running)

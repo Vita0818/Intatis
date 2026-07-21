@@ -465,6 +465,7 @@ final class IntatisCoworkTests: XCTestCase {
         XCTAssertFalse(toolNames.contains("ask_agent"))
         XCTAssertFalse(toolNames.contains("list_agents"))
         XCTAssertFalse(toolNames.contains("remove_agent"))
+        XCTAssertFalse(toolNames.contains("rename_session"))
 
         let systemPrompt = try XCTUnwrap(request.messages.first?.content)
         XCTAssertTrue(systemPrompt.contains("running inside Intatis"))
@@ -522,6 +523,7 @@ final class IntatisCoworkTests: XCTestCase {
         let mainToolNames = Set(mainRequest.tools.map(\.name))
         XCTAssertTrue(mainToolNames.contains("spawn_agent"))
         XCTAssertTrue(mainToolNames.contains("delegate_task"))
+        XCTAssertTrue(mainToolNames.contains("rename_session"))
         let spawnDescriptor = try XCTUnwrap(mainRequest.tools.first { $0.name == "spawn_agent" })
         let spawnSchema = String(
             decoding: try JSONEncoder().encode(spawnDescriptor.parameters),
@@ -544,6 +546,7 @@ final class IntatisCoworkTests: XCTestCase {
         XCTAssertTrue(toolNames.contains("delegate_task"))
         XCTAssertTrue(toolNames.contains("list_agents"))
         XCTAssertTrue(toolNames.contains("remove_agent"))
+        XCTAssertFalse(toolNames.contains("rename_session"))
 
         let systemPrompt = try XCTUnwrap(request.messages.first?.content)
         XCTAssertTrue(systemPrompt.contains("running inside Intatis"))

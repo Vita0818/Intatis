@@ -6,6 +6,7 @@ public enum CoworkMentionRouteError: Error, Equatable, Sendable {
     case emptyMessage
     case emptyMention
     case unknownMention(String)
+    case invalidMention(String)
     case ambiguousMention(String, [AgentID])
     case ambiguousDefault([AgentID])
 
@@ -19,6 +20,8 @@ public enum CoworkMentionRouteError: Error, Equatable, Sendable {
             return "Type an agent name after @."
         case .unknownMention(let name):
             return "No attached agent matches @\(name)."
+        case .invalidMention(let name):
+            return "@\(name) is not a valid agent name. Use ASCII letters, digits, '-' or '_'."
         case .ambiguousMention(let name, let agents):
             return "Ambiguous @\(name): " + agents.map { "@\($0.rawValue)" }.joined(separator: ", ")
         case .ambiguousDefault(let agents):
@@ -43,6 +46,50 @@ public struct CoworkMentionRoute: Equatable, Sendable {
 }
 
 public enum CoworkMentionRouter {
+    /// Freezes the user's requested route without consulting the live roster.
+    /// A missing/unresolved target is an execution-admission failure after the
+    /// immutable submission has been preserved, not a reason to discard Send.
+    public static func routeSubmittedIntent(
+        input: String,
+        defaultTarget: AgentID
+    ) -> CoworkMentionRoute {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return CoworkMentionRoute(originalInput: input, outcome: .blocked(.emptyMessage))
+        }
+        guard trimmed.hasPrefix("@") else {
+            return CoworkMentionRoute(
+                originalInput: input,
+                outcome: .send(text: trimmed, target: defaultTarget))
+        }
+
+        let rest = trimmed.dropFirst()
+        guard let first = rest.first, !first.isWhitespaceOrNewline else {
+            return CoworkMentionRoute(originalInput: input, outcome: .blocked(.emptyMention))
+        }
+        let splitIndex = rest.firstIndex { $0.isWhitespaceOrNewline }
+        let mention = String(splitIndex.map { rest[..<$0] } ?? rest[...])
+        guard isValidFrozenAgentName(mention) else {
+            return CoworkMentionRoute(
+                originalInput: input,
+                outcome: .blocked(.invalidMention(mention)))
+        }
+        let message: String
+        if let splitIndex {
+            let afterSpace = rest.index(after: splitIndex)
+            message = String(rest[afterSpace...])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        } else {
+            message = ""
+        }
+        guard !message.isEmpty else {
+            return CoworkMentionRoute(originalInput: input, outcome: .blocked(.emptyMessage))
+        }
+        return CoworkMentionRoute(
+            originalInput: input,
+            outcome: .send(text: message, target: AgentID(rawValue: mention)))
+    }
+
     public static func route(input: String, attachedAgents: [AgentID]) -> CoworkMentionRoute {
         let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
@@ -114,6 +161,23 @@ public enum CoworkMentionRouter {
             return .failure(.ambiguousMention(mention, caseInsensitive))
         }
         return .failure(.unknownMention(mention))
+    }
+
+    private static func isValidFrozenAgentName(_ name: String) -> Bool {
+        guard let first = name.unicodeScalars.first,
+              isASCIIAlphaNumeric(first) else { return false }
+        return name.unicodeScalars.allSatisfy {
+            isASCIIAlphaNumeric($0) || $0.value == 45 || $0.value == 95
+        }
+    }
+
+    private static func isASCIIAlphaNumeric(_ scalar: Unicode.Scalar) -> Bool {
+        switch scalar.value {
+        case 48...57, 65...90, 97...122:
+            return true
+        default:
+            return false
+        }
     }
 }
 

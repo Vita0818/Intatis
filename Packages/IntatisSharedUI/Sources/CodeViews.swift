@@ -10,7 +10,7 @@ import IntatisConversation
 /// Tools/Permission/AgentKernel dependencies).
 public struct CodeShell: View {
     private static let bottomAnchorID = "intatis-code-thread-bottom"
-    private let items: [CodeItem]
+    private let displayedItems: [CodeItem]
     private let pending: PendingPermission?
     private let permissionNotice: PermissionResolutionNotice?
     private let latestTurnStats: TurnStatsSnapshot?
@@ -24,7 +24,7 @@ public struct CodeShell: View {
     private let composerAccessory: AnyView?
     @Binding private var input: String
     private let onSend: () -> Void
-    private let onResolve: (PermissionDecision) -> Void
+    private let onResolve: (PermissionResponseAction) -> Void
 
     public init(items: [CodeItem],
                 pending: PendingPermission?,
@@ -41,8 +41,8 @@ public struct CodeShell: View {
                 composerAccessory: AnyView? = nil,
                 input: Binding<String>,
                 onSend: @escaping () -> Void,
-                onResolve: @escaping (PermissionDecision) -> Void) {
-        self.items = items
+                onResolve: @escaping (PermissionResponseAction) -> Void) {
+        self.displayedItems = IntatisExecutionTracePresentation.displayedItems(items)
         self.pending = pending
         self.permissionNotice = permissionNotice
         self.latestTurnStats = latestTurnStats
@@ -80,7 +80,7 @@ public struct CodeShell: View {
                 CodeInspectorView(
                     workspaceName: workspaceName,
                     agentState: agentState,
-                    itemCount: items.count,
+                    itemCount: displayedItems.count,
                     pending: pending,
                     latestTurnStats: latestTurnStats,
                     failedItems: failedItems,
@@ -94,7 +94,7 @@ public struct CodeShell: View {
     }
 
     private var failedItems: [CodeItem] {
-        Array(items.filter { $0.isFailure || $0.kind == .error }.suffix(4))
+        Array(displayedItems.filter { $0.isFailure || $0.kind == .error }.suffix(4))
     }
 
     private func threadColumn(layout: IntatisThreadContentLayout) -> some View {
@@ -132,15 +132,18 @@ public struct CodeShell: View {
     }
 
     @ViewBuilder private func thread(layout: IntatisThreadContentLayout) -> some View {
-        if items.isEmpty && !showsThinkingIndicator {
+        if displayedItems.isEmpty && !showsThinkingIndicator {
             CodeEmptyThreadView(style: threadStyle)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .padding(.horizontal, layout.horizontalPadding)
         } else {
             ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 12) {
-                        ForEach(items) { item in
+                    IntatisAdaptiveThreadStack(
+                        visibleRowCount: displayedItems.count + (showsThinkingIndicator ? 1 : 0),
+                        alignment: .leading,
+                        spacing: 12) {
+                        ForEach(displayedItems) { item in
                             CodeItemRow(item: item, style: threadStyle, layout: layout)
                                 .id(item.id)
                         }
@@ -150,12 +153,13 @@ public struct CodeShell: View {
                         }
                         Color.clear
                             .frame(height: 1)
+                            .padding(.bottom, 16)
                             .id(Self.bottomAnchorID)
                     }
                     .frame(width: layout.contentWidth)
                     .frame(maxWidth: .infinity)
                     .padding(.horizontal, layout.horizontalPadding)
-                    .padding(.vertical, 16)
+                    .padding(.top, 16)
                 }
                 .scrollContentBackground(.hidden)
                 .onAppear {
@@ -170,15 +174,15 @@ public struct CodeShell: View {
 
     private var showsThinkingIndicator: Bool {
         IntatisThreadActivity.isAwaitingModelOutput(
-            items: items,
+            items: displayedItems,
             isWorking: isWorking,
             permissionBlocksResponse: permissionBlocksComposer)
     }
 
     private var itemScrollSignature: String {
-        guard let last = items.last else { return "0" }
+        guard let last = displayedItems.last else { return "0" }
         return [
-            "\(items.count)",
+            "\(displayedItems.count)",
             last.id,
             "\(last.body.count)",
             "\(last.complete)",
@@ -247,13 +251,16 @@ struct CodeItemRow: View {
     let item: CodeItem
     let style: IntatisThreadStyle
     let layout: IntatisThreadContentLayout
+    let onRetrySubmission: ((SubmissionID) -> Void)?
 
     init(item: CodeItem,
          style: IntatisThreadStyle = .standard(.light),
-         layout: IntatisThreadContentLayout = IntatisThreadContentLayout(rawWidth: 900)) {
+         layout: IntatisThreadContentLayout = IntatisThreadContentLayout(rawWidth: 900),
+         onRetrySubmission: ((SubmissionID) -> Void)? = nil) {
         self.item = item
         self.style = style
         self.layout = layout
+        self.onRetrySubmission = onRetrySubmission
     }
 
     var body: some View {
@@ -303,11 +310,20 @@ struct CodeItemRow: View {
                 }
             }
             if isUser {
-                Text(body)
-                    .font(.system(size: 15))
-                    .foregroundStyle(style.primaryText)
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
+                if !body.isEmpty {
+                    Text(body)
+                        .font(.system(size: 15))
+                        .foregroundStyle(style.primaryText)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if !item.attachments.isEmpty {
+                    Label(
+                        "\(item.attachments.count) attachment\(item.attachments.count == 1 ? "" : "s")",
+                        systemImage: "paperclip")
+                        .font(.caption)
+                        .foregroundStyle(style.secondaryText)
+                }
             } else {
                 IntatisMessageContentView(
                     messageID: item.id,
@@ -322,6 +338,14 @@ struct CodeItemRow: View {
                     tint: item.isFailure ? style.error : style.accent,
                     style: style)
             }
+            if isUser,
+               let submissionID = item.submissionID,
+               let submissionStatus = item.submissionStatus {
+                submissionStatusView(
+                    id: submissionID,
+                    status: submissionStatus,
+                    failure: item.submissionFailure)
+            }
         }
         .padding(.horizontal, 15)
         .padding(.vertical, 11)
@@ -332,7 +356,64 @@ struct CodeItemRow: View {
         }
     }
 
+    private func submissionStatusView(
+        id: SubmissionID,
+        status: SubmissionStatus,
+        failure: SubmissionFailure?
+    ) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: submissionStatusIcon(status))
+                .foregroundStyle(status == .failed || status == .cancelled
+                    ? style.error
+                    : style.secondaryText)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(submissionStatusLabel(status))
+                    .font(.caption2.bold())
+                    .foregroundStyle(status == .failed || status == .cancelled
+                        ? style.error
+                        : style.secondaryText)
+                if let failure {
+                    Text(failure.message)
+                        .font(.caption2)
+                        .foregroundStyle(style.secondaryText)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Spacer(minLength: 4)
+            if failure?.retryable == true, let onRetrySubmission {
+                Button("Retry") { onRetrySubmission(id) }
+                    .buttonStyle(.borderless)
+                    .font(.caption.bold())
+                    .accessibilityIdentifier("submission.\(id.rawValue).retry")
+            }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("submission.\(id.rawValue).status")
+    }
+
+    private func submissionStatusLabel(_ status: SubmissionStatus) -> String {
+        switch status {
+        case .queued: return "Queued locally"
+        case .running: return "Running"
+        case .completed: return "Completed"
+        case .failed: return "Needs attention"
+        case .cancelled: return "Cancelled"
+        }
+    }
+
+    private func submissionStatusIcon(_ status: SubmissionStatus) -> String {
+        switch status {
+        case .queued: return "clock"
+        case .running: return "arrow.triangle.2.circlepath"
+        case .completed: return "checkmark.circle.fill"
+        case .failed: return "exclamationmark.circle.fill"
+        case .cancelled: return "xmark.circle.fill"
+        }
+    }
+
     private func bubbleStroke(isUser: Bool) -> Color {
+        if isUser && item.isFailure { return style.error.opacity(0.48) }
         if isUser { return style.accent.opacity(0.48) }
         if item.isFailure { return style.error.opacity(0.36) }
         return .clear
@@ -393,7 +474,7 @@ public struct PermissionResolutionNoticeView: View {
             Image(systemName: notice.decision == .allow ? "checkmark.circle.fill" : "xmark.circle.fill")
                 .foregroundStyle(notice.decision == .allow ? .green : .orange)
             VStack(alignment: .leading, spacing: 2) {
-                Text("\(notice.tool) \(notice.decision == .allow ? "approved" : "rejected")")
+                Text(title)
                     .font(.caption.bold())
                 Text(notice.reason)
                     .font(.caption)
@@ -406,14 +487,38 @@ public struct PermissionResolutionNoticeView: View {
         .intatisContentSurface(cornerRadius: 8)
         .padding(.horizontal)
         .padding(.vertical, 4)
+        .accessibilityIdentifier("permission.resolution")
+    }
+
+    private var title: String {
+        if notice.decision == .allow { return "\(notice.tool) approved" }
+        if notice.action == .cancelTurn { return "Turn cancelled" }
+        switch notice.failureSource {
+        case .userDenied:
+            return "\(notice.tool) call declined"
+        case .userCancelled, .turnCancelled:
+            return "Turn cancelled"
+        case .policyDenied:
+            return "\(notice.tool) call denied by policy"
+        case .reviewerTimedOut:
+            return "Automatic review timed out"
+        case .reviewerFailed:
+            return "Automatic review failed"
+        case .sandboxDenied:
+            return "Sandbox denied \(notice.tool)"
+        case .runtimeFailed:
+            return "\(notice.tool) runtime failed"
+        case nil:
+            return "\(notice.tool) denied"
+        }
     }
 }
 
 public struct PermissionCard: View {
     let permission: PendingPermission
-    let onResolve: (PermissionDecision) -> Void
+    let onResolve: (PermissionResponseAction) -> Void
 
-    public init(permission: PendingPermission, onResolve: @escaping (PermissionDecision) -> Void) {
+    public init(permission: PendingPermission, onResolve: @escaping (PermissionResponseAction) -> Void) {
         self.permission = permission
         self.onResolve = onResolve
     }
@@ -445,10 +550,19 @@ public struct PermissionCard: View {
                 Spacer()
                 if permission.state == .resolving {
                     ProgressView().controlSize(.small)
-                    Text("Resolving…").font(.caption).foregroundStyle(.secondary)
+                    Text(request.effectiveApprovalMode == .automaticReviewer
+                         ? "Automatic review in progress…"
+                         : "Resolving…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 } else if permission.state.isActionable {
-                    Button("Reject") { onResolve(.deny) }
-                    Button("Approve") { onResolve(.allow) }.keyboardShortcut(.defaultAction)
+                    Button("Cancel Turn") { onResolve(.cancelTurn) }
+                        .accessibilityIdentifier("permission.cancel-turn")
+                    Button("Decline Call") { onResolve(.decline) }
+                        .accessibilityIdentifier("permission.decline-call")
+                    Button("Approve Call") { onResolve(.approve) }
+                        .keyboardShortcut(.defaultAction)
+                        .accessibilityIdentifier("permission.approve-call")
                 }
             }
         }
@@ -471,7 +585,9 @@ public struct PermissionCard: View {
         case .livePending:
             return "Waiting for your decision."
         case .resolving:
-            return "Applying your decision."
+            return request.effectiveApprovalMode == .automaticReviewer
+                ? "The reserved permission reviewer is evaluating this call."
+                : "Applying your decision."
         case .approved:
             return "Approved."
         case .rejected:

@@ -100,9 +100,9 @@ workspace-relevant observations
 - `delegate_task` 不改变目标 binding，权限 target 必须包含其安全快照并在执行前复核。
 - rebind 是 host-only、idle-only、durable-first 的显式状态迁移，只影响未来 invocation；reviewer 不参与普通 rebind。
 - legacy 无 binding、missing revision、definition mismatch、unsupported wire 或显式能力不兼容一律 fail closed，不得回退 current/default/同名 model。
-- GUI/CLI recovery 的 startup gate 只要求 `@main` exact-resolved、reviewer/control plane ready，并先完成 Goal recovery；non-empty CLI session 缺失 `@main` 时只能由 host `/agent restore-main <path> <profile-id>` 显式恢复，不能套用 today default。ordinary worker unresolved 不得冻结全局 scheduler：它自己的 queued invocation 必须在 provider request 前 durable fail closed 并清除 active/queued fence，其他 agents 继续运行，随后 host 才可在该 worker idle 时 rebind。
+- GUI 与 CLI 的 recovery gate 不得混写。GUI 把 `@main` exact resolution 与 reviewer/control-plane readiness 作为提交后的执行状态，不作为 composer 编辑或本地 admission 条件；完成 Goal 对账后只为新工作释放 scheduler，恢复出的 root tasks 保持 paused/interrupted，直至精确 submission Retry。CLI 则保留显式 `/auto|/default` 与 data-plane resume 边界。active Goal 冷启动只 reconcile 并 durable pause（或 budget-limit），显式 Resume 才创建 continuation。non-empty CLI session 缺失 `@main` 时只能由 host `/agent restore-main <path> <profile-id>` 显式恢复，不能套用 today default。ordinary worker unresolved 不得冻结全局 scheduler：它自己的 queued invocation 必须在 provider request 前 durable fail closed 并清除 active/queued fence，其他 agents 继续运行，随后 host 才可在该 worker idle 时 rebind。
 - Modern CLI unqualified model 只有唯一 route match 时才选择该 route；explicit reasoning 必须命中 configured variant/base effort，否则 fail closed，不能合成 synthetic profile。
-- reviewer 与 GoalVerifier 是控制面；其 provider 从首次 exact `@main` binding 冻结，data-plane rebind 不能静默 retarget。
+- reviewer 与 GoalVerifier 是控制面；首次 exact `@main` resolution 冻结其 identity、binding 与 route，data-plane rebind 不能静默 retarget。Permission Reviewer 的 provider wrapper 按该冻结 binding 逐 generation 重新解析；GoalVerifier 保留独立 provider lifecycle。
 - binding、EventLog、permission preview、roster/UI 只显示安全 identity/revision/model/variant/route label/trust/egress 分类与不可逆 digest；不得暴露 raw endpoint、credential、headers/query/options 或完整实际 digest。Permission target fingerprint 必须绑定这些安全分类并在 review/prepare/executor 边界复核。
 - Cowork durable profile options 只接受显式 allowlisted schema；unknown key、错误 shape/size/depth、secret/auth/header/query/URL/endpoint-like container、runtime structural/stream/multi-candidate fields 全部 fail closed。Chat/Code 兼容 `ProviderEndpoint` 仍可 lossless 保留 arbitrary model JSON，但所有 OpenAI-compatible Chat/Agent request 都必须移除配置 `stream_options`/候选控制并固定 `n = 1`；host output-token ceiling 另移除竞争 aliases。Provider/custom runtime diagnostic 在成为 durable 事实前必须统一把完整 HTTP(S) URL 与 secret 脱敏并限长；ordinary permission preview 不使用该 URL-wide diagnostic rule。所有 provider transport 对 HTTP 30x 都 fail closed，不得自动跟随到未进入 exact binding/trust review 的 endpoint。
 
@@ -114,6 +114,8 @@ Provider resolution 也必须是原子的：shipping resolver 一次返回 exact
 
 ### 2.4 Capability Lease
 工具应按 capability lease 暴露。普通 worker task 不应收到 coordinator 工具（`spawn_agent` / `remove_agent` / `delegate_task`）。若 task 需委派，经 `CapabilityLease.delegation` 显式授予。子 agent 不应仅因被 spawn 就获得 coordinator 能力。Git、文档/媒体与网络/浏览器工具同样按 lease 收窄：新 spawn 的 worker 默认 `read_only`，只能获得安全只读能力；用户/上级显式请求 `read_write` 且不超过 issuer WorkspaceLease ceiling 时，worker 可获得不含 coordinator 工具的 Code/data-plane 写入能力。`canCoordinate` 与 workspace access 正交：只读 coordinator 可调度但不能写 workspace，read-write worker 可执行文件工作但不能 spawn/delegate 下级。
+
+`rename_session` 是普通工具协议中的 session-local metadata 能力，但不是普通 coordinator 能力。它只进入 exact `@main` 的 default capability lease；worker、spawn 出的 coordinator、task-scoped non-main lease 与 reviewer 都必须移除，不能通过 intersection/继承意外流下去。模型只提供名称，宿主绑定当前 session/kind 和 durable execution ID；不存在跨 session 目标解析。
 
 Lease 不只是工具列表：task-scoped lease 必须核对 task ID、communication/delegation grant，并在终态撤销；WorkspaceLease 必须执行 root、read-only/read-write、allow/deny path，并固定 canonical root 的文件系统 identity。任何可能跨 await 的授权都不能只在入口校验：attach commit、权限等待后、durable prepare 后紧邻 executor、派生/retry 与 process 启动前必须复核 identity；同路径目录被替换或 legacy lease 无 identity 时 fail closed。retry 只可从原 lease 的持久审计记录克隆，缺失历史时收窄到 worker，禁止按 agent 默认角色扩大权限。
 
@@ -129,15 +131,19 @@ Task lifecycle 是 durable state machine：
 created -> assigned -> queued -> running -> completed | failed | cancelled
 failed | cancelled -> queued  only through an explicit bounded retry attempt
 ```
-恢复时不能默认把所有 running 任务整段重放。每个实际 tool executor 调用前必须先持久化 execution ticket，结果持久化后再 settle；只有普通 read-only 调用可自动重放。write/exec/network/destructive 与通信、委派、spawn/remove 等协作副作用处于“prepared 但未 settled”时，任务必须进入人工对账失败态，不能自动增加 attempt。没有未决非幂等副作用的 running 任务才可在新 attempt 的 queue 事件成功落盘后重排；半完成 admission、耗尽 attempts 或缺失关键 lease 也必须明确失败。执行应有 bounded timeout/cancel、attempt 和明确标为 soft 的 session token budget；模型缺完成标记、迭代耗尽或不完整 finish reason 都是失败。
+恢复时不能默认把所有 running 任务整段重放。每个实际 tool executor 调用前必须先持久化 execution ticket，结果持久化后再 settle；只有明确 eligible 的 non-root/CLI recovery task 内的普通 read-only 调用可自动重放；GUI restored root 不适用。write/exec/network/destructive 与通信、委派、spawn/remove 等协作副作用处于“prepared 但未 settled”时，任务必须进入人工对账失败态，不能自动增加 attempt。只有明确 eligible 的 non-root/CLI read-only running task 才可在新 attempt 的 queue 事件成功落盘后重排；Phase A GUI restored root submission 始终 paused/interrupted，必须 exact Retry；半完成 admission、耗尽 attempts 或缺失关键 lease 也必须明确失败。执行应有 bounded timeout/cancel、attempt 和明确标为 soft 的 session token budget；模型缺完成标记、迭代耗尽或不完整 finish reason 都是失败。
 
-Permission Reviewer 是独立控制面，不是普通 worker：使用结构化 `PermissionReviewTask`、有界 FIFO/single-flight、独立 timeout/cancellation/单次输出上限，不占数据面 scheduler 槽，也不得递归运行 `AgentLoop`。deadline 从 submit 计时，queue full/timeout fail closed；自动模式只有 `allow` / `deny`，timeout、cancel、truncated、malformed、tool call、provider/persistence failure 只 durable deny 当前调用，不得隐式切到 GUI 人工 fallback。review request 与 verdict 都必须 durable-first；`allow` 只有 settled audit 成功后才可返回，自审或 hard deny 都不得放行，恢复时 orphan request 必须显式关闭。累计 token 仅可作为 soft warning/度量，默认不得用不可恢复的 session-lifetime cap 永久关闭 reviewer。用户取消当前数据面任务不得顺带关闭常驻 reviewer；只有 session stop、显式 disable 或控制面自身安全故障才进入 quiesce/shutdown。停用 reviewer 先 quiesce，再持久化 revoke/detach，迟到 allow 或落盘失败不得被误报成成功停用。reviewer 只可在 deterministic gate 的最大权限边界内收窄，不能批准真正越权；人工模式只能由用户显式切换。
+这里的判断单位是“这一次具体调用是否可能已经产生副作用”，不是只看工具静态类别。write 类工具继续默认 non-replayable；只有拥有 mutation boundary 的受信实现或 prepare 前 durable state 能证明该边界未被跨越时，才能追加可选 `effectDisposition=not_started` 的失败/取消 settlement。typed ordinary failure 可作为 observation 回灌同一 Agent turn；pre-executor cancellation 结算后仍中断 turn；legacy repair 只对账 EventLog，不存在当前 turn。新成功 settlement 必须显式标为 `committed`；legacy nil+succeeded 仅兼容成已完成效果并继续阻断 whole-task retry。生产 Orchestrator 的 `task_update` stale revision 是当前首个精确 no-effect case；公共 manager 的同名错误、普通 error、timeout、executor 内 cancellation、legacy failure nil/unknown 都不能套用。Projection 对 execution ID 坚持一次 prepare：第二个 prepare 即使相同也永久 ambiguous，冲突 terminal 同样保留首记录并永久 ambiguous；只有完全相同 terminal 可幂等，`succeeded + not_started` 是无效矛盾并进入 uncertain。旧日志修复必须先由 `replayForProjectionChecked()` + `hasCompleteKnownHistory` 证明历史完整，并且只能发生在无 current Goal、exact 唯一 prepare、没有任何 settlement/ambiguity、JSON safe integer 与 prepare 前 monotonic revision proof 同时成立时，不得解析自由文本或用 prepare 后状态猜测。Goal startup/进程内 launch、Orchestrator restore 与 whole-task retry 都必须使用同一 complete-known-history gate；unknown future type 或 seq gap 不能支持 absence/order proof。任务级确定错误应局部终结，不应无条件升级成整个 session 不可输入；无 Goal 的隔离仍须证明 exact contract-before-prepare、正 attempt 与 exact-attempt terminal-after-prepare，无法归属、损坏/不完整历史、非终态任务与任何 current Goal 的 uncertain 副作用保持 fail closed。
+
+Permission Reviewer 是独立控制面，不是普通 worker：使用结构化 `PermissionReviewTask`、有界 FIFO/single-flight、独立 timeout/cancellation/单次输出上限，不占数据面 scheduler 槽，也不得递归运行 `AgentLoop`。deadline 从 submit 计时，queue full/timeout fail closed；自动模式只有 `allow` / `deny`。pre-submit caller cancel 直接返回 typed deny且不创建 review lifecycle；timeout、truncated、malformed、tool call、provider/persistence failure 与已登记 review 在 terminal-claim 前被观察到的 cancel durable deny 当前调用，不得隐式切到 GUI 人工 fallback；claim 后 cancel 保留唯一 settlement 但最终 authorization delivery deny。review request 与 verdict 都必须 durable-first；`allow` 只有 settled audit 成功后才可返回，自审或 hard deny 都不得放行，恢复时 orphan request 必须显式关闭。每个 provider dispatch 使用 exact `{reviewTaskID, nonce}` generation；provider/timeout 竞争同代首 terminal，provider-backed terminal claim 必须匹配该 generation，pre-dispatch terminal 则从 running/no-generation 状态唯一 claim。caller cancel 由同步 request token、actor path 与 settlement/delivery/admission 围栏共同处理。timeout/cancel 只影响当前 call；若已有 active generation 就只 retire 该代，下一 request fresh-resolve provider wrapper；旧代 late/duplicate result 无 EventLog/health/authorization 能力。provider factory 冻结 reviewer identity/exact binding，且不得捕获 Orchestrator；`ToolCallingProvider.stream` 必须立即返回 request-owned stream，并传播 consumer termination，同步永久阻塞实现不在契约内。累计 token 仅可作为 soft warning/度量，默认不得用不可恢复的 session-lifetime cap 永久关闭 reviewer。用户取消当前数据面任务不得顺带关闭常驻 reviewer；只有 session stop、显式 disable 或控制面自身安全故障才进入 quiesce/shutdown。停用 reviewer 先 quiesce，再持久化 revoke/detach；迟到 allow 或落盘失败不得被误报成成功停用，detach 失败 resume 后仍必须用 fresh generation。terminal claim 后 cancel/quiesce 可使最终 authorization delivery deny，但不得重写唯一 reviewer settlement 或执行工具。reviewer 只可在 deterministic gate 的最大权限边界内收窄，不能批准真正越权；人工模式只能由用户显式切换。legacy `provider_still_stopping` 只作旧 EventLog 解码，不得重新成为 live permission-review state。
+
+每个 ask-class request 还必须有稳定 RequestID、TurnID 与 toolCallID，并在 responder/UI/transport 可见前 durable register。EventLog 在完整已知历史与跨进程锁内实现 request first-write、settlement first-terminal；exact duplicate/reconnect 幂等共享原 owner generation/terminal，冲突 payload 或终态 fail closed。人工 action 必须显式区分 approve、decline、cancel-turn：decline 是 call-scoped，写 typed denied tool result 后允许同一 turn 继续；cancel-turn 是 turn-scoped，只写 permission terminal并结束为 interrupted，不能制造 user-denied tool result。automatic mode 从最早通用 request event 起不可人工操作或 fallback。pending projection/CLI responder 保持 FIFO，结算中间项不能改变其他请求相对顺序。取消/停止先 drain provider/tool child，再清 waiter、关闭 reviewer与发布 terminal。
 
 Goal Verifier 是另一条独立控制面，职责仅是判定 Goal 是否已有充分证据完成。它不是 Permission Reviewer，也不是普通 agent：使用独立 system/context、无工具 provider 请求、有界 timeout/cancel/output，不能写 EventLog 或执行 workspace 动作。WorkTask result/evidence 是 agent-reported，不是完成证明；只有 host 从同一 Goal 的 durable 成功 tool-execution settlement 经 validation-tool allowlist 派生的 `validationEvidence` 才能作为 completion proof。malformed、tool call、缺完成标记、provider/usage failure、timeout/cancel 必须 fail safe 为 `continue`，不能误报 Goal 完成。只有 host 校验 verifier 返回的 requirement/evidence 与这些 host-bound evidence 一致后，才可追加 Goal audit/completed 事件。
 
-Goal 生命周期必须由 host 串行化：start、ordinary turn、Goal mutation 与 stop/shutdown 分别有 single-flight/mutation/stop gate；pending durable stop 未结算前不得启动新 run，start 取消后若已创建 continuation，必须先 scoped cancel、等待退出并 checkpoint 才返回失败。restore 必须持续暂停 scheduler，直到 roster/reviewer/main 与 Goal recovery/reconcile 完成且宿主显式 resume 成功。Cowork `/goal` 是明确 host action；普通自然语言只有在窄、确定性的中英文持续目标分类器命中时才可为本轮提供 create intent，复杂请求、Goal 提及、一次性目标、引用示例或附件内容不得提升权限。
+Goal 生命周期必须由 host 串行化：start、ordinary turn、Goal mutation 与 stop/shutdown 分别有 single-flight/mutation/stop gate；pending durable stop 未结算前不得启动新 run，start 取消后若已创建 continuation，必须先 scoped cancel、等待退出并 checkpoint 才返回失败。restore 必须持续暂停 scheduler，直到 roster/reviewer/main 与 Goal recovery/reconcile 完成。GUI 随后只释放新工作并继续围栏 restored roots；CLI 才执行显式 data-plane resume。Cowork `/goal` 是明确 host action；普通自然语言只有在窄、确定性的中英文持续目标分类器命中时才可为本轮提供 create intent，复杂请求、Goal 提及、一次性目标、引用示例或附件内容不得提升权限。
 
-模型可见的 agent/task/message/goal 操作与文件、网络、文档工具遵循同一个 ToolCall 协议。WorkTask CRUD 与 Goal create/update 也是 control-plane effects，必须先过 schema、lease 与 PermissionEngine；worker 默认只能读取 Goal/相关 WorkTask，并更新自己当前绑定的 WorkTask，不能改 DAG/owner/priority/retry/cancel 或提交 Goal verdict。一个外部 ToolCall 只能有一个权限决定；`spawn_agent` / 原子 `delegate_task` 获准后，内部 roster、lease、mailbox、task graph 与 scheduler admission 必须作为 executor 的 durable transaction 完成，不能再次递归进入 PermissionEngine。Code 与 Cowork agent 共用 headless `AgentRuntime`；首个 system message 必须稳定声明 Intatis 模式、API tools 权威性、严格 JSON Schema 与 ToolResult 完成语义，动态 workspace/task/lease/goal/run 数据仍放在 user-role untrusted context。
+模型可见的 agent/task/message/goal/session 操作与文件、网络、文档工具遵循同一个 ToolCall 协议。WorkTask CRUD、Goal create/update 与 session rename 都必须先过 schema、lease（Cowork）与 PermissionEngine；`rename_session` 的 exact current-session/no-path/no-network/no-data-effect intent 可由 deterministic gate 低风险放行，但 near-miss 与 locked 状态不能借此绕过。worker 默认只能读取 Goal/相关 WorkTask，并更新自己当前绑定的 WorkTask，不能改 DAG/owner/priority/retry/cancel、提交 Goal verdict或改 session 名称。一个外部 ToolCall 只能有一个权限决定；`spawn_agent` / 原子 `delegate_task` 获准后，内部 roster、lease、mailbox、task graph 与 scheduler admission 必须作为 executor 的 durable transaction 完成，不能再次递归进入 PermissionEngine。Code 与 Cowork agent 共用 headless `AgentRuntime`；首个 system message 必须稳定声明 Intatis 模式、API tools 权威性、严格 JSON Schema 与 ToolResult 完成语义，动态 workspace/task/lease/goal/run 数据仍放在 user-role untrusted context。
 
 ## 3. 通信 vs 委派
 
@@ -173,7 +179,20 @@ unbounded agent spawning
 
 Cowork 可以采用项目制：一个 session 绑定一个或多个用户选择的工作目录，并有一个 `@main` 主 agent。用户默认只向 `@main` 下达项目任务；`@main` 通过工具创建、委派、调取、删除子 agent，并管理任务、上下文、未来-agent inference default、权限 profile、token budget 等 project metadata。但 project/session settings 只是本地元数据与 UI 投影；future default 不得重写现有 agent，也不得替代 task contract、exact inference binding、capability lease、workspace lease 或权限门。
 
-工作区扩展**绝非**只读。创建或附加 agent 到新目录是能力/工作区扩展，必须经权限。唯一例外是 brand-new session 的初始 bootstrap：用户在 New Cowork Session 文件选择器或 CLI workspace 参数中明确选定 primary workspace 后，这次显式选择本身授权固定 `@main` 在该 canonical root 建立默认 workspace/capability lease；该路径必须同时要求空 EventLog、空 roster、固定 `@main` 身份、敏感/过宽根目录拒绝和 admission batch durable-first，不能被普通 attach/spawn/tool/recovery 复用。初始 `@permission-reviewer` 可随后用其固定 read_only + 空工具 lease 挂载；两者之间不得再让模型审批同一次 primary-workspace 选择。
+Session 状态遵循一个事实源、两个不同性质的本地投影：
+
+```text
+events.jsonl              canonical settings / migration / agent+lease registration / runtime events
+session.json              schema-v2 secret-free rebuildable projection; EventLog always wins
+workspace-access.plist    schema-v1 session-owned opaque bookmark capability; never copied into either text store
+```
+
+- settings、显示名、迁移标记必须 EventLog-first；append 返回值和 subscriber 也必须发布从实际落盘 bytes 反解的 canonical Envelope。legacy display name 必须在任何 schema-v2 rebuild 前捕获，并在同一 transaction 中先追加 settings+marker；`session.json` 同水位也要用完整 EventLog fold 校验，不能因 cache 看起来“更新”就信任它。模型改名记录必须保存 source 与宿主提供的 durable execution ID；同 operation exact retry 不能追加，冲突 payload fail closed，旧 operation retry 只返回 latest projection而不能覆盖更晚 rename。raw 名称在 authorization/prepared 前 secret-scan，不能进入 durable tool-call args/digest。
+- bookmark 是能力材料，不是项目文案或普通设置。它必须以 binary plist、`0600`、no-follow lock、原子替换与 file/parent sync 保存；macOS 在实际 Code/Cowork 使用期持有同一 scoped URL 的 `WorkspaceAccessLease`，不能只保存 canonical path 后立即停止 security scope。共享 path 必须按 settings + live roster 做引用判断，不能 last-writer-wins；primary 在 UI、业务方法和 store 默认拒删，只有尚未成立的新建/重授权事务失败回滚可显式清理。
+- UserDefaults/旧 path map 只作迁移输入。只有 session 自己存在 ownership evidence，且 exact binding、全部必需 bookmark、primary 语义与 capability 文件都验证成功，才可追加稳定 migration marker并清理旧 key；symlink alias 必须先 resolve bookmark、启用 scope、验证 canonical identity，再把 canonical settings 写入 EventLog，最后写 marker。候选发现可跳过无关 stale evidence，但真正选中的 source 必须再次严格 resolve。marker 后禁止从 global map 恢复能力材料。
+- Session settings 本身不授予 capability/workspace lease，也不触发 provider。可恢复“登记”不等于可恢复“执行”；普通 recovered root task 不得因 projection 重建而自动续跑，active Goal 也只能在冷启动对账后 durable pause。运行中的 app 内 session 切换/Command-W 不等于 Stop；Command-Q 才对全部 runtime 发起 bounded stop，crash/reopen 只显示 reconciled interrupted/paused 状态。继续执行必须是用户显式 Send、Retry 或 Resume。
+
+工作区扩展**绝非**只读。创建或附加 agent 到新目录是能力/工作区扩展，必须经权限。唯一例外是 brand-new session 的初始 bootstrap：用户在 New Cowork Session 文件选择器或 CLI workspace 参数中明确选定 primary workspace 后，这次显式选择本身授权一个严格 settings-first 七事件合同，连续 `seq 0...6` 依次登记 settings、`@main` workspace/capability/agent、`@permission-reviewer` workspace/capability/agent。两者共享 host-selected exact inference binding，但 identity、workspace lease 与 capability lease 必须不同；reviewer 固定 read-only、空工具、无 communication/delegation、depth 0。该路径还必须要求空 EventLog、空 roster、敏感/过宽根目录拒绝、canonical identity 与 durable-first；初始化不调用模型/provider，也不能被普通 attach/spawn/tool/recovery 复用。
 
 不得让 model 静默附加到：
 ```text
@@ -218,6 +237,16 @@ hard deny remains final before the reviewer can see anything
 - max-iteration/incomplete provider responses can be reported as completed
 - session-global provider/model selection makes existing agents drift together
 - recovery silently substitutes a current/default model for an unresolved exact binding
+- session settings/bookmarks are split across UserDefaults/global path maps without one canonical session authority
+- session.json can override EventLog or become the only source of a rename
+- fresh bootstrap omits canonical settings or relies on a model request before local registration
+- legacy shared bookmark fallback can resurrect deleted session capability material after migration
+- EventLog append can publish a pre-encoding object that diverges from replayed canonical bytes
+- legacy display-name migration can rebuild schema-v2 projection before preserving the old name
+- historical-main recovery can accept a malformed settings revision chain outside the strict canonical fold
+- shared workspace metadata can overwrite the only owner and revoke a still-referenced bookmark
+- shared primary workspace can become removable while roster restoration is still pending
+- symlink alias migration can compare protected paths before enabling the bookmark security scope
 
 仍需持续关注：
 - priorHistory/global context projection must stay scoped for task runs
@@ -230,6 +259,8 @@ hard deny remains final before the reviewer can see anything
 - cancellation is cooperative; provider/tool implementations need their own bounded cancellation/watchdog behavior
 - real-provider crash/restart and long-running Goal/WorkTask multi-agent GUI/CLI matrices remain device-level validation work
 - EventLog-derived context/recovery index remains a future long-session performance optimization; request context itself must remain bounded even before such an index exists
+- composer/edit-dialog permission UX (Phase A), reviewer request/generation isolation (Phase B), permission/tool/turn outcome semantics (Phase C), and App/runtime ownership plus quit semantics (Phase L) are implemented as separate changes; Phase S persistence must not be described as solving any of them
+- application runtime ownership stays exact-session scoped: windows own presentation, the app manager owns runtimes; switching/Command-W never implies stop, exact deletion drains only that session, Command-Q closes admission and uses bounded concurrent shutdown, and cold reopen never auto-dispatches provider work
 - immutable inference revisions and exact agent/task bindings must never be collapsed back to mutable current/default pointers
 - future-agent default changes must not rewrite existing agents; implicit spawn inherits exactly, explicit profile stays host-approved, and rebind remains host-only/idle-only/durable-first
 - permission/control-plane audit must retain a safe target-binding snapshot without leaking endpoint, credential or options
@@ -258,6 +289,7 @@ hard deny remains final before the reviewer can see anything
 9. Add Goal / WorkTask / ContinuationRun above the existing AgentInvocation layer without renaming old durable event types.
 10. Add host-driven continuation and an independent GoalVerifier; never let an agent self-certify Goal completion.
 11. Add versioned immutable inference catalog + exact per-agent binding before adding multi-wire, route-lease or fallback policy; do not retrofit a mutable session-global model pointer into agent identity.
+12. Keep session state EventLog-first, `session.json` rebuildable, bookmark capability session-owned, legacy migration provenance-bound, and fresh bootstrap fixed at seven local events before changing composer/reviewer/lifecycle behavior.
 ```
 
 ## 8. 测试期望
@@ -274,12 +306,32 @@ worker receives only read-only document/media tools and no git-control/git-remot
 delegation cycle is rejected
 workspace expansion requires permission
 fresh-session bootstrap attaches fixed @main with a host-selected exact inference binding, without model review, and cannot be reused after any durable session state exists
+fresh-session bootstrap writes exactly seven ordered events (settings, main workspace/capability/agent, reviewer workspace/capability/agent), uses distinct identities/leases, and never calls a provider
+session settings protocol round-trips/legacy-decodes additively, rejects wrong session/kind/schema/revision/migration IDs, and canonical encoding omits legacy defaultProviderID
+session.json schema-v2 refresh is EventLog-wins against same-watermark and lagging corruption, serializes concurrent writers, refuses unknown future session events, and is safely rebuildable
+workspace-access.plist is schema-v1 binary owner-only 0600, validates session/path/single primary, preserves primary on bookmark refresh, and rejects unsafe lock/write states
+security-scoped workspace access is retained for the whole active Code/Cowork lifetime and reauthorization accepts only the exact canonical historical path
+legacy settings/bookmark migration requires per-session provenance plus all-required capability verification, writes an idempotent marker before cleanup, and never resurrects global fallback after that marker
+historical missing-main recovery uses canonical settings and a dedicated host-authorized path; reviewer replacement happens only after main repair; neither path calls the provider or resumes interrupted work
+session rename appends the EventLog settings transition before refreshing session.json and never changes SessionID/directory
 agent-to-agent event records caller, target, task, and causal chain
 automatic permission reviewer cannot override hard deny
 automatic permission reviewer can be enabled/disabled without becoming a normal worker
+permission request identity is first-write-wins and conflicting RequestID reuse fails closed
+permission settlement is first-terminal-wins under concurrency; exact duplicates are idempotent and conflicting terminals cannot overwrite the first
+legacy outcome/action/mode/correlation fields decode conservatively, while each new Chat/Code/Cowork turn records one semantic terminal turn outcome
+manual decline emits one denied tool result and continues the same turn; cancel-turn interrupts without a fabricated denied tool result
+pending permission projection and CLI response handling stay FIFO, including middle-item settlement, and automatic requests expose no manual action
+turn abort drains provider/tool execution before clearing approval waiters, shutting down the reviewer, publishing terminal state, or returning to the caller
+trusted sandbox startup denial is typed and not-started when provable, but never automatically widens authority, removes the sandbox, or retries
 user turn creates a root task and waits for one terminal event
 same agent is single-flight while different agents respect the concurrency limit
-running task recovery increments attempt; exhausted/interrupted admission fails explicitly
+eligible non-root/CLI read-only crash recovery increments attempt; GUI restored root submissions stay paused/interrupted until exact submission Retry; exhausted/interrupted admission fails explicitly
+tool execution projection accepts only one prepare per execution ID, permanently quarantines duplicate prepares/conflicting terminals while retaining the first records, and rejects succeeded/not-started contradictions
+new successful settlements are explicitly committed; legacy nil+succeeded remains a completed effect that blocks whole-task retry, while legacy failed/cancelled/denied nil and explicit unknown remain uncertain
+Orchestrator restore, Goal startup/in-process launch, and whole-task retry require complete known projection history; unknown future event types and seq gaps fail closed for absence/order proofs
+legacy stale task_update repair requires no current Goal, one exact unambiguous prepare, no settlement, a JSON-safe expected revision, and durable pre-prepare revision proof
+no-Goal uncertain-ticket isolation requires exact contract/positive-attempt/terminal ordering; any current Goal requires an empty uncertain set
 cancel, timeout, maxIterations, missing completion marker, and incomplete finish reason never complete
 Goal / WorkTask / ContinuationRun IDs remain stable and all new events round-trip/replay without breaking legacy TaskContract JSON
 WorkTask DAG rejects missing/cross-run/self/cyclic dependencies, stale revisions, invalid transitions, and completion without required result/evidence
@@ -314,7 +366,7 @@ ordinary attach revalidates the exact approved profile after permission-review a
 reviewer/GoalVerifier provider stays frozen when a data-plane agent is rebound
 CLI compiles multiple routes/models/variants, retains old exact revisions, and resolves each connection revision with its own credential reference rather than the selected route's key
 CLI selects an unqualified model's route only when unique, rejects missing reasoning variants, and requires explicit restore-main for a non-empty session with no durable @main
-GUI/CLI gate startup only on exact-resolved @main plus reviewer/control-plane readiness; an unresolved ordinary worker durably fails only its own queued invocation before provider dispatch, clears its busy fence, and does not pause other agents
+GUI local admission remains available regardless of exact-main/reviewer readiness and only new work is released after recovery; CLI retains explicit data-plane resume; an unresolved ordinary worker durably fails only its own queued invocation before provider dispatch, clears its busy fence, and does not pause other agents
 macOS raw variant config keys never enter durable bindings/events; diagnostic URLs are redacted and provider HTTP 30x redirects are never followed
 roster/UI/CLI inference presentation never exposes raw endpoint, credential, options, secret-shaped labels, or a complete actual digest
 provider/custom runtime diagnostics are secret-redacted again before durable ErrorPayload/task failure persistence

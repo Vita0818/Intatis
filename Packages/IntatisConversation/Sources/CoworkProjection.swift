@@ -65,19 +65,71 @@ public struct CoworkToolExecutionView: Identifiable, Equatable, Sendable {
     public var preparedSeq: Int
     public var settled: ToolExecutionSettledPayload?
     public var settledSeq: Int?
+    /// Duplicate prepares or conflicting terminal settlements make an
+    /// execution ID unsafe to interpret. The projection retains the first
+    /// observed records for audit, but no terminal result may clear recovery
+    /// gates once this flag is set.
+    public var hasAmbiguousDurableHistory: Bool
 
     public init(prepared: ToolExecutionPreparedPayload,
                 preparedSeq: Int,
                 settled: ToolExecutionSettledPayload? = nil,
-                settledSeq: Int? = nil) {
+                settledSeq: Int? = nil,
+                hasAmbiguousDurableHistory: Bool = false) {
         self.prepared = prepared
         self.preparedSeq = preparedSeq
         self.settled = settled
         self.settledSeq = settledSeq
+        self.hasAmbiguousDurableHistory = hasAmbiguousDurableHistory
+    }
+
+    /// A settlement is authoritative for this projected execution only when it
+    /// follows (or reconstructs) the exact durable prepare record. Reused IDs,
+    /// reordered events, and mismatched payloads remain unresolved rather than
+    /// borrowing a terminal outcome from another call.
+    public var validatedSettlement: ToolExecutionSettledPayload? {
+        guard !hasAmbiguousDurableHistory,
+              let settled,
+              let settledSeq,
+              settledSeq >= preparedSeq,
+              settled.prepared == prepared,
+              !(settled.outcome == .succeeded
+                && settled.effectDisposition == .notStarted) else { return nil }
+        return settled
+    }
+}
+
+/// Immutable accepted user payload plus its latest validated execution status.
+/// Array order in ``CoworkProjection/submittedIntents`` is admission FIFO.
+public struct CoworkSubmittedIntentView: Identifiable, Equatable, Sendable {
+    public let id: SubmissionID
+    public let payload: UserMessagePayload
+    public let submittedSeq: Int
+    public var status: SubmissionStatus?
+    public var attempt: Int?
+    public var failure: SubmissionFailure?
+
+    public init?(payload: UserMessagePayload,
+                 submittedSeq: Int,
+                 status: SubmissionStatus? = nil,
+                 attempt: Int? = nil,
+                 failure: SubmissionFailure? = nil) {
+        guard let id = payload.submissionID else { return nil }
+        self.id = id
+        self.payload = payload
+        self.submittedSeq = submittedSeq
+        self.status = status
+        self.attempt = attempt
+        self.failure = failure
     }
 }
 
 public struct CoworkProjection: Equatable, Sendable {
+    public private(set) var sessionSettings: SessionSettingsUpdatedPayload?
+    public private(set) var completedSessionMigrations: [String: SessionStorageMigratedPayload] = [:]
+    /// Accepted submitted intents in first-admission order. Duplicate
+    /// `user_message` records carrying an existing identity are ignored.
+    public private(set) var submittedIntents: [CoworkSubmittedIntentView] = []
     /// Execution-layer invocation views (legacy `TaskID` semantics).
     public private(set) var tasks: [TaskID: CoworkTaskView] = [:]
     /// Durable user-visible work plan, independent of invocation completion.
@@ -141,7 +193,7 @@ public struct CoworkProjection: Equatable, Sendable {
 
     public var unresolvedToolExecutions: [CoworkToolExecutionView] {
         toolExecutions.values
-            .filter { $0.settled == nil }
+            .filter { $0.validatedSettlement == nil }
             .sorted {
                 if $0.preparedSeq == $1.preparedSeq { return $0.id < $1.id }
                 return $0.preparedSeq < $1.preparedSeq
@@ -154,13 +206,50 @@ public struct CoworkProjection: Equatable, Sendable {
         }
     }
 
-    /// Every non-replayable executor boundary that was reached, including
-    /// calls whose settled record says `succeeded`. A settled success proves
-    /// the side effect happened; it does not make replaying the enclosing task
-    /// safe because the task starts again from its first model/tool step.
+    /// Non-replayable calls whose durable outcome still cannot establish
+    /// whether the declared side effect happened. A legacy successful
+    /// settlement is a known completed effect (and still blocks task replay),
+    /// while legacy failed/cancelled/denied settlements remain uncertain.
+    public var uncertainNonReplayableToolExecutions: [CoworkToolExecutionView] {
+        toolExecutions.values
+            .filter { execution in
+                guard execution.prepared.requiresTaskReplayReconciliation else {
+                    return false
+                }
+                guard let settled = execution.validatedSettlement else {
+                    return true
+                }
+                switch settled.effectDisposition {
+                case .notStarted, .committed:
+                    return false
+                case .unknown:
+                    return true
+                case nil:
+                    return settled.outcome != .succeeded
+                }
+            }
+            .sorted {
+                if $0.preparedSeq == $1.preparedSeq { return $0.id < $1.id }
+                return $0.preparedSeq < $1.preparedSeq
+            }
+    }
+
+    /// Every non-replayable executor boundary that may have produced an effect.
+    /// A settled success or legacy/unknown disposition remains blocking because
+    /// replaying the enclosing task starts again from its first model/tool step.
+    /// Only a validated settlement proving the side effect never started is exempt.
     public var startedNonReplayableToolExecutions: [CoworkToolExecutionView] {
         toolExecutions.values
-            .filter { $0.prepared.requiresTaskReplayReconciliation }
+            .filter { execution in
+                guard execution.prepared.requiresTaskReplayReconciliation else {
+                    return false
+                }
+                guard let settled = execution.validatedSettlement else {
+                    return true
+                }
+                return settled.effectDisposition != .notStarted
+                    || settled.outcome == .succeeded
+            }
             .sorted {
                 if $0.preparedSeq == $1.preparedSeq { return $0.id < $1.id }
                 return $0.preparedSeq < $1.preparedSeq
@@ -177,6 +266,47 @@ public struct CoworkProjection: Equatable, Sendable {
 
     public mutating func apply(_ envelope: Envelope) {
         switch envelope.event {
+        case .sessionSettingsUpdated(let payload):
+            guard payload.schemaVersion == SessionSettingsUpdatedPayload.currentSchemaVersion,
+                  payload.kind == .cowork,
+                  payload.revision > 0,
+                  payload.cowork?.sessionID == envelope.session else { return }
+            if let current = sessionSettings {
+                let (expectedRevision, overflow) =
+                    current.revision.addingReportingOverflow(1)
+                guard payload.previousRevision == current.revision,
+                      !overflow,
+                      payload.revision == expectedRevision else { return }
+            } else {
+                guard payload.previousRevision == nil,
+                      payload.revision == 1 else { return }
+            }
+            sessionSettings = payload
+        case .sessionStorageMigrated(let payload):
+            guard payload.schemaVersion == SessionStorageMigratedPayload.currentSchemaVersion,
+                  !payload.migrationID.isEmpty else { return }
+            if let current = completedSessionMigrations[payload.migrationID], current != payload {
+                return
+            }
+            completedSessionMigrations[payload.migrationID] = payload
+        case .userMessage(let payload):
+            guard let submissionID = payload.submissionID,
+                  !submittedIntents.contains(where: { $0.id == submissionID }) else { return }
+            guard let submittedIntent = CoworkSubmittedIntentView(
+                payload: payload,
+                submittedSeq: envelope.seq) else { return }
+            submittedIntents.append(submittedIntent)
+        case .submissionStatusChanged(let payload):
+            guard let index = submittedIntents.firstIndex(where: {
+                $0.id == payload.submissionID
+            }), SubmissionStatusFold.accepts(
+                currentStatus: submittedIntents[index].status,
+                currentAttempt: submittedIntents[index].attempt,
+                next: payload)
+            else { return }
+            submittedIntents[index].status = payload.status
+            submittedIntents[index].attempt = payload.attempt
+            submittedIntents[index].failure = payload.failure
         case .agentAttached(let payload):
             agentRoster[payload.agent] = payload
         case .agentSpawned(let payload):
@@ -391,8 +521,11 @@ public struct CoworkProjection: Equatable, Sendable {
             capabilityLeaseAgents.removeValue(forKey: payload.leaseID)
         case .toolExecutionPrepared(let payload):
             if var existing = toolExecutions[payload.executionID] {
-                existing.prepared = payload
-                existing.preparedSeq = envelope.seq
+                // An execution ID identifies exactly one durable attempt. A
+                // second prepare cannot supersede the first, even when its
+                // payload is byte-for-byte identical: the first executor may
+                // already have committed before the duplicate was appended.
+                existing.hasAmbiguousDurableHistory = true
                 toolExecutions[payload.executionID] = existing
             } else {
                 toolExecutions[payload.executionID] = CoworkToolExecutionView(
@@ -404,16 +537,25 @@ public struct CoworkProjection: Equatable, Sendable {
                 ?? CoworkToolExecutionView(
                     prepared: payload.prepared,
                     preparedSeq: envelope.seq)
-            execution.settled = payload
-            execution.settledSeq = envelope.seq
+            if let firstSettlement = execution.settled {
+                // Exact duplicate terminal records are idempotent. A different
+                // second terminal record is ambiguous and must never overwrite
+                // the first result or relax recovery/retry gates.
+                if firstSettlement != payload {
+                    execution.hasAmbiguousDurableHistory = true
+                }
+            } else {
+                execution.settled = payload
+                execution.settledSeq = envelope.seq
+            }
             toolExecutions[payload.executionID] = execution
-        case .userMessage, .messageDelta, .messageCompleted, .error,
+        case .messageDelta, .messageCompleted, .error,
              .toolCall, .toolResult, .permissionRequest, .permissionResolved,
              .patchProposed, .agentAttachRequested,
              .agentSpawnRequested, .agentToAgentMessage, .workspaceLeaseRequested,
              .workspaceLeaseDenied, .permissionReview, .permissionReviewRequested,
              .permissionReviewSettled, .artifactAdded,
-             .artifactProgress, .turnStats:
+             .artifactProgress, .turnStats, .turnOutcome:
             break
         }
     }

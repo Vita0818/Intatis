@@ -14,6 +14,59 @@ private enum WorkspaceNetworkAccess {
     case allowed
 }
 
+enum WorkspaceSandboxBackend: Sendable {
+    case macOSSandboxExec
+    case bubblewrap
+}
+
+/// Recognizes only diagnostics emitted by the sandbox wrapper while it is
+/// setting up the isolation boundary. A command that merely exits non-zero or
+/// prints an unqualified "Operation not permitted" is intentionally not
+/// classified: once the target process may have started, the result is an
+/// ordinary runtime failure with no safe retry inference.
+func workspaceSandboxStartupDenial(
+    in result: ShellResult,
+    backend: WorkspaceSandboxBackend,
+    managedCommandShimStarted: Bool
+) -> WorkspaceSandboxDeniedError? {
+    guard result.exitCode != 0,
+          managedCommandShimStarted == false else { return nil }
+    let lines = result.stderr.split(whereSeparator: { $0.isNewline }).map {
+        $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    switch backend {
+    case .macOSSandboxExec:
+        let denied = lines.contains { line in
+            let isWrapperDiagnostic = line.hasPrefix("sandbox-exec:")
+                || line.hasPrefix("/usr/bin/sandbox-exec:")
+            return isWrapperDiagnostic
+                && line.contains("sandbox_apply:")
+                && (line.contains("operation not permitted")
+                    || line.contains("permission denied"))
+        }
+        return denied
+            ? WorkspaceSandboxDeniedError(
+                reason: "macOS workspace sandbox denied process startup")
+            : nil
+
+    case .bubblewrap:
+        let denied = lines.contains { line in
+            let isWrapperDiagnostic = line.hasPrefix("bwrap:")
+                || line.hasPrefix("/usr/bin/bwrap:")
+                || line.hasPrefix("/bin/bwrap:")
+            return isWrapperDiagnostic
+                && (line.contains("operation not permitted")
+                    || line.contains("permission denied")
+                    || line.contains("no permissions to create"))
+        }
+        return denied
+            ? WorkspaceSandboxDeniedError(
+                reason: "Bubblewrap workspace sandbox denied process startup")
+            : nil
+    }
+}
+
 /// Runs model-authored raw shell commands inside an OS-enforced workspace
 /// envelope. The production registry does not expose this tool, but the runner
 /// itself remains fail-closed for compatibility and regression tests.
@@ -366,10 +419,26 @@ private func runWorkspaceProcess(executable: URL,
     try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
     try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: runtime) }
+    let startupMarkerURL = runtime.appendingPathComponent(
+        "command-shim-started-\(UUID().uuidString)")
+    guard FileManager.default.createFile(
+        atPath: startupMarkerURL.path,
+        contents: Data()) else {
+        throw IntatisError.io("could not create managed process startup marker")
+    }
+    let startupMarkerHandle = try FileHandle(forReadingFrom: startupMarkerURL)
+    defer { try? startupMarkerHandle.close() }
+    let markerDescriptor = startupMarkerHandle.fileDescriptor
+    let markerFlags = fcntl(markerDescriptor, F_GETFD)
+    guard markerFlags >= 0,
+          fcntl(markerDescriptor, F_SETFD, markerFlags | FD_CLOEXEC) == 0 else {
+        throw IntatisError.io("could not protect managed process startup marker")
+    }
 
     var sanitized = sanitizedProcessEnvironment(home: home, temporary: temporary)
     environment.forEach { sanitized[$0.key] = $0.value }
     let processSpec: ManagedProcessSpec
+    let sandboxBackend: WorkspaceSandboxBackend
     #if os(macOS)
     guard FileManager.default.isExecutableFile(atPath: "/usr/bin/sandbox-exec") else {
         throw IntatisError.config("process execution is disabled because the macOS workspace sandbox is unavailable")
@@ -386,8 +455,10 @@ private func runWorkspaceProcess(executable: URL,
         arguments: ["-p", profile] + limitedExecutionArguments(
             executable: executable,
             arguments: arguments,
+            startupMarker: startupMarkerURL,
             maximumOutputBytes: maximumOutputBytes),
         environment: sanitized)
+    sandboxBackend = .macOSSandboxExec
     #elseif os(Linux)
     guard let bubblewrap = bubblewrapExecutable() else {
         throw IntatisError.config("process execution is disabled because Bubblewrap is unavailable; install bwrap")
@@ -410,16 +481,35 @@ private func runWorkspaceProcess(executable: URL,
             workspaceLease: lease,
             environment: sanitized,
             networkAccess: networkAccess,
+            startupMarker: startupMarkerURL,
             maximumOutputBytes: maximumOutputBytes),
         environment: sanitized)
+    sandboxBackend = .bubblewrap
     #endif
-    return try await runManagedProcess(
+    let result = try await runManagedProcess(
         spec: processSpec,
         cwd: workspace,
         captureDirectory: runtime,
         timeoutSeconds: timeoutSeconds,
         terminationGraceSeconds: terminationGraceSeconds,
         maximumOutputBytes: maximumOutputBytes)
+    let managedCommandShimStarted: Bool
+    do {
+        try startupMarkerHandle.seek(toOffset: 0)
+        managedCommandShimStarted = try startupMarkerHandle.read(upToCount: 2) == Data([0x31])
+    } catch {
+        // Marker inspection is evidence, not an execution prerequisite. If it
+        // cannot be read, conservatively assume the target may have started.
+        managedCommandShimStarted = true
+    }
+    if let denial = workspaceSandboxStartupDenial(
+        in: result,
+        backend: sandboxBackend,
+        managedCommandShimStarted: managedCommandShimStarted
+    ) {
+        throw denial
+    }
+    return result
 }
 
 private func runManagedProcess(spec: ManagedProcessSpec,
@@ -574,12 +664,13 @@ private func sanitizedProcessEnvironment(home: URL, temporary: URL) -> [String: 
 
 private func limitedExecutionArguments(executable: URL,
                                        arguments: [String],
+                                       startupMarker: URL,
                                        maximumOutputBytes: Int) -> [String] {
     let blocks = max(2, maximumOutputBytes / 512)
     return [
         "/bin/sh", "-c",
-        "ulimit -f \(blocks) 2>/dev/null; exec \"$@\"",
-        "intatis-managed", executable.path,
+        "marker=$1; shift; printf 1 > \"$marker\" || exit 125; rm -f -- \"$marker\" || exit 125; ulimit -f \(blocks) 2>/dev/null; exec \"$@\"",
+        "intatis-managed", startupMarker.path, executable.path,
     ] + arguments
 }
 
@@ -787,6 +878,7 @@ private func bubblewrapArguments(workspace: URL,
                                  workspaceLease: WorkspaceLease,
                                  environment: [String: String],
                                  networkAccess: WorkspaceNetworkAccess,
+                                 startupMarker: URL,
                                  maximumOutputBytes: Int) -> [String] {
     let baseRoots = ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc/ssl", "/etc/pki",
                      "/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf"]
@@ -829,6 +921,7 @@ private func bubblewrapArguments(workspace: URL,
     result.append(contentsOf: limitedExecutionArguments(
         executable: executable,
         arguments: arguments,
+        startupMarker: startupMarker,
         maximumOutputBytes: maximumOutputBytes))
     return result
 }

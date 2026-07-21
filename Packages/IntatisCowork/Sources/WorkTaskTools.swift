@@ -231,8 +231,8 @@ public struct TaskUpdateTool: Tool {
             result: value.result,
             evidence: value.evidence,
             isRetry: value.retry ?? false)
-        return ToolObservation(text: try encodeWorkTaskToolResult(
-            await manager.updateWorkTask(request)))
+        let detail = try await manager.updateWorkTask(request)
+        return ToolObservation(text: try encodeWorkTaskToolResult(detail))
     }
 }
 

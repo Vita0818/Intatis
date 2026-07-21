@@ -23,6 +23,11 @@ public enum EventLogError: Error, Equatable, LocalizedError, Sendable {
     case nonMonotonicSequence(previous: Int, current: Int)
     case sequenceRegressed(expectedAtLeast: Int, found: Int)
     case sequenceExhausted
+    case unsupportedEventTypes
+    case incompleteEventHistory
+    case permissionRequestNotFound
+    case conflictingPermissionRequest
+    case conflictingPermissionSettlement
 
     public var errorDescription: String? {
         switch self {
@@ -48,6 +53,16 @@ public enum EventLogError: Error, Equatable, LocalizedError, Sendable {
             return "The session event log was replaced or truncated (expected sequence \(expectedAtLeast) or later, found \(found))."
         case .sequenceExhausted:
             return "The session event log sequence space is exhausted."
+        case .unsupportedEventTypes:
+            return "The session contains newer event types that this Intatis version cannot update safely."
+        case .incompleteEventHistory:
+            return "The session event history is incomplete and cannot safely settle a permission request."
+        case .permissionRequestNotFound:
+            return "The permission request is not durably registered in this session."
+        case .conflictingPermissionRequest:
+            return "The session contains conflicting records for the same permission request."
+        case .conflictingPermissionSettlement:
+            return "The permission request already has a different terminal response."
         }
     }
 
@@ -64,6 +79,11 @@ public enum EventLogError: Error, Equatable, LocalizedError, Sendable {
             return "Stop writing to this session and inspect or restore its event log before retrying."
         case .sequenceExhausted:
             return "Start a new session."
+        case .unsupportedEventTypes:
+            return "Open this session with a compatible newer Intatis version before changing its settings."
+        case .incompleteEventHistory, .permissionRequestNotFound,
+             .conflictingPermissionRequest, .conflictingPermissionSettlement:
+            return "Reload the session from its canonical event log and inspect the permission history before retrying."
         }
     }
 }
@@ -191,7 +211,71 @@ private struct EventLogFileSnapshot {
 private struct EventLogCheckedScan {
     let envelopes: [Envelope]
     let containsEnvelopeHeader: Bool
+    let containsUnknownEventTypes: Bool
     let nextSeq: Int
+}
+
+/// Strict replay metadata used only by rebuildable derived projections. Unlike
+/// ordinary `replayChecked`, this also exposes the highest durable header and
+/// whether a newer binary wrote an event type this binary cannot project.
+public struct EventLogProjectionReplay: Equatable, Sendable {
+    public let envelopes: [Envelope]
+    public let lastDurableSeq: Int?
+    public let containsUnknownEventTypes: Bool
+
+    public init(envelopes: [Envelope],
+                lastDurableSeq: Int?,
+                containsUnknownEventTypes: Bool) {
+        self.envelopes = envelopes
+        self.lastDurableSeq = lastDurableSeq
+        self.containsUnknownEventTypes = containsUnknownEventTypes
+    }
+
+    /// Whether this binary has a complete, gap-free projection of every
+    /// durable event from sequence zero through the current tail. Unknown
+    /// future types and sequence gaps both invalidate absence/order proofs.
+    public var hasCompleteKnownHistory: Bool {
+        guard !containsUnknownEventTypes else { return false }
+        guard let lastDurableSeq else { return envelopes.isEmpty }
+        guard lastDurableSeq >= 0 else { return false }
+        let (expectedCount, overflow) = lastDurableSeq.addingReportingOverflow(1)
+        guard !overflow,
+              envelopes.count == expectedCount else { return false }
+        return envelopes.enumerated().allSatisfy { offset, envelope in
+            envelope.seq == offset
+        }
+    }
+}
+
+/// Result of the RequestID-scoped permission settlement compare-and-append.
+/// `didAppend == false` is an idempotent replay of the exact first terminal
+/// response; the returned envelope is always the canonical durable winner.
+public struct PermissionSettlementAppendResult: Equatable, Sendable {
+    public let envelope: Envelope
+    public let resolution: PermissionResolvedPayload
+    public let didAppend: Bool
+
+    public init(envelope: Envelope,
+                resolution: PermissionResolvedPayload,
+                didAppend: Bool) {
+        self.envelope = envelope
+        self.resolution = resolution
+        self.didAppend = didAppend
+    }
+}
+
+public struct PermissionRequestRegistrationResult: Equatable, Sendable {
+    public let envelope: Envelope
+    public let request: PermissionRequestPayload
+    public let didAppend: Bool
+
+    public init(envelope: Envelope,
+                request: PermissionRequestPayload,
+                didAppend: Bool) {
+        self.envelope = envelope
+        self.request = request
+        self.didAppend = didAppend
+    }
 }
 
 private enum EventLogJournalState {
@@ -342,6 +426,7 @@ public final class EventLogWriterLease: @unchecked Sendable {
 public actor EventLog {
     private let session: SessionID
     private let fileURL: URL
+    public nonisolated let sessionDirectoryURL: URL
     /// Package-internal identity for process-wide coordination registries.
     /// It may contain a private filesystem path and must never be logged or
     /// surfaced to models/UI.
@@ -359,6 +444,7 @@ public actor EventLog {
         self.session = session
         let canonicalFileURL = fileURL.standardizedFileURL.resolvingSymlinksInPath()
         self.fileURL = canonicalFileURL
+        self.sessionDirectoryURL = canonicalFileURL.deletingLastPathComponent()
         self.coordinationKey = canonicalFileURL.path
         self.lockURL = canonicalFileURL.appendingPathExtension("lock")
         self.writerLockURL = canonicalFileURL.appendingPathExtension("writer.lock")
@@ -449,6 +535,304 @@ public actor EventLog {
                 found: state.nextSeq)
         }
 
+        return try persistLocked(events, ts: ts, state: state)
+    }
+
+    /// Internal compare-and-append primitive for versioned session metadata.
+    /// The builder sees the strictly decoded canonical history while the same
+    /// cross-process lock that assigns sequence numbers is held. This prevents
+    /// two EventLog instances from deriving and appending the same settings
+    /// revision, while keeping the public EventLog schema append-only.
+    public func appendSessionStateTransaction(
+        ts: Date = Date(),
+        _ buildEvents: @Sendable ([Envelope]) throws -> [Event]
+    ) throws -> [Envelope] {
+        let lock = try EventLogFileLock.acquire(at: lockURL, mode: .exclusive)
+        defer { lock.release() }
+
+        try Self.recoverJournalIfNeeded(
+            fileURL: fileURL,
+            journalURL: journalURL,
+            temporaryURL: journalTemporaryURL,
+            session: session,
+            decoder: decoder)
+        let data = try Self.readLogData(at: fileURL)
+        let scan = try Self.checkedScan(
+            data: data,
+            expectedSession: session,
+            decoder: decoder,
+            from: 0)
+        guard !scan.containsUnknownEventTypes else {
+            throw EventLogError.unsupportedEventTypes
+        }
+        let state = try Self.tailSequenceState(
+            at: fileURL,
+            expectedSession: session,
+            decoder: decoder)
+        guard state.nextSeq >= nextSeq else {
+            throw EventLogError.sequenceRegressed(
+                expectedAtLeast: nextSeq,
+                found: state.nextSeq)
+        }
+        let events = try buildEvents(scan.envelopes)
+        guard !events.isEmpty else {
+            nextSeq = state.nextSeq
+            return []
+        }
+        return try persistLocked(events, ts: ts, state: state)
+    }
+
+    /// Atomically settles one durably registered permission request.
+    ///
+    /// The complete-known-history check, first-terminal comparison, and append
+    /// all run under the same cross-process lock. An exact duplicate response
+    /// is idempotent; a conflicting duplicate fails closed and no bytes are
+    /// appended. This is the durable linearization point used by local UI,
+    /// automatic review, and future remote `permission.respond` transports.
+    public func settlePermissionRequest(
+        _ resolution: PermissionResolvedPayload,
+        ts: Date = Date()
+    ) throws -> PermissionSettlementAppendResult {
+        guard let requestID = resolution.requestId else {
+            throw EventLogError.permissionRequestNotFound
+        }
+
+        let lock = try EventLogFileLock.acquire(at: lockURL, mode: .exclusive)
+        defer { lock.release() }
+
+        try Self.recoverJournalIfNeeded(
+            fileURL: fileURL,
+            journalURL: journalURL,
+            temporaryURL: journalTemporaryURL,
+            session: session,
+            decoder: decoder)
+        let data = try Self.readLogData(at: fileURL)
+        let scan = try Self.checkedScan(
+            data: data,
+            expectedSession: session,
+            decoder: decoder,
+            from: 0)
+        guard !scan.containsUnknownEventTypes else {
+            throw EventLogError.unsupportedEventTypes
+        }
+        guard scan.envelopes.enumerated().allSatisfy({ offset, envelope in
+            envelope.seq == offset
+        }) else {
+            throw EventLogError.incompleteEventHistory
+        }
+
+        var registeredRequest: PermissionRequestPayload?
+        var firstTerminal: (Envelope, PermissionResolvedPayload)?
+        for envelope in scan.envelopes {
+            switch envelope.event {
+            case .permissionRequest(let request) where request.requestId == requestID:
+                if let registeredRequest, registeredRequest != request {
+                    throw EventLogError.conflictingPermissionRequest
+                }
+                registeredRequest = request
+
+            case .permissionResolved(let existing) where existing.requestId == requestID:
+                if let firstTerminal {
+                    guard firstTerminal.1 == existing else {
+                        throw EventLogError.conflictingPermissionSettlement
+                    }
+                } else {
+                    firstTerminal = (envelope, existing)
+                }
+
+            default:
+                break
+            }
+        }
+
+        guard let registeredRequest else {
+            throw EventLogError.permissionRequestNotFound
+        }
+        guard registeredRequest.tool == resolution.tool else {
+            throw EventLogError.conflictingPermissionSettlement
+        }
+        if let expectedTurnID = registeredRequest.context?.turnID {
+            guard resolution.turnID == expectedTurnID else {
+                throw EventLogError.conflictingPermissionSettlement
+            }
+        }
+        if let expectedToolCallID = registeredRequest.context?.toolCallID {
+            guard resolution.toolCallID == expectedToolCallID else {
+                throw EventLogError.conflictingPermissionSettlement
+            }
+        }
+        if let expectedAuthorization = registeredRequest.context?.authorization {
+            guard resolution.authorization == expectedAuthorization else {
+                throw EventLogError.conflictingPermissionSettlement
+            }
+        }
+        if let action = resolution.action {
+            let isConsistent = action == .approve
+                ? resolution.decision == .allow
+                : resolution.decision == .deny
+            guard isConsistent else {
+                throw EventLogError.conflictingPermissionSettlement
+            }
+        }
+        if let firstTerminal {
+            guard firstTerminal.1 == resolution else {
+                throw EventLogError.conflictingPermissionSettlement
+            }
+            nextSeq = max(nextSeq, scan.nextSeq)
+            return PermissionSettlementAppendResult(
+                envelope: firstTerminal.0,
+                resolution: firstTerminal.1,
+                didAppend: false)
+        }
+
+        let state = try Self.tailSequenceState(
+            at: fileURL,
+            expectedSession: session,
+            decoder: decoder)
+        guard state.nextSeq >= nextSeq else {
+            throw EventLogError.sequenceRegressed(
+                expectedAtLeast: nextSeq,
+                found: state.nextSeq)
+        }
+        guard let envelope = try persistLocked(
+            [.permissionResolved(resolution)],
+            ts: ts,
+            state: state).first,
+              case .permissionResolved(let canonicalResolution) = envelope.event else {
+            preconditionFailure("a permission settlement append must persist one terminal event")
+        }
+        return PermissionSettlementAppendResult(
+            envelope: envelope,
+            resolution: canonicalResolution,
+            didAppend: true)
+    }
+
+    /// RequestID-scoped first-write registration for callers entering at a
+    /// responder/transport boundary. AgentLoop normally persists its request
+    /// and blocked status as one batch before publishing; this method lets a
+    /// reconnect or test verify that exact durable identity without appending
+    /// a duplicate. A conflicting payload fails closed under the same lock.
+    public func registerPermissionRequest(
+        _ request: PermissionRequestPayload,
+        ts: Date = Date()
+    ) throws -> PermissionRequestRegistrationResult {
+        let lock = try EventLogFileLock.acquire(at: lockURL, mode: .exclusive)
+        defer { lock.release() }
+
+        try Self.recoverJournalIfNeeded(
+            fileURL: fileURL,
+            journalURL: journalURL,
+            temporaryURL: journalTemporaryURL,
+            session: session,
+            decoder: decoder)
+        let data = try Self.readLogData(at: fileURL)
+        let scan = try Self.checkedScan(
+            data: data,
+            expectedSession: session,
+            decoder: decoder,
+            from: 0)
+        guard !scan.containsUnknownEventTypes else {
+            throw EventLogError.unsupportedEventTypes
+        }
+        guard scan.envelopes.enumerated().allSatisfy({ offset, envelope in
+            envelope.seq == offset
+        }) else {
+            throw EventLogError.incompleteEventHistory
+        }
+
+        var firstRequest: (Envelope, PermissionRequestPayload)?
+        for envelope in scan.envelopes {
+            if case .permissionRequest(let existing) = envelope.event,
+               existing.requestId == request.requestId {
+                if let firstRequest {
+                    guard firstRequest.1 == existing else {
+                        throw EventLogError.conflictingPermissionRequest
+                    }
+                } else {
+                    firstRequest = (envelope, existing)
+                }
+            }
+        }
+        if let firstRequest {
+            guard firstRequest.1 == request else {
+                throw EventLogError.conflictingPermissionRequest
+            }
+            nextSeq = max(nextSeq, scan.nextSeq)
+            return PermissionRequestRegistrationResult(
+                envelope: firstRequest.0,
+                request: firstRequest.1,
+                didAppend: false)
+        }
+
+        let state = try Self.tailSequenceState(
+            at: fileURL,
+            expectedSession: session,
+            decoder: decoder)
+        guard state.nextSeq >= nextSeq else {
+            throw EventLogError.sequenceRegressed(
+                expectedAtLeast: nextSeq,
+                found: state.nextSeq)
+        }
+        guard let envelope = try persistLocked(
+            [.permissionRequest(request)],
+            ts: ts,
+            state: state).first,
+              case .permissionRequest(let canonicalRequest) = envelope.event else {
+            preconditionFailure("a permission registration must persist one request event")
+        }
+        return PermissionRequestRegistrationResult(
+            envelope: envelope,
+            request: canonicalRequest,
+            didAppend: true)
+    }
+
+    /// Appends a fresh-session bootstrap only if no durable Envelope header is
+    /// present at the instant of append. The emptiness predicate and batch
+    /// write share one cross-process lock, closing the check/write race between
+    /// separate EventLog instances.
+    public func appendIfEmptyChecked(
+        _ events: [Event],
+        ts: Date = Date()
+    ) throws -> [Envelope]? {
+        guard !events.isEmpty else { return [] }
+        let lock = try EventLogFileLock.acquire(at: lockURL, mode: .exclusive)
+        defer { lock.release() }
+
+        try Self.recoverJournalIfNeeded(
+            fileURL: fileURL,
+            journalURL: journalURL,
+            temporaryURL: journalTemporaryURL,
+            session: session,
+            decoder: decoder)
+        let data = try Self.readLogData(at: fileURL)
+        let scan = try Self.checkedScan(
+            data: data,
+            expectedSession: session,
+            decoder: decoder,
+            from: 0)
+        guard !scan.containsEnvelopeHeader else {
+            nextSeq = max(nextSeq, scan.nextSeq)
+            return nil
+        }
+        let state = try Self.tailSequenceState(
+            at: fileURL,
+            expectedSession: session,
+            decoder: decoder)
+        guard state.nextSeq >= nextSeq else {
+            throw EventLogError.sequenceRegressed(
+                expectedAtLeast: nextSeq,
+                found: state.nextSeq)
+        }
+        return try persistLocked(events, ts: ts, state: state)
+    }
+
+    private func persistLocked(
+        _ events: [Event],
+        ts: Date,
+        state: EventLogSequenceState
+    ) throws -> [Envelope] {
+        guard !events.isEmpty else { return [] }
+
         var envelopes: [Envelope] = []
         envelopes.reserveCapacity(events.count)
         var bytes = Data()
@@ -466,9 +850,19 @@ public actor EventLog {
             } catch {
                 throw Self.storageError(operation: "encode an event", error: error)
             }
+            let canonicalEnvelope: Envelope
+            do {
+                // Encoding may intentionally omit decode-only compatibility
+                // fields or normalize values such as Date precision. Return
+                // and publish the exact semantic envelope represented by the
+                // bytes that will become canonical JSONL state.
+                canonicalEnvelope = try decoder.decode(Envelope.self, from: line)
+            } catch {
+                throw Self.storageError(operation: "canonicalize an event", error: error)
+            }
             line.append(0x0A)
             bytes.append(line)
-            envelopes.append(envelope)
+            envelopes.append(canonicalEnvelope)
         }
 
         let (advancedNextSeq, overflow) = state.nextSeq.addingReportingOverflow(events.count)
@@ -567,6 +961,35 @@ public actor EventLog {
         return scan.envelopes
     }
 
+    /// Strict replay for `session.json` and other fully rebuildable caches.
+    /// Callers must not overwrite a newer projection when an unknown event is
+    /// present because this binary cannot prove it understands that state.
+    public func replayForProjectionChecked(from seq: Int = 0) throws -> EventLogProjectionReplay {
+        let lock = try EventLogFileLock.acquire(at: lockURL, mode: .exclusive)
+        defer { lock.release() }
+        try Self.recoverJournalIfNeeded(
+            fileURL: fileURL,
+            journalURL: journalURL,
+            temporaryURL: journalTemporaryURL,
+            session: session,
+            decoder: decoder)
+        let data = try Self.readLogData(at: fileURL)
+        let scan = try Self.checkedScan(
+            data: data,
+            expectedSession: session,
+            decoder: decoder,
+            from: seq)
+        guard scan.nextSeq >= nextSeq else {
+            throw EventLogError.sequenceRegressed(
+                expectedAtLeast: nextSeq,
+                found: scan.nextSeq)
+        }
+        return EventLogProjectionReplay(
+            envelopes: scan.envelopes,
+            lastDurableSeq: scan.containsEnvelopeHeader ? scan.nextSeq - 1 : nil,
+            containsUnknownEventTypes: scan.containsUnknownEventTypes)
+    }
+
     /// Strict emptiness check used by fresh-session bootstrap. Unlike
     /// `replayChecked().isEmpty`, any valid Envelope header counts as durable
     /// state, including an otherwise-skipped future event type.
@@ -631,6 +1054,7 @@ public actor EventLog {
         var envelopes: [Envelope] = []
         var previousSequence: Int?
         var containsEnvelopeHeader = false
+        var containsUnknownEventTypes = false
         var nextSequence = 0
         let lines = data.split(separator: 0x0A, omittingEmptySubsequences: false)
 
@@ -663,7 +1087,10 @@ public actor EventLog {
             // A header that is structurally valid but names a future type is
             // durable state and reserves its sequence. Its payload remains
             // opaque to this binary and is intentionally skipped.
-            guard Event.TypeTag(rawValue: header.type) != nil else { continue }
+            guard Event.TypeTag(rawValue: header.type) != nil else {
+                containsUnknownEventTypes = true
+                continue
+            }
             let envelope: Envelope
             do {
                 envelope = try decoder.decode(Envelope.self, from: Data(line))
@@ -678,6 +1105,7 @@ public actor EventLog {
         return EventLogCheckedScan(
             envelopes: envelopes,
             containsEnvelopeHeader: containsEnvelopeHeader,
+            containsUnknownEventTypes: containsUnknownEventTypes,
             nextSeq: nextSequence)
     }
 

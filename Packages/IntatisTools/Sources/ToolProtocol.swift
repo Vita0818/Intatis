@@ -62,6 +62,23 @@ public struct ShellResult: Equatable, Sendable {
     }
 }
 
+/// A managed workspace sandbox rejected process startup before the target
+/// executable was entered. Only the sandbox runner may manufacture this
+/// error from an attributable wrapper diagnostic. Generic command failures,
+/// including an unqualified `EPERM`, must remain ordinary `ShellResult`s.
+///
+/// Because this error proves the target process did not start, AgentKernel may
+/// durably settle the prepared execution as `not_started` without retrying it.
+public struct WorkspaceSandboxDeniedError: Error, Equatable, Sendable, LocalizedError {
+    public let reason: String
+
+    init(reason: String) {
+        self.reason = reason
+    }
+
+    public var errorDescription: String? { reason }
+}
+
 public struct GitPatchResult: Equatable, Sendable {
     public var text: String
     public var changedFiles: [String]
@@ -176,6 +193,12 @@ public struct ToolContext: Sendable {
     public let workTaskManager: WorkTaskManager?
     public let goalManager: GoalManager?
     public let imageGenerator: ImageGenerationToolService?
+    /// Host service bound to the session that owns this exact invocation.
+    /// The model never supplies a session identifier.
+    public let sessionNaming: SessionNamingService?
+    /// Durable executor operation identifier used to make session renames
+    /// idempotent across retries and reconciliation.
+    public let executionID: String?
     /// Immutable host authorization for the exact executor invocation. Tools
     /// that need a host-resolved target (for example delegate_task(to:auto))
     /// must consume this snapshot instead of resolving a different target from
@@ -192,6 +215,8 @@ public struct ToolContext: Sendable {
                 workTaskManager: WorkTaskManager? = nil,
                 goalManager: GoalManager? = nil,
                 imageGenerator: ImageGenerationToolService? = nil,
+                sessionNaming: SessionNamingService? = nil,
+                executionID: String? = nil,
                 authorization: ResolvedToolAuthorization? = nil) {
         let effectiveLease = workspaceLease ?? WorkspaceLease(
             rootPath: workspaceRoot.resolvingSymlinksInPath().standardizedFileURL.path,
@@ -245,6 +270,8 @@ public struct ToolContext: Sendable {
         self.workTaskManager = workTaskManager
         self.goalManager = goalManager
         self.imageGenerator = imageGenerator
+        self.sessionNaming = sessionNaming
+        self.executionID = executionID
         self.authorization = authorization
     }
 }
@@ -898,7 +925,7 @@ public struct ToolRegistry: Sendable {
             BrowserTypeTool(), BrowserSubmitTool(), BrowserSelectOptionTool(),
             BrowserPressKeyTool(), BrowserScrollTool(), BrowserWaitTool(), BrowserScreenshotTool(),
             BrowserUploadFileTool(), BrowserDownloadTool(), BrowserDownloadsTool(),
-            BrowserSearchTool(),
+            BrowserSearchTool(), RenameSessionTool(),
         ])
     }
 }

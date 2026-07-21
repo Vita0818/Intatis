@@ -74,9 +74,6 @@ private struct IntatisChatSessionScreen: View {
         GeometryReader { proxy in
             content(layout: IntatisMacScreenLayout(rawWidth: proxy.size.width))
         }
-        .task(id: env.chatSessionID.rawValue) {
-            model.start()
-        }
     }
 
     private func content(layout: IntatisMacScreenLayout) -> some View {
@@ -136,7 +133,10 @@ private struct IntatisChatSessionScreen: View {
         } else {
             ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVStack(spacing: 14) {
+                    IntatisAdaptiveThreadStack(
+                        visibleRowCount: model.messages.count
+                            + ((model.isStreaming && model.messages.last?.role == .user) ? 1 : 0),
+                        spacing: 14) {
                         ForEach(model.messages) { msg in
                             IntatisMessageBubble(message: msg,
                                                  rowWidth: layout.contentWidth,
@@ -149,12 +149,13 @@ private struct IntatisChatSessionScreen: View {
                         }
                         Color.clear
                             .frame(height: 1)
+                            .padding(.bottom, 16)
                             .id(Self.bottomAnchorID)
                     }
                     .frame(width: layout.contentWidth)
                     .frame(maxWidth: .infinity)
                     .padding(.horizontal, layout.horizontalPadding)
-                    .padding(.vertical, 16)
+                    .padding(.top, 16)
                 }
                 .scrollContentBackground(.hidden)
                 .onAppear {

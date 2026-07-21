@@ -151,6 +151,45 @@ private final class ReliabilityFailingProvider: ToolCallingProvider, @unchecked 
     }
 }
 
+private struct ReliabilitySelfCancellingProvider: ToolCallingProvider {
+    func stream(_ request: AgentRequest) -> AsyncThrowingStream<AgentChunk, Error> {
+        AsyncThrowingStream { continuation in
+            continuation.finish(throwing: CancellationError())
+        }
+    }
+}
+
+private final class ReliabilityWriteThenFinalProvider: ToolCallingProvider, @unchecked Sendable {
+    private let lock = NSLock()
+    private var capturedRequestCount = 0
+
+    var requestCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return capturedRequestCount
+    }
+
+    func stream(_ request: AgentRequest) -> AsyncThrowingStream<AgentChunk, Error> {
+        lock.lock()
+        capturedRequestCount += 1
+        let requestNumber = capturedRequestCount
+        lock.unlock()
+        return AsyncThrowingStream { continuation in
+            if requestNumber == 1 {
+                continuation.yield(.toolCalls([ToolCall(
+                    id: "phase-c-cancel-all-write",
+                    name: "write_file",
+                    arguments: #"{"path":"phase-c.txt","content":"must not run"}"#)]))
+                continuation.yield(.done(finishReason: "tool_calls"))
+            } else {
+                continuation.yield(.textDelta("continued after reviewer shutdown"))
+                continuation.yield(.done(finishReason: "stop"))
+            }
+            continuation.finish()
+        }
+    }
+}
+
 private final class ReliabilityMailboxSideEffectThenFailProvider: ToolCallingProvider, @unchecked Sendable {
     private let lock = NSLock()
     private var capturedRequestCount = 0
@@ -305,6 +344,94 @@ private final class ReliabilityBlockingProvider: ToolCallingProvider, @unchecked
     }
 }
 
+private final class ReliabilityCancellationCleanupProbe: @unchecked Sendable {
+    enum Milestone: Hashable {
+        case providerEntered
+        case callerWaiting
+        case providerCleanupFinished
+        case terminalPersisted
+        case callerReturned
+    }
+
+    private let condition = NSCondition()
+    private var cleanupReleased = false
+    private var recordedMilestones: [Milestone] = []
+    private var milestoneWaiters: [Milestone: [CheckedContinuation<Void, Never>]] = [:]
+
+    func record(_ milestone: Milestone) {
+        condition.lock()
+        recordedMilestones.append(milestone)
+        let waiters = milestoneWaiters.removeValue(forKey: milestone) ?? []
+        condition.unlock()
+        for waiter in waiters { waiter.resume() }
+    }
+
+    func wait(until milestone: Milestone) async {
+        await withCheckedContinuation { continuation in
+            condition.lock()
+            if recordedMilestones.contains(milestone) {
+                condition.unlock()
+                continuation.resume()
+            } else {
+                milestoneWaiters[milestone, default: []].append(continuation)
+                condition.unlock()
+            }
+        }
+    }
+
+    func waitForCleanupRelease() {
+        condition.lock()
+        while !cleanupReleased {
+            condition.wait()
+        }
+        condition.unlock()
+    }
+
+    func releaseCleanup() {
+        condition.lock()
+        cleanupReleased = true
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    func milestones() -> [Milestone] {
+        condition.lock()
+        defer { condition.unlock() }
+        return recordedMilestones
+    }
+}
+
+private final class ReliabilityFiniteCleanupBarrierProvider: ToolCallingProvider, @unchecked Sendable {
+    private let probe: ReliabilityCancellationCleanupProbe
+    private let lock = NSLock()
+    private var capturedRequestCount = 0
+
+    init(probe: ReliabilityCancellationCleanupProbe) {
+        self.probe = probe
+    }
+
+    var requestCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return capturedRequestCount
+    }
+
+    func stream(_ request: AgentRequest) -> AsyncThrowingStream<AgentChunk, Error> {
+        lock.lock()
+        capturedRequestCount += 1
+        lock.unlock()
+
+        probe.record(.providerEntered)
+        probe.waitForCleanupRelease()
+        probe.record(.providerCleanupFinished)
+        return AsyncThrowingStream { continuation in
+            continuation.yield(.textDelta("late provider output"))
+            continuation.yield(.done(finishReason: "stop"))
+            continuation.finish()
+        }
+    }
+}
+
 private final class ReliabilityCapturingProvider: ToolCallingProvider, @unchecked Sendable {
     private let lock = NSLock()
     private var captured: [AgentRequest] = []
@@ -385,7 +512,9 @@ private func appendReliabilityTaskWithSettledSideEffect(
     workspace: URL,
     taskID: TaskID,
     agent: AgentID,
-    terminalStatus: TaskStatus?
+    terminalStatus: TaskStatus?,
+    outcome: ToolExecutionOutcome = .succeeded,
+    effectDisposition: ToolExecutionEffectDisposition? = nil
 ) async throws -> TaskContract {
     let workspaceLease = WorkspaceLease(
         taskID: taskID,
@@ -452,8 +581,9 @@ private func appendReliabilityTaskWithSettledSideEffect(
         .toolExecutionPrepared(prepared),
         .toolExecutionSettled(ToolExecutionSettledPayload(
             prepared: prepared,
-            outcome: .succeeded,
-            reason: "the write completed before the task stopped")),
+            outcome: outcome,
+            effectDisposition: effectDisposition,
+            reason: "the tool reached a durable terminal test outcome")),
     ]
     switch terminalStatus {
     case .failed:
@@ -477,6 +607,136 @@ private func appendReliabilityTaskWithSettledSideEffect(
     }
     try await log.append(events)
     return contract
+}
+
+@discardableResult
+private func appendLegacyTaskUpdateRevisionConflict(
+    to log: EventLog,
+    workspace: URL,
+    agent: AgentID,
+    expectedRevision: Int
+) async throws -> (taskID: TaskID, workTaskID: WorkTaskID, executionID: String) {
+    let taskID = TaskID(rawValue: "legacy-stale-task-update-invocation-\(expectedRevision)")
+    let workTaskID = WorkTaskID(rawValue: "legacy-stale-work-task-\(expectedRevision)")
+    let runID = ContinuationRunID(rawValue: "legacy-stale-run-\(expectedRevision)")
+    let workspaceLease = WorkspaceLease(
+        rootPath: workspace.path,
+        access: .readWrite)
+    let capabilityLease = CapabilityLease.coordinator()
+    let contract = TaskContract(
+        id: taskID,
+        kind: .root,
+        issuer: nil,
+        assignee: agent,
+        workTaskID: workTaskID,
+        continuationRunID: runID,
+        objective: "update a WorkTask using an old revision",
+        roleHint: "root coordinator",
+        expectedDeliverable: "refresh the task before retrying",
+        workspaceID: workspaceLease.workspaceID,
+        workspaceLeaseID: workspaceLease.id,
+        capabilityLeaseID: capabilityLease.id,
+        replyMode: TaskReplyMode.none,
+        maxAttempts: 3)
+    let metadata = CoworkEventMetadata(
+        taskID: taskID,
+        rootTaskID: taskID,
+        agentID: agent,
+        assignee: agent,
+        workspaceID: workspaceLease.workspaceID,
+        workspaceLeaseID: workspaceLease.id,
+        capabilityLeaseID: capabilityLease.id,
+        scope: .task)
+
+    let createdAt = Date(timeIntervalSince1970: 1_700_000_000)
+    let created = WorkTask(
+        id: workTaskID,
+        runID: runID,
+        title: "durable work",
+        description: "already completed by another update",
+        status: .pending,
+        owner: agent,
+        latestInvocationIDs: [taskID],
+        createdAt: createdAt,
+        revision: 0)
+    var ready = created
+    ready.status = .ready
+    ready.revision = 1
+    var started = ready
+    started.status = .inProgress
+    started.revision = 2
+    var progressed = started
+    progressed.progressNote = "newer progress"
+    progressed.revision = 3
+    var completed = progressed
+    completed.status = .completed
+    completed.result = "completed by the newer revision"
+    completed.completedAt = createdAt.addingTimeInterval(4)
+    completed.revision = 4
+
+    let executionID = "legacy-stale-task-update-\(expectedRevision)"
+    let intent = PermissionIntent(
+        action: "task.update",
+        resources: [PermissionResource(kind: .task, value: workTaskID.rawValue)],
+        metadata: ["expectedRevision": .number(Double(expectedRevision))],
+        dataEffects: [.none],
+        controlEffects: [.updateTask],
+        risks: [.controlPlaneMutation],
+        replayPolicy: .requiresManualReconciliation)
+    let prepared = ToolExecutionPreparedPayload(
+        executionID: executionID,
+        taskID: taskID,
+        attempt: 1,
+        toolCallID: "legacy-stale-call-\(expectedRevision)",
+        agent: agent,
+        tool: "task_update",
+        sideEffect: .write,
+        intent: intent,
+        replayPolicy: .requiresManualReconciliation)
+    try await log.append([
+        .agentAttached(AgentAttachedPayload(
+            agent: agent,
+            path: workspace.path,
+            model: ModelID(rawValue: "m"),
+            profile: PermissionProfile.reviewed.rawValue)),
+        .workspaceLeaseGranted(WorkspaceLeaseGrantedPayload(
+            agent: agent,
+            lease: workspaceLease)),
+        .capabilityLeaseCreated(CapabilityLeaseCreatedPayload(
+            agent: agent,
+            lease: capabilityLease)),
+        .taskCreated(TaskCreatedPayload(contract: contract, metadata: metadata)),
+        .taskAssigned(TaskAssignedPayload(contract: contract, metadata: metadata)),
+        .taskQueued(TaskQueuedPayload(
+            contract: contract,
+            rootTaskID: taskID,
+            assignee: agent,
+            hopCount: 0,
+            visitedAgents: [agent],
+            attempt: 1,
+            metadata: metadata)),
+        .taskStarted(TaskStartedPayload(
+            taskID: taskID,
+            agent: agent,
+            attempt: 1,
+            metadata: metadata)),
+        .workTaskCreated(WorkTaskCreatedPayload(task: created)),
+        .workTaskReady(WorkTaskReadyPayload(task: ready)),
+        .workTaskStarted(WorkTaskStartedPayload(task: started)),
+        .workTaskProgressed(WorkTaskProgressedPayload(task: progressed)),
+        .workTaskCompleted(WorkTaskCompletedPayload(task: completed)),
+        .toolExecutionPrepared(prepared),
+        .toolResult(ToolResultPayload(
+            toolCallId: prepared.toolCallID,
+            observation: "tool error: stale revision; manual reconciliation required")),
+        .taskFailed(TaskFailedPayload(
+            taskID: taskID,
+            agent: agent,
+            error: "manual reconciliation required",
+            attempt: 1,
+            metadata: metadata)),
+    ])
+    return (taskID, workTaskID, executionID)
 }
 
 final class OrchestrationReliabilityTests: XCTestCase {
@@ -1524,6 +1784,85 @@ final class OrchestrationReliabilityTests: XCTestCase {
         XCTAssertEqual(CoworkProjection.build(from: events).tasks[taskID]?.status, .cancelled)
     }
 
+    func testSingleTaskCancellationWaitsForProviderCleanupBeforeTerminalAndCallerResult() async throws {
+        let log = try reliabilityLog()
+        let workspace = try reliabilityWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let probe = ReliabilityCancellationCleanupProbe()
+        defer { probe.releaseCleanup() }
+        let provider = ReliabilityFiniteCleanupBarrierProvider(probe: probe)
+        let orchestrator = Orchestrator(
+            log: log,
+            allowsShell: true,
+            responder: FixedResponder(.allow)) { _ in provider }
+        await orchestrator.setTaskLifecycleEventAppender { event in
+            _ = try await log.append(event)
+            if case .taskCancelled = event {
+                probe.record(.terminalPersisted)
+            }
+        }
+        await orchestrator.setSchedulerResultWaiterHookForTesting { _ in
+            probe.record(.callerWaiting)
+        }
+        let attached = await orchestrator.attach(Agent(
+            name: main,
+            workspaceRoot: workspace,
+            model: ModelID(rawValue: "m"),
+            profile: .reviewed,
+            coordinationDepth: Agent.defaultCoordinationDepth))
+        XCTAssertTrue(attached)
+
+        let sendTask = Task {
+            let result = await orchestrator.send("cancel after provider starts", to: main)
+            probe.record(.callerReturned)
+            return result
+        }
+        await probe.wait(until: .providerEntered)
+        await probe.wait(until: .callerWaiting)
+        let runningProjection = CoworkProjection.build(from: await log.replay())
+        let taskID = try XCTUnwrap(runningProjection.runningTasks.first?.id)
+
+        let cancelled = await orchestrator.cancel(
+            taskID: taskID,
+            reason: "single-task cleanup barrier")
+        XCTAssertTrue(cancelled)
+        XCTAssertEqual(provider.requestCount, 1)
+        let beforeRelease = probe.milestones()
+        XCTAssertNil(beforeRelease.firstIndex(of: .providerCleanupFinished))
+        XCTAssertNil(beforeRelease.firstIndex(of: .terminalPersisted))
+        XCTAssertNil(beforeRelease.firstIndex(of: .callerReturned))
+        let beforeReleaseEvents = await log.replay()
+        XCTAssertNil(reliabilityEventIndex(beforeReleaseEvents, type: .taskCompleted, taskID: taskID))
+        XCTAssertNil(reliabilityEventIndex(beforeReleaseEvents, type: .taskFailed, taskID: taskID))
+        XCTAssertNil(reliabilityEventIndex(beforeReleaseEvents, type: .taskCancelled, taskID: taskID))
+
+        probe.releaseCleanup()
+        guard case .failed(let message) = await sendTask.value else {
+            return XCTFail("single-task cancellation must fail the waiting send after cleanup")
+        }
+        XCTAssertTrue(message.contains("single-task cleanup barrier"))
+
+        let milestones = probe.milestones()
+        let cleanupIndex = try XCTUnwrap(milestones.firstIndex(of: .providerCleanupFinished))
+        let terminalIndex = try XCTUnwrap(milestones.firstIndex(of: .terminalPersisted))
+        let callerIndex = try XCTUnwrap(milestones.firstIndex(of: .callerReturned))
+        XCTAssertLessThan(cleanupIndex, terminalIndex)
+        XCTAssertLessThan(terminalIndex, callerIndex)
+
+        let events = await log.replay()
+        let terminalEvents = events.filter { envelope in
+            switch envelope.event {
+            case .taskCompleted(let payload): return payload.taskID == taskID
+            case .taskFailed(let payload): return payload.taskID == taskID
+            case .taskCancelled(let payload): return payload.taskID == taskID
+            default: return false
+            }
+        }
+        XCTAssertEqual(terminalEvents.count, 1)
+        XCTAssertNotNil(reliabilityEventIndex(events, type: .taskCancelled, taskID: taskID))
+        XCTAssertEqual(CoworkProjection.build(from: events).tasks[taskID]?.status, .cancelled)
+    }
+
     func testRunningCancellationRefreshesConsumedTokenCount() async throws {
         let log = try reliabilityLog()
         let workspace = try reliabilityWorkspace()
@@ -1568,7 +1907,7 @@ final class OrchestrationReliabilityTests: XCTestCase {
         XCTAssertEqual(provider.requestCount, 1)
     }
 
-    func testEnablingBudgetKeepsTimedOutNonCooperativeRequestOnTheSessionMeter() async throws {
+    func testEnablingBudgetKeepsTimedOutRequestOnTheSessionMeterUntilCleanupEnds() async throws {
         let log = try reliabilityLog("budget-in-place-reconfigure-\(UUID().uuidString)")
         let firstWorkspace = try reliabilityWorkspace()
         let secondWorkspace = try reliabilityWorkspace()
@@ -1605,16 +1944,21 @@ final class OrchestrationReliabilityTests: XCTestCase {
         XCTAssertTrue(firstAttached)
         XCTAssertTrue(secondAttached)
 
-        let started = Date()
-        guard case .failed(let firstMessage) = await orchestrator.send(
-            "start while disabled and ignore timeout cancellation",
-            to: mainAgent) else {
-            return XCTFail("the watchdog must finish before the blocking provider")
+        let firstSend = Task {
+            await orchestrator.send(
+                "start while disabled and unwind after timeout cancellation",
+                to: mainAgent)
         }
-        XCTAssertTrue(firstMessage.lowercased().contains("timed out"))
-        XCTAssertLessThan(Date().timeIntervalSince(started), 0.4)
+        for _ in 0..<200 where firstProvider.requestCount == 0 {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
         XCTAssertEqual(firstProvider.requestCount, 1)
         XCTAssertNil(firstProvider.requests.first?.maxOutputTokens)
+        // The watchdog has fired, but structured timeout cleanup keeps the
+        // scheduler task non-terminal until this finite blocking provider
+        // unwinds. A permanently synchronous provider is outside the runtime
+        // contract and would intentionally keep the task non-terminal.
+        try await Task.sleep(nanoseconds: 100_000_000)
 
         let outstanding = await orchestrator.tokenBudgetSnapshotForTesting()
         XCTAssertNil(outstanding.limit)
@@ -1642,12 +1986,17 @@ final class OrchestrationReliabilityTests: XCTestCase {
         XCTAssertTrue(blockedMessage.lowercased().contains("budget"))
         XCTAssertTrue(secondProvider.requests.isEmpty)
 
+        guard case .failed(let firstMessage) = await firstSend.value else {
+            return XCTFail("the timed-out request must fail after cleanup ends")
+        }
+        XCTAssertTrue(firstMessage.lowercased().contains("timed out"))
+
         var settled = await orchestrator.tokenBudgetSnapshotForTesting()
         for _ in 0..<300 where settled.reserved != 0 {
             try await Task.sleep(nanoseconds: 5_000_000)
             settled = await orchestrator.tokenBudgetSnapshotForTesting()
         }
-        XCTAssertEqual(settled.reserved, 0, "the late cancelled request must settle exactly once")
+        XCTAssertEqual(settled.reserved, 0, "the timed-out request must settle exactly once")
         XCTAssertGreaterThan(settled.consumed, 0)
         XCTAssertEqual(firstProvider.requestCount, 1)
 
@@ -1801,7 +2150,7 @@ final class OrchestrationReliabilityTests: XCTestCase {
         XCTAssertTrue(iterationProjection.completedTasks.isEmpty)
     }
 
-    func testTimeoutDoesNotWaitForProviderThatIgnoresCancellation() async throws {
+    func testTimeoutWaitsForProviderCleanupBeforeTaskSettlement() async throws {
         let log = try reliabilityLog()
         let workspace = try reliabilityWorkspace()
         defer { try? FileManager.default.removeItem(at: workspace) }
@@ -1820,21 +2169,149 @@ final class OrchestrationReliabilityTests: XCTestCase {
         XCTAssertTrue(attached)
 
         let started = Date()
-        let result = await orchestrator.send("timeout a non-cooperative provider", to: main)
+        let result = await orchestrator.send("timeout then await provider cleanup", to: main)
         let elapsed = Date().timeIntervalSince(started)
 
         guard case .failed(let message) = result else {
-            return XCTFail("the bounded watchdog must fail the task")
+            return XCTFail("the bounded watchdog must fail after cleanup")
         }
         XCTAssertTrue(message.lowercased().contains("timed out"))
-        XCTAssertLessThan(elapsed, 0.3)
+        XCTAssertGreaterThanOrEqual(elapsed, 0.45)
+        XCTAssertLessThan(elapsed, 1.5)
         XCTAssertEqual(provider.requestCount, 1)
-        // Let the deliberately blocked test provider unwind before deleting its
-        // temporary log; its late result must not change the terminal task state.
-        try await Task.sleep(nanoseconds: 550_000_000)
         let projection = CoworkProjection.build(from: await log.replay())
         XCTAssertEqual(projection.failedTasks.count, 1)
         XCTAssertTrue(projection.completedTasks.isEmpty)
+    }
+
+    func testProviderCancellationErrorIsRuntimeFailureWhenTaskWasNotCancelled() async throws {
+        let log = try reliabilityLog()
+        let workspace = try reliabilityWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let orchestrator = Orchestrator(
+            log: log,
+            allowsShell: true,
+            responder: FixedResponder(.allow)) { _ in
+                ReliabilitySelfCancellingProvider()
+            }
+        let attached = await orchestrator.attach(Agent(
+            name: main,
+            workspaceRoot: workspace,
+            model: ModelID(rawValue: "m"),
+            profile: .reviewed,
+            coordinationDepth: Agent.defaultCoordinationDepth))
+        XCTAssertTrue(attached)
+
+        guard case .failed = await orchestrator.send(
+            "provider reports its own cancellation",
+            to: main) else {
+            return XCTFail("provider-originated CancellationError must be a runtime failure")
+        }
+
+        let projection = CoworkProjection.build(from: await log.replay())
+        XCTAssertEqual(projection.failedTasks.count, 1)
+        XCTAssertTrue(projection.cancelledTasks.isEmpty)
+    }
+
+    func testCancelAllWaitsForDataPlaneCleanupBeforeCancelledTerminal() async throws {
+        let log = try reliabilityLog()
+        let workspace = try reliabilityWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let provider = ReliabilityBlockingProvider(blockingSeconds: 0.5)
+        let orchestrator = Orchestrator(
+            log: log,
+            allowsShell: true,
+            responder: FixedResponder(.allow),
+            executionPolicy: CoworkExecutionPolicy(taskTimeoutSeconds: 10)) { _ in
+                provider
+            }
+        let attached = await orchestrator.attach(Agent(
+            name: main,
+            workspaceRoot: workspace,
+            model: ModelID(rawValue: "m"),
+            profile: .reviewed,
+            coordinationDepth: Agent.defaultCoordinationDepth))
+        XCTAssertTrue(attached)
+
+        let sendTask = Task {
+            await orchestrator.send("cancel then await finite cleanup", to: main)
+        }
+        for _ in 0..<200 where provider.requestCount == 0 {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertEqual(provider.requestCount, 1)
+
+        let started = Date()
+        await orchestrator.cancelAll(reason: "phase C cleanup test")
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertGreaterThanOrEqual(elapsed, 0.4)
+        XCTAssertLessThan(elapsed, 1.5)
+        guard case .failed = await sendTask.value else {
+            return XCTFail("cancelAll must settle the task as cancelled after cleanup")
+        }
+        let projection = CoworkProjection.build(from: await log.replay())
+        XCTAssertEqual(projection.cancelledTasks.count, 1)
+        XCTAssertTrue(projection.completedTasks.isEmpty)
+    }
+
+    func testCancelAllDrainsDataPlaneBeforeShuttingDownPermissionReviewer() async throws {
+        let log = try reliabilityLog()
+        let workspace = try reliabilityWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let mainProvider = ReliabilityWriteThenFinalProvider()
+        let reviewerProbe = ReliabilityConcurrencyProbe()
+        let reviewerProvider = ReliabilityDelayedProvider(
+            agent: Orchestrator.automaticPermissionReviewerID,
+            delayNanoseconds: 5_000_000_000,
+            response: #"{"decision":"allow","reason":"late allow"}"#,
+            probe: reviewerProbe)
+        let orchestrator = Orchestrator(
+            log: log,
+            allowsShell: true,
+            responder: FixedResponder(.allow)) { agent -> ToolCallingProvider in
+                if agent.name == Orchestrator.automaticPermissionReviewerID {
+                    return reviewerProvider
+                }
+                return mainProvider
+            }
+        let attached = await orchestrator.attach(Agent(
+            name: main,
+            workspaceRoot: workspace,
+            model: ModelID(rawValue: "m"),
+            profile: .reviewed,
+            coordinationDepth: Agent.defaultCoordinationDepth))
+        XCTAssertTrue(attached)
+        let enableResult = await orchestrator.enableAutomaticPermissionReview(
+            model: ModelID(rawValue: "reviewer"),
+            workspaceRoot: workspace)
+        XCTAssertEqual(
+            enableResult,
+            AutomaticPermissionReviewResult.enabled(
+                Orchestrator.automaticPermissionReviewerID))
+
+        let sendTask = Task {
+            await orchestrator.send("request a reviewed write", to: main)
+        }
+        for _ in 0..<400 where reviewerProvider.requestCount == 0 {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertEqual(reviewerProvider.requestCount, 1)
+
+        await orchestrator.cancelAll(reason: "phase C session stop")
+
+        guard case .failed = await sendTask.value else {
+            return XCTFail("cancelAll must interrupt the running data-plane task")
+        }
+        let projection = CoworkProjection.build(from: await log.replay())
+        XCTAssertEqual(projection.cancelledTasks.count, 1)
+        XCTAssertTrue(projection.completedTasks.isEmpty)
+        XCTAssertEqual(
+            mainProvider.requestCount,
+            1,
+            "reviewer shutdown must not release a denial that lets the cancelled turn continue")
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: workspace.appendingPathComponent("phase-c.txt").path))
     }
 
     func testRestoreRequeuesInterruptedAttemptAndCompletesNextAttempt() async throws {
@@ -1915,6 +2392,105 @@ final class OrchestrationReliabilityTests: XCTestCase {
             return payload.attempt
         }
         XCTAssertEqual(attempts, [1, 2])
+    }
+
+    func testHistoricalRestoreKeepsRecoveredTaskPausedUntilExactRetry() async throws {
+        let log = try reliabilityLog()
+        let workspace = try reliabilityWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let workspaceLease = WorkspaceLease(rootPath: workspace.path, access: .readWrite)
+        let capabilityLease = CapabilityLease.coordinator()
+        let taskID = TaskID.new()
+        let submissionID = SubmissionID(rawValue: "sub_restored_exact_retry")
+        let userMessage = UserMessagePayload(
+            text: "resume only when I explicitly retry",
+            submissionID: submissionID)
+        let contract = TaskContract(
+            id: taskID,
+            kind: .root,
+            issuer: nil,
+            assignee: main,
+            submissionID: submissionID,
+            objective: userMessage.text,
+            roleHint: "root coordinator",
+            expectedDeliverable: "recovered result",
+            workspaceID: workspaceLease.workspaceID,
+            workspaceLeaseID: workspaceLease.id,
+            capabilityLeaseID: capabilityLease.id,
+            replyMode: TaskReplyMode.none,
+            executionTimeoutSeconds: 10,
+            maxAttempts: 3)
+        let metadata = CoworkEventMetadata(
+            taskID: taskID,
+            rootTaskID: taskID,
+            agentID: main,
+            assignee: main,
+            workspaceID: workspaceLease.workspaceID,
+            workspaceLeaseID: workspaceLease.id,
+            capabilityLeaseID: capabilityLease.id,
+            scope: .task)
+        try await log.append(.userMessage(userMessage))
+        try await log.append(.agentAttached(AgentAttachedPayload(
+            agent: main,
+            path: workspace.path,
+            model: ModelID(rawValue: "m"),
+            profile: PermissionProfile.reviewed.rawValue)))
+        try await log.append(.workspaceLeaseGranted(WorkspaceLeaseGrantedPayload(
+            agent: main,
+            lease: workspaceLease)))
+        try await log.append(.capabilityLeaseCreated(CapabilityLeaseCreatedPayload(
+            agent: main,
+            lease: capabilityLease)))
+        try await log.append(.taskCreated(TaskCreatedPayload(contract: contract, metadata: metadata)))
+        try await log.append(.taskAssigned(TaskAssignedPayload(contract: contract, metadata: metadata)))
+        try await log.append(.taskQueued(TaskQueuedPayload(
+            contract: contract,
+            rootTaskID: taskID,
+            assignee: main,
+            hopCount: 0,
+            visitedAgents: [main],
+            attempt: 1,
+            metadata: metadata)))
+        try await log.append(.taskStarted(TaskStartedPayload(
+            taskID: taskID,
+            agent: main,
+            attempt: 1,
+            metadata: metadata)))
+
+        let provider = ReliabilityCapturingProvider()
+        let restored = Orchestrator(
+            log: log,
+            allowsShell: true,
+            responder: FixedResponder(.allow)) { _ in provider }
+        await restored.restore(from: CoworkProjection.build(from: await log.replay()))
+        let startedNewTasks = await restored.startNewTasksKeepingRestoredTasksPaused()
+        XCTAssertTrue(startedNewTasks)
+
+        let newResult = await restored.send("new work after reopening", to: main)
+        XCTAssertEqual(newResult, .sent)
+        XCTAssertEqual(provider.requests.count, 1)
+
+        let pausedProjection = CoworkProjection.build(from: await log.replay())
+        let pausedTask = try XCTUnwrap(pausedProjection.tasks[taskID])
+        XCTAssertEqual(pausedTask.status, .queued)
+        XCTAssertEqual(pausedTask.attempt, 2)
+
+        let retryResult = await restored.retry(
+            pausedTask,
+            userMessage: userMessage,
+            recordUserMessage: false)
+        XCTAssertEqual(retryResult, .sent)
+        XCTAssertEqual(provider.requests.count, 2)
+
+        let finalEvents = await log.replay()
+        let finalProjection = CoworkProjection.build(from: finalEvents)
+        XCTAssertEqual(finalProjection.tasks[taskID]?.status, .completed)
+        XCTAssertEqual(finalProjection.tasks[taskID]?.attempt, 2)
+        let originalSubmissionMessages = finalEvents.filter { envelope in
+            guard case .userMessage(let payload) = envelope.event else { return false }
+            return payload.submissionID == submissionID
+        }
+        XCTAssertEqual(originalSubmissionMessages.count, 1)
     }
 
     func testRestoreDoesNotReplayUnsettledNonReplayableToolExecution() async throws {
@@ -2007,6 +2583,296 @@ final class OrchestrationReliabilityTests: XCTestCase {
             return payload.attempt
         }
         XCTAssertEqual(queuedAttempts, [1])
+    }
+
+    func testRestoreSettlesLegacyTaskUpdateWhoseRevisionWasAlreadyStale() async throws {
+        let log = try reliabilityLog()
+        let workspace = try reliabilityWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let fixture = try await appendLegacyTaskUpdateRevisionConflict(
+            to: log,
+            workspace: workspace,
+            agent: main,
+            expectedRevision: 1)
+
+        let restored = Orchestrator(
+            log: log,
+            allowsShell: true,
+            responder: FixedResponder(.allow)) { _ in ReliabilityCapturingProvider() }
+        await restored.restore(from: CoworkProjection.build(from: await log.replay()))
+
+        let events = try await log.replayChecked()
+        let projection = CoworkProjection.build(from: events)
+        let settlements = events.compactMap { envelope -> ToolExecutionSettledPayload? in
+            guard case .toolExecutionSettled(let payload) = envelope.event,
+                  payload.executionID == fixture.executionID else { return nil }
+            return payload
+        }
+        XCTAssertEqual(settlements.count, 1)
+        XCTAssertEqual(settlements.first?.outcome, .failed)
+        XCTAssertEqual(settlements.first?.effectDisposition, .notStarted)
+        XCTAssertTrue(settlements.first?.reason?.contains("stale_revision") == true)
+        XCTAssertTrue(projection.unresolvedNonReplayableToolExecutions.isEmpty)
+        XCTAssertTrue(projection.startedNonReplayableToolExecutions.isEmpty)
+        XCTAssertEqual(projection.workTasks[fixture.workTaskID]?.revision, 4)
+        XCTAssertEqual(projection.workTasks[fixture.workTaskID]?.status, .completed)
+        XCTAssertEqual(projection.tasks[fixture.taskID]?.status, .failed)
+        let toolResults = events.filter { envelope in
+            guard case .toolResult(let payload) = envelope.event else { return false }
+            return payload.toolCallId == "legacy-stale-call-1"
+        }
+        XCTAssertEqual(toolResults.count, 1, "recovery must not duplicate an existing model-visible result")
+
+        await restored.restore(from: projection)
+        let repeatedSettlements = try await log.replayChecked().filter { envelope in
+            guard case .toolExecutionSettled(let payload) = envelope.event else { return false }
+            return payload.executionID == fixture.executionID
+        }
+        XCTAssertEqual(repeatedSettlements.count, 1, "legacy recovery must be idempotent")
+    }
+
+    func testRestoreDoesNotGuessNoEffectWhenExpectedRevisionCouldStillBeReached() async throws {
+        let log = try reliabilityLog()
+        let workspace = try reliabilityWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let fixture = try await appendLegacyTaskUpdateRevisionConflict(
+            to: log,
+            workspace: workspace,
+            agent: main,
+            expectedRevision: 5)
+
+        let restored = Orchestrator(
+            log: log,
+            allowsShell: true,
+            responder: FixedResponder(.allow)) { _ in ReliabilityCapturingProvider() }
+        await restored.restore(from: CoworkProjection.build(from: await log.replay()))
+
+        let projection = CoworkProjection.build(from: try await log.replayChecked())
+        XCTAssertEqual(
+            projection.unresolvedNonReplayableToolExecutions.map(\.id),
+            [fixture.executionID])
+        XCTAssertEqual(
+            projection.startedNonReplayableToolExecutions.map(\.id),
+            [fixture.executionID])
+    }
+
+    func testLegacyRepairDoesNotBorrowAnEarlierPrepareWithReusedExecutionID() async throws {
+        let log = try reliabilityLog()
+        let workTaskID = WorkTaskID(rawValue: "reused-execution-work-task")
+        let runID = ContinuationRunID(rawValue: "reused-execution-run")
+        let task = WorkTask(
+            id: workTaskID,
+            runID: runID,
+            title: "Current durable state",
+            description: "Revision four is authoritative",
+            status: .inProgress,
+            revision: 4)
+        func prepared(expectedRevision: Int, callID: String) -> ToolExecutionPreparedPayload {
+            ToolExecutionPreparedPayload(
+                executionID: "reused-execution-id",
+                taskID: TaskID(rawValue: "reused-execution-task"),
+                attempt: 1,
+                toolCallID: callID,
+                agent: main,
+                tool: "task_update",
+                sideEffect: .write,
+                intent: PermissionIntent(
+                    action: "task.update",
+                    resources: [PermissionResource(kind: .task, value: workTaskID.rawValue)],
+                    metadata: ["expectedRevision": .number(Double(expectedRevision))],
+                    dataEffects: [.none],
+                    controlEffects: [.updateTask],
+                    risks: [.controlPlaneMutation],
+                    replayPolicy: .requiresManualReconciliation),
+                replayPolicy: .requiresManualReconciliation)
+        }
+        try await log.append([
+            .workTaskCreated(WorkTaskCreatedPayload(task: task)),
+            .toolExecutionPrepared(prepared(expectedRevision: 1, callID: "earlier-stale-call")),
+            .toolExecutionPrepared(prepared(expectedRevision: 5, callID: "current-possible-call")),
+        ])
+        let events = try await log.replayChecked()
+        let projection = CoworkProjection.build(from: events)
+
+        XCTAssertTrue(Orchestrator.provenStaleTaskUpdateSettlementEvents(
+            events: events,
+            projection: projection).isEmpty)
+        XCTAssertTrue(projection.toolExecutions["reused-execution-id"]?
+            .hasAmbiguousDurableHistory == true)
+        XCTAssertEqual(
+            projection.unresolvedNonReplayableToolExecutions.map(\.prepared.toolCallID),
+            ["earlier-stale-call"],
+            "the first prepare remains the audit record; the duplicate poisons the ID")
+    }
+
+    func testLegacyRepairRejectsDuplicatePrepareEvenWhenLaterStateLooksStale() async throws {
+        let log = try reliabilityLog()
+        let workTaskID = WorkTaskID(rawValue: "duplicate-prepare-work-task")
+        let runID = ContinuationRunID(rawValue: "duplicate-prepare-run")
+        let created = WorkTask(
+            id: workTaskID,
+            runID: runID,
+            title: "Optimistic update",
+            description: "The first invocation may have changed this task",
+            status: .pending,
+            revision: 0)
+        var ready = created
+        ready.status = .ready
+        ready.revision = 1
+        var started = ready
+        started.status = .inProgress
+        started.revision = 2
+        let prepared = ToolExecutionPreparedPayload(
+            executionID: "duplicate-prepare-execution",
+            taskID: TaskID(rawValue: "duplicate-prepare-task"),
+            attempt: 1,
+            toolCallID: "duplicate-prepare-call",
+            agent: main,
+            tool: "task_update",
+            sideEffect: .write,
+            intent: PermissionIntent(
+                action: "task.update",
+                resources: [PermissionResource(kind: .task, value: workTaskID.rawValue)],
+                metadata: ["expectedRevision": .number(1)],
+                dataEffects: [.none],
+                controlEffects: [.updateTask],
+                risks: [.controlPlaneMutation],
+                replayPolicy: .requiresManualReconciliation),
+            replayPolicy: .requiresManualReconciliation)
+        try await log.append([
+            .workTaskCreated(WorkTaskCreatedPayload(task: created)),
+            .workTaskReady(WorkTaskReadyPayload(task: ready)),
+            .toolExecutionPrepared(prepared),
+            .workTaskStarted(WorkTaskStartedPayload(task: started)),
+            .toolExecutionPrepared(prepared),
+        ])
+        let events = try await log.replayChecked()
+        let projection = CoworkProjection.build(from: events)
+
+        let execution = try XCTUnwrap(projection.toolExecutions[prepared.executionID])
+        XCTAssertTrue(execution.hasAmbiguousDurableHistory)
+        XCTAssertNil(execution.validatedSettlement)
+        XCTAssertTrue(Orchestrator.provenStaleTaskUpdateSettlementEvents(
+            events: events,
+            projection: projection).isEmpty)
+        XCTAssertEqual(
+            projection.unresolvedNonReplayableToolExecutions.map(\.id),
+            [prepared.executionID])
+    }
+
+    func testRestoreDoesNotRepairLegacyTicketWhenFutureEventIsUnknown() async throws {
+        let name = "unknown-future-\(UUID().uuidString)"
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("intatis-reliability-\(name)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let log = try reliabilityLog(name)
+        let workspace = try reliabilityWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let fixture = try await appendLegacyTaskUpdateRevisionConflict(
+            to: log,
+            workspace: workspace,
+            agent: main,
+            expectedRevision: 1)
+        let knownEvents = try await log.replayChecked()
+        let nextSequence = try XCTUnwrap(knownEvents.last?.seq) + 1
+        let encoder = Envelope.makeEncoder()
+        let placeholder = try encoder.encode(Envelope(
+            seq: nextSequence,
+            ts: Date(timeIntervalSince1970: Double(nextSequence)),
+            session: await log.sessionID,
+            event: .userMessage(.init(text: "placeholder"))))
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: placeholder) as? [String: Any])
+        object["type"] = "future_work_task_reconciliation_event"
+        object["payload"] = ["futureField": true]
+        var raw = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        raw.append(0x0A)
+        let file = root.appendingPathComponent("events.jsonl")
+        let handle = try FileHandle(forWritingTo: file)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: raw)
+        try handle.close()
+
+        let restored = Orchestrator(
+            log: log,
+            allowsShell: true,
+            responder: FixedResponder(.allow)) { _ in ReliabilityCapturingProvider() }
+        await restored.restore(from: CoworkProjection.build(from: knownEvents))
+
+        let projection = CoworkProjection.build(from: await log.replay())
+        XCTAssertEqual(
+            projection.unresolvedNonReplayableToolExecutions.map(\.id),
+            [fixture.executionID])
+        XCTAssertNil(projection.toolExecutions[fixture.executionID]?.settled)
+    }
+
+    func testLegacyRepairRejectsExpectedRevisionOutsideJSONSafeIntegerRange() async throws {
+        let log = try reliabilityLog()
+        let unsafeRevision = 9_007_199_254_740_993
+        let workTaskID = WorkTaskID(rawValue: "unsafe-double-work-task")
+        let task = WorkTask(
+            id: workTaskID,
+            runID: ContinuationRunID(rawValue: "unsafe-double-run"),
+            title: "Large revision",
+            description: "Do not infer through a lossy Double",
+            status: .inProgress,
+            revision: unsafeRevision)
+        let prepared = ToolExecutionPreparedPayload(
+            executionID: "unsafe-double-execution",
+            taskID: TaskID(rawValue: "unsafe-double-task"),
+            attempt: 1,
+            toolCallID: "unsafe-double-call",
+            agent: main,
+            tool: "task_update",
+            sideEffect: .write,
+            intent: PermissionIntent(
+                action: "task.update",
+                resources: [PermissionResource(kind: .task, value: workTaskID.rawValue)],
+                metadata: ["expectedRevision": .number(Double(unsafeRevision))],
+                dataEffects: [.none],
+                controlEffects: [.updateTask],
+                risks: [.controlPlaneMutation],
+                replayPolicy: .requiresManualReconciliation),
+            replayPolicy: .requiresManualReconciliation)
+        try await log.append([
+            .workTaskCreated(WorkTaskCreatedPayload(task: task)),
+            .toolExecutionPrepared(prepared),
+        ])
+        let events = try await log.replayChecked()
+        let projection = CoworkProjection.build(from: events)
+
+        XCTAssertEqual(Double(unsafeRevision), 9_007_199_254_740_992)
+        XCTAssertTrue(Orchestrator.provenStaleTaskUpdateSettlementEvents(
+            events: events,
+            projection: projection).isEmpty)
+    }
+
+    func testRestoreDoesNotRepairLegacyStaleTicketWhileCurrentGoalExists() async throws {
+        let log = try reliabilityLog()
+        let workspace = try reliabilityWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let fixture = try await appendLegacyTaskUpdateRevisionConflict(
+            to: log,
+            workspace: workspace,
+            agent: main,
+            expectedRevision: 1)
+        let goal = Goal(
+            sessionID: await log.sessionID,
+            objective: "Require explicit reconciliation before startup")
+        try await log.append(.goalCreated(GoalCreatedPayload(goal: goal)))
+
+        let restored = Orchestrator(
+            log: log,
+            allowsShell: true,
+            responder: FixedResponder(.allow)) { _ in ReliabilityCapturingProvider() }
+        await restored.restore(from: CoworkProjection.build(from: await log.replay()))
+
+        let projection = CoworkProjection.build(from: try await log.replayChecked())
+        XCTAssertEqual(
+            projection.unresolvedNonReplayableToolExecutions.map(\.id),
+            [fixture.executionID])
+        XCTAssertTrue(projection.toolExecutions[fixture.executionID]?.settled == nil)
+        XCTAssertEqual(projection.currentGoalID, goal.id)
     }
 
     func testRestoreDoesNotReplayTaskAfterSettledSuccessfulNonReplayableExecution() async throws {
@@ -2220,6 +3086,68 @@ final class OrchestrationReliabilityTests: XCTestCase {
         }
         XCTAssertTrue(message.contains("could not be verified"))
         XCTAssertTrue(provider.requests.isEmpty)
+    }
+
+    func testRetryFailsClosedOnUnknownFutureEventOrSequenceGap() async throws {
+        for scenario in ["unknown-future", "sequence-gap"] {
+            let name = "retry-\(scenario)-\(UUID().uuidString)"
+            let fileURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("intatis-reliability-\(name)", isDirectory: true)
+                .appendingPathComponent("events.jsonl")
+            defer { try? FileManager.default.removeItem(at: fileURL.deletingLastPathComponent()) }
+            let log = try reliabilityLog(name)
+            let workspace = try reliabilityWorkspace()
+            defer { try? FileManager.default.removeItem(at: workspace) }
+            let taskID = TaskID(rawValue: "retry-\(scenario)")
+            try await appendReliabilityTaskWithSettledSideEffect(
+                to: log,
+                workspace: workspace,
+                taskID: taskID,
+                agent: main,
+                terminalStatus: .failed,
+                outcome: .failed,
+                effectDisposition: .notStarted)
+
+            let provider = ReliabilityCapturingProvider()
+            let orchestrator = Orchestrator(
+                log: log,
+                allowsShell: true,
+                responder: FixedResponder(.allow)) { _ in provider }
+            let knownEvents = try await log.replayChecked()
+            let initialProjection = CoworkProjection.build(from: knownEvents)
+            await orchestrator.restore(from: initialProjection)
+            let failedView = try XCTUnwrap(initialProjection.tasks[taskID])
+
+            let nextSequence = try XCTUnwrap(knownEvents.last?.seq)
+                + (scenario == "sequence-gap" ? 2 : 1)
+            let encoder = Envelope.makeEncoder()
+            let placeholder = try encoder.encode(Envelope(
+                seq: nextSequence,
+                ts: Date(timeIntervalSince1970: Double(nextSequence)),
+                session: await log.sessionID,
+                event: .userMessage(.init(text: "placeholder"))))
+            var object = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: placeholder) as? [String: Any])
+            if scenario == "unknown-future" {
+                object["type"] = "future_retry_reconciliation_event"
+                object["payload"] = ["futureField": true]
+            }
+            var raw = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+            raw.append(0x0A)
+            let handle = try FileHandle(forWritingTo: fileURL)
+            try handle.seekToEnd()
+            try handle.write(contentsOf: raw)
+            try handle.close()
+
+            let result = await orchestrator.retry(failedView)
+
+            guard case .failed(let message) = result else {
+                XCTFail("\(scenario) must keep retry fail-closed")
+                continue
+            }
+            XCTAssertTrue(message.contains("could not be verified"), scenario)
+            XCTAssertTrue(provider.requests.isEmpty, scenario)
+        }
     }
 
     func testRestoreAtMaxAttemptFailsAtLastActualAttemptWithoutPhantomRetry() async throws {

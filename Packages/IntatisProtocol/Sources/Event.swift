@@ -17,16 +17,21 @@ public struct UserMessagePayload: Codable, Equatable, Sendable {
     public var to: AgentID?
     public var tags: [String]?
     public var goal: String?
+    /// Stable identity of an accepted user intent. `nil` denotes a legacy
+    /// message that predates durable submission admission.
+    public var submissionID: SubmissionID?
     public init(text: String,
                 attachments: [ArtifactID]? = nil,
                 to: AgentID? = nil,
                 tags: [String]? = nil,
-                goal: String? = nil) {
+                goal: String? = nil,
+                submissionID: SubmissionID? = nil) {
         self.text = text
         self.attachments = attachments
         self.to = to
         self.tags = tags
         self.goal = goal
+        self.submissionID = submissionID
     }
 }
 
@@ -35,11 +40,17 @@ public struct MessageDeltaPayload: Codable, Equatable, Sendable {
     public var role: MessageRole
     public var agent: AgentID?
     public var textDelta: String
-    public init(messageId: MessageID, role: MessageRole, agent: AgentID? = nil, textDelta: String) {
+    public var submissionID: SubmissionID?
+    public init(messageId: MessageID,
+                role: MessageRole,
+                agent: AgentID? = nil,
+                textDelta: String,
+                submissionID: SubmissionID? = nil) {
         self.messageId = messageId
         self.role = role
         self.agent = agent
         self.textDelta = textDelta
+        self.submissionID = submissionID
     }
 }
 
@@ -48,11 +59,17 @@ public struct MessageCompletedPayload: Codable, Equatable, Sendable {
     public var role: MessageRole
     public var agent: AgentID?
     public var text: String
-    public init(messageId: MessageID, role: MessageRole, agent: AgentID? = nil, text: String) {
+    public var submissionID: SubmissionID?
+    public init(messageId: MessageID,
+                role: MessageRole,
+                agent: AgentID? = nil,
+                text: String,
+                submissionID: SubmissionID? = nil) {
         self.messageId = messageId
         self.role = role
         self.agent = agent
         self.text = text
+        self.submissionID = submissionID
     }
 }
 
@@ -60,10 +77,63 @@ public struct ErrorPayload: Codable, Equatable, Sendable {
     public var code: String
     public var message: String
     public var fatal: Bool
-    public init(code: String, message: String, fatal: Bool = false) {
+    public var submissionID: SubmissionID?
+    public init(code: String,
+                message: String,
+                fatal: Bool = false,
+                submissionID: SubmissionID? = nil) {
         self.code = code
         self.message = message
         self.fatal = fatal
+        self.submissionID = submissionID
+    }
+}
+
+// MARK: - Durable submitted-intent admission
+
+/// User-visible lifecycle of one accepted submission attempt.
+public enum SubmissionStatus: String, Codable, Equatable, Sendable {
+    case queued
+    case running
+    case completed
+    case failed
+    case cancelled
+
+    public var isTerminal: Bool {
+        self == .completed || self == .failed || self == .cancelled
+    }
+}
+
+/// Bounded failure presentation retained with a failed submission. Provider
+/// response bodies and secrets must be scrubbed before constructing this value.
+public struct SubmissionFailure: Codable, Equatable, Sendable {
+    public var code: String
+    public var message: String
+    public var retryable: Bool
+
+    public init(code: String, message: String, retryable: Bool) {
+        self.code = code
+        self.message = message
+        self.retryable = retryable
+    }
+}
+
+/// Additive status record for an immutable `user_message` carrying the same
+/// `submissionID`. Attempt numbers are one-based and monotonic per submission.
+public struct SubmissionStatusChangedPayload: Codable, Equatable, Sendable {
+    public var submissionID: SubmissionID
+    public var status: SubmissionStatus
+    public var attempt: Int
+    public var failure: SubmissionFailure?
+
+    public init(submissionID: SubmissionID,
+                status: SubmissionStatus,
+                attempt: Int,
+                failure: SubmissionFailure? = nil) {
+        self.submissionID = submissionID
+        self.status = status
+        self.attempt = attempt
+        self.failure = failure
     }
 }
 
@@ -77,6 +147,13 @@ public enum PermissionDecision: String, Codable, Sendable {
     case allow
     case deny
     case askUser = "ask_user"
+}
+
+/// Who is expected to settle an `ask_user` permission request. Legacy requests
+/// omit this field and remain manual for compatibility.
+public enum PermissionApprovalMode: String, Codable, Equatable, Sendable {
+    case manual
+    case automaticReviewer = "automatic_reviewer"
 }
 
 public enum AgentState: String, Codable, Sendable {
@@ -118,10 +195,24 @@ public struct ToolResultPayload: Codable, Equatable, Sendable {
     public var toolCallId: String
     public var observation: String
     public var truncated: Bool?
-    public init(toolCallId: String, observation: String, truncated: Bool? = nil) {
+    public var outcome: ToolCallOutcome?
+    public var failureSource: ExecutionFailureSource?
+    public var turnID: TurnID?
+    public var permissionRequestID: RequestID?
+    public init(toolCallId: String,
+                observation: String,
+                truncated: Bool? = nil,
+                outcome: ToolCallOutcome? = nil,
+                failureSource: ExecutionFailureSource? = nil,
+                turnID: TurnID? = nil,
+                permissionRequestID: RequestID? = nil) {
         self.toolCallId = toolCallId
         self.observation = observation
         self.truncated = truncated
+        self.outcome = outcome
+        self.failureSource = failureSource
+        self.turnID = turnID
+        self.permissionRequestID = permissionRequestID
     }
 }
 
@@ -134,8 +225,10 @@ public struct PermissionRequestPayload: Codable, Equatable, Sendable {
     public var risk: RiskLevel
     public var reason: String
     public var context: PermissionRequestContext?
+    public var approvalMode: PermissionApprovalMode?
     public init(requestId: RequestID, agent: AgentID? = nil, tool: String, args: String,
-                risk: RiskLevel, reason: String, context: PermissionRequestContext? = nil) {
+                risk: RiskLevel, reason: String, context: PermissionRequestContext? = nil,
+                approvalMode: PermissionApprovalMode? = nil) {
         self.requestId = requestId
         self.agent = agent
         self.tool = tool
@@ -143,12 +236,19 @@ public struct PermissionRequestPayload: Codable, Equatable, Sendable {
         self.risk = risk
         self.reason = reason
         self.context = context
+        self.approvalMode = approvalMode
+    }
+
+    public var effectiveApprovalMode: PermissionApprovalMode {
+        approvalMode ?? .manual
     }
 }
 
 /// Audit record of how a permission decision was settled (gate or user).
 public struct PermissionResolvedPayload: Codable, Equatable, Sendable {
     public var requestId: RequestID?
+    public var turnID: TurnID?
+    public var toolCallID: String?
     public var tool: String
     public var decision: PermissionDecision
     public var risk: RiskLevel
@@ -159,14 +259,23 @@ public struct PermissionResolvedPayload: Codable, Equatable, Sendable {
     public var reviewTaskID: PermissionReviewTaskID?
     public var reviewStatus: PermissionReviewStatus?
     public var failureKind: PermissionApprovalFailureKind?
-    public init(requestId: RequestID? = nil, tool: String, decision: PermissionDecision,
+    public var failureSource: ExecutionFailureSource?
+    public var action: PermissionResponseAction?
+    public init(requestId: RequestID? = nil,
+                turnID: TurnID? = nil,
+                toolCallID: String? = nil,
+                tool: String, decision: PermissionDecision,
                 risk: RiskLevel, reason: String, intent: PermissionIntent? = nil,
                 authorization: ResolvedToolAuthorization? = nil,
                 source: PermissionApprovalSource? = nil,
                 reviewTaskID: PermissionReviewTaskID? = nil,
                 reviewStatus: PermissionReviewStatus? = nil,
-                failureKind: PermissionApprovalFailureKind? = nil) {
+                failureKind: PermissionApprovalFailureKind? = nil,
+                failureSource: ExecutionFailureSource? = nil,
+                action: PermissionResponseAction? = nil) {
         self.requestId = requestId
+        self.turnID = turnID
+        self.toolCallID = toolCallID
         self.tool = tool
         self.decision = decision
         self.risk = risk
@@ -177,6 +286,8 @@ public struct PermissionResolvedPayload: Codable, Equatable, Sendable {
         self.reviewTaskID = reviewTaskID
         self.reviewStatus = reviewStatus
         self.failureKind = failureKind
+        self.failureSource = failureSource
+        self.action = action
     }
 }
 
@@ -422,7 +533,11 @@ public struct TaskRejectedPayload: Codable, Equatable, Sendable {
 /// persistence record and the kernel→client notification (ARCHITECTURE.md §5.1,
 /// principle A). Adding cases is additive — older clients skip unknown types.
 public enum Event: Equatable, Sendable {
+    // versioned session/project metadata (derived into session.json)
+    case sessionSettingsUpdated(SessionSettingsUpdatedPayload)
+    case sessionStorageMigrated(SessionStorageMigratedPayload)
     case userMessage(UserMessagePayload)
+    case submissionStatusChanged(SubmissionStatusChangedPayload)
     case messageDelta(MessageDeltaPayload)
     case messageCompleted(MessageCompletedPayload)
     case error(ErrorPayload)
@@ -509,10 +624,15 @@ public enum Event: Equatable, Sendable {
     case artifactProgress(ArtifactProgressPayload)
     // stats
     case turnStats(TurnStatsPayload)
+    // typed terminal turn lifecycle (Phase C)
+    case turnOutcome(TurnOutcomePayload)
 
     /// Stable wire discriminator (snake_case) used in the `type` field.
     public enum TypeTag: String, Codable, Sendable {
+        case sessionSettingsUpdated = "session_settings_updated"
+        case sessionStorageMigrated = "session_storage_migrated"
         case userMessage = "user_message"
+        case submissionStatusChanged = "submission_status_changed"
         case messageDelta = "message_delta"
         case messageCompleted = "message_completed"
         case error = "error"
@@ -591,11 +711,15 @@ public enum Event: Equatable, Sendable {
         case artifactAdded = "artifact_added"
         case artifactProgress = "artifact_progress"
         case turnStats = "turn_stats"
+        case turnOutcome = "turn_outcome"
     }
 
     public var type: TypeTag {
         switch self {
+        case .sessionSettingsUpdated: return .sessionSettingsUpdated
+        case .sessionStorageMigrated: return .sessionStorageMigrated
         case .userMessage:        return .userMessage
+        case .submissionStatusChanged: return .submissionStatusChanged
         case .messageDelta:       return .messageDelta
         case .messageCompleted:   return .messageCompleted
         case .error:              return .error
@@ -674,6 +798,7 @@ public enum Event: Equatable, Sendable {
         case .artifactAdded:       return .artifactAdded
         case .artifactProgress:    return .artifactProgress
         case .turnStats:           return .turnStats
+        case .turnOutcome:         return .turnOutcome
         }
     }
 }

@@ -98,5 +98,9 @@ public enum AgentChunk: Equatable, Sendable {
 
 /// A model that supports tool/function calling (`Capability.tool_calling`).
 public protocol ToolCallingProvider: Sendable {
+    /// Must return a request-owned stream promptly. Implementations perform
+    /// network/blocking work in the stream producer, keep continuations scoped
+    /// to this request, and propagate consumer termination to that producer.
+    /// Synchronously blocking this method is outside the provider contract.
     func stream(_ request: AgentRequest) -> AsyncThrowingStream<AgentChunk, Error>
 }

@@ -155,100 +155,76 @@ private enum RetryAdmissionResult: Sendable {
     case rejected(String)
 }
 
-private final class CoworkTimeoutGate<Value: Sendable>: @unchecked Sendable {
-    private let lock = NSLock()
-    private var continuation: CheckedContinuation<Value, Error>?
-    private var pendingResult: Result<Value, Error>?
-    private var tasks: [Task<Void, Never>] = []
-    private var resolved = false
-
-    func install(_ continuation: CheckedContinuation<Value, Error>) {
-        let result: Result<Value, Error>?
-        lock.lock()
-        if let pendingResult {
-            result = pendingResult
-            self.pendingResult = nil
-        } else {
-            self.continuation = continuation
-            result = nil
-        }
-        lock.unlock()
-        if let result { continuation.resume(with: result) }
-    }
-
-    func setTasks(_ tasks: [Task<Void, Never>]) {
-        let shouldCancel: Bool
-        lock.lock()
-        if resolved {
-            shouldCancel = true
-        } else {
-            self.tasks = tasks
-            shouldCancel = false
-        }
-        lock.unlock()
-        if shouldCancel { tasks.forEach { $0.cancel() } }
-    }
-
-    func resolve(_ result: Result<Value, Error>) {
-        let continuation: CheckedContinuation<Value, Error>?
-        let tasks: [Task<Void, Never>]
-        lock.lock()
-        guard !resolved else {
-            lock.unlock()
-            return
-        }
-        resolved = true
-        continuation = self.continuation
-        self.continuation = nil
-        if continuation == nil { pendingResult = result }
-        tasks = self.tasks
-        self.tasks.removeAll()
-        lock.unlock()
-
-        tasks.forEach { $0.cancel() }
-        continuation?.resume(with: result)
-    }
+private enum CoworkTaskTimeoutRace<Value: Sendable>: Sendable {
+    case operation(Value)
+    case timeout
 }
 
+/// Races one request-owned operation against its deadline, then joins both
+/// children before returning. Operations must react to cancellation or at
+/// least eventually unwind; a permanently synchronous blocker is deliberately
+/// outside the provider contract because publishing a terminal task while it
+/// still runs would make the execution result unknowable.
 private func withTaskTimeout<T: Sendable>(
     seconds: Double,
     operation: @escaping @Sendable () async throws -> T
 ) async throws -> T {
     let boundedSeconds = max(0.001, seconds)
-    let gate = CoworkTimeoutGate<T>()
-    return try await withTaskCancellationHandler(operation: {
-        try Task.checkCancellation()
-        return try await withCheckedThrowingContinuation { continuation in
-            gate.install(continuation)
-            // Detached tasks must not inherit the Orchestrator actor executor:
-            // a provider is allowed to block synchronously while constructing
-            // its stream, and that must not starve the independent watchdog.
-            let operationTask = Task.detached(priority: nil) {
-                do {
-                    gate.resolve(.success(try await operation()))
-                } catch {
-                    gate.resolve(.failure(error))
-                }
-            }
-            let timeoutTask = Task.detached(priority: nil) {
-                do {
-                    let nanos = UInt64(
-                        min(boundedSeconds, Double(UInt64.max) / 1_000_000_000)
-                            * 1_000_000_000)
-                    try await Task.sleep(nanoseconds: nanos)
-                    gate.resolve(.failure(CoworkTaskExecutionError.timedOut(
-                        seconds: boundedSeconds)))
-                } catch is CancellationError {
-                    // The operation won the race or the caller was cancelled.
-                } catch {
-                    gate.resolve(.failure(error))
-                }
-            }
-            gate.setTasks([operationTask, timeoutTask])
+    try Task.checkCancellation()
+    return try await withThrowingTaskGroup(
+        of: CoworkTaskTimeoutRace<T>.self,
+        returning: T.self
+    ) { group in
+        group.addTask {
+            .operation(try await operation())
         }
-    }, onCancel: {
-        gate.resolve(.failure(CancellationError()))
-    })
+        group.addTask {
+            let nanos = UInt64(
+                min(boundedSeconds, Double(UInt64.max) / 1_000_000_000)
+                    * 1_000_000_000)
+            try await Task.sleep(nanoseconds: nanos)
+            return .timeout
+        }
+
+        do {
+            guard let first = try await group.next() else {
+                throw CancellationError()
+            }
+            group.cancelAll()
+            // Leaving a task-group scope is a structured join. Explicitly
+            // drain the losing child as well so the terminal task event cannot
+            // be committed while provider/tool cleanup is still executing.
+            while true {
+                do {
+                    guard try await group.next() != nil else { break }
+                } catch is CancellationError {
+                    // Expected for the cancelled timeout or operation child.
+                } catch {
+                    // The first terminal signal owns the race; a losing
+                    // child's late failure cannot replace it.
+                }
+            }
+            try Task.checkCancellation()
+            switch first {
+            case .operation(let value):
+                return value
+            case .timeout:
+                throw CoworkTaskExecutionError.timedOut(seconds: boundedSeconds)
+            }
+        } catch {
+            group.cancelAll()
+            // A caller cancellation or provider failure must also wait for all
+            // in-scope cleanup before it is observed by the scheduler.
+            while true {
+                do {
+                    guard try await group.next() != nil else { break }
+                } catch {
+                    // Preserve the first observed error after all children end.
+                }
+            }
+            throw error
+        }
+    }
 }
 
 /// Coordinates multiple agents over one shared event log (ARCHITECTURE.md §7).
@@ -345,6 +321,7 @@ public actor Orchestrator {
     private let resolvedInferenceFor: (@Sendable (Agent) async throws -> ResolvedInferenceProfile)?
     private let providerFor: @Sendable (Agent) async throws -> ToolCallingProvider
     private let imageGeneratorFor: @Sendable (Agent) async -> ImageGenerationToolService?
+    private let sessionNaming: SessionNamingService?
     private var messageConsumptionAppender: (@Sendable (AgentMessageConsumedPayload) async throws -> Void)?
     private var taskLifecycleEventAppender: (@Sendable (Event) async throws -> Void)?
     private var terminalPersistenceFailures: [TaskID: String]
@@ -376,6 +353,7 @@ public actor Orchestrator {
         availableInferenceProfiles: [AgentInferenceBinding] = [],
         requiresInferenceBindings: Bool = false,
         imageGeneratorFor: @escaping @Sendable (Agent) async -> ImageGenerationToolService? = { _ in nil },
+        sessionNaming: SessionNamingService? = nil,
         providerFor: @escaping @Sendable (Agent) async throws -> ToolCallingProvider
     ) throws -> Orchestrator {
         guard !requiresInferenceBindings else {
@@ -397,6 +375,7 @@ public actor Orchestrator {
             availableInferenceProfiles: availableInferenceProfiles,
             requiresInferenceBindings: requiresInferenceBindings,
             imageGeneratorFor: imageGeneratorFor,
+            sessionNaming: sessionNaming,
             writerLease: writerLease,
             providerFor: providerFor)
     }
@@ -419,6 +398,7 @@ public actor Orchestrator {
         availableInferenceProfiles: [AgentInferenceBinding] = [],
         requiresInferenceBindings: Bool = true,
         imageGeneratorFor: @escaping @Sendable (Agent) async -> ImageGenerationToolService? = { _ in nil },
+        sessionNaming: SessionNamingService? = nil,
         resolvedInferenceFor: @escaping @Sendable (Agent) async throws -> ResolvedInferenceProfile
     ) throws -> Orchestrator {
         let writerLease = try log.acquireWriterLease()
@@ -436,6 +416,7 @@ public actor Orchestrator {
             availableInferenceProfiles: availableInferenceProfiles,
             requiresInferenceBindings: requiresInferenceBindings,
             imageGeneratorFor: imageGeneratorFor,
+            sessionNaming: sessionNaming,
             writerLease: writerLease,
             resolvedInferenceFor: resolvedInferenceFor,
             providerFor: { agent in
@@ -459,6 +440,7 @@ public actor Orchestrator {
                 availableInferenceProfiles: [AgentInferenceBinding] = [],
                 requiresInferenceBindings: Bool = false,
                 imageGeneratorFor: @escaping @Sendable (Agent) async -> ImageGenerationToolService? = { _ in nil },
+                sessionNaming: SessionNamingService? = nil,
                 writerLease: EventLogWriterLease? = nil,
                 resolvedInferenceFor: (@Sendable (Agent) async throws -> ResolvedInferenceProfile)? = nil,
                 providerFor: @escaping @Sendable (Agent) async throws -> ToolCallingProvider) {
@@ -513,6 +495,7 @@ public actor Orchestrator {
         self.resolvedInferenceFor = resolvedInferenceFor
         self.providerFor = providerFor
         self.imageGeneratorFor = imageGeneratorFor
+        self.sessionNaming = sessionNaming
         self.messageConsumptionAppender = nil
         self.taskLifecycleEventAppender = nil
         self.terminalPersistenceFailures = [:]
@@ -548,6 +531,35 @@ public actor Orchestrator {
                 "configurationUnresolved: resolved inference profile does not match the agent binding and model")
         }
         return resolved.provider
+    }
+
+    /// Freezes the reviewer identity and exact inference binding while giving
+    /// every permission-review generation a newly resolved provider wrapper.
+    /// Capture only the resolver seams and immutable Agent value: capturing
+    /// this Orchestrator would create a responder/control-plane retain cycle.
+    private func permissionReviewProviderFactory(
+        for agent: Agent
+    ) -> PermissionReviewProviderFactory {
+        let frozenAgent = agent
+        let exactResolver = resolvedInferenceFor
+        let legacyProviderFor = providerFor
+        return {
+            guard let exactResolver else {
+                return try await legacyProviderFor(frozenAgent)
+            }
+            guard let binding = frozenAgent.agentInferenceBinding,
+                  binding.modelID == frozenAgent.model else {
+                throw IntatisError.config(
+                    "configurationUnresolved: reviewer inference binding and model differ")
+            }
+            let resolved = try await exactResolver(frozenAgent)
+            guard resolved.binding == binding,
+                  resolved.model == frozenAgent.model else {
+                throw IntatisError.config(
+                    "configurationUnresolved: resolved reviewer profile does not match its frozen binding and model")
+            }
+            return resolved.provider
+        }
     }
 
     @discardableResult
@@ -809,7 +821,23 @@ public actor Orchestrator {
             return false
         }
 
-        let resolution = await activePermissionResponder().requestResolution(request)
+        let reviewedResolution = await activePermissionResponder().requestResolution(request)
+        // A responder may finish concurrently with caller cancellation. Never
+        // let a direct host admission path treat that stale allow as authority;
+        // AgentLoop has its own equivalent post-review cancellation fence.
+        let resolution: PermissionApprovalResolution
+        if Task.isCancelled {
+            resolution = PermissionApprovalResolution(
+                decision: .deny,
+                reason: "agent attach caller cancelled after permission review",
+                risk: reviewedResolution.risk ?? assessment.risk,
+                source: .callerCancellation,
+                reviewTaskID: reviewedResolution.reviewTaskID,
+                reviewStatus: .cancelled,
+                failureKind: .callerCancelled)
+        } else {
+            resolution = reviewedResolution
+        }
         guard resolution.decision == .allow else {
             let suppliedReason = resolution.reason?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -926,6 +954,40 @@ public actor Orchestrator {
             } catch {
                 try? await log.append(.error(ErrorPayload(
                     code: "agent_attach_identity_denial_persistence_failed",
+                    message: error.localizedDescription)))
+            }
+            releaseAdmissionLock()
+            return false
+        }
+        // This check is the cancellation linearization point for durable host
+        // admission. Cancellation observed after review but while exact
+        // inference resolution or the admission lock was suspended must win;
+        // once this check passes, the atomic append below owns the commit.
+        if Task.isCancelled {
+            let reason = "agent attach caller cancelled before durable admission"
+            do {
+                try await appendAdmissionEvents([
+                    .permissionResolved(PermissionResolvedPayload(
+                        requestId: requestID,
+                        tool: "agent.attach",
+                        decision: .deny,
+                        risk: resolution.risk ?? assessment.risk,
+                        reason: reason,
+                        intent: attachIntent,
+                        authorization: attachAuthorization,
+                        source: .callerCancellation,
+                        reviewTaskID: resolution.reviewTaskID,
+                        reviewStatus: .cancelled,
+                        failureKind: .callerCancelled)),
+                    .workspaceLeaseDenied(WorkspaceLeaseDeniedPayload(
+                        agent: proposedAgent.name,
+                        rootPath: assessedPath,
+                        reason: reason,
+                        metadata: workspaceMetadata)),
+                ])
+            } catch {
+                try? await log.append(.error(ErrorPayload(
+                    code: "agent_attach_cancellation_denial_persistence_failed",
                     message: error.localizedDescription)))
             }
             releaseAdmissionLock()
@@ -1114,6 +1176,459 @@ public actor Orchestrator {
         registry.add(proposedAgent)
         commitDefaultLeases(proposedLeases, for: proposedAgent.name)
         return .attached(proposedAgent.name)
+    }
+
+    /// Repairs a historical Cowork session whose canonical settings and
+    /// workspace authorization survived but whose durable @main registration
+    /// is missing. This is a host-control-plane recovery path: it never asks a
+    /// model for permission and is unavailable for an empty/fresh session.
+    /// The exact settings snapshot, inference binding, workspace identity, and
+    /// absence of stale @main leases are revalidated immediately before the
+    /// three registration events are appended atomically.
+    @discardableResult
+    public func restoreHistoricalMainAgent(
+        _ agent: Agent,
+        settings rawSettings: CoworkSessionSettings,
+        hostAuthorized: Bool
+    ) async -> CoworkSessionBootstrapResult {
+        guard hostAuthorized else {
+            return .failed("Historical @main recovery requires explicit host authorization.")
+        }
+        guard agent.name == Self.mainAgentID else {
+            return .failed("Historical Cowork recovery only accepts @\(Self.mainAgentID.rawValue).")
+        }
+        if let validationError = Self.agentNameValidationError(agent.name.rawValue) {
+            return .failed(validationError)
+        }
+        guard !requiresInferenceBindings || agent.agentInferenceBinding != nil else {
+            return .failed("@main requires an exact inference profile binding.")
+        }
+
+        let sessionID = await log.sessionID
+        var settings = rawSettings
+        // Provider identifiers are non-canonical compatibility metadata and
+        // are deliberately absent from EventLog settings snapshots.
+        settings.defaultProviderID = nil
+        let primaryWorkspaces = settings.workspaces.filter(\.isPrimary)
+        guard settings.schemaVersion == CoworkSessionSettings.currentSchemaVersion,
+              settings.sessionID == sessionID,
+              settings.mainAgentName == Self.mainAgentID.rawValue,
+              settings.defaultInferenceProfileBinding == agent.agentInferenceBinding,
+              settings.defaultModelID == nil || settings.defaultModelID == agent.model.rawValue,
+              settings.defaultPermissionProfile == agent.profile.rawValue,
+              primaryWorkspaces.count == 1,
+              let primary = primaryWorkspaces.first else {
+            return .failed("Historical Cowork settings do not match the fixed @main registration.")
+        }
+
+        let assessment = assessWorkspaceAttach(agent.workspaceRoot)
+        guard assessment.canAskUser, let canonical = assessment.canonical else {
+            return .failed(assessment.reason)
+        }
+        guard URL(fileURLWithPath: primary.path).standardizedFileURL.resolvingSymlinksInPath()
+                == canonical.standardizedFileURL.resolvingSymlinksInPath() else {
+            return .failed("Historical Cowork settings do not match the authorized primary workspace.")
+        }
+
+        var proposedMain = agent
+        proposedMain.workspaceRoot = canonical
+        if requiresInferenceBindings {
+            do {
+                _ = try await resolvedProvider(for: proposedMain)
+            } catch {
+                return .failed("@main exact inference profile revision is unavailable or incompatible.")
+            }
+        }
+        let reviewedCatalogBinding = proposedMain.agentInferenceBinding.flatMap {
+            availableInferenceProfiles[$0.inferenceProfileID]
+        }
+        let proposedLeases = prepareDefaultLeases(for: proposedMain)
+
+        await acquireAdmissionLock()
+        if registry.agent(Self.mainAgentID) != nil {
+            releaseAdmissionLock()
+            return .alreadyAttached(Self.mainAgentID)
+        }
+        let catalogBindingBeforeResolution = proposedMain.agentInferenceBinding.flatMap {
+            availableInferenceProfiles[$0.inferenceProfileID]
+        }
+        do {
+            let envelopes = try await log.replayChecked()
+            let canonicalSettings = try SessionProjectionStore.canonicalSessionSettings(
+                from: envelopes,
+                session: sessionID)
+            let projection = CoworkProjection.build(from: envelopes)
+            guard !envelopes.isEmpty,
+                  canonicalSettings?.kind == .cowork,
+                  canonicalSettings?.cowork.map({
+                      Self.historicalRecoverySettingsMatch($0, settings)
+                  }) == true,
+                  projection.agentRoster[Self.mainAgentID] == nil,
+                  !projection.workspaceLeaseAgents.values.contains(Self.mainAgentID),
+                  !projection.capabilityLeaseAgents.values.contains(Self.mainAgentID) else {
+                releaseAdmissionLock()
+                return .failed("Historical @main recovery preconditions are not satisfied.")
+            }
+        } catch {
+            releaseAdmissionLock()
+            return .failed("Historical @main recovery could not verify the event log: \(error.localizedDescription)")
+        }
+        releaseAdmissionLock()
+
+        if requiresInferenceBindings {
+            do {
+                _ = try await resolvedProvider(for: proposedMain)
+            } catch {
+                return .failed("@main exact inference profile changed before durable recovery.")
+            }
+        }
+
+        await acquireAdmissionLock()
+        defer { releaseAdmissionLock() }
+        if registry.agent(Self.mainAgentID) != nil {
+            return .alreadyAttached(Self.mainAgentID)
+        }
+        if requiresInferenceBindings {
+            let liveCatalogBinding = proposedMain.agentInferenceBinding.flatMap {
+                availableInferenceProfiles[$0.inferenceProfileID]
+            }
+            guard reviewedCatalogBinding == catalogBindingBeforeResolution,
+                  catalogBindingBeforeResolution == liveCatalogBinding else {
+                return .failed("@main host-approved inference profile changed before durable recovery.")
+            }
+        }
+        guard let reviewedIdentity = proposedLeases.workspace.rootIdentity,
+              reviewedIdentity.matchesCurrentDirectory(rootPath: proposedLeases.workspace.rootPath) else {
+            return .failed("The primary workspace identity changed before durable recovery.")
+        }
+
+        let agentMetadata = CoworkEventMetadata(
+            agentID: proposedMain.name,
+            workspaceID: proposedLeases.workspace.workspaceID,
+            workspaceLeaseID: proposedLeases.workspace.id,
+            capabilityLeaseID: proposedLeases.capability.id,
+            scope: .agent)
+        let workspaceMetadata = CoworkEventMetadata(
+            agentID: proposedMain.name,
+            workspaceID: proposedLeases.workspace.workspaceID,
+            workspaceLeaseID: proposedLeases.workspace.id,
+            scope: .workspace)
+        let capabilityMetadata = CoworkEventMetadata(
+            agentID: proposedMain.name,
+            capabilityLeaseID: proposedLeases.capability.id,
+            scope: .capability)
+        let registrationEvents: [Event] = [
+                .workspaceLeaseGranted(WorkspaceLeaseGrantedPayload(
+                    agent: proposedMain.name,
+                    lease: proposedLeases.workspace,
+                    metadata: workspaceMetadata)),
+                .capabilityLeaseCreated(CapabilityLeaseCreatedPayload(
+                    agent: proposedMain.name,
+                    lease: proposedLeases.capability,
+                    metadata: capabilityMetadata)),
+                .agentAttached(AgentAttachedPayload(
+                    agent: proposedMain.name,
+                    path: proposedMain.workspaceRoot.path,
+                    model: proposedMain.model,
+                    profile: proposedMain.profile.rawValue,
+                    agentInferenceBinding: proposedMain.agentInferenceBinding,
+                    metadata: agentMetadata)),
+        ]
+        let recoverySettings = settings
+        do {
+            // The history predicate and the three-event append share the same
+            // EventLog cross-process lock. A concurrent settings update can no
+            // longer land between revalidation and registration.
+            let persisted = try await log.appendSessionStateTransaction { envelopes in
+                let canonicalSettings = try SessionProjectionStore.canonicalSessionSettings(
+                    from: envelopes,
+                    session: sessionID)
+                let projection = CoworkProjection.build(from: envelopes)
+                guard !envelopes.isEmpty,
+                      canonicalSettings?.kind == .cowork,
+                      canonicalSettings?.cowork.map({
+                          Self.historicalRecoverySettingsMatch($0, recoverySettings)
+                      }) == true,
+                      projection.agentRoster[Self.mainAgentID] == nil,
+                      !projection.workspaceLeaseAgents.values.contains(Self.mainAgentID),
+                      !projection.capabilityLeaseAgents.values.contains(Self.mainAgentID) else {
+                    throw IntatisError.config(
+                        "Historical @main recovery state changed before durable registration.")
+                }
+                return registrationEvents
+            }
+            guard persisted.count == registrationEvents.count else {
+                return .failed("Historical @main recovery did not commit its complete registration batch.")
+            }
+        } catch {
+            return .failed("Historical @main recovery could not be persisted: \(error.localizedDescription)")
+        }
+
+        registry.add(proposedMain)
+        commitDefaultLeases(proposedLeases, for: proposedMain.name)
+        return .attached(proposedMain.name)
+    }
+
+    private static func historicalRecoverySettingsMatch(
+        _ canonical: CoworkSessionSettings,
+        _ requested: CoworkSessionSettings
+    ) -> Bool {
+        var canonical = canonical
+        var requested = requested
+        canonical.defaultProviderID = nil
+        requested.defaultProviderID = nil
+        // ISO-8601 EventLog encoding intentionally does not preserve
+        // subsecond precision. `addedAt` is presentation metadata and cannot
+        // authorize a workspace or inference route, so compare a stable form.
+        canonical.workspaces = canonical.workspaces.map { workspace in
+            var workspace = workspace
+            workspace.addedAt = Date(timeIntervalSince1970: 0)
+            return workspace
+        }
+        requested.workspaces = requested.workspaces.map { workspace in
+            var workspace = workspace
+            workspace.addedAt = Date(timeIntervalSince1970: 0)
+            return workspace
+        }
+        return canonical == requested
+    }
+
+    /// Atomically establishes the complete local identity/settings baseline for
+    /// a brand-new Cowork session. Registration is local durable state only;
+    /// constructing the no-tools reviewer responder does not issue a model
+    /// request. The reviewer is derived from @main so their exact inference
+    /// binding cannot drift, while their identity and leases remain distinct.
+    @discardableResult
+    public func bootstrapFreshSession(
+        main agent: Agent,
+        settings rawSettings: CoworkSessionSettings,
+        reviewerPolicy: PermissionReviewControlPlanePolicy = PermissionReviewControlPlanePolicy()
+    ) async -> CoworkSessionBootstrapResult {
+        guard agent.name == Self.mainAgentID else {
+            return .failed("Cowork session bootstrap only accepts @\(Self.mainAgentID.rawValue).")
+        }
+        if let validationError = Self.agentNameValidationError(agent.name.rawValue) {
+            return .failed(validationError)
+        }
+        guard !requiresInferenceBindings || agent.agentInferenceBinding != nil else {
+            return .failed("@main requires an exact inference profile binding.")
+        }
+        let sessionID = await log.sessionID
+        let primaryWorkspaces = rawSettings.workspaces.filter(\.isPrimary)
+        guard rawSettings.schemaVersion == CoworkSessionSettings.currentSchemaVersion,
+              rawSettings.sessionID == sessionID,
+              rawSettings.mainAgentName == Self.mainAgentID.rawValue,
+              rawSettings.defaultInferenceProfileBinding == agent.agentInferenceBinding,
+              rawSettings.defaultModelID == nil || rawSettings.defaultModelID == agent.model.rawValue,
+              rawSettings.defaultPermissionProfile == agent.profile.rawValue,
+              primaryWorkspaces.count == 1,
+              let primary = primaryWorkspaces.first else {
+            return .failed("Initial Cowork settings do not match the fixed @main registration.")
+        }
+
+        let assessment = assessWorkspaceAttach(agent.workspaceRoot)
+        guard assessment.canAskUser, let canonical = assessment.canonical else {
+            return .failed(assessment.reason)
+        }
+        guard URL(fileURLWithPath: primary.path).standardizedFileURL.resolvingSymlinksInPath()
+                == canonical.standardizedFileURL.resolvingSymlinksInPath() else {
+            return .failed("Initial Cowork settings do not match the selected primary workspace.")
+        }
+
+        var proposedMain = agent
+        proposedMain.workspaceRoot = canonical
+        var settings = rawSettings
+        settings.workspaces = settings.workspaces.map { workspace in
+            guard workspace.isPrimary else { return workspace }
+            var updated = workspace
+            updated.path = canonical.path
+            updated.agentName = Self.mainAgentID.rawValue
+            return updated
+        }
+        let reviewer = Agent(
+            name: Self.automaticPermissionReviewerID,
+            workspaceRoot: canonical,
+            model: proposedMain.model,
+            agentInferenceBinding: proposedMain.agentInferenceBinding,
+            profile: .readOnly,
+            coordinationDepth: 0)
+
+        let reviewerProviderFactory = permissionReviewProviderFactory(for: reviewer)
+        do {
+            _ = try await resolvedProvider(for: proposedMain)
+            _ = try await reviewerProviderFactory()
+        } catch {
+            return .failed("The exact @main/reviewer inference profile is unavailable or incompatible.")
+        }
+        let reviewedCatalogBinding = proposedMain.agentInferenceBinding.flatMap {
+            availableInferenceProfiles[$0.inferenceProfileID]
+        }
+        let mainLeases = prepareDefaultLeases(for: proposedMain)
+        let reviewerWorkspaceLease = WorkspaceLease(
+            rootPath: canonical.path,
+            access: .readOnly)
+        let reviewerCapabilityLease = CapabilityLease(
+            tools: [],
+            communication: .none,
+            delegation: .none,
+            expiresAtTaskCompletion: false)
+
+        // Preserve the existing strict-empty double preflight. Settings are in
+        // the eventual atomic batch, never written as a permissive prefix.
+        await acquireAdmissionLock()
+        guard registry.isEmpty,
+              automaticPermissionResponder == nil,
+              automaticPermissionReviewerAgentID == nil else {
+            releaseAdmissionLock()
+            return registry.agent(Self.mainAgentID) != nil
+                ? .alreadyAttached(Self.mainAgentID)
+                : .failed("Initial Cowork bootstrap requires an empty local roster.")
+        }
+        do {
+            guard try await log.isEmptyChecked() else {
+                releaseAdmissionLock()
+                return .failed("Initial Cowork bootstrap is only available for an empty session.")
+            }
+        } catch {
+            releaseAdmissionLock()
+            return .failed("Initial Cowork bootstrap could not verify an empty event log: \(error.localizedDescription)")
+        }
+        let catalogBindingBeforeResolution = proposedMain.agentInferenceBinding.flatMap {
+            availableInferenceProfiles[$0.inferenceProfileID]
+        }
+        releaseAdmissionLock()
+
+        do {
+            _ = try await resolvedProvider(for: proposedMain)
+            _ = try await resolvedProvider(for: reviewer)
+        } catch {
+            return .failed("The exact @main/reviewer inference profile changed before durable admission.")
+        }
+
+        await acquireAdmissionLock()
+        defer { releaseAdmissionLock() }
+        guard registry.isEmpty,
+              automaticPermissionResponder == nil,
+              automaticPermissionReviewerAgentID == nil else {
+            return registry.agent(Self.mainAgentID) != nil
+                ? .alreadyAttached(Self.mainAgentID)
+                : .failed("Initial Cowork bootstrap requires an empty local roster.")
+        }
+        do {
+            guard try await log.isEmptyChecked() else {
+                return .failed("Initial Cowork bootstrap is only available for an empty session.")
+            }
+        } catch {
+            return .failed("Initial Cowork bootstrap could not verify an empty event log: \(error.localizedDescription)")
+        }
+        if requiresInferenceBindings {
+            let liveCatalogBinding = proposedMain.agentInferenceBinding.flatMap {
+                availableInferenceProfiles[$0.inferenceProfileID]
+            }
+            guard reviewedCatalogBinding == catalogBindingBeforeResolution,
+                  catalogBindingBeforeResolution == liveCatalogBinding else {
+                return .failed("@main host-approved inference profile changed before durable admission.")
+            }
+        }
+        guard let mainRootIdentity = mainLeases.workspace.rootIdentity,
+              mainRootIdentity.matchesCurrentDirectory(rootPath: mainLeases.workspace.rootPath),
+              let reviewerRootIdentity = reviewerWorkspaceLease.rootIdentity,
+              reviewerRootIdentity.matchesCurrentDirectory(
+                rootPath: reviewerWorkspaceLease.rootPath) else {
+            return .failed("The selected workspace identity changed before durable bootstrap admission.")
+        }
+
+        let mainWorkspaceMetadata = CoworkEventMetadata(
+            agentID: proposedMain.name,
+            workspaceID: mainLeases.workspace.workspaceID,
+            workspaceLeaseID: mainLeases.workspace.id,
+            scope: .workspace)
+        let mainCapabilityMetadata = CoworkEventMetadata(
+            agentID: proposedMain.name,
+            capabilityLeaseID: mainLeases.capability.id,
+            scope: .capability)
+        let mainAgentMetadata = CoworkEventMetadata(
+            agentID: proposedMain.name,
+            workspaceID: mainLeases.workspace.workspaceID,
+            workspaceLeaseID: mainLeases.workspace.id,
+            capabilityLeaseID: mainLeases.capability.id,
+            scope: .agent)
+        let reviewerWorkspaceMetadata = CoworkEventMetadata(
+            agentID: reviewer.name,
+            workspaceID: reviewerWorkspaceLease.workspaceID,
+            workspaceLeaseID: reviewerWorkspaceLease.id,
+            scope: .workspace)
+        let reviewerCapabilityMetadata = CoworkEventMetadata(
+            agentID: reviewer.name,
+            capabilityLeaseID: reviewerCapabilityLease.id,
+            scope: .capability)
+        let reviewerAgentMetadata = CoworkEventMetadata(
+            agentID: reviewer.name,
+            workspaceID: reviewerWorkspaceLease.workspaceID,
+            workspaceLeaseID: reviewerWorkspaceLease.id,
+            capabilityLeaseID: reviewerCapabilityLease.id,
+            scope: .agent)
+
+        do {
+            let persisted = try await appendFreshSessionAdmissionEventsIfEmpty([
+                .sessionSettingsUpdated(SessionSettingsUpdatedPayload(
+                    revision: 1,
+                    changeKind: .created,
+                    kind: .cowork,
+                    cowork: settings)),
+                .workspaceLeaseGranted(WorkspaceLeaseGrantedPayload(
+                    agent: proposedMain.name,
+                    lease: mainLeases.workspace,
+                    metadata: mainWorkspaceMetadata)),
+                .capabilityLeaseCreated(CapabilityLeaseCreatedPayload(
+                    agent: proposedMain.name,
+                    lease: mainLeases.capability,
+                    metadata: mainCapabilityMetadata)),
+                .agentAttached(AgentAttachedPayload(
+                    agent: proposedMain.name,
+                    path: proposedMain.workspaceRoot.path,
+                    model: proposedMain.model,
+                    profile: proposedMain.profile.rawValue,
+                    agentInferenceBinding: proposedMain.agentInferenceBinding,
+                    metadata: mainAgentMetadata)),
+                .workspaceLeaseGranted(WorkspaceLeaseGrantedPayload(
+                    agent: reviewer.name,
+                    lease: reviewerWorkspaceLease,
+                    metadata: reviewerWorkspaceMetadata)),
+                .capabilityLeaseCreated(CapabilityLeaseCreatedPayload(
+                    agent: reviewer.name,
+                    lease: reviewerCapabilityLease,
+                    metadata: reviewerCapabilityMetadata)),
+                .agentAttached(AgentAttachedPayload(
+                    agent: reviewer.name,
+                    path: reviewer.workspaceRoot.path,
+                    model: reviewer.model,
+                    profile: reviewer.profile.rawValue,
+                    agentInferenceBinding: reviewer.agentInferenceBinding,
+                    metadata: reviewerAgentMetadata)),
+            ])
+            guard persisted else {
+                return .failed("Initial Cowork bootstrap lost the empty-session race; no registration was committed.")
+            }
+        } catch {
+            return .failed("Initial Cowork settings and registrations could not be persisted: \(error.localizedDescription)")
+        }
+
+        registry.add(proposedMain)
+        commitDefaultLeases(mainLeases, for: proposedMain.name)
+        registry.add(reviewer)
+        workspaceLeases[reviewerWorkspaceLease.id] = reviewerWorkspaceLease
+        capabilityLeases[reviewerCapabilityLease.id] = reviewerCapabilityLease
+        defaultWorkspaceLeaseIDs[reviewer.name] = reviewerWorkspaceLease.id
+        defaultCapabilityLeaseIDs[reviewer.name] = reviewerCapabilityLease.id
+        automaticPermissionReviewerAgentID = reviewer.name
+        automaticPermissionResponder = AgentPermissionResponder(
+            log: log,
+            reviewerAgent: reviewer,
+            providerFactory: reviewerProviderFactory,
+            fallback: responder,
+            policy: reviewerPolicy)
+        return .attached(proposedMain.name)
     }
 
     @discardableResult
@@ -1392,9 +1907,9 @@ public actor Orchestrator {
             profile: .readOnly,
             coordinationDepth: 0)
 
-        let provider: ToolCallingProvider
+        let reviewerProviderFactory = permissionReviewProviderFactory(for: reviewer)
         do {
-            provider = try await resolvedProvider(for: reviewer)
+            _ = try await reviewerProviderFactory()
         } catch {
             return .failed("automatic permission reviewer inference profile is unavailable or incompatible")
         }
@@ -1451,7 +1966,7 @@ public actor Orchestrator {
         automaticPermissionResponder = AgentPermissionResponder(
             log: log,
             reviewerAgent: reviewer,
-            provider: provider,
+            providerFactory: reviewerProviderFactory,
             fallback: responder,
             policy: policy)
         return .enabled(reviewer.name)
@@ -1548,7 +2063,11 @@ public actor Orchestrator {
         workTaskRecoveryFailure = nil
         var events: [Envelope]
         do {
-            events = try await log.replayChecked()
+            let replay = try await log.replayForProjectionChecked()
+            guard replay.hasCompleteKnownHistory else {
+                throw EventLogError.unsupportedEventTypes
+            }
+            events = replay.envelopes
         } catch {
             let message = "Cowork restore could not verify the durable event log: \(error.localizedDescription)"
             automaticPermissionReviewRecoveryFailure = message
@@ -1558,6 +2077,33 @@ public actor Orchestrator {
             return
         }
         var projection = CoworkProjection.build(from: events)
+        // Older AgentLoop builds left every failed non-replayable tool ticket
+        // unresolved, even when optimistic concurrency had already made a
+        // task_update impossible before its executor could mutate anything.
+        // Repair only the narrow case the pre-prepare EventLog can prove: the
+        // durable WorkTask revision was already newer than expected. A lower
+        // revision could still advance while the executor waits for admission,
+        // and every other unresolved side effect remains fail-closed.
+        let staleTaskUpdateSettlements = Self.provenStaleTaskUpdateSettlementEvents(
+            events: events,
+            projection: projection)
+        if !staleTaskUpdateSettlements.isEmpty {
+            do {
+                try await appendAdmissionEvents(staleTaskUpdateSettlements)
+                let replay = try await log.replayForProjectionChecked()
+                guard replay.hasCompleteKnownHistory else {
+                    throw EventLogError.unsupportedEventTypes
+                }
+                events = replay.envelopes
+                projection = CoworkProjection.build(from: events)
+            } catch {
+                workTaskRecoveryFailure =
+                    "proven stale task_update recovery could not be persisted: \(error.localizedDescription)"
+                releaseAdmissionLock()
+                resumeScheduler(suspension: restoreSuspension, ensureRunning: false)
+                return
+            }
+        }
         let auditedRunIDs = Set(events.compactMap { envelope -> ContinuationRunID? in
             guard case .goalAuditCompleted(let payload) = envelope.event else { return nil }
             return payload.runID
@@ -1622,7 +2168,11 @@ public actor Orchestrator {
                     scope: .agent))))
             do {
                 try await appendAdmissionEvents(cleanupEvents)
-                events = try await log.replayChecked()
+                let replay = try await log.replayForProjectionChecked()
+                guard replay.hasCompleteKnownHistory else {
+                    throw EventLogError.unsupportedEventTypes
+                }
+                events = replay.envelopes
                 projection = CoworkProjection.build(from: events)
                 switch validatedRestoredWorkTaskGraph(from: projection) {
                 case .success(let restored):
@@ -1669,6 +2219,8 @@ public actor Orchestrator {
                 break
             }
         }
+        let allReferencedCapabilityLeaseIDs: Set<CapabilityLeaseID> = Set(
+            projection.tasks.values.compactMap { $0.contract?.capabilityLeaseID })
         let referencedCapabilityLeaseIDs: Set<CapabilityLeaseID> = Set(projection.tasks.values.compactMap {
             guard $0.contract?.kind != .root else { return nil }
             return $0.contract?.capabilityLeaseID
@@ -1716,7 +2268,13 @@ public actor Orchestrator {
                 .filter { lease in
                     lease.taskID == nil && !referencedCapabilityLeaseIDs.contains(lease.id)
                 }
-                .sorted { lhs, rhs in lhs.id.rawValue < rhs.id.rawValue }
+                .sorted { lhs, rhs in
+                    if payload.agent == Self.mainAgentID,
+                       lhs.tools.contains(.renameSession) != rhs.tools.contains(.renameSession) {
+                        return lhs.tools.contains(.renameSession)
+                    }
+                    return lhs.id.rawValue < rhs.id.rawValue
+                }
                 .first
             registry.add(Agent(
                 name: payload.agent,
@@ -1761,6 +2319,8 @@ public actor Orchestrator {
                     message: "@\(agent.name.rawValue): \(error.localizedDescription)")))
             }
         }
+        await upgradeMainRenameCapabilityIfNeeded(
+            referencedLeaseIDs: allReferencedCapabilityLeaseIDs)
         spawnedAgentOwners = projection.agentOwners.filter { registry.agent($0.key) != nil }
 
         var nodes: [TaskID: TaskNode] = [:]
@@ -1953,7 +2513,88 @@ public actor Orchestrator {
         for agentID in recoveredMailboxes.keys.sorted(by: { $0.rawValue < $1.rawValue }) {
             await enqueuePendingMailboxWakeIfNeeded(for: agentID)
         }
+        // Mailbox reconciliation above may synthesize a new queued wake task.
+        // It is still recovered work and must remain behind the same explicit
+        // resume boundary as tasks replayed directly from EventLog.
+        restoredPendingTaskIDs.formUnion(
+            scheduler.queuedTasks().map { $0.contract.id })
         resumeScheduler(suspension: restoreSuspension, ensureRunning: false)
+    }
+
+    /// Produces an additive compatibility settlement for the one legacy
+    /// unresolved write failure that can be proven to have had no effect from
+    /// durable history alone. This deliberately does not infer from free-form
+    /// error text or from the latest projection after the prepared boundary.
+    static func provenStaleTaskUpdateSettlementEvents(
+        events: [Envelope],
+        projection: CoworkProjection
+    ) -> [Event] {
+        // A current Goal still follows the pre-existing automatic-continuation
+        // lifecycle on startup. Do not let this compatibility repair silently
+        // remove its only recovery fence until current-Goal reconciliation and
+        // explicit Resume semantics are implemented as their own migration.
+        guard projection.currentGoal == nil else { return [] }
+
+        let latestToolResultSeq = events.reduce(into: [String: Int]()) { result, envelope in
+            guard case .toolResult(let payload) = envelope.event else { return }
+            result[payload.toolCallId] = max(result[payload.toolCallId] ?? -1, envelope.seq)
+        }
+        let executionIDsWithSettlement = Set(events.compactMap { envelope -> String? in
+            guard case .toolExecutionSettled(let payload) = envelope.event else { return nil }
+            return payload.executionID
+        })
+        var prefix = CoworkProjection()
+        var recoveryEvents: [Event] = []
+
+        for envelope in events {
+            defer { prefix.apply(envelope) }
+            guard case .toolExecutionPrepared(let prepared) = envelope.event,
+                  let currentExecution = projection.toolExecutions[prepared.executionID],
+                  currentExecution.preparedSeq == envelope.seq,
+                  currentExecution.prepared == prepared,
+                  !currentExecution.hasAmbiguousDurableHistory,
+                  currentExecution.validatedSettlement == nil,
+                  !executionIDsWithSettlement.contains(prepared.executionID),
+                  prepared.tool == "task_update",
+                  prepared.sideEffect == .write,
+                  prepared.replayPolicy == .requiresManualReconciliation,
+                  let intent = prepared.intent,
+                  intent.controlEffects.contains(.updateTask)
+                    || intent.controlEffects.contains(.cancelTask),
+                  case .number(let rawExpectedRevision)? =
+                    intent.metadata["expectedRevision"],
+                  rawExpectedRevision.isFinite,
+                  rawExpectedRevision >= 0,
+                  rawExpectedRevision < 9_007_199_254_740_992,
+                  rawExpectedRevision.rounded(.towardZero) == rawExpectedRevision else {
+                continue
+            }
+            let taskResources = intent.resources.filter { $0.kind == .task }
+            guard taskResources.count == 1,
+                  !taskResources[0].value.isEmpty else { continue }
+            let workTaskID = WorkTaskID(rawValue: taskResources[0].value)
+            let expectedRevision = Int(rawExpectedRevision)
+            guard let durableTaskBeforePrepare = prefix.workTasks[workTaskID],
+                  durableTaskBeforePrepare.revision > expectedRevision else {
+                continue
+            }
+
+            let reason = "stale_revision: WorkTask \(workTaskID.rawValue) expected revision "
+                + "\(expectedRevision), but durable revision "
+                + "\(durableTaskBeforePrepare.revision) was already committed before execution; "
+                + "no side effect was applied. Read task_get before retrying."
+            if (latestToolResultSeq[prepared.toolCallID] ?? -1) <= envelope.seq {
+                recoveryEvents.append(.toolResult(ToolResultPayload(
+                    toolCallId: prepared.toolCallID,
+                    observation: "tool error: \(reason)")))
+            }
+            recoveryEvents.append(.toolExecutionSettled(ToolExecutionSettledPayload(
+                prepared: prepared,
+                outcome: .failed,
+                effectDisposition: .notStarted,
+                reason: reason)))
+        }
+        return recoveryEvents
     }
 
     /// Route a user message to the explicit target, or to the first attached agent
@@ -2002,7 +2643,8 @@ public actor Orchestrator {
             roleHint: "root task coordinator",
             expectedDeliverable: "Coordinate assigned subtasks and synthesize the result.",
             goalID: goalID,
-            continuationRunID: continuationRunID),
+            continuationRunID: continuationRunID,
+            submissionID: userMessage?.submissionID),
               let rootNode = taskGraph.node(rootTaskID) else {
             return .failed("Could not create the root task.")
         }
@@ -2127,14 +2769,32 @@ public actor Orchestrator {
     }
 
     @discardableResult
-    public func retry(_ task: CoworkTaskView) async -> OrchestratorSendResult {
+    public func retry(_ task: CoworkTaskView,
+                      images: [ImageAttachment] = [],
+                      userMessage: UserMessagePayload? = nil,
+                      recordUserMessage: Bool = true,
+                      explicitGoalIntent: Bool = false) async -> OrchestratorSendResult {
         let admittedTaskID: TaskID
-        switch await admitRetry(taskID: task.id, reason: "explicit retry") {
-        case .admitted(let taskID):
-            admittedTaskID = taskID
-        case .rejected(let message):
-            return .failed(message)
+        if restoredPendingTaskIDs.contains(task.id),
+           scheduler.record(for: task.id)?.status == .queued {
+            // The user explicitly chose Retry for a task recovered from a
+            // previous process. Resume that exact durable task instead of
+            // creating a second root or appending another user message.
+            restoredPendingTaskIDs.remove(task.id)
+            admittedTaskID = task.id
+        } else {
+            switch await admitRetry(taskID: task.id, reason: "explicit retry") {
+            case .admitted(let taskID):
+                admittedTaskID = taskID
+            case .rejected(let message):
+                return .failed(message)
+            }
         }
+        rootInvocations[admittedTaskID] = RootInvocationContext(
+            images: images,
+            userMessage: userMessage,
+            recordUserMessage: recordUserMessage,
+            explicitGoalIntent: explicitGoalIntent)
         ensureSchedulerRunning()
         _ = await awaitSchedulerResult(admittedTaskID)
         if let failure = terminalPersistenceFailures[admittedTaskID] {
@@ -2252,7 +2912,11 @@ public actor Orchestrator {
     private func retryReconciliationFailure(taskID: TaskID, attempt: Int) async -> String? {
         let events: [Envelope]
         do {
-            events = try await log.replayChecked()
+            let replay = try await log.replayForProjectionChecked()
+            guard replay.hasCompleteKnownHistory else {
+                throw EventLogError.unsupportedEventTypes
+            }
+            events = replay.envelopes
         } catch {
             return "retry denied because durable side-effect history could not be verified: \(error.localizedDescription)"
         }
@@ -2492,9 +3156,6 @@ public actor Orchestrator {
     private func cancelAll(reason: String,
                            shutdownPermissionReviewer: Bool) async {
         let schedulerSuspension = suspendScheduler()
-        if shutdownPermissionReviewer {
-            await automaticPermissionResponder?.shutdown(reason: reason)
-        }
         let queuedIDs = scheduler.queuedTasks().map { $0.contract.id }
         let runningIDs = Array(runningExecutions.keys)
         for taskID in queuedIDs {
@@ -2505,6 +3166,12 @@ public actor Orchestrator {
         }
         let executions = runningIDs.compactMap { runningExecutions[$0] }
         for execution in executions { await execution.value }
+        // The reviewer is part of the control plane for data-plane work. Keep
+        // it alive until every cancelled execution has unwound its provider,
+        // tool, and approval waiters; only then retire the session reviewer.
+        if shutdownPermissionReviewer {
+            await automaticPermissionResponder?.shutdown(reason: reason)
+        }
         if let cancelAllBeforeResumeHook {
             await cancelAllBeforeResumeHook()
         }
@@ -2514,6 +3181,29 @@ public actor Orchestrator {
 
     @discardableResult
     public func resumePendingTasks() -> Bool {
+        guard !Task.isCancelled else { return false }
+        restoredPendingTaskIDs.removeAll()
+        if let startupSchedulerSuspension {
+            self.startupSchedulerSuspension = nil
+            resumeScheduler(
+                suspension: startupSchedulerSuspension,
+                ensureRunning: true)
+            return true
+        }
+        if schedulerSuspended {
+            schedulerResumeRequested = true
+        } else {
+            ensureSchedulerRunning()
+        }
+        return true
+    }
+
+    /// Releases the restore-time scheduler gate for newly admitted work while
+    /// keeping tasks recovered from an earlier process explicitly paused.
+    /// Opening a historical session uses this path; only a user-driven retry
+    /// or resume may release `restoredPendingTaskIDs`.
+    @discardableResult
+    public func startNewTasksKeepingRestoredTasksPaused() -> Bool {
         guard !Task.isCancelled else { return false }
         if let startupSchedulerSuspension {
             self.startupSchedulerSuspension = nil
@@ -2540,12 +3230,12 @@ public actor Orchestrator {
             return
         }
 
-        // Pause new scheduler admission while publishing policy + limit, but do
-        // not rely on draining runningExecutions for correctness. The outer
-        // timeout wrapper may already have finished while its detached,
-        // non-cooperative AgentLoop still owns a reservation. Because every run
-        // holds this session's one meter actor, reconfiguration can preserve that
-        // reservation without waiting for the old operation to cooperate.
+        // Pause new scheduler admission while publishing policy + limit. The
+        // structured timeout path drains its losing child before returning, so
+        // it cannot leave a detached AgentLoop behind. We still need not drain
+        // unrelated running executions here: every run uses this session's one
+        // meter actor, which preserves their outstanding reservations across
+        // reconfiguration.
         let schedulerSuspension = suspendScheduler()
         executionPolicyUpdateInProgress = true
         guard await refreshConsumedTokenCount() else {
@@ -3009,7 +3699,8 @@ public actor Orchestrator {
                         roleHint: String = "root task coordinator",
                         expectedDeliverable: String = "Coordinate assigned subtasks and synthesize the result.",
                         goalID: GoalID? = nil,
-                        continuationRunID: ContinuationRunID? = nil) async -> TaskID? {
+                        continuationRunID: ContinuationRunID? = nil,
+                        submissionID: SubmissionID? = nil) async -> TaskID? {
         guard assignee != Self.automaticPermissionReviewerID else { return nil }
         await acquireAdmissionLock()
         defer { releaseAdmissionLock() }
@@ -3024,6 +3715,7 @@ public actor Orchestrator {
             assignee: agent.name,
             continuationRunID: continuationRunID,
             goalID: goalID,
+            submissionID: submissionID,
             objective: objective.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty ?? "Coordinate the cowork task.",
             roleHint: roleHint,
             expectedDeliverable: expectedDeliverable,
@@ -5179,7 +5871,7 @@ public actor Orchestrator {
             explicitGoalIntent: explicitGoalIntent,
             canCreate: capabilityLease.tools.contains(.createGoal),
             canSubmitVerdict: capabilityLease.tools.contains(.submitGoalVerdict))
-        let toolRegistry = Self.toolRegistry(for: capabilityLease)
+        let toolRegistry = Self.toolRegistry(for: capabilityLease, agentID: agent.name)
         let imageGenerator = await imageGeneratorFor(agent)
         let allowedToolNames = toolRegistry.descriptors().map(\.name).sorted()
         let canCoordinate = Self.canCoordinate(capabilityLease)
@@ -5189,10 +5881,11 @@ public actor Orchestrator {
             name: agent.name.rawValue, folder: agent.workspaceRoot.path,
             coordinationDepth: agent.coordinationDepth,
             canCoordinate: canCoordinate)
+        let contextEvents = try await log.replayChecked()
         let contextBundle = ContextProjector().project(
             agentID: agent.name,
             taskContract: taskContract,
-            events: await log.replay(),
+            events: contextEvents,
             allowedToolNames: allowedToolNames,
             workspaceRoot: agent.workspaceRoot)
         let runtime = AgentRuntime.cowork(
@@ -5219,6 +5912,7 @@ public actor Orchestrator {
             workTaskManager: workTaskManager,
             goalManager: goalManager,
             imageGenerator: imageGenerator,
+            sessionNaming: agent.name == Self.mainAgentID ? sessionNaming : nil,
             capabilityLease: capabilityLease,
             workspaceLease: workspaceLease,
             rootTaskID: rootTaskID,
@@ -5241,7 +5935,8 @@ public actor Orchestrator {
             input,
             images: images,
             userMessage: userMessage,
-            recordUserMessage: recordUserMessage)
+            recordUserMessage: recordUserMessage,
+            submissionID: taskContract?.submissionID)
         return AgentRunResult(
             output: output,
             presentedMessageIDs: contextBundle.directMessages.compactMap(\.messageID))
@@ -6027,21 +6722,85 @@ public actor Orchestrator {
         taskLeaseIDs: Set<CapabilityLeaseID>
     ) -> [AgentID: CapabilityLeaseID] {
         var result: [AgentID: CapabilityLeaseID] = [:]
-        let candidates = projection.capabilityLeaseAgents.compactMap { leaseID, agent -> (AgentID, CapabilityLeaseID)? in
+        let candidates = projection.capabilityLeaseAgents.compactMap {
+            leaseID, agent -> (agent: AgentID, leaseID: CapabilityLeaseID, supportsRename: Bool)? in
             guard agent != Self.automaticPermissionReviewerID,
                   let lease = projection.capabilityLeases[leaseID],
                   lease.taskID == nil,
                   !taskLeaseIDs.contains(leaseID),
                   capabilityLeases[leaseID] != nil else { return nil }
-            return (agent, leaseID)
+            return (
+                agent: agent,
+                leaseID: leaseID,
+                supportsRename: lease.tools.contains(.renameSession))
         }.sorted {
-            if $0.0 == $1.0 { return $0.1.rawValue < $1.1.rawValue }
-            return $0.0.rawValue < $1.0.rawValue
+            if $0.agent == $1.agent {
+                if $0.agent == Self.mainAgentID,
+                   $0.supportsRename != $1.supportsRename {
+                    return $0.supportsRename
+                }
+                return $0.leaseID.rawValue < $1.leaseID.rawValue
+            }
+            return $0.agent.rawValue < $1.agent.rawValue
         }
-        for (agent, leaseID) in candidates where result[agent] == nil {
-            result[agent] = leaseID
+        for candidate in candidates where result[candidate.agent] == nil {
+            result[candidate.agent] = candidate.leaseID
         }
         return result
+    }
+
+    /// Old sessions can contain a perfectly valid @main default lease created
+    /// before `rename_session` existed. Upgrade that durable default without
+    /// mutating its historical grant in place. Leases referenced by any task
+    /// remain available to that frozen contract; an unreferenced default is
+    /// revoked and replaced atomically.
+    private func upgradeMainRenameCapabilityIfNeeded(
+        referencedLeaseIDs: Set<CapabilityLeaseID>
+    ) async {
+        guard registry.agent(Self.mainAgentID) != nil,
+              let oldID = defaultCapabilityLeaseIDs[Self.mainAgentID],
+              let oldLease = capabilityLeases[oldID],
+              oldLease.taskID == nil,
+              !oldLease.tools.contains(.renameSession) else { return }
+
+        var upgraded = oldLease
+        upgraded.id = CapabilityLeaseID.new()
+        upgraded.taskID = nil
+        upgraded.tools.insert(.renameSession)
+        upgraded.expiresAtTaskCompletion = false
+        let revokeOld = !referencedLeaseIDs.contains(oldID)
+        var events: [Event] = []
+        if revokeOld {
+            events.append(.capabilityLeaseRevoked(CapabilityLeaseRevokedPayload(
+                agent: Self.mainAgentID,
+                leaseID: oldID,
+                reason: "replace legacy @main default with rename_session capability",
+                metadata: CoworkEventMetadata(
+                    agentID: Self.mainAgentID,
+                    capabilityLeaseID: oldID,
+                    scope: .capability))))
+        }
+        events.append(.capabilityLeaseCreated(CapabilityLeaseCreatedPayload(
+            agent: Self.mainAgentID,
+            lease: upgraded,
+            metadata: CoworkEventMetadata(
+                agentID: Self.mainAgentID,
+                capabilityLeaseID: upgraded.id,
+                scope: .capability))))
+
+        do {
+            try await appendAdmissionEvents(events)
+        } catch {
+            try? await log.append(.error(ErrorPayload(
+                code: "restore_main_rename_capability_upgrade_failed",
+                message: error.localizedDescription)))
+            return
+        }
+        if revokeOld {
+            capabilityLeases[oldID] = nil
+        }
+        capabilityLeases[upgraded.id] = upgraded
+        defaultCapabilityLeaseIDs[Self.mainAgentID] = upgraded.id
     }
 
     private func deterministicDefaultWorkspaceLeases(
@@ -6157,6 +6916,7 @@ public actor Orchestrator {
             ?? CapabilityLease.worker(taskID: taskID, workspaceAccess: workspaceAccess)
         if assignee.name != Self.mainAgentID {
             capabilityLease.tools.remove(.createGoal)
+            capabilityLease.tools.remove(.renameSession)
         }
         capabilityLease.id = CapabilityLeaseID.new()
         capabilityLease.taskID = taskID
@@ -6174,6 +6934,7 @@ public actor Orchestrator {
             workTaskID: workTask?.id,
             continuationRunID: workTask?.runID ?? scopeContract?.continuationRunID,
             goalID: workTask?.goalID ?? scopeContract?.goalID,
+            submissionID: scopeContract?.submissionID,
             objective: trimmedObjective.isEmpty ? "Answer the assigned task." : trimmedObjective,
             roleHint: roleHint?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
                 ?? Self.defaultRoleHint(for: assignee.name, objective: trimmedObjective),
@@ -6211,8 +6972,11 @@ public actor Orchestrator {
         var capabilityLease: CapabilityLease = agent.coordinationDepth > 0
             ? .coordinator(workspaceAccess: workspaceAccess)
             : .worker(workspaceAccess: grantWorkerWriteCapabilities ? workspaceAccess : .readOnly)
-        if agent.name != Self.mainAgentID {
+        if agent.name == Self.mainAgentID {
+            capabilityLease.tools.insert(.renameSession)
+        } else {
             capabilityLease.tools.remove(.createGoal)
+            capabilityLease.tools.remove(.renameSession)
         }
         capabilityLease.expiresAtTaskCompletion = false
         return (capabilityLease, workspaceLease)
@@ -6242,6 +7006,7 @@ public actor Orchestrator {
                 workspaceAccess: workspaceAccess == .readWrite ? .readWrite : .readOnly)
         var tools = baseline.tools.intersection(parentCapabilityLease.tools)
         tools.remove(.createGoal)
+        tools.remove(.renameSession)
 
         let communication: CommunicationGrant
         if canCoordinate {
@@ -6341,11 +7106,11 @@ public actor Orchestrator {
                 throw CoworkTaskExecutionError.invalidLease(
                     "capability lease belongs to task \(boundTaskID.rawValue)")
             }
-            return Self.goalScopedCapabilityLease(lease, for: agent.name)
+            return Self.mainScopedCapabilityLease(lease, for: agent.name)
         }
         if let leaseID = defaultCapabilityLeaseIDs[agent.name],
            let lease = capabilityLeases[leaseID] {
-            return Self.goalScopedCapabilityLease(lease, for: agent.name)
+            return Self.mainScopedCapabilityLease(lease, for: agent.name)
         }
         var lease = CapabilityLease.worker()
         lease.expiresAtTaskCompletion = false
@@ -6354,11 +7119,12 @@ public actor Orchestrator {
         return lease
     }
 
-    private static func goalScopedCapabilityLease(_ lease: CapabilityLease,
-                                                   for agentID: AgentID) -> CapabilityLease {
+    private static func mainScopedCapabilityLease(_ lease: CapabilityLease,
+                                                  for agentID: AgentID) -> CapabilityLease {
         guard agentID != mainAgentID else { return lease }
         var scoped = lease
         scoped.tools.remove(.createGoal)
+        scoped.tools.remove(.renameSession)
         return scoped
     }
 
@@ -6547,6 +7313,7 @@ public actor Orchestrator {
     func runNextScheduledTask() async -> Bool {
         let excludedTaskIDs = terminalCommitTaskIDs
             .union(Set(terminalPersistenceFailures.keys))
+            .union(restoredPendingTaskIDs)
         guard let task = scheduler.claimNext(excluding: excludedTaskIDs) else { return false }
         let execution = launchClaimedTask(task)
         await execution.value
@@ -6569,6 +7336,7 @@ public actor Orchestrator {
         let concurrencyLimit = max(1, executionPolicy.maxConcurrentTasks)
         let excludedTaskIDs = terminalCommitTaskIDs
             .union(Set(terminalPersistenceFailures.keys))
+            .union(restoredPendingTaskIDs)
         while runningExecutions.count < concurrencyLimit,
               let task = scheduler.claimNext(excluding: excludedTaskIDs) {
             _ = launchClaimedTask(task)
@@ -6695,7 +7463,8 @@ public actor Orchestrator {
                     input: task.input,
                     images: invocation?.images ?? [],
                     userMessage: invocation?.userMessage,
-                    recordUserMessage: invocation?.recordUserMessage ?? true,
+                    recordUserMessage: invocation?.recordUserMessage
+                        ?? (task.contract.submissionID == nil),
                     explicitGoalIntent: invocation?.explicitGoalIntent ?? false,
                     taskContract: task.contract,
                     rootTaskID: task.rootTaskID,
@@ -6712,8 +7481,16 @@ public actor Orchestrator {
                 presentedMessageIDs: Set(runResult.presentedMessageIDs),
                 metadata: metadata)
         } catch {
-            if error is CancellationError || cancellationReasons[taskID] != nil {
-                let reason = cancellationReasons[taskID] ?? "execution cancelled"
+            // A provider is allowed to report CancellationError as its own
+            // runtime failure. It is a task cancellation only when this exact
+            // scheduler execution was cancelled or an explicit reason was
+            // installed by the cancellation path.
+            if Task.isCancelled
+                || cancellationReasons[taskID] != nil
+                || error is AgentTurnInterruptedError {
+                let reason = cancellationReasons[taskID]
+                    ?? (error as? AgentTurnInterruptedError)?.reason
+                    ?? "execution cancelled"
                 await finishCancelledTask(task, reason: reason, metadata: metadata)
             } else {
                 let usageLimit = error as? ProviderUsageLimitError
@@ -7104,6 +7881,9 @@ public actor Orchestrator {
             try await admissionEventAppender(event)
         } else {
             try await log.append(event)
+            if Self.affectsSessionProjection(event) {
+                _ = try? await SessionProjectionStore.refresh(from: log)
+            }
         }
     }
 
@@ -7117,6 +7897,39 @@ public actor Orchestrator {
             // test seam here: doing so would make failure injection capable of
             // producing a state that production explicitly forbids.
             try await log.append(events)
+            if events.contains(where: Self.affectsSessionProjection) {
+                _ = try? await SessionProjectionStore.refresh(from: log)
+            }
+        }
+    }
+
+    private func appendFreshSessionAdmissionEventsIfEmpty(_ events: [Event]) async throws -> Bool {
+        guard !events.isEmpty else { return true }
+        if let admissionEventsAppender {
+            // Test seams are required to emulate an all-or-nothing successful
+            // fresh admission. Cross-instance empty-log races are covered by
+            // the production EventLog primitive directly.
+            try await admissionEventsAppender(events)
+            return true
+        }
+        guard try await log.appendIfEmptyChecked(events) != nil else {
+            return false
+        }
+        if events.contains(where: Self.affectsSessionProjection) {
+            _ = try? await SessionProjectionStore.refresh(from: log)
+        }
+        return true
+    }
+
+    private static func affectsSessionProjection(_ event: Event) -> Bool {
+        switch event {
+        case .sessionSettingsUpdated, .sessionStorageMigrated,
+             .agentAttached, .agentDetached,
+             .workspaceLeaseGranted, .workspaceLeaseRevoked,
+             .capabilityLeaseCreated, .capabilityLeaseRevoked:
+            return true
+        default:
+            return false
         }
     }
 
@@ -7335,6 +8148,7 @@ public actor Orchestrator {
         !runningExecutions.isEmpty
             || scheduler.queuedTasks().contains {
                 terminalPersistenceFailures[$0.contract.id] == nil
+                    && !restoredPendingTaskIDs.contains($0.contract.id)
             }
     }
 
@@ -7894,7 +8708,8 @@ public actor Orchestrator {
         }
     }
 
-    static func toolRegistry(for lease: CapabilityLease) -> ToolRegistry {
+    static func toolRegistry(for lease: CapabilityLease,
+                             agentID: AgentID? = nil) -> ToolRegistry {
         var registrations: [ToolRegistration] = []
         func register(
             _ tools: [any Tool],
@@ -7997,6 +8812,9 @@ public actor Orchestrator {
         }
         if lease.tools.contains(.submitGoalVerdict) {
             register([UpdateGoalTool()], granting: [.submitGoalVerdict])
+        }
+        if agentID == mainAgentID, lease.tools.contains(.renameSession) {
+            register([RenameSessionTool()], granting: [.renameSession])
         }
         let canInitiateCommunication: Bool
         switch lease.communication {
@@ -8304,7 +9122,7 @@ struct OrchestratorManager: AgentManager {
 /// Capability- and invocation-scoped adapter for the model-facing WorkTask
 /// tools. Keeping the authority context here prevents callers from widening
 /// their own read or mutation scope through tool arguments.
-private struct OrchestratorWorkTaskManager: WorkTaskManager {
+struct OrchestratorWorkTaskManager: WorkTaskManager {
     let orchestrator: Orchestrator
     let requester: AgentID
     let currentWorkTaskID: WorkTaskID?
@@ -8323,13 +9141,30 @@ private struct OrchestratorWorkTaskManager: WorkTaskManager {
     }
 
     func updateWorkTask(_ request: WorkTaskUpdateRequest) async throws -> WorkTaskDetail {
-        try await orchestrator.updateWorkTask(
-            requestedBy: requester,
-            currentWorkTaskID: currentWorkTaskID,
-            currentRunID: currentRunID,
-            canManage: canManage,
-            canUpdateOwned: canUpdateOwned,
-            request: request)
+        do {
+            return try await orchestrator.updateWorkTask(
+                requestedBy: requester,
+                currentWorkTaskID: currentWorkTaskID,
+                currentRunID: currentRunID,
+                canManage: canManage,
+                canUpdateOwned: canUpdateOwned,
+                request: request)
+        } catch let violation as WorkTaskGraphViolation {
+            guard violation.kind == .staleRevision,
+                  violation.taskID == request.taskID,
+                  violation.expectedRevision == request.expectedRevision,
+                  let actualRevision = violation.actualRevision else {
+                throw violation
+            }
+            // This adapter owns the proof boundary: Orchestrator performs the
+            // optimistic-concurrency check against a preflight graph and does
+            // not append WorkTask events or commit its in-memory graph on this
+            // failure. An arbitrary WorkTaskManager is not trusted to make the
+            // same no-side-effect claim.
+            throw ToolExecutionRejectedWithoutSideEffect(
+                code: violation.kind.rawValue,
+                message: "task_update rejected without applying changes: expected_revision \(request.expectedRevision) is stale; the current revision is \(actualRevision). Call task_get for task_id \"\(request.taskID.rawValue)\", merge against the authoritative task state, then retry task_update using that revision as expected_revision.")
+        }
     }
 
     func getWorkTask(_ taskID: WorkTaskID) async throws -> WorkTaskDetail {

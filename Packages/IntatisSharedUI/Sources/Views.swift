@@ -96,15 +96,20 @@ struct ThreadView: View {
         VStack(spacing: 0) {
             ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 12) {
+                    IntatisAdaptiveThreadStack(
+                        visibleRowCount: model.messages.count,
+                        alignment: .leading,
+                        spacing: 12) {
                         ForEach(model.messages) { message in
                             MessageRow(message: message).id(message.id)
                         }
                         Color.clear
                             .frame(height: 1)
+                            .padding(.bottom, 16)
                             .id(Self.bottomAnchorID)
                     }
-                    .padding()
+                    .padding(.horizontal, 16)
+                    .padding(.top, 16)
                 }
                 .onAppear {
                     scrollToBottom(proxy, animated: false)

@@ -55,8 +55,8 @@ public enum SessionHistoryStoreError: Error, LocalizedError, Equatable {
 
 public enum SessionHistoryStore {
     private struct Metadata: Codable {
-        var version: Int
-        var displayName: String
+        var version: Int?
+        var displayName: String?
     }
 
     public static func sessionFile(root: URL, session: SessionID) -> URL {
@@ -69,6 +69,10 @@ public enum SessionHistoryStore {
         root
             .appendingPathComponent(session.rawValue, isDirectory: true)
             .appendingPathComponent("artifacts", isDirectory: true)
+    }
+
+    public static func sessionDirectory(root: URL, session: SessionID) throws -> URL {
+        try validatedSessionDirectory(root: root, session: session)
     }
 
     public static func setDisplayName(_ rawName: String,
@@ -87,10 +91,21 @@ public enum SessionHistoryStore {
               }) else {
             throw SessionHistoryStoreError.invalidDisplayName
         }
-        let metadata = Metadata(version: 1, displayName: displayName)
-        let data = try JSONEncoder().encode(metadata)
+        let metadataURL = directory.appendingPathComponent("session.json")
+        var object: [String: Any] = [:]
+        if let existing = try? Data(contentsOf: metadataURL),
+           let decoded = try? JSONSerialization.jsonObject(with: existing) as? [String: Any] {
+            object = decoded
+        }
+        if object["version"] == nil {
+            object["version"] = 1
+        }
+        object["displayName"] = displayName
+        let data = try JSONSerialization.data(
+            withJSONObject: object,
+            options: [.sortedKeys])
         try data.write(
-            to: directory.appendingPathComponent("session.json"),
+            to: metadataURL,
             options: .atomic)
     }
 
@@ -166,7 +181,8 @@ public enum SessionHistoryStore {
               let metadata = try? JSONDecoder().decode(Metadata.self, from: data) else {
             return nil
         }
-        let value = metadata.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let displayName = metadata.displayName else { return nil }
+        let value = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty,
               value.count <= 120,
               value.unicodeScalars.allSatisfy({

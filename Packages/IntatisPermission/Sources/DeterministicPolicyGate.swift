@@ -24,6 +24,14 @@ public struct DeterministicPolicyGate: Sendable {
             }
         }
 
+        // A registered rename_session tool binds the target to this runtime's
+        // current EventLog. The exact structured intent is intentionally
+        // recognized without adding a new nested permission enum value, so an
+        // older binary can still decode the surrounding durable event.
+        if Self.isCurrentSessionRename(call) {
+            return .allow(reason: "rename current session display label", risk: .low)
+        }
+
         // 2. Control-plane effects are authorized as control-plane effects,
         // never inferred as file writes from a legacy ToolDescriptor. The
         // WorkspaceLease remains an authority ceiling: a read-only caller may
@@ -223,5 +231,24 @@ public struct DeterministicPolicyGate: Sendable {
     private static func boolMetadata(_ key: String, in intent: PermissionIntent) -> Bool? {
         guard case .bool(let value)? = intent.metadata[key] else { return nil }
         return value
+    }
+
+    private static func isCurrentSessionRename(_ call: ToolCallContext) -> Bool {
+        guard call.toolName == "rename_session",
+              call.sideEffect == .write,
+              call.intent.action == "session.rename",
+              call.touchedPaths.isEmpty,
+              !call.risksNetwork,
+              call.intent.metadata.isEmpty,
+              call.intent.dataEffects == [.none],
+              call.intent.controlEffects.isEmpty,
+              call.intent.risks == [.controlPlaneMutation],
+              call.intent.suggestedPersistentRules.isEmpty,
+              call.intent.replayPolicy == .requiresManualReconciliation,
+              call.intent.resources == [PermissionResource(
+                  kind: .tool,
+                  value: "current_session")]
+        else { return false }
+        return true
     }
 }

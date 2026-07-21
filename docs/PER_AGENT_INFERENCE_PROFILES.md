@@ -173,7 +173,7 @@ Host 更新可选 profile catalog 时必须取得与 attach/spawn/delegate/rebin
 
 Agent admission 也遵守同一规则。Ordinary attach 在 permission review 前保存目标 exact binding 对应的 host-catalog snapshot；review allow 后先在锁外再次 exact-resolve，再进入 admission lock 比较 review 前、resolve 前和 commit 前的 snapshot，变化时 durable deny 而不写 `agent_attached`。Fresh `bootstrapMainAgent` 不调用模型 reviewer，但首次 empty-session preflight 与最终 commit 之间仍有 admission/resolver suspension：实现会在锁内检查空 roster/EventLog并记录 catalog snapshot，锁外二次 exact-resolve，随后重新取得锁并再次检查 empty-session 与 catalog facts，全部一致后才提交 leases/roster。
 
-自动 permission reviewer 和 GoalVerifier 属于控制面。当前 GUI/CLI 在首次解析 `@main` exact binding 时冻结本进程控制面 provider；后续 data-plane rebind 不会悄悄 retarget 正在运行的控制面。若需要改变控制面配置，应通过显式停止/重建控制面的产品流程实现，不能复用普通 agent rebind。
+自动 permission reviewer 和 GoalVerifier 属于控制面。当前 GUI/CLI 在首次解析 `@main` exact binding 时冻结本进程控制面 identity 与 exact route；后续 data-plane rebind 不会悄悄 retarget 正在运行的控制面。Permission reviewer 会在该冻结 binding 上为每个 request generation 重新 exact-resolve provider wrapper，GoalVerifier 保留自己的独立 provider lifecycle。若需要改变控制面配置，应通过显式停止/重建控制面的产品流程实现，不能复用普通 agent rebind。
 
 ## 8. Permission、EventLog 与安全
 

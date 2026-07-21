@@ -10,13 +10,15 @@ final class PermissionProjectionTests: XCTestCase {
         Envelope(seq: seq, ts: Date(timeIntervalSince1970: Double(seq)), session: session, event: event)
     }
 
-    private func request(_ id: String = "req_1") -> PermissionRequestPayload {
+    private func request(_ id: String = "req_1",
+                         approvalMode: PermissionApprovalMode? = nil) -> PermissionRequestPayload {
         PermissionRequestPayload(requestId: RequestID(rawValue: id),
                                  agent: AgentID(rawValue: "A"),
                                  tool: "write_file",
                                  args: #"{"path":"a.txt"}"#,
                                  risk: .medium,
-                                 reason: "write to workspace")
+                                 reason: "write to workspace",
+                                 approvalMode: approvalMode)
     }
 
     private func authorization() -> ResolvedToolAuthorization {
@@ -48,6 +50,22 @@ final class PermissionProjectionTests: XCTestCase {
             replayPolicy: .requiresManualReconciliation)
     }
 
+    private func reviewRequested(_ requestID: String) -> PermissionReviewRequestedPayload {
+        PermissionReviewRequestedPayload(task: PermissionReviewTask(
+            id: PermissionReviewTaskID(rawValue: "review_\(requestID)"),
+            sessionID: session,
+            requestID: RequestID(rawValue: requestID),
+            requestingAgent: AgentID(rawValue: "A"),
+            reviewerAgent: AgentID(rawValue: "permission-reviewer"),
+            tool: "write_file",
+            normalizedArgs: #"{"path":"a.txt"}"#,
+            gate: PermissionReviewGateSnapshot(
+                decision: .ask,
+                risk: .medium,
+                reason: "automatic review required"),
+            deadline: Date(timeIntervalSince1970: 60)))
+    }
+
     func testUnresolvedPermissionRequestAppearsPending() {
         let projection = PermissionProjection.build(from: [
             env(0, .permissionRequest(request()))
@@ -57,6 +75,87 @@ final class PermissionProjectionTests: XCTestCase {
         XCTAssertEqual(projection.latest?.request.requestId, RequestID(rawValue: "req_1"))
         XCTAssertEqual(projection.latest?.state, .livePending)
         XCTAssertEqual(projection.latest?.state.isActionable, true)
+    }
+
+    func testExactDuplicateRequestIsIdempotentAndDoesNotChangeFIFOOrder() {
+        let projection = PermissionProjection.build(from: [
+            env(0, .permissionRequest(request("req_1"))),
+            env(1, .permissionRequest(request("req_2"))),
+            env(2, .permissionRequest(request("req_1"))),
+        ])
+
+        XCTAssertEqual(projection.pending.map(\.id), [
+            RequestID(rawValue: "req_1"),
+            RequestID(rawValue: "req_2"),
+        ])
+        XCTAssertEqual(projection.pending.first?.requestedSeq, 0)
+        XCTAssertEqual(projection.latest?.id, RequestID(rawValue: "req_1"))
+    }
+
+    func testConflictingDuplicateRequestRetainsFirstPayloadAndFailsClosed() {
+        var conflicting = request("req_1")
+        conflicting.tool = "network_request"
+        conflicting.args = #"{"url":"https://example.invalid"}"#
+
+        let projection = PermissionProjection.build(from: [
+            env(0, .permissionRequest(request("req_1"))),
+            env(1, .permissionRequest(conflicting)),
+        ])
+
+        XCTAssertEqual(projection.pending.count, 1)
+        XCTAssertEqual(projection.latest?.request.tool, "write_file")
+        XCTAssertEqual(projection.latest?.requestedSeq, 0)
+        XCTAssertEqual(projection.latest?.state, .expired)
+        XCTAssertEqual(projection.latest?.hasIdentityConflict, true)
+        XCTAssertFalse(projection.latest?.state.isActionable == true)
+    }
+
+    func testAutomaticReviewMakesGenericRequestNonActionable() {
+        let projection = PermissionProjection.build(from: [
+            env(0, .permissionRequest(request("req_auto"))),
+            env(1, .permissionReviewRequested(reviewRequested("req_auto"))),
+        ])
+
+        XCTAssertEqual(projection.latest?.id, RequestID(rawValue: "req_auto"))
+        XCTAssertEqual(projection.latest?.state, .resolving)
+        XCTAssertFalse(projection.latest?.state.isActionable == true)
+    }
+
+    func testAutomaticApprovalModeIsNonActionableBeforeReviewLifecycleStarts() {
+        let projection = PermissionProjection.build(from: [
+            env(0, .permissionRequest(request(
+                "req_auto",
+                approvalMode: .automaticReviewer))),
+        ])
+
+        XCTAssertEqual(projection.latest?.id, RequestID(rawValue: "req_auto"))
+        XCTAssertEqual(projection.latest?.state, .resolving)
+        XCTAssertFalse(projection.latest?.state.isActionable == true)
+    }
+
+    func testLegacyNilAndExplicitManualDuplicateAreEquivalent() {
+        let projection = PermissionProjection.build(from: [
+            env(0, .permissionRequest(request("req_manual"))),
+            env(1, .permissionRequest(request(
+                "req_manual",
+                approvalMode: .manual))),
+        ])
+
+        XCTAssertEqual(projection.pending.count, 1)
+        XCTAssertEqual(projection.latest?.requestedSeq, 0)
+        XCTAssertEqual(projection.latest?.state, .livePending)
+        XCTAssertEqual(projection.latest?.hasIdentityConflict, false)
+        XCTAssertEqual(projection.latest?.state.isActionable, true)
+    }
+
+    func testAutomaticReviewSeenBeforeGenericRequestStillFailsClosed() {
+        let projection = PermissionProjection.build(from: [
+            env(0, .permissionReviewRequested(reviewRequested("req_auto"))),
+            env(1, .permissionRequest(request("req_auto"))),
+        ])
+
+        XCTAssertEqual(projection.latest?.state, .resolving)
+        XCTAssertFalse(projection.latest?.state.isActionable == true)
     }
 
     func testPermissionResolvedRemovesPending() {
@@ -104,6 +203,67 @@ final class PermissionProjectionTests: XCTestCase {
             PermissionReviewTaskID(rawValue: "review_1"))
         XCTAssertEqual(projection.latestResolved?.reviewStatus, .allowed)
         XCTAssertEqual(projection.latestResolved, replayed.latestResolved)
+    }
+
+    func testFirstTerminalResolutionWinsAgainstLateAndConflictingDuplicates() {
+        let requestID = RequestID(rawValue: "req_1")
+        let projection = PermissionProjection.build(from: [
+            env(0, .permissionRequest(request())),
+            env(1, .permissionResolved(.init(
+                requestId: requestID,
+                tool: "write_file",
+                decision: .allow,
+                risk: .medium,
+                reason: "first terminal"))),
+            env(2, .permissionResolved(.init(
+                requestId: requestID,
+                tool: "write_file",
+                decision: .deny,
+                risk: .high,
+                reason: "late conflicting terminal"))),
+        ])
+
+        XCTAssertTrue(projection.pending.isEmpty)
+        XCTAssertEqual(projection.resolved.count, 1)
+        XCTAssertEqual(projection.latestResolved?.decision, .allow)
+        XCTAssertEqual(projection.latestResolved?.reason, "first terminal")
+        XCTAssertEqual(projection.latestResolved?.resolvedSeq, 1)
+    }
+
+    func testTerminalResolutionPreventsLateRequestFromReopeningIdentity() {
+        let requestID = RequestID(rawValue: "req_1")
+        let projection = PermissionProjection.build(from: [
+            env(0, .permissionResolved(.init(
+                requestId: requestID,
+                tool: "write_file",
+                decision: .deny,
+                risk: .medium,
+                reason: "already terminal"))),
+            env(1, .permissionRequest(request())),
+        ])
+
+        XCTAssertTrue(projection.pending.isEmpty)
+        XCTAssertEqual(projection.resolved.count, 1)
+    }
+
+    func testResolvingMiddleRequestPreservesRemainingFIFOOrder() {
+        let projection = PermissionProjection.build(from: [
+            env(0, .permissionRequest(request("req_1"))),
+            env(1, .permissionRequest(request("req_2"))),
+            env(2, .permissionRequest(request("req_3"))),
+            env(3, .permissionResolved(.init(
+                requestId: RequestID(rawValue: "req_2"),
+                tool: "write_file",
+                decision: .deny,
+                risk: .medium,
+                reason: "remote decline"))),
+        ])
+
+        XCTAssertEqual(projection.pending.map(\.id), [
+            RequestID(rawValue: "req_1"),
+            RequestID(rawValue: "req_3"),
+        ])
+        XCTAssertEqual(projection.latest?.id, RequestID(rawValue: "req_1"))
     }
 
     func testPermissionFailureClassificationAndAuthorizationReachProjection() {
