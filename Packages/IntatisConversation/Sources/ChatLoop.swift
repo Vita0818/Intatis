@@ -64,18 +64,23 @@ public struct ChatLoop: Sendable {
                     break
                 }
             }
+            // A transport can finish its stream while cancellation is racing
+            // the final callback. Never turn a user Stop into a completed
+            // partial assistant message.
+            try Task.checkCancellation()
             try await log.append(.messageCompleted(
                 MessageCompletedPayload(messageId: assistantID, role: .assistant, text: full)))
             await appendTurnStats(start: start, firstTokenAt: firstTokenAt, usage: usage)
+            try Task.checkCancellation()
             try await log.append(.turnOutcome(TurnOutcomePayload(
                 turnID: turnID,
                 outcome: .completed,
                 submissionID: submissionID)))
         } catch {
-            let interrupted = error is CancellationError && Task.isCancelled
+            let interrupted = IntatisCancellation.isCurrentTaskCancellation(error)
             if !interrupted {
                 let payload: ErrorPayload
-                if error is CancellationError {
+                if IntatisCancellation.isCancellationSignal(error) {
                     // A provider-originated CancellationError is not evidence
                     // that the user cancelled this turn.
                     payload = ErrorPayload(

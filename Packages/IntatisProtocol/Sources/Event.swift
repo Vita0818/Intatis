@@ -20,18 +20,26 @@ public struct UserMessagePayload: Codable, Equatable, Sendable {
     /// Stable identity of an accepted user intent. `nil` denotes a legacy
     /// message that predates durable submission admission.
     public var submissionID: SubmissionID?
+    /// Exact, secret-free `@main` inference binding selected at the Cowork
+    /// composer Send boundary. It is immutable with the submitted intent so a
+    /// queued or retried submission cannot drift when the user changes the
+    /// selector again. `nil` covers Chat, legacy Cowork messages, and direct
+    /// messages to ordinary agents.
+    public var mainAgentInferenceBinding: AgentInferenceBinding?
     public init(text: String,
                 attachments: [ArtifactID]? = nil,
                 to: AgentID? = nil,
                 tags: [String]? = nil,
                 goal: String? = nil,
-                submissionID: SubmissionID? = nil) {
+                submissionID: SubmissionID? = nil,
+                mainAgentInferenceBinding: AgentInferenceBinding? = nil) {
         self.text = text
         self.attachments = attachments
         self.to = to
         self.tags = tags
         self.goal = goal
         self.submissionID = submissionID
+        self.mainAgentInferenceBinding = mainAgentInferenceBinding
     }
 }
 

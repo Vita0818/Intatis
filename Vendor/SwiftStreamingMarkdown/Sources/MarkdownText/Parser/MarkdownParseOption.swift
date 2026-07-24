@@ -20,6 +20,9 @@ public struct MarkdownParseOption {
   ///   behavior, API, and rendering output may change in future releases.
   ///   Defaults to `false`.
   public let imageSupport: Bool
+  /// Math grammar applied during parsing. Internal so the public low-level
+  /// parser cannot return a tokenized AST without its request-local catalog.
+  let mathConfig: MathRenderConfig
 
   /// Create a new parse option.
   /// - Parameters:
@@ -31,5 +34,18 @@ public struct MarkdownParseOption {
   ) {
     self.speculativeRewrite = speculativeRewrite
     self.imageSupport = imageSupport
+    self.mathConfig = .disabled
+  }
+
+  /// Internal resolved-render path. Callers that enable math must retain and
+  /// consume the request-local catalog before exposing rendered output.
+  init(
+    speculativeRewrite: Bool,
+    imageSupport: Bool = false,
+    mathConfig: MathRenderConfig
+  ) {
+    self.speculativeRewrite = speculativeRewrite
+    self.imageSupport = imageSupport
+    self.mathConfig = mathConfig
   }
 }

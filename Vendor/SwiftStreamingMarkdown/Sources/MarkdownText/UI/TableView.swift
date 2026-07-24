@@ -18,14 +18,19 @@ enum RowContent: Equatable {
 
 struct TableView: View {
   @Environment(\.markdownConfig) var config: MarkdownRenderConfig
-  let headings: [AttributedString]
+  let headings: [RowContent]
   let rows: [[RowContent]]
   let columnMaxWidths: [Int: CGFloat]
 
   private let defaultMaxColumnWidth: CGFloat = 200
   @State private var scrollWidth: CGFloat = 0
   init(headings: [NSMutableAttributedString], rows: [[NSMutableAttributedString]], columnMaxWidths: [Int: CGFloat] = [:], rawMarkdown: String = "") {
-    self.headings = headings.map { AttributedString($0) }
+    self.headings = headings.map { content in
+      if content.containsAttachments(in: NSRange(location: 0, length: content.length)) {
+        return .containsAttachment(string: content)
+      }
+      return .text(string: AttributedString(content))
+    }
     self.rows = rows.map { row in
       row.map { content in
         if content.containsAttachments(in: NSRange(location: 0, length: content.length)) {
@@ -43,18 +48,39 @@ struct TableView: View {
     return rows.count
   }
 
+  @ViewBuilder
   private func headerView(colIdx: Int) -> some View {
     HStack(spacing: 0) {
-      Text(headings[colIdx])
-        .foregroundStyle(config.tableStyle.headerTextColor)
-        .textSelection(.enabled)
-        .lineLimit(nil)
-        .multilineTextAlignment(.leading)
+      switch headings[colIdx] {
+      case .containsAttachment(let content):
+        ParagraphView(contents: applyTypographyThemingAndGetContent(
+          content,
+          color: MDColor(config.tableStyle.headerTextColor)
+        ))
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
-        .if(config.shouldAnimateText) { view in
-          view.fadeInTextTransition(attributedString: headings[colIdx])
-        }
-        .accessibilityValue(String.itemPositionInTable(rowIndex: 1, totalRow: numOfRows + 1, columnIndex: colIdx + 1, totalColumn: headings.count))
+        .accessibilityValue(String.itemPositionInTable(
+          rowIndex: 1,
+          totalRow: numOfRows + 1,
+          columnIndex: colIdx + 1,
+          totalColumn: headings.count
+        ))
+      case .text(let content):
+        Text(content)
+          .foregroundStyle(config.tableStyle.headerTextColor)
+          .textSelection(.enabled)
+          .lineLimit(nil)
+          .multilineTextAlignment(.leading)
+          .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+          .if(config.shouldAnimateText) { view in
+            view.fadeInTextTransition(attributedString: content)
+          }
+          .accessibilityValue(String.itemPositionInTable(
+            rowIndex: 1,
+            totalRow: numOfRows + 1,
+            columnIndex: colIdx + 1,
+            totalColumn: headings.count
+          ))
+      }
       Spacer()
     }
     .padding(12)
@@ -97,7 +123,10 @@ struct TableView: View {
     switch content {
     case .containsAttachment(let nsAttributedString):
       HStack(spacing: 0) {
-        ParagraphView(contents: applyTypographyThemingAndGetContent(nsAttributedString))
+        ParagraphView(contents: applyTypographyThemingAndGetContent(
+          nsAttributedString,
+          color: MDColor(config.tableStyle.regularTextColor)
+        ))
           .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
           .accessibilityValue(String.itemPositionInTable(rowIndex: rowIdx + 2, totalRow: numOfRows + 1, columnIndex: colIdx + 1, totalColumn: headings.count))
         Spacer()
@@ -258,12 +287,13 @@ struct TableLayout: Layout {
 // MARK: - Helper Functions
 extension TableView {
   /// Apply typography theming and return themed content for use with ParagraphView
-  private func applyTypographyThemingAndGetContent(_ attributedString: NSAttributedString) -> NSMutableAttributedString {
+  private func applyTypographyThemingAndGetContent(
+    _ attributedString: NSAttributedString,
+    color themeColor: MDColor
+  ) -> NSMutableAttributedString {
     // Apply typography theming for table cells
     let mutableAttributedString = NSMutableAttributedString(attributedString: attributedString)
     let fullRange = NSRange(location: 0, length: mutableAttributedString.length)
-    let themeColor = MDColor(config.tableStyle.regularTextColor)
-
     // Apply theme color to text that doesn't already have a foreground color
     mutableAttributedString.enumerateAttribute(.foregroundColor, in: fullRange, options: []) { existingColor, range, _ in
       if existingColor == nil {

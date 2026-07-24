@@ -2,6 +2,7 @@
 import Foundation
 import IntatisCore
 import IntatisProviders
+import IntatisConversation
 
 typealias IOSSessionSummary = SessionSummary
 
@@ -279,7 +280,9 @@ enum IOSConfig {
     }
 
     static func recentSessions() -> [IOSSessionSummary] {
-        SessionHistoryStore.recentSessions(root: appSupportDir(), kind: .chat)
+        SessionActivityHistoryStore.recentSessions(
+            root: appSupportDir(),
+            kind: .chat)
     }
 
     static func providerConfig() -> ProviderConfig {

@@ -22,7 +22,11 @@ struct UnorderedListView: View {
               ListItemContentWrapper(paragraphContents: contents) {
                 SingleBlockView(renderable: firstChild)
               }
-              .accessibilityLabel(Text(listItemAccessibilityLabel(for: contents.string, at: idx, checkbox: items[idx].checkbox)))
+              .accessibilityLabel(Text(listItemAccessibilityLabel(
+                for: contents.accessibilityTextDescribingAttachments,
+                at: idx,
+                checkbox: items[idx].checkbox
+              )))
             } else {
               SingleBlockView(renderable: firstChild)
             }

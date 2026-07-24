@@ -89,7 +89,7 @@ extension MarkdownRenderable {
   var plainText: String? {
     switch self {
     case .paragraph(_, let content), .heading(_, _, let content):
-      return content.string
+      return content.plainTextRestoringInlineMath
     case .orderedList(_, let items):
       return items.plainText(separator: "\n")
     case .unorderedList(_, let items, _):
@@ -97,8 +97,12 @@ extension MarkdownRenderable {
     case .codeBlock(_, _, let code):
       return code
     case .table(_, let headers, let rows, _):
-      let headerLine = headers.map { $0.string }.joined(separator: "\t")
-      let rowLines = rows.map { row in row.map { $0.string }.joined(separator: "\t") }
+      let headerLine = headers
+        .map(\.plainTextRestoringInlineMath)
+        .joined(separator: "\t")
+      let rowLines = rows.map { row in
+        row.map(\.plainTextRestoringInlineMath).joined(separator: "\t")
+      }
       return ([headerLine] + rowLines).joined(separator: "\n")
     case .blockQuote(_, let item):
       return item.quoteType.plainText
@@ -123,17 +127,52 @@ private extension BlockQuoteType {
   var plainText: String {
     switch self {
     case .text(let text):
-      return text
+      return text.plainTextRestoringBlockQuoteAttachments
     case .nested(let items):
       return items.map { $0.plainText }.joined(separator: "\n")
     }
+  }
+
+  var attributedStrings: [NSAttributedString] {
+    switch self {
+    case .text(let text):
+      return [text]
+    case .nested(let items):
+      return items.flatMap(\.attributedStrings)
+    }
+  }
+}
+
+private extension NSAttributedString {
+  /// Block quotes historically restored citation titles in their plain-text
+  /// projection. Keep that contract while also restoring raw math literals.
+  var plainTextRestoringBlockQuoteAttachments: String {
+    guard length > 0 else { return "" }
+    let mutable = NSMutableAttributedString(attributedString: self)
+    var replacements: [(NSRange, String)] = []
+    enumerateAttribute(
+      .attachment,
+      in: NSRange(location: 0, length: length),
+      options: []
+    ) { value, range, _ in
+      if let attachment = value as? InlineMathAttachment {
+        replacements.append((range, attachment.mathData.originalLiteral))
+      } else if let attachment = value as? InlineCitationAttachment,
+                let citationData = attachment.citationData {
+        replacements.append((range, citationData.title))
+      }
+    }
+    for (range, replacement) in replacements.reversed() {
+      mutable.replaceCharacters(in: range, with: replacement)
+    }
+    return mutable.string
   }
 }
 
 extension MarkdownRenderable {
   func extractAttributedStrings() -> [NSAttributedString] {
     switch self {
-    case .paragraph(_, let str):
+    case .paragraph(_, let str), .heading(_, _, let str):
       return [str]
     case .orderedList(_, let items):
       return items.flatMap { $0.attributedStrings() }
@@ -141,6 +180,8 @@ extension MarkdownRenderable {
       return items.flatMap { $0.attributedStrings() }
     case .table(_, let headers, let rows, _):
       return headers + rows.flatMap { $0 }
+    case .blockQuote(_, let item):
+      return item.quoteType.attributedStrings
     default:
       return []
     }

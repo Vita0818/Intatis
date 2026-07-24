@@ -65,7 +65,7 @@ final class MessageRendererModeTests: XCTestCase {
     }
 
     func testPlainSafeRenderPlanPreservesRawTextAndLineEndings() {
-        let raw = "  **first**\r\n| a | b |\r`code`\n第三行  "
+        let raw = "  **first**\r\n| a | b |\r`$code$`\n公式 $x_i$ 与 \\$29.99  "
         let plan = IntatisMessageRenderPlan.resolve(
             rawText: raw,
             isComplete: true,

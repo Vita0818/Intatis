@@ -54,14 +54,10 @@ private struct InternalBlockQuoteView: View {
 }
 
 struct QuoteTextView: View {
-  @Environment(\.markdownConfig) var config: MarkdownRenderConfig
-
-  let text: String
+  let text: NSMutableAttributedString
 
   var body: some View {
-    Text(text)
-      .font(config.blockQuoteStyle.textFonts)
-      .foregroundStyle(config.blockQuoteStyle.textColor)
+    ParagraphView(contents: text, lineSpacing: 5)
       .padding(.vertical, 4.0)
       .fixedSize(horizontal: false, vertical: true)
   }
@@ -75,7 +71,7 @@ struct QuoteDivider: View {
 }
 
 indirect enum BlockQuoteType: Equatable, Hashable {
-  case text(String)
+  case text(NSMutableAttributedString)
   case nested([BlockQuoteType])
 
   var isNested: Bool {

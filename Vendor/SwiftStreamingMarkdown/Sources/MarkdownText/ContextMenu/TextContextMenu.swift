@@ -34,7 +34,9 @@ public struct TextContextMenu: Hashable, Sendable {
     var customMenu: [UIMenu] = []
 
     let clampedRange = NSIntersectionRange(selectedRange, NSRange(location: 0, length: textView.attributedText.length))
-    let selectedText = textView.attributedText.attributedSubstring(from: clampedRange).string
+    let selectedText = textView.attributedText
+      .attributedSubstring(from: clampedRange)
+      .plainTextRestoringInlineMath
     for group in menuGroups {
       var groupActions: [UIAction] = []
       for item in group.items {

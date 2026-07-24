@@ -14,8 +14,10 @@ extension Markdown.Table: BlockConvertible {
     var headerContainer = attributeContainer
     bodyContainer[.font] = config.tableStyle.textFonts.normal
     bodyContainer[.typography] = config.tableStyle.textFonts
+    bodyContainer[.foregroundColor] = MDColor(config.tableStyle.regularTextColor)
     headerContainer[.font] = config.tableStyle.textFonts.bold ?? config.tableStyle.textFonts.normal
     headerContainer[.typography] = config.tableStyle.textFonts
+    headerContainer[.foregroundColor] = MDColor(config.tableStyle.headerTextColor)
     let headerCells = self
       .head
       .children

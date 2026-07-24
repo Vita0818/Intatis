@@ -72,6 +72,7 @@ private struct Limits: Encodable {
 private enum ContainmentProfile: String, Encodable {
     case minimal
     case isolation
+    case computerUse = "computer-use"
     case replaySmoke = "replay-smoke"
 
     var limits: Limits {
@@ -102,6 +103,19 @@ private enum ContainmentProfile: String, Encodable {
                 termGraceSeconds: 0.5,
                 killGraceSeconds: 2,
                 minimumExpectedRuntimeSeconds: 16)
+        case .computerUse:
+            return Limits(
+                observationSeconds: 45,
+                hardWallSeconds: 50,
+                rssBytes: 384 * mib,
+                footprintBytes: 384 * mib,
+                rollingCPUPercent: 150,
+                rollingCPUWindowSeconds: 3,
+                cpuGraceSeconds: 2,
+                absoluteCPUSeconds: 60,
+                termGraceSeconds: 0.5,
+                killGraceSeconds: 2,
+                minimumExpectedRuntimeSeconds: 36)
         case .replaySmoke:
             return Limits(
                 observationSeconds: 30,
@@ -123,6 +137,11 @@ private enum FixtureStage: String, Encodable {
     case minimal
     case table
     case codeSelection = "code-selection"
+    case mathOne = "math-one"
+    case mathThirtyTwo = "math-thirty-two"
+    case mathStructure = "math-structure"
+    case mathHistory = "math-history"
+    case mathStream = "math-stream"
     case streamReplacement = "stream-replacement"
     case incidentReplay = "incident-replay"
     case fullStatic = "full-static"
@@ -131,7 +150,13 @@ private enum FixtureStage: String, Encodable {
         switch (self, profile) {
         case (.minimal, .minimal): true
         case (.table, .isolation), (.codeSelection, .isolation),
+             (.mathOne, .isolation), (.mathThirtyTwo, .isolation),
+             (.mathStructure, .isolation), (.mathHistory, .isolation),
+             (.mathStream, .isolation),
              (.streamReplacement, .isolation), (.fullStatic, .isolation): true
+        case (.mathOne, .computerUse), (.mathThirtyTwo, .computerUse),
+             (.mathStructure, .computerUse), (.mathHistory, .computerUse),
+             (.mathStream, .computerUse): true
         case (.incidentReplay, .replaySmoke): true
         default: false
         }
@@ -146,6 +171,18 @@ private enum RendererMode: String, Encodable {
         switch self {
         case .microsoft: "-IntatisMicrosoftMarkdownMessages"
         case .plainSafe: "-IntatisPlainSafeMessages"
+        }
+    }
+}
+
+private enum MathMode: String, Encodable {
+    case disabled
+    case singleDollar = "single-dollar"
+
+    var launchArgument: String? {
+        switch self {
+        case .disabled: "-IntatisDisableSingleDollarMath"
+        case .singleDollar: nil
         }
     }
 }
@@ -169,6 +206,7 @@ private struct RunConfiguration {
     let outputPath: String
     let stage: FixtureStage
     let renderer: RendererMode
+    let mathMode: MathMode
     let appearance: Appearance
     let profile: ContainmentProfile
 }
@@ -209,7 +247,7 @@ private struct EventRecord: Encodable {
 }
 
 private struct Manifest: Encodable {
-    let schema = "intatis.renderer-watchdog.manifest.v1"
+    let schema = "intatis.renderer-watchdog.manifest.v2"
     let createdAt: String
     let operatingSystem: String
     let physicalMemoryBytes: UInt64
@@ -222,6 +260,7 @@ private struct Manifest: Encodable {
     let fixtureSHA256: String
     let stage: FixtureStage
     let renderer: RendererMode
+    let mathMode: MathMode
     let appearance: Appearance
     let profile: ContainmentProfile
     let limits: Limits
@@ -1070,6 +1109,7 @@ private func validateApp(_ configuration: RunConfiguration) throws -> (String, M
         fixtureSHA256: fixtureHash,
         stage: configuration.stage,
         renderer: configuration.renderer,
+        mathMode: configuration.mathMode,
         appearance: configuration.appearance,
         profile: configuration.profile,
         limits: configuration.profile.limits,
@@ -1082,7 +1122,7 @@ private func parseRunConfiguration(_ arguments: [String]) throws -> RunConfigura
     var sawApproval = false
     let valueFlags = Set([
         "--app", "--expected-app-sha256", "--fixture", "--output", "--stage", "--renderer",
-        "--appearance", "--profile",
+        "--math", "--appearance", "--profile",
     ])
     var index = 2
     while index < arguments.count {
@@ -1115,10 +1155,11 @@ private func parseRunConfiguration(_ arguments: [String]) throws -> RunConfigura
     }
     guard let stage = FixtureStage(rawValue: try required("--stage")),
           let renderer = RendererMode(rawValue: try required("--renderer")),
+          let mathMode = MathMode(rawValue: try required("--math")),
           let appearance = Appearance(rawValue: try required("--appearance")),
           let profile = ContainmentProfile(rawValue: try required("--profile"))
     else {
-        throw WatchdogFailure.usage("invalid stage/renderer/appearance/profile")
+        throw WatchdogFailure.usage("invalid stage/renderer/math/appearance/profile")
     }
     guard stage.accepts(profile) else {
         throw WatchdogFailure.preflight("profile \(profile.rawValue) is not valid for stage \(stage.rawValue)")
@@ -1138,6 +1179,7 @@ private func parseRunConfiguration(_ arguments: [String]) throws -> RunConfigura
         outputPath: try required("--output"),
         stage: stage,
         renderer: renderer,
+        mathMode: mathMode,
         appearance: appearance,
         profile: profile)
 }
@@ -1152,7 +1194,7 @@ private func runValidation(_ arguments: [String]) throws -> Int32 {
     try writer.event(kind: "preflight", detail: "bundle, fixture, lock, and telemetry prerequisites passed", elapsedSeconds: 0)
 
     let limits = configuration.profile.limits
-    let launchArguments = [
+    var launchArguments = [
         "-IntatisRendererFixture",
         configuration.renderer.launchArgument,
         configuration.appearance.launchArgument,
@@ -1163,6 +1205,9 @@ private func runValidation(_ arguments: [String]) throws -> Int32 {
         "-IntatisRendererFixtureAutoExitSeconds",
         String(format: "%.3f", limits.observationSeconds),
     ]
+    if let mathLaunchArgument = configuration.mathMode.launchArgument {
+        launchArguments.append(mathLaunchArgument)
+    }
     let result = try runMonitor(
         specification: MonitorSpecification(
             executablePath: validated.0,
@@ -1264,11 +1309,34 @@ private func writeSelfTestSummary(_ summary: SelfTestSummary, at url: URL) throw
     try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
 }
 
+private func validateClosedSetSelfTestContracts() throws {
+    let isolatedMathStages: [FixtureStage] = [
+        .mathOne,
+        .mathThirtyTwo,
+        .mathStructure,
+        .mathHistory,
+        .mathStream,
+    ]
+    guard isolatedMathStages.allSatisfy({ $0.accepts(.isolation) }),
+          isolatedMathStages.allSatisfy({ $0.accepts(.computerUse) }),
+          isolatedMathStages.allSatisfy({ !$0.accepts(.minimal) }),
+          isolatedMathStages.allSatisfy({ !$0.accepts(.replaySmoke) }),
+          FixtureStage.mathStructure.rawValue == "math-structure",
+          FixtureStage.mathHistory.rawValue == "math-history",
+          MathMode.disabled.launchArgument == "-IntatisDisableSingleDollarMath",
+          MathMode.singleDollar.launchArgument == nil
+    else {
+        throw WatchdogFailure.preflight(
+            "closed-set math validation contracts failed self-test")
+    }
+}
+
 private func runSelfTests(_ arguments: [String]) throws -> Int32 {
     guard arguments.count == 4, arguments[2] == "--output" else {
         throw WatchdogFailure.usage("usage: watchdog self-test --output NEW_DIRECTORY")
     }
     let lock = try AdvisoryLock(path: watchdogLockPath)
+    try validateClosedSetSelfTestContracts()
     let outputURL = URL(fileURLWithPath: arguments[3]).standardizedFileURL
     guard !FileManager.default.fileExists(atPath: outputURL.path) else {
         throw WatchdogFailure.preflight("refusing to reuse self-test output directory")
@@ -1424,7 +1492,8 @@ private func printUsage() {
         --app VALIDATION.app --expected-app-sha256 SHA256 \\
         --fixture incident-1249-sanitized-v1.json \\
         --output NEW_DIRECTORY --stage STAGE --renderer microsoft|plainSafe \\
-        --appearance light|dark --profile minimal|isolation|replay-smoke
+        --math disabled|single-dollar --appearance light|dark \\
+        --profile minimal|isolation|computer-use|replay-smoke
 
     The run command only accepts a hash-pinned Intatis validation build and never
     treats a containment run as release-performance evidence.

@@ -17,6 +17,53 @@ public enum ChatArtifactGenerationState: Equatable, Sendable {
     }
 }
 
+struct ChatProjectionState: Equatable, Sendable {
+    var conversation = ConversationProjection()
+    var artifactProgress = ArtifactProgressProjection()
+    var turnStats = TurnStatsProjection()
+    var artifacts: [ArtifactCardInfo] = []
+
+    mutating func apply(_ envelope: Envelope) {
+        conversation.apply(envelope)
+        artifactProgress.apply(envelope)
+        turnStats.apply(envelope)
+        if case .artifactAdded(let payload) = envelope.event {
+            artifacts.append(ArtifactCardInfo(
+                id: payload.artifactId.rawValue,
+                kind: payload.kind,
+                mime: payload.mime,
+                path: payload.path,
+                prompt: payload.prompt))
+        }
+    }
+}
+
+actor ChatHistoryProjectionBuilder {
+    private let beforeBuild: (@Sendable () async -> Void)?
+
+    init(beforeBuild: (@Sendable () async -> Void)? = nil) {
+        self.beforeBuild = beforeBuild
+    }
+
+    func build(_ envelopes: [Envelope]) async -> ChatProjectionState? {
+        await beforeBuild?()
+        guard !Task.isCancelled else { return nil }
+        var state = ChatProjectionState()
+        for envelope in envelopes {
+            guard !Task.isCancelled else { return nil }
+            state.apply(envelope)
+        }
+        return state
+    }
+}
+
+typealias ChatHistorySnapshotLoader =
+    @Sendable (EventLog) async throws -> [Envelope]
+
+let defaultChatHistorySnapshotLoader: ChatHistorySnapshotLoader = { log in
+    try await log.replayChecked()
+}
+
 /// Bridges the event log to SwiftUI. It subscribes to the log's event stream and
 /// folds it into `messages`; it never talks to a provider directly except
 /// through `ChatLoop`. This is the UI-side enforcement of "consume structured
@@ -43,10 +90,27 @@ public final class ChatViewModel: ObservableObject {
     private var imageGenerationOperation: Task<Void, Never>?
     private var shutdownTask: Task<Void, Never>?
     private var isShutdown = false
+    private let historyProjectionBuilder: ChatHistoryProjectionBuilder
+    private let historySnapshotLoader: ChatHistorySnapshotLoader
+    private var historyReplayErrorText: String?
 
     public init(log: EventLog, registry: ProviderRegistry) {
         self.log = log
         self.registry = registry
+        self.historyProjectionBuilder = ChatHistoryProjectionBuilder()
+        self.historySnapshotLoader = defaultChatHistorySnapshotLoader
+    }
+
+    init(
+        log: EventLog,
+        registry: ProviderRegistry,
+        historyProjectionBuilder: ChatHistoryProjectionBuilder,
+        historySnapshotLoader: @escaping ChatHistorySnapshotLoader
+    ) {
+        self.log = log
+        self.registry = registry
+        self.historyProjectionBuilder = historyProjectionBuilder
+        self.historySnapshotLoader = historySnapshotLoader
     }
 
     public func updateProviderRegistry(_ registry: ProviderRegistry) {
@@ -62,28 +126,104 @@ public final class ChatViewModel: ObservableObject {
         guard !isShutdown, subscription == nil else { return }
         subscription = Task { @MainActor [weak self] in
             guard let self else { return }
-            let stream = await self.log.stream(from: 0)
-            var projection = ConversationProjection()
-            var artifactProgressProjection = ArtifactProgressProjection()
-            var turnStatsProjection = TurnStatsProjection()
-            for await envelope in stream {
-                projection.apply(envelope)
-                artifactProgressProjection.apply(envelope)
-                turnStatsProjection.apply(envelope)
-                self.messages = projection.messages
-                self.artifactProgress = artifactProgressProjection.active
-                self.latestTurnStats = turnStatsProjection.latest
-                if case .artifactAdded(let p) = envelope.event {
-                    self.artifacts.append(ArtifactCardInfo(id: p.artifactId.rawValue, kind: p.kind,
-                                                           mime: p.mime, path: p.path, prompt: p.prompt))
-                }
+            let history: [Envelope]
+            do {
+                history = try await self.historySnapshotLoader(self.log)
+            } catch {
+                guard !Task.isCancelled, !self.isShutdown else { return }
+                let message = IntatisLocalization.format(
+                    "Chat history could not be loaded: %@",
+                    error.localizedDescription)
+                self.historyReplayErrorText = message
+                self.errorText = message
+                // The failed task must not occupy the subscription slot
+                // forever. A later view appearance or explicit start can
+                // retry the strict snapshot without restarting the runtime.
+                self.subscription = nil
+                return
             }
+            guard !Task.isCancelled else { return }
+            let historyLastSeq = history.last?.seq ?? -1
+            let liveFrom = historyLastSeq == Int.max
+                ? Int.max
+                : historyLastSeq + 1
+            // Register the live subscriber before folding. Events appended
+            // after the replay snapshot are replayed into this exact stream,
+            // so the off-main fold cannot create a loss window.
+            let stream = await self.log.stream(from: liveFrom)
+            // `stream(from:)` intentionally keeps compatibility fail-soft
+            // replay semantics. Take a second strict catch-up snapshot after
+            // subscriber registration and de-duplicate by seq: this covers an
+            // event appended between the initial snapshot and registration,
+            // even if the stream's compatibility replay could not read it.
+            let catchUp: [Envelope]
+            do {
+                catchUp = try await self.log.replayChecked(from: liveFrom)
+            } catch {
+                guard !Task.isCancelled, !self.isShutdown else { return }
+                let message = IntatisLocalization.format(
+                    "Chat history could not be loaded: %@",
+                    error.localizedDescription)
+                self.historyReplayErrorText = message
+                self.errorText = message
+                self.subscription = nil
+                return
+            }
+            var restoreInput = history
+            restoreInput.append(contentsOf: catchUp.filter {
+                $0.seq > historyLastSeq
+            })
+            guard let restored = await self.historyProjectionBuilder.build(restoreInput),
+                  !Task.isCancelled else {
+                return
+            }
+            var state = restored
+            var lastAppliedSeq = restoreInput.last?.seq ?? -1
+            if self.errorText == self.historyReplayErrorText {
+                self.errorText = nil
+            }
+            self.historyReplayErrorText = nil
+            self.publish(state)
+            for await envelope in stream {
+                guard !Task.isCancelled else { return }
+                guard envelope.seq > lastAppliedSeq else { continue }
+                state.apply(envelope)
+                lastAppliedSeq = envelope.seq
+                self.publish(state)
+            }
+        }
+    }
+
+    private func publish(_ state: ChatProjectionState) {
+        let restoredMessages = state.conversation.messages
+        if messages != restoredMessages {
+            messages = restoredMessages
+        }
+        let restoredArtifacts = state.artifacts
+        if artifacts != restoredArtifacts {
+            artifacts = restoredArtifacts
+        }
+        let restoredProgress = state.artifactProgress.active
+        if artifactProgress != restoredProgress {
+            artifactProgress = restoredProgress
+        }
+        let restoredStats = state.turnStats.latest
+        if latestTurnStats != restoredStats {
+            latestTurnStats = restoredStats
         }
     }
 
     public func stop() {
         subscription?.cancel()
         subscription = nil
+    }
+
+    /// Cancels only the currently submitted Chat operation. The process-owned
+    /// session runtime, EventLog subscription, and future Send capability stay
+    /// alive.
+    public func cancelCurrentOperation() {
+        runningOperation?.cancel()
+        imageGenerationOperation?.cancel()
     }
 
     /// Permanently stops this session runtime and waits for provider-backed
@@ -144,8 +284,12 @@ public final class ChatViewModel: ObservableObject {
                 let loop = ChatLoop(log: self.log, provider: provider, model: model)
                 try await loop.send(parsed.text, userMessage: parsed.userMessagePayload)
             } catch {
-                let loggedError = await self.hasLoggedError(after: startSeq)
-                self.errorText = loggedError ? nil : error.localizedDescription
+                if IntatisCancellation.isCurrentTaskCancellation(error) {
+                    self.errorText = nil
+                } else {
+                    let loggedError = await self.hasLoggedError(after: startSeq)
+                    self.errorText = loggedError ? nil : error.localizedDescription
+                }
             }
             self.isStreaming = false
             self.runningOperation = nil
@@ -168,7 +312,7 @@ public final class ChatViewModel: ObservableObject {
         let prompt = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !isShutdown, !prompt.isEmpty, !isBusy else { return }
         guard let onGenerateImage else {
-            let message = "Image generation is not available."
+            let message = IntatisLocalization.string("Image generation is not available.")
             imageGenerationState = .failed(message)
             errorText = message
             return
@@ -182,7 +326,18 @@ public final class ChatViewModel: ObservableObject {
                 try await onGenerateImage(prompt)
                 self.imageGenerationState = .idle
             } catch {
-                let message = "Image generation failed: \(error.localizedDescription)"
+                if IntatisCancellation.isCurrentTaskCancellation(error) {
+                    self.imageGenerationState = .idle
+                    self.errorText = nil
+                    if self.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        self.input = prompt
+                    }
+                    self.imageGenerationOperation = nil
+                    return
+                }
+                let message = IntatisLocalization.format(
+                    "Image generation failed: %@",
+                    error.localizedDescription)
                 self.errorText = message
                 self.imageGenerationState = .failed(message)
                 if self.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {

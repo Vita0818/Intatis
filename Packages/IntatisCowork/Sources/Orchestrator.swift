@@ -155,6 +155,27 @@ private enum RetryAdmissionResult: Sendable {
     case rejected(String)
 }
 
+private struct PreparedMainInferenceRebind: Sendable {
+    var previous: Agent
+    var candidate: Agent
+}
+
+private enum MainInferencePreparation: Sendable {
+    case unchanged
+    case rebind(PreparedMainInferenceRebind)
+    case failed(String)
+}
+
+private enum MainInferenceCommit: Sendable {
+    case ready(Agent, Event?)
+    case failed(String)
+}
+
+private enum RootTaskCreationResult: Sendable {
+    case created(TaskID)
+    case failed(String)
+}
+
 private enum CoworkTaskTimeoutRace<Value: Sendable>: Sendable {
     case operation(Value)
     case timeout
@@ -1822,6 +1843,88 @@ public actor Orchestrator {
         return .rebound(agentID, binding)
     }
 
+    /// Resolves a composer-selected `@main` binding outside the admission
+    /// lock. The returned snapshot is only a candidate: the lock-held commit
+    /// path revalidates the catalog, live roster, and busy fences before it can
+    /// be persisted beside the exact root/retry admission that consumes it.
+    private func prepareMainInferenceForAdmission(
+        _ binding: AgentInferenceBinding
+    ) async -> MainInferencePreparation {
+        guard availableInferenceProfiles[binding.inferenceProfileID] == binding else {
+            return .failed(
+                "the model selected for the next @main message is no longer in the host-approved catalog")
+        }
+        guard let current = registry.agent(Self.mainAgentID) else {
+            return .failed("no agent named @\(Self.mainAgentID.rawValue)")
+        }
+        if current.agentInferenceBinding == binding {
+            return .unchanged
+        }
+        var candidate = current
+        candidate.model = binding.modelID
+        candidate.agentInferenceBinding = binding
+        do {
+            _ = try await resolvedProvider(for: candidate)
+        } catch {
+            return .failed(
+                "the model selected for the next @main message is unavailable or incompatible")
+        }
+        return .rebind(PreparedMainInferenceRebind(
+            previous: current,
+            candidate: candidate))
+    }
+
+    /// Lock-held half of next-main admission. A changed binding is returned
+    /// with its durable event, but the live registry is not mutated here; the
+    /// caller must append that event atomically with the root/retry admission
+    /// and only then commit both in-memory states.
+    private func mainInferenceCommit(
+        required binding: AgentInferenceBinding,
+        preparation: MainInferencePreparation
+    ) -> MainInferenceCommit {
+        guard availableInferenceProfiles[binding.inferenceProfileID] == binding,
+              let live = registry.agent(Self.mainAgentID) else {
+            return .failed(
+                "the model selected for the next @main message is no longer available")
+        }
+        if live.agentInferenceBinding == binding,
+           live.model == binding.modelID {
+            return .ready(live, nil)
+        }
+        guard case .rebind(let prepared) = preparation,
+              live.agentInferenceBinding == prepared.previous.agentInferenceBinding,
+              live.model == prepared.previous.model,
+              live.workspaceRoot.standardizedFileURL ==
+                prepared.previous.workspaceRoot.standardizedFileURL,
+              live.profile == prepared.previous.profile,
+              live.coordinationDepth == prepared.previous.coordinationDepth,
+              prepared.candidate.agentInferenceBinding == binding,
+              prepared.candidate.model == binding.modelID,
+              !automaticDelegationReservations.contains(Self.mainAgentID),
+              !taskGraph.nodes.values.contains(where: {
+                  $0.assignee == Self.mainAgentID && Self.isActiveTaskStatus($0.status)
+              }),
+              !scheduler.queuedTasks().contains(where: {
+                  $0.assignee == Self.mainAgentID
+              }) else {
+            return .failed(
+                "@main changed or became busy before the selected model could be admitted")
+        }
+        let event = Event.agentAttached(AgentAttachedPayload(
+            agent: prepared.candidate.name,
+            path: prepared.candidate.workspaceRoot.path,
+            model: prepared.candidate.model,
+            profile: prepared.candidate.profile.rawValue,
+            agentInferenceBinding: prepared.candidate.agentInferenceBinding,
+            previousAgentInferenceBinding: live.agentInferenceBinding,
+            inferenceBindingChangeReason: "selected at Cowork Send boundary",
+            metadata: CoworkEventMetadata(
+                agentID: prepared.candidate.name,
+                scope: .agent,
+                visibility: .global)))
+        return .ready(prepared.candidate, event)
+    }
+
     public func automaticPermissionReviewEnabled() -> Bool {
         automaticPermissionResponder != nil && !automaticPermissionReviewDisabling
     }
@@ -2597,6 +2700,181 @@ public actor Orchestrator {
         return recoveryEvents
     }
 
+    /// Atomically consumes one composer-frozen `@main` binding with the root
+    /// task it belongs to. The optional rebind and created/assigned/queued task
+    /// events share one EventLog transaction and one admission-lock hold, so no
+    /// unrelated delegation can observe the new live binding first.
+    private func admitNextMainRootTask(
+        text: String,
+        images: [ImageAttachment],
+        userMessage: UserMessagePayload,
+        goalID: GoalID?,
+        continuationRunID: ContinuationRunID?,
+        recordUserMessage: Bool,
+        explicitGoalIntent: Bool
+    ) async -> RootTaskCreationResult {
+        guard let requiredBinding = userMessage.mainAgentInferenceBinding else {
+            return .failed("The next @main submission has no frozen model binding.")
+        }
+        guard !Task.isCancelled,
+              !isGoalRunCancellationRequested(
+                  goalID: goalID,
+                  continuationRunID: continuationRunID) else {
+            return .failed("Goal continuation was cancelled before root task admission.")
+        }
+        let inferencePreparation = await prepareMainInferenceForAdmission(
+            requiredBinding)
+        if case .failed(let message) = inferencePreparation {
+            return .failed(message)
+        }
+
+        await acquireAdmissionLock()
+        defer { releaseAdmissionLock() }
+        guard !Task.isCancelled,
+              !isGoalRunCancellationRequested(
+                  goalID: goalID,
+                  continuationRunID: continuationRunID) else {
+            return .failed("Goal continuation was cancelled before root task admission.")
+        }
+        let agent: Agent
+        let inferenceRebindEvent: Event?
+        switch mainInferenceCommit(
+            required: requiredBinding,
+            preparation: inferencePreparation) {
+        case .ready(let preparedAgent, let event):
+            agent = preparedAgent
+            inferenceRebindEvent = event
+        case .failed(let message):
+            return .failed(message)
+        }
+        guard let workspaceLeaseID = defaultWorkspaceLeaseIDs[agent.name],
+              let workspaceLease = workspaceLeases[workspaceLeaseID],
+              let capabilityLeaseID = defaultCapabilityLeaseIDs[agent.name],
+              capabilityLeases[capabilityLeaseID] != nil else {
+            return .failed("The @main default leases are unavailable.")
+        }
+        let contract = TaskContract(
+            kind: .root,
+            issuer: nil,
+            assignee: agent.name,
+            continuationRunID: continuationRunID,
+            goalID: goalID,
+            submissionID: userMessage.submissionID,
+            objective: text.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+                ?? "Coordinate the cowork task.",
+            roleHint: "root task coordinator",
+            expectedDeliverable: "Coordinate assigned subtasks and synthesize the result.",
+            workspaceID: workspaceLease.workspaceID,
+            workspaceLeaseID: workspaceLeaseID,
+            capabilityLeaseID: capabilityLeaseID,
+            agentInferenceBinding: requiredBinding,
+            relatedAgents: agentVisibleNames(excluding: agent.name),
+            replyMode: TaskReplyMode.none,
+            executionTimeoutSeconds: executionPolicy.taskTimeoutSeconds,
+            maxAttempts: executionPolicy.maxAttempts)
+        let scheduled = ScheduledTask(
+            contract: contract,
+            input: text,
+            rootTaskID: contract.id,
+            parentTaskID: nil,
+            issuer: nil,
+            assignee: agent.name,
+            causalParentID: nil,
+            hopCount: 0,
+            visitedAgents: [agent.name],
+            attempt: 1)
+        var preflightGraph = taskGraph
+        guard case .success = preflightGraph.addRootTask(contract),
+              preflightGraph.updateStatus(taskID: contract.id, status: .assigned) else {
+            return .failed("The selected @main root task violates the task graph.")
+        }
+        var preflightScheduler = scheduler
+        guard preflightScheduler.enqueue(scheduled, mode: .newTask).accepted else {
+            return .failed("The selected @main root task is already queued.")
+        }
+        let metadata = taskMetadata(
+            contract: contract,
+            rootTaskID: contract.id,
+            parentTaskID: nil,
+            sender: nil,
+            recipient: agent.name)
+        var events: [Event] = []
+        if let inferenceRebindEvent {
+            events.append(inferenceRebindEvent)
+        }
+        events.append(.taskCreated(TaskCreatedPayload(
+            contract: contract,
+            metadata: metadata)))
+        events.append(.taskAssigned(TaskAssignedPayload(
+            contract: contract,
+            metadata: metadata)))
+        events.append(.taskQueued(TaskQueuedPayload(
+            contract: contract,
+            rootTaskID: contract.id,
+            parentTaskID: nil,
+            issuer: nil,
+            assignee: agent.name,
+            causalParentID: nil,
+            hopCount: 0,
+            visitedAgents: [agent.name],
+            attempt: 1,
+            reason: "user task admitted with frozen @main model",
+            metadata: metadata)))
+        do {
+            try await appendAdmissionEvents(events)
+        } catch {
+            return .failed(
+                "The selected @main root admission could not be persisted: \(error.localizedDescription)")
+        }
+
+        if inferenceRebindEvent != nil {
+            registry.add(agent)
+        }
+        guard case .success = taskGraph.addRootTask(contract) else {
+            return .failed("The selected @main root admission could not be committed after persistence.")
+        }
+        _ = taskGraph.updateStatus(taskID: contract.id, status: .assigned)
+        if Task.isCancelled || isGoalRunCancellationRequested(
+            goalID: goalID,
+            continuationRunID: continuationRunID) {
+            let persisted = await cancelUnqueuedRootTask(
+                scheduled,
+                reason: "Goal continuation was cancelled during durable root task admission")
+            return .failed(persisted
+                ? "Goal continuation was cancelled before root task execution."
+                : "Goal continuation cancellation could not be persisted.")
+        }
+        guard scheduler.enqueue(scheduled, mode: .newTask).accepted else {
+            return .failed("Root task scheduler commit failed after durable admission.")
+        }
+        rootInvocations[contract.id] = RootInvocationContext(
+            images: images,
+            userMessage: userMessage,
+            recordUserMessage: recordUserMessage,
+            explicitGoalIntent: explicitGoalIntent)
+        _ = taskGraph.updateStatus(taskID: contract.id, status: .queued)
+        return .created(contract.id)
+    }
+
+    private func awaitRootTaskCompletion(_ rootTaskID: TaskID) async -> OrchestratorSendResult {
+        ensureSchedulerRunning()
+        _ = await awaitSchedulerResult(rootTaskID)
+        if let failure = terminalPersistenceFailures[rootTaskID] {
+            return .failed(failure)
+        }
+        guard let record = scheduler.record(for: rootTaskID) else {
+            return .failed("Root task ended without an execution record.")
+        }
+        switch record.status {
+        case .completed:
+            return .sent
+        case .failed, .cancelled:
+            return .failed(record.error ?? "Root task \(record.status.rawValue).")
+        case .created, .assigned, .queued, .running:
+            return .failed("Root task did not reach a terminal state.")
+        }
+    }
+
     /// Route a user message to the explicit target, or to the first attached agent
     /// only when the caller did not specify a target.
     @discardableResult
@@ -2637,16 +2915,45 @@ public actor Orchestrator {
             }
             agent = defaultTarget
         }
-        guard let rootTaskID = await createRootTask(
+        if userMessage?.mainAgentInferenceBinding != nil {
+            guard agent.name == Self.mainAgentID else {
+                return .failed(
+                    "The composer model selection is reserved for @\(Self.mainAgentID.rawValue).")
+            }
+            guard let userMessage else {
+                return .failed("The next @main submission payload is unavailable.")
+            }
+            switch await admitNextMainRootTask(
+                text: text,
+                images: images,
+                userMessage: userMessage,
+                goalID: goalID,
+                continuationRunID: continuationRunID,
+                recordUserMessage: recordUserMessage,
+                explicitGoalIntent: explicitGoalIntent) {
+            case .created(let rootTaskID):
+                return await awaitRootTaskCompletion(rootTaskID)
+            case .failed(let message):
+                return .failed(message)
+            }
+        }
+        let rootCreation = await createRootTaskResult(
             assignee: agent.name,
             objective: text,
             roleHint: "root task coordinator",
             expectedDeliverable: "Coordinate assigned subtasks and synthesize the result.",
             goalID: goalID,
             continuationRunID: continuationRunID,
-            submissionID: userMessage?.submissionID),
-              let rootNode = taskGraph.node(rootTaskID) else {
-            return .failed("Could not create the root task.")
+            submissionID: userMessage?.submissionID)
+        let rootTaskID: TaskID
+        switch rootCreation {
+        case .created(let created):
+            rootTaskID = created
+        case .failed(let message):
+            return .failed(message)
+        }
+        guard let rootNode = taskGraph.node(rootTaskID) else {
+            return .failed("The admitted root task is unavailable.")
         }
 
         let scheduled = ScheduledTask(
@@ -2750,22 +3057,7 @@ public actor Orchestrator {
             explicitGoalIntent: explicitGoalIntent)
         _ = taskGraph.updateStatus(taskID: rootTaskID, status: .queued)
         releaseAdmissionLock()
-        ensureSchedulerRunning()
-        _ = await awaitSchedulerResult(rootTaskID)
-        if let failure = terminalPersistenceFailures[rootTaskID] {
-            return .failed(failure)
-        }
-        guard let record = scheduler.record(for: rootTaskID) else {
-            return .failed("Root task ended without an execution record.")
-        }
-        switch record.status {
-        case .completed:
-            return .sent
-        case .failed, .cancelled:
-            return .failed(record.error ?? "Root task \(record.status.rawValue).")
-        case .created, .assigned, .queued, .running:
-            return .failed("Root task did not reach a terminal state.")
-        }
+        return await awaitRootTaskCompletion(rootTaskID)
     }
 
     @discardableResult
@@ -2774,16 +3066,46 @@ public actor Orchestrator {
                       userMessage: UserMessagePayload? = nil,
                       recordUserMessage: Bool = true,
                       explicitGoalIntent: Bool = false) async -> OrchestratorSendResult {
+        let requiredMainBinding = userMessage?.mainAgentInferenceBinding
+        if let requiredMainBinding {
+            guard (task.assignee ?? task.contract?.assignee) == Self.mainAgentID,
+                  task.contract?.agentInferenceBinding == requiredMainBinding else {
+                return .failed(
+                    "The retry task does not match the model frozen by its @main submission.")
+            }
+        }
         let admittedTaskID: TaskID
         if restoredPendingTaskIDs.contains(task.id),
            scheduler.record(for: task.id)?.status == .queued {
             // The user explicitly chose Retry for a task recovered from a
             // previous process. Resume that exact durable task instead of
             // creating a second root or appending another user message.
+            if let requiredMainBinding {
+                guard let liveMain = registry.agent(Self.mainAgentID),
+                      liveMain.agentInferenceBinding == requiredMainBinding,
+                      liveMain.model == requiredMainBinding.modelID else {
+                    return .failed(
+                        "The restored @main task is queued with a different live model and cannot be resumed safely.")
+                }
+            }
             restoredPendingTaskIDs.remove(task.id)
             admittedTaskID = task.id
         } else {
-            switch await admitRetry(taskID: task.id, reason: "explicit retry") {
+            let inferencePreparation: MainInferencePreparation
+            if let requiredMainBinding {
+                inferencePreparation = await prepareMainInferenceForAdmission(
+                    requiredMainBinding)
+                if case .failed(let message) = inferencePreparation {
+                    return .failed(message)
+                }
+            } else {
+                inferencePreparation = .unchanged
+            }
+            switch await admitRetry(
+                taskID: task.id,
+                reason: "explicit retry",
+                requiredMainInferenceBinding: requiredMainBinding,
+                inferencePreparation: inferencePreparation) {
             case .admitted(let taskID):
                 admittedTaskID = taskID
             case .rejected(let message):
@@ -2813,7 +3135,12 @@ public actor Orchestrator {
         }
     }
 
-    private func admitRetry(taskID: TaskID, reason: String) async -> RetryAdmissionResult {
+    private func admitRetry(
+        taskID: TaskID,
+        reason: String,
+        requiredMainInferenceBinding: AgentInferenceBinding? = nil,
+        inferencePreparation: MainInferencePreparation = .unchanged
+    ) async -> RetryAdmissionResult {
         await acquireAdmissionLock()
         defer { releaseAdmissionLock() }
         guard let currentRecord = scheduler.record(for: taskID),
@@ -2834,6 +3161,27 @@ public actor Orchestrator {
         }
         guard registry.agent(assignee) != nil else {
             return .rejected("No attached agent named @\(assignee.rawValue).")
+        }
+        let inferenceRebindAgent: Agent?
+        let inferenceRebindEvent: Event?
+        if let requiredMainInferenceBinding {
+            guard assignee == Self.mainAgentID,
+                  currentTask.contract.agentInferenceBinding == requiredMainInferenceBinding else {
+                return .rejected(
+                    "The retry task does not match the model frozen by its @main submission.")
+            }
+            switch mainInferenceCommit(
+                required: requiredMainInferenceBinding,
+                preparation: inferencePreparation) {
+            case .ready(let agent, let event):
+                inferenceRebindAgent = event == nil ? nil : agent
+                inferenceRebindEvent = event
+            case .failed(let message):
+                return .rejected(message)
+            }
+        } else {
+            inferenceRebindAgent = nil
+            inferenceRebindEvent = nil
         }
         let maxAttempts = currentTask.contract.maxAttempts ?? executionPolicy.maxAttempts
         guard let currentAttempt = currentRecord.attempt,
@@ -2879,8 +3227,7 @@ public actor Orchestrator {
               preflightGraph.updateStatus(taskID: contract.id, status: .queued, isRetry: true) else {
             return .rejected("Task state no longer permits retry.")
         }
-        do {
-            try await appendAdmissionEvent(.taskQueued(TaskQueuedPayload(
+        let queuedEvent = Event.taskQueued(TaskQueuedPayload(
                 contract: contract,
                 rootTaskID: scheduled.rootTaskID,
                 parentTaskID: scheduled.parentTaskID,
@@ -2896,9 +3243,21 @@ public actor Orchestrator {
                     rootTaskID: scheduled.rootTaskID,
                     parentTaskID: scheduled.parentTaskID,
                     sender: scheduled.issuer,
-                    recipient: scheduled.assignee))))
+                    recipient: scheduled.assignee)))
+        do {
+            if let inferenceRebindEvent {
+                try await appendAdmissionEvents([
+                    inferenceRebindEvent,
+                    queuedEvent,
+                ])
+            } else {
+                try await appendAdmissionEvent(queuedEvent)
+            }
         } catch {
             return .rejected("Retry admission could not be persisted: \(error.localizedDescription)")
+        }
+        if let inferenceRebindAgent {
+            registry.add(inferenceRebindAgent)
         }
         commitTaskLeaseRenewal(renewal)
         guard taskGraph.replaceContract(contract),
@@ -3701,14 +4060,43 @@ public actor Orchestrator {
                         goalID: GoalID? = nil,
                         continuationRunID: ContinuationRunID? = nil,
                         submissionID: SubmissionID? = nil) async -> TaskID? {
-        guard assignee != Self.automaticPermissionReviewerID else { return nil }
+        switch await createRootTaskResult(
+            assignee: assignee,
+            objective: objective,
+            roleHint: roleHint,
+            expectedDeliverable: expectedDeliverable,
+            goalID: goalID,
+            continuationRunID: continuationRunID,
+            submissionID: submissionID) {
+        case .created(let taskID):
+            return taskID
+        case .failed:
+            return nil
+        }
+    }
+
+    private func createRootTaskResult(
+        assignee: AgentID,
+        objective: String,
+        roleHint: String,
+        expectedDeliverable: String,
+        goalID: GoalID?,
+        continuationRunID: ContinuationRunID?,
+        submissionID: SubmissionID?
+    ) async -> RootTaskCreationResult {
+        guard assignee != Self.automaticPermissionReviewerID else {
+            return .failed("@permission-reviewer cannot receive root tasks.")
+        }
         await acquireAdmissionLock()
         defer { releaseAdmissionLock() }
-        guard let agent = registry.agent(assignee),
-              let workspaceLeaseID = defaultWorkspaceLeaseIDs[agent.name],
+        guard let liveAgent = registry.agent(assignee),
+              let workspaceLeaseID = defaultWorkspaceLeaseIDs[liveAgent.name],
               let workspaceLease = workspaceLeases[workspaceLeaseID],
-              let capabilityLeaseID = defaultCapabilityLeaseIDs[agent.name],
-              capabilityLeases[capabilityLeaseID] != nil else { return nil }
+              let capabilityLeaseID = defaultCapabilityLeaseIDs[liveAgent.name],
+              capabilityLeases[capabilityLeaseID] != nil else {
+            return .failed("The root task assignee or its default leases are unavailable.")
+        }
+        let agent = liveAgent
         let contract = TaskContract(
             kind: .root,
             issuer: nil,
@@ -3736,22 +4124,27 @@ public actor Orchestrator {
                 parentTaskID: nil,
                 sender: contract.issuer,
                 recipient: contract.assignee)
+            let createdEvent = Event.taskCreated(TaskCreatedPayload(
+                contract: contract,
+                metadata: metadata))
+            let assignedEvent = Event.taskAssigned(TaskAssignedPayload(
+                contract: contract,
+                metadata: metadata))
             do {
-                try await appendAdmissionEvent(.taskCreated(TaskCreatedPayload(
-                    contract: contract,
-                    metadata: metadata)))
-                try await appendAdmissionEvent(.taskAssigned(TaskAssignedPayload(
-                    contract: contract,
-                    metadata: metadata)))
+                try await appendAdmissionEvent(createdEvent)
+                try await appendAdmissionEvent(assignedEvent)
             } catch {
                 try? await log.append(.error(ErrorPayload(
                     code: "root_admission_persistence_failed",
                     message: error.localizedDescription)))
-                return nil
+                return .failed(
+                    "Root task admission could not be persisted: \(error.localizedDescription)")
             }
-            guard case .success = taskGraph.addRootTask(contract) else { return nil }
+            guard case .success = taskGraph.addRootTask(contract) else {
+                return .failed("Root task admission could not be committed after persistence.")
+            }
             _ = taskGraph.updateStatus(taskID: contract.id, status: .assigned)
-            return contract.id
+            return .created(contract.id)
         case .failure(let violation):
             try? await log.append(.error(ErrorPayload(
                 code: "task_graph_rejected",
@@ -3764,7 +4157,7 @@ public actor Orchestrator {
                 reason: violation.message,
                 violationKind: violation.kind.rawValue,
                 metadata: taskMetadata(contract: contract, rootTaskID: contract.id))))
-            return nil
+            return .failed(violation.message)
         }
     }
 
@@ -5121,7 +5514,8 @@ public actor Orchestrator {
 
     func createGoal(request: GoalCreateRequest,
                     explicitGoalIntent: Bool,
-                    canCreate: Bool) async throws -> Goal {
+                    canCreate: Bool,
+                    mainAgentInferenceBinding: AgentInferenceBinding? = nil) async throws -> Goal {
         guard canCreate else {
             throw IntatisError.permissionDenied("the current capability lease cannot create Goals")
         }
@@ -5150,7 +5544,8 @@ public actor Orchestrator {
             objective: objective,
             successCriteria: request.successCriteria,
             constraints: request.constraints,
-            tokenBudget: request.tokenBudget)
+            tokenBudget: request.tokenBudget,
+            mainAgentInferenceBinding: mainAgentInferenceBinding)
         try await appendAdmissionEvent(.goalCreated(GoalCreatedPayload(goal: goal)))
         return goal
     }

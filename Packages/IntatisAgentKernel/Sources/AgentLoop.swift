@@ -655,6 +655,7 @@ public struct AgentLoop: Sendable {
             }
 
             if !assistantText.isEmpty {
+                try Task.checkCancellation()
                 try await log.append(.messageCompleted(
                     MessageCompletedPayload(
                         messageId: assistantID,
@@ -668,6 +669,7 @@ public struct AgentLoop: Sendable {
                 await appendTurnStats(start: start, firstTokenAt: firstTokenAt, usage: usage)
                 turnStatsAppended = true
                 try await log.append(.agentStatus(AgentStatusPayload(agent: agent.name, state: .idle)))
+                try Task.checkCancellation()
                 try await log.append(.turnOutcome(TurnOutcomePayload(
                     turnID: turnID,
                     outcome: .completed,
@@ -725,7 +727,7 @@ public struct AgentLoop: Sendable {
         if let interrupted = error as? AgentTurnInterruptedError {
             return (interrupted.failureSource, interrupted.reason)
         }
-        if error is CancellationError, Task.isCancelled {
+        if IntatisCancellation.isCurrentTaskCancellation(error) {
             return (.turnCancelled, "Turn cancelled")
         }
         return nil
@@ -760,7 +762,7 @@ public struct AgentLoop: Sendable {
         for error: Error,
         submissionID: SubmissionID? = nil
     ) -> ErrorPayload {
-        if error is CancellationError {
+        if IntatisCancellation.isCancellationSignal(error) {
             return ErrorPayload(
                 code: "runtime_failed",
                 message: "The provider or runtime ended with an unexpected cancellation signal.",

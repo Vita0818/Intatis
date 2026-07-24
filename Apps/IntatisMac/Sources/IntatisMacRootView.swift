@@ -19,9 +19,9 @@ enum IntatisNavItem: String, CaseIterable, Identifiable, Hashable {
 
     var title: String {
         switch self {
-        case .chat: return "Chat"
-        case .code: return "Code"
-        case .cowork: return "Cowork"
+        case .chat: return IntatisLocalization.string("Chat")
+        case .code: return IntatisLocalization.string("Code")
+        case .cowork: return IntatisLocalization.string("Cowork")
         }
     }
 
@@ -43,17 +43,17 @@ enum IntatisNavItem: String, CaseIterable, Identifiable, Hashable {
 
     var newSessionTitle: String {
         switch self {
-        case .chat: return "New chat"
-        case .code: return "New code session"
-        case .cowork: return "New cowork session"
+        case .chat: return IntatisLocalization.string("New chat")
+        case .code: return IntatisLocalization.string("New code session")
+        case .cowork: return IntatisLocalization.string("New cowork session")
         }
     }
 
     var emptyHistoryTitle: String {
         switch self {
-        case .chat: return "No chat sessions yet."
-        case .code: return "No code sessions yet."
-        case .cowork: return "No cowork sessions yet."
+        case .chat: return IntatisLocalization.string("No chat sessions yet.")
+        case .code: return IntatisLocalization.string("No code sessions yet.")
+        case .cowork: return IntatisLocalization.string("No cowork sessions yet.")
         }
     }
 }
@@ -78,15 +78,21 @@ struct IntatisMacRootView: View {
     @State private var recentCoworkSessions: [AppSessionSummary] = []
     @State private var codeVM: CodeViewModel?
     @State private var coworkVM: CoworkViewModel?
+    @State private var showsCodeInspector = true
+    @State private var showsCoworkInspector = true
     @State private var coworkTransitionID: UUID?
     @State private var codeSessionError: String?
     @State private var coworkSessionError: String?
     @State private var renameTarget: SessionActionTarget?
     @State private var deleteTarget: SessionActionTarget?
     @State private var sessionActionError: String?
+    @State private var runtimeStatuses: [
+        AppSessionRuntimeKey: AppSessionRuntimePresentationStatus
+    ]
 
     init(runtimeManager: AppSessionRuntimeManager) {
         _runtimeManager = ObservedObject(wrappedValue: runtimeManager)
+        _runtimeStatuses = State(initialValue: runtimeManager.runtimeStatusSnapshot())
     }
 
     private var items: [IntatisNavItem] {
@@ -106,7 +112,7 @@ struct IntatisMacRootView: View {
                 selection: $selection,
                 isSettings: $isSettings,
                 historyItems: historyItems,
-                historyTitle: "\(selection.title) Sessions",
+                historyTitle: IntatisLocalization.string("Recent"),
                 emptyHistoryTitle: selection.emptyHistoryTitle,
                 newSessionTitle: selection.newSessionTitle,
                 isNewDisabled: newSessionDisabled,
@@ -138,6 +144,16 @@ struct IntatisMacRootView: View {
         .onReceive(runtimeManager.sessionDisplayNameChanged) { change in
             handleSessionDisplayNameChange(change)
         }
+        .onReceive(runtimeManager.sessionActivitySettled) { settlement in
+            refreshSessions(kind: settlement.key.kind)
+        }
+        .onReceive(runtimeManager.sessionRuntimeStatusChanged) { change in
+            if let status = change.status {
+                runtimeStatuses[change.key] = status
+            } else {
+                runtimeStatuses.removeValue(forKey: change.key)
+            }
+        }
         .sheet(item: $renameTarget) { target in
             SessionRenameSheet(initialName: target.title) { newName in
                 try await renameSession(target, to: newName)
@@ -149,12 +165,14 @@ struct IntatisMacRootView: View {
                 deleteSession(target)
             }
         } message: { target in
-            Text("\"\(target.title)\" and its Intatis event history and artifacts will be permanently deleted. Files in the linked workspace will not be changed.")
+            Text(IntatisLocalization.format(
+                "\"%@\" and its Intatis event history and artifacts will be permanently deleted. Files in the linked workspace will not be changed.",
+                target.title))
         }
         .alert("Session Action Failed", isPresented: sessionErrorPresented) {
             Button("OK", role: .cancel) {}
         } message: {
-            Text(sessionActionError ?? "The session action failed.")
+            Text(sessionActionError ?? IntatisLocalization.string("The session action failed."))
         }
     }
 
@@ -164,7 +182,11 @@ struct IntatisMacRootView: View {
         } else {
             switch selection {
             case .chat:
-                IntatisChatScreen(env: env)
+                IntatisChatScreen(
+                    env: env,
+                    sessionTitle: sessionTitle(
+                        kind: .chat,
+                        sessionID: env.chatSessionID))
             case .code:
                 codeDetail
             case .cowork:
@@ -175,22 +197,28 @@ struct IntatisMacRootView: View {
 
     @ViewBuilder private var codeDetail: some View {
         if let vm = codeVM {
+            let presentationScope = IntatisThreadPresentationScope(
+                kind: .code,
+                sessionID: vm.sessionID)
             CodeSessionView(
                 vm: vm,
+                sessionTitle: sessionTitle(kind: .code, sessionID: vm.sessionID),
                 catalog: env.providerCatalog,
                 onSelectModel: env.selectProviderModel(providerID:modelID:variantID:),
                 onShowSessions: showCodeSessions,
-                onNewSession: startNewCodeSession)
+                onNewSession: startNewCodeSession,
+                showsInspector: $showsCodeInspector)
+                .id(presentationScope)
         } else {
             WorkspaceSessionHome(
-                title: "Code",
-                subtitle: "Local workspace agent session",
+                title: IntatisLocalization.string("Code"),
+                subtitle: IntatisLocalization.string("Local workspace agent session"),
                 icon: "folder.badge.plus",
-                primaryTitle: "Choose Workspace",
+                primaryTitle: IntatisLocalization.string("Choose Workspace"),
                 primarySystemImage: "folder",
                 primaryShortcut: "o",
                 error: codeSessionError,
-                sessionsTitle: "Recent Code Sessions",
+                sessionsTitle: IntatisLocalization.string("Recent Code Sessions"),
                 sessions: [],
                 workspacePath: { WorkspaceAccess.workspacePath(for: $0) },
                 onPrimary: startNewCodeSession,
@@ -200,22 +228,28 @@ struct IntatisMacRootView: View {
 
     @ViewBuilder private var coworkDetail: some View {
         if let vm = coworkVM {
+            let presentationScope = IntatisThreadPresentationScope(
+                kind: .cowork,
+                sessionID: vm.sessionID)
             CoworkSessionView(
                 vm: vm,
+                sessionTitle: sessionTitle(kind: .cowork, sessionID: vm.sessionID),
                 catalog: env.providerCatalog,
                 onShowSessions: showCoworkSessions,
                 onNewSession: startNewCoworkSession,
-                onSessionDidBecomeReady: refreshCoworkSessions)
+                onSessionDidBecomeReady: refreshCoworkSessions,
+                showsInspector: $showsCoworkInspector)
+                .id(presentationScope)
         } else {
             WorkspaceSessionHome(
-                title: "Cowork",
-                subtitle: "Multi-agent workspace session",
+                title: IntatisLocalization.string("Cowork"),
+                subtitle: IntatisLocalization.string("Multi-agent workspace session"),
                 icon: "person.2",
-                primaryTitle: "New Cowork Session",
+                primaryTitle: IntatisLocalization.string("New Cowork Session"),
                 primarySystemImage: "plus",
                 primaryShortcut: "n",
                 error: coworkSessionError,
-                sessionsTitle: "Recent Cowork Sessions",
+                sessionsTitle: IntatisLocalization.string("Recent Cowork Sessions"),
                 sessions: [],
                 workspacePath: { _ in String?.none },
                 onPrimary: startNewCoworkSession,
@@ -263,14 +297,19 @@ struct IntatisMacRootView: View {
     }
 
     private func isDeleteDisabled(_ session: AppSessionSummary) -> Bool {
-        env.runtimeManager.isBusy(kind: session.kind, sessionID: session.id)
+        guard runtimeManager.state == .running else { return true }
+        let key = AppSessionRuntimeKey(kind: session.kind, sessionID: session.id)
+        return runtimeStatuses[key]?.blocksDeletion == true
+            || runtimeManager.isBusy(kind: session.kind, sessionID: session.id)
     }
 
     private func sessionDetail(_ session: AppSessionSummary) -> String {
         let timestamp = session.updatedAt == .distantPast
-            ? "Unknown date"
+            ? IntatisLocalization.string("Unknown date")
             : session.updatedAt.formatted(date: .abbreviated, time: .shortened)
-        let count = session.eventCount == 1 ? "1 event" : "\(session.eventCount) events"
+        let count = session.eventCount == 1
+            ? IntatisLocalization.string("1 event")
+            : IntatisLocalization.format("%lld events", Int64(session.eventCount))
         let workspace: String
         switch selection {
         case .code:
@@ -280,9 +319,16 @@ struct IntatisMacRootView: View {
         case .chat:
             workspace = ""
         }
-        let runtimeState = env.runtimeManager.statusLabel(
-            kind: session.kind,
-            sessionID: session.id).map { " · \($0)" } ?? ""
+        let key = AppSessionRuntimeKey(kind: session.kind, sessionID: session.id)
+        let runtimeLabel: String?
+        if runtimeManager.state != .running, runtimeStatuses[key] != nil {
+            runtimeLabel = "Stopping"
+        } else {
+            runtimeLabel = runtimeStatuses[key]?.label
+        }
+        let runtimeState = runtimeLabel.map {
+                " · \(IntatisLocalization.string($0))"
+            } ?? ""
         return "\(count) · \(timestamp)\(workspace)\(runtimeState)"
     }
 
@@ -302,6 +348,17 @@ struct IntatisMacRootView: View {
 
     private func refreshCoworkSessions() {
         recentCoworkSessions = env.recentCoworkSessions()
+    }
+
+    private func refreshSessions(kind: SessionKind) {
+        switch kind {
+        case .chat:
+            refreshChatSessions()
+        case .code:
+            refreshCodeSessions()
+        case .cowork:
+            refreshCoworkSessions()
+        }
     }
 
     private func handleRemovedRuntime(_ key: AppSessionRuntimeKey) {
@@ -435,6 +492,13 @@ struct IntatisMacRootView: View {
         }
     }
 
+    private func sessionTitle(kind: SessionKind, sessionID: SessionID) -> String {
+        sessions(for: kind)
+            .first(where: { $0.id == sessionID })
+            .flatMap(\.displayName)
+            ?? sessionID.rawValue
+    }
+
     private func renameSession(_ target: SessionActionTarget, to newName: String) async throws {
         let log = try EventLog(
             session: target.sessionID,
@@ -467,30 +531,28 @@ struct IntatisMacRootView: View {
                 case .chat:
                     try await env.deleteChatSession(target.sessionID)
                 case .code:
-                    try await env.runtimeManager.removeRuntime(
+                    try await env.runtimeManager.removeSession(
                         kind: .code,
                         sessionID: target.sessionID,
-                        reason: "Code session deleted by user")
-                    if codeVM?.sessionID == target.sessionID {
-                        codeVM = nil
+                        reason: "Code session deleted by user"
+                    ) {
+                        try SessionHistoryStore.deleteSession(
+                            root: AppConfig.appSupportDir(),
+                            session: target.sessionID)
+                        WorkspaceAccess.forget(session: target.sessionID)
                     }
-                    try SessionHistoryStore.deleteSession(
-                        root: AppConfig.appSupportDir(),
-                        session: target.sessionID)
-                    WorkspaceAccess.forget(session: target.sessionID)
                 case .cowork:
-                    try await env.runtimeManager.removeRuntime(
+                    try await env.runtimeManager.removeSession(
                         kind: .cowork,
                         sessionID: target.sessionID,
-                        reason: "Cowork session deleted by user")
-                    if coworkVM?.sessionID == target.sessionID {
-                        coworkVM = nil
+                        reason: "Cowork session deleted by user"
+                    ) {
+                        try SessionHistoryStore.deleteSession(
+                            root: AppConfig.appSupportDir(),
+                            session: target.sessionID)
+                        CoworkProjectSettingsStore.remove(sessionID: target.sessionID)
+                        WorkspaceAccess.forget(session: target.sessionID)
                     }
-                    try SessionHistoryStore.deleteSession(
-                        root: AppConfig.appSupportDir(),
-                        session: target.sessionID)
-                    CoworkProjectSettingsStore.remove(sessionID: target.sessionID)
-                    WorkspaceAccess.forget(session: target.sessionID)
                 }
                 refreshAllSessions()
             } catch {
@@ -508,7 +570,9 @@ struct IntatisMacRootView: View {
             codeSessionError = nil
             refreshCodeSessions()
         } catch {
-            codeSessionError = "Could not start Code session: \(error.localizedDescription)"
+            codeSessionError = IntatisLocalization.format(
+                "Could not start Code session: %@",
+                error.localizedDescription)
         }
     }
 
@@ -524,8 +588,10 @@ struct IntatisMacRootView: View {
                 workspace = restored
             } else {
                 guard let expectedPath = try WorkspaceAccess.workspacePathChecked(for: sessionID),
-                      let selected = WorkspaceAccess.choose(prompt: "Reauthorize Code Workspace") else {
-                    codeSessionError = "The original Code workspace identity is unavailable; this session was not rebound."
+                      let selected = WorkspaceAccess.choose(
+                        prompt: IntatisLocalization.string("Reauthorize Code Workspace")) else {
+                    codeSessionError = IntatisLocalization.string(
+                        "The original Code workspace identity is unavailable; this session was not rebound.")
                     return
                 }
                 let expected = URL(fileURLWithPath: expectedPath)
@@ -533,13 +599,17 @@ struct IntatisMacRootView: View {
                     .resolvingSymlinksInPath()
                 guard selected.canonicalURL == expected else {
                     selected.release()
-                    codeSessionError = "Choose the original Code workspace at \(expectedPath)."
+                    codeSessionError = IntatisLocalization.format(
+                        "Choose the original Code workspace at %@.",
+                        expectedPath)
                     return
                 }
                 workspace = selected
             }
         } catch {
-            codeSessionError = "Code workspace access could not be read safely: \(error.localizedDescription)"
+            codeSessionError = IntatisLocalization.format(
+                "Code workspace access could not be read safely: %@",
+                error.localizedDescription)
             return
         }
         selection = .code
@@ -549,12 +619,15 @@ struct IntatisMacRootView: View {
             codeSessionError = nil
             refreshCodeSessions()
         } catch {
-            codeSessionError = "Could not resume Code session: \(error.localizedDescription)"
+            codeSessionError = IntatisLocalization.format(
+                "Could not resume Code session: %@",
+                error.localizedDescription)
         }
     }
 
     private func startNewCoworkSession() {
-        guard let workspace = WorkspaceAccess.choose(prompt: "Choose Cowork Workspace") else { return }
+        guard let workspace = WorkspaceAccess.choose(
+            prompt: IntatisLocalization.string("Choose Cowork Workspace")) else { return }
         selection = .cowork
         isSettings = false
         let transitionID = UUID()
@@ -571,7 +644,9 @@ struct IntatisMacRootView: View {
                 coworkSessionError = nil
                 refreshCoworkSessions()
             } catch {
-                coworkSessionError = "Could not start Cowork session: \(error.localizedDescription)"
+                coworkSessionError = IntatisLocalization.format(
+                    "Could not start Cowork session: %@",
+                    error.localizedDescription)
             }
             if coworkTransitionID == transitionID {
                 coworkTransitionID = nil
@@ -599,7 +674,9 @@ struct IntatisMacRootView: View {
                 coworkSessionError = nil
                 refreshCoworkSessions()
             } catch {
-                coworkSessionError = "Could not resume Cowork session: \(error.localizedDescription)"
+                coworkSessionError = IntatisLocalization.format(
+                    "Could not resume Cowork session: %@",
+                    error.localizedDescription)
             }
             if coworkTransitionID == transitionID {
                 coworkTransitionID = nil
@@ -688,20 +765,6 @@ struct IntatisSidebar: View {
     let onDeleteSession: (SessionID) -> Void
     @Environment(\.colorScheme) private var scheme
 
-    private var modeTabs: [IntatisModeTab] {
-        items.map { IntatisModeTab(id: $0.rawValue, title: $0.title, systemImage: $0.icon) }
-    }
-
-    private var selectionID: Binding<String> {
-        Binding(
-            get: { selection.rawValue },
-            set: { raw in
-                guard let item = IntatisNavItem(rawValue: raw) else { return }
-                selection = item
-                isSettings = false
-            })
-    }
-
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             titleBlock
@@ -709,12 +772,10 @@ struct IntatisSidebar: View {
                 .padding(.top, 22)
                 .padding(.bottom, 12)
 
-            IntatisModeSegmentedControl(
-                tabs: modeTabs,
-                selectionID: selectionID,
-                style: .intatisMac(scheme))
+            modeNavigation
             .padding(.horizontal, 12)
             .padding(.bottom, 14)
+            .accessibilityIdentifier("sidebar.mode.selector")
 
             Divider().opacity(0.45)
                 .padding(.horizontal, 12)
@@ -741,6 +802,7 @@ struct IntatisSidebar: View {
             .padding(.horizontal, 12)
             .padding(.top, 12)
             .padding(.bottom, 14)
+            .accessibilityIdentifier("sidebar.settings")
         }
     }
 
@@ -749,12 +811,71 @@ struct IntatisSidebar: View {
             Text("Intatis")
                 .font(IntatisType.brand(28))
                 .foregroundStyle(IntatisTheme.deepText(scheme))
-            Text("Local AI workbench")
+            Text(IntatisLocalization.string("Local AI workbench"))
                 .font(IntatisType.caption(12, .semibold))
                 .foregroundStyle(IntatisTheme.softText(scheme))
                 .lineLimit(1)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var modeNavigation: some View {
+        VStack(spacing: 4) {
+            ForEach(items) { item in
+                let isSelected = selection == item && !isSettings
+                Button {
+                    selection = item
+                    isSettings = false
+                } label: {
+                    IntatisSidebarModeRow(
+                        title: item.title,
+                        systemImage: item.icon,
+                        selected: isSelected)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(item.title)
+                .accessibilityAddTraits(isSelected ? .isSelected : [])
+                .accessibilityIdentifier("sidebar.mode.\(item.rawValue)")
+            }
+        }
+    }
+}
+
+private struct IntatisSidebarModeRow: View {
+    let title: String
+    let systemImage: String
+    let selected: Bool
+    @Environment(\.colorScheme) private var scheme
+
+    var body: some View {
+        Group {
+            if selected {
+                content
+                    .intatisLiquidGlass(cornerRadius: 10, interactive: true)
+            } else {
+                content
+            }
+        }
+        .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    private var content: some View {
+        HStack(spacing: 10) {
+            Image(systemName: systemImage)
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(selected
+                    ? IntatisTheme.accent(scheme)
+                    : IntatisTheme.softText(scheme))
+                .frame(width: 22)
+            Text(title)
+                .font(IntatisType.body(14, selected ? .semibold : .medium))
+                .foregroundStyle(selected
+                    ? IntatisTheme.deepText(scheme)
+                    : IntatisTheme.softText(scheme))
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
     }
 }
 
@@ -769,7 +890,7 @@ private struct IntatisSidebarSettingsRow: View {
                 .font(.system(size: 13, weight: .medium))
                 .foregroundStyle(selected ? IntatisTheme.accent(scheme) : IntatisTheme.softText(scheme))
                 .frame(width: 20)
-            Text("Settings")
+            Text(IntatisLocalization.string("Settings"))
                 .font(IntatisType.body(13, selected ? .semibold : .medium))
                 .foregroundStyle(selected ? IntatisTheme.deepText(scheme) : IntatisTheme.softText(scheme))
             Spacer(minLength: 0)

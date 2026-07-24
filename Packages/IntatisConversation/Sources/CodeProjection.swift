@@ -33,6 +33,7 @@ public struct CodeItem: Identifiable, Equatable, Sendable {
     public var submissionStatus: SubmissionStatus?
     public var submissionAttempt: Int?
     public var submissionFailure: SubmissionFailure?
+    public var timestamp: Date?
 
     public init(id: String, kind: Kind, title: String, body: String,
                 presentationSource: PresentationSource = .conversation,
@@ -46,7 +47,8 @@ public struct CodeItem: Identifiable, Equatable, Sendable {
                 submissionID: SubmissionID? = nil,
                 submissionStatus: SubmissionStatus? = nil,
                 submissionAttempt: Int? = nil,
-                submissionFailure: SubmissionFailure? = nil) {
+                submissionFailure: SubmissionFailure? = nil,
+                timestamp: Date? = nil) {
         self.id = id
         self.kind = kind
         self.presentationSource = presentationSource
@@ -63,6 +65,7 @@ public struct CodeItem: Identifiable, Equatable, Sendable {
         self.submissionStatus = submissionStatus
         self.submissionAttempt = submissionAttempt
         self.submissionFailure = submissionFailure
+        self.timestamp = timestamp
     }
 }
 
@@ -226,21 +229,29 @@ public struct CodeProjection: Equatable, Sendable {
         case .messageDelta(let p):
             if let i = agentIndex(p.messageId.rawValue) {
                 items[i].body += p.textDelta
+                if items[i].timestamp == nil {
+                    items[i].timestamp = envelope.ts
+                }
             } else {
                 items.append(CodeItem(id: p.messageId.rawValue, kind: .agent,
                                       title: p.agent?.rawValue ?? "Agent", body: p.textDelta, complete: false,
-                                      submissionID: p.submissionID))
+                                      submissionID: p.submissionID,
+                                      timestamp: envelope.ts))
             }
 
         case .messageCompleted(let p):
             if let i = agentIndex(p.messageId.rawValue) {
                 items[i].body = p.text
                 items[i].complete = true
+                if items[i].timestamp == nil {
+                    items[i].timestamp = envelope.ts
+                }
                 recordCompletedMessage(at: i, from: p.agent)
             } else {
                 items.append(CodeItem(id: p.messageId.rawValue, kind: .agent,
                                       title: p.agent?.rawValue ?? "Agent", body: p.text,
-                                      submissionID: p.submissionID))
+                                      submissionID: p.submissionID,
+                                      timestamp: envelope.ts))
                 recordCompletedMessage(at: items.count - 1, from: p.agent)
             }
 
@@ -304,7 +315,8 @@ public struct CodeProjection: Equatable, Sendable {
             let title = p.from.flatMap { from in p.to.map { "\(from.rawValue) -> \($0.rawValue)" } }
                 ?? p.agent.rawValue
             items.append(CodeItem(id: p.messageId.rawValue, kind: .agent,
-                                  title: title, body: p.content))
+                                  title: title, body: p.content,
+                                  timestamp: envelope.ts))
 
         case .agentMessageConsumed, .agentMessageDiscarded:
             break
@@ -394,7 +406,8 @@ public struct CodeProjection: Equatable, Sendable {
                 : .conversation
             items.append(CodeItem(id: p.taskID.rawValue + ":completed", kind: .agent,
                                   title: p.agent.rawValue, body: p.result,
-                                  presentationSource: presentationSource))
+                                  presentationSource: presentationSource,
+                                  timestamp: envelope.ts))
             finishTaskTracking(taskID: p.taskID, agent: p.agent, attempt: p.attempt)
 
         case .taskFailed(let p):

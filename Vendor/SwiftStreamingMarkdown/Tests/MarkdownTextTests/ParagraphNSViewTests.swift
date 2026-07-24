@@ -11,6 +11,13 @@ import Testing
 @Suite("ParagraphNSView Measurement Tests")
 @MainActor
 struct ParagraphNSViewTests {
+  @Test("Uses TextKit 2 for live attachment view providers")
+  func usesTextKitTwo() {
+    let view = ParagraphNSView()
+
+    #expect(view.textLayoutManager != nil)
+    #expect(view.textContentStorage != nil)
+  }
 
   /// Regression: a paragraph is often measured before SwiftUI has given the view a frame
   /// (e.g. during a navigation transition). Measuring through the view's own text container

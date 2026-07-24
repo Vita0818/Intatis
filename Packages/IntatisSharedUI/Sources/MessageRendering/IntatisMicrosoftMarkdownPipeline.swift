@@ -2,6 +2,11 @@
 import Foundation
 import SwiftUI
 import SwiftStreamingMarkdown
+#if canImport(AppKit)
+import AppKit
+#elseif canImport(UIKit)
+import UIKit
+#endif
 
 enum IntatisMarkdownRendererLimits {
     /// A syntax-agnostic admission limit. Inputs above this size remain exact,
@@ -14,7 +19,36 @@ enum IntatisMarkdownRendererLimits {
     /// `Text` for every token can still monopolize the main actor. Keep the
     /// first/current/final source exact while bounding append-only projections.
     static let rawTextProjectionIntervalNanoseconds: UInt64 = 100_000_000
-    static let configurationRevision = 1
+    /// A process-scoped, non-persistent kill switch used by controlled
+    /// validation and emergency rollback. `plainSafe` remains the stronger
+    /// whole-renderer bypass.
+    static let disableSingleDollarMathLaunchArgument =
+        "-IntatisDisableSingleDollarMath"
+    static let mathMode = IntatisMarkdownMathMode.resolve(
+        arguments: ProcessInfo.processInfo.arguments)
+    static let configurationRevision =
+        mathMode == .singleDollarInline ? 2 : 3
+}
+
+enum IntatisMarkdownMathMode: String, Hashable, Sendable {
+    case disabled
+    case singleDollarInline
+
+    static func resolve(arguments: [String]) -> IntatisMarkdownMathMode {
+        arguments.contains(
+            IntatisMarkdownRendererLimits.disableSingleDollarMathLaunchArgument)
+            ? .disabled
+            : .singleDollarInline
+    }
+
+    var renderConfig: MathRenderConfig {
+        switch self {
+        case .disabled:
+            return .disabled
+        case .singleDollarInline:
+            return .singleDollarInline
+        }
+    }
 }
 
 enum IntatisMarkdownLinkPolicy {
@@ -30,6 +64,87 @@ enum IntatisMarkdownAppearanceRevision: String, Hashable, Sendable {
 
     init(_ colorScheme: ColorScheme) {
         self = colorScheme == .dark ? .dark : .light
+    }
+}
+
+/// A stable, request-local projection of SwiftUI's Dynamic Type environment.
+///
+/// The scale table follows the point-size progression of Apple's 17-point
+/// Body text style. Keeping the resolved category in request identity prevents
+/// a parse started under one content-size category from publishing after the
+/// user changes it. `.large` intentionally remains the existing 1.0 baseline.
+enum IntatisMarkdownTypographyRevision: String, Hashable, Sendable {
+    case extraSmall
+    case small
+    case medium
+    case large
+    case extraLarge
+    case extraExtraLarge
+    case extraExtraExtraLarge
+    case accessibility1
+    case accessibility2
+    case accessibility3
+    case accessibility4
+    case accessibility5
+
+    init(_ dynamicTypeSize: DynamicTypeSize) {
+        switch dynamicTypeSize {
+        case .xSmall:
+            self = .extraSmall
+        case .small:
+            self = .small
+        case .medium:
+            self = .medium
+        case .large:
+            self = .large
+        case .xLarge:
+            self = .extraLarge
+        case .xxLarge:
+            self = .extraExtraLarge
+        case .xxxLarge:
+            self = .extraExtraExtraLarge
+        case .accessibility1:
+            self = .accessibility1
+        case .accessibility2:
+            self = .accessibility2
+        case .accessibility3:
+            self = .accessibility3
+        case .accessibility4:
+            self = .accessibility4
+        case .accessibility5:
+            self = .accessibility5
+        @unknown default:
+            self = .large
+        }
+    }
+
+    var scale: CGFloat {
+        switch self {
+        case .extraSmall:
+            return 14.0 / 17.0
+        case .small:
+            return 15.0 / 17.0
+        case .medium:
+            return 16.0 / 17.0
+        case .large:
+            return 1
+        case .extraLarge:
+            return 19.0 / 17.0
+        case .extraExtraLarge:
+            return 21.0 / 17.0
+        case .extraExtraExtraLarge:
+            return 23.0 / 17.0
+        case .accessibility1:
+            return 28.0 / 17.0
+        case .accessibility2:
+            return 33.0 / 17.0
+        case .accessibility3:
+            return 40.0 / 17.0
+        case .accessibility4:
+            return 47.0 / 17.0
+        case .accessibility5:
+            return 53.0 / 17.0
+        }
     }
 }
 
@@ -72,7 +187,24 @@ struct IntatisMarkdownRenderRevision: Hashable, Sendable {
     let rawText: String
     let isComplete: Bool
     let appearance: IntatisMarkdownAppearanceRevision
+    let typography: IntatisMarkdownTypographyRevision
     let configurationRevision: Int
+
+    init(
+        messageID: String,
+        rawText: String,
+        isComplete: Bool,
+        appearance: IntatisMarkdownAppearanceRevision,
+        typography: IntatisMarkdownTypographyRevision = .large,
+        configurationRevision: Int
+    ) {
+        self.messageID = messageID
+        self.rawText = rawText
+        self.isComplete = isComplete
+        self.appearance = appearance
+        self.typography = typography
+        self.configurationRevision = configurationRevision
+    }
 
     var isAdmitted: Bool {
         !rawText.isEmpty
@@ -320,13 +452,15 @@ private enum IntatisMarkdownParseBridge {
     @concurrent
     static func parse(
         text: String,
-        style: IntatisMarkdownStyleSnapshot
+        style: IntatisMarkdownStyleSnapshot,
+        typography: IntatisMarkdownTypographyRevision
     ) async -> sending RenderableDocument {
         // The non-Sendable render configuration is born in this concurrent
         // task region and is consumed exactly once by the upstream `sending`
         // boundary. No main-actor alias crosses into parser work.
         let configuration = IntatisMicrosoftMarkdownRenderState.makeConfiguration(
-            style: style.threadStyle)
+            style: style.threadStyle,
+            typography: typography)
         return await MarkdownDocumentParser.parse(
             text: text,
             config: configuration)
@@ -450,7 +584,8 @@ final class IntatisMicrosoftMarkdownRenderState: ObservableObject {
 
         let document = await IntatisMarkdownParseBridge.parse(
             text: request.revision.rawText,
-            style: request.style)
+            style: request.style,
+            typography: request.revision.typography)
 
         let isStillCurrent = isCurrent(request, activationID: activationID)
             && !Task.isCancelled
@@ -466,7 +601,8 @@ final class IntatisMicrosoftMarkdownRenderState: ObservableObject {
         // This independent configuration is created only after the await and
         // stays MainActor-owned with the returned non-Sendable document.
         let displayConfiguration = Self.makeConfiguration(
-            style: request.style.threadStyle)
+            style: request.style.threadStyle,
+            typography: request.revision.typography)
         publishedDocument = PublishedDocument(
             request: request,
             document: document,
@@ -481,30 +617,32 @@ final class IntatisMicrosoftMarkdownRenderState: ObservableObject {
     }
 
     nonisolated static func makeConfiguration(
-        style: IntatisThreadStyle
+        style: IntatisThreadStyle,
+        typography: IntatisMarkdownTypographyRevision = .large
     ) -> MarkdownRenderConfig {
         let defaults = MarkdownRenderConfig.default
+        let scale = typography.scale
         return MarkdownRenderConfig(
             shouldAnimateText: false,
             blockQuoteStyle: .init(
-                textFonts: defaults.blockQuoteStyle.textFonts,
+                textFonts: defaults.blockQuoteStyle.textFonts.intatisScaled(by: scale),
                 textColor: style.secondaryText),
             headingStyle: .init(
-                h1Font: defaults.headingStyle.h1Font,
-                h2Font: defaults.headingStyle.h2Font,
-                h3Font: defaults.headingStyle.h3Font,
-                h4Font: defaults.headingStyle.h4Font,
-                h5Font: defaults.headingStyle.h5Font,
-                h6Font: defaults.headingStyle.h6Font,
+                h1Font: defaults.headingStyle.h1Font.intatisScaled(by: scale),
+                h2Font: defaults.headingStyle.h2Font.intatisScaled(by: scale),
+                h3Font: defaults.headingStyle.h3Font.intatisScaled(by: scale),
+                h4Font: defaults.headingStyle.h4Font.intatisScaled(by: scale),
+                h5Font: defaults.headingStyle.h5Font.intatisScaled(by: scale),
+                h6Font: defaults.headingStyle.h6Font.intatisScaled(by: scale),
                 textColor: style.primaryText),
             orderedListStyle: .init(
-                textFonts: defaults.orderedListStyle.textFonts,
+                textFonts: defaults.orderedListStyle.textFonts.intatisScaled(by: scale),
                 textColor: style.primaryText),
             paragraphStyle: .init(
-                textFonts: defaults.paragraphStyle.textFonts,
+                textFonts: defaults.paragraphStyle.textFonts.intatisScaled(by: scale),
                 textColor: style.primaryText),
             tableStyle: .init(
-                textFonts: defaults.tableStyle.textFonts,
+                textFonts: defaults.tableStyle.textFonts.intatisScaled(by: scale),
                 headerTextColor: style.primaryText,
                 regularTextColor: style.primaryText,
                 headerBackgroundColor: style.stroke.opacity(0.12),
@@ -512,9 +650,13 @@ final class IntatisMicrosoftMarkdownRenderState: ObservableObject {
                 actionButtonColor: style.secondaryText),
             inlineStyle: .init(
                 boldTextColor: style.primaryText,
-                linkTextFont: defaults.inlineStyle.linkTextFont,
+                linkTextFont: intatisScaledFont(
+                    defaults.inlineStyle.linkTextFont,
+                    by: scale),
                 linkTextColor: style.accent,
-                codeTextFont: defaults.inlineStyle.codeTextFont,
+                codeTextFont: intatisScaledFont(
+                    defaults.inlineStyle.codeTextFont,
+                    by: scale),
                 codeTextColor: style.primaryText,
                 codeBackgroundColor: style.stroke.opacity(0.18),
                 codeUnderlineColor: style.stroke),
@@ -526,7 +668,34 @@ final class IntatisMicrosoftMarkdownRenderState: ObservableObject {
             blockSpacing: 18,
             textSelectionConfig: .init(isEnabled: true, backgroundColor: nil),
             thematicBreakColor: style.stroke,
-            imageConfig: .disabled)
+            imageConfig: .disabled,
+            mathConfig: IntatisMarkdownRendererLimits.mathMode.renderConfig)
     }
+}
+
+private extension TextFonts {
+    func intatisScaled(by scale: CGFloat) -> TextFonts {
+        guard scale != 1 else { return self }
+        return TextFonts(
+            normal: intatisScaledFont(normal, by: scale),
+            italic: italic.map { intatisScaledFont($0, by: scale) },
+            bold: bold.map { intatisScaledFont($0, by: scale) },
+            boldItalic: boldItalic.map { intatisScaledFont($0, by: scale) },
+            preferredLetterSpacing: preferredLetterSpacing.map { $0 * scale },
+            preferredLineHeight: preferredLineHeight.map { $0 * scale })
+    }
+}
+
+private func intatisScaledFont(
+    _ font: MDFont,
+    by scale: CGFloat
+) -> MDFont {
+    guard scale != 1 else { return font }
+    let size = font.pointSize * scale
+#if canImport(AppKit)
+    return NSFont(descriptor: font.fontDescriptor, size: size) ?? font
+#elseif canImport(UIKit)
+    return UIFont(descriptor: font.fontDescriptor, size: size)
+#endif
 }
 #endif

@@ -3,6 +3,7 @@ import Foundation
 import IntatisCore
 import IntatisProtocol
 import IntatisProviders
+import IntatisConversation
 
 typealias AppSessionSummary = SessionSummary
 
@@ -454,7 +455,9 @@ enum AppConfig {
     }
 
     static func recentSessions(kind: SessionKind) -> [AppSessionSummary] {
-        SessionHistoryStore.recentSessions(root: appSupportDir(), kind: kind)
+        SessionActivityHistoryStore.recentSessions(
+            root: appSupportDir(),
+            kind: kind)
     }
 
     static func providerConfig() -> ProviderConfig {

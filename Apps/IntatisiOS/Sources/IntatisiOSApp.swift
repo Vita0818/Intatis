@@ -57,7 +57,9 @@ final class IOSAppEnvironment: ObservableObject {
         do {
             try switchChatSession(to: SessionID.new())
         } catch {
-            chatSessionError = "Could not start chat session: \(error.localizedDescription)"
+            chatSessionError = IntatisLocalization.format(
+                "Could not start chat session: %@",
+                error.localizedDescription)
         }
     }
 
@@ -65,7 +67,9 @@ final class IOSAppEnvironment: ObservableObject {
         do {
             try switchChatSession(to: session.id)
         } catch {
-            chatSessionError = "Could not resume chat session: \(error.localizedDescription)"
+            chatSessionError = IntatisLocalization.format(
+                "Could not resume chat session: %@",
+                error.localizedDescription)
         }
     }
 
@@ -210,6 +214,19 @@ struct IOSRootView: View {
                 refreshSessions()
                 if env.needsAPIKey { showSettings = true }
             }
+            .onReceive(
+                Publishers.CombineLatest(
+                    env.viewModel.$isStreaming,
+                    env.viewModel.$imageGenerationState)
+                    .map { isStreaming, generationState in
+                        isStreaming || generationState.isRunning
+                    }
+                    .removeDuplicates()
+            ) { isBusy in
+                if !isBusy {
+                    refreshSessions()
+                }
+            }
     }
 
     private var sessionHistoryMenu: some View {
@@ -268,7 +285,9 @@ struct IOSRootView: View {
         let formatter = DateFormatter()
         formatter.dateStyle = .short
         formatter.timeStyle = .short
-        let count = session.eventCount == 1 ? "1 event" : "\(session.eventCount) events"
+        let count = session.eventCount == 1
+            ? IntatisLocalization.string("1 event")
+            : IntatisLocalization.format("%lld events", Int64(session.eventCount))
         return "\(formatter.string(from: session.updatedAt)) · \(count)"
     }
 
@@ -331,7 +350,9 @@ struct IOSRootView: View {
                         Button {
                             testProvider()
                         } label: {
-                            Label(isTestingProvider ? "Testing Provider" : "Test Provider",
+                            Label(isTestingProvider
+                                    ? IntatisLocalization.string("Testing Provider")
+                                    : IntatisLocalization.string("Test Provider"),
                                   systemImage: isTestingProvider ? "hourglass" : "checkmark.seal")
                         }
                         .disabled(isTestingProvider)
@@ -340,13 +361,13 @@ struct IOSRootView: View {
                             ProgressView("Testing provider...")
                         } else if let report = providerHealthReport {
                             VStack(alignment: .leading, spacing: 4) {
-                                Label(report.displayTitle,
+                                Label(IntatisLocalization.string(report.displayTitle),
                                       systemImage: report.isOK ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
                                     .foregroundStyle(report.isOK ? .green : .red)
-                                Text(report.displaySummary)
+                                Text(IntatisLocalization.providerHealthSummary(report))
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
-                                Text(report.displayDetail)
+                                Text(IntatisLocalization.providerHealthDetail(report))
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
@@ -391,7 +412,9 @@ struct IOSRootView: View {
                             providerHealthReport = nil
                             showSettings = false
                         } catch {
-                            settingsError = "Could not save settings: \(error.localizedDescription)"
+                            settingsError = IntatisLocalization.format(
+                                "Could not save settings: %@",
+                                error.localizedDescription)
                         }
                     }
                 }
@@ -401,10 +424,15 @@ struct IOSRootView: View {
 
     private var messageRendererHelpText: String {
         if let launchOverride = IntatisMessageRendererMode.launchOverride() {
-            let label = launchOverride == .plainSafe ? "Plain text safe mode" : "Rich Markdown"
-            return "Current launch is forced to \(label). This picker is saved immediately for the next launch without an override; Cancel only discards provider edits."
+            let label = launchOverride == .plainSafe
+                ? IntatisLocalization.string("Plain text safe mode")
+                : IntatisLocalization.string("Rich Markdown")
+            return IntatisLocalization.format(
+                "Current launch is forced to %@. This picker is saved immediately for the next launch without an override; Cancel only discards provider edits.",
+                label)
         }
-        return "This choice is saved and applied immediately; Cancel only discards provider edits. Rich Markdown uses the audited upstream renderer with images, math typesetting, and syntax highlighting disabled for the first release. Plain text safe mode bypasses Markdown entirely without changing session data."
+        return IntatisLocalization.string(
+            "This choice is saved and applied immediately; Cancel only discards provider edits. Rich Markdown uses the audited upstream renderer with images, math typesetting, and syntax highlighting disabled for the first release. Plain text safe mode bypasses Markdown entirely without changing session data.")
     }
 
     private var rendererModeSelection: Binding<String> {
@@ -515,7 +543,9 @@ struct IOSRootView: View {
     }
 
     private func apiKeyPlaceholder(for provider: IOSProviderSettings) -> String {
-        env.hasAPIKey(for: provider) ? "••••••••••••••••" : "Enter API key"
+        env.hasAPIKey(for: provider)
+            ? "••••••••••••••••"
+            : IntatisLocalization.string("Enter API key")
     }
 
     private func testProvider() {
@@ -531,7 +561,9 @@ struct IOSRootView: View {
                 apiKeysByProviderID = [:]
                 providerHealthReport = await env.healthCheckSelectedProvider()
             } catch {
-                settingsError = "Could not test provider: \(error.localizedDescription)"
+                settingsError = IntatisLocalization.format(
+                    "Could not test provider: %@",
+                    error.localizedDescription)
             }
         }
     }

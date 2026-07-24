@@ -47,7 +47,8 @@ public struct IntatisThirdPartyNoticesView: View {
         }
 
         guard !documents.isEmpty else {
-            return "Third-party notices are missing from this build."
+            return IntatisLocalization.string(
+                "Third-party notices are missing from this build.")
         }
         return documents
             .map { "===== \($0.0) =====\n\n\($0.1)" }

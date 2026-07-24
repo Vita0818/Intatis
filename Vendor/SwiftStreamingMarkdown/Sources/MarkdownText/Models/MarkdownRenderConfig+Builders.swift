@@ -22,8 +22,10 @@ extension MarkdownRenderConfig {
       codeBlockConfig: codeBlockConfig,
       blockSpacing: blockSpacing,
       textSelectionConfig: textSelectionConfig,
-      thematicBreakColor: thematicBreakColor
-    )
+      thematicBreakColor: thematicBreakColor,
+      imageConfig: imageConfig,
+      mathConfig: mathConfig
+    ).withInlineMathCatalog(inlineMathCatalog)
   }
 
   /// Returns a copy with `blockQuoteStyle` replaced.
@@ -41,8 +43,10 @@ extension MarkdownRenderConfig {
       codeBlockConfig: codeBlockConfig,
       blockSpacing: blockSpacing,
       textSelectionConfig: textSelectionConfig,
-      thematicBreakColor: thematicBreakColor
-    )
+      thematicBreakColor: thematicBreakColor,
+      imageConfig: imageConfig,
+      mathConfig: mathConfig
+    ).withInlineMathCatalog(inlineMathCatalog)
   }
 
   /// Returns a copy with `headingStyle` replaced.
@@ -60,8 +64,10 @@ extension MarkdownRenderConfig {
       codeBlockConfig: codeBlockConfig,
       blockSpacing: blockSpacing,
       textSelectionConfig: textSelectionConfig,
-      thematicBreakColor: thematicBreakColor
-    )
+      thematicBreakColor: thematicBreakColor,
+      imageConfig: imageConfig,
+      mathConfig: mathConfig
+    ).withInlineMathCatalog(inlineMathCatalog)
   }
 
   /// Returns a copy with `orderedListStyle` replaced.
@@ -79,8 +85,10 @@ extension MarkdownRenderConfig {
       codeBlockConfig: codeBlockConfig,
       blockSpacing: blockSpacing,
       textSelectionConfig: textSelectionConfig,
-      thematicBreakColor: thematicBreakColor
-    )
+      thematicBreakColor: thematicBreakColor,
+      imageConfig: imageConfig,
+      mathConfig: mathConfig
+    ).withInlineMathCatalog(inlineMathCatalog)
   }
 
   /// Returns a copy with `paragraphStyle` replaced.
@@ -98,8 +106,10 @@ extension MarkdownRenderConfig {
       codeBlockConfig: codeBlockConfig,
       blockSpacing: blockSpacing,
       textSelectionConfig: textSelectionConfig,
-      thematicBreakColor: thematicBreakColor
-    )
+      thematicBreakColor: thematicBreakColor,
+      imageConfig: imageConfig,
+      mathConfig: mathConfig
+    ).withInlineMathCatalog(inlineMathCatalog)
   }
 
   /// Returns a copy with `tableStyle` replaced.
@@ -117,8 +127,10 @@ extension MarkdownRenderConfig {
       codeBlockConfig: codeBlockConfig,
       blockSpacing: blockSpacing,
       textSelectionConfig: textSelectionConfig,
-      thematicBreakColor: thematicBreakColor
-    )
+      thematicBreakColor: thematicBreakColor,
+      imageConfig: imageConfig,
+      mathConfig: mathConfig
+    ).withInlineMathCatalog(inlineMathCatalog)
   }
 
   /// Returns a copy with `inlineStyle` replaced.
@@ -136,8 +148,10 @@ extension MarkdownRenderConfig {
       codeBlockConfig: codeBlockConfig,
       blockSpacing: blockSpacing,
       textSelectionConfig: textSelectionConfig,
-      thematicBreakColor: thematicBreakColor
-    )
+      thematicBreakColor: thematicBreakColor,
+      imageConfig: imageConfig,
+      mathConfig: mathConfig
+    ).withInlineMathCatalog(inlineMathCatalog)
   }
 
   /// Returns a copy with `textContextMenu` replaced. Pass `nil` to remove the
@@ -156,8 +170,10 @@ extension MarkdownRenderConfig {
       codeBlockConfig: codeBlockConfig,
       blockSpacing: blockSpacing,
       textSelectionConfig: textSelectionConfig,
-      thematicBreakColor: thematicBreakColor
-    )
+      thematicBreakColor: thematicBreakColor,
+      imageConfig: imageConfig,
+      mathConfig: mathConfig
+    ).withInlineMathCatalog(inlineMathCatalog)
   }
 
   /// Returns a copy with `blockSpacing` replaced.
@@ -175,8 +191,10 @@ extension MarkdownRenderConfig {
       codeBlockConfig: codeBlockConfig,
       blockSpacing: value,
       textSelectionConfig: textSelectionConfig,
-      thematicBreakColor: thematicBreakColor
-    )
+      thematicBreakColor: thematicBreakColor,
+      imageConfig: imageConfig,
+      mathConfig: mathConfig
+    ).withInlineMathCatalog(inlineMathCatalog)
   }
 
   /// Returns a copy with `codeBlockConfig` replaced.
@@ -194,8 +212,10 @@ extension MarkdownRenderConfig {
       codeBlockConfig: value,
       blockSpacing: blockSpacing,
       textSelectionConfig: textSelectionConfig,
-      thematicBreakColor: thematicBreakColor
-    )
+      thematicBreakColor: thematicBreakColor,
+      imageConfig: imageConfig,
+      mathConfig: mathConfig
+    ).withInlineMathCatalog(inlineMathCatalog)
   }
 
   /// Returns a copy with `textSelectionConfig` replaced. Pass a config with
@@ -214,8 +234,10 @@ extension MarkdownRenderConfig {
       codeBlockConfig: codeBlockConfig,
       blockSpacing: blockSpacing,
       textSelectionConfig: value,
-      thematicBreakColor: thematicBreakColor
-    )
+      thematicBreakColor: thematicBreakColor,
+      imageConfig: imageConfig,
+      mathConfig: mathConfig
+    ).withInlineMathCatalog(inlineMathCatalog)
   }
 
   /// Returns a copy with `thematicBreakColor` replaced.
@@ -233,8 +255,10 @@ extension MarkdownRenderConfig {
       codeBlockConfig: codeBlockConfig,
       blockSpacing: blockSpacing,
       textSelectionConfig: textSelectionConfig,
-      thematicBreakColor: value
-    )
+      thematicBreakColor: value,
+      imageConfig: imageConfig,
+      mathConfig: mathConfig
+    ).withInlineMathCatalog(inlineMathCatalog)
   }
 
   /// Returns a copy with `imageConfig` replaced. Image support is experimental.
@@ -253,7 +277,29 @@ extension MarkdownRenderConfig {
       blockSpacing: blockSpacing,
       textSelectionConfig: textSelectionConfig,
       thematicBreakColor: thematicBreakColor,
-      imageConfig: value
-    )
+      imageConfig: value,
+      mathConfig: mathConfig
+    ).withInlineMathCatalog(inlineMathCatalog)
+  }
+
+  /// Returns a copy with `mathConfig` replaced.
+  public func withMathConfig(_ value: MathRenderConfig) -> MarkdownRenderConfig {
+    MarkdownRenderConfig(
+      shouldAnimateText: shouldAnimateText,
+      blockQuoteStyle: blockQuoteStyle,
+      headingStyle: headingStyle,
+      orderedListStyle: orderedListStyle,
+      paragraphStyle: paragraphStyle,
+      tableStyle: tableStyle,
+      inlineStyle: inlineStyle,
+      textContextMenu: textContextMenu,
+      citationConfig: citationConfig,
+      codeBlockConfig: codeBlockConfig,
+      blockSpacing: blockSpacing,
+      textSelectionConfig: textSelectionConfig,
+      thematicBreakColor: thematicBreakColor,
+      imageConfig: imageConfig,
+      mathConfig: value
+    ).withInlineMathCatalog(inlineMathCatalog)
   }
 }

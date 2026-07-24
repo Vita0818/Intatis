@@ -175,11 +175,15 @@ enum CoworkProjectSettingsStore {
                 legacyWarning = nil
             } catch {
                 fallback = recoveredSettings(sessionID: sessionID, document: nil)
-                legacyWarning = " Legacy settings were retained but could not be decoded safely: \(error.localizedDescription)"
+                legacyWarning = " " + IntatisLocalization.format(
+                    "Legacy settings were retained but could not be decoded safely: %@",
+                    error.localizedDescription)
             }
             return LoadResult(
                 settings: fallback,
-                warning: "Session settings projection could not be rebuilt: \(error.localizedDescription)\(legacyWarning ?? "")",
+                warning: IntatisLocalization.format(
+                    "Session settings projection could not be rebuilt: %@",
+                    error.localizedDescription) + (legacyWarning ?? ""),
                 legacySettingsCleanupEligible: false)
         }
         if let canonical = document.coworkSettings {
@@ -475,10 +479,12 @@ struct CoworkProjectSettingsSheet: View {
                         Label("Add Directory", systemImage: "folder.badge.plus")
                     }
                     .buttonStyle(.borderless)
-                    .disabled(vm.isWorking)
+                    .disabled(vm.isRuntimeMutationBlocked)
                 }
                 workspaceList
             }
+
+            recoveryActionsSection
 
             if let settingsError {
                 Text(settingsError)
@@ -526,7 +532,8 @@ struct CoworkProjectSettingsSheet: View {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("@\(agent.name)")
                                 .font(.caption.bold())
-                            Text(agent.inferenceDisplayLabel ?? "Inference profile unavailable")
+                            Text(agent.inferenceDisplayLabel
+                                ?? IntatisLocalization.string("Inference profile unavailable"))
                                 .font(.caption2)
                                 .foregroundStyle(agent.inferenceResolution.requiresAttention
                                     ? IntatisTheme.accent(scheme)
@@ -548,7 +555,7 @@ struct CoworkProjectSettingsSheet: View {
                         }
                         .menuStyle(.borderlessButton)
                         .fixedSize()
-                        .disabled(vm.isWorking || inferenceProfileOptions.isEmpty)
+                        .disabled(vm.isRuntimeMutationBlocked || inferenceProfileOptions.isEmpty)
                         .accessibilityIdentifier("cowork.agent.\(agent.id).rebind")
                     }
                     .padding(8)
@@ -557,6 +564,38 @@ struct CoworkProjectSettingsSheet: View {
                             .stroke(IntatisTheme.separator(scheme), lineWidth: 1)
                     }
                 }
+            }
+        }
+    }
+
+    @ViewBuilder private var recoveryActionsSection: some View {
+        if vm.needsPrimaryWorkspaceAuthorization || vm.permissionReviewerStatus.canRetry {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Recovery")
+                    .font(.caption.bold())
+                    .foregroundStyle(.secondary)
+                HStack(spacing: 10) {
+                    if vm.needsPrimaryWorkspaceAuthorization {
+                        Button("Reauthorize Workspace") {
+                            dismiss()
+                            DispatchQueue.main.async {
+                                vm.reauthorizePrimaryWorkspace()
+                            }
+                        }
+                        .accessibilityIdentifier("cowork.workspace.reauthorize")
+                    }
+                    if vm.permissionReviewerStatus.canRetry {
+                        Button("Retry Automatic Review") {
+                            vm.retryAutomaticPermissionReview()
+                        }
+                        .accessibilityIdentifier("cowork.permission-reviewer.retry")
+                    }
+                }
+            }
+            .padding(12)
+            .overlay {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(IntatisTheme.separator(scheme), lineWidth: 1)
             }
         }
     }
@@ -624,7 +663,7 @@ struct CoworkProjectSettingsSheet: View {
     private func formRow<Content: View>(_ title: String,
                                         @ViewBuilder content: () -> Content) -> some View {
         HStack(alignment: .center, spacing: 12) {
-            Text(title)
+            Text(IntatisLocalization.string(title))
                 .font(.caption.bold())
                 .foregroundStyle(.secondary)
                 .frame(width: 210, alignment: .leading)
@@ -669,8 +708,12 @@ struct CoworkProjectSettingsSheet: View {
                             Image(systemName: "trash")
                         }
                         .buttonStyle(.borderless)
-                        .disabled(!workspace.canRemove || vm.isWorking)
-                        .help(workspace.canRemove ? "Remove workspace" : "Primary workspace is kept with @\(draft.mainAgentName)")
+                        .disabled(!workspace.canRemove || vm.isRuntimeMutationBlocked)
+                        .help(workspace.canRemove
+                            ? IntatisLocalization.string("Remove workspace")
+                            : IntatisLocalization.format(
+                                "Primary workspace is kept with @%@",
+                                draft.mainAgentName))
                     }
                     .padding(8)
                     .overlay {
@@ -715,7 +758,7 @@ struct CoworkProjectSettingsSheet: View {
         guard let binding = draft.defaultInferenceProfileBinding else { return nil }
         return (
             bindingSelectionKey(binding),
-            "Saved inference profile (retained revision)")
+            IntatisLocalization.string("Saved inference profile (retained revision)"))
     }
 
     private func bindingSelectionKey(_ binding: AgentInferenceBinding) -> String {
@@ -760,10 +803,10 @@ struct CoworkProjectSettingsSheet: View {
 
     private var permissionOptions: [(rawValue: String, title: String)] {
         [
-            (PermissionProfile.reviewed.rawValue, "Reviewed"),
-            (PermissionProfile.manual.rawValue, "Manual"),
-            (PermissionProfile.readOnly.rawValue, "Read only"),
-            (PermissionProfile.locked.rawValue, "Locked"),
+            (PermissionProfile.reviewed.rawValue, IntatisLocalization.string("Reviewed")),
+            (PermissionProfile.manual.rawValue, IntatisLocalization.string("Manual")),
+            (PermissionProfile.readOnly.rawValue, IntatisLocalization.string("Read only")),
+            (PermissionProfile.locked.rawValue, IntatisLocalization.string("Locked")),
         ]
     }
 
@@ -787,7 +830,8 @@ struct CoworkProjectSettingsSheet: View {
         } else if let value = Int(trimmed), value > 0 {
             draft.tokenBudget = value
         } else {
-            settingsError = "Soft token budget must be empty or a positive integer."
+            settingsError = IntatisLocalization.string(
+                "Soft token budget must be empty or a positive integer.")
             return
         }
         settingsError = nil
@@ -798,7 +842,8 @@ struct CoworkProjectSettingsSheet: View {
             if saved {
                 dismiss()
             } else {
-                settingsError = vm.composerError ?? "Session settings could not be saved."
+                settingsError = vm.composerError
+                    ?? IntatisLocalization.string("Session settings could not be saved.")
             }
         }
     }

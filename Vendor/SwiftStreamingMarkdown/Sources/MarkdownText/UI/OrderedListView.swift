@@ -25,7 +25,11 @@ struct OrderedListView: View {
               ListItemContentWrapper(paragraphContents: contents) {
                 SingleBlockView(renderable: firstChild)
               }
-              .accessibilityLabel(Text(markdownListAccessibilityLabel(for: contents.string, at: idx, length: items.count)))
+              .accessibilityLabel(Text(markdownListAccessibilityLabel(
+                for: contents.accessibilityTextDescribingAttachments,
+                at: idx,
+                length: items.count
+              )))
             } else {
               SingleBlockView(renderable: firstChild)
             }
@@ -66,6 +70,9 @@ struct ListItemContentWrapper<Content: View>: View {
     if let citation = firstCharacterCitationAttachment(in: paragraphContents) {
       return citation.font
     }
+    if let math = firstCharacterMathAttachment(in: paragraphContents) {
+      return math.font
+    }
     // Otherwise, look for regular font attributes
     if let font = firstFont(in: paragraphContents) {
       return font
@@ -76,6 +83,11 @@ struct ListItemContentWrapper<Content: View>: View {
   private func firstCharacterCitationAttachment(in attributedString: NSAttributedString) -> InlineCitationAttachment? {
     guard attributedString.length > 0 else { return nil }
     return attributedString.attribute(.attachment, at: 0, effectiveRange: nil) as? InlineCitationAttachment
+  }
+
+  private func firstCharacterMathAttachment(in attributedString: NSAttributedString) -> InlineMathAttachment? {
+    guard attributedString.length > 0 else { return nil }
+    return attributedString.attribute(.attachment, at: 0, effectiveRange: nil) as? InlineMathAttachment
   }
 
   private func firstFont(in attributedString: NSAttributedString) -> MDFont? {
@@ -99,6 +111,38 @@ struct ListItemContentWrapper<Content: View>: View {
 
 func markdownListAccessibilityLabel(for item: String, at index: Int, length: Int) -> String {
   "\(String.markdownList(length: String(length))), item \(index + 1): \(item)"
+}
+
+extension NSAttributedString {
+  /// Accessibility text keeps the surrounding prose while expanding inline
+  /// attachments into the same spoken descriptions used by paragraph views.
+  var accessibilityTextDescribingAttachments: String {
+    guard length > 0 else { return "" }
+    let mutable = NSMutableAttributedString(attributedString: self)
+    var replacements: [(NSRange, String)] = []
+    enumerateAttribute(
+      .attachment,
+      in: NSRange(location: 0, length: length),
+      options: []
+    ) { value, range, _ in
+      if let attachment = value as? InlineMathAttachment {
+        replacements.append((
+          range,
+          String.localizedStringWithFormat(
+            String.mathFormulaAccessibilityFormat,
+            attachment.mathData.source
+          )
+        ))
+      } else if let attachment = value as? InlineCitationAttachment,
+                let citationData = attachment.citationData {
+        replacements.append((range, citationData.accessibilityLabel))
+      }
+    }
+    for (range, description) in replacements.reversed() {
+      mutable.replaceCharacters(in: range, with: description)
+    }
+    return mutable.string
+  }
 }
 
 #Preview(body: {

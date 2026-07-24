@@ -10,6 +10,12 @@ import SwiftUI
 extension Markdown.Text: InlineConvertible {
 
   func convert(attributeContainer: NSAttributeContainer, config: MarkdownRenderConfig) -> NSMutableAttributedString {
+    if let resolved = config.inlineMathCatalog?.attributedString(
+      replacingTokensIn: self.string,
+      attributes: attributeContainer
+    ) {
+      return resolved
+    }
     return NSMutableAttributedString(string: self.string).mergingAttributes(attributeContainer)
   }
 }

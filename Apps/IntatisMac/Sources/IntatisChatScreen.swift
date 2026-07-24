@@ -57,9 +57,13 @@ struct IntatisMacScreenLayout {
 
 struct IntatisChatScreen: View {
     @ObservedObject var env: AppEnvironment
+    let sessionTitle: String
 
     var body: some View {
-        IntatisChatSessionScreen(env: env, model: env.viewModel)
+        IntatisChatSessionScreen(
+            env: env,
+            model: env.viewModel,
+            sessionTitle: sessionTitle)
             .id(env.chatSessionID.rawValue)
     }
 }
@@ -67,6 +71,7 @@ struct IntatisChatScreen: View {
 private struct IntatisChatSessionScreen: View {
     @ObservedObject var env: AppEnvironment
     @ObservedObject var model: ChatViewModel
+    let sessionTitle: String
     @Environment(\.colorScheme) private var scheme
     private static let bottomAnchorID = "intatis-chat-thread-bottom"
 
@@ -103,7 +108,7 @@ private struct IntatisChatSessionScreen: View {
     }
 
     private func header(layout: IntatisMacScreenLayout) -> some View {
-        IntatisPageHeader(title: "Chat", subtitle: subtitle)
+        IntatisPageHeader(title: sessionTitle, subtitle: subtitle)
         .padding(.horizontal, layout.horizontalPadding)
         .padding(.top, 24)
         .padding(.bottom, 10)
@@ -146,6 +151,7 @@ private struct IntatisChatSessionScreen: View {
                         }
                         if model.isStreaming, model.messages.last?.role == .user {
                             thinkingRow(layout: layout)
+                                .id("intatis-chat-thinking-\(chatThinkingPhaseID)")
                         }
                         Color.clear
                             .frame(height: 1)
@@ -179,6 +185,13 @@ private struct IntatisChatSessionScreen: View {
         ].joined(separator: ":")
     }
 
+    private var chatThinkingPhaseID: String {
+        [
+            env.chatSessionID.rawValue,
+            model.messages.last?.id.rawValue ?? "initial"
+        ].joined(separator: ":")
+    }
+
     private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool = true) {
         DispatchQueue.main.async {
             if animated {
@@ -206,12 +219,13 @@ private struct IntatisChatSessionScreen: View {
 
     private func thinkingRow(layout: IntatisMacScreenLayout) -> some View {
         IntatisThreadBubbleRow(isTrailing: false,
+                               fillsAvailableWidth: true,
                                rowWidth: layout.contentWidth,
                                maxWidth: layout.messageMaxWidth,
                                gutter: layout.messageGutter) {
             HStack(spacing: 8) {
                 ProgressView().controlSize(.small)
-                Text("Thinking…")
+                IntatisThinkingElapsedLabel(phaseID: chatThinkingPhaseID)
                     .font(IntatisType.caption(12))
                     .foregroundStyle(IntatisTheme.softText(scheme))
                 Spacer(minLength: 0)
@@ -225,11 +239,11 @@ struct IntatisChatModelMenu: View {
     let catalog: AppProviderCatalog
     let isBusy: Bool
     let isCompact: Bool
-    var help: String = "Switch model"
+    var usesGlassButton: Bool = true
+    var help: String = IntatisLocalization.string("Switch model")
     let onSelect: (String, String, String?) -> Void
     @Environment(\.colorScheme) private var scheme
 
-    private var selectedProvider: AppProviderSettings? { catalog.selectedProvider }
     private var selectedModel: AppProviderModel? { catalog.selectedModel }
     private var menuProviders: [ProviderModelMenuProvider] {
         catalog.providers.map { provider in
@@ -256,7 +270,17 @@ struct IntatisChatModelMenu: View {
         }
     }
 
-    var body: some View {
+    @ViewBuilder var body: some View {
+        if usesGlassButton {
+            selectionMenu
+                .intatisComposerSelectionMenu()
+        } else {
+            selectionMenu
+                .buttonStyle(.borderless)
+        }
+    }
+
+    private var selectionMenu: some View {
         ProviderModelSelectionMenu(
             providers: menuProviders,
             selectedProviderID: catalog.selectedProviderID,
@@ -266,52 +290,47 @@ struct IntatisChatModelMenu: View {
             onSelect: onSelect) {
                 label
         }
-        .intatisGlassButton()
-        .help(isBusy ? "Model changes apply after the current response finishes" : help)
+        .help(isBusy
+            ? IntatisLocalization.string("Model changes apply after the current response finishes")
+            : help)
     }
 
-    private var label: some View {
-        HStack(spacing: 9) {
-            Image(systemName: "cpu")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(IntatisTheme.accent(scheme))
-                .frame(width: 18)
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 5) {
-                    Text(selectedModel?.title ?? AppConfig.defaultDisplayName(for: AppConfig.defaultModel))
-                        .font(IntatisType.body(13, .semibold))
-                        .foregroundStyle(IntatisTheme.deepText(scheme))
-                    if let detail = selectedModelDetail {
-                        Text(detail)
-                            .font(IntatisType.body(13, .medium))
-                            .foregroundStyle(IntatisTheme.softText(scheme))
-                    }
-                }
+    @ViewBuilder private var label: some View {
+        if usesGlassButton && isCompact {
+            labelContent
+                .intatisComposerSelectionLabel()
+        } else if usesGlassButton {
+            labelContent
+                .padding(.horizontal, 12)
+                .padding(.vertical, 9)
+                .intatisLiquidGlass(cornerRadius: 16, interactive: true)
+        } else {
+            labelContent
+                .padding(.horizontal, 2)
+                .padding(.vertical, 1)
+                .frame(
+                    maxWidth: IntatisComposerControlMetrics.selectionMaxWidth,
+                    alignment: .leading)
+        }
+    }
+
+    private var labelContent: some View {
+        HStack(spacing: 8) {
+            Text(selectedModel?.title ?? AppConfig.defaultDisplayName(for: AppConfig.defaultModel))
+                .font(IntatisType.body(13, .semibold))
+                .foregroundStyle(IntatisTheme.deepText(scheme))
                 .lineLimit(1)
                 .truncationMode(.middle)
-                if !isCompact {
-                    Text(selectedProvider?.title ?? "OpenAI")
-                        .font(IntatisType.caption(11, .medium))
-                        .foregroundStyle(IntatisTheme.softText(scheme))
-                        .lineLimit(1)
-                }
-            }
             Image(systemName: "chevron.down")
                 .font(.system(size: 10, weight: .semibold))
                 .foregroundStyle(IntatisTheme.tertiaryText(scheme))
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 9)
-        .frame(minWidth: isCompact ? 0 : 190,
-               maxWidth: isCompact ? .infinity : 260,
-               alignment: .leading)
-    }
-
-    private var selectedModelDetail: String? {
-        if let variant = catalog.selectedVariant {
-            return variantMenuDetail(variant)
-        }
-        return selectedModel?.reasoningLabel
+        .frame(
+            minWidth: isCompact || !usesGlassButton ? 0 : 190,
+            maxWidth: usesGlassButton
+                ? (isCompact ? nil : 260)
+                : IntatisComposerControlMetrics.selectionMaxWidth,
+            alignment: .leading)
     }
 
     private func variantMenuID(modelID: String, variantID: String) -> String {
@@ -337,7 +356,7 @@ struct IntatisArtifactProgressStrip: View {
                 HStack(spacing: 10) {
                     ProgressView(value: min(max(item.progress, 0), 1))
                         .frame(width: 120)
-                    Text(item.state)
+                    Text(localizedState(item.state))
                         .font(IntatisType.caption(12, .semibold))
                         .foregroundStyle(IntatisTheme.deepText(scheme))
                     Spacer(minLength: 8)
@@ -350,6 +369,17 @@ struct IntatisArtifactProgressStrip: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 9)
         .intatisCard(cornerRadius: 14)
+    }
+
+    private func localizedState(_ state: String) -> String {
+        switch state.lowercased() {
+        case "queued": return IntatisLocalization.string("queued")
+        case "running": return IntatisLocalization.string("running")
+        case "completed": return IntatisLocalization.string("completed")
+        case "failed": return IntatisLocalization.string("failed")
+        case "cancelled": return IntatisLocalization.string("cancelled")
+        default: return state
+        }
     }
 }
 
@@ -364,12 +394,17 @@ struct IntatisMessageBubble: View {
 
     private var isUser: Bool { message.role == .user }
 
+    private var isUninterruptedAgentReply: Bool {
+        (message.role == .assistant || message.role == .agent)
+            && message.recoveryAdvice == nil
+    }
+
     private var roleLabel: String {
         switch message.role {
-        case .user:      return "You"
+        case .user:      return IntatisLocalization.string("You")
         case .assistant: return "Intatis"
-        case .agent:     return message.agent?.rawValue ?? "Agent"
-        case .system:    return "System"
+        case .agent:     return message.agent?.rawValue ?? "Intatis"
+        case .system:    return IntatisLocalization.string("System")
         }
     }
 
@@ -380,6 +415,7 @@ struct IntatisMessageBubble: View {
     var body: some View {
         IntatisThreadBubbleRow(
             isTrailing: isUser,
+            fillsAvailableWidth: message.role == .assistant || message.role == .agent,
             rowWidth: rowWidth,
             maxWidth: maxWidth,
             gutter: gutter) {
@@ -387,13 +423,33 @@ struct IntatisMessageBubble: View {
         }
     }
 
-    private var bubble: some View {
+    @ViewBuilder private var bubble: some View {
+        if isUninterruptedAgentReply {
+            bubbleBody
+                .padding(.vertical, 8)
+        } else {
+            bubbleBody
+                .padding(.horizontal, 15)
+                .padding(.vertical, 11)
+                .intatisContentSurface(cornerRadius: 16)
+                .overlay { userSelectionStroke }
+        }
+    }
+
+    private var bubbleBody: some View {
         VStack(alignment: .leading, spacing: 5) {
             HStack(spacing: 6) {
-                Text(roleLabel.uppercased())
+                Text(roleLabel)
                     .font(IntatisType.caption(10, .semibold))
                     .tracking(0.6)
                     .foregroundStyle(isUser ? IntatisTheme.accent(scheme) : IntatisTheme.tertiaryText(scheme))
+                if (message.role == .assistant || message.role == .agent),
+                   let timestamp = message.timestamp {
+                    Text(IntatisMessageTimestampPresentation.string(for: timestamp))
+                        .font(IntatisType.caption(10))
+                        .monospacedDigit()
+                        .foregroundStyle(IntatisTheme.tertiaryText(scheme))
+                }
                 ForEach(message.tags, id: \.self) { tag in
                     goalTag(tag)
                 }
@@ -413,10 +469,6 @@ struct IntatisMessageBubble: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
-        .padding(.horizontal, 15)
-        .padding(.vertical, 11)
-        .intatisContentSurface(cornerRadius: 16)
-        .overlay { userSelectionStroke }
     }
 
     @ViewBuilder private var userSelectionStroke: some View {
@@ -452,99 +504,49 @@ struct IntatisComposer: View {
 
     var body: some View {
         IntatisThreadComposer(
-            placeholder: "Message Intatis...",
+            placeholder: IntatisLocalization.string("Message Intatis..."),
             input: $model.input,
             canSend: canSend,
             isInputDisabled: model.isBusy,
             style: .intatisMac(scheme),
             secondaryAction: IntatisThreadComposerSecondaryAction(
                 systemImage: "photo",
-                help: "Generate image from prompt",
+                help: IntatisLocalization.string("Generate image from prompt"),
                 isBusy: model.isGeneratingArtifact,
                 isDisabled: !canSend,
                 action: { model.generateImage() }),
+            leadingAccessory: AnyView(IntatisComposerModelControl(
+                catalog: catalog,
+                isBusy: model.isBusy,
+                onSelectModel: onSelectModel)),
+            stopAction: model.isBusy
+                ? IntatisThreadComposerSecondaryAction(
+                    systemImage: "stop.fill",
+                    help: IntatisLocalization.string("Stop"),
+                    action: { model.cancelCurrentOperation() })
+                : nil,
             accessory: {
-                IntatisComposerAccessory(
-                    catalog: catalog,
-                    isBusy: model.isBusy,
-                    latestTurnStats: model.latestTurnStats,
-                    contextLabel: contextLabel,
-                    onSelectModel: onSelectModel)
+                IntatisComposerUsageStrip(
+                    stats: model.latestTurnStats,
+                    style: .intatisMac(scheme))
             },
             onSend: { model.send() })
     }
-
-    private var contextLabel: String? {
-        guard let promptTokens = model.latestTurnStats?.promptTokens else { return nil }
-        let formatted = Self.numberFormatter.string(from: NSNumber(value: promptTokens)) ?? "\(promptTokens)"
-        return "Context \(formatted) tok"
-    }
-
-    private static let numberFormatter: NumberFormatter = {
-        let formatter = NumberFormatter()
-        formatter.numberStyle = .decimal
-        return formatter
-    }()
 }
 
-struct IntatisComposerAccessory: View {
+struct IntatisComposerModelControl: View {
     let catalog: AppProviderCatalog
     let isBusy: Bool
-    let latestTurnStats: TurnStatsSnapshot?
-    let contextLabel: String?
     let onSelectModel: (String, String, String?) -> Void
-    @Environment(\.colorScheme) private var scheme
 
     var body: some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(spacing: 8) {
-                modelMenu(isCompact: false)
-                metricsRow
-            }
-            VStack(alignment: .leading, spacing: 8) {
-                modelMenu(isCompact: true)
-                metricsRow
-            }
-        }
-    }
-
-    private func modelMenu(isCompact: Bool) -> some View {
         IntatisChatModelMenu(
             catalog: catalog,
             isBusy: isBusy,
-            isCompact: isCompact,
-            help: "Switch model",
+            isCompact: true,
+            usesGlassButton: true,
+            help: IntatisLocalization.string("Switch model"),
             onSelect: onSelectModel)
-    }
-
-    @ViewBuilder private var metricsRow: some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(spacing: 7) {
-                metricChips
-            }
-            VStack(alignment: .leading, spacing: 6) {
-                metricChips
-            }
-        }
-    }
-
-    @ViewBuilder private var metricChips: some View {
-        if let latestTurnStats {
-            IntatisTurnStatsSummaryView(stats: latestTurnStats, style: .intatisMac(scheme))
-        }
-        if let contextLabel {
-            HStack(spacing: 6) {
-                Image(systemName: "rectangle.stack")
-                    .font(.system(size: 11, weight: .semibold))
-                Text(contextLabel)
-                    .font(IntatisType.caption(12, .medium))
-                    .lineLimit(1)
-            }
-            .foregroundStyle(IntatisTheme.softText(scheme))
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-            .intatisContentSurface(cornerRadius: 14)
-        }
     }
 }
 
@@ -584,7 +586,9 @@ struct IntatisSettingsPanel: View {
     private func settingsContent(layout: IntatisMacScreenLayout) -> some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 22) {
-                IntatisPageHeader(title: "Settings", subtitle: "Providers · models · API keys")
+                IntatisPageHeader(
+                    title: IntatisLocalization.string("Settings"),
+                    subtitle: IntatisLocalization.string("Providers · models · API keys"))
 
                 settingsCard(layout: layout)
 
@@ -669,10 +673,15 @@ struct IntatisSettingsPanel: View {
 
     private var rendererModeHelpText: String {
         if let rendererLaunchOverride {
-            let label = rendererLaunchOverride == .plainSafe ? "Plain text safe mode" : "Rich Markdown"
-            return "Current launch is forced to \(label). This picker is saved immediately for the next launch without an override, so a rescued session can remain in safe mode."
+            let label = rendererLaunchOverride == .plainSafe
+                ? IntatisLocalization.string("Plain text safe mode")
+                : IntatisLocalization.string("Rich Markdown")
+            return IntatisLocalization.format(
+                "Current launch is forced to %@. This picker is saved immediately for the next launch without an override, so a rescued session can remain in safe mode.",
+                label)
         }
-        return "This choice is saved and applied immediately; it is independent of provider Save. Rich Markdown uses the audited upstream renderer with images, math typesetting, and syntax highlighting disabled for the first release. Plain text safe mode bypasses Markdown entirely. Raw session data is unchanged."
+        return IntatisLocalization.string(
+            "This choice is saved and applied immediately; it is independent of provider Save. Rich Markdown uses the audited upstream renderer with images, math typesetting, and syntax highlighting disabled for the first release. Plain text safe mode bypasses Markdown entirely. Raw session data is unchanged.")
     }
 
     @ViewBuilder private func settingsCard(layout: IntatisMacScreenLayout) -> some View {
@@ -744,7 +753,9 @@ struct IntatisSettingsPanel: View {
 
     private func testProviderButton(layout: IntatisMacScreenLayout) -> some View {
         Button(action: testProvider) {
-            Label(isTestingProvider ? "Testing" : (layout.isCompact ? "Test" : "Test Provider"),
+            Label(isTestingProvider
+                    ? IntatisLocalization.string("Testing")
+                    : IntatisLocalization.string(layout.isCompact ? "Test" : "Test Provider"),
                   systemImage: isTestingProvider ? "hourglass" : "checkmark.seal")
                 .font(IntatisType.body(14, .semibold))
                 .foregroundStyle(.primary)
@@ -772,14 +783,15 @@ struct IntatisSettingsPanel: View {
             VStack(alignment: .leading, spacing: 8) {
                 ForEach(Array(providerHealthReports.enumerated()), id: \.offset) { _, report in
                     VStack(alignment: .leading, spacing: 4) {
-                        Label(report.displayTitle, systemImage: report.isOK ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                        Label(IntatisLocalization.string(report.displayTitle),
+                              systemImage: report.isOK ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
                             .font(IntatisType.caption(12, .semibold))
                             .foregroundStyle(report.isOK ? .green : .red)
-                        Text(report.displaySummary)
+                        Text(IntatisLocalization.providerHealthSummary(report))
                             .font(IntatisType.caption(11, .medium))
                             .foregroundStyle(IntatisTheme.softText(scheme))
                             .lineLimit(2)
-                        Text(report.displayDetail)
+                        Text(IntatisLocalization.providerHealthDetail(report))
                             .font(IntatisType.caption(11, .regular))
                             .foregroundStyle(IntatisTheme.softText(scheme))
                             .fixedSize(horizontal: false, vertical: true)
@@ -827,7 +839,9 @@ struct IntatisSettingsPanel: View {
                 secureField("API key",
                             text: apiKeyBinding(for: catalog.providers[providerIndex].id),
                             placeholder: apiKeyPlaceholder(for: catalog.providers[providerIndex]))
-                Text("Key source: \(apiKeySourceLabel(for: catalog.providers[providerIndex]))")
+                Text(IntatisLocalization.format(
+                    "Key source: %@",
+                    apiKeySourceLabel(for: catalog.providers[providerIndex])))
                     .font(IntatisType.caption(11, .medium))
                     .foregroundStyle(IntatisTheme.softText(scheme))
                     .fixedSize(horizontal: false, vertical: true)
@@ -982,7 +996,9 @@ struct IntatisSettingsPanel: View {
             withAnimation { saved = true }
         } catch {
             saved = false
-            settingsError = "Could not save settings: \(error.localizedDescription)"
+            settingsError = IntatisLocalization.format(
+                "Could not save settings: %@",
+                error.localizedDescription)
         }
     }
 
@@ -995,14 +1011,19 @@ struct IntatisSettingsPanel: View {
             saved = false
             #if canImport(AppKit)
             if !NSWorkspace.shared.open(url) {
-                settingsError = "Could not open JSON config at \(url.path)"
+                settingsError = IntatisLocalization.format(
+                    "Could not open JSON config at %@",
+                    url.path)
             }
             #else
-            settingsError = "Opening JSON config is not available on this platform."
+            settingsError = IntatisLocalization.string(
+                "Opening JSON config is not available on this platform.")
             #endif
         } catch {
             saved = false
-            settingsError = "Could not open JSON config: \(error.localizedDescription)"
+            settingsError = IntatisLocalization.format(
+                "Could not open JSON config: %@",
+                error.localizedDescription)
         }
     }
 
@@ -1021,7 +1042,9 @@ struct IntatisSettingsPanel: View {
                 providerHealthReports = await env.healthCheckSelectedProvider()
             } catch {
                 saved = false
-                settingsError = "Could not test provider: \(error.localizedDescription)"
+                settingsError = IntatisLocalization.format(
+                    "Could not test provider: %@",
+                    error.localizedDescription)
             }
         }
     }
@@ -1080,7 +1103,20 @@ struct IntatisSettingsPanel: View {
 
     private func providerSubtitle(_ provider: AppProviderSettings) -> String {
         let host = URL(string: provider.baseURL)?.host ?? provider.baseURL
-        return "\(provider.models.count) models · \(host) · \(apiKeySourceLabel(for: provider))"
+        let format = provider.models.count == 1
+            ? "1 model · %@ · %@"
+            : "%lld models · %@ · %@"
+        if provider.models.count == 1 {
+            return IntatisLocalization.format(
+                format,
+                host,
+                apiKeySourceLabel(for: provider))
+        }
+        return IntatisLocalization.format(
+            format,
+            Int64(provider.models.count),
+            host,
+            apiKeySourceLabel(for: provider))
     }
 
     private func providerFieldBinding(_ providerIndex: Int,
@@ -1142,40 +1178,48 @@ struct IntatisSettingsPanel: View {
     private func apiKeyPlaceholder(for provider: AppProviderSettings) -> String {
         let ref = AppConfig.apiKeyRef(for: provider)
         if ref.source != .authFile {
-            return "Using \(apiKeySourceLabel(for: provider)); enter key to replace"
+            return IntatisLocalization.format(
+                "Using %@; enter key to replace",
+                apiKeySourceLabel(for: provider))
         }
-        return env.hasAPIKey(for: provider) ? "••••••••••••••••" : "Enter API key"
+        return env.hasAPIKey(for: provider)
+            ? "••••••••••••••••"
+            : IntatisLocalization.string("Enter API key")
     }
 
     private func apiKeySourceLabel(for provider: AppProviderSettings) -> String {
         let ref = AppConfig.apiKeyRef(for: provider)
         switch ref.source {
         case .authFile:
-            return "auth file"
+            return IntatisLocalization.string("auth file")
         case .environment:
-            return ref.account.isEmpty ? "environment" : "env \(ref.account)"
+            return ref.account.isEmpty
+                ? IntatisLocalization.string("environment")
+                : IntatisLocalization.format("env %@", ref.account)
         case .file:
-            return "secret file"
+            return IntatisLocalization.string("secret file")
         case .providerConfig:
-            return "provider config"
+            return IntatisLocalization.string("provider config")
         case .keychain:
-            return "legacy keychain"
+            return IntatisLocalization.string("legacy keychain")
         }
     }
 
     private var settingsStorageNote: String {
         if let path = AppConfig.externalConfigDescription {
-            return "Config: \(path)"
+            return IntatisLocalization.format("Config: %@", path)
         }
-        return "Config: \(AppConfig.editableConfigDescription)"
+        return IntatisLocalization.format(
+            "Config: %@",
+            AppConfig.editableConfigDescription)
     }
 
     @ViewBuilder private func field(_ label: String, text: Binding<String>, placeholder: String) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(label)
+            Text(IntatisLocalization.string(label))
                 .font(IntatisType.caption(12, .semibold))
                 .foregroundStyle(IntatisTheme.softText(scheme))
-            TextField(placeholder, text: text)
+            TextField(IntatisLocalization.string(placeholder), text: text)
                 .textFieldStyle(.plain)
                 .font(IntatisType.mono(13))
                 .foregroundStyle(IntatisTheme.deepText(scheme))
@@ -1187,10 +1231,10 @@ struct IntatisSettingsPanel: View {
 
     @ViewBuilder private func secureField(_ label: String, text: Binding<String>, placeholder: String) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(label)
+            Text(IntatisLocalization.string(label))
                 .font(IntatisType.caption(12, .semibold))
                 .foregroundStyle(IntatisTheme.softText(scheme))
-            SecureField(placeholder, text: text)
+            SecureField(IntatisLocalization.string(placeholder), text: text)
                 .textFieldStyle(.plain)
                 .font(IntatisType.mono(13))
                 .foregroundStyle(IntatisTheme.deepText(scheme))

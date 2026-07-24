@@ -101,6 +101,13 @@ extension String {
     comment: "Accessibility label for the button that dismisses the fullscreen image viewer"
   )
 
+  static let mathFormulaAccessibilityFormat = NSLocalizedString(
+    "a11y_math_formula",
+    bundle: .module,
+    value: "Math formula: %@",
+    comment: "Accessibility label for an inline mathematical formula followed by its TeX source"
+  )
+
 }
 
 extension Markdown.Document {

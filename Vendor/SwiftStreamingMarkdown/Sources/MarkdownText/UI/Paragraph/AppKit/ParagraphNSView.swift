@@ -2,6 +2,8 @@
 //  Copyright (c) Microsoft Corporation. All rights reserved.
 //  Licensed under the MIT License. See LICENSE in the project root for license information.
 //
+//  Intatis derivative modification: TextKit 2 inline-math hosting.
+//
 
 #if canImport(AppKit)
 import AppKit
@@ -22,6 +24,8 @@ class ParagraphNSView: NSTextView {
   private var fadeAnimationDisplayLink: CADisplayLink?
   private var cachedSize: CachedParagraphNSViewSize?
   private var lastLaidOutWidth: CGFloat?
+  private var retainedTextContentStorage: NSTextContentStorage?
+  private var textKitTwoViewportLayoutScheduled = false
 
   var textContextMenu: TextContextMenu?
   var markdownController: MarkdownController?
@@ -29,22 +33,34 @@ class ParagraphNSView: NSTextView {
   var onUrlTap: (URL) -> Void = { NSWorkspace.shared.open($0) }
 
   convenience init() {
-    let textStorage = NSTextStorage()
-    let layoutManager = NSLayoutManager()
-    textStorage.addLayoutManager(layoutManager)
-    let textContainer = NSTextContainer(containerSize: NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude))
-    textContainer.widthTracksTextView = true
-    textContainer.heightTracksTextView = false
-    layoutManager.addTextContainer(textContainer)
-    self.init(frame: .zero, textContainer: textContainer)
+    let contentStorage = NSTextContentStorage()
+    let layoutManager = NSTextLayoutManager()
+    contentStorage.addTextLayoutManager(layoutManager)
+    contentStorage.primaryTextLayoutManager = layoutManager
+    let container = NSTextContainer(
+      size: NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude)
+    )
+    layoutManager.textContainer = container
+
+    self.init(frame: .zero, textContainer: container)
+    // NSTextContainer and NSTextLayoutManager only retain the neighboring
+    // objects needed for layout. Keep the root content storage alive for the
+    // lifetime of this view so the native TextKit 2 network cannot collapse.
+    retainedTextContentStorage = contentStorage
   }
 
   override init(frame frameRect: NSRect, textContainer container: NSTextContainer?) {
+    registerInlineMathAttachmentViewProvider()
+    // ParagraphNSView() delegates through AppKit's dedicated TextKit 2
+    // convenience initializer. AppKit supplies its fully configured container
+    // to this designated initializer; forwarding that exact container keeps
+    // the native TextKit 2 content/layout network intact.
     super.init(frame: frameRect, textContainer: container)
     setupView()
   }
 
   required init?(coder: NSCoder) {
+    registerInlineMathAttachmentViewProvider()
     super.init(coder: coder)
     setupView()
   }
@@ -117,6 +133,7 @@ class ParagraphNSView: NSTextView {
     lastLaidOutWidth = width
     invalidateCachedSize()
     invalidateIntrinsicContentSize()
+    scheduleTextKitTwoViewportLayout()
   }
 
   // MARK: - Content Update
@@ -131,16 +148,25 @@ class ParagraphNSView: NSTextView {
     self.lineSpacing = lineSpacing
 
     let oldLength = textStorage?.length ?? 0
+    let materializedContents = materializeInlineMathAttachments(in: newContents)
     let finalString: NSMutableAttributedString
     if lineSpacing != nil {
-      finalString = applyLineSpacing(to: newContents, lineSpacing: lineSpacing)
+      finalString = applyLineSpacing(to: materializedContents, lineSpacing: lineSpacing)
     } else {
-      finalString = newContents
+      finalString = materializedContents
     }
 
     tearDownDisplayLink()
     invalidateCachedSize()
     textStorage?.setAttributedString(finalString)
+    if let textLayoutManager {
+      // NSTextStorage clears NSTextContentStorage's primary layout manager
+      // after a wholesale programmatic replacement. Restore this view's sole
+      // TextKit 2 layout manager so viewport layout and attachment hosting stay
+      // bound to the visible paragraph.
+      textContentStorage?.primaryTextLayoutManager = textLayoutManager
+    }
+    scheduleTextKitTwoViewportLayout()
 
     configureAccessibility(for: finalString)
 
@@ -209,6 +235,16 @@ class ParagraphNSView: NSTextView {
     setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
   }
 
+  private func scheduleTextKitTwoViewportLayout() {
+    guard !textKitTwoViewportLayoutScheduled else { return }
+    textKitTwoViewportLayoutScheduled = true
+    DispatchQueue.main.async { [weak self] in
+      guard let self else { return }
+      self.textKitTwoViewportLayoutScheduled = false
+      self.textLayoutManager?.textViewportLayoutController.layoutViewport()
+    }
+  }
+
   // MARK: - Accessibility
 
   private func generateAccessibilityContent(from attributedString: NSAttributedString) -> (label: String?, actions: [() -> Void])? {
@@ -220,6 +256,14 @@ class ParagraphNSView: NSTextView {
       if let attachment = attrs[.attachment] as? InlineCitationAttachment,
          let citationData = attachment.citationData {
         labelComponents.append(citationData.accessibilityLabel)
+        hasAttachments = true
+      } else if let attachment = attrs[.attachment] as? InlineMathAttachment {
+        labelComponents.append(
+          String.localizedStringWithFormat(
+            String.mathFormulaAccessibilityFormat,
+            attachment.mathData.source
+          )
+        )
         hasAttachments = true
       } else {
         let text = attributedString.attributedSubstring(from: range).string
@@ -334,6 +378,43 @@ class ParagraphNSView: NSTextView {
 
   // MARK: - Context Menu
 
+  override func copy(_ sender: Any?) {
+    guard let textStorage else {
+      super.copy(sender)
+      return
+    }
+    let range = NSIntersectionRange(
+      selectedRange(),
+      NSRange(location: 0, length: textStorage.length)
+    )
+    guard range.length > 0 else {
+      super.copy(sender)
+      return
+    }
+    let selection = textStorage.attributedSubstring(from: range)
+    var hasInlineMath = false
+    selection.enumerateAttribute(
+      .attachment,
+      in: NSRange(location: 0, length: selection.length),
+      options: []
+    ) { value, _, stop in
+      if value is InlineMathAttachment {
+        hasInlineMath = true
+        stop.pointee = true
+      }
+    }
+    guard hasInlineMath else {
+      super.copy(sender)
+      return
+    }
+    let pasteboard = NSPasteboard.general
+    pasteboard.clearContents()
+    pasteboard.setString(
+      selection.plainTextRestoringInlineMath,
+      forType: .string
+    )
+  }
+
   override func menu(for event: NSEvent) -> NSMenu? {
     guard let textContextMenu, let textStorage else {
       return super.menu(for: event)
@@ -341,7 +422,9 @@ class ParagraphNSView: NSTextView {
 
     let selectedRange = self.selectedRange()
     let clampedRange = NSIntersectionRange(selectedRange, NSRange(location: 0, length: textStorage.length))
-    let selectedText = textStorage.attributedSubstring(from: clampedRange).string
+    let selectedText = textStorage
+      .attributedSubstring(from: clampedRange)
+      .plainTextRestoringInlineMath
 
     // Start from the native context menu so system items (Copy, Look Up,
     // Translate, Share, Services, …) are preserved, then inject the configured

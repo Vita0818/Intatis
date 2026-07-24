@@ -11,6 +11,7 @@ name: Intatis
 
 options:
   bundleIdPrefix: com.Vita0818
+  developmentLanguage: en
   deploymentTarget:
     macOS: "26.0"
     iOS: "26.0"
@@ -40,6 +41,8 @@ targets:
     platform: macOS
     sources:
       - Apps/IntatisMac/Sources
+      - path: Apps/SharedResources
+        buildPhase: resources
       - path: NOTICE.md
         buildPhase: resources
       - path: ThirdPartyNotices
@@ -88,6 +91,8 @@ targets:
     sources:
       - Apps/IntatisiOS/Sources
       - Apps/IntatisiOS/Resources
+      - path: Apps/SharedResources
+        buildPhase: resources
       - path: NOTICE.md
         buildPhase: resources
       - path: ThirdPartyNotices

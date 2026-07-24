@@ -5,6 +5,86 @@ import IntatisCore
 import IntatisProtocol
 import IntatisConversation
 
+private func intatisNormalizedStatus(_ status: String) -> String {
+    status
+        .replacingOccurrences(of: "-", with: "_")
+        .replacingOccurrences(of: " ", with: "_")
+        .lowercased()
+}
+
+private func intatisLocalizedRawStatus(_ status: String) -> String {
+    switch intatisNormalizedStatus(status) {
+    case "idle": return IntatisLocalization.string("idle")
+    case "active": return IntatisLocalization.string("active")
+    case "running": return IntatisLocalization.string("running")
+    case "thinking": return IntatisLocalization.string("thinking")
+    case "tool": return IntatisLocalization.string("tool")
+    case "assigned": return IntatisLocalization.string("assigned")
+    case "paused": return IntatisLocalization.string("paused")
+    case "pending": return IntatisLocalization.string("pending")
+    case "queued": return IntatisLocalization.string("queued")
+    case "ready": return IntatisLocalization.string("ready")
+    case "mailbox": return IntatisLocalization.string("mailbox")
+    case "completed", "complete", "done":
+        return IntatisLocalization.string("completed")
+    case "failed": return IntatisLocalization.string("failed")
+    case "error": return IntatisLocalization.string("error")
+    case "rejected": return IntatisLocalization.string("rejected")
+    case "blocked": return IntatisLocalization.string("blocked")
+    case "budget_limited": return IntatisLocalization.string("budget limited")
+    case "usage_limited": return IntatisLocalization.string("usage limited")
+    case "in_progress", "inprogress":
+        return IntatisLocalization.string("in progress")
+    case "cancelled", "canceled":
+        return IntatisLocalization.string("cancelled")
+    default: return status
+    }
+}
+
+private func intatisLocalizedDisplayStatus(_ status: String) -> String {
+    switch intatisNormalizedStatus(status) {
+    case "idle": return IntatisLocalization.string("Idle")
+    case "active": return IntatisLocalization.string("Active")
+    case "running": return IntatisLocalization.string("Running")
+    case "thinking": return IntatisLocalization.string("Thinking")
+    case "tool": return IntatisLocalization.string("Tool")
+    case "assigned": return IntatisLocalization.string("Assigned")
+    case "paused": return IntatisLocalization.string("Paused")
+    case "pending": return IntatisLocalization.string("Pending")
+    case "queued": return IntatisLocalization.string("Queued")
+    case "ready": return IntatisLocalization.string("Ready")
+    case "mailbox": return IntatisLocalization.string("Mailbox")
+    case "completed", "complete", "done":
+        return IntatisLocalization.string("Completed")
+    case "failed": return IntatisLocalization.string("Failed")
+    case "error": return IntatisLocalization.string("Error")
+    case "rejected": return IntatisLocalization.string("Rejected")
+    case "blocked": return IntatisLocalization.string("Blocked")
+    case "budget_limited": return IntatisLocalization.string("Budget Limited")
+    case "usage_limited": return IntatisLocalization.string("Usage Limited")
+    case "in_progress", "inprogress":
+        return IntatisLocalization.string("In Progress")
+    case "cancelled", "canceled":
+        return IntatisLocalization.string("Cancelled")
+    default:
+        let display = status
+            .replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: "-", with: " ")
+            .capitalized
+        return IntatisLocalization.string(display)
+    }
+}
+
+private func intatisLocalizedAgentRole(_ role: String) -> String {
+    switch role.lowercased() {
+    case "main": return IntatisLocalization.string("main")
+    case "coordinator": return IntatisLocalization.string("coordinator")
+    case "worker": return IntatisLocalization.string("worker")
+    case "reviewer": return IntatisLocalization.string("reviewer")
+    default: return role
+    }
+}
+
 public enum CoworkInferenceResolution: String, Codable, Equatable, Sendable {
     /// A legacy projection has no durable inference binding to resolve yet.
     case legacy
@@ -113,12 +193,18 @@ public struct CoworkAgentInfo: Identifiable, Equatable, Sendable {
     public var statusLine: String {
         let queued = pendingTasks + pendingMessages
         if queued > 0 {
-            return "\(status) · \(queued) queued"
+            return IntatisLocalization.format(
+                "%@ · %lld queued",
+                intatisLocalizedRawStatus(status),
+                Int64(queued))
         }
         if completedTasks > 0 {
-            return "\(status) · \(completedTasks) completed"
+            return IntatisLocalization.format(
+                "%@ · %lld completed",
+                intatisLocalizedRawStatus(status),
+                Int64(completedTasks))
         }
-        return status
+        return intatisLocalizedRawStatus(status)
     }
 
     /// Safe secondary roster text. Raw endpoints, raw request options, profile
@@ -126,9 +212,9 @@ public struct CoworkAgentInfo: Identifiable, Equatable, Sendable {
     public var inferenceDisplayLabel: String? {
         switch inferenceResolution {
         case .unresolved:
-            return "Inference unavailable"
+            return IntatisLocalization.string("Inference unavailable")
         case .incompatible:
-            return "Inference incompatible"
+            return IntatisLocalization.string("Inference incompatible")
         case .legacy, .resolved:
             break
         }
@@ -143,9 +229,13 @@ public struct CoworkAgentInfo: Identifiable, Equatable, Sendable {
         ].compactMap { $0 }
         if !components.isEmpty {
             let label = components.joined(separator: " · ")
-            return inferenceResolution == .legacy ? "Legacy · \(label)" : label
+            return inferenceResolution == .legacy
+                ? IntatisLocalization.format("Legacy · %@", label)
+                : label
         }
-        return inferenceResolution == .resolved ? "Inference resolved" : "Legacy inference"
+        return inferenceResolution == .resolved
+            ? IntatisLocalization.string("Inference resolved")
+            : IntatisLocalization.string("Legacy inference")
     }
 
     private static func safeInferenceComponent(_ value: String?) -> String? {
@@ -373,9 +463,9 @@ private enum CoworkInspectorTab: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .agents: return "Agents"
-        case .tasks: return "Tasks"
-        case .context: return "Context"
+        case .agents: return IntatisLocalization.string("Agents")
+        case .tasks: return IntatisLocalization.string("Tasks")
+        case .context: return IntatisLocalization.string("Context")
         }
     }
 }
@@ -390,8 +480,8 @@ public struct CoworkProjectInfo: Equatable, Sendable {
 
     public init(sessionID: String = "",
                 mainAgentName: String = "main",
-                defaultModel: String = "current model",
-                defaultPermission: String = "reviewed",
+                defaultModel: String = IntatisLocalization.string("current model"),
+                defaultPermission: String = IntatisLocalization.string("reviewed"),
                 tokenBudget: String? = nil,
                 workspaces: [CoworkWorkspaceInfo] = []) {
         self.sessionID = sessionID
@@ -444,8 +534,10 @@ public struct CoworkStatusSummary: Equatable, Sendable {
 /// Presentational Cowork project thread: the user gives work to Main, while
 /// the roster/inspector exposes the sub-agent activity Main schedules.
 public struct CoworkShell: View {
-    private static let bottomAnchorID = "intatis-cowork-thread-bottom"
     private let displayedItems: [CodeItem]
+    private let presentationScope: IntatisThreadPresentationScope
+    private let sessionTitle: String
+    private let thinkingPhaseID: String
     private let agents: [CoworkAgentInfo]
     private let pending: PendingPermission?
     private let permissionNotice: PermissionResolutionNotice?
@@ -463,6 +555,7 @@ public struct CoworkShell: View {
     private let onNewSession: (() -> Void)?
     private let onShowProjectSettings: (() -> Void)?
     private let composerAccessory: AnyView?
+    private let composerInputAccessory: AnyView?
     @Binding private var input: String
     private let onSend: () -> Void
     private let onCancelCurrent: (() -> Void)?
@@ -477,8 +570,13 @@ public struct CoworkShell: View {
     private let onClearGoal: (() -> Void)?
     @State private var selectedAgentID: String?
     @State private var inspectorTab: CoworkInspectorTab = .agents
+    @Binding private var showsInspector: Bool
+    @StateObject private var scrollCoordinator = IntatisThreadScrollCoordinator()
 
     public init(items: [CodeItem],
+                presentationScope: IntatisThreadPresentationScope,
+                sessionTitle: String = IntatisLocalization.string("Cowork"),
+                thinkingScopeID: String = "cowork",
                 agents: [CoworkAgentInfo],
                 pending: PendingPermission?,
                 permissionNotice: PermissionResolutionNotice? = nil,
@@ -497,6 +595,8 @@ public struct CoworkShell: View {
                 onNewSession: (() -> Void)? = nil,
                 onShowProjectSettings: (() -> Void)? = nil,
                 composerAccessory: AnyView? = nil,
+                composerInputAccessory: AnyView? = nil,
+                showsInspector: Binding<Bool>,
                 input: Binding<String>,
                 onSend: @escaping () -> Void,
                 onCancelCurrent: (() -> Void)? = nil,
@@ -510,6 +610,9 @@ public struct CoworkShell: View {
                 onEditGoal: (() -> Void)? = nil,
                 onClearGoal: (() -> Void)? = nil) {
         self.displayedItems = IntatisExecutionTracePresentation.displayedItems(items)
+        self.presentationScope = presentationScope
+        self.sessionTitle = sessionTitle
+        self.thinkingPhaseID = "\(thinkingScopeID):\(items.last?.id ?? "initial")"
         self.agents = agents
         self.pending = pending
         self.permissionNotice = permissionNotice
@@ -527,6 +630,8 @@ public struct CoworkShell: View {
         self.onNewSession = onNewSession
         self.onShowProjectSettings = onShowProjectSettings
         self.composerAccessory = composerAccessory
+        self.composerInputAccessory = composerInputAccessory
+        self._showsInspector = showsInspector
         self._input = input
         self.onSend = onSend
         self.onCancelCurrent = onCancelCurrent
@@ -560,34 +665,41 @@ public struct CoworkShell: View {
         GeometryReader { proxy in
             content(rawWidth: proxy.size.width)
         }
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    showsInspector.toggle()
+                } label: {
+                    Image(systemName: "sidebar.right")
+                }
+                .help(showsInspector
+                    ? IntatisLocalization.string("Hide Inspector")
+                    : IntatisLocalization.string("Show Inspector"))
+            }
+        }
     }
 
-    @ViewBuilder private func content(rawWidth: CGFloat) -> some View {
-        if rawWidth >= 980 {
-            HStack(spacing: 0) {
-                threadColumn(
-                    layout: IntatisThreadContentLayout(rawWidth: rawWidth - 320),
-                    showsCompactActions: false)
-                .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
-                Divider().opacity(0.45)
+    private func content(rawWidth: CGFloat) -> some View {
+        let usesInspector = rawWidth >= 980
+        let inspectorVisible = usesInspector && showsInspector
+        let threadWidth = inspectorVisible ? max(rawWidth - 320, 1) : rawWidth
+        let inspectorBinding = Binding(
+            get: { inspectorVisible },
+            set: { if usesInspector { showsInspector = $0 } })
+
+        return threadColumn(
+            layout: IntatisThreadContentLayout(rawWidth: threadWidth),
+            showsCompactActions: !inspectorVisible)
+            .inspector(isPresented: inspectorBinding) {
                 inspectorColumn
-                    .frame(width: 318)
-                    .frame(maxHeight: .infinity)
+                    .inspectorColumnWidth(min: 286, ideal: 318, max: 390)
             }
-        } else {
-            threadColumn(
-                layout: IntatisThreadContentLayout(rawWidth: rawWidth),
-                showsCompactActions: true)
-        }
     }
 
     private func threadColumn(layout: IntatisThreadContentLayout,
                               showsCompactActions: Bool) -> some View {
         VStack(spacing: 0) {
             header(layout: layout, showsCompactActions: showsCompactActions)
-            if showsCompactActions {
-                compactGoalTaskDock(layout: layout)
-            }
             thread(layout: layout)
             permissionArea(layout: layout)
             composerArea(layout: layout)
@@ -597,14 +709,17 @@ public struct CoworkShell: View {
 
     private func header(layout: IntatisThreadContentLayout, showsCompactActions: Bool) -> some View {
         IntatisWorkspaceThreadHeader(
-            title: "Cowork",
-            subtitle: "\(agents.count) agents · \(summary.runningCount) running",
+            title: sessionTitle,
+            subtitle: IntatisLocalization.format(
+                "%lld agents · %lld running",
+                Int64(agents.count),
+                Int64(summary.runningCount)),
             style: threadStyle,
             actions: headerActions(showsCompactActions: showsCompactActions))
         .frame(maxWidth: layout.contentMaxWidth)
         .frame(maxWidth: .infinity)
         .padding(.horizontal, layout.horizontalPadding)
-        .padding(.top, 26)
+        .padding(.top, 12)
         .padding(.bottom, 12)
     }
 
@@ -613,13 +728,16 @@ public struct CoworkShell: View {
         if showsCompactActions {
             if let onShowProjectSettings {
                 actions.append(IntatisThreadHeaderAction(
-                    title: "Project",
+                    title: IntatisLocalization.string("Project"),
                     systemImage: "slider.horizontal.3",
                     isDisabled: isWorking,
                     action: onShowProjectSettings))
             }
             if let onAddAgent {
-                actions.append(IntatisThreadHeaderAction(title: "Attach", systemImage: "person.badge.plus", action: onAddAgent))
+                actions.append(IntatisThreadHeaderAction(
+                    title: IntatisLocalization.string("Attach"),
+                    systemImage: "person.badge.plus",
+                    action: onAddAgent))
             }
         }
         return actions
@@ -724,11 +842,12 @@ public struct CoworkShell: View {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .font(.caption2)
                     .foregroundStyle(threadStyle.accent)
-                    .accessibilityLabel(agent.inferenceDisplayLabel ?? "Inference unavailable")
+                    .accessibilityLabel(agent.inferenceDisplayLabel
+                        ?? IntatisLocalization.string("Inference unavailable"))
             }
         }
         .padding(.vertical, 2)
-        .help(["\(agent.name): \(agent.status)", agent.inferenceDisplayLabel]
+        .help(["\(agent.name): \(intatisLocalizedRawStatus(agent.status))", agent.inferenceDisplayLabel]
             .compactMap { $0 }
             .joined(separator: " · "))
     }
@@ -745,34 +864,6 @@ public struct CoworkShell: View {
             workTasksContent
         }
         .accessibilityIdentifier("cowork.tasks.card")
-    }
-
-    @ViewBuilder private func compactGoalTaskDock(layout: IntatisThreadContentLayout) -> some View {
-        if goal != nil || !workTasks.tasks.isEmpty {
-            ScrollView(.horizontal) {
-                HStack(alignment: .top, spacing: 10) {
-                    if goal != nil {
-                        inspectorSection("Goal") {
-                            goalCardContent
-                        }
-                        .frame(width: min(max(layout.contentWidth * 0.82, 280), 380))
-                        .accessibilityIdentifier("cowork.goal.card")
-                    }
-                    if !workTasks.tasks.isEmpty {
-                        inspectorSection("Tasks") {
-                            workTasksContent
-                        }
-                        .frame(width: min(max(layout.contentWidth * 0.92, 300), 440))
-                        .accessibilityIdentifier("cowork.tasks.card")
-                    }
-                }
-                .padding(.horizontal, layout.horizontalPadding)
-                .padding(.vertical, 1)
-            }
-            .scrollIndicators(.hidden)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.bottom, 10)
-        }
     }
 
     @ViewBuilder private var goalCardContent: some View {
@@ -800,8 +891,13 @@ public struct CoworkShell: View {
                         .accessibilityIdentifier("cowork.goal.objective")
 
                     HStack(alignment: .top, spacing: 12) {
-                        goalMetric("Tokens", value: tokenSummary(for: goal))
-                        goalMetric("Run", value: goal.currentRunOrdinal.map { "#\($0)" } ?? "Not started")
+                        goalMetric(
+                            IntatisLocalization.string("Tokens"),
+                            value: tokenSummary(for: goal))
+                        goalMetric(
+                            IntatisLocalization.string("Run"),
+                            value: goal.currentRunOrdinal.map { "#\($0)" }
+                                ?? IntatisLocalization.string("Not started"))
                     }
 
                     if let auditSummary = auditSummary(for: goal) {
@@ -812,7 +908,9 @@ public struct CoworkShell: View {
                     }
 
                     if goal.revision > 0 {
-                        Text("Revision \(goal.revision)")
+                        Text(IntatisLocalization.format(
+                            "Revision %lld",
+                            Int64(goal.revision)))
                             .font(.caption2)
                             .foregroundStyle(threadStyle.tertiaryText)
                     }
@@ -829,7 +927,7 @@ public struct CoworkShell: View {
 
     private func goalMetric(_ title: String, value: String) -> some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(title.uppercased())
+            Text(IntatisLocalization.string(title).uppercased())
                 .font(.caption2.bold())
                 .foregroundStyle(threadStyle.tertiaryText)
             Text(value)
@@ -885,11 +983,16 @@ public struct CoworkShell: View {
         } else {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    Text("\(workTasks.completedCount) / \(workTasks.totalCount) complete")
+                    Text(IntatisLocalization.format(
+                        "%lld / %lld complete",
+                        Int64(workTasks.completedCount),
+                        Int64(workTasks.totalCount)))
                         .font(.caption2.bold())
                         .foregroundStyle(threadStyle.secondaryText)
                     if workTasks.runningCount > 0 {
-                        Text("· \(workTasks.runningCount) running")
+                        Text(IntatisLocalization.format(
+                            "· %lld running",
+                            Int64(workTasks.runningCount)))
                             .font(.caption2)
                             .foregroundStyle(threadStyle.accent)
                     }
@@ -923,7 +1026,7 @@ public struct CoworkShell: View {
     private func tokenSummary(for goal: CoworkGoalCardInfo) -> String {
         let used = NumberFormatter.localizedString(from: NSNumber(value: goal.tokensUsed), number: .decimal)
         guard let tokenBudget = goal.tokenBudget else {
-            return "\(used) · no budget"
+            return IntatisLocalization.format("%@ · no budget", used)
         }
         let budget = NumberFormatter.localizedString(from: NSNumber(value: max(tokenBudget, 0)), number: .decimal)
         return "\(used) / \(budget)"
@@ -932,7 +1035,10 @@ public struct CoworkShell: View {
     private func auditSummary(for goal: CoworkGoalCardInfo) -> String? {
         var parts: [String] = []
         if let proven = goal.auditProvenCount, let required = goal.auditRequirementCount {
-            parts.append("\(max(proven, 0)) / \(max(required, 0)) requirements proven")
+            parts.append(IntatisLocalization.format(
+                "%lld / %lld requirements proven",
+                Int64(max(proven, 0)),
+                Int64(max(required, 0))))
         }
         if let summary = goal.latestAuditSummary?.trimmingCharacters(in: .whitespacesAndNewlines),
            !summary.isEmpty {
@@ -942,10 +1048,7 @@ public struct CoworkShell: View {
     }
 
     private func displayStatus(_ status: String) -> String {
-        status
-            .replacingOccurrences(of: "_", with: " ")
-            .replacingOccurrences(of: "-", with: " ")
-            .capitalized
+        intatisLocalizedDisplayStatus(status)
     }
 
     private func rightRailSection<Content: View>(_ title: String,
@@ -997,7 +1100,7 @@ public struct CoworkShell: View {
 
     private func overviewMetric(_ title: String, _ value: String) -> some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(title.uppercased())
+            Text(IntatisLocalization.string(title).uppercased())
                 .font(.caption2.bold())
                 .foregroundStyle(threadStyle.tertiaryText)
                 .lineLimit(1)
@@ -1066,7 +1169,9 @@ public struct CoworkShell: View {
         inspectorSection("Access") {
             inspectorRow("Workspace leases", value: "\(summary.workspaceLeaseCount)")
             inspectorRow("Capability leases", value: "\(summary.capabilityLeaseCount)")
-            inspectorRow("Git", value: "status only")
+            inspectorRow(
+                "Git",
+                value: IntatisLocalization.string("status only"))
             Text("Commit, branch, PR, CI, and review workflows are deferred.")
                 .font(.caption2)
                 .foregroundStyle(threadStyle.tertiaryText)
@@ -1081,7 +1186,11 @@ public struct CoworkShell: View {
 
     private var projectSection: some View {
         VStack(alignment: .leading, spacing: 7) {
-            inspectorRow("Session", value: project.sessionID.isEmpty ? "current" : project.sessionID)
+            inspectorRow(
+                "Session",
+                value: project.sessionID.isEmpty
+                    ? IntatisLocalization.string("current")
+                    : project.sessionID)
             inspectorRow("Main", value: "@\(project.mainAgentName)")
             inspectorRow("Model", value: project.defaultModel)
             inspectorRow("Permission", value: project.defaultPermission)
@@ -1173,7 +1282,9 @@ public struct CoworkShell: View {
             ForEach(summary.failedTasks) { task in
                 taskCompactRow(
                     task: task,
-                    actionTitle: onRetryTask == nil ? nil : "Retry",
+                    actionTitle: onRetryTask == nil
+                        ? nil
+                        : IntatisLocalization.string("Retry"),
                     actionDisabled: isWorking,
                     action: onRetryTask.map { retry in { retry(task.id) } })
             }
@@ -1186,7 +1297,7 @@ public struct CoworkShell: View {
     private func inspectorSection<Content: View>(_ title: String,
                                                  @ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text(title.uppercased())
+            Text(IntatisLocalization.string(title).uppercased())
                 .font(.caption2.bold())
                 .foregroundStyle(threadStyle.tertiaryText)
             content()
@@ -1198,7 +1309,7 @@ public struct CoworkShell: View {
 
     private func inspectorRow(_ title: String, value: String) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text(title)
+            Text(IntatisLocalization.string(title))
                 .font(.caption)
                 .foregroundStyle(threadStyle.secondaryText)
             Spacer(minLength: 8)
@@ -1233,7 +1344,7 @@ public struct CoworkShell: View {
 
     private func metric(_ title: String, _ value: Int) -> some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(title)
+            Text(IntatisLocalization.string(title))
                 .font(.caption2.bold())
                 .foregroundStyle(threadStyle.tertiaryText)
             Text("\(value)")
@@ -1264,7 +1375,7 @@ public struct CoworkShell: View {
                             .font(.caption.bold())
                             .foregroundStyle(threadStyle.primaryText)
                             .lineLimit(1)
-                        Text(agent.role)
+                        Text(intatisLocalizedAgentRole(agent.role))
                             .font(.caption2.bold())
                             .foregroundStyle(threadStyle.secondaryText)
                             .lineLimit(1)
@@ -1300,7 +1411,7 @@ public struct CoworkShell: View {
                     .foregroundStyle(threadStyle.primaryText)
                     .lineLimit(1)
                 Spacer(minLength: 8)
-                Text(agent.status)
+                Text(intatisLocalizedRawStatus(agent.status))
                     .font(.caption2.bold())
                     .foregroundStyle(statusColor(for: agent.status))
                     .lineLimit(1)
@@ -1323,14 +1434,23 @@ public struct CoworkShell: View {
                 .truncationMode(.middle)
                 .textSelection(.enabled)
             Divider().opacity(0.35)
-            agentDetailRow("Role", value: agent.role)
+            agentDetailRow("Role", value: intatisLocalizedAgentRole(agent.role))
             agentDetailRow("Model", value: agent.model)
             if let inferenceLabel = agent.inferenceDisplayLabel {
                 agentDetailRow("Inference", value: inferenceLabel)
             }
             agentDetailRow("Permission", value: agent.permissionProfile)
-            agentDetailRow("Queued", value: "\(agent.pendingTasks) tasks / \(agent.pendingMessages) messages")
-            agentDetailRow("Completed", value: "\(agent.completedTasks) tasks")
+            agentDetailRow(
+                "Queued",
+                value: IntatisLocalization.format(
+                    "%lld tasks / %lld messages",
+                    Int64(agent.pendingTasks),
+                    Int64(agent.pendingMessages)))
+            agentDetailRow(
+                "Completed",
+                value: IntatisLocalization.format(
+                    "%lld tasks",
+                    Int64(agent.completedTasks)))
             if let workspaceLease = agent.workspaceLease {
                 agentDetailRow("Workspace lease", value: workspaceLease)
             }
@@ -1356,7 +1476,7 @@ public struct CoworkShell: View {
                         .intatisGlassButton()
                         .disabled(actionDisabled)
                 }
-                Text(task.status)
+                Text(intatisLocalizedDisplayStatus(task.status))
                     .font(.caption2.bold())
                     .foregroundStyle(statusColor(for: task.status))
                     .lineLimit(1)
@@ -1429,11 +1549,12 @@ public struct CoworkShell: View {
     }
 
     private var primaryWorkspaceName: String {
-        primaryWorkspace?.displayName ?? "No workspace"
+        primaryWorkspace?.displayName ?? IntatisLocalization.string("No workspace")
     }
 
     private var primaryWorkspacePath: String {
-        primaryWorkspace?.path ?? "Attach a workspace to inspect git state."
+        primaryWorkspace?.path
+            ?? IntatisLocalization.string("Attach a workspace to inspect git state.")
     }
 
     private func agentRoster(layout: IntatisThreadContentLayout) -> some View {
@@ -1484,7 +1605,7 @@ public struct CoworkShell: View {
                 Text("@\(agent.name)")
                     .font(.caption.bold())
                     .foregroundStyle(selected ? threadStyle.accent : threadStyle.primaryText)
-                Text(agent.status)
+                Text(intatisLocalizedRawStatus(agent.status))
                     .font(.caption2)
                     .foregroundStyle(threadStyle.secondaryText)
                 if selected {
@@ -1507,7 +1628,7 @@ public struct CoworkShell: View {
                     .font(.caption.bold())
                     .foregroundStyle(threadStyle.primaryText)
                 Spacer(minLength: 8)
-                Text(agent.status)
+                Text(intatisLocalizedRawStatus(agent.status))
                     .font(.caption2.bold())
                     .foregroundStyle(threadStyle.accent)
             }
@@ -1517,14 +1638,23 @@ public struct CoworkShell: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
                 .textSelection(.enabled)
-            agentDetailRow("Role", value: agent.role)
+            agentDetailRow("Role", value: intatisLocalizedAgentRole(agent.role))
             agentDetailRow("Model", value: agent.model)
             if let inferenceLabel = agent.inferenceDisplayLabel {
                 agentDetailRow("Inference", value: inferenceLabel)
             }
             agentDetailRow("Permission", value: agent.permissionProfile)
-            agentDetailRow("Queued", value: "\(agent.pendingTasks) tasks / \(agent.pendingMessages) messages")
-            agentDetailRow("Completed", value: "\(agent.completedTasks) tasks")
+            agentDetailRow(
+                "Queued",
+                value: IntatisLocalization.format(
+                    "%lld tasks / %lld messages",
+                    Int64(agent.pendingTasks),
+                    Int64(agent.pendingMessages)))
+            agentDetailRow(
+                "Completed",
+                value: IntatisLocalization.format(
+                    "%lld tasks",
+                    Int64(agent.completedTasks)))
             if let workspaceLease = agent.workspaceLease {
                 agentDetailRow("Workspace lease", value: workspaceLease)
             }
@@ -1551,7 +1681,7 @@ public struct CoworkShell: View {
 
     private func agentDetailRow(_ title: String, value: String) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text(title)
+            Text(IntatisLocalization.string(title))
                 .font(.caption2)
                 .foregroundStyle(threadStyle.secondaryText)
             Spacer(minLength: 8)
@@ -1571,7 +1701,9 @@ public struct CoworkShell: View {
                     CoworkTaskLineRow(
                         task: task,
                         style: threadStyle,
-                        actionTitle: onRetryTask == nil ? nil : "Retry",
+                        actionTitle: onRetryTask == nil
+                            ? nil
+                            : IntatisLocalization.string("Retry"),
                         actionDisabled: isWorking,
                         action: onRetryTask.map { retry in { retry(task.id) } })
                 }
@@ -1604,13 +1736,16 @@ public struct CoworkShell: View {
                                 .id(item.id)
                         }
                         if showsThinkingIndicator {
-                            IntatisThreadThinkingRow(layout: layout, style: threadStyle)
-                                .id("intatis-cowork-thinking")
+                            IntatisThreadThinkingRow(
+                                layout: layout,
+                                style: threadStyle,
+                                phaseID: thinkingPhaseID)
+                                .id("intatis-cowork-thinking-\(thinkingPhaseID)")
                         }
                         Color.clear
                             .frame(height: 1)
                             .padding(.bottom, 16)
-                            .id(Self.bottomAnchorID)
+                            .id(IntatisThreadBottomAnchorID(scope: presentationScope))
                     }
                     .frame(width: layout.contentWidth)
                     .frame(maxWidth: .infinity)
@@ -1619,12 +1754,66 @@ public struct CoworkShell: View {
                 }
                 .scrollContentBackground(.hidden)
                 .onAppear {
-                    scrollToBottom(proxy, animated: false)
+                    scrollCoordinator.activate(scope: presentationScope)
+                    requestScroll(
+                        proxy,
+                        reason: .initialRestore)
                 }
-                .onChange(of: itemScrollSignature) { _ in
-                    scrollToBottom(proxy)
+                .onChange(of: itemScrollSignature) { _, _ in
+                    scrollCoordinator.beginLayoutEpoch(
+                        scope: presentationScope)
+                    requestScroll(
+                        proxy,
+                        reason: scrollReason)
+                }
+                .onChange(of: layout.contentWidth) { _, _ in
+                    scrollCoordinator.beginLayoutEpoch(
+                        scope: presentationScope)
+                }
+                .onChange(of: presentationScope) { _, newScope in
+                    scrollCoordinator.activate(scope: newScope)
+                    requestScroll(
+                        proxy,
+                        reason: .initialRestore)
+                }
+                .onScrollGeometryChange(
+                    for: IntatisThreadScrollGeometry.self
+                ) { geometry in
+                    IntatisThreadScrollGeometry.measure(
+                        contentOffsetY: geometry.contentOffset.y,
+                        containerHeight: geometry.containerSize.height,
+                        bottomInset: geometry.contentInsets.bottom,
+                        contentHeight: geometry.contentSize.height)
+                } action: { previous, current in
+                    scrollCoordinator.updateBottomProximity(
+                        current.isAtBottom,
+                        contentHeight: current.contentHeight,
+                        scope: presentationScope)
+                    if !current.isAtBottom,
+                       current.hasMaterialHeightChange(from: previous) {
+                        requestScroll(
+                            proxy,
+                            reason: .richHeightCorrection,
+                            contentHeight: current.contentHeight)
+                    }
+                }
+                .onScrollPhaseChange { _, newPhase in
+                    switch newPhase {
+                    case .tracking, .interacting, .decelerating:
+                        scrollCoordinator.userInteractionDidBegin(
+                            scope: presentationScope)
+                    case .idle:
+                        scrollCoordinator.userInteractionDidEnd(
+                            scope: presentationScope)
+                    case .animating:
+                        break
+                    }
+                }
+                .onDisappear {
+                    scrollCoordinator.deactivate(scope: presentationScope)
                 }
             }
+            .id(presentationScope)
         }
     }
 
@@ -1635,27 +1824,48 @@ public struct CoworkShell: View {
             permissionBlocksResponse: permissionBlocksComposer)
     }
 
-    private var itemScrollSignature: String {
-        guard let last = displayedItems.last else { return "0" }
-        return [
-            "\(displayedItems.count)",
-            last.id,
-            "\(last.body.count)",
-            "\(last.complete)",
-            "\(isWorking)",
-            "\(showsThinkingIndicator)"
-        ].joined(separator: ":")
+    private var itemScrollSignature: IntatisThreadScrollSignature {
+        let last = displayedItems.last
+        return IntatisThreadScrollSignature(
+            visibleItemCount: displayedItems.count,
+            lastItemID: last?.id,
+            lastBodyUTF8Count: last?.body.utf8.count ?? 0,
+            lastItemComplete: last?.complete ?? false,
+            isWorking: isWorking,
+            showsThinkingIndicator: showsThinkingIndicator)
     }
 
-    private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool = true) {
-        DispatchQueue.main.async {
-            if animated {
+    private var scrollReason: IntatisThreadScrollReason {
+        guard let last = displayedItems.last else { return .liveUpdate }
+        return last.complete && !isWorking ? .completion : .liveUpdate
+    }
+
+    private func requestScroll(
+        _ proxy: ScrollViewProxy,
+        reason: IntatisThreadScrollReason,
+        contentHeight: CGFloat? = nil
+    ) {
+        let perform: @MainActor (IntatisThreadScrollRequest) -> Void = { request in
+            let anchorID = IntatisThreadBottomAnchorID(scope: request.scope)
+            if request.animated {
                 withAnimation(.easeOut(duration: 0.18)) {
-                    proxy.scrollTo(Self.bottomAnchorID, anchor: .bottom)
+                    proxy.scrollTo(anchorID, anchor: .bottom)
                 }
             } else {
-                proxy.scrollTo(Self.bottomAnchorID, anchor: .bottom)
+                proxy.scrollTo(anchorID, anchor: .bottom)
             }
+        }
+        if reason == .richHeightCorrection,
+           let contentHeight {
+            scrollCoordinator.requestRichHeightCorrection(
+                scope: presentationScope,
+                contentHeight: contentHeight,
+                perform: perform)
+        } else {
+            scrollCoordinator.request(
+                scope: presentationScope,
+                reason: reason,
+                perform: perform)
         }
     }
 
@@ -1680,27 +1890,25 @@ public struct CoworkShell: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             IntatisThreadComposer(
-                placeholder: "Give Main a project task...",
+                placeholder: IntatisLocalization.string("Give Main a project task..."),
                 input: $input,
                 canSend: !isAcceptingSubmission
                     && (!input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                         || hasDraftAttachments),
                 isInputDisabled: false,
                 style: threadStyle,
+                leadingAccessory: composerAccessory,
+                inputLeadingAccessory: composerInputAccessory,
+                stopAction: onCancelCurrent.map { onCancelCurrent in
+                    IntatisThreadComposerSecondaryAction(
+                        systemImage: "stop.fill",
+                        help: IntatisLocalization.string("Stop"),
+                        action: onCancelCurrent)
+                },
                 accessory: {
-                    HStack(spacing: 10) {
-                        if let composerAccessory {
-                            composerAccessory
-                        } else if let latestTurnStats {
-                            IntatisTurnStatsSummaryView(stats: latestTurnStats, style: threadStyle)
-                        }
-                        if isWorking, let onCancelCurrent {
-                            Button("Cancel task", action: onCancelCurrent)
-                                .intatisGlassButton()
-                                .foregroundStyle(threadStyle.error)
-                                .accessibilityLabel("Cancel current Cowork task")
-                        }
-                    }
+                    IntatisComposerUsageStrip(
+                        stats: latestTurnStats,
+                        style: threadStyle)
                 },
                 onSend: onSend)
         }
@@ -1840,7 +2048,7 @@ private struct CoworkWorkTaskRow: View {
 
     private func detailBlock(_ title: String, value: String) -> some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(title.uppercased())
+            Text(IntatisLocalization.string(title).uppercased())
                 .font(.caption2.bold())
                 .foregroundStyle(style.tertiaryText)
             Text(value)
@@ -1855,7 +2063,7 @@ private struct CoworkWorkTaskRow: View {
                             values: [String],
                             monospaced: Bool = false) -> some View {
         VStack(alignment: .leading, spacing: 3) {
-            Text(title.uppercased())
+            Text(IntatisLocalization.string(title).uppercased())
                 .font(.caption2.bold())
                 .foregroundStyle(style.tertiaryText)
             ForEach(Array(values.enumerated()), id: \.offset) { _, value in
@@ -1873,10 +2081,7 @@ private struct CoworkWorkTaskRow: View {
     }
 
     private var displayStatus: String {
-        task.status
-            .replacingOccurrences(of: "_", with: " ")
-            .replacingOccurrences(of: "-", with: " ")
-            .capitalized
+        intatisLocalizedDisplayStatus(task.status)
     }
 
     private var statusColor: Color {
@@ -1927,7 +2132,9 @@ private struct CoworkTaskLineRow: View {
                         .intatisGlassButton()
                         .disabled(actionDisabled)
                 }
-                Text(task.status).font(.caption).foregroundStyle(style.secondaryText)
+                Text(intatisLocalizedDisplayStatus(task.status))
+                    .font(.caption)
+                    .foregroundStyle(style.secondaryText)
             }
             if !task.detail.isEmpty {
                 Text(task.detail)

@@ -155,6 +155,8 @@ Catalog 编译阶段采用浅覆盖，顺序固定为：
 
 UI 的 rebind 控件与 CLI `/agent rebind` 都调用同一 Orchestrator 边界。UI 可为了减少无效操作在全局工作时禁用控件，但安全性依赖 Orchestrator 的 per-agent idle recheck，而不是界面状态。
 
+Cowork composer 底部的模型 selector 是另一条 main-only submitted-intent 路径：选择动作只更新“下一次 `@main`”的暂存值，即使 current task/worker 正在运行也保持可用，不直接调用 rebind。按下 Send 时把当时的 secret-free exact binding 冻结进 immutable `UserMessagePayload`，并随 outbox、EventLog、FIFO、恢复与 Retry 保持 first-write-wins；新式 main/Goal Send 无 exact binding 时保留草稿并 fail closed。FIFO 到达该 submission 的空闲 execution boundary 后，Orchestrator 在一个 admission-lock hold / EventLog batch 内同时提交可选 `@main` rebind 与该 root 的 created/assigned/queued，持久化成功后才提交 live roster 和 scheduler；Retry 的 rebind/queue 同样原子。新式 Goal 还 durable 保存该 binding，后续 continuation/重启不读取 mutable live/default。Direct ordinary-worker message 不携带该字段；候选撤销或不再可解析时 fail closed，不回退 current/default，也不改 worker、reviewer、GoalVerifier 或 future-agent default。
+
 ## 7. Runtime、并发与控制面
 
 Provider resolution 发生在 agent invocation 边界，而不是 session 启动时把一个 provider 全局注入所有 agent。`ProviderRegistryBox` 按 agent binding 取得 provider；Orchestrator 在模型调用前验证：
@@ -196,6 +198,7 @@ Endpoint/trust-domain 变化本质上是数据出口变化。当前第一阶段�
 ### macOS Cowork
 
 - 新 session 使用当前 provider/model/variant 对应的 exact profile 创建 `@main`。
+- composer 底部菜单显示并暂存下一次发送给 `@main` 的 exact profile；忙时仍可选择，选择不改变当前 invocation，Send 才把当时值冻结进该 submission，FIFO 到执行边界才 main-only rebind。
 - Project Settings 中的默认 profile 只标注为未来新 agent 默认。
 - roster 显示每个 ordinary agent 的安全 profile label、model/variant 和 resolved/unresolved 状态。
 - host 可从安全列表为 idle agent rebind；UI 不展示 endpoint、options 或 credential。
@@ -246,6 +249,7 @@ Endpoint/trust-domain 变化本质上是数据出口变化。当前第一阶段�
 - 两个 agent 解析各自 provider/model；
 - explicit spawn allowlist、exact inheritance、delegate target snapshot；
 - busy rebind 拒绝、idle durable rebind 只影响未来 task；
+- bottom selector busy 可选但不 live rebind；A/B 连续 Send 各自冻结 exact binding，outbox/replay/Retry 保真，direct worker message 为 nil，unavailable profile no fallback，且 worker/reviewer/GoalVerifier/future default 不变；
 - catalog update 与 admission/rebind 串行化，异步 resolver suspension 后重新验证 approved map/roster/fingerprint，阻止 TOCTOU；
 - ordinary attach 在 permission review `await` 后、durable admission 前重新 exact-resolve并核对 review/resolve/commit host-approved catalog snapshots；fresh `bootstrapMainAgent` 在 admission wait 前后复核 empty-session facts，并以锁外二次 resolve + 锁内 catalog recheck 关闭竞态；
 - `.tool_call` audit 在 append 前分类参数：unknown/invalid/inference-control args 只落 redacted placeholder + count/redacted，不保留 raw-value digest；其他有效参数也 secret-scrub/限长，只有未脱敏/未截断的 canonical 参数可带 additive digest；旧事件继续兼容解码；
@@ -256,7 +260,7 @@ Endpoint/trust-domain 变化本质上是数据出口变化。当前第一阶段�
 - UI/CLI 只展示安全字段，URL/credential-shaped 值不能进入 roster label。
 - provider/custom runtime 错误在 durable boundary 再脱敏，route/trust/egress permission metadata 不泄露 URL 或 credential。
 
-对应 focused suites 和命令见 `docs/TESTING.md`。真实产品验收至少要用两个 profile 在一个 session 中启动两个 agent，观察各自真实上游/model/effort，同时验证修改未来-agent default 不改变现有 agent，并验证 busy rebind 被拒绝、idle rebind 后只有下一次调用改变。
+对应 focused suites 和命令见 `docs/TESTING.md`。真实产品验收至少要用两个 profile 在一个 session 中启动两个 agent，观察各自真实上游/model/effort，同时验证修改未来-agent default 不改变现有 agent，并验证 Project Settings/CLI 的 busy rebind 被拒绝、idle rebind 后只有下一次调用改变；还要在 current work 期间用底部 selector 连续冻结两个不同的 next-main submission，确认当前 work、direct worker、控制面与 future default 均不变化。
 
 2026-07-16 在本轮终审追加项之前的验证基线是：per-agent focused run 62/62、CLI offline `intatis selftest`、完整 SwiftPM 734 tests（14 skipped，0 failures）、IntatisMac macOS Debug 与 IntatisiOS Simulator Debug build 均通过。Computer Use 在当时最新 Debug app 中确认旧 session 对 unresolved `@main` fail closed、composer/Send disabled，以及 Project sheet 的 future default profile 和逐 agent `Legacy`/Rebind menu；未保存 rebind、未发送 provider 请求。随后新增的 diagnostic URL redaction、HTTP 30x no-follow、CLI restore-main/selection fail-closed、main/control-plane startup gate + unresolved-worker invocation isolation、opaque durable variant ID 与 attach/bootstrap TOCTOU 收口，其最终复跑结果以本轮总体验证记录为准，不能沿用上述基线冒充新改动已验证。
 

@@ -99,6 +99,7 @@ workspace-relevant observations
 - `spawn_agent` 未指定 profile 时精确继承 issuer binding；显式 profile 必须 host-approved，不能让模型直接提交 raw endpoint/model/options。
 - `delegate_task` 不改变目标 binding，权限 target 必须包含其安全快照并在执行前复核。
 - rebind 是 host-only、idle-only、durable-first 的显式状态迁移，只影响未来 invocation；reviewer 不参与普通 rebind。
+- Cowork composer 的底部 selector 只暂存下一次 `@main`，选择本身不是 rebind，当前 task/agent 工作时仍可修改。每次 Send 把当时的 exact binding 冻结进 immutable submitted intent；新式 main/Goal Send 不得接受 `nil`。FIFO 到该 submission 的空闲执行边界后，必须在同一 admission lock / EventLog batch 中原子提交可选 main rebind 与对应 root/retry queue，成功后才更新 live roster；durable Goal 的后续 continuation/恢复继续使用 Goal Send 的 binding。Direct worker message 不携带该字段；失败不得 fallback，也不得改 worker、reviewer、GoalVerifier 或 future-agent default。
 - legacy 无 binding、missing revision、definition mismatch、unsupported wire 或显式能力不兼容一律 fail closed，不得回退 current/default/同名 model。
 - GUI 与 CLI 的 recovery gate 不得混写。GUI 把 `@main` exact resolution 与 reviewer/control-plane readiness 作为提交后的执行状态，不作为 composer 编辑或本地 admission 条件；完成 Goal 对账后只为新工作释放 scheduler，恢复出的 root tasks 保持 paused/interrupted，直至精确 submission Retry。CLI 则保留显式 `/auto|/default` 与 data-plane resume 边界。active Goal 冷启动只 reconcile 并 durable pause（或 budget-limit），显式 Resume 才创建 continuation。non-empty CLI session 缺失 `@main` 时只能由 host `/agent restore-main <path> <profile-id>` 显式恢复，不能套用 today default。ordinary worker unresolved 不得冻结全局 scheduler：它自己的 queued invocation 必须在 provider request 前 durable fail closed 并清除 active/queued fence，其他 agents 继续运行，随后 host 才可在该 worker idle 时 rebind。
 - Modern CLI unqualified model 只有唯一 route match 时才选择该 route；explicit reasoning 必须命中 configured variant/base effort，否则 fail closed，不能合成 synthetic profile。
@@ -360,6 +361,7 @@ same model with different variants/connections/credential references remains iso
 implicit spawn inherits the issuer's complete exact binding; explicit profile is host-approved and raw model/profile ambiguity is rejected
 TaskContract freezes inference binding; live roster mismatch fails before provider dispatch
 busy rebind is rejected; host-only idle rebind persists previous/new binding before memory change and affects only future invocations
+Cowork bottom selector stays available while work is active, stages only the next @main binding, and each Send freezes an independent exact value that survives FIFO/outbox/replay/retry; direct worker messages carry none and no fallback or control-plane/default retarget is allowed
 delegate authorization snapshots the target's exact safe inference binding including route/trust/egress classification and revalidates its derived fingerprint after review and prepare
 catalog update and admission/rebind share a lock; spawn/rebind and AgentLoop pre-prepare execution revalidation reject catalog/roster changes that occur while an async exact resolver is suspended
 ordinary attach revalidates the exact approved profile after permission-review await; bootstrapMain revalidates exact profile plus empty-session facts around its admission wait before durable admission

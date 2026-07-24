@@ -52,7 +52,7 @@ struct ArtifactProgressRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Text(progress.state).font(.caption.bold())
+                Text(localizedState).font(.caption.bold())
                 Spacer(minLength: 6)
                 Text("\(Int(clampedProgress * 100))%")
                     .font(.caption)
@@ -67,6 +67,17 @@ struct ArtifactProgressRow: View {
     private var clampedProgress: Double {
         min(max(progress.progress, 0), 1)
     }
+
+    private var localizedState: String {
+        switch progress.state.lowercased() {
+        case "queued": return IntatisLocalization.string("queued")
+        case "running": return IntatisLocalization.string("running")
+        case "completed": return IntatisLocalization.string("completed")
+        case "failed": return IntatisLocalization.string("failed")
+        case "cancelled": return IntatisLocalization.string("cancelled")
+        default: return progress.state
+        }
+    }
 }
 
 struct ArtifactCardView: View {
@@ -74,7 +85,7 @@ struct ArtifactCardView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(artifact.kind).font(.caption.bold())
+            Text(localizedKind).font(.caption.bold())
             content
             if let prompt = artifact.prompt {
                 Text(prompt).font(.caption2).foregroundStyle(.secondary).lineLimit(3)
@@ -115,8 +126,17 @@ struct ArtifactCardView: View {
         #endif
     }
 
+    private var localizedKind: String {
+        switch artifact.kind.lowercased() {
+        case "image": return IntatisLocalization.string("image")
+        case "transcript": return IntatisLocalization.string("transcript")
+        default: return artifact.kind
+        }
+    }
+
     private var fileText: String {
-        (try? String(contentsOfFile: artifact.path, encoding: .utf8)) ?? "(transcript)"
+        (try? String(contentsOfFile: artifact.path, encoding: .utf8))
+            ?? IntatisLocalization.string("(transcript)")
     }
 }
 #endif

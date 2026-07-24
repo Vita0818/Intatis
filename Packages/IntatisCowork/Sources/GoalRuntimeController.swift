@@ -452,7 +452,8 @@ public actor GoalRuntimeController {
     public func createGoal(objective: String,
                            successCriteria: [String] = [],
                            constraints: [String] = [],
-                           tokenBudget: Int? = nil) async throws -> Goal {
+                           tokenBudget: Int? = nil,
+                           userMessage: UserMessagePayload? = nil) async throws -> Goal {
         await acquireGoalMutationLock()
         defer { releaseGoalMutationLock() }
         guard !Task.isCancelled,
@@ -477,14 +478,16 @@ public actor GoalRuntimeController {
                     constraints: Self.cleaned(constraints),
                     tokenBudget: tokenBudget),
                 explicitGoalIntent: true,
-                canCreate: true)
+                canCreate: true,
+                mainAgentInferenceBinding: userMessage?.mainAgentInferenceBinding)
         } else {
             goal = Goal(
                 sessionID: sessionID,
                 objective: objective,
                 successCriteria: Self.cleaned(successCriteria),
                 constraints: Self.cleaned(constraints),
-                tokenBudget: tokenBudget)
+                tokenBudget: tokenBudget,
+                mainAgentInferenceBinding: userMessage?.mainAgentInferenceBinding)
             try await append(.goalCreated(GoalCreatedPayload(goal: goal)))
         }
         await launchCurrentGoalIfEligible(allowDuringGoalMutation: true)
@@ -1546,11 +1549,16 @@ public actor GoalRuntimeController {
             goal: runGoal,
             run: running,
             projection: runProjection)
+        let inferenceBoundUserMessage = runGoal.mainAgentInferenceBinding.map { binding in
+            UserMessagePayload(
+                text: prompt,
+                mainAgentInferenceBinding: binding)
+        }
         let sendResult = await sendOperation(
             prompt,
             Orchestrator.mainAgentID,
             [],
-            nil,
+            inferenceBoundUserMessage,
             startingGoal.id,
             running.id,
             false,

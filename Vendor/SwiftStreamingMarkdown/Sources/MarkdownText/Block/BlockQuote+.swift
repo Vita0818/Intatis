@@ -8,16 +8,26 @@ import Markdown
 import SwiftUI
 
 extension BlockQuote: BlockConvertible {
-  var quoteTypes: BlockQuoteType {
+  private func quoteTypes(
+    attributeContainer: NSAttributeContainer,
+    config: MarkdownRenderConfig
+  ) -> BlockQuoteType {
     var finalQuoteTypes = [BlockQuoteType]()
 
     for child in children {
-      if let inlineContainer = child as? InlineContainer {
-        // Use our custom extractPlainText method instead of the built-in plainText property
-        // to properly handle attachment citations
-        finalQuoteTypes.append(.text(inlineContainer.extractPlainText(removeHeading: false)))
+      if child is InlineContainer, let blockMarkup = child as? BlockMarkup {
+        let contents = blockMarkup.buildParagraphContent(
+          container: attributeContainer,
+          config: config
+        )
+        finalQuoteTypes.append(.text(contents))
       } else if let blockQuoteContainer = child as? BlockQuote {
-        finalQuoteTypes.append(blockQuoteContainer.quoteTypes)
+        finalQuoteTypes.append(
+          blockQuoteContainer.quoteTypes(
+            attributeContainer: attributeContainer,
+            config: config
+          )
+        )
       }
     }
 
@@ -25,7 +35,22 @@ extension BlockQuote: BlockConvertible {
   }
 
   func convert(attributeContainer: NSAttributeContainer, config: MarkdownRenderConfig) -> MarkdownRenderable {
-    .blockQuote(id: id, item: .init(quoteType: quoteTypes))
+    var quoteContainer = attributeContainer
+    quoteContainer[.font] = config.blockQuoteStyle.textFonts.normal
+    quoteContainer[.typography] = config.blockQuoteStyle.textFonts
+    if let kern = config.blockQuoteStyle.textFonts.preferredLetterSpacing {
+      quoteContainer[.kern] = kern
+    }
+    quoteContainer[.foregroundColor] = MDColor(config.blockQuoteStyle.textColor)
+    return .blockQuote(
+      id: id,
+      item: .init(
+        quoteType: quoteTypes(
+          attributeContainer: quoteContainer,
+          config: config
+        )
+      )
+    )
   }
 }
 

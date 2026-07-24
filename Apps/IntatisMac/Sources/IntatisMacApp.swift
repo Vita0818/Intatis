@@ -3,6 +3,7 @@ import SwiftUI
 import Combine
 import Foundation
 import IntatisCore
+import IntatisProtocol
 import IntatisProviders
 import IntatisConversation
 import IntatisAgentKernel
@@ -76,7 +77,9 @@ final class AppEnvironment: ObservableObject {
         do {
             try switchChatSession(to: SessionID.new())
         } catch {
-            chatSessionError = "Could not start chat session: \(error.localizedDescription)"
+            chatSessionError = IntatisLocalization.format(
+                "Could not start chat session: %@",
+                error.localizedDescription)
         }
     }
 
@@ -84,7 +87,9 @@ final class AppEnvironment: ObservableObject {
         do {
             try switchChatSession(to: session.id)
         } catch {
-            chatSessionError = "Could not resume chat session: \(error.localizedDescription)"
+            chatSessionError = IntatisLocalization.format(
+                "Could not resume chat session: %@",
+                error.localizedDescription)
         }
     }
 
@@ -94,7 +99,8 @@ final class AppEnvironment: ObservableObject {
 
     func deleteChatSession(_ session: SessionID) async throws {
         guard !runtimeManager.isBusy(kind: .chat, sessionID: session) else {
-            throw IntatisError.io("Wait for the Chat response to finish before deleting this session.")
+            throw IntatisError.io(IntatisLocalization.string(
+                "Wait for the Chat response to finish before deleting this session."))
         }
         if session == chatSessionID {
             let replacement = recentChatSessions()
@@ -102,13 +108,15 @@ final class AppEnvironment: ObservableObject {
                 ?? SessionID.new()
             try switchChatSession(to: replacement)
         }
-        try await runtimeManager.removeRuntime(
+        try await runtimeManager.removeSession(
             kind: .chat,
             sessionID: session,
-            reason: "Chat session deleted by user")
-        try SessionHistoryStore.deleteSession(
-            root: AppConfig.appSupportDir(),
-            session: session)
+            reason: "Chat session deleted by user"
+        ) {
+            try SessionHistoryStore.deleteSession(
+                root: AppConfig.appSupportDir(),
+                session: session)
+        }
     }
 
     func handleRemovedChatRuntime(sessionID: SessionID) {
@@ -119,7 +127,9 @@ final class AppEnvironment: ObservableObject {
         do {
             try switchChatSession(to: replacement)
         } catch {
-            chatSessionError = "The removed Chat session could not be replaced: \(error.localizedDescription)"
+            chatSessionError = IntatisLocalization.format(
+                "The removed Chat session could not be replaced: %@",
+                error.localizedDescription)
         }
     }
 
@@ -248,13 +258,15 @@ final class AppEnvironment: ObservableObject {
         guard let inferenceCatalogSnapshot else {
             primaryWorkspace.release()
             throw IntatisError.config(
-                inferenceCatalogError ?? "Inference profiles are still loading. Try again in a moment.")
+                inferenceCatalogError ?? IntatisLocalization.string(
+                    "Inference profiles are still loading. Try again in a moment."))
         }
         guard let selectedBinding = AppInferenceCatalogCompiler.selectedBinding(
             catalog: providerCatalog,
             snapshot: inferenceCatalogSnapshot) else {
             primaryWorkspace.release()
-            throw IntatisError.config("Choose a resolvable default inference profile before creating Cowork.")
+            throw IntatisError.config(IntatisLocalization.string(
+                "Choose a resolvable default inference profile before creating Cowork."))
         }
         let session = SessionID(rawValue: IDGen.random(prefix: "cowork"))
         do {
@@ -289,7 +301,8 @@ final class AppEnvironment: ObservableObject {
     func makeCoworkViewModel(session: SessionID) async throws -> CoworkViewModel {
         guard let inferenceCatalogSnapshot else {
             throw IntatisError.config(
-                inferenceCatalogError ?? "Inference profiles are still loading. Try again in a moment.")
+                inferenceCatalogError ?? IntatisLocalization.string(
+                    "Inference profiles are still loading. Try again in a moment."))
         }
         return try await runtimeManager.coworkRuntime(sessionID: session) { [self] in
         let coworkLog = try EventLog(session: session, fileURL: AppConfig.sessionFile(session))
@@ -348,7 +361,9 @@ final class AppEnvironment: ObservableObject {
                 }
             }
         } catch {
-            let message = "Legacy workspace access remains in compatibility mode: \(error.localizedDescription)"
+            let message = IntatisLocalization.format(
+                "Legacy workspace access remains in compatibility mode: %@",
+                error.localizedDescription)
             warning = warning.map { "\($0) \(message)" } ?? message
         }
         return try makeCoworkViewModel(
@@ -488,7 +503,9 @@ final class AppEnvironment: ObservableObject {
             // Keep a previously valid snapshot/registry alive for exact
             // bindings. Initial startup remains fail-closed until a valid
             // durable catalog can be loaded or reconciled.
-            inferenceCatalogError = "Versioned inference profiles are unavailable: \(error.localizedDescription)"
+            inferenceCatalogError = IntatisLocalization.format(
+                "Versioned inference profiles are unavailable: %@",
+                error.localizedDescription)
         }
     }
 
@@ -574,7 +591,7 @@ struct WorkspaceSessionHome: View {
                             title: sessionsTitle,
                             sessions: sessions,
                             workspacePath: workspacePath,
-                            actionTitle: "Resume",
+                            actionTitle: IntatisLocalization.string("Resume"),
                             onAction: onResume)
                     }
 
@@ -652,24 +669,34 @@ private struct RecentSessionList: View {
 
     private func metadata(for session: AppSessionSummary) -> String {
         let timestamp = session.updatedAt == .distantPast
-            ? "Unknown date"
+            ? IntatisLocalization.string("Unknown date")
             : session.updatedAt.formatted(date: .abbreviated, time: .shortened)
         let workspace = workspacePath(session.id).map { " · \($0)" } ?? ""
-        return "\(session.eventCount) events · \(timestamp)\(workspace)"
+        let count = session.eventCount == 1
+            ? IntatisLocalization.string("1 event")
+            : IntatisLocalization.format("%lld events", Int64(session.eventCount))
+        return "\(count) · \(timestamp)\(workspace)"
     }
 }
 
 struct CodeSessionView: View {
     @ObservedObject var vm: CodeViewModel
+    let sessionTitle: String
     let catalog: AppProviderCatalog
     let onSelectModel: (String, String, String?) -> Void
     let onShowSessions: () -> Void
     let onNewSession: () -> Void
+    @Binding var showsInspector: Bool
     @Environment(\.colorScheme) private var scheme
 
     var body: some View {
-        CodeShell(items: vm.items,
-                  pending: vm.pendingPermission,
+            CodeShell(items: vm.items,
+                      presentationScope: IntatisThreadPresentationScope(
+                        kind: .code,
+                        sessionID: vm.sessionID),
+                      sessionTitle: sessionTitle,
+                      thinkingScopeID: vm.sessionID.rawValue,
+                      pending: vm.pendingPermission,
                   permissionNotice: vm.permissionNotice,
                   latestTurnStats: vm.latestTurnStats,
                   isWorking: vm.isWorking,
@@ -679,36 +706,27 @@ struct CodeSessionView: View {
                   threadStyle: .intatisMac(scheme),
                   onShowSessions: onShowSessions,
                   onNewSession: onNewSession,
-                  composerAccessory: AnyView(IntatisComposerAccessory(
+                  composerAccessory: AnyView(IntatisComposerModelControl(
                     catalog: catalog,
                     isBusy: vm.isWorking,
-                    latestTurnStats: vm.latestTurnStats,
-                    contextLabel: contextLabel,
                     onSelectModel: onSelectModel)),
+                  showsInspector: $showsInspector,
                   input: $vm.input,
                   onSend: { vm.send() },
+                  onCancelCurrent: { vm.cancelCurrentTurn() },
                   onResolve: { vm.resolvePermission($0) })
     }
 
-    private var contextLabel: String? {
-        guard let promptTokens = vm.latestTurnStats?.promptTokens else { return nil }
-        let formatted = Self.numberFormatter.string(from: NSNumber(value: promptTokens)) ?? "\(promptTokens)"
-        return "Context \(formatted) tok"
-    }
-
-    private static let numberFormatter: NumberFormatter = {
-        let formatter = NumberFormatter()
-        formatter.numberStyle = .decimal
-        return formatter
-    }()
 }
 
 struct CoworkSessionView: View {
     @ObservedObject var vm: CoworkViewModel
+    let sessionTitle: String
     let catalog: AppProviderCatalog
     let onShowSessions: () -> Void
     let onNewSession: () -> Void
     let onSessionDidBecomeReady: () -> Void
+    @Binding var showsInspector: Bool
     @State private var showProjectSettings = false
     @State private var showGoalEditor = false
     @State private var showGoalClearConfirmation = false
@@ -725,13 +743,17 @@ struct CoworkSessionView: View {
     }
 
     private var isCoworkBusy: Bool {
-        vm.isWorking || vm.isGoalContinuing
+        vm.isAgentWorkActive || vm.isGoalContinuing
     }
 
     var body: some View {
         VStack(spacing: 0) {
-            permissionReviewerBanner
             CoworkShell(items: vm.items,
+                        presentationScope: IntatisThreadPresentationScope(
+                            kind: .cowork,
+                            sessionID: vm.sessionID),
+                        sessionTitle: sessionTitle,
+                        thinkingScopeID: vm.sessionID.rawValue,
                         agents: vm.agents,
                         pending: vm.pendingPermission,
                         permissionNotice: vm.permissionNotice,
@@ -751,34 +773,55 @@ struct CoworkSessionView: View {
                         onShowSessions: onShowSessions,
                         onNewSession: onNewSession,
                         onShowProjectSettings: { showProjectSettings = true },
-                        composerAccessory: AnyView(HStack(spacing: 8) {
+                        composerAccessory: AnyView(CoworkInferenceAccessory(
+                            options: vm.inferenceProfileOptions,
+                            selectedBinding: vm.nextMainInferenceBinding,
+                            isDisabled: !hasMainAgent,
+                            onSelect: { binding in
+                                vm.selectMainInferenceProfileForNextSubmission(binding)
+                            })),
+                        composerInputAccessory: AnyView(HStack(
+                            alignment: .center,
+                            spacing: IntatisComposerControlMetrics.rowSpacing
+                        ) {
                             Button {
                                 showAttachmentImporter = true
                             } label: {
-                                Image(systemName: "paperclip")
+                                Label(
+                                    IntatisLocalization.string("Attach files"),
+                                    systemImage: "paperclip")
+                                    .intatisComposerIconLabel()
                             }
-                            .buttonStyle(.borderless)
-                            .help("Attach files")
-                            .accessibilityLabel("Attach files")
+                            .intatisCompactIconButton()
+                            .help(IntatisLocalization.string("Attach files"))
+                            .accessibilityLabel(IntatisLocalization.string("Attach files"))
                             .accessibilityIdentifier("cowork.composer.attach")
                             if !vm.draftAttachments.isEmpty {
-                                Menu("\(vm.draftAttachments.count) attached") {
+                                Menu(IntatisLocalization.format(
+                                    "%lld attached",
+                                    Int64(vm.draftAttachments.count))) {
                                     ForEach(vm.draftAttachments) { attachment in
-                                        Button("Remove \(attachment.name)") {
+                                        Button(IntatisLocalization.format(
+                                            "Remove %@",
+                                            attachment.name)) {
                                             vm.removeDraftAttachment(attachment.id)
                                         }
                                     }
                                 }
+                                .controlSize(.regular)
                                 .menuStyle(.borderlessButton)
                                 .accessibilityIdentifier("cowork.composer.attachments")
                             }
-                            CoworkInferenceAccessory(
-                                profileLabel: vm.mainInferenceDisplayLabel,
-                                contextLabel: contextLabel)
-                        }),
+                        }
+                        .frame(
+                            minHeight: IntatisComposerControlMetrics.controlHeight,
+                            alignment: .center)),
+                        showsInspector: $showsInspector,
                         input: $vm.input,
                         onSend: { vm.send() },
-                        onCancelCurrent: vm.isWorking ? { vm.cancelCurrentTask() } : nil,
+                        onCancelCurrent: isCoworkBusy
+                            ? { vm.cancelCurrentActivity() }
+                            : nil,
                         onResolve: { vm.resolvePermission($0) },
                         onRemoveAgent: { vm.removeAgent(name: $0) },
                         onRetryTask: { vm.retryFailedTask(id: $0) },
@@ -824,122 +867,15 @@ struct CoworkSessionView: View {
         }
     }
 
-    private var permissionReviewerBanner: some View {
-        let presentation = permissionReviewerPresentation
-        return HStack(spacing: 9) {
-            if presentation.isBusy {
-                ProgressView()
-                    .controlSize(.small)
-                    .frame(width: 16, height: 16)
-                    .accessibilityLabel("Starting permission reviewer")
-            } else {
-                Image(systemName: presentation.systemImage)
-                    .foregroundStyle(presentation.tint)
-                    .frame(width: 16)
-                    .accessibilityHidden(true)
-            }
-            Text(presentation.title)
-                .font(.caption.bold())
-                .foregroundStyle(presentation.tint)
-            Text(presentation.detail)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(2)
-            Spacer(minLength: 8)
-            if vm.needsPrimaryWorkspaceAuthorization {
-                Button("Reauthorize Workspace") {
-                    vm.reauthorizePrimaryWorkspace()
-                }
-                .buttonStyle(.borderless)
-                .font(.caption.bold())
-                .accessibilityIdentifier("cowork.workspace.reauthorize")
-            }
-            if vm.permissionReviewerStatus.canRetry {
-                Button("Retry") { vm.retryAutomaticPermissionReview() }
-                    .buttonStyle(.borderless)
-                    .font(.caption.bold())
-            }
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 8)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .overlay(alignment: .bottom) { Divider().opacity(0.45) }
-        .help("\(presentation.title): \(presentation.detail)")
-    }
-
-    private var permissionReviewerPresentation: (
-        title: String,
-        detail: String,
-        systemImage: String,
-        tint: Color,
-        isBusy: Bool
-    ) {
-        switch vm.permissionReviewerStatus {
-        case .disabled:
-            return (
-                "Permission reviewer disabled",
-                "You can keep editing and submitting; ask-class tools fail closed until automatic review is active.",
-                "shield.slash",
-                .secondary,
-                false)
-        case .enabling:
-            return (
-                "Starting permission reviewer…",
-                "Ordinary work can proceed; ask-class tools wait for or fail closed without automatic review.",
-                "shield",
-                .secondary,
-                true)
-        case .enabled(let reviewer):
-            return (
-                "@\(reviewer.rawValue) enabled",
-                "Eligible requests are reviewed automatically; hard policy denials remain final.",
-                "checkmark.shield.fill",
-                .green,
-                false)
-        case .fallback(let reason):
-            return (
-                "Permission reviewer unavailable",
-                reason,
-                "person.crop.circle.badge.questionmark",
-                .orange,
-                false)
-        case .degraded(let reason):
-            return (
-                "Permission reviewer degraded",
-                reason,
-                "exclamationmark.shield.fill",
-                .orange,
-                false)
-        case .failed(let reason):
-            return (
-                "Permission reviewer failed",
-                "\(reason) Input remains available; ask-class tools fail closed until automatic review starts.",
-                "exclamationmark.shield.fill",
-                .red,
-                false)
-        }
-    }
-
-    private var contextLabel: String? {
-        guard let promptTokens = vm.latestTurnStats?.promptTokens else { return nil }
-        let formatted = Self.numberFormatter.string(from: NSNumber(value: promptTokens)) ?? "\(promptTokens)"
-        return "Context \(formatted) tok"
-    }
-
-    private static let numberFormatter: NumberFormatter = {
-        let formatter = NumberFormatter()
-        formatter.numberStyle = .decimal
-        return formatter
-    }()
-
     private var goalEditorValidationMessage: String? {
         if let goalEditorSubmissionError { return goalEditorSubmissionError }
         if goalObjectiveDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return "A Goal objective is required."
+            return IntatisLocalization.string("A Goal objective is required.")
         }
         let budget = goalTokenBudgetDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         if !budget.isEmpty, Int(budget).map({ $0 > 0 }) != true {
-            return "Token budget must be a positive whole number, or left empty for no budget."
+            return IntatisLocalization.string(
+                "Token budget must be a positive whole number, or left empty for no budget.")
         }
         return nil
     }
@@ -960,7 +896,8 @@ struct CoworkSessionView: View {
             catalog: catalog,
             inferenceProfileOptions: vm.inferenceProfileOptions,
             onAddWorkspace: {
-                if let url = WorkspaceAccess.choose(prompt: "Choose Project Workspace") {
+                if let url = WorkspaceAccess.choose(
+                    prompt: IntatisLocalization.string("Choose Project Workspace")) {
                     vm.addProjectWorkspace(url)
                 }
             })
@@ -1081,28 +1018,88 @@ struct CoworkSessionView: View {
 }
 
 private struct CoworkInferenceAccessory: View {
-    let profileLabel: String
-    let contextLabel: String?
+    let options: [AppInferenceProfileOption]
+    let selectedBinding: AgentInferenceBinding?
+    let isDisabled: Bool
+    let onSelect: (AgentInferenceBinding) -> Void
+    @Environment(\.colorScheme) private var scheme
+
+    private var selectedOption: AppInferenceProfileOption? {
+        guard let selectedBinding else { return nil }
+        return options.first { $0.binding == selectedBinding }
+    }
+
+    private var modelLabel: String {
+        selectedOption?.modelTitle ?? IntatisLocalization.string("Inference unavailable")
+    }
+
+    private var menuProviders: [ProviderModelMenuProvider] {
+        Dictionary(grouping: options, by: \.providerID)
+            .compactMap { providerID, providerOptions in
+                guard let first = providerOptions.first else { return nil }
+                return ProviderModelMenuProvider(
+                    id: providerID,
+                    title: first.providerTitle,
+                    models: providerOptions.map { option in
+                        ProviderModelMenuModel(
+                            id: option.id,
+                            modelID: option.modelID,
+                            variantID: option.variantID,
+                            title: option.modelTitle,
+                            detail: option.variantTitle)
+                    })
+            }
+            .sorted { lhs, rhs in
+                [lhs.title, lhs.id].lexicographicallyPrecedes([rhs.title, rhs.id])
+            }
+    }
 
     var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "point.3.connected.trianglepath.dotted")
-                .foregroundStyle(.secondary)
-                .accessibilityHidden(true)
-            Text(profileLabel)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .accessibilityIdentifier("cowork.main.inference-profile")
-            if let contextLabel {
-                Divider().frame(height: 12)
-                Text(contextLabel)
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-            }
+        ProviderModelSelectionMenu(
+            providers: menuProviders,
+            selectedProviderID: selectedOption?.providerID ?? "",
+            selectedModelID: selectedOption?.modelID ?? "",
+            selectedVariantID: selectedOption?.variantID,
+            isBusy: isDisabled || options.isEmpty,
+            onSelect: { providerID, modelID, variantID in
+                guard let option = options.first(where: {
+                    $0.providerID == providerID
+                        && $0.modelID == modelID
+                        && $0.variantID == variantID
+                }) else { return }
+                onSelect(option.binding)
+            }) {
+                HStack(spacing: 8) {
+                    Text(modelLabel)
+                        .font(IntatisType.body(13, .semibold))
+                        .foregroundStyle(IntatisTheme.deepText(scheme))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(IntatisTheme.tertiaryText(scheme))
+                        .accessibilityHidden(true)
+                }
+                .intatisComposerSelectionLabel()
         }
-        .help("Existing agents keep their exact inference profile revision. Change defaults or explicitly rebind agents in Cowork Project settings.")
+        .intatisComposerSelectionMenu()
+        .help(helpText)
+        .accessibilityLabel(Text(IntatisLocalization.format(
+            "Next @main model: %@",
+            modelLabel)))
+        .accessibilityIdentifier("cowork.main.inference-profile")
+    }
+
+    private var helpText: String {
+        if options.isEmpty {
+            return IntatisLocalization.string("No configured inference profiles are available")
+        }
+        if isDisabled {
+            return IntatisLocalization.string(
+                "@main must be attached before selecting its next model")
+        }
+        return IntatisLocalization.string(
+            "Model for the next @main message. Current work and other agents keep their existing models.")
     }
 }
 
@@ -1111,7 +1108,32 @@ private struct CoworkInferenceAccessory: View {
 final class IntatisApplicationDelegate: NSObject, NSApplicationDelegate {
     private var terminationTask: Task<Void, Never>?
 
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        #if INTATIS_RENDERER_VALIDATION
+        let arguments = ProcessInfo.processInfo.arguments
+        guard arguments.contains("-IntatisRendererFixture"),
+              let rawSeconds = Self.argumentValue(
+                  after: "-IntatisRendererFixtureAutoExitSeconds"),
+              let seconds = Double(rawSeconds),
+              (1...300).contains(seconds)
+        else { return }
+
+        // Keep watchdog auto-exit independent of SwiftUI view-task lifetime.
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) {
+            NSApplication.shared.terminate(nil)
+        }
+        #endif
+    }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        #if INTATIS_RENDERER_VALIDATION
+        // The offline renderer fixture never creates AppEnvironment or session runtimes.
+        // Let its watchdog-owned auto-exit complete inside the containment window
+        // instead of paying the production runtime-drain deadline.
+        if ProcessInfo.processInfo.arguments.contains("-IntatisRendererFixture") {
+            return .terminateNow
+        }
+        #endif
         let manager = AppSessionRuntimeManager.shared
         if manager.state == .stopped {
             return .terminateNow

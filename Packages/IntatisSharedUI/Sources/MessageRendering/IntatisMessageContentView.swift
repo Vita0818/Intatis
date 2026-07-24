@@ -84,6 +84,7 @@ public struct IntatisMessageContentView: View {
     let style: IntatisThreadStyle
 
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @StateObject private var lifecycleGate = IntatisMessageProjectionLifecycleGate()
     @StateObject private var richState = IntatisMicrosoftMarkdownRenderState()
     @StateObject private var rawState: IntatisRawTextProjectionState
@@ -126,7 +127,7 @@ public struct IntatisMessageContentView: View {
                     .accessibilityIdentifier("intatis.message.microsoft.\(messageID)")
             } else {
                 Text(verbatim: rawState.text(for: rawProjectionRevision))
-                    .font(.system(size: 15))
+                    .font(.system(size: 15 * typographyRevision.scale))
                     .foregroundStyle(style.primaryText)
                     .textSelection(.enabled)
                     .accessibilityIdentifier("intatis.message.plain.\(messageID)")
@@ -183,7 +184,12 @@ public struct IntatisMessageContentView: View {
             rawText: rawText,
             isComplete: isComplete,
             appearance: IntatisMarkdownAppearanceRevision(colorScheme),
+            typography: typographyRevision,
             configurationRevision: IntatisMarkdownRendererLimits.configurationRevision)
+    }
+
+    private var typographyRevision: IntatisMarkdownTypographyRevision {
+        IntatisMarkdownTypographyRevision(dynamicTypeSize)
     }
 
     private var richRequest: IntatisMarkdownRenderRequest {

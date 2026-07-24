@@ -2,9 +2,9 @@
 import Combine
 import CryptoKit
 import SwiftUI
-import SwiftStreamingMarkdown
 import XCTest
 @testable import IntatisSharedUI
+@testable import SwiftStreamingMarkdown
 
 private enum MarkdownRenderingTestError: Error {
     case timedOut
@@ -54,6 +54,25 @@ private func waitForPublishedMarkdown(
 }
 
 final class MessageRenderingTests: XCTestCase {
+    private func inlineMathAttachmentCount(
+        in document: RenderableDocument
+    ) -> Int {
+        document.attributedStrings.reduce(into: 0) { count, string in
+            string.enumerateAttribute(
+                .attachment,
+                in: NSRange(location: 0, length: string.length),
+                options: []
+            ) { value, _, _ in
+                guard let attachment = value as? NSTextAttachment,
+                      attachment.fileType
+                        == InlineMathAttachment.typeIdentifier else {
+                    return
+                }
+                count += 1
+            }
+        }
+    }
+
     private func rawRevision(
         messageID: String = "raw",
         lane: IntatisRawTextProjectionLane = .plain,
@@ -73,6 +92,7 @@ final class MessageRenderingTests: XCTestCase {
         text: String,
         isComplete: Bool = true,
         appearance: IntatisMarkdownAppearanceRevision = .light,
+        typography: IntatisMarkdownTypographyRevision = .large,
         style: IntatisThreadStyle = .standard(.light)
     ) -> IntatisMarkdownRenderRequest {
         IntatisMarkdownRenderRequest(
@@ -81,6 +101,7 @@ final class MessageRenderingTests: XCTestCase {
                 rawText: text,
                 isComplete: isComplete,
                 appearance: appearance,
+                typography: typography,
                 configurationRevision: IntatisMarkdownRendererLimits.configurationRevision),
             style: IntatisMarkdownStyleSnapshot(style))
     }
@@ -181,6 +202,7 @@ final class MessageRenderingTests: XCTestCase {
             rawText: text,
             isComplete: false,
             appearance: .light,
+            typography: .large,
             configurationRevision: IntatisMarkdownRendererLimits.configurationRevision)
         let first = IntatisMarkdownRenderRequest(
             revision: revision,
@@ -215,6 +237,150 @@ final class MessageRenderingTests: XCTestCase {
         XCTAssertEqual(state.publishedDocument?.request, replacement)
         state.deactivate()
         withExtendedLifetime(observation) {}
+    }
+
+    @MainActor
+    func testTypographyOnlyRequestChangeSupersedesOldParseAndScalesConfiguration() async throws {
+        let text = "paragraph with $x$ math\n\n"
+            + String(repeating: "paragraph\n\n", count: 999)
+        let large = renderRequest(
+            messageID: "typography",
+            text: text,
+            isComplete: false,
+            typography: .large)
+        let accessibility = renderRequest(
+            messageID: "typography",
+            text: text,
+            isComplete: false,
+            typography: .accessibility3)
+
+        XCTAssertNotEqual(large.revision, accessibility.revision)
+        XCTAssertNotEqual(large, accessibility)
+        XCTAssertEqual(
+            IntatisMarkdownTypographyRevision(DynamicTypeSize.large),
+            .large)
+        XCTAssertEqual(
+            IntatisMarkdownTypographyRevision(DynamicTypeSize.accessibility3),
+            .accessibility3)
+
+        let baseline = IntatisMicrosoftMarkdownRenderState.makeConfiguration(
+            style: .standard(.light),
+            typography: .large)
+        let scaled = IntatisMicrosoftMarkdownRenderState.makeConfiguration(
+            style: .standard(.light),
+            typography: .accessibility3)
+        XCTAssertEqual(
+            baseline.paragraphStyle.textFonts,
+            MarkdownRenderConfig.default.paragraphStyle.textFonts)
+        XCTAssertEqual(
+            scaled.paragraphStyle.textFonts.normal.pointSize,
+            baseline.paragraphStyle.textFonts.normal.pointSize
+                * IntatisMarkdownTypographyRevision.accessibility3.scale,
+            accuracy: 0.001)
+        XCTAssertEqual(
+            scaled.headingStyle.h1Font.normal.pointSize,
+            baseline.headingStyle.h1Font.normal.pointSize
+                * IntatisMarkdownTypographyRevision.accessibility3.scale,
+            accuracy: 0.001)
+        XCTAssertEqual(
+            scaled.tableStyle.textFonts.normal.pointSize,
+            baseline.tableStyle.textFonts.normal.pointSize
+                * IntatisMarkdownTypographyRevision.accessibility3.scale,
+            accuracy: 0.001)
+        XCTAssertEqual(
+            scaled.inlineStyle.linkTextFont.pointSize,
+            baseline.inlineStyle.linkTextFont.pointSize
+                * IntatisMarkdownTypographyRevision.accessibility3.scale,
+            accuracy: 0.001)
+        XCTAssertEqual(
+            scaled.inlineStyle.codeTextFont.pointSize,
+            baseline.inlineStyle.codeTextFont.pointSize
+                * IntatisMarkdownTypographyRevision.accessibility3.scale,
+            accuracy: 0.001)
+
+        let state = IntatisMicrosoftMarkdownRenderState()
+        state.submit(request: large)
+        state.submit(request: accessibility)
+        let published = try await waitForPublishedMarkdown(
+            state,
+            request: accessibility,
+            attempts: 10_000)
+        XCTAssertEqual(published.request, accessibility)
+        XCTAssertEqual(
+            published.displayConfiguration.paragraphStyle.textFonts.normal.pointSize,
+            scaled.paragraphStyle.textFonts.normal.pointSize,
+            accuracy: 0.001)
+        state.deactivate()
+    }
+
+    @MainActor
+    func testProductionSchedulerPublishesMathAcrossStreamingCorrectionAndReentry() async throws {
+        let state = IntatisMicrosoftMarkdownRenderState()
+        let sequence: [(String, Int)] = [
+            ("$", 0),
+            ("$x", 0),
+            ("$x$", 1),
+            ("$x$ 后", 1),
+            ("$y$ 后", 1),
+        ]
+
+        for (index, item) in sequence.enumerated() {
+            let request = renderRequest(
+                messageID: "math-stream",
+                text: item.0,
+                isComplete: index == sequence.indices.last)
+            state.submit(request: request)
+            let published = try await waitForPublishedMarkdown(
+                state,
+                request: request)
+            XCTAssertEqual(published.request, request)
+            XCTAssertEqual(
+                inlineMathAttachmentCount(in: published.document),
+                item.1,
+                "Unexpected attachment count for \(item.0)")
+        }
+
+        let deliberatelySlow = renderRequest(
+            messageID: "math-stream",
+            text: String(repeating: "paragraph\n\n", count: 2_000)
+                + "$stale$",
+            isComplete: false)
+        let replacement = renderRequest(
+            messageID: "math-stream",
+            text: "$current$",
+            isComplete: true)
+        state.submit(request: deliberatelySlow)
+        state.submit(request: replacement)
+        let current = try await waitForPublishedMarkdown(
+            state,
+            request: replacement,
+            attempts: 10_000)
+        XCTAssertEqual(current.request, replacement)
+        XCTAssertEqual(
+            inlineMathAttachmentCount(in: current.document),
+            1)
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(state.publishedDocument?.request, replacement)
+
+        state.deactivate()
+        XCTAssertNil(state.publishedDocument)
+
+        let reentry = renderRequest(
+            messageID: "math-stream",
+            text: "返回 $z$",
+            isComplete: true,
+            appearance: .dark,
+            typography: .accessibility1,
+            style: .standard(.dark))
+        state.submit(request: reentry)
+        let reentered = try await waitForPublishedMarkdown(
+            state,
+            request: reentry)
+        XCTAssertEqual(reentered.request, reentry)
+        XCTAssertEqual(
+            inlineMathAttachmentCount(in: reentered.document),
+            1)
+        state.deactivate()
     }
 
     func testRawProjectionUsesLeadingTrailingThrottleWithoutResettingDeadline() throws {
@@ -419,24 +585,28 @@ final class MessageRenderingTests: XCTestCase {
             rawText: String(repeating: "a", count: 64 * 1024),
             isComplete: true,
             appearance: .light,
+            typography: .large,
             configurationRevision: 1)
         let oversized = IntatisMarkdownRenderRevision(
             messageID: "oversized",
             rawText: String(repeating: "a", count: 64 * 1024 + 1),
             isComplete: true,
             appearance: .light,
+            typography: .large,
             configurationRevision: 1)
         let multiByteOversized = IntatisMarkdownRenderRevision(
             messageID: "multibyte",
             rawText: String(repeating: "中", count: 22_000),
             isComplete: true,
             appearance: .light,
+            typography: .large,
             configurationRevision: 1)
         let empty = IntatisMarkdownRenderRevision(
             messageID: "empty",
             rawText: "",
             isComplete: false,
             appearance: .light,
+            typography: .large,
             configurationRevision: 1)
 
         XCTAssertTrue(exact.isAdmitted)
@@ -468,8 +638,29 @@ final class MessageRenderingTests: XCTestCase {
         XCTAssertFalse(configuration.shouldAnimateText)
         XCTAssertFalse(configuration.citationConfig.isEnabled)
         XCTAssertFalse(configuration.imageConfig.enabled)
+        XCTAssertEqual(
+            configuration.mathConfig.mode,
+            IntatisMarkdownRendererLimits.mathMode.renderConfig.mode)
         XCTAssertNil(configuration.textContextMenu)
         XCTAssertEqual(configuration.blockSpacing, 18)
+    }
+
+    func testSingleDollarMathIsDefaultAndHasAnIndependentLaunchKillSwitch() {
+        XCTAssertEqual(
+            IntatisMarkdownMathMode.resolve(arguments: ["Intatis"]),
+            .singleDollarInline)
+        XCTAssertEqual(
+            IntatisMarkdownMathMode.resolve(arguments: [
+                "Intatis",
+                IntatisMarkdownRendererLimits.disableSingleDollarMathLaunchArgument,
+            ]),
+            .disabled)
+        XCTAssertEqual(
+            IntatisMarkdownMathMode.singleDollarInline.renderConfig.mode,
+            .singleDollarInline)
+        XCTAssertEqual(
+            IntatisMarkdownMathMode.disabled.renderConfig.mode,
+            .disabled)
     }
 
     func testLinkPolicyAllowsOnlyProductSchemes() throws {
@@ -491,6 +682,7 @@ final class MessageRenderingTests: XCTestCase {
             rawText: raw,
             isComplete: true,
             appearance: .light,
+            typography: .large,
             configurationRevision: IntatisMarkdownRendererLimits.configurationRevision)
 
         state.submit(revision: revision, style: .standard(.light))
@@ -511,6 +703,7 @@ final class MessageRenderingTests: XCTestCase {
                 rawText: String(repeating: "x", count: index),
                 isComplete: false,
                 appearance: .dark,
+                typography: .large,
                 configurationRevision: IntatisMarkdownRendererLimits.configurationRevision)
             state.submit(revision: revision, style: .standard(.dark))
         }
@@ -520,6 +713,7 @@ final class MessageRenderingTests: XCTestCase {
             rawText: finalText,
             isComplete: true,
             appearance: .dark,
+            typography: .large,
             configurationRevision: IntatisMarkdownRendererLimits.configurationRevision)
         state.submit(revision: finalRevision, style: .standard(.dark))
 
@@ -537,6 +731,7 @@ final class MessageRenderingTests: XCTestCase {
             rawText: String(repeating: "paragraph\n\n", count: 2_000),
             isComplete: false,
             appearance: .light,
+            typography: .large,
             configurationRevision: IntatisMarkdownRendererLimits.configurationRevision)
 
         state.submit(revision: revision, style: .standard(.light))
@@ -561,6 +756,7 @@ final class MessageRenderingTests: XCTestCase {
                     rawText: oversized + String(index),
                     isComplete: false,
                     appearance: .light,
+                    typography: .large,
                     configurationRevision: IntatisMarkdownRendererLimits.configurationRevision),
                 style: .standard(.light))
         }
@@ -585,6 +781,7 @@ final class MessageRenderingTests: XCTestCase {
             rawText: corpus,
             isComplete: true,
             appearance: .light,
+            typography: .large,
             configurationRevision: IntatisMarkdownRendererLimits.configurationRevision)
 
         state.submit(revision: revision, style: .standard(.light))
@@ -629,6 +826,7 @@ final class MessageRenderingTests: XCTestCase {
                     rawText: snapshot,
                     isComplete: index == message.deltas.index(before: message.deltas.endIndex),
                     appearance: .light,
+                    typography: .large,
                     configurationRevision: IntatisMarkdownRendererLimits.configurationRevision)
                 state.submit(revision: revision, style: .standard(.light))
                 if revision.isComplete {

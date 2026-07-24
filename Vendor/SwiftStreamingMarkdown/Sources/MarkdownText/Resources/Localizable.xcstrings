@@ -1,6 +1,23 @@
 {
   "sourceLanguage": "en",
   "strings": {
+    "a11y_math_formula": {
+      "comment": "Accessibility label for an inline mathematical formula followed by its TeX source",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Math formula: %@"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "数学公式：%@"
+          }
+        }
+      }
+    },
     "Copied": {
       "extractionState": "stale",
       "localizations": {

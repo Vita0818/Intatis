@@ -185,6 +185,11 @@ public struct Goal: Codable, Sendable, Hashable, Identifiable {
     public var consecutiveBlockedRuns: Int
     public var noProgressRuns: Int
 
+    /// Exact, secret-free `@main` binding selected when this durable Goal was
+    /// submitted. New Goal continuations keep this route across retries and
+    /// restart; legacy/model-created Goals decode it as `nil`.
+    public var mainAgentInferenceBinding: AgentInferenceBinding?
+
     public var createdAt: Date
     public var updatedAt: Date
     public var completedAt: Date?
@@ -215,6 +220,7 @@ public struct Goal: Codable, Sendable, Hashable, Identifiable {
                 blockerFingerprint: String? = nil,
                 consecutiveBlockedRuns: Int = 0,
                 noProgressRuns: Int = 0,
+                mainAgentInferenceBinding: AgentInferenceBinding? = nil,
                 createdAt: Date = Date(),
                 updatedAt: Date? = nil,
                 completedAt: Date? = nil) {
@@ -232,6 +238,7 @@ public struct Goal: Codable, Sendable, Hashable, Identifiable {
         self.blockerFingerprint = blockerFingerprint
         self.consecutiveBlockedRuns = consecutiveBlockedRuns
         self.noProgressRuns = noProgressRuns
+        self.mainAgentInferenceBinding = mainAgentInferenceBinding
         self.createdAt = createdAt
         self.updatedAt = updatedAt ?? createdAt
         self.completedAt = completedAt

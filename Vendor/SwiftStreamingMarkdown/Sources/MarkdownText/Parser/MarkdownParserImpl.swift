@@ -25,15 +25,28 @@ public final class MarkdownParserImpl: MarkdownParser {
   /// Synchronous core used when a caller deliberately keeps the entire parse
   /// and conversion on one actor.
   func parseSynchronously(text: String, option: MarkdownParseOption) -> MarkdownParseResult {
+    let rawDocument = Document(parsing: text)
+    let mathOutput = InlineMathPreprocessor.preprocess(
+      source: text,
+      document: rawDocument,
+      config: option.mathConfig
+    )
     var result: MarkdownParseResult = MarkdownParseResult(
-      document: Document(parsing: text),
-      speculativeRewritten: false
+      document: mathOutput.map {
+        Document(parsing: $0.transformedSource)
+      } ?? rawDocument,
+      speculativeRewritten: false,
+      inlineMathCatalog: mathOutput?.catalog
     )
 
     if option.speculativeRewrite {
       for rewriter in rewriters {
         if let rewrittenDoc = rewriter.rewriteIfApplicable(document: result.document) {
-          result = MarkdownParseResult(document: rewrittenDoc, speculativeRewritten: true)
+          result = MarkdownParseResult(
+            document: rewrittenDoc,
+            speculativeRewritten: true,
+            inlineMathCatalog: result.inlineMathCatalog
+          )
         }
       }
     }
@@ -42,7 +55,8 @@ public final class MarkdownParserImpl: MarkdownParser {
       if let rewrittenDoc = imageBlockRewriter.rewriteIfApplicable(document: result.document) {
         result = MarkdownParseResult(
           document: rewrittenDoc,
-          speculativeRewritten: result.speculativeRewritten
+          speculativeRewritten: result.speculativeRewritten,
+          inlineMathCatalog: result.inlineMathCatalog
         )
       }
     }

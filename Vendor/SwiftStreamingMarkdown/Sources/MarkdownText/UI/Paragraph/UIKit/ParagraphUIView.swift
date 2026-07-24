@@ -34,12 +34,14 @@ class ParagraphUIView: UITextView {
   var onUrlTap: (URL) -> Void = { UIApplication.shared.open($0) }
 
   override init(frame: CGRect, textContainer: NSTextContainer?) {
+    registerInlineMathAttachmentViewProvider()
     super.init(frame: frame, textContainer: textContainer)
     delegate = self
     setupView()
   }
 
   required init?(coder: NSCoder) {
+    registerInlineMathAttachmentViewProvider()
     super.init(coder: coder)
     delegate = self
     setupView()
@@ -118,11 +120,12 @@ class ParagraphUIView: UITextView {
     self.lineSpacing = lineSpacing
 
     let oldAttributedString: NSAttributedString = attributedText
+    let materializedContents = materializeInlineMathAttachments(in: newContents)
     let finalString: NSMutableAttributedString
     if lineSpacing != nil {
-      finalString = applyLineSpacing(to: newContents, lineSpacing: lineSpacing)
+      finalString = applyLineSpacing(to: materializedContents, lineSpacing: lineSpacing)
     } else {
-      finalString = newContents
+      finalString = materializedContents
     }
 
     guard finalString != oldAttributedString else {
@@ -218,6 +221,7 @@ class ParagraphUIView: UITextView {
   private func generateAccessibilityContent(from attributedString: NSAttributedString) -> AccessibilityContent? {
     var labelComponents: [String] = []
     var actions: [UIAccessibilityCustomAction] = []
+    var hasAttachment = false
     let fullRange = NSRange(location: 0, length: attributedString.length)
 
     attributedString.enumerateAttributes(in: fullRange, options: []) { attrs, range, _ in
@@ -231,6 +235,15 @@ class ParagraphUIView: UITextView {
         let actionName = String.openCitation(citationLabel: citationData.accessibilityLabel)
         let action = makeAccessibilityAction(name: actionName, url: citationData.url)
         actions.append(action)
+        hasAttachment = true
+      } else if let attachment = attrs[.attachment] as? InlineMathAttachment {
+        labelComponents.append(
+          String.localizedStringWithFormat(
+            String.mathFormulaAccessibilityFormat,
+            attachment.mathData.source
+          )
+        )
+        hasAttachment = true
       } else {
         // Add the regular text for this range
         let substring = attributedString.attributedSubstring(from: range)
@@ -244,7 +257,7 @@ class ParagraphUIView: UITextView {
     let accessibilityLabel = labelComponents.isEmpty ? nil : labelComponents.joined()
 
     // Return nil if no attachments were found
-    guard !actions.isEmpty else { return nil }
+    guard hasAttachment else { return nil }
 
     return AccessibilityContent(label: accessibilityLabel, actions: actions)
   }
@@ -339,6 +352,34 @@ class ParagraphUIView: UITextView {
   func setMarkdownController(_ controller: MarkdownController?) {
     markdownController = controller
   }
+
+  override func copy(_ sender: Any?) {
+    let range = NSIntersectionRange(
+      selectedRange,
+      NSRange(location: 0, length: attributedText.length)
+    )
+    guard range.length > 0 else {
+      super.copy(sender)
+      return
+    }
+    let selection = attributedText.attributedSubstring(from: range)
+    var hasInlineMath = false
+    selection.enumerateAttribute(
+      .attachment,
+      in: NSRange(location: 0, length: selection.length),
+      options: []
+    ) { value, _, stop in
+      if value is InlineMathAttachment {
+        hasInlineMath = true
+        stop.pointee = true
+      }
+    }
+    guard hasInlineMath else {
+      super.copy(sender)
+      return
+    }
+    UIPasteboard.general.string = selection.plainTextRestoringInlineMath
+  }
 }
 
 // MARK: - UITextViewDelegate
@@ -372,7 +413,9 @@ extension ParagraphUIView: UITextViewDelegate {
   func textView(_ textView: UITextView, willPresentEditMenuWith animator: any UIEditMenuInteractionAnimating) {
     guard let textContextMenu, let markdownController else { return }
     let clampedRange = NSIntersectionRange(textView.selectedRange, NSRange(location: 0, length: textView.attributedText.length))
-    let selectedText = textView.attributedText.attributedSubstring(from: clampedRange).string
+    let selectedText = textView.attributedText
+      .attributedSubstring(from: clampedRange)
+      .plainTextRestoringInlineMath
     for group in textContextMenu.menuGroups {
       for item in group.items where item.id != TextSelectionConfig.selectMoreItemID {
         markdownController.onContextMenuAppear(id: item.id, selectedContent: selectedText)

@@ -10,6 +10,7 @@ public struct ChatMessageView: Identifiable, Equatable, Sendable {
     public var agent: AgentID?
     public var text: String
     public var isComplete: Bool
+    public var timestamp: Date?
     public var tags: [String]
     public var goal: String?
     public var recoveryAdvice: RuntimeRecoveryAdvice?
@@ -19,6 +20,7 @@ public struct ChatMessageView: Identifiable, Equatable, Sendable {
                 agent: AgentID? = nil,
                 text: String,
                 isComplete: Bool,
+                timestamp: Date? = nil,
                 tags: [String] = [],
                 goal: String? = nil,
                 recoveryAdvice: RuntimeRecoveryAdvice? = nil) {
@@ -27,6 +29,7 @@ public struct ChatMessageView: Identifiable, Equatable, Sendable {
         self.agent = agent
         self.text = text
         self.isComplete = isComplete
+        self.timestamp = timestamp
         self.tags = tags
         self.goal = goal
         self.recoveryAdvice = recoveryAdvice
@@ -41,52 +44,65 @@ public struct ConversationProjection: Equatable, Sendable {
     public init() {}
 
     public mutating func apply(_ envelope: Envelope) {
-        apply(envelope.event) { suffix in
+        apply(envelope.event, timestamp: envelope.ts) { suffix in
             MessageID(rawValue: "msg_\(envelope.session.rawValue)_\(envelope.seq)_\(suffix)")
         }
     }
 
     public mutating func apply(_ event: Event) {
-        apply(event) { _ in MessageID.new() }
+        apply(event, timestamp: nil) { _ in MessageID.new() }
     }
 
-    private mutating func apply(_ event: Event, syntheticID: (String) -> MessageID) {
+    private mutating func apply(_ event: Event,
+                                timestamp: Date?,
+                                syntheticID: (String) -> MessageID) {
         switch event {
         case .userMessage(let p):
             messages.append(ChatMessageView(id: syntheticID("user"),
                                             role: .user,
                                             text: p.text,
                                             isComplete: true,
+                                            timestamp: timestamp,
                                             tags: p.tags ?? [],
                                             goal: p.goal))
 
         case .messageDelta(let p):
             if let i = messages.firstIndex(where: { $0.id == p.messageId }) {
                 messages[i].text += p.textDelta
+                if messages[i].timestamp == nil {
+                    messages[i].timestamp = timestamp
+                }
             } else {
                 messages.append(ChatMessageView(id: p.messageId, role: p.role, agent: p.agent,
-                                                text: p.textDelta, isComplete: false))
+                                                text: p.textDelta, isComplete: false,
+                                                timestamp: timestamp))
             }
 
         case .messageCompleted(let p):
             if let i = messages.firstIndex(where: { $0.id == p.messageId }) {
                 messages[i].text = p.text
                 messages[i].isComplete = true
+                if messages[i].timestamp == nil {
+                    messages[i].timestamp = timestamp
+                }
             } else {
                 messages.append(ChatMessageView(id: p.messageId, role: p.role, agent: p.agent,
-                                                text: p.text, isComplete: true))
+                                                text: p.text, isComplete: true,
+                                                timestamp: timestamp))
             }
 
         case .error(let p):
             markCurrentPartialMessageStopped(with: p)
             messages.append(ChatMessageView(id: syntheticID("error"), role: .system,
                                             text: "⚠️ \(p.message)", isComplete: true,
+                                            timestamp: timestamp,
                                             recoveryAdvice: RuntimeErrorPresentation.recoveryAdvice(for: p)))
 
         case .artifactAdded(let p):
             messages.append(ChatMessageView(id: syntheticID("artifact"), role: .system,
                                             text: "📎 \(p.kind) artifact" + (p.prompt.map { ": \($0)" } ?? ""),
-                                            isComplete: true))
+                                            isComplete: true,
+                                            timestamp: timestamp))
 
         case .sessionSettingsUpdated, .sessionStorageMigrated, .submissionStatusChanged,
              .toolCall, .toolResult, .toolExecutionPrepared, .toolExecutionSettled,

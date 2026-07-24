@@ -13,8 +13,9 @@ and patch ledger; no separate Intatis fork URL or commit is required. The exact
 Microsoft upstream basis and parser revisions below remain fixed and verified.
 
 The package is not fully offline: it still resolves the exact-pinned
-`swift-markdown` and transitive `swift-cmark` revisions from their upstream
-Git repositories when they are absent from the local SwiftPM cache.
+`swift-markdown`, transitive `swift-cmark`, and Apple-only `iosMath`
+dependencies from their upstream Git repositories when they are absent from
+the local SwiftPM cache.
 
 ## Microsoft SwiftStreamingMarkdown
 
@@ -36,12 +37,41 @@ permanent adjacent ledger at
 `Vendor/SwiftStreamingMarkdown/INTATIS_PATCH_LEDGER.md` records
 dependency/resource thinning, ownership-transfer and Swift 6 concurrency
 hardening, disabled optional features, a native code-copy control, zero native
-paragraph-view retention, and focused test changes. The vendored package removes
-HighlightSwift, iosMath, Shimmer, SnapshotTesting, upstream branded color/media
-assets, math and syntax-highlighting implementations, and obsolete optional
-feature tests/snapshots. The retained package resource is the localization
-catalog. Its manifest contains only the library and test targets; scratch
-validation probes and executable targets are absent from the vendored tree.
+paragraph-view retention, the later audited single-dollar inline-math patch,
+and focused test changes. The initial import removed HighlightSwift, iosMath,
+Shimmer, SnapshotTesting, upstream branded color/media assets, the unsafe
+regex-based math path, syntax-highlighting implementations, and obsolete
+optional-feature tests/snapshots. The current derivative does not restore that
+old math implementation: it adds a code-aware, bounded single-dollar path and
+an exact iosMath 2.5.0 dependency while block math remains disabled.
+HighlightSwift, Shimmer, SnapshotTesting, branded assets, images, citations,
+animation, and syntax highlighting remain removed or disabled. The
+derivative's directly retained resource is the localization catalog; iosMath
+owns a separate audited resource bundle containing math fonts and their
+license/readme data. The derivative manifest contains only the library and
+test targets; scratch validation probes and executable targets are absent
+from the vendored tree.
+
+## iosMath integration
+
+- Upstream: <https://github.com/kostub/iosMath>
+- Version/tag: `2.5.0`
+- Commit: `838cddc01fdd67efd530f8bb67959ad2715f9b06`
+- Local reuse mode: `dependency` (exact, conditioned on iOS and macOS)
+- Product role: native TeX parsing and layout for code-aware single-dollar
+  inline math
+- Package dependencies: none
+- Engine license: MIT
+
+iosMath and its eight bundled OpenType math fonts are covered in
+`ThirdPartyNotices/MathRendering.md`, including the complete engine/OFL terms,
+the shipped GUST notice, attributions, resource inventory, and distribution
+approval.
+The font resources are not part of Microsoft's source or license.
+The derivative hosts accepted formulas as live TextKit 2
+`MTMathUILabel` attachment views with a 1024×256-point preflight bound,
+semantic appearance, Dynamic Type-aware configuration, and exact literal
+fallback. It does not generate or retain formula raster previews.
 
 ### MIT License
 

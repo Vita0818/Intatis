@@ -53,6 +53,15 @@ public struct MarkdownRenderConfig: Hashable {
   /// - Important: Image support is **experimental**. The behavior, API, and
   ///   rendering output may change in future releases. Defaults to `.disabled`.
   public let imageConfig: ImageConfig
+  /// Configuration for the optional inline-math grammar and renderer.
+  ///
+  /// Defaults to `.disabled`. Math attachments never use the Markdown image
+  /// loading path.
+  public let mathConfig: MathRenderConfig
+
+  /// Tokens created by one parse request. This is intentionally internal and
+  /// never persists in caller configuration, caches, or raw message state.
+  var inlineMathCatalog: InlineMathCatalog?
 
   /// Font and color style for a uniformly-styled run of markdown text.
   public struct MarkdownTextStyle: Hashable {
@@ -281,7 +290,8 @@ public struct MarkdownRenderConfig: Hashable {
     blockSpacing: CGFloat = MarkdownRenderConfig.defaultBlockSpacing,
     textSelectionConfig: TextSelectionConfig = .default,
     thematicBreakColor: Color = MarkdownRenderConfig.defaultThematicBreakColor,
-    imageConfig: ImageConfig = .disabled
+    imageConfig: ImageConfig = .disabled,
+    mathConfig: MathRenderConfig = .disabled
   ) {
     self.shouldAnimateText = shouldAnimateText
     self.blockQuoteStyle = blockQuoteStyle
@@ -297,6 +307,8 @@ public struct MarkdownRenderConfig: Hashable {
     self.textSelectionConfig = textSelectionConfig
     self.thematicBreakColor = thematicBreakColor
     self.imageConfig = imageConfig
+    self.mathConfig = mathConfig
+    self.inlineMathCatalog = nil
   }
 
   /// The default render config, equivalent to calling `init()` with no
@@ -349,7 +361,16 @@ public struct MarkdownRenderConfig: Hashable {
       blockSpacing: blockSpacing,
       textSelectionConfig: textSelectionConfig,
       thematicBreakColor: thematicBreakColor,
-      imageConfig: .disabled
+      imageConfig: .disabled,
+      mathConfig: mathConfig
     )
+  }
+
+  func withInlineMathCatalog(
+    _ value: InlineMathCatalog?
+  ) -> MarkdownRenderConfig {
+    var copy = self
+    copy.inlineMathCatalog = value
+    return copy
   }
 }

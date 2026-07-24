@@ -13,13 +13,19 @@ let package = Package(
       targets: ["SwiftStreamingMarkdown"])
   ],
   dependencies: [
-    .package(url: "https://github.com/swiftlang/swift-markdown.git", exact: "0.8.0")
+    .package(url: "https://github.com/swiftlang/swift-markdown.git", exact: "0.8.0"),
+    .package(url: "https://github.com/kostub/iosMath.git", exact: "2.5.0")
   ],
   targets: [
     .target(
       name: "SwiftStreamingMarkdown",
       dependencies: [
-        .product(name: "Markdown", package: "swift-markdown")
+        .product(name: "Markdown", package: "swift-markdown"),
+        .product(
+          name: "iosMath",
+          package: "iosMath",
+          condition: .when(platforms: [.iOS, .macOS])
+        )
       ],
       path: "Sources/MarkdownText",
       resources: [

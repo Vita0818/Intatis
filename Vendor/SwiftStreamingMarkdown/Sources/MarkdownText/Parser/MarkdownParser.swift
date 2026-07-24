@@ -32,11 +32,18 @@ extension MarkdownParser {
   ///   - config: Render configuration applied when building the renderable.
   /// - Returns: A `RenderableDocument` built from the parsed `Document`.
   public func parse(text: String, config: MarkdownRenderConfig) async -> RenderableDocument {
-    let document = await parse(
+    let result = await parse(
       text: text,
-      option: .init(speculativeRewrite: false, imageSupport: config.imageConfig.enabled)
-    ).document
-    return await RenderableDocument(document: document, config: config)
+      option: .init(
+        speculativeRewrite: false,
+        imageSupport: config.imageConfig.enabled,
+        mathConfig: config.mathConfig
+      )
+    )
+    return await RenderableDocument(
+      document: result.document,
+      config: config.withInlineMathCatalog(result.inlineMathCatalog)
+    )
   }
 }
 
@@ -52,11 +59,20 @@ public enum MarkdownDocumentParser {
   ) async -> sending RenderableDocument {
     let safeConfig = config.firstReleaseParseConfiguration()
     let parser = MarkdownParserImpl()
-    let document = parser.parseSynchronously(
+    let result = parser.parseSynchronously(
       text: text,
-      option: .init(speculativeRewrite: false, imageSupport: false)
-    ).document
-    return RenderableDocument(renderables: document.convert(with: safeConfig))
+      option: .init(
+        speculativeRewrite: false,
+        imageSupport: false,
+        mathConfig: safeConfig.mathConfig
+      )
+    )
+    let resolvedConfig = safeConfig.withInlineMathCatalog(
+      result.inlineMathCatalog
+    )
+    return RenderableDocument(
+      renderables: result.document.convert(with: resolvedConfig)
+    )
   }
 
   /// Compatibility path for the package convenience views. It preserves the
@@ -69,13 +85,19 @@ public enum MarkdownDocumentParser {
     config: MarkdownRenderConfig
   ) -> RenderableDocument {
     let parser = MarkdownParserImpl()
-    let document = parser.parseSynchronously(
+    let result = parser.parseSynchronously(
       text: text,
       option: .init(
         speculativeRewrite: false,
-        imageSupport: config.imageConfig.enabled
+        imageSupport: config.imageConfig.enabled,
+        mathConfig: config.mathConfig
       )
-    ).document
-    return RenderableDocument(renderables: document.convert(with: config))
+    )
+    let resolvedConfig = config.withInlineMathCatalog(
+      result.inlineMathCatalog
+    )
+    return RenderableDocument(
+      renderables: result.document.convert(with: resolvedConfig)
+    )
   }
 }

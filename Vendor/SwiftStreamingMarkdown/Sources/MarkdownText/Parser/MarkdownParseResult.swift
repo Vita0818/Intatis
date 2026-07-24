@@ -12,4 +12,16 @@ public struct MarkdownParseResult {
   /// `true` if the parser applied a speculative rewrite (e.g. completing a
   /// partial table or emphasis) before returning the document.
   public let speculativeRewritten: Bool
+  /// Request-local token catalog used only while converting this document.
+  let inlineMathCatalog: InlineMathCatalog?
+
+  init(
+    document: Document,
+    speculativeRewritten: Bool,
+    inlineMathCatalog: InlineMathCatalog? = nil
+  ) {
+    self.document = document
+    self.speculativeRewritten = speculativeRewritten
+    self.inlineMathCatalog = inlineMathCatalog
+  }
 }

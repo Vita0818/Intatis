@@ -21,6 +21,9 @@ renderer code.
   revision `3c6f9523da3a1ec2fd829673e472d95b8097a3b8`
 - Transitive parser dependency: `swift-cmark` 0.8.0,
   revision `924936d0427cb25a61169739a7660230bffa6ea6`
+- Direct Apple-platform math dependency: `iosMath` 2.5.0,
+  revision `838cddc01fdd67efd530f8bb67959ad2715f9b06`, conditioned
+  on iOS and macOS; iosMath has no transitive package dependency
 
 `swift-markdown` 0.8.0 itself uses a Swift 6.2 tools manifest but explicitly
 declares `swiftLanguageModes: [.v5]`. The derivative is Swift 6; the parser
@@ -34,7 +37,7 @@ retain the Swift 6.2+ requirement.
 
 ## Patch groups
 
-### 1. Dependency and resource thinning
+### 1. Initial dependency and resource thinning
 
 Paths:
 
@@ -47,19 +50,26 @@ Paths:
 
 Changes and reason:
 
-- Remove HighlightSwift, iosMath, Shimmer, SnapshotTesting, and their
-  transitive first-release surface.
+- The initial vendored import removed HighlightSwift, iosMath, Shimmer,
+  SnapshotTesting, and their transitive first-release surface. Patch group 10
+  later reintroduces only exact iosMath 2.5.0 for a new bounded inline-math
+  path; the old regex preprocessor and the other removed packages remain
+  absent.
 - Pin `swift-markdown` exactly to 0.8.0 because its malformed-table handling is
   required by the retained table path.
 - Remove branded color/media assets instead of compiling or excluding dead
-  payload. A SwiftPM build bundle contains only `Info.plist` and
+  payload. The derivative-owned SwiftPM bundle contains only `Info.plist` and
   `Localizable.xcstrings`; Xcode compiles the same catalog to localized
   `*.lproj/Localizable.strings`. Neither form may contain image/color assets.
+  iosMath owns a separate `iosMath_iosMath.bundle`; its eight OpenType fonts,
+  math tables, license texts, README files, and conversion script are audited
+  third-party resources rather than derivative-owned media assets.
 
 Regression obligations:
 
 - Resolve from an empty package cache using the pinned graph.
-- Inventory the macOS and iOS resource bundles after Release builds.
+- Inventory both the derivative localization bundle and
+  `iosMath_iosMath.bundle` after macOS and iOS Release builds.
 - Preserve MIT and dependency notices in the consuming application.
 
 ### 2. Audited ownership-transfer boundary
@@ -124,7 +134,7 @@ Regression obligations:
 - Verify streamed updates cannot retain or forward documents through an
   AsyncStream or actor mailbox.
 
-### 4. Disabled first-release features
+### 4. Features disabled at the initial cutover
 
 Paths:
 
@@ -138,7 +148,11 @@ Paths:
 
 Changes and reason:
 
-- Delete math and syntax-highlighting implementations and APIs.
+- At the initial cutover, delete the upstream regex-based math implementation
+  and all syntax-highlighting implementations and APIs. Patch group 10 does
+  not restore those deleted files: it adds a code-aware single-dollar path
+  with a smaller public/configuration surface. Syntax highlighting remains
+  deleted.
 - Force animation, citations, and images off in
   `firstReleaseParseConfiguration()` for the production off-main parser.
 - Keep any still-compiled legacy image/citation compatibility source out of the
@@ -147,8 +161,9 @@ Changes and reason:
 Regression obligations:
 
 - Contract-test the forced-off production parse configuration.
-- Scan the production dependency graph and source tree for removed optional
-  runtimes and branded assets.
+- Scan the production dependency graph and source tree for every removed
+  optional runtime and branded asset, allowing only the exact iosMath identity
+  recorded in patch group 10.
 
 ### 5. Native code-copy control and accessibility
 
@@ -294,9 +309,11 @@ Changes and reason:
 
 - Compile every remaining test source; do not hide files with a manifest
   allowlist or `exclude` gate.
-- Replace removed math/image/citation/highlight/snapshot suites with focused
-  first-release ownership, profile, zero-cache, code-copy, table, font, and
-  parser contracts.
+- At initial cutover, replace removed
+  math/image/citation/highlight/snapshot suites with focused first-release
+  ownership, profile, zero-cache, code-copy, table, font, and parser
+  contracts. Patch group 10 adds new formula-specific coverage without
+  restoring the removed suites.
 - Cover the restored view-diff guards, stable-width/zero-width layout
   invalidation contract, and selection-overlay ownership described above.
 - Snapshot image deletions are mechanical repository thinning and must be
@@ -315,28 +332,164 @@ Regression obligations:
   renderer defect to either implementation. Validate real window open/close in
   a signed GUI host through Computer Use.
 
+### 10. Code-aware single-dollar inline math
+
+Paths:
+
+- `Package.swift`
+- `Package.resolved`
+- `README.md`
+- `Sources/MarkdownText/Models/MathRenderConfig.swift` (added)
+- `Sources/MarkdownText/Models/InlineMathCatalog.swift` (added)
+- `Sources/MarkdownText/Models/MathAttachmentData.swift` (added)
+- `Sources/MarkdownText/Parser/InlineMathPreprocessor.swift` (added)
+- `Sources/MarkdownText/UI/Paragraph/InlineMathAttachment.swift` (added)
+- `Sources/MarkdownText/Models/MarkdownRenderConfig.swift`
+- `Sources/MarkdownText/Models/MarkdownRenderConfig+Builders.swift`
+- `Sources/MarkdownText/Models/RenderableDocument.swift`
+- `Sources/MarkdownText/Parser/MarkdownParseOption.swift`
+- `Sources/MarkdownText/Parser/MarkdownParseResult.swift`
+- `Sources/MarkdownText/Parser/MarkdownParser.swift`
+- `Sources/MarkdownText/Parser/MarkdownParserImpl.swift`
+- `Sources/MarkdownText/Inline/Markdown+InlineConvertible.swift`
+- `Sources/MarkdownText/Block/BlockQuote+.swift`
+- `Sources/MarkdownText/Block/Table+.swift`
+- `Sources/MarkdownText/ContextMenu/TextContextMenu.swift`
+- `Sources/MarkdownText/UI/BlockQuoteView.swift`
+- `Sources/MarkdownText/UI/OrderedListView.swift`
+- `Sources/MarkdownText/UI/UnorderedListView.swift`
+- `Sources/MarkdownText/UI/TableView.swift`
+- `Sources/MarkdownText/UI/Paragraph/AppKit/ParagraphNSView.swift`
+- `Sources/MarkdownText/UI/Paragraph/UIKit/ParagraphUIView.swift`
+- `Sources/MarkdownText/Utilities/String+.swift`
+- `Sources/MarkdownText/Resources/Localizable.xcstrings`
+- `Tests/MarkdownTextTests/InlineMathAttachmentTests.swift` (added)
+- `Tests/MarkdownTextTests/InlineMathParserTests.swift` (added)
+- `Tests/MarkdownTextTests/InlineMathPreprocessorTests.swift` (added)
+- `Tests/MarkdownTextTests/ParagraphNSViewTests.swift`
+- retained parser/config/contract tests under `Tests/MarkdownTextTests/**`
+- containing Intatis revision:
+  `Packages/IntatisSharedUI/Sources/MessageRendering/IntatisMessageContentView.swift`
+- containing Intatis revision:
+  `Packages/IntatisSharedUI/Sources/MessageRendering/IntatisMicrosoftMarkdownPipeline.swift`
+- containing Intatis revision:
+  `Packages/IntatisSharedUI/Tests/MessageRenderingTests.swift`
+- containing Intatis revision:
+  `Apps/IntatisMac/Sources/RendererFixtureView.swift`
+- containing Intatis revision:
+  `scripts/RendererValidationWatchdog.swift`
+- containing Intatis revision:
+  `Package.resolved`, `project.yml`, `NOTICE.md`, and
+  `ThirdPartyNotices/{MarkdownRendering,MathRendering}.md`
+
+Changes and reason:
+
+- Add exact iosMath 2.5.0 as an iOS/macOS-only product dependency. The pinned
+  tag resolves to commit `838cddc01fdd67efd530f8bb67959ad2715f9b06`;
+  iosMath has no transitive package dependency.
+- Support a normal paired single-dollar delimiter for inline math while
+  preserving fenced code, inline code spans, escaped dollars, malformed or
+  incomplete input, unsupported delimiter forms, and non-formula currency
+  cases as literal source.
+- Cap admission at 32 formulas per message and 8 KiB UTF-8 bytes per
+  formula. Exceeding either limit leaves every candidate in that message
+  literal rather than producing a partial attachment set.
+- Keep `$$...$$`, `\(...\)`, and `\[...\]` outside the first formula
+  profile. Do not restore the deleted `LaTexPreProcessor.swift`,
+  `LatexAttachmentData.swift`, `BlockMathView.swift`, or
+  `LatexViewProvider.swift`.
+- Preserve raw TeX source beside any native attachment for fallback,
+  selection/copy, and accessibility. Formula rendering remains a disposable
+  display projection and cannot rewrite EventLog/provider content.
+- Keep the existing off-main Markdown parse and single-owner MainActor
+  document boundary. iosMath's native label parse/update is UI-bound and must
+  be budgeted explicitly; it is not `Sendable` work and must not be hidden in
+  the process-wide parser scheduler.
+- Host accepted formulas through a live TextKit 2
+  `NSTextAttachmentViewProvider` whose view is `MTMathUILabel`. Preflight each
+  label on MainActor, cap it at 1024×256 points, and restore exact literal
+  source when layout is invalid or out of bounds. Do not generate or retain a
+  raster preview/cache. Resolve semantic foreground color from the live
+  AppKit/UIKit appearance and include the caller's Dynamic Type typography in
+  Intatis' display revision so an old-size attachment cannot overwrite a
+  newer request.
+- Preserve attachment-aware final output in headings, lists, block quotes,
+  and tables. Their copy and accessibility projections must restore either
+  exact source or the localized formula label rather than leaking private
+  tokens or U+FFFC.
+- Keep `.plainSafe` as a complete bypass before any Markdown or math parser is
+  constructed. Images, citations, animation, syntax highlighting, table
+  actions, and non-HTTP(S)/mailto links retain their existing first-release
+  policy.
+- Treat iosMath's eight unmodified OpenType fonts and accompanying math-table,
+  license, README, and script files as a separate audited resource bundle.
+  They do not replace or determine Intatis' product-interface font.
+
+Regression obligations:
+
+- Delimiter tests must cover prose, streaming incomplete/complete transitions,
+  escapes, inline/fenced code, currency and unmatched dollars, adjacency,
+  malformed TeX, and the literal block/bracket/parenthesis forms.
+- Selection, clipboard, and accessibility must preserve the original formula
+  source rather than an empty object-replacement character.
+- Strict macOS Debug/Release, iOS compile/build, dependency-resolution, notice,
+  and final-bundle inventory checks must use the exact pinned graph. A
+  distributed app must expose iosMath MIT plus GUST/LPPL and OFL terms.
+- Compare the same Microsoft renderer with math disabled and enabled; a
+  plain-safe run is not a valid no-math performance baseline.
+- Run the existing single-instance, hash-pinned hard-watchdog containment
+  stages before any long interaction/soak protocol. Formula count, stream
+  replacement, Light/Dark, selection/copy, accessibility, main-thread stalls,
+  RSS/footprint, and cleanup remain release gates. Existing adverse renderer
+  evidence remains authoritative until those gates pass.
+
+Dependency-only audit evidence:
+
+- The Intatis root and derivative `Package.resolved` files currently agree on
+  iosMath 2.5.0 at revision
+  `838cddc01fdd67efd530f8bb67959ad2715f9b06`.
+- At the exact iosMath revision, macOS SwiftPM Debug and Release,
+  compile-only `swift build --build-tests`, and unsigned iOS Simulator Release
+  builds passed with Swift 6.3.3 / Xcode 26.6.
+- Upstream test executables were not run. These compile-only checks do not
+  validate this derivative's delimiter, UI, accessibility, streaming, or
+  performance behavior.
+- The isolated iOS product copied the 26-file, 7,234,424-byte `fonts/`
+  payload byte-for-byte: 8 OTF files, 8 math-table plist files, 5 license
+  files, 4 README files, and `math_table_to_plist.py`. The complete built
+  resource bundle has 27 files because Xcode/SwiftPM generates a root
+  `Info.plist`.
+- The 2026-07-24 derivative `swift test --disable-sandbox` run passed 75
+  XCTest tests and 7 Swift Testing tests (82 total). Final macOS/iOS products,
+  bundle inventory, executable hash and controlled short GUI validation were
+  also reproduced as separate evidence below; long soak and real
+  selection/clipboard/VoiceOver remain separate release gates.
+
 ## Current validation evidence
 
-All evidence below was produced with Swift 6.3.3 / Xcode 26.6. The release
-hygiene checks were repeated after removing the scratch probes. Re-run the
-same checks whenever this vendored snapshot or its exact parser pins change.
+Unless explicitly identified as patch-group-10 evidence above, the renderer
+evidence below predates the single-dollar/iosMath change. It remains a useful
+baseline for the earlier derivative but cannot be promoted to current
+math-integration evidence. Re-run the same checks with Swift 6.3.3 / Xcode
+26.6 whenever this vendored snapshot or any exact dependency pin changes.
 
 - Post-hygiene `swift package dump-package` reports exactly one library
   product, one regular library target, and one test target; no executable
   product or target remains.
-- Fresh post-hygiene macOS Debug and Release SwiftPM resolutions fetched both
-  dependencies from an isolated local cache at the exact revisions above.
-  After the view-diff/layout/selection hardening in patch group 8, the current
-  snapshot reran strict concurrency, concurrency warnings, and Swift
+- Fresh post-hygiene macOS Debug and Release SwiftPM resolutions fetched the
+  then-current two parser dependencies from an isolated local cache at their
+  exact revisions. After the view-diff/layout/selection hardening in patch
+  group 8, that pre-math snapshot reran strict concurrency, concurrency
+  warnings, and Swift
   warnings-as-errors in both configurations. Each ran all 38 XCTest tests and
   six Swift Testing tests (44 total per configuration, zero failures).
 - The retained suite plus Phase-2 corpus passed: malformed and streaming table
   prefixes; byte-exact LaTeX delimiters inside fenced/inline code; disabled
   image matrix; six link schemes; 100 KiB and 256 KiB Markdown; 71,680-byte
   code; offscreen large SwiftUI hosts; and light/dark/resize host lifecycle.
-- A separate headless consumer resolved the local derivative plus both exact
-  remote pins from a fresh scratch directory, built strict Release with Swift
-  warnings-as-errors, and printed `HEADLESS_CONSUMER_OK`.
+- A separate pre-math headless consumer resolved the local derivative plus the
+  two exact parser pins from a fresh scratch directory, built strict Release
+  with Swift warnings-as-errors, and printed `HEADLESS_CONSUMER_OK`.
 - An independent minimal app rebuilt Release after release hygiene and had
   previously built Debug for `generic/platform=iOS` without signing, resolving
   the same exact graph. A separate arm64 iOS library-only SwiftPM build passed
@@ -346,13 +499,14 @@ same checks whenever this vendored snapshot or its exact parser pins change.
 - Before its required removal, the scratch-only output-free scheduler
   integration executable built under the same strict flags and printed
   `SENDING_BOUNDARY_OK`.
-- Source scans found no package-owned unchecked/unsafe concurrency escape,
-  removed optional runtime name, branded private identifier, or
-  document-bearing AsyncStream/actor storage.
+- Pre-math source scans found no package-owned unchecked/unsafe concurrency
+  escape, removed optional runtime name, branded private identifier, or
+  document-bearing AsyncStream/actor storage. Current scans must allow only the
+  explicitly pinned iosMath dependency while retaining the other exclusions.
 
-### Adverse GUI validation evidence and release disposition
+### Historical adverse GUI evidence and current release disposition
 
-The latest on-window validation did **not** pass. On 2026-07-18, three
+The 2026-07-18 on-window validation did **not** pass. Three
 `Intatis Renderer Validation` instances were accidentally allowed to coexist.
 The macOS Force Quit UI reported **129.63 GB of application memory** for the
 dominant instance. That number is a macOS UI value; it must not be restated as
@@ -369,15 +523,38 @@ not identify the final retaining edge, and the root cause remains
 Computer Use, or a particular Apple framework leak would overstate the
 evidence.
 
-Patch group 8 addresses a high-confidence amplification path: lost upstream
+Patch group 8 addressed a high-confidence amplification path: lost upstream
 diff guards, stable-width intrinsic-size invalidation, and a duplicate rich
-whole-document selection overlay. The strict unit suites, Intatis focused
-tests, iOS test-target compilation, and non-GUI product builds verify those
-contracts, but they do not supersede the adverse on-window evidence. The
-latest Computer Use result is therefore **FAIL / ABORTED**, and the current
-release disposition remains **NO-GO** until a single-instance,
-watchdog-controlled GUI rerun demonstrates bounded memory/CPU and the required
-selection/copy/accessibility behavior.
+whole-document selection overlay. Patch group 10 additionally fixed the
+math-era AppKit attachment lifecycle by retaining an explicit TextKit 2
+content-storage/layout-manager/text-container network, restoring the primary
+layout manager after replacing content, and coalescing viewport layout on the
+next main turn. Neither patch identifies the final retaining edge from the
+historical multi-instance incident.
+
+The current 2026-07-24 short controlled evidence is positive:
+
+- Vendor tests passed 82/82 and strict Release warnings-as-errors passed;
+  SharedUI `MessageRenderingTests` passed 25/25; the root suite passed 938
+  tests with 14 skipped and zero failures.
+- IntatisMac Debug/Release and IntatisiOS generic Simulator Debug/Release
+  products built successfully. The two app bundles each contain the audited
+  eight OTF files and complete 26-file iosMath `fonts/` payload; their
+  bundled `NOTICE.md` matches the repository notice.
+- One hash-pinned validation executable ran the same Microsoft renderer with
+  math disabled/enabled, then `math-one`, `math-thirty-two`, `math-history`
+  and `math-stream`; every short run exited 0, required no TERM/KILL, passed
+  double cleanup and left no process behind.
+- Light and Dark Computer Use `math-structure` runs visibly rendered formulas
+  in headings, paragraphs, both list kinds, block quotes and tables while
+  protected `$not_math$` / `$table_code$` text stayed literal. The AX tree
+  exposed original TeX formula descriptions.
+
+These short runs supersede the old statement that the latest Computer Use
+result was `FAIL / ABORTED`; they do not erase the historical incident or
+establish release readiness. A >160-second single-instance soak, real
+selection/clipboard-byte checks, real VoiceOver operation, minimum-supported
+macOS runtime and representative iOS device validation remain open.
 
 Warm offscreen single-paragraph plain-text timings (parse plus host, six
 Release samples across two test processes, each after an explicit 1 KiB
@@ -458,8 +635,10 @@ or upstream basis changes:
 - Tracked total: 331 files, 325 insertions, 5,616 deletions.
 - Renderer/package source excluding `Resources/**`: 39 text files, 269
   insertions, 1,142 deletions.
-- Production resources: 54 tracked asset/media files deleted; only the
-  localization catalog remains.
+- Derivative-owned production resources: 54 tracked asset/media files deleted;
+  only the localization catalog remains. The later iosMath dependency's
+  separately licensed resource bundle is outside this Microsoft upstream-delta
+  count.
 - Tracked test cleanup: 235 files changed/deleted, including 213 binary
   snapshots; remaining tracked text delta is 2 insertions and 3,168 deletions.
 - New retained validation sources, not included in Git's unstaged diff count:
@@ -484,8 +663,9 @@ revision provides all of the following, or equivalent demonstrably safe APIs:
 3. Supported off-main parse followed by single-owner `@MainActor` installation,
    without document-bearing actor or AsyncStream storage.
 4. Optional math, highlighting, images, citations, branded resources, and
-   associated dependencies removable or completely absent from the Intatis
-   build artifact.
+   associated dependencies independently gated and removable; if math is
+   present, its engine/resources must remain exact-pinned, code-aware,
+   license-complete, and separable from the other disabled features.
 5. A bounded paragraph-view cache with a supported zero-retention mode.
 6. A native, keyboard- and accessibility-operable, byte-exact code-copy button.
 7. Passing strict Mac/iOS builds plus functional, accessibility, memory, and

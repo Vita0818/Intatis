@@ -136,6 +136,13 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
         }
     }
 
+    /// Cancels the current model/tool turn without tearing down the session
+    /// runtime or its projection subscription.
+    func cancelCurrentTurn() {
+        guard !isShutdown, isWorking else { return }
+        runningOperation?.cancel()
+    }
+
     /// Permanently stops this session runtime and waits until the active turn,
     /// permission waiters, projection subscription, and workspace scope have
     /// all settled. Page/session switching must never call this method.
@@ -213,7 +220,7 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
                 try await loop.send(parsed.text, userMessage: parsed.userMessagePayload)
             } catch {
                 let isInterruption = error is AgentTurnInterruptedError
-                    || error is CancellationError
+                    || IntatisCancellation.isCurrentTaskCancellation(error)
                 let message = error.localizedDescription
                 self.composerError = isInterruption ? nil : message
                 if !didEnterAgentLoop {

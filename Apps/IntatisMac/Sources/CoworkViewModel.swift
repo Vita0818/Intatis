@@ -226,8 +226,16 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
     @Published var input: String = ""
     @Published private(set) var draftAttachments: [CoworkDraftAttachment] = []
     @Published private(set) var isAcceptingSubmission = false
-    @Published private(set) var isWorking = false
-    @Published private(set) var isGoalContinuing = false
+    @Published private(set) var isWorking = false {
+        didSet { refreshRuntimeBusy() }
+    }
+    @Published private(set) var isAgentWorkActive = false {
+        didSet { refreshRuntimeBusy() }
+    }
+    @Published private(set) var isGoalContinuing = false {
+        didSet { refreshRuntimeBusy() }
+    }
+    @Published private(set) var runtimeBusy = false
     @Published private(set) var isGoalRuntimeReady = false
     @Published var pendingPermission: PendingPermission?
     @Published private(set) var permissionNotice: PermissionResolutionNotice?
@@ -240,6 +248,7 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
     @Published private(set) var permissionReviewerStatus: CoworkPermissionReviewerStatus = .disabled
     @Published private(set) var inferenceProfileOptions: [AppInferenceProfileOption]
     @Published private(set) var inferenceResolutionFailures: [String: String] = [:]
+    @Published private var nextMainInferenceOption: AppInferenceProfileOption?
 
     var isAutomaticPermissionReviewReady: Bool {
         switch permissionReviewerStatus {
@@ -257,9 +266,38 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
 
     var mainInferenceDisplayLabel: String {
         guard let main = agents.first(where: { $0.name == projectSettings.mainAgentName }) else {
-            return "@\(projectSettings.mainAgentName) inference not attached"
+            return IntatisLocalization.format(
+                "@%@ inference not attached",
+                projectSettings.mainAgentName)
         }
-        return main.inferenceDisplayLabel ?? "@\(main.name) inference unavailable"
+        return main.inferenceDisplayLabel ?? IntatisLocalization.format(
+            "@%@ inference unavailable",
+            main.name)
+    }
+
+    /// Composer selection for the next submission hosted by `@main`.
+    /// This intentionally does not mutate the live agent binding until the
+    /// frozen submission reaches its FIFO execution boundary.
+    var nextMainInferenceBinding: AgentInferenceBinding? {
+        if let staged = nextMainInferenceOption,
+           inferenceProfileOptions.contains(where: { $0.binding == staged.binding }) {
+            return staged.binding
+        }
+        guard let live = agentInferenceBinding(name: projectSettings.mainAgentName),
+              inferenceProfileOptions.contains(where: { $0.binding == live }) else {
+            return nil
+        }
+        return live
+    }
+
+    var nextMainInferenceDisplayLabel: String {
+        nextMainInferenceOption?.title ?? mainInferenceDisplayLabel
+    }
+
+    /// Project/roster mutations cannot cross an active invocation or Goal.
+    /// The composer selector is intentionally independent from this fence.
+    var isRuntimeMutationBlocked: Bool {
+        isWorking || isGoalContinuing
     }
 
     var inferenceComposerError: String? {
@@ -267,7 +305,9 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
               !isMainInferenceReady else {
             return nil
         }
-        return "@\(projectSettings.mainAgentName) needs an explicit, resolvable inference profile rebind before Cowork can run."
+        return IntatisLocalization.format(
+            "@%@ needs an explicit, resolvable inference profile rebind before Cowork can run.",
+            projectSettings.mainAgentName)
     }
 
     private let log: EventLog
@@ -278,13 +318,20 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
     private var orchestrator: Orchestrator?
     private var goalRuntime: GoalRuntimeController?
     private var subscription: Task<Void, Never>?
-    private var shutdownTask: Task<Void, Never>?
+    private var shutdownTask: Task<Void, Never>? {
+        didSet { refreshRuntimeBusy() }
+    }
     private var didStop = false
+    private var isCancellingCurrentActivity = false
     private var permissionWaiters: [RequestID: CoworkPermissionWaiter] = [:]
     private var permissionQueue: [PendingPermission] = []
     private var suppressedPermissionRequestIDs: Set<RequestID> = []
-    private var activeOperations: [UUID: Task<Void, Never>] = [:]
-    private var directOperationIDs: Set<UUID> = []
+    private var activeOperations: [UUID: Task<Void, Never>] = [:] {
+        didSet { refreshRuntimeBusy() }
+    }
+    private var directOperationIDs: Set<UUID> = [] {
+        didSet { refreshRuntimeBusy() }
+    }
     private var directOperationDrainWaiters: [CheckedContinuation<Void, Never>] = []
     private var canonicalItems: [CodeItem] = []
     private var submissionQueue: [SubmissionID] = []
@@ -321,6 +368,7 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             registry,
             controlPlaneBinding: nil)
         self.inferenceProfileOptions = inferenceProfileOptions
+        self.nextMainInferenceOption = nil
         self.projectSettings = projectSettings
         self.launchMode = launchMode
         self.sessionStorageWarning = sessionStorageWarning
@@ -339,10 +387,17 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
 
     var hasActiveWork: Bool {
         isWorking
+            || isAgentWorkActive
             || isGoalContinuing
             || !activeOperations.isEmpty
             || !directOperationIDs.isEmpty
             || shutdownTask != nil
+    }
+
+    private func refreshRuntimeBusy() {
+        let nextValue = hasActiveWork
+        guard runtimeBusy != nextValue else { return }
+        runtimeBusy = nextValue
     }
 
     private var acceptsNewOperations: Bool {
@@ -376,10 +431,8 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         inferenceProfileOptions: [AppInferenceProfileOption]? = nil
     ) {
         guard acceptsNewOperations else { return }
-        if let inferenceProfileOptions {
-            self.inferenceProfileOptions = inferenceProfileOptions
-        }
-        let bindings = (inferenceProfileOptions ?? self.inferenceProfileOptions).map(\.binding)
+        let refreshedOptions = inferenceProfileOptions
+        let bindings = (refreshedOptions ?? self.inferenceProfileOptions).map(\.binding)
         let operationID = UUID()
         let operation = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -388,6 +441,17 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             await self.orchestrator?.updateAvailableInferenceProfiles(
                 bindings,
                 hostAuthorized: true)
+            // Publish new menu entries only after Orchestrator has accepted the
+            // same host-approved snapshot, so a newly visible choice cannot
+            // race a stale admission catalog.
+            if let refreshedOptions {
+                if let staged = self.nextMainInferenceOption {
+                    self.nextMainInferenceOption = refreshedOptions.first(where: {
+                        $0.binding == staged.binding
+                    })
+                }
+                self.inferenceProfileOptions = refreshedOptions
+            }
             await self.refreshInferenceResolutionState()
         }
         activeOperations[operationID] = operation
@@ -424,7 +488,9 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                 })
         } catch {
             let message = RuntimeErrorPresentation.message(for: error)
-            projectionError = "Cowork session could not start: \(message)"
+            projectionError = IntatisLocalization.format(
+                "Cowork session could not start: %@",
+                message)
             setPermissionReviewerStatus(.failed(message))
             return
         }
@@ -526,6 +592,7 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         goalRuntime = nil
         for operation in runningOperations { operation.cancel() }
         isWorking = false
+        isAgentWorkActive = false
         isGoalContinuing = false
         isGoalRuntimeReady = false
         goal = Self.goalPresentation(
@@ -593,7 +660,9 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                     return (id, entry)
                 })
         } catch {
-            composerError = "The local submission outbox could not be read: \(error.localizedDescription)"
+            composerError = IntatisLocalization.format(
+                "The local submission outbox could not be read: %@",
+                error.localizedDescription)
         }
     }
 
@@ -619,7 +688,8 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         var presented = canonicalItems
         let interruptedFailure = SubmissionFailure(
             code: "interrupted",
-            message: "This submission was queued or running when the previous runtime stopped. Retry explicitly to run it again.",
+            message: IntatisLocalization.string(
+                "This submission was queued or running when the previous runtime stopped. Retry explicitly to run it again."),
             retryable: true)
         for index in presented.indices {
             guard let id = presented[index].submissionID,
@@ -642,12 +712,13 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                 let failure = SubmissionFailure(
                     code: "event_log_unavailable",
                     message: entry.lastCanonicalError
-                        ?? "The submission is safe in the local outbox but has not entered the session EventLog.",
+                        ?? IntatisLocalization.string(
+                            "The submission is safe in the local outbox but has not entered the session EventLog."),
                     retryable: true)
                 return CodeItem(
                     id: id.rawValue,
                     kind: .user,
-                    title: "You",
+                    title: IntatisLocalization.string("You"),
                     body: entry.payload.text,
                     tags: entry.payload.tags ?? [],
                     goal: entry.payload.goal,
@@ -738,7 +809,7 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                     name: payload.agent.rawValue,
                     workspace: payload.path,
                     model: payload.model.rawValue,
-                    permissionProfile: payload.profile,
+                    permissionProfile: Self.permissionDescription(payload.profile),
                     inferenceProfileLabel: inferenceOption?.title,
                     inferenceProfileRef: binding?.inferenceProfileRef,
                     inferenceConnectionLabel: binding?.safeRouteLabel,
@@ -749,8 +820,16 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                     pendingTasks: mailbox.pendingTasks.count,
                     pendingMessages: mailbox.pendingMessages.count,
                     completedTasks: mailbox.completedTasks.count,
-                    workspaceLease: workspaceLeaseCount > 0 ? "\(workspaceLeaseCount) workspace lease" : nil,
-                    capabilityLease: capabilityLeaseCount > 0 ? "\(capabilityLeaseCount) capability lease" : nil,
+                    workspaceLease: workspaceLeaseCount > 0
+                        ? IntatisLocalization.format(
+                            "%lld workspace lease",
+                            Int64(workspaceLeaseCount))
+                        : nil,
+                    capabilityLease: capabilityLeaseCount > 0
+                        ? IntatisLocalization.format(
+                            "%lld capability lease",
+                            Int64(capabilityLeaseCount))
+                        : nil,
                     canRemove: !isMain && payload.agent != Orchestrator.automaticPermissionReviewerID)
             }
     }
@@ -779,10 +858,12 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         if let audit {
             var parts = [audit.verdict.rawValue]
             if !audit.remainingWork.isEmpty {
-                parts.append("Remaining: " + audit.remainingWork.joined(separator: "; "))
+                parts.append(IntatisLocalization.format(
+                    "Remaining: %@",
+                    audit.remainingWork.joined(separator: "; ")))
             }
             if let blocker = audit.blocker, !blocker.isEmpty {
-                parts.append("Blocker: \(blocker)")
+                parts.append(IntatisLocalization.format("Blocker: %@", blocker))
             }
             auditSummary = parts.joined(separator: " · ")
         } else {
@@ -885,7 +966,8 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
     }
 
     private func taskLine(_ task: CoworkTaskView) -> CoworkTaskLine {
-        let assignee = task.assignee.map { "@\($0.rawValue)" } ?? "Unassigned"
+        let assignee = task.assignee.map { "@\($0.rawValue)" }
+            ?? IntatisLocalization.string("Unassigned")
         let title = task.contract.map { "\(assignee) · \($0.roleHint)" } ?? assignee
         let detail = task.contract?.objective ?? task.report?.summary ?? task.error ?? task.result ?? ""
         return CoworkTaskLine(id: task.id.rawValue, title: title, detail: detail, status: task.status.rawValue)
@@ -918,7 +1000,9 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             workspaceAccessLeases[lease.canonicalPath] = lease
             return lease.canonicalURL
         } catch {
-            sessionStorageWarning = "Workspace access could not be read safely: \(error.localizedDescription)"
+            sessionStorageWarning = IntatisLocalization.format(
+                "Workspace access could not be read safely: %@",
+                error.localizedDescription)
             return nil
         }
     }
@@ -1007,7 +1091,8 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
 
     private func ensureAutomaticPermissionReview(existingProjection projection: CoworkProjection) async {
         guard let orchestrator else {
-            setPermissionReviewerStatus(.failed("Cowork session is not ready."))
+            setPermissionReviewerStatus(.failed(
+                IntatisLocalization.string("Cowork session is not ready.")))
             return
         }
         setPermissionReviewerStatus(.enabling)
@@ -1017,13 +1102,17 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             $0.name == mainID
         }), let mainBinding = mainAgent.agentInferenceBinding else {
             setPermissionReviewerStatus(.failed(
-                "@\(mainID.rawValue) has no resolved inference profile for the control plane."))
+                IntatisLocalization.format(
+                    "@%@ has no resolved inference profile for the control plane.",
+                    mainID.rawValue)))
             return
         }
         guard let controlPlaneBinding = await registryBox
             .freezeResolvableControlPlaneBinding(mainBinding) else {
             setPermissionReviewerStatus(.failed(
-                "@\(mainID.rawValue) exact inference profile revision is unavailable or incompatible."))
+                IntatisLocalization.format(
+                    "@%@ exact inference profile revision is unavailable or incompatible.",
+                    mainID.rawValue)))
             return
         }
 
@@ -1031,7 +1120,8 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             guard let restored = retainWorkspaceAccess(forPath: main.path) else {
                 needsPrimaryWorkspaceAuthorization = true
                 setPermissionReviewerStatus(.failed(
-                    "Primary workspace access must be authorized again before automatic review can start."))
+                    IntatisLocalization.string(
+                        "Primary workspace access must be authorized again before automatic review can start.")))
                 return
             }
             workspaceURL = restored
@@ -1039,13 +1129,16 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             guard let restored = retainWorkspaceAccess(forPath: workspace.path) else {
                 needsPrimaryWorkspaceAuthorization = true
                 setPermissionReviewerStatus(.failed(
-                    "Primary workspace access must be authorized again before automatic review can start."))
+                    IntatisLocalization.string(
+                        "Primary workspace access must be authorized again before automatic review can start.")))
                 return
             }
             workspaceURL = restored
         } else {
             setPermissionReviewerStatus(.failed(
-                "No primary workspace is available for @\(Orchestrator.automaticPermissionReviewerID.rawValue)."))
+                IntatisLocalization.format(
+                    "No primary workspace is available for @%@.",
+                    Orchestrator.automaticPermissionReviewerID.rawValue)))
             return
         }
 
@@ -1134,7 +1227,9 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         }
         await refreshInferenceResolutionState()
         guard inferenceResolutionFailures[mainID.rawValue] == nil else {
-            projectionError = "@\(mainID.rawValue) has an unresolved inference profile. Rebind it before resuming Cowork."
+            projectionError = IntatisLocalization.format(
+                "@%@ has an unresolved inference profile. Rebind it before resuming Cowork.",
+                mainID.rawValue)
             return
         }
         isGoalRuntimeReady = false
@@ -1148,7 +1243,8 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             return
         }
         guard recoverySafe else {
-            let message = "Goal recovery could not be completed safely. Pending Cowork work remains stopped; retry after resolving the persistence or cancellation error."
+            let message = IntatisLocalization.string(
+                "Goal recovery could not be completed safely. Pending Cowork work remains stopped; retry after resolving the persistence or cancellation error.")
             projectionError = message
             setPermissionReviewerStatus(.failed(message))
             return
@@ -1183,12 +1279,17 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         guard let workspace = projectSettings.primaryWorkspace else { return }
         guard let url = retainWorkspaceAccess(forPath: workspace.path) else {
             needsPrimaryWorkspaceAuthorization = true
-            composerError = "Primary workspace access must be authorized again before @\(mainID.rawValue) can be registered."
-            setPermissionReviewerStatus(.failed(composerError ?? "Workspace access unavailable."))
+            composerError = IntatisLocalization.format(
+                "Primary workspace access must be authorized again before @%@ can be registered.",
+                mainID.rawValue)
+            setPermissionReviewerStatus(.failed(
+                composerError ?? IntatisLocalization.string("Workspace access unavailable.")))
             return
         }
         guard let binding = projectSettings.defaultInferenceProfileBinding else {
-            composerError = "Choose a default inference profile before attaching @\(mainID.rawValue)."
+            composerError = IntatisLocalization.format(
+                "Choose a default inference profile before attaching @%@.",
+                mainID.rawValue)
             return
         }
         didRequestMainAgentAttach = true
@@ -1239,11 +1340,14 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
     func reauthorizePrimaryWorkspace() {
         guard acceptsNewOperations,
               let primary = projectSettings.primaryWorkspace,
-              let selected = WorkspaceAccess.choose(prompt: "Reauthorize Primary Workspace") else {
+              let selected = WorkspaceAccess.choose(
+                prompt: IntatisLocalization.string("Reauthorize Primary Workspace")) else {
             return
         }
         guard WorkspaceAccess.selectedLease(selected, matchesStoredPath: primary.path) else {
-            composerError = "Choose the original primary workspace at \(primary.path)."
+            composerError = IntatisLocalization.format(
+                "Choose the original primary workspace at %@.",
+                primary.path)
             needsPrimaryWorkspaceAuthorization = true
             selected.release()
             return
@@ -1251,7 +1355,9 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         do {
             try WorkspaceAccess.remember(selected.scopedURL, for: sessionID, isPrimary: true)
         } catch {
-            composerError = "Primary workspace authorization could not be saved: \(error.localizedDescription)"
+            composerError = IntatisLocalization.format(
+                "Primary workspace authorization could not be saved: %@",
+                error.localizedDescription)
             needsPrimaryWorkspaceAuthorization = true
             selected.release()
             return
@@ -1316,7 +1422,8 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
     @discardableResult
     func updateProjectSettings(_ settings: CoworkProjectSettings) async -> Bool {
         guard let operationID = beginDirectOperation() else {
-            composerError = "The Cowork session is stopping and cannot change project settings."
+            composerError = IntatisLocalization.string(
+                "The Cowork session is stopping and cannot change project settings.")
             return false
         }
         defer { finishDirectOperation(operationID) }
@@ -1331,7 +1438,8 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                 $0.name == mainID
             } ?? false
             guard hasDurableBaseline else {
-                composerError = "Retry the initial @main registration before changing project settings; the seven-event session baseline must remain atomic."
+                composerError = IntatisLocalization.string(
+                    "Retry the initial @main registration before changing project settings; the seven-event session baseline must remain atomic.")
                 return false
             }
         }
@@ -1347,7 +1455,8 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                 coworkSettings: normalized,
                 changeKind: .updated)
             guard let canonical = document.coworkSettings else {
-                composerError = "Session settings were persisted without a readable Cowork snapshot."
+                composerError = IntatisLocalization.string(
+                    "Session settings were persisted without a readable Cowork snapshot.")
                 return false
             }
             projectSettings = canonical
@@ -1360,21 +1469,27 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             composerError = nil
             return true
         } catch {
-            composerError = "Session settings could not be saved: \(error.localizedDescription)"
+            composerError = IntatisLocalization.format(
+                "Session settings could not be saved: %@",
+                error.localizedDescription)
             return false
         }
     }
 
     func removeAgent(name rawName: String) {
-        guard acceptsNewOperations, !isWorking, let orchestrator else { return }
+        guard acceptsNewOperations, !isRuntimeMutationBlocked, let orchestrator else { return }
         let name = Self.normalizedAgentName(rawName)
         guard !name.isEmpty else { return }
         guard name != projectSettings.mainAgentName else {
-            composerError = "Cannot remove @\(projectSettings.mainAgentName)."
+            composerError = IntatisLocalization.format(
+                "Cannot remove @%@.",
+                projectSettings.mainAgentName)
             return
         }
         guard AgentID(rawValue: name) != Orchestrator.automaticPermissionReviewerID else {
-            composerError = "@\(Orchestrator.automaticPermissionReviewerID.rawValue) is reserved."
+            composerError = IntatisLocalization.format(
+                "@%@ is reserved.",
+                Orchestrator.automaticPermissionReviewerID.rawValue)
             return
         }
         isWorking = true
@@ -1395,7 +1510,9 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             }
             await self.synchronizePermissionReviewerHealth(using: orchestrator)
             guard detached else {
-                self.composerError = "@\(name) could not be removed; it may still have active tasks."
+                self.composerError = IntatisLocalization.format(
+                    "@%@ could not be removed; it may still have active tasks.",
+                    name)
                 self.isWorking = false
                 return
             }
@@ -1432,7 +1549,10 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                     self.releaseWorkspaceAccess(forPath: removablePath)
                 }
             } catch {
-                self.composerError = "@\(name) is detached, but its unreferenced workspace capability was retained because cleanup failed: \(error.localizedDescription)"
+                self.composerError = IntatisLocalization.format(
+                    "@%@ is detached, but its unreferenced workspace capability was retained because cleanup failed: %@",
+                    name,
+                    error.localizedDescription)
                 self.isWorking = false
                 return
             }
@@ -1447,11 +1567,21 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             .agentInferenceBinding
     }
 
+    func selectMainInferenceProfileForNextSubmission(
+        _ binding: AgentInferenceBinding
+    ) {
+        guard acceptsNewOperations,
+              let option = inferenceProfileOptions.first(where: {
+                  $0.binding == binding
+              }) else { return }
+        nextMainInferenceOption = option
+    }
+
     func rebindAgentInferenceProfile(
         name rawName: String,
         binding: AgentInferenceBinding
     ) {
-        guard acceptsNewOperations, !isWorking, let orchestrator else { return }
+        guard acceptsNewOperations, !isRuntimeMutationBlocked, let orchestrator else { return }
         let name = Self.normalizedAgentName(rawName)
         guard !name.isEmpty else { return }
         isWorking = true
@@ -1488,11 +1618,13 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             guard let self else { return }
             defer { self.activeOperations.removeValue(forKey: operationID) }
             guard let configuredWorkspace = self.configuredWorkspace(matching: path) else {
-                self.composerError = "This workspace could not be matched safely to session settings."
+                self.composerError = IntatisLocalization.string(
+                    "This workspace could not be matched safely to session settings.")
                 return
             }
             guard !configuredWorkspace.isPrimary else {
-                self.composerError = "The primary workspace cannot be removed."
+                self.composerError = IntatisLocalization.string(
+                    "The primary workspace cannot be removed.")
                 return
             }
             let remainingAgents = await self.orchestrator?.agentList() ?? []
@@ -1502,7 +1634,8 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                 candidate: configuredWorkspace.path,
                 settings: settings,
                 remainingAgents: remainingAgents) else {
-                self.composerError = "This workspace is still referenced by session settings or an attached agent."
+                self.composerError = IntatisLocalization.string(
+                    "This workspace is still referenced by session settings or an attached agent.")
                 return
             }
             guard await self.updateProjectSettings(settings) else { return }
@@ -1510,7 +1643,9 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                 try WorkspaceAccess.forget(path: removablePath, in: self.sessionID)
                 self.releaseWorkspaceAccess(forPath: removablePath)
             } catch {
-                self.composerError = "The workspace metadata was removed, but its capability was retained because cleanup failed: \(error.localizedDescription)"
+                self.composerError = IntatisLocalization.format(
+                    "The workspace metadata was removed, but its capability was retained because cleanup failed: %@",
+                    error.localizedDescription)
                 return
             }
         }
@@ -1530,7 +1665,9 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                 in: sessionID)
             try WorkspaceAccess.remember(authorization.scopedURL, for: sessionID)
         } catch {
-            composerError = "Workspace access could not be saved: \(error.localizedDescription)"
+            composerError = IntatisLocalization.format(
+                "Workspace access could not be saved: %@",
+                error.localizedDescription)
             authorization.release()
             return
         }
@@ -1564,7 +1701,8 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
 
     func addAgent(name rawName: String, workspace authorization: WorkspaceAccessLease) {
         guard acceptsNewOperations, let orchestrator else {
-            addAgentStatus = .failed("Cowork session is not ready.")
+            addAgentStatus = .failed(
+                IntatisLocalization.string("Cowork session is not ready."))
             authorization.release()
             return
         }
@@ -1578,7 +1716,8 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             return
         }
         guard let binding = projectSettings.defaultInferenceProfileBinding else {
-            addAgentStatus = .failed("Choose a default inference profile for new agents.")
+            addAgentStatus = .failed(IntatisLocalization.string(
+                "Choose a default inference profile for new agents."))
             authorization.release()
             return
         }
@@ -1591,7 +1730,9 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                 in: sessionID)
             try WorkspaceAccess.remember(authorization.scopedURL, for: sessionID)
         } catch {
-            addAgentStatus = .failed("Workspace access could not be saved: \(error.localizedDescription)")
+            addAgentStatus = .failed(IntatisLocalization.format(
+                "Workspace access could not be saved: %@",
+                error.localizedDescription))
             authorization.release()
             return
         }
@@ -1629,7 +1770,9 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                     // hide or revoke the capability behind a false success.
                     _ = self.adoptWorkspaceAccess(authorization)
                     self.addAgentStatus = .failed(
-                        "@\(normalizedName) was attached, but its project settings could not be saved; remove it or retry settings before continuing.")
+                        IntatisLocalization.format(
+                            "@%@ was attached, but its project settings could not be saved; remove it or retry settings before continuing.",
+                            normalizedName))
                 }
                 return
             }
@@ -1675,7 +1818,10 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                         name: url.lastPathComponent,
                         mime: mime))
                 } catch {
-                    self.composerError = "Attachment \(url.lastPathComponent) could not be preserved: \(error.localizedDescription)"
+                    self.composerError = IntatisLocalization.format(
+                        "Attachment %@ could not be preserved: %@",
+                        url.lastPathComponent,
+                        error.localizedDescription)
                 }
             }
         }
@@ -1689,7 +1835,9 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
 
     func reportAttachmentImportFailure(_ error: Error) {
         guard acceptsNewOperations else { return }
-        composerError = "Attachments could not be selected: \(error.localizedDescription)"
+        composerError = IntatisLocalization.format(
+            "Attachments could not be selected: %@",
+            error.localizedDescription)
     }
 
     func send() {
@@ -1705,10 +1853,11 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             case .success(let value):
                 initialParsed = value
             case .failure(.empty):
-                composerError = CoworkMentionRouteError.emptyMessage.message
+                composerError = Self.presentationMessage(
+                    for: CoworkMentionRouteError.emptyMessage)
                 return
             case .failure(let error):
-                composerError = error.message
+                composerError = Self.presentationMessage(for: error)
                 return
             }
         }
@@ -1722,7 +1871,7 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             : routeProjectInput(routeInput)
         switch route.outcome {
         case .blocked(let error):
-            composerError = error.message
+            composerError = Self.presentationMessage(for: error)
             return
         case .send(let text, let target):
             let finalParsed: ParsedUserInput
@@ -1730,12 +1879,27 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             case .success(let parsed) where parsed.isGoal:
                 finalParsed = parsed
             case .failure(.missingGoal):
-                composerError = GoalInputParseError.missingGoal.message
+                composerError = Self.presentationMessage(
+                    for: GoalInputParseError.missingGoal)
                 return
             default:
                 finalParsed = initialParsed.isGoal
                     ? ParsedUserInput(text: text, goal: text, tags: [ParsedUserInput.goalTag])
                     : ParsedUserInput(text: text)
+            }
+            let mainAgentID = AgentID(rawValue: projectSettings.mainAgentName)
+            let isMainHostedSubmission = target == mainAgentID || finalParsed.goal != nil
+            let frozenMainInferenceBinding: AgentInferenceBinding?
+            if isMainHostedSubmission {
+                guard let exactBinding = nextMainInferenceBinding else {
+                    composerError = IntatisLocalization.format(
+                        "Choose a resolvable model for the next @%@ message before sending.",
+                        mainAgentID.rawValue)
+                    return
+                }
+                frozenMainInferenceBinding = exactBinding
+            } else {
+                frozenMainInferenceBinding = nil
             }
             let payload = UserMessagePayload(
                 text: finalParsed.text,
@@ -1743,7 +1907,8 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                 to: target,
                 tags: finalParsed.tags.isEmpty ? nil : finalParsed.tags,
                 goal: finalParsed.goal,
-                submissionID: SubmissionID.new())
+                submissionID: SubmissionID.new(),
+                mainAgentInferenceBinding: frozenMainInferenceBinding)
             isAcceptingSubmission = true
             let operationID = UUID()
             let operation = Task { @MainActor [weak self] in
@@ -1779,13 +1944,17 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                         self.scheduleSubmissionDrain()
                     case .outbox(let entry, let canonicalError):
                         self.outboxEntries[submissionID] = entry
-                        self.composerError = "Submission saved in the local outbox. Retry when the session EventLog is writable: \(canonicalError)"
+                        self.composerError = IntatisLocalization.format(
+                            "Submission saved in the local outbox. Retry when the session EventLog is writable: %@",
+                            canonicalError)
                         self.refreshPresentedItems()
                     }
                 } catch {
                     // Neither canonical EventLog nor the owner-only outbox
                     // accepted the intent. Keep the original draft verbatim.
-                    self.composerError = "The submission could not be preserved, so the draft was not cleared: \(error.localizedDescription)"
+                    self.composerError = IntatisLocalization.format(
+                        "The submission could not be preserved, so the draft was not cleared: %@",
+                        error.localizedDescription)
                 }
             }
             activeOperations[operationID] = operation
@@ -1826,8 +1995,23 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             }
             let attempt = max(1, submissionAttempts[submissionID] ?? 1)
             let target = payload.to ?? AgentID(rawValue: projectSettings.mainAgentName)
+            let mainAgentID = AgentID(rawValue: projectSettings.mainAgentName)
+            let isMainHostedSubmission = target == mainAgentID || payload.goal != nil
+            if payload.mainAgentInferenceBinding != nil, !isMainHostedSubmission {
+                await settleSubmissionFailure(
+                    submissionID: submissionID,
+                    attempt: attempt,
+                    code: "invalid_main_model_target",
+                    message: "The composer model selection can only be applied to @\(mainAgentID.rawValue). Direct agent messages keep their own configured model.",
+                    retryable: false)
+                submissionQueue.removeFirst()
+                continue
+            }
+            let frozenBindingCanRepairMain = target == mainAgentID
+                && payload.mainAgentInferenceBinding != nil
             guard let targetAgent = agents.first(where: { $0.name == target.rawValue }),
-                  targetAgent.inferenceResolution == .resolved else {
+                  targetAgent.inferenceResolution == .resolved
+                    || frozenBindingCanRepairMain else {
                 await settleSubmissionFailure(
                     submissionID: submissionID,
                     attempt: attempt,
@@ -1840,7 +2024,9 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             // Runtime reconstruction may still be in progress, but route
             // failures are already knowable locally and should become an
             // actionable submission state instead of an indefinite spinner.
-            guard isGoalRuntimeReady else { return }
+            guard isGoalRuntimeReady else {
+                return
+            }
 
             do {
                 try await submittedIntentStore.appendStatus(
@@ -1849,11 +2035,15 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                         status: .running,
                         attempt: attempt))
             } catch {
-                composerError = "Submission \(submissionID.rawValue) remains queued because its running state could not be persisted: \(error.localizedDescription)"
+                composerError = IntatisLocalization.format(
+                    "Submission %@ remains queued because its running state could not be persisted: %@",
+                    submissionID.rawValue,
+                    error.localizedDescription)
                 return
             }
 
             isWorking = true
+            isAgentWorkActive = true
             var didStartGoalContinuation = false
             let executionFailure: SubmissionFailure?
             if payload.goal != nil {
@@ -1869,7 +2059,9 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                         ? baseObjective
                         : "@\(target.rawValue): \(baseObjective)"
                     do {
-                        _ = try await goalRuntime.createGoal(objective: objective)
+                        _ = try await goalRuntime.createGoal(
+                            objective: objective,
+                            userMessage: payload)
                         // `createGoal` launches its continuation asynchronously.
                         // Close the FIFO gate immediately instead of waiting for
                         // the streamed projection to report the active run.
@@ -1927,7 +2119,6 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                 }
             }
             await synchronizePermissionReviewerHealth(using: orchestrator)
-            isWorking = false
 
             if let executionFailure {
                 await settleSubmissionFailure(
@@ -1949,9 +2140,14 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                     // automatically when the terminal status could not be
                     // persisted; the restored UI will require an explicit
                     // reconciliation/retry decision.
-                    composerError = "Submission \(submissionID.rawValue) finished, but completion could not be persisted: \(error.localizedDescription)"
+                    composerError = IntatisLocalization.format(
+                        "Submission %@ finished, but completion could not be persisted: %@",
+                        submissionID.rawValue,
+                        error.localizedDescription)
                 }
             }
+            isWorking = false
+            isAgentWorkActive = false
             if submissionQueue.first == submissionID {
                 submissionQueue.removeFirst()
             } else {
@@ -2005,7 +2201,9 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                         retryable: retryable)))
             composerError = safeMessage
         } catch {
-            composerError = "Submission failed, and its retry state could not be persisted: \(error.localizedDescription)"
+            composerError = IntatisLocalization.format(
+                "Submission failed, and its retry state could not be persisted: %@",
+                error.localizedDescription)
         }
     }
 
@@ -2038,14 +2236,17 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                         self.scheduleSubmissionDrain()
                     case .outbox(let entry, let canonicalError):
                         self.outboxEntries[submissionID] = entry
-                        self.composerError = "The submission is still safe in the local outbox: \(canonicalError)"
+                        self.composerError = IntatisLocalization.format(
+                            "The submission is still safe in the local outbox: %@",
+                            canonicalError)
                         self.refreshPresentedItems()
                     }
                     return
                 }
 
                 guard let payload = self.submittedPayloads[submissionID] else {
-                    self.composerError = "This submission payload is no longer available for retry."
+                    self.composerError = IntatisLocalization.string(
+                        "This submission payload is no longer available for retry.")
                     return
                 }
                 if let task = try await self.canonicalSubmissionTask(for: submissionID) {
@@ -2086,7 +2287,9 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                 self.refreshPresentedItems()
                 self.scheduleSubmissionDrain()
             } catch {
-                self.composerError = "The submission could not be queued for retry: \(error.localizedDescription)"
+                self.composerError = IntatisLocalization.format(
+                    "The submission could not be queued for retry: %@",
+                    error.localizedDescription)
             }
         }
         activeOperations[operationID] = operation
@@ -2133,17 +2336,48 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         }
     }
 
-    func cancelCurrentTask() {
-        guard acceptsNewOperations, isWorking, let orchestrator else { return }
-        composerError = "Cancelling the current Cowork task…"
+    func cancelCurrentActivity() {
+        guard acceptsNewOperations,
+              !isCancellingCurrentActivity,
+              isAgentWorkActive || isGoalContinuing else {
+            return
+        }
+        isCancellingCurrentActivity = true
+        composerError = IntatisLocalization.string(
+            "Cancelling the current Cowork task…")
         let operationID = UUID()
         let operation = Task { @MainActor [weak self] in
             guard let self else { return }
-            defer { self.activeOperations.removeValue(forKey: operationID) }
+            defer {
+                self.isCancellingCurrentActivity = false
+                self.activeOperations.removeValue(forKey: operationID)
+            }
+
+            let hasActiveGoal = self.isGoalContinuing
+                || self.goal?.normalizedStatus == "active"
+            if hasActiveGoal {
+                guard let goalRuntime = self.goalRuntime else {
+                    self.composerError = IntatisLocalization.string(
+                        "Cowork session is not ready.")
+                    return
+                }
+                do {
+                    _ = try await goalRuntime.pauseCurrentGoal()
+                    self.composerError = nil
+                } catch {
+                    self.composerError = error.localizedDescription
+                }
+                return
+            }
+
+            guard let orchestrator = self.orchestrator else {
+                self.composerError = IntatisLocalization.string(
+                    "Cowork session is not ready.")
+                return
+            }
             await orchestrator.cancelActiveTasks(reason: "cancelled by user")
             await self.synchronizePermissionReviewerHealth(using: orchestrator)
             self.composerError = nil
-            self.isWorking = false
         }
         activeOperations[operationID] = operation
     }
@@ -2177,7 +2411,9 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                   constraints: String,
                   tokenBudget: String) -> String? {
         let objective = objective.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !objective.isEmpty else { return "A Goal objective is required." }
+        guard !objective.isEmpty else {
+            return IntatisLocalization.string("A Goal objective is required.")
+        }
 
         let budgetText = tokenBudget.trimmingCharacters(in: .whitespacesAndNewlines)
         let parsedBudget: Int?
@@ -2186,14 +2422,16 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         } else if let value = Int(budgetText), value > 0 {
             parsedBudget = value
         } else {
-            return "Token budget must be a positive whole number, or left empty for no budget."
+            return IntatisLocalization.string(
+                "Token budget must be a positive whole number, or left empty for no budget.")
         }
 
         guard isGoalRuntimeReady,
               acceptsNewOperations,
               let goalRuntime,
               latestCoworkProjection.currentGoal != nil else {
-            return "Goal recovery must finish before the durable Goal can be edited."
+            return IntatisLocalization.string(
+                "Goal recovery must finish before the durable Goal can be edited.")
         }
         let parsedCriteria = Self.goalEditLines(successCriteria)
         let parsedConstraints = Self.goalEditLines(constraints)
@@ -2244,10 +2482,53 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             defaultTarget: AgentID(rawValue: projectSettings.mainAgentName))
     }
 
+    private static func presentationMessage(
+        for error: GoalInputParseError
+    ) -> String {
+        switch error {
+        case .empty:
+            return IntatisLocalization.string("Enter a message.")
+        case .missingGoal:
+            return IntatisLocalization.string("Enter a goal after /goal.")
+        }
+    }
+
+    private static func presentationMessage(
+        for error: CoworkMentionRouteError
+    ) -> String {
+        switch error {
+        case .noAgents:
+            return IntatisLocalization.string(
+                "Add an agent before sending a Cowork message.")
+        case .emptyMessage:
+            return IntatisLocalization.string("Enter a message before sending.")
+        case .emptyMention:
+            return IntatisLocalization.string("Type an agent name after @.")
+        case .unknownMention(let name):
+            return IntatisLocalization.format(
+                "No attached agent matches @%@.",
+                name)
+        case .invalidMention(let name):
+            return IntatisLocalization.format(
+                "@%@ is not a valid agent name. Use ASCII letters, digits, '-' or '_'.",
+                name)
+        case .ambiguousMention(let name, let agents):
+            return IntatisLocalization.format(
+                "Ambiguous @%@: %@",
+                name,
+                agents.map { "@\($0.rawValue)" }.joined(separator: ", "))
+        case .ambiguousDefault(let agents):
+            return IntatisLocalization.format(
+                "Use @Name to choose an agent: %@",
+                agents.map { "@\($0.rawValue)" }.joined(separator: ", "))
+        }
+    }
+
     func retryFailedTask(id: String) {
-        guard acceptsNewOperations, !isWorking, let orchestrator else { return }
+        guard acceptsNewOperations, !isRuntimeMutationBlocked, let orchestrator else { return }
         guard let task = retryableTasks[id] else {
-            composerError = "This failed task is no longer retryable."
+            composerError = IntatisLocalization.string(
+                "This failed task is no longer retryable.")
             return
         }
         if let submissionID = task.contract?.submissionID {
@@ -2256,6 +2537,7 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         }
         composerError = nil
         isWorking = true
+        isAgentWorkActive = true
         let operationID = UUID()
         let operation = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -2266,6 +2548,7 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                 self.composerError = message
             }
             self.isWorking = false
+            self.isAgentWorkActive = false
         }
         activeOperations[operationID] = operation
     }
@@ -2445,13 +2728,18 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
     private var permissionFallbackReason: String {
         switch steadyPermissionReviewerStatus {
         case .enabled:
-            return "Automatic review unexpectedly left the automatic path; ask-class tools fail closed until it recovers."
+            return IntatisLocalization.string(
+                "Automatic review unexpectedly left the automatic path; ask-class tools fail closed until it recovers.")
         case .failed(let reason):
-            return "Automatic review is unavailable (\(reason)); ordinary submissions remain available, but ask-class tools fail closed."
+            return IntatisLocalization.format(
+                "Automatic review is unavailable (%@); ordinary submissions remain available, but ask-class tools fail closed.",
+                reason)
         case .disabled:
-            return "Automatic review is disabled; ordinary submissions remain available, but ask-class tools fail closed."
+            return IntatisLocalization.string(
+                "Automatic review is disabled; ordinary submissions remain available, but ask-class tools fail closed.")
         case .enabling:
-            return "Automatic review is still starting; ordinary submissions remain available."
+            return IntatisLocalization.string(
+                "Automatic review is still starting; ordinary submissions remain available.")
         case .degraded(let reason):
             return reason
         case .fallback(let reason):
@@ -2467,17 +2755,22 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
     private func validateNewAgentName(_ rawName: String) -> AgentNameValidation {
         let name = Self.normalizedAgentName(rawName)
         guard !name.isEmpty else {
-            return .failure("Enter an agent name.")
+            return .failure(IntatisLocalization.string("Enter an agent name."))
         }
         guard name.rangeOfCharacter(from: .whitespacesAndNewlines) == nil else {
-            return .failure("Agent names cannot contain spaces.")
+            return .failure(IntatisLocalization.string(
+                "Agent names cannot contain spaces."))
         }
         let existing = agents.map(\.name)
         if existing.contains(name) {
-            return .failure("@\(name) is already attached.")
+            return .failure(IntatisLocalization.format(
+                "@%@ is already attached.",
+                name))
         }
         if existing.contains(where: { $0.lowercased() == name.lowercased() }) {
-            return .failure("@\(name) conflicts with an attached agent name.")
+            return .failure(IntatisLocalization.format(
+                "@%@ conflicts with an attached agent name.",
+                name))
         }
         return .success(name)
     }
@@ -2514,7 +2807,9 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         }).last {
             return .failed(error.message)
         }
-        return .failed("Could not attach @\(agentName).")
+        return .failed(IntatisLocalization.format(
+            "Could not attach @%@.",
+            agentName))
     }
 
     private static func makeProjectInfo(sessionID: SessionID,
@@ -2590,7 +2885,9 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             mainAgentName: mainName,
             defaultModel: defaultModelDescription(settings),
             defaultPermission: permissionDescription(settings.defaultPermissionProfile),
-            tokenBudget: settings.tokenBudget.map { "\(formatNumber($0)) tok" },
+            tokenBudget: settings.tokenBudget.map {
+                IntatisLocalization.format("%@ tok", formatNumber($0))
+            },
             workspaces: workspaces)
     }
 
@@ -2615,7 +2912,9 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
 
     private static func defaultModelDescription(_ settings: CoworkProjectSettings) -> String {
         let model = settings.defaultModelID?.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let model, !model.isEmpty else { return "current model" }
+        guard let model, !model.isEmpty else {
+            return IntatisLocalization.string("current model")
+        }
         if let provider = settings.defaultProviderID?.trimmingCharacters(in: .whitespacesAndNewlines),
            !provider.isEmpty {
             return "\(provider)/\(model)"
@@ -2625,11 +2924,11 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
 
     private static func permissionDescription(_ rawValue: String) -> String {
         switch PermissionProfile(rawValue: rawValue) {
-        case .some(.manual): return "manual"
-        case .some(.reviewed): return "reviewed"
-        case .some(.autopilot): return "autopilot"
-        case .some(.readOnly): return "read only"
-        case .some(.locked): return "locked"
+        case .some(.manual): return IntatisLocalization.string("manual")
+        case .some(.reviewed): return IntatisLocalization.string("reviewed")
+        case .some(.autopilot): return IntatisLocalization.string("autopilot")
+        case .some(.readOnly): return IntatisLocalization.string("read only")
+        case .some(.locked): return IntatisLocalization.string("locked")
         case .none: return rawValue
         }
     }
@@ -2686,13 +2985,13 @@ enum CoworkAddAgentStatus: Equatable {
         case .idle:
             return nil
         case .validating:
-            return "Validating agent…"
+            return IntatisLocalization.string("Validating agent…")
         case .attaching(let name):
-            return "Attaching @\(name)…"
+            return IntatisLocalization.format("Attaching @%@…", name)
         case .attached(let name):
-            return "@\(name) attached."
+            return IntatisLocalization.format("@%@ attached.", name)
         case .denied(let reason):
-            return "Permission denied: \(reason)"
+            return IntatisLocalization.format("Permission denied: %@", reason)
         case .failed(let message):
             return message
         }

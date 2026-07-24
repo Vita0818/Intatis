@@ -29,9 +29,43 @@ struct AppSessionDisplayNameChange: Equatable, Sendable {
     let projectedThroughSeq: Int
 }
 
+struct AppSessionActivitySettlement: Equatable, Sendable {
+    let key: AppSessionRuntimeKey
+}
+
+enum AppSessionRuntimePresentationStatus: Equatable, Sendable {
+    case opening
+    case idle
+    case running
+    case removing
+
+    var label: String? {
+        switch self {
+        case .opening:
+            return "Opening"
+        case .idle:
+            return nil
+        case .running:
+            return "Running"
+        case .removing:
+            return "Stopping"
+        }
+    }
+
+    var blocksDeletion: Bool {
+        self != .idle
+    }
+}
+
+struct AppSessionRuntimeStatusChange: Equatable, Sendable {
+    let key: AppSessionRuntimeKey
+    let status: AppSessionRuntimePresentationStatus?
+}
+
 enum AppSessionRuntimeManagerError: Error, LocalizedError {
     case quiescing
     case runtimeBusy(AppSessionRuntimeKey)
+    case runtimeBeingRemoved(AppSessionRuntimeKey)
 
     var errorDescription: String? {
         switch self {
@@ -39,6 +73,8 @@ enum AppSessionRuntimeManagerError: Error, LocalizedError {
             return "The application is stopping and cannot open another session runtime."
         case .runtimeBusy(let key):
             return "The \(key.kind.rawValue) session \(key.sessionID.rawValue) is still running. Stop it before deleting the session."
+        case .runtimeBeingRemoved(let key):
+            return "The \(key.kind.rawValue) session \(key.sessionID.rawValue) is being removed."
         }
     }
 }
@@ -113,17 +149,25 @@ final class AppSessionRuntimeManager: ObservableObject {
     static let shared = AppSessionRuntimeManager()
 
     @Published private(set) var state: State = .running
-    @Published private(set) var runtimeRevision: UInt64 = 0
     let runtimeRemoved = PassthroughSubject<AppSessionRuntimeKey, Never>()
     let sessionDisplayNameChanged = PassthroughSubject<AppSessionDisplayNameChange, Never>()
+    let sessionActivitySettled = PassthroughSubject<AppSessionActivitySettlement, Never>()
+    let sessionRuntimeStatusChanged = PassthroughSubject<AppSessionRuntimeStatusChange, Never>()
     private var chatRuntimes: [SessionID: AppChatSessionRuntime] = [:]
     private var codeRuntimes: [SessionID: CodeViewModel] = [:]
     private var coworkRuntimes: [SessionID: CoworkSlot] = [:]
     private var entries: [AppSessionRuntimeKey: RuntimeEntry] = [:]
     private var currentRegistry: ProviderRegistry?
     private var currentInferenceOptions: [AppInferenceProfileOption] = []
-    private var runtimeObservations: [AppSessionRuntimeKey: AnyCancellable] = [:]
+    private var runtimeActivityObservations: [AppSessionRuntimeKey: AnyCancellable] = [:]
+    private var runtimeActivityStates: [AppSessionRuntimeKey: Bool] = [:]
+    private var runtimeSettlementObservations: [AppSessionRuntimeKey: AnyCancellable] = [:]
+    private var runtimeSettlementStates: [AppSessionRuntimeKey: Bool] = [:]
+    private var runtimePresentationStatuses: [
+        AppSessionRuntimeKey: AppSessionRuntimePresentationStatus
+    ] = [:]
     private var sessionDisplayNameWatermarks: [AppSessionRuntimeKey: (revision: Int, seq: Int)] = [:]
+    private var removingKeys: Set<AppSessionRuntimeKey> = []
     private var shutdownBatch: BoundedSessionRuntimeShutdown?
     private(set) var shutdownReport: SessionRuntimeShutdownReport?
     #if DEBUG
@@ -137,20 +181,34 @@ final class AppSessionRuntimeManager: ObservableObject {
         registry: ProviderRegistry
     ) throws -> AppChatSessionRuntime {
         guard state == .running else { throw AppSessionRuntimeManagerError.quiescing }
+        let key = AppSessionRuntimeKey(kind: .chat, sessionID: sessionID)
+        guard !removingKeys.contains(key) else {
+            throw AppSessionRuntimeManagerError.runtimeBeingRemoved(key)
+        }
         currentRegistry = registry
         if let existing = chatRuntimes[sessionID] {
             existing.updateProviderRegistry(registry)
+            // `ChatViewModel.start()` is idempotent while subscribed and
+            // retries a strict history snapshot after a transient replay
+            // failure released its subscription slot.
+            existing.start()
             return existing
         }
         let runtime = try AppChatSessionRuntime(
             sessionID: sessionID,
             registry: registry)
-        let key = AppSessionRuntimeKey(kind: .chat, sessionID: sessionID)
         chatRuntimes[sessionID] = runtime
         entries[key] = RuntimeEntry(
             isBusy: { runtime.isBusy },
             shutdown: { reason in await runtime.shutdown(reason: reason) })
-        observe(runtime.viewModel, key: key)
+        observeActivity(
+            Publishers.CombineLatest(
+                runtime.viewModel.$isStreaming,
+                runtime.viewModel.$imageGenerationState)
+                .map { isStreaming, generationState in
+                    isStreaming || generationState.isRunning
+                },
+            key: key)
         runtime.start()
         return runtime
     }
@@ -166,6 +224,13 @@ final class AppSessionRuntimeManager: ObservableObject {
             }
             throw AppSessionRuntimeManagerError.quiescing
         }
+        let key = AppSessionRuntimeKey(kind: .code, sessionID: runtime.sessionID)
+        guard !removingKeys.contains(key) else {
+            Task { @MainActor in
+                await runtime.shutdown(reason: "Code session is being removed")
+            }
+            throw AppSessionRuntimeManagerError.runtimeBeingRemoved(key)
+        }
         if let existing = codeRuntimes[runtime.sessionID] {
             Task { @MainActor in
                 await runtime.shutdown(reason: "Duplicate Code session runtime")
@@ -175,12 +240,11 @@ final class AppSessionRuntimeManager: ObservableObject {
         if let currentRegistry {
             runtime.updateProviderRegistry(currentRegistry)
         }
-        let key = AppSessionRuntimeKey(kind: .code, sessionID: runtime.sessionID)
         codeRuntimes[runtime.sessionID] = runtime
         entries[key] = RuntimeEntry(
             isBusy: { runtime.isWorking },
             shutdown: { reason in await runtime.shutdown(reason: reason) })
-        observe(runtime, key: key)
+        observeActivity(runtime.$isWorking, key: key)
         runtime.start()
         return runtime
     }
@@ -190,6 +254,10 @@ final class AppSessionRuntimeManager: ObservableObject {
         create: @escaping @MainActor () async throws -> CoworkViewModel
     ) async throws -> CoworkViewModel {
         guard state == .running else { throw AppSessionRuntimeManagerError.quiescing }
+        let key = AppSessionRuntimeKey(kind: .cowork, sessionID: sessionID)
+        guard !removingKeys.contains(key) else {
+            throw AppSessionRuntimeManagerError.runtimeBeingRemoved(key)
+        }
         if let slot = coworkRuntimes[sessionID] {
             switch slot {
             case .ready(let runtime):
@@ -205,7 +273,9 @@ final class AppSessionRuntimeManager: ObservableObject {
         let generation = UUID()
         let task = Task { @MainActor in try await create() }
         coworkRuntimes[sessionID] = .creating(generation, task)
-        markRuntimeChanged()
+        publishRuntimeStatus(
+            key: key,
+            status: .opening)
         return try await finishCoworkCreation(
             sessionID: sessionID,
             generation: generation,
@@ -238,14 +308,23 @@ final class AppSessionRuntimeManager: ObservableObject {
             entries[key] = RuntimeEntry(
                 isBusy: { runtime.hasActiveWork },
                 shutdown: { reason in await runtime.stop(reason: reason) })
-            observe(runtime, key: key)
+            observeActivity(runtime.$runtimeBusy, key: key)
+            observeSettlement(
+                Publishers.CombineLatest3(
+                    runtime.$isWorking,
+                    runtime.$isAgentWorkActive,
+                    runtime.$isGoalContinuing)
+                    .map { $0 || $1 || $2 },
+                key: key)
             runtime.start()
             return runtime
         } catch {
             if case .creating(let activeGeneration, _)? = coworkRuntimes[sessionID],
                activeGeneration == generation {
                 coworkRuntimes.removeValue(forKey: sessionID)
-                markRuntimeChanged()
+                publishRuntimeStatus(
+                    key: AppSessionRuntimeKey(kind: .cowork, sessionID: sessionID),
+                    status: nil)
             }
             throw error
         }
@@ -280,15 +359,18 @@ final class AppSessionRuntimeManager: ObservableObject {
     }
 
     func statusLabel(kind: SessionKind, sessionID: SessionID) -> String? {
-        if state == .quiescing,
-           entries[AppSessionRuntimeKey(kind: kind, sessionID: sessionID)] != nil {
+        let key = AppSessionRuntimeKey(kind: kind, sessionID: sessionID)
+        if state != .running,
+           runtimePresentationStatuses[key] != nil {
             return "Stopping"
         }
-        if kind.rawValue == SessionKind.cowork.rawValue,
-           case .creating? = coworkRuntimes[sessionID] {
-            return "Opening"
-        }
-        return isBusy(kind: kind, sessionID: sessionID) ? "Running" : nil
+        return runtimePresentationStatuses[key]?.label
+    }
+
+    func runtimeStatusSnapshot() -> [
+        AppSessionRuntimeKey: AppSessionRuntimePresentationStatus
+    ] {
+        runtimePresentationStatuses
     }
 
     /// Publishes only the newest verified display-name projection for an exact
@@ -309,15 +391,30 @@ final class AppSessionRuntimeManager: ObservableObject {
         sessionDisplayNameChanged.send(change)
     }
 
-    func removeRuntime(
+    /// Drains one exact runtime and deletes its durable session state while the
+    /// same removal fence remains installed. The final notification is emitted
+    /// only after the storage transaction has either committed or aborted, so
+    /// another window cannot reopen the key between runtime shutdown and disk
+    /// deletion.
+    ///
+    /// If storage deletion fails, the stopped runtime is still detached and all
+    /// windows are notified after the abort. The durable session remains intact
+    /// and can be opened again as a fresh runtime once this method returns.
+    func removeSession(
         kind: SessionKind,
         sessionID: SessionID,
-        reason: String
+        reason: String,
+        deleteStorage: @escaping @MainActor () throws -> Void
     ) async throws {
         let key = AppSessionRuntimeKey(kind: kind, sessionID: sessionID)
+        guard removingKeys.insert(key).inserted else {
+            throw AppSessionRuntimeManagerError.runtimeBeingRemoved(key)
+        }
+        defer { removingKeys.remove(key) }
         guard !isBusy(kind: kind, sessionID: sessionID) else {
             throw AppSessionRuntimeManagerError.runtimeBusy(key)
         }
+        publishRuntimeStatus(key: key, status: .removing)
         switch kind {
         case .chat:
             if let runtime = chatRuntimes.removeValue(forKey: sessionID) {
@@ -332,11 +429,26 @@ final class AppSessionRuntimeManager: ObservableObject {
                 await runtime.stop(reason: reason)
             }
         }
+
+        let storageError: Error?
+        do {
+            try deleteStorage()
+            storageError = nil
+        } catch {
+            storageError = error
+        }
+
         entries.removeValue(forKey: key)
-        runtimeObservations.removeValue(forKey: key)?.cancel()
+        runtimeActivityObservations.removeValue(forKey: key)?.cancel()
+        runtimeActivityStates.removeValue(forKey: key)
+        runtimeSettlementObservations.removeValue(forKey: key)?.cancel()
+        runtimeSettlementStates.removeValue(forKey: key)
         sessionDisplayNameWatermarks.removeValue(forKey: key)
+        publishRuntimeStatus(key: key, status: nil)
         runtimeRemoved.send(key)
-        markRuntimeChanged()
+        if let storageError {
+            throw storageError
+        }
     }
 
     /// Atomically quiesces the registry, broadcasts shutdown to every retained
@@ -418,25 +530,92 @@ final class AppSessionRuntimeManager: ObservableObject {
         entries[key] = RuntimeEntry(
             isBusy: { isBusy(runtime) },
             shutdown: { reason in await shutdown(runtime, reason) })
-        observe(runtime, key: key)
         return runtime
     }
     #endif
 
-    private func observe<Runtime: ObservableObject>(
-        _ runtime: Runtime,
+    private func observeActivity<P: Publisher>(
+        _ publisher: P,
         key: AppSessionRuntimeKey
-    ) {
-        runtimeObservations[key] = runtime.objectWillChange.sink { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.markRuntimeChanged()
+    ) where P.Output == Bool, P.Failure == Never {
+        runtimeActivityObservations[key] = publisher
+            .removeDuplicates()
+            .sink { [weak self] isActive in
+                // All three runtime ViewModels are MainActor-bound, so their
+                // @Published activity values arrive synchronously on MainActor.
+                MainActor.assumeIsolated {
+                    self?.runtimeActivityDidChange(
+                        key: key,
+                        isActive: isActive)
+                }
             }
-        }
-        markRuntimeChanged()
     }
 
-    private func markRuntimeChanged() {
-        runtimeRevision &+= 1
+    private func runtimeActivityDidChange(
+        key: AppSessionRuntimeKey,
+        isActive: Bool
+    ) {
+        guard entries[key] != nil else { return }
+        let wasActive = runtimeActivityStates.updateValue(
+            isActive,
+            forKey: key)
+        guard !removingKeys.contains(key) else { return }
+        publishRuntimeStatus(
+            key: key,
+            status: isActive ? .running : .idle)
+        if wasActive == true && !isActive,
+           runtimeSettlementObservations[key] == nil {
+            sessionActivitySettled.send(AppSessionActivitySettlement(key: key))
+        }
+    }
+
+    private func observeSettlement<P: Publisher>(
+        _ publisher: P,
+        key: AppSessionRuntimeKey
+    ) where P.Output == Bool, P.Failure == Never {
+        runtimeSettlementObservations[key] = publisher
+            .removeDuplicates()
+            .sink { [weak self] isActive in
+                MainActor.assumeIsolated {
+                    self?.runtimeSettlementDidChange(
+                        key: key,
+                        isActive: isActive)
+                }
+            }
+    }
+
+    private func runtimeSettlementDidChange(
+        key: AppSessionRuntimeKey,
+        isActive: Bool
+    ) {
+        guard entries[key] != nil else { return }
+        let wasActive = runtimeSettlementStates.updateValue(
+            isActive,
+            forKey: key)
+        guard !removingKeys.contains(key) else { return }
+        if wasActive == true && !isActive {
+            sessionActivitySettled.send(AppSessionActivitySettlement(key: key))
+        }
+    }
+
+    private func publishRuntimeStatus(
+        key: AppSessionRuntimeKey,
+        status: AppSessionRuntimePresentationStatus?
+    ) {
+        if removingKeys.contains(key),
+           status != nil,
+           status != .removing {
+            return
+        }
+        guard runtimePresentationStatuses[key] != status else { return }
+        if let status {
+            runtimePresentationStatuses[key] = status
+        } else {
+            runtimePresentationStatuses.removeValue(forKey: key)
+        }
+        sessionRuntimeStatusChanged.send(AppSessionRuntimeStatusChange(
+            key: key,
+            status: status))
     }
 }
 #endif
