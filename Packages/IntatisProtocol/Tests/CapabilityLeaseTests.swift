@@ -32,11 +32,19 @@ final class CapabilityLeaseTests: XCTestCase {
         XCTAssertTrue(lease.tools.contains(.browseWeb))
         XCTAssertTrue(lease.tools.contains(.gitControl))
         XCTAssertTrue(lease.tools.contains(.gitRemote))
-        XCTAssertFalse(lease.tools.contains(.runShell))
+        XCTAssertTrue(lease.tools.contains(.runShell))
         guard case .granted(let budget) = lease.delegation else {
             return XCTFail("coordinator lease should grant delegation")
         }
         XCTAssertGreaterThan(budget.maxTasks, 0)
+    }
+
+    func testReadWriteWorkerReceivesManagedTerminalCapability() {
+        let readOnly = CapabilityLease.worker(workspaceAccess: .readOnly)
+        let readWrite = CapabilityLease.worker(workspaceAccess: .readWrite)
+
+        XCTAssertFalse(readOnly.tools.contains(.runShell))
+        XCTAssertTrue(readWrite.tools.contains(.runShell))
     }
 
     func testCapabilityLeaseCodableRoundTrip() throws {

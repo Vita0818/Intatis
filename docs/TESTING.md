@@ -1,5 +1,85 @@
 # TESTING
 
+## 2026-07-25 Cowork `@main` 持久模型历史
+
+本轮专项命令使用独立 module cache，并复用仓内已解析的 SwiftPM dependencies：
+
+```sh
+env CLANG_MODULE_CACHE_PATH=/private/tmp/intatis-codex-history-cache/clang \
+  SWIFTPM_MODULECACHE_OVERRIDE=/private/tmp/intatis-codex-history-cache/swiftpm \
+  swift test --disable-sandbox \
+  --filter 'ModelHistoryAgentLoopTests|ModelHistoryProjectionTests|ModelHistoryProtocolTests|SubmittedIntentHistoryTests|ContextProjectionTests|IntatisCoworkTests.testMainProviderRequestCarriesCompletedConversationAcrossTurns|IntatisCoworkTests.testDirectWorkerRootRemainsTaskScopedAcrossTurns'
+# 34 tests, 0 failures
+```
+
+覆盖内容包括：U1/A1/U2 跨 turn 顺序；重建 `AgentLoop` 后 user/assistant/function-call/function-output 仍按原结构进入请求；assistant call batch 先于工具执行事实落盘；tool result/settlement/model output 连续同 batch 写路径；missing output → prompt-only `aborted`；orphan output 删除；并行 output 按原 call 顺序恢复；latest retry attempt 选择；冲突 item ID、wrong agent/target、unknown future event 与 seq gap 在 provider 前 fail closed；跨工具轮重复 `call_0` 唯一化；只有完整 direct output 才删除 ContextBundle audit result；task-scoped worker 不继承主 thread；`write_stdin` 原始字符不进入 EventLog。
+
+最终完整验证使用相同的独立 module cache：
+
+```sh
+env CLANG_MODULE_CACHE_PATH=/private/tmp/intatis-codex-history-cache/clang \
+  SWIFTPM_MODULECACHE_OVERRIDE=/private/tmp/intatis-codex-history-cache/swiftpm \
+  swift test --disable-sandbox
+# 1000 tests, 14 skipped, 0 failures
+
+env CLANG_MODULE_CACHE_PATH=/private/tmp/intatis-codex-history-cache/clang \
+  SWIFTPM_MODULECACHE_OVERRIDE=/private/tmp/intatis-codex-history-cache/swiftpm \
+  swift build --disable-sandbox
+# succeeded
+
+xcodebuild -quiet -project Intatis.xcodeproj -scheme IntatisMac \
+  -configuration Debug -destination 'platform=macOS' \
+  -derivedDataPath /private/tmp/intatis-model-history-mac-dd \
+  COMPILER_INDEX_STORE_ENABLE=NO CODE_SIGNING_ALLOWED=NO build
+# succeeded
+
+xcodebuild -quiet -project Intatis.xcodeproj -scheme IntatisiOS \
+  -configuration Debug -sdk iphonesimulator \
+  -destination 'generic/platform=iOS Simulator' \
+  -derivedDataPath /private/tmp/intatis-model-history-ios-dd \
+  COMPILER_INDEX_STORE_ENABLE=NO CODE_SIGNING_ALLOWED=NO build
+# succeeded
+
+git diff --check
+# passed
+```
+
+第一次在受限外层环境运行 full suite 时，既有 process/browser/network 环境测试受到宿主限制，进程已中止；随后获准使用测试本身的 sandbox 配置完成上述权威 full run，1000 项没有源码测试失败。两个 Xcode build 只有既有的 `try?` 返回值未使用、iOS 17 `onChange(of:perform:)` 弃用等警告。
+
+通过 full suite 和双端构建仍不表示完整 Codex 等价。provider-native reasoning、历史图片重新装载、replacement-history compaction、同一中断 submission 原地 resume、rollback/fork、真实 provider 长会话和真实 App/process kill 后重开仍未由本节证明。
+
+## 2026-07-24 managed terminal 最终验证
+
+本轮为 macOS Code/Cowork/CLI 加入真实持久终端与 PTY，最终源码状态验证如下：
+
+```sh
+swift test
+# 984 tests, 14 skipped, 0 failures
+
+swift test --filter TerminalToolsTests
+# 25 tests, 0 failures
+
+swift test --filter 'TerminalToolsTests|TerminalAgentLoopTests|ShellPermissionTests|ProcessShellRunner|CapabilityLeaseTests|ToolRegistryLeaseTests|AgentLoopPolicyTests|OrchestrationReliabilityTests'
+# 首轮 136 项中仅新增环境测试的期望写法失败；修正测试后单项、专项与最终 full suite 均通过
+
+xcodebuild -quiet -project Intatis.xcodeproj -scheme IntatisMac \
+  -configuration Debug -destination platform=macOS \
+  -derivedDataPath /private/tmp/intatis-managed-terminal-final3-mac-dd \
+  COMPILER_INDEX_STORE_ENABLE=NO CODE_SIGNING_ALLOWED=NO build
+# succeeded
+
+xcodebuild -quiet -project Intatis.xcodeproj -scheme IntatisiOS \
+  -configuration Debug -sdk iphonesimulator \
+  -destination 'generic/platform=iOS Simulator' \
+  -derivedDataPath /private/tmp/intatis-managed-terminal-final3-ios-dd \
+  COMPILER_INDEX_STORE_ENABLE=NO CODE_SIGNING_ALLOWED=NO build
+# succeeded
+```
+
+`TerminalToolsTests` 的 25 项覆盖真实 cwd/写文件、跨调用 stdin、TTY stdin/stdout/controlling `/dev/tty`、Ctrl-C、Swift toolchain 与 secret environment 过滤、owner isolation、空/自定义 WorkspaceLease 也不能移除的大小写无关凭据路径底线、timeout descendant cleanup、12 MiB build artifact、bounded newest-tail output、延迟输入回显清洗、完成未 poll 自动收口、workspace root replacement、sandbox 内命令不能 signal unsandboxed XCTest host、跨多次输入的危险命令、zsh 光标/escape/keymap 改写拒绝、随机盐 authorization identity 和 registry/schema opt-in。`TerminalAgentLoopTests` 证明 prepare/settle 进入 EventLog 但 stdin 原文/摘要不落盘；权限测试证明 `write_stdin` 不能绕过危险命令 hard deny。
+
+本轮未做真实 provider 驱动的长时间 Agent coding session、全屏 TUI/resize/SIGWINCH、App `kill -9` 后 orphan 检查、Linux bwrap/PTY、跨进程 terminal session 恢复或长期资源 soak；任意名字的自定义 secret 环境变量、极快自行 `setsid` 的后代与工作区复核到 spawn 之间的替换窗口也没有被证明完全覆盖。一次临时的“填满 stdin pipe”压力用例未能形成稳定可重复的结果，已中止且没有保留为通过测试；当前能确认的是任意 stdin 写入错误都会封死并清理 session。这些仍为 `UNKNOWN`，不能用单元测试或 Debug 构建冒充已完成。
+
 ## 2026-07-24 Session 切换布局风暴修复
 
 自动化覆盖：

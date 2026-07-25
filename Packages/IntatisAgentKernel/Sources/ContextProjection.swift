@@ -131,7 +131,8 @@ public struct ContextProjector: Sendable {
                         taskContract: TaskContract?,
                         events: [Envelope],
                         allowedToolNames: [String],
-                        workspaceRoot: URL?) -> ContextBundle {
+                        workspaceRoot: URL?,
+                        projectsCompletedRootAnswersIntoConversation: Bool = false) -> ContextBundle {
         let submissionBoundary = taskContract.flatMap {
             Self.submissionContextBoundary(for: $0, events: events)
         }
@@ -167,16 +168,38 @@ public struct ContextProjector: Sendable {
             events: scopedContentEvents,
             duplicateTexts: duplicateTexts,
             budget: budget)
-        let agentLocalEvents = Self.agentLocalEvents(
+        let toolTaskByCallID = submissionBoundary?.taskByToolCallID ?? [:]
+        var agentLocalEvents = Self.agentLocalEvents(
             for: agentID,
             taskContract: taskContract,
             relevantTaskIDs: relevantTaskIDs,
             taskAnchor: taskAnchor,
             events: scopedContentEvents,
             toolAgentByCallID: Self.toolAgentByCallID(from: events),
-            toolTaskByCallID: submissionBoundary?.taskByToolCallID ?? [:],
+            toolTaskByCallID: toolTaskByCallID,
             duplicateTexts: duplicateTexts,
             budget: budget)
+        if projectsCompletedRootAnswersIntoConversation,
+           let taskContract,
+           taskContract.kind == .root,
+           taskContract.issuer == nil,
+           taskContract.submissionID != nil {
+            // AgentLoop reconstructs completed root-turn answers as real
+            // assistant-role thread history. Direct model-history tool pairs
+            // likewise supersede their bounded audit previews. Keep legacy
+            // tool facts until a direct model record exists; they cannot be
+            // safely promoted into assistant/tool roles, but remain useful
+            // as explicitly untrusted context data.
+            let redundantToolAuditSequences =
+                Self.modelHistoryBackedToolAuditSequences(
+                    agentID: agentID,
+                    events: events,
+                    toolTaskByCallID: toolTaskByCallID)
+            agentLocalEvents.removeAll {
+                $0.kind == "agent_message_completed"
+                    || redundantToolAuditSequences.contains($0.seq)
+            }
+        }
         return ContextBundle(
             globalBrief: globalBrief,
             safetyPolicy: "Follow workspace confinement, permission policy, and the current task constraints.",
@@ -1041,6 +1064,68 @@ public struct ContextProjector: Sendable {
         return candidatesByCallID.compactMapValues { candidates in
             candidates.count == 1 ? candidates.first : nil
         }
+    }
+
+    private struct ModelHistoryToolKey: Hashable {
+        var taskID: TaskID
+        var callID: String
+    }
+
+    private static func modelHistoryBackedToolAuditSequences(
+        agentID: AgentID,
+        events: [Envelope],
+        toolTaskByCallID: [String: TaskID]
+    ) -> Set<Int> {
+        var directCallKeys = Set<ModelHistoryToolKey>()
+        var directOutputKeys = Set<ModelHistoryToolKey>()
+        for envelope in events {
+            guard case .modelHistoryItem(let payload) = envelope.event,
+                  payload.schemaVersion == ModelHistoryItemPayload.currentSchemaVersion,
+                  payload.agent == agentID,
+                  let taskID = payload.taskID else {
+                continue
+            }
+            switch payload.kind {
+            case .functionCallBatch:
+                for call in payload.functionCalls ?? [] {
+                    directCallKeys.insert(ModelHistoryToolKey(
+                        taskID: taskID,
+                        callID: call.callID))
+                }
+            case .functionCallOutput:
+                if let callID = payload.callID {
+                    directOutputKeys.insert(ModelHistoryToolKey(
+                        taskID: taskID,
+                        callID: callID))
+                }
+            case .message, .reasoning:
+                break
+            }
+        }
+
+        var result = Set<Int>()
+        for envelope in events {
+            let callID: String
+            let matchingKeys: Set<ModelHistoryToolKey>
+            switch envelope.event {
+            case .toolCall(let payload) where payload.agent == agentID:
+                callID = payload.toolCallId
+                matchingKeys = directCallKeys
+            case .toolResult(let payload):
+                callID = payload.toolCallId
+                matchingKeys = directOutputKeys
+            default:
+                continue
+            }
+            guard let taskID = toolTaskByCallID[callID],
+                  matchingKeys.contains(ModelHistoryToolKey(
+                      taskID: taskID,
+                      callID: callID)) else {
+                continue
+            }
+            result.insert(envelope.seq)
+        }
+        return result
     }
 
     private static func validUserObjective(_ payload: UserMessagePayload) -> String? {

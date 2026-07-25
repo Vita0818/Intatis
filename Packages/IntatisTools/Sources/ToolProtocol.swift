@@ -94,6 +94,114 @@ public protocol ShellRunner: Sendable {
     func run(_ command: String, cwd: URL) async throws -> ShellResult
 }
 
+/// Immutable host identity for a terminal process. The model receives only the
+/// opaque session ID; it cannot choose or widen this owner binding.
+public struct TerminalSessionOwner: Equatable, Sendable {
+    public let sessionID: SessionID
+    public let agent: AgentID
+    public let taskID: TaskID?
+    public let taskAttempt: Int?
+    public let workspaceRootIdentity: WorkspaceRootIdentity
+
+    public init(sessionID: SessionID,
+                agent: AgentID,
+                taskID: TaskID?,
+                taskAttempt: Int? = nil,
+                workspaceRootIdentity: WorkspaceRootIdentity) {
+        self.sessionID = sessionID
+        self.agent = agent
+        self.taskID = taskID
+        self.taskAttempt = taskAttempt
+        self.workspaceRootIdentity = workspaceRootIdentity
+    }
+}
+
+public struct TerminalExecRequest: Equatable, Sendable {
+    public let command: String
+    public let workingDirectory: String?
+    public let shellPath: String
+    public let loginShell: Bool
+    public let usesTTY: Bool
+    public let allowsNetwork: Bool
+    public let yieldMilliseconds: Int
+    public let timeoutMilliseconds: Int
+
+    public init(command: String,
+                workingDirectory: String? = nil,
+                shellPath: String = "/bin/zsh",
+                loginShell: Bool = true,
+                usesTTY: Bool = false,
+                allowsNetwork: Bool = false,
+                yieldMilliseconds: Int = 10_000,
+                timeoutMilliseconds: Int = 300_000) {
+        self.command = command
+        self.workingDirectory = workingDirectory
+        self.shellPath = shellPath
+        self.loginShell = loginShell
+        self.usesTTY = usesTTY
+        self.allowsNetwork = allowsNetwork
+        self.yieldMilliseconds = yieldMilliseconds
+        self.timeoutMilliseconds = timeoutMilliseconds
+    }
+}
+
+public struct TerminalInteractionRequest: Equatable, Sendable {
+    public let characters: String?
+    public let closeInput: Bool
+    public let terminate: Bool
+    public let yieldMilliseconds: Int
+
+    public init(characters: String? = nil,
+                closeInput: Bool = false,
+                terminate: Bool = false,
+                yieldMilliseconds: Int = 1_000) {
+        self.characters = characters
+        self.closeInput = closeInput
+        self.terminate = terminate
+        self.yieldMilliseconds = yieldMilliseconds
+    }
+}
+
+public struct TerminalSessionObservation: Equatable, Sendable {
+    public let sessionID: String?
+    public let isRunning: Bool
+    public let stdout: String
+    public let stderr: String
+    public let exitCode: Int?
+    public let timedOut: Bool
+    public let truncated: Bool
+
+    public init(sessionID: String?,
+                isRunning: Bool,
+                stdout: String,
+                stderr: String,
+                exitCode: Int?,
+                timedOut: Bool = false,
+                truncated: Bool = false) {
+        self.sessionID = sessionID
+        self.isRunning = isRunning
+        self.stdout = stdout
+        self.stderr = stderr
+        self.exitCode = exitCode
+        self.timedOut = timedOut
+        self.truncated = truncated
+    }
+}
+
+/// Session-owned terminal backend. A Code or Cowork runtime retains one
+/// instance across AgentLoop turns and drains it during runtime shutdown.
+public protocol TerminalSessionManaging: Sendable {
+    func execute(_ request: TerminalExecRequest,
+                 owner: TerminalSessionOwner,
+                 workspaceLease: WorkspaceLease) async throws -> TerminalSessionObservation
+    func interact(sessionID: String,
+                  request: TerminalInteractionRequest,
+                  owner: TerminalSessionOwner) async throws -> TerminalSessionObservation
+    func terminate(taskID: TaskID, reason: String) async
+    func terminateAll(reason: String) async
+    func shutdown(reason: String) async
+}
+
 /// Git backend. v0.2 dev uses `ProcessGitService` (spawns git); the App Store
 /// sandbox build swaps in a libgit2-backed implementation (ARCHITECTURE.md §9.1).
 public protocol GitService: Sendable {
@@ -187,6 +295,10 @@ public struct ToolContext: Sendable {
     /// Keeping this separate prevents a document/LaTeX wrapper from inheriting
     /// browser network authority merely because both are process-backed.
     public let networkStructuredShell: ShellRunner
+    /// Long-lived, runtime-owned terminal service used by `exec_command` and
+    /// `write_stdin`. It is optional so isolated tool hosts must opt in rather
+    /// than silently creating a process manager with the wrong lifetime.
+    public let terminal: (any TerminalSessionManaging)?
     public let git: GitService
     public let messenger: AgentMessenger?
     public let agentManager: AgentManager?
@@ -209,6 +321,7 @@ public struct ToolContext: Sendable {
                 shell: ShellRunner = ProcessShellRunner(),
                 structuredShell: ShellRunner? = nil,
                 networkStructuredShell: ShellRunner? = nil,
+                terminal: (any TerminalSessionManaging)? = nil,
                 git: GitService = ProcessGitService(),
                 messenger: AgentMessenger? = nil,
                 agentManager: AgentManager? = nil,
@@ -260,6 +373,7 @@ public struct ToolContext: Sendable {
             // Preserve the pre-existing single fake-runner injection behavior.
             self.networkStructuredShell = resolvedStructuredShell
         }
+        self.terminal = terminal
         if let processGit = git as? ProcessGitService {
             self.git = processGit.scoped(to: effectiveLease)
         } else {
@@ -295,6 +409,11 @@ public protocol Tool: Sendable {
     /// redacted by `PermissionActionPreview` and never substitutes for the raw
     /// argument digest used by host validation.
     func permissionActionPreview(_ args: ToolArgs) -> PermissionActionPreview?
+    /// Secret-safe material used to bind the in-memory invocation to its
+    /// immutable authorization snapshot. Most tools use the normalized raw
+    /// JSON. Tools that accept secret-like interactive bytes may instead
+    /// return a structural identity that deliberately omits those bytes.
+    func authorizationArgumentIdentity(_ args: ToolArgs) -> String
     func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation
 }
 
@@ -361,6 +480,8 @@ public extension Tool {
         guard !fields.isEmpty else { return nil }
         return PermissionActionPreview(kind: Self.descriptor.name, fields: fields)
     }
+
+    func authorizationArgumentIdentity(_ args: ToolArgs) -> String { args.raw }
 
     private static func permissionArgumentObject(_ args: ToolArgs) -> [String: JSONValue]? {
         guard let data = args.raw.data(using: .utf8),
@@ -564,6 +685,8 @@ public struct ToolRegistry: Sendable {
            workspaceTaskID != invocation.taskID {
             throw ToolRegistryAuthorizationError.leaseTaskMismatch(tool: toolName)
         }
+        let authorizationArguments = registration.tool.authorizationArgumentIdentity(
+            ToolArgs(raw: normalizedArguments))
         return ResolvedToolAuthorization(
             authorizationID: authorizationID ?? IDGen.random(prefix: "tool-authorization"),
             registryVersion: registryVersion,
@@ -582,8 +705,8 @@ public struct ToolRegistry: Sendable {
             workspaceAccess: workspaceLease?.access,
             workspaceRootIdentity: workspaceLease?.rootIdentity,
             invocation: invocation,
-            normalizedArgumentsDigest: Self.sha256(Data(normalizedArguments.utf8)),
-            normalizedArgumentsCharacterCount: normalizedArguments.count,
+            normalizedArgumentsDigest: Self.sha256(Data(authorizationArguments.utf8)),
+            normalizedArgumentsCharacterCount: authorizationArguments.count,
             intent: intent,
             sideEffect: descriptor.sideEffect,
             risksNetwork: risksNetwork,
@@ -645,8 +768,10 @@ public struct ToolRegistry: Sendable {
               authorization.sideEffect == descriptor.sideEffect else {
             throw ToolRegistryAuthorizationError.authorizationDescriptorMismatch(tool: toolName)
         }
-        guard authorization.normalizedArgumentsDigest == Self.sha256(Data(normalizedArguments.utf8)),
-              authorization.normalizedArgumentsCharacterCount == normalizedArguments.count else {
+        let authorizationArguments = registration.tool.authorizationArgumentIdentity(
+            ToolArgs(raw: normalizedArguments))
+        guard authorization.normalizedArgumentsDigest == Self.sha256(Data(authorizationArguments.utf8)),
+              authorization.normalizedArgumentsCharacterCount == authorizationArguments.count else {
             throw ToolRegistryAuthorizationError.authorizationArgumentsMismatch(tool: toolName)
         }
         let expectedCanonicalPermission = type(of: registration.tool).canonicalPermission ?? intent.action
@@ -905,8 +1030,8 @@ public struct ToolRegistry: Sendable {
     /// stays implemented for isolated tests/future helper processes but is not
     /// model-exposed because arbitrary commands cannot declare exact touched
     /// paths for WorkspaceLease denied-pattern enforcement.
-    public static func standard() -> ToolRegistry {
-        ToolRegistry([
+    public static func standard(includesTerminal: Bool = false) -> ToolRegistry {
+        var tools: [any Tool] = [
             ReadFileTool(), ListFilesTool(), SearchTextTool(), WriteFileTool(),
             ApplyPatchTool(), GitStatusTool(), GitDiffTool(),
             GitStagedDiffTool(), GitInfoTool(), GitRecentCommitsTool(),
@@ -926,7 +1051,12 @@ public struct ToolRegistry: Sendable {
             BrowserPressKeyTool(), BrowserScrollTool(), BrowserWaitTool(), BrowserScreenshotTool(),
             BrowserUploadFileTool(), BrowserDownloadTool(), BrowserDownloadsTool(),
             BrowserSearchTool(), RenameSessionTool(),
-        ])
+        ]
+        if includesTerminal {
+            tools.append(ExecCommandTool())
+            tools.append(WriteStdinTool())
+        }
+        return ToolRegistry(tools)
     }
 }
 

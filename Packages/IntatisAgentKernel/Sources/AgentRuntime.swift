@@ -93,6 +93,7 @@ public struct AgentRuntime: Sendable {
                          agent: Agent,
                          context: ContextBuilder? = nil,
                          shell: ShellRunner = ProcessShellRunner(),
+                         terminal: (any TerminalSessionManaging)? = nil,
                          git: GitService = ProcessGitService(),
                          messenger: AgentMessenger? = nil,
                          agentManager: AgentManager? = nil,
@@ -113,7 +114,8 @@ public struct AgentRuntime: Sendable {
             systemPrompt: supplied.systemPrompt,
             taskContract: supplied.taskContract,
             contextBundle: supplied.contextBundle,
-            runtimeEnvironment: environment)
+            runtimeEnvironment: environment,
+            conversationHistoryPolicy: supplied.conversationHistoryPolicy)
         return AgentLoop(
             log: log,
             provider: provider,
@@ -124,6 +126,7 @@ public struct AgentRuntime: Sendable {
             context: runtimeContext,
             allowsShell: allowsShell,
             shell: shell,
+            terminal: terminal,
             git: git,
             messenger: messenger,
             agentManager: agentManager,

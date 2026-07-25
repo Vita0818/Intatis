@@ -2,6 +2,21 @@
 
 This temporary file records the next concrete objective for this project.
 
+## Implemented slice / active follow-up — 2026-07-25 Codex-style Cowork model history
+
+- 已完成第一条必要主链：Cowork 稳定 `@main` 的后续 submission 请求现在从 durable `model_history_item` 恢复 user/assistant/tool-call/有界清洗后的 model-visible tool-output 顺序，再追加当前用户消息；工具调用先整批落盘再执行，结果先落盘再继续采样。已经成为 prior history 的遗留 call 会在 prompt 副本中得到 `aborted`，orphan output 被删除，worker 仍保持 task-scoped；同一 submission 的 whole-task Retry 仍是 fresh invocation，不能冒充 Codex 式 in-place resume。
+- 已完成安全、持久化与迁移边界：新式历史不从截短 audit 事件反推；旧 session 只恢复可证明的 completed U/A 文本；敏感/非法参数使用合法 placeholder，`write_stdin` 原文不落盘；direct model pair 与 ContextBundle audit preview 去重。tool result/model output/settlement 同 batch，空或跨轮重复 call ID 做 turn-local 唯一化，unknown future event/seq gap 在 provider 前 fail closed。
+- 下一项经用户授权的实现目标不是另造“截短最近 N 条”规则，而是继续逐项对照同一 pinned Codex 源码实现 **replacement-history compaction checkpoint + resume reconstruction**。checkpoint 必须保存压缩后的完整 replacement item 数组，并在恢复时以最新 checkpoint 为基底回放后续 item；不能只保存一段摘要后丢掉结构。
+- 仍未完成且必须单列：provider-native reasoning item；历史图片/多模态 tool output 的 ArtifactStore 重新装载；compaction 触发阈值与模型窗口策略；同一 submission in-place resume；rollback/fork semantics。前四项在完成前均为 `UNKNOWN` / 不得宣称 Codex 全等。
+- 当前专项验证为 34/34；最终完整 SwiftPM 为 1000 tests / 14 skipped / 0 failures，`swift build`、IntatisMac macOS Debug 与 IntatisiOS Simulator Debug build 均通过；最终 diff check 结果以 `docs/TESTING.md` 的 2026-07-25 小节为准。
+
+## Completed implementation slice — 2026-07-24 real managed terminal
+
+- macOS Code/Cowork/CLI 的 shell-capable agent 已获得真实 `exec_command` / `write_stdin`：长进程可跨调用保留，`tty=true` 有 controlling terminal，stdin/轮询/Ctrl-C/结束/终止可用。production raw `run_shell` 仍不暴露。
+- 目标不是“让 agent 想跑什么就跑什么”，而是“像 Codex CLI 一样真的有终端，同时仍属于 Intatis 的工作区和权限系统”：exact owner/task/attempt/WorkspaceLease 绑定、每次交互重新审批、macOS Seatbelt、默认断网、有界输出、凭据环境过滤、stdin durable redaction、task/runtime cancellation cleanup 已完成。
+- 最终 `swift test` 984 tests / 14 skipped / 0 failures，其中 `TerminalToolsTests` 25/25；IntatisMac macOS Debug 与 IntatisiOS generic Simulator Debug build 通过。实现仅参考 pinned Codex CLI 公开架构，未复制或翻译其源码，NOTICE 无需变化。
+- 这不是要求立即继续扩展的 active target。若用户以后决定继续，最有价值的窄切片依次是：运行中 resize/SIGWINCH + 常见 TUI smoke；macOS 强制杀进程后的 orphan/恢复策略；Linux bwrap denied-pattern 映射与 PTY backend。当前三项仍为 `UNKNOWN` / 未完成。
+
 ## Completed reliability slice — 2026-07-24 session-switch layout storm
 
 - Code/Cowork now separate process-retained runtime from window-local session presentation. Exact session identity rebuilds only the visible thread tree; scoped bottom anchors and a one-pending-task scroll coordinator reject stale generations, preserve user scroll intent, and perform monotonic rich-height correction without stopping background runtime.

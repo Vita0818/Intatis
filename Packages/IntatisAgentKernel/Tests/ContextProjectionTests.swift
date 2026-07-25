@@ -405,6 +405,10 @@ final class ContextProjectionTests: XCTestCase {
             envelope(21, .toolResult(ToolResultPayload(
                 toolCallId: "unscoped_call",
                 observation: "UNSCOPED TOOL RESULT MUST NOT LEAK"))),
+            envelope(22, .taskCompleted(TaskCompletedPayload(
+                taskID: priorTask.id,
+                agent: main,
+                result: "PRIOR ANSWER INCLUDED"))),
         ]
 
         let bundle = ContextProjector().project(
@@ -412,12 +416,20 @@ final class ContextProjectionTests: XCTestCase {
             taskContract: currentTask,
             events: events,
             allowedToolNames: [],
-            workspaceRoot: nil)
+            workspaceRoot: nil,
+            projectsCompletedRootAnswersIntoConversation: true)
         let local = bundle.agentLocalEvents.map(\.content).joined(separator: "\n")
         let direct = bundle.directMessages.map(\.content).joined(separator: "\n")
+        let threadHistory = AgentThreadHistoryProjector().project(
+            agentID: main,
+            currentTask: currentTask,
+            events: events)
 
         XCTAssertEqual(bundle.globalBrief, "Current request")
-        XCTAssertTrue(local.contains("PRIOR ANSWER INCLUDED"))
+        XCTAssertFalse(local.contains("PRIOR ANSWER INCLUDED"))
+        XCTAssertEqual(
+            threadHistory.compactMap(\.content),
+            ["Prior request", "PRIOR ANSWER INCLUDED"])
         XCTAssertTrue(local.contains("PRIOR TOOL CALL INCLUDED"))
         XCTAssertTrue(local.contains("PRIOR TOOL RESULT INCLUDED"))
         XCTAssertFalse(local.contains("CURRENT"))

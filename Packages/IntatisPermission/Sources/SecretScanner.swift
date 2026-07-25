@@ -1,5 +1,6 @@
 import Foundation
 import IntatisCore
+import IntatisProtocol
 
 /// Deterministic detection of sensitive files, secret-bearing content, and
 /// protected config — the hard rules that must never depend on a model
@@ -63,16 +64,6 @@ public enum SecretScanner {
 
 /// Heuristics for `run_shell` command strings.
 public enum ShellInspector {
-
-    private static let dangerous: [String] = [
-        "sudo", "rm -rf", "rm -fr", "rm -r ", ":(){", "mkfs", "dd if=", "> /dev/sd",
-        "chmod -r 777", "chown -r", "/etc/", "~/.ssh", "shutdown", "reboot", "killall",
-    ]
-    private static let networkOrInstall: [String] = [
-        "curl ", "wget ", "npm install", "npm i ", "yarn add", "pnpm add", "pip install",
-        "pip3 install", "apt ", "apt-get", "brew install", "gem install", "git clone",
-        "git push", "git pull", "git fetch", "nc ", "ssh ", "scp ",
-    ]
     private static let readOnlyAllowlist: Set<String> = [
         "pwd", "ls", "find", "rg", "grep", "cat",
     ]
@@ -84,13 +75,11 @@ public enum ShellInspector {
     }
 
     public static func isDangerous(_ command: String) -> Bool {
-        let lower = command.lowercased()
-        return dangerous.contains { lower.contains($0) }
+        ShellCommandRiskClassifier.isDangerous(command)
     }
 
     public static func risksNetworkOrInstall(_ command: String) -> Bool {
-        let lower = command.lowercased()
-        return networkOrInstall.contains { lower.contains($0) }
+        ShellCommandRiskClassifier.risksNetworkOrInstall(command)
     }
 
     public static func isReadOnlyCommand(_ command: String) -> Bool {

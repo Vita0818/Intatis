@@ -69,8 +69,13 @@ let package = Package(
         ),
         // v0.2 — Code: tools, deterministic permission gate, single-agent kernel.
         .target(
+            name: "IntatisPTYLauncher",
+            path: "Packages/IntatisPTYLauncher",
+            publicHeadersPath: "include"
+        ),
+        .target(
             name: "IntatisTools",
-            dependencies: ["IntatisCore", "IntatisProtocol"],
+            dependencies: ["IntatisCore", "IntatisProtocol", "IntatisPTYLauncher"],
             path: "Packages/IntatisTools/Sources"
         ),
         .target(

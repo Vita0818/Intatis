@@ -549,7 +549,7 @@ public struct CoworkProjection: Equatable, Sendable {
                 execution.settledSeq = envelope.seq
             }
             toolExecutions[payload.executionID] = execution
-        case .messageDelta, .messageCompleted, .error,
+        case .messageDelta, .messageCompleted, .modelHistoryItem, .error,
              .toolCall, .toolResult, .permissionRequest, .permissionResolved,
              .patchProposed, .agentAttachRequested,
              .agentSpawnRequested, .agentToAgentMessage, .workspaceLeaseRequested,

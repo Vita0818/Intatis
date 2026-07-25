@@ -273,6 +273,7 @@ public actor Orchestrator {
     private let bus: MessageBus
     private let engine: PermissionEngine
     private let allowsShell: Bool
+    private let terminal: ProcessTerminalSessionManager
     private let responder: PermissionResponder
     private var automaticPermissionResponder: AgentPermissionResponder?
     private var automaticPermissionReviewerAgentID: AgentID?
@@ -471,6 +472,7 @@ public actor Orchestrator {
         self.bus = MessageBus(log: log, mediator: mediator)
         self.engine = engine
         self.allowsShell = allowsShell
+        self.terminal = ProcessTerminalSessionManager()
         self.responder = responder
         self.automaticPermissionResponder = nil
         self.automaticPermissionReviewerAgentID = nil
@@ -3525,6 +3527,11 @@ public actor Orchestrator {
         }
         let executions = runningIDs.compactMap { runningExecutions[$0] }
         for execution in executions { await execution.value }
+        if shutdownPermissionReviewer {
+            await terminal.shutdown(reason: reason)
+        } else {
+            await terminal.terminateAll(reason: reason)
+        }
         // The reviewer is part of the control plane for data-plane work. Keep
         // it alive until every cancelled execution has unwound its provider,
         // tool, and approval waiters; only then retire the session reviewer.
@@ -6266,7 +6273,10 @@ public actor Orchestrator {
             explicitGoalIntent: explicitGoalIntent,
             canCreate: capabilityLease.tools.contains(.createGoal),
             canSubmitVerdict: capabilityLease.tools.contains(.submitGoalVerdict))
-        let toolRegistry = Self.toolRegistry(for: capabilityLease, agentID: agent.name)
+        let toolRegistry = Self.toolRegistry(
+            for: capabilityLease,
+            agentID: agent.name,
+            includesTerminal: allowsShell)
         let imageGenerator = await imageGeneratorFor(agent)
         let allowedToolNames = toolRegistry.descriptors().map(\.name).sorted()
         let canCoordinate = Self.canCoordinate(capabilityLease)
@@ -6277,12 +6287,19 @@ public actor Orchestrator {
             coordinationDepth: agent.coordinationDepth,
             canCoordinate: canCoordinate)
         let contextEvents = try await log.replayChecked()
+        let usesMainConversationHistory =
+            agent.name == Self.mainAgentID
+            && taskContract?.kind == .root
+            && taskContract?.issuer == nil
+            && taskContract?.assignee == agent.name
+            && taskContract?.submissionID != nil
         let contextBundle = ContextProjector().project(
             agentID: agent.name,
             taskContract: taskContract,
             events: contextEvents,
             allowedToolNames: allowedToolNames,
-            workspaceRoot: agent.workspaceRoot)
+            workspaceRoot: agent.workspaceRoot,
+            projectsCompletedRootAnswersIntoConversation: usesMainConversationHistory)
         let runtime = AgentRuntime.cowork(
             registry: toolRegistry,
             engine: engine,
@@ -6301,7 +6318,11 @@ public actor Orchestrator {
             context: ContextBuilder(systemPrompt: systemPrompt,
                                     taskContract: taskContract,
                                     contextBundle: contextBundle,
-                                    runtimeEnvironment: .cowork),
+                                    runtimeEnvironment: .cowork,
+                                    conversationHistoryPolicy: usesMainConversationHistory
+                                        ? .coworkMainThread
+                                        : .taskScoped),
+            terminal: terminal,
             messenger: messenger,
             agentManager: manager,
             workTaskManager: workTaskManager,
@@ -8033,6 +8054,9 @@ public actor Orchestrator {
                                      result: String,
                                      presentedMessageIDs: Set<MessageID>,
                                      metadata: CoworkEventMetadata) async -> Bool {
+        await terminal.terminate(
+            taskID: task.contract.id,
+            reason: "task completed")
         let report = Self.makeTaskReport(
             task: task,
             status: .completed,
@@ -8080,6 +8104,9 @@ public actor Orchestrator {
                                   message: String,
                                   metadata: CoworkEventMetadata,
                                   failureCode: TaskFailureCode? = nil) async -> Bool {
+        await terminal.terminate(
+            taskID: task.contract.id,
+            reason: "task failed")
         let report = Self.makeTaskReport(
             task: task,
             status: .failed,
@@ -8134,6 +8161,9 @@ public actor Orchestrator {
     private func finishCancelledTask(_ task: ScheduledTask,
                                      reason: String,
                                      metadata: CoworkEventMetadata) async -> Bool {
+        await terminal.terminate(
+            taskID: task.contract.id,
+            reason: reason)
         let report = Self.makeTaskReport(
             task: task,
             status: .cancelled,
@@ -9104,7 +9134,8 @@ public actor Orchestrator {
     }
 
     static func toolRegistry(for lease: CapabilityLease,
-                             agentID: AgentID? = nil) -> ToolRegistry {
+                             agentID: AgentID? = nil,
+                             includesTerminal: Bool = true) -> ToolRegistry {
         var registrations: [ToolRegistration] = []
         func register(
             _ tools: [any Tool],
@@ -9141,10 +9172,15 @@ public actor Orchestrator {
         if lease.tools.contains(.editPDF) {
             register([EditPDFPagesTool()], granting: [.editPDF])
         }
-        // Raw run_shell is deliberately not exposed, even when a legacy lease
-        // contains `.runShell`: arbitrary shell cannot declare exact touched
-        // paths for WorkspaceLease denied-pattern enforcement. The capability
-        // remains as a compatibility signal for the read-only Git tools below.
+        // `run_shell` remains unavailable. The two managed terminal tools use
+        // an OS-enforced WorkspaceLease sandbox and an owner-bound process
+        // session instead.
+        if includesTerminal, lease.tools.contains(.runShell) {
+            register(
+                [ExecCommandTool(), WriteStdinTool()],
+                granting: [.runShell])
+        }
+        // Keep the legacy alias for read-only Git inspection.
         if lease.tools.contains(.gitControl) || lease.tools.contains(.runShell) {
             register([
                 GitStatusTool(), GitDiffTool(), GitInfoTool(),

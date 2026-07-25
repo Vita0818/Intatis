@@ -49,6 +49,8 @@ public struct Envelope: Codable, Equatable, Sendable {
             event = .messageDelta(try c.decode(MessageDeltaPayload.self, forKey: .payload))
         case .messageCompleted:
             event = .messageCompleted(try c.decode(MessageCompletedPayload.self, forKey: .payload))
+        case .modelHistoryItem:
+            event = .modelHistoryItem(try c.decode(ModelHistoryItemPayload.self, forKey: .payload))
         case .error:
             event = .error(try c.decode(ErrorPayload.self, forKey: .payload))
         case .toolCall:
@@ -220,6 +222,7 @@ public struct Envelope: Codable, Equatable, Sendable {
         case .submissionStatusChanged(let p): try c.encode(p, forKey: .payload)
         case .messageDelta(let p):       try c.encode(p, forKey: .payload)
         case .messageCompleted(let p):   try c.encode(p, forKey: .payload)
+        case .modelHistoryItem(let p):   try c.encode(p, forKey: .payload)
         case .error(let p):              try c.encode(p, forKey: .payload)
         case .toolCall(let p):           try c.encode(p, forKey: .payload)
         case .toolResult(let p):         try c.encode(p, forKey: .payload)

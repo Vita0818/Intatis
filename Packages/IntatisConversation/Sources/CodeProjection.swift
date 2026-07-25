@@ -435,7 +435,7 @@ public struct CodeProjection: Equatable, Sendable {
             items.append(CodeItem(id: p.artifactId.rawValue, kind: .note, title: "artifact",
                                   body: "📎 \(p.kind)" + (p.prompt.map { ": \($0)" } ?? "")))
 
-        case .sessionSettingsUpdated, .sessionStorageMigrated,
+        case .sessionSettingsUpdated, .sessionStorageMigrated, .modelHistoryItem,
              .toolExecutionPrepared, .toolExecutionSettled,
              .permissionRequest, .permissionReviewRequested, .permissionReviewSettled,
              .agentStatus,

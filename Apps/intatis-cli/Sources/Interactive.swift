@@ -110,8 +110,14 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
     let spinner = TurnSpinner()
     let editor = LineEditor()
     let options = RenderOptions()
+    let terminal = ProcessTerminalSessionManager()
     var render = Task { await renderLoop(log, spinner: spinner, options: options) }
     defer { render.cancel(); spinner.stop() }
+
+    func finishChatCode(_ exit: REPLExit) async -> REPLExit {
+        await terminal.shutdown(reason: "CLI \(mode.rawValue) session ended")
+        return exit
+    }
 
     banner(mode: mode, model: model, host: config.selectedRouteLabel)
 
@@ -121,9 +127,9 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
         }
         let line: String
         switch editor.readLine(prompt: prompt(mode)) {
-        case .eof: return .quit
-        case .shortcut(.exit): return .quit
-        case .shortcut(.cycleMode): return .switchTo(nextMode(mode))
+        case .eof: return await finishChatCode(.quit)
+        case .shortcut(.exit): return await finishChatCode(.quit)
+        case .shortcut(.cycleMode): return await finishChatCode(.switchTo(nextMode(mode)))
         case .shortcut(.switchModel):
             if case .text(let m) = editor.readLine(prompt: "\(S.green)model ❯\(S.reset) ") {
                 let name = unbracket(m.trimmingCharacters(in: .whitespaces))
@@ -146,7 +152,7 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
             case "help":
                 out(replHelp)
             case "exit", "quit":
-                return .quit
+                return await finishChatCode(.quit)
             case "model":
                 if arg.isEmpty { out("model: \(model)\n") } else { model = arg; out("model → \(model)\n") }
             case "reasoning":
@@ -166,7 +172,11 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
                 out("verbose → \(options.verbose ? "on" : "off")\n")
             case "mode":
                 if let m = Mode(rawValue: arg.lowercased()) {
-                    if m == mode { out("already in \(m.rawValue)\n") } else { return .switchTo(m) }
+                    if m == mode {
+                        out("already in \(m.rawValue)\n")
+                    } else {
+                        return await finishChatCode(.switchTo(m))
+                    }
                 } else {
                     out("usage: /mode chat|code|cowork\n")
                 }
@@ -187,6 +197,7 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
                     }
                 }
             case "clear":
+                await terminal.terminateAll(reason: "CLI session history cleared")
                 render.cancel(); log = try sessionLog(); render = Task { await renderLoop(log, spinner: spinner, options: options) }
                 out("(new session)\n")
             case "config":
@@ -215,13 +226,19 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
                 let provider = try await registry.defaultAgentProvider()
                 let agent = Agent(name: AgentID(rawValue: "cli"), workspaceRoot: workspace,
                                   model: ModelID(rawValue: model), profile: .reviewed)
-                _ = try await AgentLoop(log: log, provider: provider, registry: .standard(),
+                let workspaceLease = WorkspaceLease(
+                    rootPath: workspace.path,
+                    access: .readWrite)
+                _ = try await AgentLoop(log: log, provider: provider,
+                                        registry: .standard(includesTerminal: true),
                                         engine: PermissionEngine(), responder: TerminalResponder(),
                                         agent: agent, allowsShell: true,
+                                        terminal: terminal,
                                         imageGenerator: ProviderImageGenerationToolService(registry: registry),
                                         sessionNaming: EventLogSessionNamingService(log: log, kind: .code),
                                         reasoningEffort: reasoning, includeUsage: config.includeUsage,
-                                        maxIterations: config.maxSteps)
+                                        maxIterations: config.maxSteps,
+                                        workspaceLease: workspaceLease)
                     .send(sendText, images: sendImages)
             case .cowork:
                 break

@@ -92,6 +92,7 @@ public struct CapabilityLease: Codable, Sendable, Hashable {
         ]
         if workspaceAccess == .readWrite {
             tools.formUnion([
+                .runShell,
                 .gitControl,
                 .gitRemote,
                 .applyPatch,
@@ -186,6 +187,56 @@ public struct WorkspaceRootIdentity: Codable, Sendable, Hashable {
 }
 
 public struct WorkspaceLease: Codable, Sendable, Hashable {
+    /// Sensitive path floor for a model-facing general-purpose terminal. A
+    /// caller may add narrower denied patterns to a lease, but the terminal
+    /// execution boundary must always union this complete list back in so an
+    /// old or explicitly empty lease cannot remove the credential boundary.
+    public static let mandatoryTerminalDeniedPatterns: [String] = [
+        "**/.env*",
+        ".netrc",
+        ".pgpass",
+        ".npmrc",
+        ".pypirc",
+        "id_rsa",
+        "id_dsa",
+        "id_ecdsa",
+        "id_ed25519",
+        "credentials",
+        ".ssh",
+        ".aws",
+        ".gnupg",
+        ".gpg",
+        "keychains",
+        "**/secrets/**",
+        "**/*secret*",
+        "**/*token*",
+        "**/*key*",
+        "**/*credential*",
+        "**/*keychain*",
+        "**/*certificate*",
+        "**/*cert*",
+        "**/*.pem",
+        "**/*.key",
+        "**/*.p12",
+        "**/*.pfx",
+        "**/*.keystore",
+        "**/*.jks",
+        "**/*.asc",
+        "**/.config/gh/**",
+        "**/.config/opencode/**",
+        "**/.config/intatis/**",
+        "**/.local/share/opencode/**",
+        "**/.local/share/intatis/**",
+        "**/.git/config",
+        "**/.git/config.worktree",
+        "Library/Keychains",
+    ]
+
+    /// New leases persist the same floor for clear previews and replay. The
+    /// executor still unions `mandatoryTerminalDeniedPatterns` independently,
+    /// because durable data is not itself an enforcement boundary.
+    public static let defaultDeniedPatterns = mandatoryTerminalDeniedPatterns
+
     public var id: WorkspaceLeaseID
     public var workspaceID: WorkspaceID
     public var taskID: TaskID?
@@ -203,14 +254,7 @@ public struct WorkspaceLease: Codable, Sendable, Hashable {
                 rootIdentity: WorkspaceRootIdentity? = nil,
                 access: WorkspaceAccess,
                 allowedPathRules: [PathRule] = [PathRule(pattern: ".")],
-                deniedPatterns: [String] = [
-                    ".env",
-                    ".ssh",
-                    "Library/Keychains",
-                    "**/secret*",
-                    "**/*token*",
-                    "**/*key*",
-                ],
+                deniedPatterns: [String] = WorkspaceLease.defaultDeniedPatterns,
                 expiresAtTaskCompletion: Bool = false) {
         self.id = id
         self.workspaceID = workspaceID

@@ -234,6 +234,137 @@ final class IntatisCoworkTests: XCTestCase {
         XCTAssertEqual(workerProvider.requests.count, 0)
     }
 
+    func testMainProviderRequestCarriesCompletedConversationAcrossTurns() async throws {
+        let log = try tempLog()
+        let main = AgentID(rawValue: "main")
+        let workspace = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let provider = ScriptedProvider([
+            [.textDelta("A1"), .done(finishReason: "stop")],
+            [.textDelta("A2"), .done(finishReason: "stop")],
+            [.textDelta("A3"), .done(finishReason: "stop")],
+        ])
+        let orchestrator = Orchestrator(
+            log: log,
+            allowsShell: false,
+            responder: FixedResponder(.allow)) { _ in provider }
+        let submittedIntentStore = SubmittedIntentStore(log: log)
+
+        await orchestrator.attach(Agent(
+            name: main,
+            workspaceRoot: workspace,
+            model: ModelID(rawValue: "m"),
+            profile: .reviewed,
+            coordinationDepth: Agent.defaultCoordinationDepth))
+
+        let firstPayload = UserMessagePayload(
+            text: "U1",
+            to: main,
+            submissionID: SubmissionID(rawValue: "sub_main_u1"))
+        let secondPayload = UserMessagePayload(
+            text: "U2",
+            to: main,
+            submissionID: SubmissionID(rawValue: "sub_main_u2"))
+        let thirdPayload = UserMessagePayload(
+            text: "U3",
+            to: main,
+            submissionID: SubmissionID(rawValue: "sub_main_u3"))
+        _ = try await submittedIntentStore.accept(payload: firstPayload)
+        let first = await orchestrator.send(
+            "U1",
+            to: main,
+            userMessage: firstPayload,
+            recordUserMessage: false)
+        _ = try await submittedIntentStore.accept(payload: secondPayload)
+        let second = await orchestrator.send(
+            "U2",
+            to: main,
+            userMessage: secondPayload,
+            recordUserMessage: false)
+        _ = try await submittedIntentStore.accept(payload: thirdPayload)
+        let third = await orchestrator.send(
+            "U3",
+            to: main,
+            userMessage: thirdPayload,
+            recordUserMessage: false)
+        XCTAssertEqual(first, .sent)
+        XCTAssertEqual(second, .sent)
+        XCTAssertEqual(third, .sent)
+
+        let thirdRequest = try XCTUnwrap(provider.requests.last)
+        let expectedText = Set(["U1", "A1", "U2", "A2", "U3"])
+        let conversation: [(AgentRole, String)] = thirdRequest.messages.compactMap {
+            message -> (AgentRole, String)? in
+            guard let content = message.content,
+                  expectedText.contains(content) else {
+                return nil
+            }
+            return (message.role, content)
+        }
+
+        XCTAssertEqual(
+            conversation.map { $0.0 },
+            [AgentRole.user, .assistant, .user, .assistant, .user])
+        XCTAssertEqual(
+            conversation.map { $0.1 },
+            ["U1", "A1", "U2", "A2", "U3"])
+        XCTAssertEqual(
+            thirdRequest.messages.filter { $0.content == "U3" }.count,
+            1)
+    }
+
+    func testDirectWorkerRootRemainsTaskScopedAcrossTurns() async throws {
+        let log = try tempLog()
+        let worker = AgentID(rawValue: "worker")
+        let workspace = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let provider = ScriptedProvider([
+            [.textDelta("worker A1"), .done(finishReason: "stop")],
+            [.textDelta("worker A2"), .done(finishReason: "stop")],
+        ])
+        let orchestrator = Orchestrator(
+            log: log,
+            allowsShell: false,
+            responder: FixedResponder(.allow)) { _ in provider }
+        let submittedIntentStore = SubmittedIntentStore(log: log)
+
+        await orchestrator.attach(Agent(
+            name: worker,
+            workspaceRoot: workspace,
+            model: ModelID(rawValue: "m"),
+            profile: .reviewed))
+
+        let firstPayload = UserMessagePayload(
+            text: "worker U1",
+            to: worker,
+            submissionID: SubmissionID(rawValue: "sub_worker_u1"))
+        let secondPayload = UserMessagePayload(
+            text: "worker U2",
+            to: worker,
+            submissionID: SubmissionID(rawValue: "sub_worker_u2"))
+        _ = try await submittedIntentStore.accept(payload: firstPayload)
+        let first = await orchestrator.send(
+            "worker U1",
+            to: worker,
+            userMessage: firstPayload,
+            recordUserMessage: false)
+        _ = try await submittedIntentStore.accept(payload: secondPayload)
+        let second = await orchestrator.send(
+            "worker U2",
+            to: worker,
+            userMessage: secondPayload,
+            recordUserMessage: false)
+        XCTAssertEqual(first, .sent)
+        XCTAssertEqual(second, .sent)
+
+        let secondRequest = try XCTUnwrap(provider.requests.last)
+        XCTAssertFalse(secondRequest.messages.contains { $0.content == "worker U1" })
+        XCTAssertFalse(secondRequest.messages.contains { $0.content == "worker A1" })
+        XCTAssertEqual(
+            secondRequest.messages.filter { $0.content == "worker U2" }.count,
+            1)
+    }
+
     func testSendReturnsFailureWhenAgentRunFails() async throws {
         let log = try tempLog()
         let wsA = try tempWorkspace()

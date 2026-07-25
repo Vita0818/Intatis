@@ -32,20 +32,40 @@ public struct RuntimeEnvironmentManifest: Equatable, Sendable {
 }
 
 /// Builds the model request: system prompt + tool specs + message history.
+public enum AgentConversationHistoryPolicy: Equatable, Sendable {
+    /// Reuse the ordinary conversation projection. This is the existing Code
+    /// behavior and remains the default when no task-scoped ContextBundle is
+    /// present.
+    case conversation
+
+    /// Reconstruct the stable Cowork `@main` provider thread from durable
+    /// model-history items. Pre-migration turns use a completed text-only
+    /// submitted-intent/root-task bridge.
+    case coworkMainThread
+
+    /// Do not replay a session transcript. Workers and control-plane runs only
+    /// receive their bounded task-scoped ContextBundle.
+    case taskScoped
+}
+
 public struct ContextBuilder: Sendable {
     public let systemPrompt: String
     public let taskContract: TaskContract?
     public let contextBundle: ContextBundle?
     public let runtimeEnvironment: RuntimeEnvironmentManifest
+    public let conversationHistoryPolicy: AgentConversationHistoryPolicy
 
     public init(systemPrompt: String = ContextBuilder.defaultSystemPrompt,
                 taskContract: TaskContract? = nil,
                 contextBundle: ContextBundle? = nil,
-                runtimeEnvironment: RuntimeEnvironmentManifest = .code) {
+                runtimeEnvironment: RuntimeEnvironmentManifest = .code,
+                conversationHistoryPolicy: AgentConversationHistoryPolicy? = nil) {
         self.systemPrompt = systemPrompt
         self.taskContract = taskContract
         self.contextBundle = contextBundle
         self.runtimeEnvironment = runtimeEnvironment
+        self.conversationHistoryPolicy = conversationHistoryPolicy
+            ?? (contextBundle == nil ? .conversation : .taskScoped)
     }
 
     public static let defaultSystemPrompt = """

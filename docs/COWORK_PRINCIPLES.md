@@ -39,7 +39,7 @@ AgentInvocation  现有 TaskContract + TaskGraph + AgentScheduler 的一次 agen
 ```text
 Agent Identity          持久本地身份（id/displayName/exact inference binding/workspace lease/mailbox/status）
 Task Contract           每 AgentInvocation 分派的角色与交付物
-Scoped Context          上下文按作用域投影，非全量原始 transcript
+Scoped Context          worker 按作用域投影；稳定 @main 保有自己的持久模型 thread
 Capability Lease        能力按租约授予，非永久继承
 Task Graph + Scheduler  任务图 + 调度器驱动协作
 ```
@@ -91,6 +91,8 @@ explicitly shared artifacts
 workspace-relevant observations
 ```
 
+稳定 `@main` 是明确例外，但例外也不是“读取全部 UI 日志”。它必须拥有一条独立、可恢复、按模型真实输入结构保存的 thread history：user、final assistant、完整 function-call batch 与对应 output 按原顺序进入下一次 provider 请求。流式 delta、UI bubble、截短后的审计参数、`task_completed.result` 与普通 `ContextBundle` 都不能充当这条历史的事实源。崩溃后缺失的 tool output 只在请求副本中标成 `aborted`，孤立 output 不发送；task-scoped worker 仍只得到自己的 bounded context，不能继承 `@main` 的完整 thread。
+
 ### 2.3a Inference Binding
 
 推理配置属于 agent identity 的 durable route snapshot，但与权限/工具/工作区 lease 正交。`AgentInferenceBinding` 必须指向 versioned immutable connection/profile revision，并固定 model、opaque durable variant、安全 route label/trust domain/egress classification 与 opaque definition digest；macOS/CLI raw variant config key 只属于 local presentation selector，不能进入 binding/EventLog。同一个 model ID 的不同 effort、connection、credential reference 或 endpoint 是不同 profile。Catalog current/default 只是未来 agent 的创建模板，不能成为已有 agent 的动态指针。
@@ -115,6 +117,8 @@ Provider resolution 也必须是原子的：shipping resolver 一次返回 exact
 
 ### 2.4 Capability Lease
 工具应按 capability lease 暴露。普通 worker task 不应收到 coordinator 工具（`spawn_agent` / `remove_agent` / `delegate_task`）。若 task 需委派，经 `CapabilityLease.delegation` 显式授予。子 agent 不应仅因被 spawn 就获得 coordinator 能力。Git、文档/媒体与网络/浏览器工具同样按 lease 收窄：新 spawn 的 worker 默认 `read_only`，只能获得安全只读能力；用户/上级显式请求 `read_write` 且不超过 issuer WorkspaceLease ceiling 时，worker 可获得不含 coordinator 工具的 Code/data-plane 写入能力。`canCoordinate` 与 workspace access 正交：只读 coordinator 可调度但不能写 workspace，read-write worker 可执行文件工作但不能 spawn/delegate 下级。
+
+真实终端也遵循这一条。`runShell` capability 在 production 只暴露 runtime-owned `exec_command` / `write_stdin`，不能暴露 raw `run_shell`；read-only worker、reviewer 与禁用 shell 的 host 不获得它。terminal session 必须精确绑定 session/agent/task/attempt/WorkspaceLease，后续 stdin/轮询不是对首次审批的无限续期，而是新的 ToolCall、permission decision 与 durable execution ticket。task terminal 或 lease/root identity 变化必须先结束匹配 session，不能让旧 agent/session ID 继续控制进程。
 
 `rename_session` 是普通工具协议中的 session-local metadata 能力，但不是普通 coordinator 能力。它只进入 exact `@main` 的 default capability lease；worker、spawn 出的 coordinator、task-scoped non-main lease 与 reviewer 都必须移除，不能通过 intersection/继承意外流下去。模型只提供名称，宿主绑定当前 session/kind 和 durable execution ID；不存在跨 session 目标解析。
 
@@ -207,6 +211,8 @@ secret/token/key directories
 
 所有文件访问必须经工作区约束与权限策略。
 
+managed terminal 不能成为这条规则的例外。macOS process/PTY 必须在 WorkspaceLease 对应的 OS sandbox 内运行并默认断网；交互输入也要经过危险命令 hard deny。输出要持续有界 drain，stdin 原文/无盐固定摘要/延迟回显不能进入 EventLog 或 agent 间消息；取消、失败、task terminal 与 runtime shutdown 必须先 drain terminal process tree，再发布上层终态。Linux 缺少可证明的 sandbox/PTY backend 时应 fail closed。
+
 新增或删除项目工作目录是 session/project metadata 变更；真正派生工作 agent 应由 `@main` 或被显式授予协调权的 agent 通过调度器和工具完成。新建子 agent 默认只获得普通 worker + read-only workspace；`requestedAccess=read_write` 和 `canCoordinate=true` 是两个独立、显式、不可超过 issuer lease 的授权维度。除非 task contract/capability lease 明确授予，不得让子 agent 继承 `@main` 的 `spawn_agent` / `remove_agent` / `delegate_task` 等 coordinator 工具。`@main` 和自动权限审查者不应作为普通删除对象。
 
 自动权限审查若启用，审查者也必须是受控子 agent：
@@ -259,7 +265,7 @@ hard deny remains final before the reviewer can see anything
 - task-scoped tool-spawned children must be recycled only when idle
 - cancellation is cooperative; provider/tool implementations need their own bounded cancellation/watchdog behavior
 - real-provider crash/restart and long-running Goal/WorkTask multi-agent GUI/CLI matrices remain device-level validation work
-- EventLog-derived context/recovery index remains a future long-session performance optimization; request context itself must remain bounded even before such an index exists
+- EventLog-derived context/recovery index remains a future long-session performance optimization；task-scoped worker request context 必须始终有界。稳定 `@main` 当前为避免再次丢历史而重放完整 model thread，在 replacement-history compaction 完成前长度暂时无硬上限；这是显式 active gap，不能用最近 N 条或自制摘要悄悄截断，也不能把当前状态宣传为 bounded long-session solution
 - composer/edit-dialog permission UX (Phase A), reviewer request/generation isolation (Phase B), permission/tool/turn outcome semantics (Phase C), and App/runtime ownership plus quit semantics (Phase L) are implemented as separate changes; Phase S persistence must not be described as solving any of them
 - application runtime ownership stays exact-session scoped: windows own presentation, the app manager owns runtimes; switching/Command-W never implies stop, exact deletion drains only that session, Command-Q closes admission and uses bounded concurrent shutdown, and cold reopen never auto-dispatches provider work
 - immutable inference revisions and exact agent/task bindings must never be collapsed back to mutable current/default pointers
@@ -304,6 +310,11 @@ task contract appears in context
 context projection hides unrelated raw global transcript
 capability lease controls tool registry
 worker receives only read-only document/media tools and no git-control/git-remote/browser/network tools by default
+read-write shell-capable worker sees managed exec_command/write_stdin, while read-only worker/reviewer/disabled host sees neither and no production registry exposes raw run_shell
+terminal session ownership includes exact session/agent/task/attempt/workspace identity; another owner, a replaced root, revoked lease, task terminal, cancel, or shutdown cannot retain control
+write_stdin is independently authorized, cannot bypass dangerous-command hard deny through split input or mutable line editing, cursor/completion/history/escape/keymap changes fail closed, partial-write uncertainty terminates the session, and neither raw input nor delayed echo is persisted
+terminal execution unions the mandatory credential-path floor into every current or legacy WorkspaceLease and enforces denied patterns case-insensitively at the OS sandbox boundary
+managed terminal uses a real controlling PTY when requested, continuously bounds/drains output, preserves newest tail, cleans descendants, and does not cap normal build-artifact file size
 delegation cycle is rejected
 workspace expansion requires permission
 fresh-session bootstrap attaches fixed @main with a host-selected exact inference binding, without model review, and cannot be reused after any durable session state exists

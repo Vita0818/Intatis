@@ -22,6 +22,25 @@ final class ShellPermissionTests: XCTestCase {
         return gate.evaluate(call, ctx)
     }
 
+    private func interactionResult(_ characters: String, root: URL) -> GateResult {
+        let data = try! JSONSerialization.data(withJSONObject: [
+            "session_id": "terminal_policy_test",
+            "chars": characters,
+        ])
+        let raw = String(decoding: data, as: UTF8.self)
+        let call = ToolCallContext(
+            toolName: "write_stdin",
+            sideEffect: .exec,
+            touchedPaths: [],
+            risksNetwork: false,
+            rawArgs: raw)
+        let ctx = PermissionContext(
+            workspaceRoot: root,
+            profile: .reviewed,
+            allowsShell: true)
+        return gate.evaluate(call, ctx)
+    }
+
     private func assertNotAllow(_ command: String, root: URL, file: StaticString = #filePath, line: UInt = #line) {
         if case .allow = result(command, root: root) {
             XCTFail("command must not auto-allow: \(command)", file: file, line: line)
@@ -113,5 +132,14 @@ final class ShellPermissionTests: XCTestCase {
         let root = try tempWorkspace()
         defer { try? FileManager.default.removeItem(at: root) }
         assertNotAllow("curl https://example.test", root: root)
+    }
+
+    func testInteractiveShellInputCannotBypassDangerousCommandDeny() throws {
+        let root = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        guard case .deny = interactionResult("rm -rf .\n", root: root) else {
+            return XCTFail("write_stdin must inspect command-shaped input")
+        }
     }
 }

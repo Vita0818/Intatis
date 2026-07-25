@@ -63,10 +63,21 @@ final class WorkspaceLeaseTests: XCTestCase {
     func testWorkspaceLeaseExpressesRootAccessAndDeniedPatterns() {
         let lease = WorkspaceLease(rootPath: "/tmp/project", access: .readWrite)
 
+        XCTAssertEqual(
+            WorkspaceLease.defaultDeniedPatterns,
+            WorkspaceLease.mandatoryTerminalDeniedPatterns)
         XCTAssertEqual(lease.rootPath, "/tmp/project")
         XCTAssertEqual(lease.access, .readWrite)
         XCTAssertTrue(lease.allowedPathRules.contains(PathRule(pattern: ".")))
         XCTAssertTrue(lease.deniedPatterns.contains(".ssh"))
         XCTAssertTrue(lease.deniedPatterns.contains { $0.contains("token") })
+        for required in [
+            ".netrc", ".pgpass", ".npmrc", ".aws", ".gnupg",
+            "**/.config/gh/**", "**/.config/intatis/**", "**/.git/config",
+        ] {
+            XCTAssertTrue(
+                lease.deniedPatterns.contains(required),
+                "default WorkspaceLease must deny \(required)")
+        }
     }
 }

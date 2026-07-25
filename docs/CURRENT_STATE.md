@@ -1,6 +1,24 @@
 # CURRENT_STATE
 
-最近一次自查日期：2026-07-24
+最近一次自查日期：2026-07-25
+
+## 2026-07-25 Cowork `@main` 持久模型历史（Codex CLI 对齐第一阶段）
+
+- Cowork `@main` 不再把每次用户输入当成一条孤立的新请求，也不再从 UI 气泡、截短后的 `tool_call` 审计预览或 `task_completed.result` 猜测新式模型上下文。后续 submission 的 provider 请求从同一条 durable model-facing history 恢复先前的 user、assistant、tool call 与有界清洗后的 model-visible tool output，再追加当前用户消息。task-scoped worker 继续只收自己的 `ContextBundle`，不会拿到主对话全文。
+- 新的 `model_history_item` 是 EventLog 中独立于 UI/audit 事件的 tagged record。用户 item 在首次 provider dispatch 前写入；一次 assistant 返回的完整 tool-call batch 在执行任何工具前原子写入；每个有界清洗后的 tool output 与对应 `tool_result` / execution settlement 在同一 EventLog batch 中落盘，再允许下一次 provider dispatch。流式 delta 只服务 UI，完成的 assistant item 只写一次；Conversation/Code/Cowork UI projection 对 model-history event 为 no-op，不会多显示一份气泡。新开 `AgentLoop` 使用同一份完整 EventLog 时可按 durable 顺序重建，不依赖进程内数组。
+- prompt snapshot 按 Codex 的配对规则处理已经成为 prior history 的不完整工具对：有 call、无 output 时只在本次请求副本紧邻插入 `aborted`，不改写 EventLog；孤立 output 不发给模型；并行工具结果按原 assistant call 顺序回填。同一 submission 的 whole-task Retry 当前仍是 fresh invocation，不是 Codex 式 in-place turn resume。重复/冲突 item ID、同 turn 重复 call ID、冲突 output、错误 root/submission/agent binding、未知 schema version、unknown future event 或 seq gap 均在 provider dispatch 前 fail closed，不猜配。
+- 旧 session 没有 `model_history_item` 时，只通过严格 legacy bridge 恢复已完成的 root user/final-assistant 文本；一旦某 submission 有 direct model history，该记录就是唯一模型事实源。`ContextBundle` 仍作为追加的非可信任务数据存在；已有 direct model tool pair 对应的 bounded audit preview 会被去重，legacy tool preview 则仍只作为非可信数据，绝不会提升为 assistant/tool role。
+- 安全边界没有改成原样持久化所有工具输入：`write_stdin`、`spawn_agent`、`rename_session`、未知/非法、含秘密或超限的参数使用固定合法 JSON placeholder；`write_stdin` 原始字符不进入 EventLog。工具 observation 进入 model history 前再次做秘密清洗和限长。当前自动化已证明跨 turn 与“新建 AgentLoop + 同一 EventLog”的恢复；真实 App/process kill 后重开、provider-native reasoning、历史图片重新装载和 Codex-style full replacement-history compaction checkpoint 仍未完成或未验证，不能宣称与 Codex 全部等价。
+- 同一 AgentLoop 内空或重复的 provider call ID 现在会被改写为唯一 turn-local ID，并在 assistant call、工具审计、execution ticket、tool output 与后续 provider request 中一致使用，避免 OpenAI-compatible endpoint 每轮都回落 `call_0` 时破坏恢复。model history dispatch 还要求从 seq 0 到 durable tail 的 complete-known replay；unknown future event 或 seq gap 在 provider 前 fail closed。
+- 本轮固定阅读官方 `openai/codex` commit `4c43465133428898aa84f0bfc02c306ed65fb66a` 的 ContextManager、normalize、rollout、resume reconstruction、compaction checkpoint 与对应测试。实现方式为 `reference`：没有复制、逐行翻译、vendor 或链接 Codex Rust 源码，`NOTICE.md` 无需变化。专项验证为 34 tests / 0 failures；最终完整 SwiftPM 为 1000 tests / 14 skipped / 0 failures，`swift build`、IntatisMac macOS Debug 与 IntatisiOS Simulator Debug build 均通过，详细命令见 `docs/TESTING.md`。
+
+## 2026-07-24 Code / Cowork 真实受控终端
+
+- shell-capable 的 macOS Code、Cowork 与 CLI agent 现在拿到的不是一次性“代执行”接口，而是真实 `exec_command` / `write_stdin` 终端。短命令可直接等结果；长命令返回 opaque session ID，后续调用可继续读输出、写 stdin、发送 Ctrl-C、请求结束或强制终止。`tty=true` 使用真实 PTY，测试已证明 stdin/stdout 是终端、`/dev/tty` 可用且 Ctrl-C 能到达前台进程。
+- 终端没有绕开 Intatis 原来的控制线。每次启动和后续输入都先过同一 ToolRegistry、CapabilityLease、PermissionEngine 和 durable execution ticket；terminal session 精确绑定 session、agent、task、attempt 与 WorkspaceLease。启动、交互和后台存活期间都会复核 canonical workspace identity；工作区被替换时，即使 model 不再轮询，也会继续等待进程退出并自动收口，task 结束、用户取消或 runtime shutdown 也会终止并等待相关进程。read-only worker、`@permission-reviewer`、iOS 和 host 明确禁用 shell 时看不到终端工具；raw `run_shell` 仍未进入 production registry。
+- macOS 命令由 Seatbelt 约束在 WorkspaceLease 允许的路径内并默认断网；不再使用会限制大型构建产物的 8 MiB file-size limit。PTY 子进程由仓内小型 `IntatisPTYLauncher` C target 启动，`forkpty` 后只执行 C/POSIX signal、FD、chdir 与 exec 设置，避免在多线程 Swift 进程 fork 后继续运行 Swift runtime。父进程通过 close-on-exec error pipe 区分 chdir/exec 启动失败，输出持续 drain 到有界 head+tail buffer，完成但无人轮询的 session 会自动收口成一次性短期结果。
+- 交互输入不会以原文或可离线猜测的固定摘要写入 EventLog、permission preview 或普通 tool args；授权 identity 使用进程随机盐，终端输出会对当前及延迟出现的输入回显再次清洗。危险命令检查会在内存里跨多次 `write_stdin` 保留当前输入行；普通文字、退格、换行、Ctrl-C 和纯重绘可还原，光标移动、补全、历史、escape 控制以及 shell keymap 改写直接拒绝，因此不能靠拆分输入或改写行编辑规则再补字绕过。输入 descriptor 若只接收一部分便报错，整个 session 会立即终止，不能带着不一致状态继续。继承环境保留 PATH/Swift/Xcode toolchain，但过滤 token、密码、认证、代理、数据库 URL、JWT、访问密钥、session key 等常见凭据变量，并给命令独立临时 HOME；终端执行边界还会不可移除地合并 `.netrc`、`.pgpass`、`.npmrc`、SSH/AWS/GPG/Keychain、provider auth/config 和常见 secret/key/certificate 文件清单，Seatbelt 对这些路径按 ASCII 大小写无关匹配。
+- 本轮最终验证：`swift test` **984 tests / 14 skipped / 0 failures**；其中 `TerminalToolsTests` 25/25，另有 AgentLoop durable/privacy、shell permission、CapabilityLease、ToolRegistry 与 Cowork lifecycle 回归。IntatisMac macOS Debug 与 IntatisiOS generic Simulator Debug 均构建成功。macOS 实现可用；Linux PTY/默认 denied-pattern 映射、运行中的终端 resize/SIGWINCH、完整全屏 TUI 矩阵、App 被强制杀死后的跨进程 orphan 收口和终端 session 重启恢复仍为 `UNKNOWN` / 未完成。任意名字的自定义 secret 环境变量仍无法仅靠变量名过滤证明安全；极快自行 `setsid` 的后代追踪与工作区身份复核到进程启动之间的极窄替换窗口也需要后续继续验证。
 
 ## 2026-07-24 Session 切换布局风暴修复
 

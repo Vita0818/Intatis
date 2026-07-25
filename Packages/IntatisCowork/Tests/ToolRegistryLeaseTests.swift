@@ -659,6 +659,8 @@ final class ToolRegistryLeaseTests: XCTestCase {
         XCTAssertTrue(toolNames.contains("browser_downloads"))
         XCTAssertTrue(toolNames.contains("browser_search"))
         XCTAssertFalse(toolNames.contains("run_shell"))
+        XCTAssertTrue(toolNames.contains("exec_command"))
+        XCTAssertTrue(toolNames.contains("write_stdin"))
         XCTAssertTrue(toolNames.contains("git_status"))
         XCTAssertTrue(toolNames.contains("git_diff"))
         XCTAssertTrue(toolNames.contains("git_diff_staged"))
@@ -690,6 +692,17 @@ final class ToolRegistryLeaseTests: XCTestCase {
         XCTAssertTrue(toolNames.contains("get_goal"))
         XCTAssertTrue(toolNames.contains("create_goal"))
         XCTAssertFalse(toolNames.contains("update_goal"))
+    }
+
+    func testManagedTerminalCanBeSuppressedByHostPlatform() {
+        let lease = CapabilityLease.coordinator(taskID: TaskID(rawValue: "task_no_shell"))
+        let toolNames = Set(Orchestrator.toolRegistry(
+            for: lease,
+            includesTerminal: false).descriptors().map(\.name))
+
+        XCTAssertFalse(toolNames.contains("run_shell"))
+        XCTAssertFalse(toolNames.contains("exec_command"))
+        XCTAssertFalse(toolNames.contains("write_stdin"))
     }
 
     func testGoalVerifierCapabilityExposesOnlyReadAndVerdictGoalTools() {

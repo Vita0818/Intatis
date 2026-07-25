@@ -1,6 +1,9 @@
 import Foundation
 import IntatisCore
 import IntatisProtocol
+#if os(macOS)
+import IntatisPTYLauncher
+#endif
 #if canImport(Darwin)
 import Darwin
 #elseif canImport(Glibc)
@@ -9,7 +12,7 @@ import Glibc
 
 // MARK: - Shell
 
-private enum WorkspaceNetworkAccess {
+enum WorkspaceNetworkAccess {
     case denied
     case allowed
 }
@@ -169,19 +172,19 @@ struct StructuredProcessShellRunner: ShellRunner {
 }
 
 #if os(macOS) || os(Linux)
-private struct ManagedProcessSpec {
+struct ManagedProcessSpec {
     let executable: URL
     let arguments: [String]
     let environment: [String: String]
 }
 
-private enum ManagedProcessOutcome: Sendable {
+enum ManagedProcessOutcome: Sendable {
     case exited(Int32)
     case cancelled
     case timedOut
 }
 
-private enum ManagedProcessStopReason: Sendable {
+enum ManagedProcessStopReason: Sendable {
     case cancelled
     case timedOut
 
@@ -193,7 +196,7 @@ private enum ManagedProcessStopReason: Sendable {
     }
 }
 
-private final class ManagedProcessState: @unchecked Sendable {
+final class ManagedProcessState: @unchecked Sendable {
     private let lock = NSLock()
     private let descendantTrackerGroup = DispatchGroup()
     private let terminationGraceSeconds: TimeInterval
@@ -280,6 +283,12 @@ private final class ManagedProcessState: @unchecked Sendable {
         }
     }
 
+    func snapshotOutcome() -> ManagedProcessOutcome? {
+        lock.lock()
+        defer { lock.unlock() }
+        return outcome
+    }
+
     private func terminateRegisteredProcess() {
         lock.lock()
         guard outcome == nil, let pid = processID, let reason = stopReason else {
@@ -355,7 +364,7 @@ private final class ManagedProcessState: @unchecked Sendable {
     }
 }
 
-private func validatedWorkspace(_ cwd: URL) throws -> URL {
+func validatedWorkspace(_ cwd: URL) throws -> URL {
     let workspace = cwd.resolvingSymlinksInPath().standardizedFileURL
     var isDirectory: ObjCBool = false
     guard FileManager.default.fileExists(atPath: workspace.path, isDirectory: &isDirectory),
@@ -365,9 +374,14 @@ private func validatedWorkspace(_ cwd: URL) throws -> URL {
     return workspace
 }
 
-private func effectiveWorkspaceLease(_ candidate: WorkspaceLease?,
-                                     workspace: URL) throws -> WorkspaceLease {
-    let lease = candidate ?? WorkspaceLease(rootPath: workspace.path, access: .readWrite)
+func effectiveWorkspaceLease(_ candidate: WorkspaceLease?,
+                             workspace: URL,
+                             mandatoryDeniedPatterns: [String] = []) throws -> WorkspaceLease {
+    var lease = candidate ?? WorkspaceLease(rootPath: workspace.path, access: .readWrite)
+    var seenDeniedPatterns = Set(lease.deniedPatterns)
+    for pattern in mandatoryDeniedPatterns where seenDeniedPatterns.insert(pattern).inserted {
+        lease.deniedPatterns.append(pattern)
+    }
     let leaseRoot = URL(fileURLWithPath: lease.rootPath)
         .resolvingSymlinksInPath()
         .standardizedFileURL
@@ -646,7 +660,7 @@ private extension TimeInterval {
     }
 }
 
-private func sanitizedProcessEnvironment(home: URL, temporary: URL) -> [String: String] {
+func sanitizedProcessEnvironment(home: URL, temporary: URL) -> [String: String] {
     [
         "HOME": home.path,
         "TMPDIR": temporary.path + "/",
@@ -662,10 +676,10 @@ private func sanitizedProcessEnvironment(home: URL, temporary: URL) -> [String: 
     ]
 }
 
-private func limitedExecutionArguments(executable: URL,
-                                       arguments: [String],
-                                       startupMarker: URL,
-                                       maximumOutputBytes: Int) -> [String] {
+func limitedExecutionArguments(executable: URL,
+                               arguments: [String],
+                               startupMarker: URL,
+                               maximumOutputBytes: Int) -> [String] {
     let blocks = max(2, maximumOutputBytes / 512)
     return [
         "/bin/sh", "-c",
@@ -674,7 +688,17 @@ private func limitedExecutionArguments(executable: URL,
     ] + arguments
 }
 
-private func structuredRuntimeReadRoots() -> [URL] {
+func managedTerminalExecutionArguments(executable: URL,
+                                       arguments: [String],
+                                       startupMarker: URL) -> [String] {
+    [
+        "/bin/sh", "-c",
+        "marker=$1; shift; printf 1 > \"$marker\" || exit 125; rm -f -- \"$marker\" || exit 125; exec \"$@\"",
+        "intatis-managed-terminal", startupMarker.path, executable.path,
+    ] + arguments
+}
+
+func structuredRuntimeReadRoots() -> [URL] {
     [
         "/opt/homebrew",
         "/usr/local",
@@ -689,12 +713,12 @@ private func structuredRuntimeReadRoots() -> [URL] {
 }
 
 #if os(macOS)
-private func macOSSandboxProfile(workspace: URL,
-                                 runtime: URL,
-                                 trustedReadRoots: [URL],
-                                 writableRoots: [URL],
-                                 workspaceLease: WorkspaceLease,
-                                 networkAccess: WorkspaceNetworkAccess) throws -> String {
+func macOSSandboxProfile(workspace: URL,
+                         runtime: URL,
+                         trustedReadRoots: [URL],
+                         writableRoots: [URL],
+                         workspaceLease: WorkspaceLease,
+                         networkAccess: WorkspaceNetworkAccess) throws -> String {
     let baseReadRoots = [
         "/System", "/usr", "/bin", "/sbin",
         "/Library/Apple", "/Library/Frameworks", "/Library/Fonts",
@@ -746,7 +770,10 @@ private func macOSSandboxProfile(workspace: URL,
         """
     }
     let deniedRules = try workspaceLease.deniedPatterns.compactMap {
-        try seatbeltPathRegex(pattern: $0, workspaceRoot: workspaceRoot)
+        try seatbeltPathRegex(
+            pattern: $0,
+            workspaceRoot: workspaceRoot,
+            caseInsensitivePattern: true)
     }.map {
         "(deny file-read-data file-map-executable file-write* (regex \"\(sandboxLiteral($0))\"))"
     }.joined(separator: "\n")
@@ -763,7 +790,12 @@ private func macOSSandboxProfile(workspace: URL,
     (version 1)
     (deny default)
     (import "system.sb")
-    (allow process*)
+    (allow process-exec)
+    (allow process-fork)
+    (allow signal (target same-sandbox))
+    (allow process-info* (target same-sandbox))
+    (allow file-read* file-write* file-ioctl (literal "/dev/tty"))
+    (allow file-ioctl (regex "^/dev/ttys[0-9a-f]+$"))
     (allow file-read* \(readRules))
     (allow file-read-metadata file-test-existence \(ancestorRules))
     (allow file-write* \(writeRules))
@@ -776,7 +808,8 @@ private func macOSSandboxProfile(workspace: URL,
 }
 
 private func seatbeltPathRegex(pattern rawPattern: String,
-                               workspaceRoot: String) throws -> String? {
+                               workspaceRoot: String,
+                               caseInsensitivePattern: Bool = false) throws -> String? {
     var pattern = rawPattern.trimmingCharacters(in: .whitespacesAndNewlines)
         .replacingOccurrences(of: "\\", with: "/")
     while pattern.hasPrefix("./") { pattern.removeFirst(2) }
@@ -790,14 +823,19 @@ private func seatbeltPathRegex(pattern rawPattern: String,
     }
     let root = NSRegularExpression.escapedPattern(for: workspaceRoot)
     let componentPattern = pattern.contains("/") == false
-    let relative = globRegularExpression(pattern)
+    let relative = globRegularExpression(
+        pattern,
+        caseInsensitiveLiterals: caseInsensitivePattern)
     if componentPattern {
         return "^\(root)(/[^/]*)*/\(relative)(/.*)?$"
     }
     return "^\(root)/\(relative)(/.*)?$"
 }
 
-private func globRegularExpression(_ pattern: String) -> String {
+private func globRegularExpression(
+    _ pattern: String,
+    caseInsensitiveLiterals: Bool = false
+) -> String {
     var result = ""
     var index = pattern.startIndex
     while index < pattern.endIndex {
@@ -823,7 +861,16 @@ private func globRegularExpression(_ pattern: String) -> String {
             result += "[^/]"
             index = pattern.index(after: index)
         } else {
-            result += NSRegularExpression.escapedPattern(for: String(character))
+            let literal = String(character)
+            if caseInsensitiveLiterals,
+               let scalar = literal.unicodeScalars.first,
+               literal.unicodeScalars.count == 1,
+               ((scalar.value >= 65 && scalar.value <= 90)
+                   || (scalar.value >= 97 && scalar.value <= 122)) {
+                result += "[\(literal.lowercased())\(literal.uppercased())]"
+            } else {
+                result += NSRegularExpression.escapedPattern(for: literal)
+            }
             index = pattern.index(after: index)
         }
     }
@@ -863,23 +910,23 @@ private func canonicalUniqueURLs(_ urls: [URL]) -> [URL] {
 }
 
 #if os(Linux)
-private func bubblewrapExecutable() -> URL? {
+func bubblewrapExecutable() -> URL? {
     ["/usr/bin/bwrap", "/bin/bwrap"]
         .first(where: FileManager.default.isExecutableFile(atPath:))
         .map { URL(fileURLWithPath: $0) }
 }
 
-private func bubblewrapArguments(workspace: URL,
-                                 runtime: URL,
-                                 executable: URL,
-                                 arguments: [String],
-                                 trustedReadRoots: [URL],
-                                 writableRoots: [URL],
-                                 workspaceLease: WorkspaceLease,
-                                 environment: [String: String],
-                                 networkAccess: WorkspaceNetworkAccess,
-                                 startupMarker: URL,
-                                 maximumOutputBytes: Int) -> [String] {
+func bubblewrapArguments(workspace: URL,
+                         runtime: URL,
+                         executable: URL,
+                         arguments: [String],
+                         trustedReadRoots: [URL],
+                         writableRoots: [URL],
+                         workspaceLease: WorkspaceLease,
+                         environment: [String: String],
+                         networkAccess: WorkspaceNetworkAccess,
+                         startupMarker: URL,
+                         maximumOutputBytes: Int) -> [String] {
     let baseRoots = ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc/ssl", "/etc/pki",
                      "/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf"]
         .filter { FileManager.default.fileExists(atPath: $0) }
@@ -926,13 +973,14 @@ private func bubblewrapArguments(workspace: URL,
     return result
 }
 #elseif !os(macOS)
-private func bubblewrapExecutable() -> URL? { nil }
+func bubblewrapExecutable() -> URL? { nil }
 #endif
 
-private func spawnManagedProcess(spec: ManagedProcessSpec,
-                                 cwd: URL,
-                                 stdoutDescriptor: Int32,
-                                 stderrDescriptor: Int32) throws -> Int32 {
+func spawnManagedProcess(spec: ManagedProcessSpec,
+                         cwd: URL,
+                         stdinDescriptor: Int32? = nil,
+                         stdoutDescriptor: Int32,
+                         stderrDescriptor: Int32) throws -> Int32 {
     var actions: posix_spawn_file_actions_t? = nil
     var attributes: posix_spawnattr_t? = nil
     guard posix_spawn_file_actions_init(&actions) == 0,
@@ -943,16 +991,36 @@ private func spawnManagedProcess(spec: ManagedProcessSpec,
         posix_spawn_file_actions_destroy(&actions)
         posix_spawnattr_destroy(&attributes)
     }
-    let nullDescriptor = open("/dev/null", O_RDONLY)
-    guard nullDescriptor >= 0 else { throw IntatisError.io("could not open null stdin") }
-    defer { close(nullDescriptor) }
-    guard posix_spawn_file_actions_adddup2(&actions, nullDescriptor, STDIN_FILENO) == 0,
-          posix_spawn_file_actions_adddup2(&actions, stdoutDescriptor, STDOUT_FILENO) == 0,
-          posix_spawn_file_actions_adddup2(&actions, stderrDescriptor, STDERR_FILENO) == 0 else {
+    let ownedNullDescriptor: Int32?
+    let resolvedStdinDescriptor: Int32
+    if let stdinDescriptor {
+        ownedNullDescriptor = nil
+        resolvedStdinDescriptor = stdinDescriptor
+    } else {
+        let descriptor = open("/dev/null", O_RDONLY)
+        guard descriptor >= 0 else { throw IntatisError.io("could not open null stdin") }
+        ownedNullDescriptor = descriptor
+        resolvedStdinDescriptor = descriptor
+    }
+    defer {
+        if let ownedNullDescriptor { close(ownedNullDescriptor) }
+    }
+    guard posix_spawn_file_actions_adddup2(
+        &actions,
+        resolvedStdinDescriptor,
+        STDIN_FILENO) == 0,
+        posix_spawn_file_actions_adddup2(
+            &actions,
+            stdoutDescriptor,
+            STDOUT_FILENO) == 0,
+        posix_spawn_file_actions_adddup2(
+            &actions,
+            stderrDescriptor,
+            STDERR_FILENO) == 0 else {
         throw IntatisError.io("could not configure managed process file descriptors")
     }
     #if os(macOS)
-    guard posix_spawn_file_actions_addchdir_np(&actions, cwd.path) == 0 else {
+    guard posix_spawn_file_actions_addchdir(&actions, cwd.path) == 0 else {
         throw IntatisError.io("could not confine managed process working directory")
     }
     #endif
@@ -993,6 +1061,62 @@ private func spawnManagedProcess(spec: ManagedProcessSpec,
     return pid
 }
 
+#if os(macOS)
+struct ManagedPTYSpawn {
+    let pid: Int32
+    let masterDescriptor: Int32
+}
+
+/// `forkpty` establishes a new session and controlling terminal before
+/// returning in the child. The child then immediately enters the same
+/// sandbox-exec command used by the pipe backend.
+func spawnManagedPTYProcess(spec: ManagedProcessSpec,
+                            cwd: URL,
+                            rows: UInt16 = 24,
+                            columns: UInt16 = 100) throws -> ManagedPTYSpawn {
+    let argv = [spec.executable.path] + spec.arguments
+    let envp = spec.environment.keys.sorted().map {
+        "\($0)=\(spec.environment[$0] ?? "")"
+    }
+    var spawned = IntatisPTYSpawnResult(
+        pid: -1,
+        master_fd: -1,
+        error_stage: Int32(INTATIS_PTY_STAGE_NONE),
+        error_number: 0)
+    let result: Int32 = withMutableCStrings(argv) { argvPointer in
+        withMutableCStrings(envp) { envPointer in
+            intatis_spawn_managed_pty(
+                spec.executable.path,
+                argvPointer,
+                envPointer,
+                cwd.path,
+                rows,
+                columns,
+                &spawned)
+        }
+    }
+    guard result == 0, spawned.pid > 0, spawned.master_fd >= 0 else {
+        let stage: String
+        switch spawned.error_stage {
+        case Int32(INTATIS_PTY_STAGE_CHDIR):
+            stage = "working-directory setup"
+        case Int32(INTATIS_PTY_STAGE_EXEC):
+            stage = "sandbox wrapper exec"
+        default:
+            stage = "PTY setup"
+        }
+        let errorNumber = spawned.error_number != 0
+            ? spawned.error_number
+            : result
+        throw IntatisError.io(
+            "managed PTY process \(stage) failed: \(String(cString: strerror(errorNumber)))")
+    }
+    return ManagedPTYSpawn(
+        pid: spawned.pid,
+        masterDescriptor: spawned.master_fd)
+}
+#endif
+
 private func withMutableCStrings<Result>(_ strings: [String],
                                          _ body: (UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>) -> Result) -> Result {
     var pointers: [UnsafeMutablePointer<CChar>?] = strings.map { strdup($0) }
@@ -1003,7 +1127,7 @@ private func withMutableCStrings<Result>(_ strings: [String],
     }
 }
 
-private func waitAndReap(pid: pid_t) -> Int32 {
+func waitAndReap(pid: pid_t) -> Int32 {
     var status: Int32 = 0
     while waitpid(pid, &status, 0) == -1, errno == EINTR {}
     let signal = status & 0x7f

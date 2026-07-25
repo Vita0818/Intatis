@@ -185,7 +185,7 @@ public struct DeterministicPolicyGate: Sendable {
         if call.risksNetwork {
             return .pass(reason: "browser or shell-backed network access requested", risk: .high)
         }
-        let command = Self.shellCommand(from: call.rawArgs)
+        let command = Self.shellCommand(from: call.rawArgs, toolName: call.toolName)
         if ShellInspector.isDangerous(command) {
             return .deny(reason: "dangerous shell command", risk: .high)
         }
@@ -218,9 +218,25 @@ public struct DeterministicPolicyGate: Sendable {
         }
     }
 
-    static func shellCommand(from rawArgs: String) -> String {
-        struct A: Decodable { let command: String? }
-        return (try? JSONDecoder().decode(A.self, from: Data(rawArgs.utf8)))?.command ?? ""
+    static func shellCommand(from rawArgs: String,
+                             toolName: String = "run_shell") -> String {
+        struct Arguments: Decodable {
+            let command: String?
+            let chars: String?
+        }
+        guard let arguments = try? JSONDecoder().decode(
+            Arguments.self,
+            from: Data(rawArgs.utf8)) else {
+            return ""
+        }
+        // Interactive bytes can become shell commands when the managed
+        // session is a long-lived shell. They must pass the same hard-deny
+        // inspection as an initial exec_command even though their durable
+        // permission/audit representation remains secret-free.
+        if toolName == "write_stdin" {
+            return arguments.chars ?? ""
+        }
+        return arguments.command ?? ""
     }
 
     private static func stringMetadata(_ key: String, in intent: PermissionIntent) -> String? {

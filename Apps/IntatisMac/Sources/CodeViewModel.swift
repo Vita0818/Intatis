@@ -72,6 +72,7 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
     private var workspaceAccess: WorkspaceAccessLease?
     private let log: EventLog
     private let sessionNaming: SessionNamingService
+    private let terminal = ProcessTerminalSessionManager()
     private var registry: ProviderRegistry
     private var subscription: Task<Void, Never>?
     private var permissionWaiters: [RequestID: CodePermissionWaiter] = [:]
@@ -141,6 +142,7 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
     func cancelCurrentTurn() {
         guard !isShutdown, isWorking else { return }
         runningOperation?.cancel()
+        Task { await terminal.terminateAll(reason: "Code turn cancelled") }
     }
 
     /// Permanently stops this session runtime and waits until the active turn,
@@ -158,6 +160,9 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
         let operation = runningOperation
         operation?.cancel()
         let task = Task { @MainActor [weak self] in
+            if let self {
+                await self.terminal.shutdown(reason: reason)
+            }
             if let operation { await operation.value }
             if let runningSubscription { await runningSubscription.value }
             guard let self else { return }
@@ -207,15 +212,22 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
                                   workspaceRoot: self.workspaceRoot,
                                   model: model,
                                   profile: .reviewed)
+                let workspaceLease = WorkspaceLease(
+                    rootPath: self.workspaceRoot.path,
+                    access: .readWrite)
+                let allowsShell = PlatformProfile.current.allowsShell
                 let runtime = AgentRuntime.code(
-                    allowsShell: PlatformProfile.current.allowsShell)
+                    registry: .standard(includesTerminal: allowsShell),
+                    allowsShell: allowsShell)
                 let loop = runtime.makeLoop(
                     log: self.log,
                     provider: provider,
                     responder: self,
                     agent: agent,
+                    terminal: self.terminal,
                     imageGenerator: ProviderImageGenerationToolService(registry: self.registry),
-                    sessionNaming: self.sessionNaming)
+                    sessionNaming: self.sessionNaming,
+                    workspaceLease: workspaceLease)
                 didEnterAgentLoop = true
                 try await loop.send(parsed.text, userMessage: parsed.userMessagePayload)
             } catch {
