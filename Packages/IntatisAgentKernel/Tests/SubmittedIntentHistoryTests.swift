@@ -144,6 +144,8 @@ final class SubmittedIntentHistoryTests: XCTestCase {
         let firstID = SubmissionID(rawValue: "sub_u1")
         let secondID = SubmissionID(rawValue: "sub_u2")
         let currentID = SubmissionID(rawValue: "sub_u3")
+        let firstAnswer = "ROOT-ANSWER-ONE-SENTINEL"
+        let secondAnswer = "ROOT-ANSWER-TWO-SENTINEL"
 
         func rootContract(_ id: String,
                           submissionID: SubmissionID,
@@ -189,11 +191,11 @@ final class SubmittedIntentHistoryTests: XCTestCase {
         try await log.append(.taskCompleted(TaskCompletedPayload(
             taskID: firstTask.id,
             agent: main,
-            result: "A1")))
+            result: firstAnswer)))
         try await log.append(.taskCompleted(TaskCompletedPayload(
             taskID: secondTask.id,
             agent: main,
-            result: "A2")))
+            result: secondAnswer)))
 
         let replayed = try await log.replayChecked()
         let bundle = ContextProjector().project(
@@ -232,7 +234,9 @@ final class SubmittedIntentHistoryTests: XCTestCase {
             submissionID: currentID)
 
         let request = try XCTUnwrap(provider.requests.first)
-        let expectedText = Set(["U1", "A1", "U2", "A2", "U3"])
+        let expectedText = Set([
+            "U1", firstAnswer, "U2", secondAnswer, "U3",
+        ])
         let conversation = request.messages.compactMap { message -> (AgentRole, String)? in
             guard let content = message.content,
                   expectedText.contains(content) else {
@@ -241,7 +245,9 @@ final class SubmittedIntentHistoryTests: XCTestCase {
             return (message.role, content)
         }
         XCTAssertEqual(conversation.map(\.0), [.user, .assistant, .user, .assistant, .user])
-        XCTAssertEqual(conversation.map(\.1), ["U1", "A1", "U2", "A2", "U3"])
+        XCTAssertEqual(
+            conversation.map(\.1),
+            ["U1", firstAnswer, "U2", secondAnswer, "U3"])
         XCTAssertEqual(request.messages.filter { $0.content == "U3" }.count, 1)
         XCTAssertFalse(request.messages.contains { $0.content == "non-final A1 text" })
         XCTAssertFalse(request.messages.contains { $0.content == "OTHER AGENT MUST NOT LEAK" })
@@ -249,8 +255,8 @@ final class SubmittedIntentHistoryTests: XCTestCase {
         let contextData = try XCTUnwrap(request.messages.first {
             $0.content?.contains("<<<UNTRUSTED_CONTEXT_DATA>>>") == true
         }?.content)
-        XCTAssertFalse(contextData.contains("A1"))
-        XCTAssertFalse(contextData.contains("A2"))
+        XCTAssertFalse(contextData.contains(firstAnswer))
+        XCTAssertFalse(contextData.contains(secondAnswer))
     }
 
     func testTaskScopedWorkerDoesNotReceiveRootThreadTranscript() {

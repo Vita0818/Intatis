@@ -165,4 +165,221 @@ final class PermissionSettlementTransactionTests: XCTestCase {
             XCTAssertEqual(error, .conflictingPermissionRequest)
         }
     }
+
+    func testOrdinaryApproveNeverCreatesRememberedMCPApproval()
+        async throws
+    {
+        let (log, _, directory) = try makeLogPair(
+            session: "ordinary-approve")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let authorization = mcpAuthorization(
+            mode: .auto,
+            sideEffect: .readOnly)
+        var pending = request()
+        pending.tool = authorization.toolName
+        pending.context = PermissionRequestContext(
+            authorization: authorization)
+        _ = try await log.registerPermissionRequest(
+            pending)
+        _ = try await log.settlePermissionRequest(
+            PermissionResolvedPayload(
+                requestId: pending.requestId,
+                tool: authorization.toolName,
+                decision: .allow,
+                risk: .low,
+                reason: "approve once",
+                authorization: authorization,
+                source: .user,
+                action: .approve))
+
+        let replay = try await log.replayChecked()
+        XCTAssertFalse(replay.contains {
+            if case .mcpRememberedApprovalGranted =
+                    $0.event {
+                return true
+            }
+            return false
+        })
+    }
+
+    func testExplicitAutoReadOnlyApproveAndRememberCreatesExactApproval()
+        async throws
+    {
+        let (log, _, directory) = try makeLogPair(
+            session: "explicit-remember")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let authorization = mcpAuthorization(
+            mode: .auto,
+            sideEffect: .readOnly)
+        var pending = request()
+        pending.tool = authorization.toolName
+        pending.context = PermissionRequestContext(
+            authorization: authorization)
+        _ = try await log.registerPermissionRequest(
+            pending)
+        _ = try await log.settlePermissionRequest(
+            PermissionResolvedPayload(
+                requestId: pending.requestId,
+                tool: authorization.toolName,
+                decision: .allow,
+                risk: .low,
+                reason: "explicitly remember",
+                authorization: authorization,
+                source: .user,
+                action: .approveAndRemember))
+
+        let replay = try await log.replayChecked()
+        let remembered = replay.compactMap {
+            envelope -> MCPRememberedToolApproval? in
+            guard case .mcpRememberedApprovalGranted(
+                let payload) = envelope.event else {
+                return nil
+            }
+            return payload.approval
+        }
+        XCTAssertEqual(remembered.count, 1)
+        XCTAssertTrue(try XCTUnwrap(remembered.first)
+            .exactlyMatches(
+                try XCTUnwrap(
+                    authorization.mcp)))
+    }
+
+    func testRememberActionRejectsNonAutoOrNonReadOnlyAuthority()
+        async throws
+    {
+        for (index, fixture) in [
+            (MCPApprovalMode.prompt, SideEffect.readOnly),
+            (MCPApprovalMode.auto, SideEffect.destructive),
+        ].enumerated() {
+            let (log, _, directory) = try makeLogPair(
+                session: "invalid-remember-\(index)")
+            defer {
+                try? FileManager.default.removeItem(
+                    at: directory)
+            }
+            let authorization = mcpAuthorization(
+                mode: fixture.0,
+                sideEffect: fixture.1)
+            var pending = request()
+            pending.tool = authorization.toolName
+            pending.context = PermissionRequestContext(
+                authorization: authorization)
+            _ = try await log.registerPermissionRequest(
+                pending)
+            do {
+                _ = try await log
+                    .settlePermissionRequest(
+                        PermissionResolvedPayload(
+                            requestId:
+                                pending.requestId,
+                            tool:
+                                authorization
+                                    .toolName,
+                            decision: .allow,
+                            risk: .medium,
+                            reason:
+                                "invalid remember",
+                            authorization:
+                                authorization,
+                            source: .user,
+                            action:
+                                .approveAndRemember))
+                XCTFail(
+                    "ineligible remember action must fail closed")
+            } catch let error as EventLogError {
+                XCTAssertEqual(
+                    error,
+                    .conflictingPermissionSettlement)
+            }
+            let replay = try await log.replayChecked()
+            XCTAssertFalse(replay.contains {
+                if case .permissionResolved = $0.event {
+                    return true
+                }
+                return false
+            })
+        }
+    }
+
+    private func mcpAuthorization(
+        mode: MCPApprovalMode,
+        sideEffect: SideEffect
+    ) -> ResolvedToolAuthorization {
+        let mcp = MCPToolAuthorizationSnapshot(
+            server: MCPServerReference(
+                serverID:
+                    MCPServerID(
+                        rawValue: "server-fixture"),
+                serverRevision:
+                    MCPServerRevision(
+                        rawValue: "revision-fixture")),
+            attachmentID:
+                MCPAttachmentID(
+                    rawValue: "attachment-fixture"),
+            grantID:
+                MCPGrantID(
+                    rawValue: "grant-fixture"),
+            grantFingerprint: "grant-fingerprint",
+            connectionGeneration:
+                MCPConnectionGeneration(
+                    rawValue: "generation-fixture"),
+            rawCatalogRevision:
+                MCPRawCatalogRevision(
+                    rawValue: "catalog-fixture"),
+            agentCatalogViewRevision:
+                MCPAgentCatalogViewRevision(
+                    rawValue: "view-fixture"),
+            bindingID:
+                MCPBindingID(
+                    rawValue: "binding-fixture"),
+            remoteToolName: "lookup",
+            schemaHash: "schema-fingerprint",
+            protocolProfile: .codexCompat,
+            negotiatedProtocolVersion:
+                MCPNegotiatedProtocolVersion(
+                    .v2025_06_18),
+            effectiveApprovalMode: mode,
+            approvalDecision: .askUser,
+            approvalPolicySource: .serverDefault,
+            environmentReference:
+                MCPEnvironmentReference(
+                    rawValue: "environment-fixture"),
+            authorityFingerprint:
+                "authority-fingerprint",
+            revocationGeneration:
+                MCPRevocationGeneration(
+                    rawValue: "revocation-fixture"))
+        return ResolvedToolAuthorization(
+            authorizationID: "authorization-fixture",
+            registryVersion: "registry-fixture",
+            concreteToolID: "tool-fixture",
+            descriptorFingerprint:
+                "descriptor-fingerprint",
+            toolName: "mcp__fixture__lookup",
+            canonicalAction: "mcp.tool.call",
+            requiredCapabilities: [],
+            membership: .notRequired,
+            capabilityLeaseID: nil,
+            capabilityTaskID: nil,
+            workspaceLeaseID: nil,
+            workspaceAccess: nil,
+            workspaceRootIdentity: nil,
+            normalizedArgumentsDigest:
+                "arguments-fingerprint",
+            normalizedArgumentsCharacterCount: 2,
+            intent: PermissionIntent(
+                action: "mcp.tool.call",
+                resources: [],
+                replayPolicy:
+                    sideEffect == .readOnly
+                        ? .safeToReplay
+                        : .requiresManualReconciliation),
+            sideEffect: sideEffect,
+            risksNetwork: true,
+            replayPolicy:
+                sideEffect == .readOnly
+                    ? .safeToReplay
+                    : .requiresManualReconciliation,
+            mcp: mcp)
+    }
 }

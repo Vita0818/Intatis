@@ -298,7 +298,7 @@ public struct AgentModelHistoryProjector: Sendable {
                     }
                     callSequenceByKey[key] = item.sequence
                 }
-            case .functionCallOutput:
+            case .functionCallOutput, .toolSearchOutput:
                 guard let callID = item.payload.callID else { continue }
                 let key = CallKey(
                     turnID: item.payload.turnID,
@@ -334,7 +334,13 @@ public struct AgentModelHistoryProjector: Sendable {
                     ToolCall(
                         id: $0.callID,
                         name: $0.name,
-                        arguments: $0.arguments)
+                        arguments: $0.arguments,
+                        kind: $0.kind == .toolSearch
+                            ? .toolSearch
+                            : .function,
+                        namespace: $0.namespace,
+                        status: $0.status,
+                        execution: $0.execution)
                 }
                 messages.append(.assistant(
                     toolCalls: calls,
@@ -342,18 +348,41 @@ public struct AgentModelHistoryProjector: Sendable {
                 for call in calls {
                     let key = CallKey(turnID: turnID, callID: call.id)
                     let validOutputs = (outputsByKey[key] ?? []).filter {
-                        $0.sequence > item.sequence
+                        guard $0.sequence > item.sequence else {
+                            return false
+                        }
+                        switch call.kind {
+                        case .function:
+                            return $0.payload.kind ==
+                                .functionCallOutput
+                        case .toolSearch:
+                            return $0.payload.kind ==
+                                .toolSearchOutput
+                        }
                     }
                     guard validOutputs.count <= 1 else {
                         throw AgentModelHistoryProjectionError.conflictingOutput(
                             call.id)
                     }
-                    messages.append(.tool(
-                        id: call.id,
-                        content: validOutputs.first?.payload.output ?? "aborted"))
+                    switch call.kind {
+                    case .function:
+                        messages.append(.tool(
+                            id: call.id,
+                            content: validOutputs.first?.payload.output
+                                ?? "aborted"))
+                    case .toolSearch:
+                        messages.append(.toolSearchOutput(
+                            id: call.id,
+                            output: validOutputs.first?
+                                .payload.toolSearchOutput
+                                ?? ModelToolSearchOutput(
+                                    execution:
+                                        call.execution ?? "client",
+                                    tools: [])))
+                    }
                 }
 
-            case .functionCallOutput:
+            case .functionCallOutput, .toolSearchOutput:
                 // Outputs are emitted immediately after their matching call,
                 // in call order. Orphan outputs are intentionally omitted.
                 continue
@@ -384,7 +413,8 @@ public struct AgentModelHistoryProjector: Sendable {
                   payload.content != nil,
                   payload.functionCalls == nil,
                   payload.callID == nil,
-                  payload.output == nil else {
+                  payload.output == nil,
+                  payload.toolSearchOutput == nil else {
                 try invalid("message fields are inconsistent")
             }
 
@@ -393,7 +423,8 @@ public struct AgentModelHistoryProjector: Sendable {
                   let calls = payload.functionCalls,
                   !calls.isEmpty,
                   payload.callID == nil,
-                  payload.output == nil else {
+                  payload.output == nil,
+                  payload.toolSearchOutput == nil else {
                 try invalid("function-call batch fields are inconsistent")
             }
             for call in calls {
@@ -412,15 +443,32 @@ public struct AgentModelHistoryProjector: Sendable {
                   let callID = payload.callID,
                   !callID.trimmingCharacters(
                     in: .whitespacesAndNewlines).isEmpty,
-                  payload.output != nil else {
+                  payload.output != nil,
+                  payload.toolSearchOutput == nil else {
                 try invalid("function-call output fields are inconsistent")
+            }
+
+        case .toolSearchOutput:
+            guard payload.role == nil,
+                  payload.functionCalls == nil,
+                  payload.output == nil,
+                  let callID = payload.callID,
+                  !callID.trimmingCharacters(
+                    in: .whitespacesAndNewlines).isEmpty,
+                  let toolSearchOutput = payload.toolSearchOutput,
+                  !toolSearchOutput.status.trimmingCharacters(
+                    in: .whitespacesAndNewlines).isEmpty,
+                  !toolSearchOutput.execution.trimmingCharacters(
+                    in: .whitespacesAndNewlines).isEmpty else {
+                try invalid("tool-search output fields are inconsistent")
             }
 
         case .reasoning:
             guard payload.role == nil,
                   payload.functionCalls == nil,
                   payload.callID == nil,
-                  payload.output == nil else {
+                  payload.output == nil,
+                  payload.toolSearchOutput == nil else {
                 try invalid("reasoning fields are inconsistent")
             }
         }

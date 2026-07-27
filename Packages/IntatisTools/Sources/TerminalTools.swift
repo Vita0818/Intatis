@@ -5,6 +5,8 @@ import IntatisProtocol
 import Darwin
 #elseif canImport(Glibc)
 import Glibc
+#elseif canImport(Musl)
+import Musl
 #endif
 
 // MARK: - Managed terminal process sessions
@@ -1192,6 +1194,8 @@ private func duplicateDescriptor(_ descriptor: Int32) throws -> Int32 {
     let duplicate = Darwin.dup(descriptor)
     #elseif canImport(Glibc)
     let duplicate = Glibc.dup(descriptor)
+    #elseif canImport(Musl)
+    let duplicate = Musl.dup(descriptor)
     #else
     let duplicate: Int32 = -1
     #endif
@@ -1217,6 +1221,9 @@ private func killAndReapManagedProcess(_ pid: Int32) {
     #elseif canImport(Glibc)
     _ = Glibc.kill(-pid, SIGKILL)
     _ = Glibc.kill(pid, SIGKILL)
+    #elseif canImport(Musl)
+    _ = Musl.kill(-pid, SIGKILL)
+    _ = Musl.kill(pid, SIGKILL)
     #endif
     _ = waitAndReap(pid: pid)
 }
@@ -1227,6 +1234,8 @@ private func systemPipe(_ descriptors: inout [Int32]) -> Int32 {
         Darwin.pipe($0.baseAddress!)
         #elseif canImport(Glibc)
         Glibc.pipe($0.baseAddress!)
+        #elseif canImport(Musl)
+        Musl.pipe($0.baseAddress!)
         #else
         -1
         #endif
@@ -1240,6 +1249,8 @@ private func systemFcntl(_ descriptor: Int32,
     Darwin.fcntl(descriptor, command, value)
     #elseif canImport(Glibc)
     Glibc.fcntl(descriptor, command, value)
+    #elseif canImport(Musl)
+    Musl.fcntl(descriptor, command, value)
     #else
     -1
     #endif
@@ -1252,6 +1263,8 @@ private func systemWrite(_ descriptor: Int32,
     Darwin.write(descriptor, buffer, count)
     #elseif canImport(Glibc)
     Glibc.write(descriptor, buffer, count)
+    #elseif canImport(Musl)
+    Musl.write(descriptor, buffer, count)
     #else
     -1
     #endif
@@ -1264,6 +1277,8 @@ private func systemRead(_ descriptor: Int32,
     Darwin.read(descriptor, buffer, count)
     #elseif canImport(Glibc)
     Glibc.read(descriptor, buffer, count)
+    #elseif canImport(Musl)
+    Musl.read(descriptor, buffer, count)
     #else
     -1
     #endif
@@ -1274,6 +1289,8 @@ private func systemClose(_ descriptor: Int32) {
     _ = Darwin.close(descriptor)
     #elseif canImport(Glibc)
     _ = Glibc.close(descriptor)
+    #elseif canImport(Musl)
+    _ = Musl.close(descriptor)
     #endif
 }
 
@@ -1282,6 +1299,8 @@ private func systemErrno() -> Int32 {
     Darwin.errno
     #elseif canImport(Glibc)
     Glibc.errno
+    #elseif canImport(Musl)
+    Musl.errno
     #else
     0
     #endif

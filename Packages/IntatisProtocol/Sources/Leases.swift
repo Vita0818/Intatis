@@ -62,19 +62,57 @@ public struct CapabilityLease: Codable, Sendable, Hashable {
     public var communication: CommunicationGrant
     public var delegation: DelegationGrant
     public var expiresAtTaskCompletion: Bool
+    /// Exact external-MCP authority. Legacy leases and all standard
+    /// worker/coordinator factories intentionally start with no grants.
+    public var mcpGrants: [MCPGrant]
 
     public init(id: CapabilityLeaseID = CapabilityLeaseID.new(),
                 taskID: TaskID? = nil,
                 tools: Set<ToolCapability>,
                 communication: CommunicationGrant = .none,
                 delegation: DelegationGrant = .none,
-                expiresAtTaskCompletion: Bool = true) {
+                expiresAtTaskCompletion: Bool = true,
+                mcpGrants: [MCPGrant] = []) {
         self.id = id
         self.taskID = taskID
         self.tools = tools
         self.communication = communication
         self.delegation = delegation
         self.expiresAtTaskCompletion = expiresAtTaskCompletion
+        self.mcpGrants = mcpGrants
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case taskID
+        case tools
+        case communication
+        case delegation
+        case expiresAtTaskCompletion
+        case mcpGrants
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(CapabilityLeaseID.self, forKey: .id)
+        taskID = try container.decodeIfPresent(TaskID.self, forKey: .taskID)
+        tools = try container.decode(Set<ToolCapability>.self, forKey: .tools)
+        communication = try container.decode(CommunicationGrant.self, forKey: .communication)
+        delegation = try container.decode(DelegationGrant.self, forKey: .delegation)
+        expiresAtTaskCompletion =
+            try container.decodeIfPresent(Bool.self, forKey: .expiresAtTaskCompletion) ?? true
+        mcpGrants = try container.decodeIfPresent([MCPGrant].self, forKey: .mcpGrants) ?? []
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encodeIfPresent(taskID, forKey: .taskID)
+        try container.encode(tools, forKey: .tools)
+        try container.encode(communication, forKey: .communication)
+        try container.encode(delegation, forKey: .delegation)
+        try container.encode(expiresAtTaskCompletion, forKey: .expiresAtTaskCompletion)
+        try container.encode(mcpGrants, forKey: .mcpGrants)
     }
 
     public static func worker(taskID: TaskID? = nil,

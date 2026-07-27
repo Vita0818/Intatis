@@ -483,6 +483,78 @@ final class InferenceCatalogStoreResolverTests: XCTestCase {
         XCTAssertEqual(secretCallCount, 0)
     }
 
+    func testExactProfileCapabilityControlsResolvedProviderToolSearch()
+        async throws {
+        let supportedID =
+            InferenceProfileID(
+                rawValue: "search-supported")
+        let unsupportedID =
+            InferenceProfileID(
+                rawValue: "search-unsupported")
+        let catalog =
+            try InferenceCatalogReconciler.reconcile(
+                draft: makeDraft(profiles: [
+                    InferenceProfileDraft(
+                        inferenceProfileID:
+                            supportedID,
+                        inferenceConnectionID:
+                            InferenceConnectionID(
+                                rawValue: "route"),
+                        modelID:
+                            ModelID(
+                                rawValue: "same/model"),
+                        declaredCapabilities: [
+                            .chat,
+                            .toolCalling,
+                            .toolSearch,
+                        ]),
+                    InferenceProfileDraft(
+                        inferenceProfileID:
+                            unsupportedID,
+                        inferenceConnectionID:
+                            InferenceConnectionID(
+                                rawValue: "route"),
+                        modelID:
+                            ModelID(
+                                rawValue: "same/model"),
+                        declaredCapabilities: [
+                            .chat,
+                            .toolCalling,
+                        ]),
+                ]))
+        let snapshot =
+            try InferenceCatalogSnapshot(
+                catalog: catalog)
+        let registry = makeRegistry(
+            snapshot: snapshot,
+            resolver:
+                MutableInferenceSecretResolver(
+                    values: [
+                        "ROUTE_KEY": "secret",
+                    ]),
+            http: InferenceCapturingHTTP())
+
+        let supported =
+            try await registry.agentInference(
+                for: XCTUnwrap(
+                    snapshot.currentProfileRef(
+                        for: supportedID)))
+        let unsupported =
+            try await registry.agentInference(
+                for: XCTUnwrap(
+                    snapshot.currentProfileRef(
+                        for: unsupportedID)))
+
+        XCTAssertEqual(
+            supported.provider
+                .toolCallingCapabilities,
+            .responsesToolSearch)
+        XCTAssertEqual(
+            unsupported.provider
+                .toolCallingCapabilities,
+            .chatCompletionsOnly)
+    }
+
     private func temporaryRoot() -> URL {
         FileManager.default.temporaryDirectory
             .appendingPathComponent("intatis-inference-store-\(UUID().uuidString)", isDirectory: true)

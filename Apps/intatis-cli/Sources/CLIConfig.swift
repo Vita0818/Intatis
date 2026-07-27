@@ -245,7 +245,12 @@ struct CLIConfig {
                 wire: route.wire,
                 modelRequestOptions: Dictionary(uniqueKeysWithValues: route.models.map {
                     ($0.id, $0.requestOptions)
-                }))
+                }),
+                modelCapabilities: Dictionary(
+                    uniqueKeysWithValues:
+                        route.models.map {
+                            ($0.id, $0.declaredCapabilities)
+                        }))
         }
         let selectedRoute = providerRoutes.first { $0.id == selectedProviderID }
             ?? providerRoutes[0]

@@ -44,15 +44,22 @@ public struct OpenAIWireProvider: ChatProvider {
     let apiKey: String
     let http: HTTPByteStreaming
     let runtimePolicy: ProviderRuntimePolicy
+    public let toolCallingCapabilities:
+        ToolCallingProviderCapabilities
 
     public init(endpoint: ProviderEndpoint,
                 apiKey: String,
                 http: HTTPByteStreaming,
-                runtimePolicy: ProviderRuntimePolicy = .streaming) {
+                runtimePolicy: ProviderRuntimePolicy = .streaming,
+                toolCallingCapabilities:
+                    ToolCallingProviderCapabilities =
+                        .chatCompletionsOnly) {
         self.endpoint = endpoint
         self.apiKey = apiKey
         self.http = http
         self.runtimePolicy = runtimePolicy
+        self.toolCallingCapabilities =
+            toolCallingCapabilities
     }
 
     public func stream(_ request: ChatRequest) -> AsyncThrowingStream<ChatChunk, Error> {
@@ -171,7 +178,7 @@ public struct OpenAIWireProvider: ChatProvider {
         if let t = request.temperature { root["temperature"] = .number(t) }
         if let reasoning = request.reasoningEffort { root["reasoning_effort"] = .string(reasoning.rawValue) }
         if request.includeUsage { root["stream_options"] = .object(["include_usage": .bool(true)]) }
-        r.httpBody = try JSONEncoder().encode(JSONValue.object(root))
+        r.httpBody = try Self.encodeRequestBody(root)
         return r
     }
 
@@ -182,12 +189,25 @@ public struct OpenAIWireProvider: ChatProvider {
                                       model: ModelID) -> [String: JSONValue] {
         var body = endpoint.requestOptions(for: model)
         for key in [
-            "model", "messages", "tools", "stream", "stream_options",
+            "model", "messages", "tools", "stream",
+            "stream_options",
             "n", "best_of", "num_return_sequences", "candidate_count",
         ] {
             body.removeValue(forKey: key)
         }
         return body
+    }
+
+    /// Provider request bodies are compared, cached, and audited as bytes in
+    /// addition to being interpreted as JSON. Sorting every keyed container
+    /// makes equivalent request bodies deterministic without narrowing the
+    /// open provider-options extension point.
+    static func encodeRequestBody(
+        _ body: [String: JSONValue]
+    ) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return try encoder.encode(JSONValue.object(body))
     }
 
     /// Encodes a message as a plain string, or as a content-parts array when it

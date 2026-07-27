@@ -1,5 +1,61 @@
 # DO_NOT_BREAK
 
+## External MCP client 不变量
+
+- 只允许连接外部 MCP Server 的客户端角色。不得新增 Intatis MCP Server
+  target/API/UI/CLI command/server transport/server OAuth/hosting seam；sampling、
+  elicitation 与 client-hosted Tasks 是 client callback，不得误删，也不得借其
+  名义引入 server hosting。`IntatisMCPConformanceClient` 必须保持开发期
+  client driver，不能进入发行 bundle。
+- 平台链接必须保持：DeveloperID macOS 与 CLI 可链接 stdio + HTTP；
+  `IntatisMacAppStore` 只能链接 HTTP client core，不能链接
+  `IntatisMCPStdio`/guard 或本地 launch 符号；iOS 不得链接 `IntatisMCP`、
+  Curl transport、stdio runtime 或 MCP 产品 UI。共享 `IntatisProtocol`
+  payload 不构成平台能力。
+- attachment 不是连接权限，grant 也不是独立连接权限。每次 provider dispatch
+  必须冻结 exact `AgentRequestToolSnapshot`；准备和执行必须分别重验
+  attachment、Agent、CapabilityLease/task、WorkspaceLease、grant、server
+  revision、schema、raw/view catalog revision、binding、connection generation、
+  account/environment authority 与 revocation。旧 provider response 不得查询
+  current registry 或被重绑定到新 route。
+- worker 默认零 MCP，child grant 只能由 parent grant 与 child lease 显式求
+  交集；`@permission-reviewer`、GoalVerifier、read-only/unleased identity 不得
+  看见或执行 MCP tool。`tool_search` 只能返回当前 frozen Agent catalog；
+  canonical JSON 与 provider-native output 必须在 loaded-state commit 前原子
+  计入 provider-request/turn 预算。
+- HTTP direct mode 必须维持 exact origin、每 hop DNS/address authorization、
+  native socket binding、无 ambient cookie/cache、受控 proxy/redirect；
+  已发送的 tool operation 不得因 401/redirect/network failure 自动 replay。
+  `MCP-Session-Id` 必须在任何 JSON/SSE body 发布前同步校验并注册 exact
+  redaction value；mismatch 必须 retire exact generation。
+- stdio 不得回退到裸 `Process`、普通 shell 或“完全信任 localhost”。macOS
+  必须保留 Seatbelt + generation-local authenticated CONNECT gateway；Linux
+  必须在 bwrap 与 ptrace/seccomp guard 可证明时运行，否则 fail closed。
+  gateway 只允许 exact frozen origin/address，不能解析/托管 MCP JSON-RPC。
+  timeout/cancel/task terminal/runtime shutdown 必须先 drain transport、process
+  tree 与 gateway。
+- MCP macOS secret 必须使用 data-protection Keychain；CLI secret 必须使用
+  owner-only 认证加密 store。catalog/EventLog/session projection/diagnostic/
+  permission preview/CLI history 不得保存 bearer、header/env/OAuth value、
+  session identifier 或可逆派生值，只能保存 opaque reference 与 secret-free
+  identity。普通 provider config secret backend 与 MCP secret backend 不得
+  混写。
+- 外部文本、JSON key、cursor、URI/template、MIME、icon/annotation、binary
+  bytes、错误与 server instructions 在进入 model、UI、EventLog 或
+  ArtifactStore 前必须经过 session exact/derived redactor、结构校验和最终
+  字节预算。resource/template catalog 在 SDK session boundary 清洗后，
+  reader-facing UI sink 仍须以同一 session redactor 复核。敏感结构字段只能
+  fail closed，不能用 `[REDACTED]` 替换后继续当 route/identifier。
+- MCP durable event 必须继续 additive、旧日志 default-empty 可解码；unknown
+  future event、seq gap、冲突 attachment/grant/terminal 或 incomplete-known
+  history 不能被当成“无 MCP”。remembered approval 仅能由用户对 exact
+  read-only、effective `auto` call 明确 `approve_and_remember` 创建，普通
+  approve 不能隐式扩权。
+- vendored SDK 必须保持 client-only derivative、固定 upstream/provenance/
+  patch ledger/NOTICE。升级不得重新带入 Server actor、HTTP server transport、
+  server OAuth、server/conformance executable 或不必要依赖；任何公开源码
+  变更继续执行许可证、来源、双平台 linkage 与 client-only surface gate。
+
 ## 2026-07-24 Session 展示隔离不变量
 
 - Code / Cowork 的可见详情和 thread 必须保留 exact `{kind, sessionID}` presentation identity。bottom anchor、scroll request 和任何延迟 UI 工作必须携带同一 scope/generation；不得恢复静态共享 anchor、无 owner 的 `DispatchQueue.main.async` 或可在切换后命中新树的闭包。

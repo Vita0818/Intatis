@@ -6,6 +6,8 @@ import IntatisProtocol
 import Darwin
 #elseif canImport(Glibc)
 import Glibc
+#elseif canImport(Musl)
+import Musl
 #endif
 
 /// Failures raised by the event-log coordination layer. Messages deliberately
@@ -96,7 +98,6 @@ private struct EnvelopeSequenceHeader: Decodable {
     let session: SessionID
     let v: Int
     let type: String
-    let payload: JSONValue
 }
 
 private struct EventLogSequenceState {
@@ -360,6 +361,8 @@ fileprivate final class EventLogFileLock {
             return Darwin.open(path, flags, mode_t(S_IRUSR | S_IWUSR))
 #elseif canImport(Glibc)
             return Glibc.open(path, flags, mode_t(S_IRUSR | S_IWUSR))
+#elseif canImport(Musl)
+            return Musl.open(path, flags, mode_t(S_IRUSR | S_IWUSR))
 #else
             return -1
 #endif
@@ -367,7 +370,7 @@ fileprivate final class EventLogFileLock {
     }
 
     private static func applyLock(_ descriptor: Int32, operation: Int32) -> Int32 {
-#if canImport(Darwin) || canImport(Glibc)
+#if canImport(Darwin) || canImport(Glibc) || canImport(Musl)
         return flock(descriptor, operation)
 #else
         return -1
@@ -379,11 +382,13 @@ fileprivate final class EventLogFileLock {
         _ = Darwin.close(descriptor)
 #elseif canImport(Glibc)
         _ = Glibc.close(descriptor)
+#elseif canImport(Musl)
+        _ = Musl.close(descriptor)
 #endif
     }
 
     private static func currentErrno() -> Int32 {
-#if canImport(Darwin) || canImport(Glibc)
+#if canImport(Darwin) || canImport(Glibc) || canImport(Musl)
         return errno
 #else
         return -1
@@ -621,68 +626,16 @@ public actor EventLog {
             throw EventLogError.incompleteEventHistory
         }
 
-        var registeredRequest: PermissionRequestPayload?
-        var firstTerminal: (Envelope, PermissionResolvedPayload)?
-        for envelope in scan.envelopes {
-            switch envelope.event {
-            case .permissionRequest(let request) where request.requestId == requestID:
-                if let registeredRequest, registeredRequest != request {
-                    throw EventLogError.conflictingPermissionRequest
-                }
-                registeredRequest = request
-
-            case .permissionResolved(let existing) where existing.requestId == requestID:
-                if let firstTerminal {
-                    guard firstTerminal.1 == existing else {
-                        throw EventLogError.conflictingPermissionSettlement
-                    }
-                } else {
-                    firstTerminal = (envelope, existing)
-                }
-
-            default:
-                break
-            }
-        }
-
-        guard let registeredRequest else {
-            throw EventLogError.permissionRequestNotFound
-        }
-        guard registeredRequest.tool == resolution.tool else {
-            throw EventLogError.conflictingPermissionSettlement
-        }
-        if let expectedTurnID = registeredRequest.context?.turnID {
-            guard resolution.turnID == expectedTurnID else {
-                throw EventLogError.conflictingPermissionSettlement
-            }
-        }
-        if let expectedToolCallID = registeredRequest.context?.toolCallID {
-            guard resolution.toolCallID == expectedToolCallID else {
-                throw EventLogError.conflictingPermissionSettlement
-            }
-        }
-        if let expectedAuthorization = registeredRequest.context?.authorization {
-            guard resolution.authorization == expectedAuthorization else {
-                throw EventLogError.conflictingPermissionSettlement
-            }
-        }
-        if let action = resolution.action {
-            let isConsistent = action == .approve
-                ? resolution.decision == .allow
-                : resolution.decision == .deny
-            guard isConsistent else {
-                throw EventLogError.conflictingPermissionSettlement
-            }
-        }
-        if let firstTerminal {
-            guard firstTerminal.1 == resolution else {
-                throw EventLogError.conflictingPermissionSettlement
-            }
+        let existingTerminalIndex =
+            try Self.validatedPermissionSettlementIndex(
+                in: scan.envelopes,
+                requestID: requestID,
+                resolution: resolution)
+        if let existingTerminalIndex {
             nextSeq = max(nextSeq, scan.nextSeq)
-            return PermissionSettlementAppendResult(
-                envelope: firstTerminal.0,
-                resolution: firstTerminal.1,
-                didAppend: false)
+            return Self.existingPermissionSettlementResult(
+                in: scan.envelopes,
+                at: existingTerminalIndex)
         }
 
         let state = try Self.tailSequenceState(
@@ -694,12 +647,210 @@ public actor EventLog {
                 expectedAtLeast: nextSeq,
                 found: state.nextSeq)
         }
+        let events = try Self.permissionSettlementEvents(
+            resolution: resolution,
+            ts: ts,
+            history: scan.envelopes)
+        return try persistPermissionSettlement(
+            events,
+            ts: ts,
+            state: state)
+    }
+
+    @inline(never)
+    private static func validatedPermissionSettlementIndex(
+        in history: [Envelope],
+        requestID: RequestID,
+        resolution: PermissionResolvedPayload
+    ) throws -> Int? {
+        var registeredRequest: PermissionRequestPayload?
+        var firstTerminal: PermissionResolvedPayload?
+        var firstTerminalIndex: Int?
+        for (index, envelope) in history.enumerated() {
+            switch envelope.event {
+            case .permissionRequest(let request)
+                    where request.requestId == requestID:
+                if let registeredRequest,
+                   registeredRequest != request {
+                    throw EventLogError
+                        .conflictingPermissionRequest
+                }
+                registeredRequest = request
+
+            case .permissionResolved(let existing)
+                    where existing.requestId == requestID:
+                if let firstTerminal {
+                    guard firstTerminal == existing else {
+                        throw EventLogError
+                            .conflictingPermissionSettlement
+                    }
+                } else {
+                    firstTerminal = existing
+                    firstTerminalIndex = index
+                }
+
+            default:
+                break
+            }
+        }
+
+        guard let registeredRequest else {
+            throw EventLogError.permissionRequestNotFound
+        }
+        guard registeredRequest.tool == resolution.tool else {
+            throw EventLogError
+                .conflictingPermissionSettlement
+        }
+        if let expectedTurnID =
+                registeredRequest.context?.turnID {
+            guard resolution.turnID == expectedTurnID else {
+                throw EventLogError
+                    .conflictingPermissionSettlement
+            }
+        }
+        if let expectedToolCallID =
+                registeredRequest.context?.toolCallID {
+            guard resolution.toolCallID
+                    == expectedToolCallID else {
+                throw EventLogError
+                    .conflictingPermissionSettlement
+            }
+        }
+        if let expectedAuthorization =
+                registeredRequest.context?.authorization {
+            guard resolution.authorization
+                    == expectedAuthorization else {
+                throw EventLogError
+                    .conflictingPermissionSettlement
+            }
+        }
+        if let action = resolution.action {
+            let isConsistent: Bool
+            switch action {
+            case .approve, .approveAndRemember:
+                isConsistent =
+                    resolution.decision == .allow
+            case .decline, .cancelTurn:
+                isConsistent =
+                    resolution.decision == .deny
+            }
+            guard isConsistent else {
+                throw EventLogError
+                    .conflictingPermissionSettlement
+            }
+        }
+        if resolution.action
+                == .approveAndRemember {
+            guard resolution.source == .user,
+                  resolution.decision == .allow,
+                  registeredRequest.context?
+                    .authorization?
+                    .sideEffect == .readOnly,
+                  registeredRequest.context?
+                    .authorization?.mcp?
+                    .effectiveApprovalMode == .auto,
+                  resolution.authorization?
+                    .sideEffect == .readOnly,
+                  resolution.authorization?.mcp?
+                    .effectiveApprovalMode == .auto else {
+                throw EventLogError
+                    .conflictingPermissionSettlement
+            }
+        }
+        if let firstTerminal {
+            guard firstTerminal == resolution else {
+                throw EventLogError
+                    .conflictingPermissionSettlement
+            }
+        }
+        return firstTerminalIndex
+    }
+
+    @inline(never)
+    private static func existingPermissionSettlementResult(
+        in history: [Envelope],
+        at index: Int
+    ) -> PermissionSettlementAppendResult {
+        let envelope = history[index]
+        guard case .permissionResolved(
+            let canonicalResolution) = envelope.event else {
+            preconditionFailure(
+                "validated permission settlement index must reference a terminal event")
+        }
+        return PermissionSettlementAppendResult(
+            envelope: envelope,
+            resolution: canonicalResolution,
+            didAppend: false)
+    }
+
+    @inline(never)
+    private static func permissionSettlementEvents(
+        resolution: PermissionResolvedPayload,
+        ts: Date,
+        history: [Envelope]
+    ) throws -> [Event] {
+        var events: [Event] = [
+            .permissionResolved(resolution),
+        ]
+        if resolution.decision == .allow,
+           resolution.action
+                == .approveAndRemember,
+           let MCPAuthorization =
+                resolution.authorization?.mcp,
+           resolution.authorization?
+                .sideEffect == .readOnly,
+           MCPAuthorization.effectiveApprovalMode
+                == .auto {
+            let approval =
+                try MCPRememberedToolApproval(
+                    authorization: MCPAuthorization,
+                    createdAt: ts)
+            var active:
+                [MCPRememberedApprovalID:
+                    MCPRememberedToolApproval] = [:]
+            for envelope in history {
+                switch envelope.event {
+                case .mcpRememberedApprovalGranted(
+                        let payload):
+                    active[
+                        payload.approval.approvalID] =
+                        payload.approval
+                case .mcpRememberedApprovalRevoked(
+                        let payload):
+                    active.removeValue(
+                        forKey: payload.approvalID)
+                default:
+                    break
+                }
+            }
+            if !active.values.contains(where: {
+                $0.exactlyMatches(
+                    MCPAuthorization,
+                    at: ts)
+            }) {
+                events.append(
+                    .mcpRememberedApprovalGranted(
+                        .init(approval: approval)))
+            }
+        }
+        return events
+    }
+
+    @inline(never)
+    private func persistPermissionSettlement(
+        _ events: [Event],
+        ts: Date,
+        state: EventLogSequenceState
+    ) throws -> PermissionSettlementAppendResult {
         guard let envelope = try persistLocked(
-            [.permissionResolved(resolution)],
+            events,
             ts: ts,
             state: state).first,
-              case .permissionResolved(let canonicalResolution) = envelope.event else {
-            preconditionFailure("a permission settlement append must persist one terminal event")
+              case .permissionResolved(
+                let canonicalResolution) =
+                envelope.event else {
+            preconditionFailure(
+                "a permission settlement append must persist one terminal event")
         }
         return PermissionSettlementAppendResult(
             envelope: envelope,
@@ -1032,6 +1183,56 @@ public actor EventLog {
         return stream
     }
 
+    /// Registers a live-only subscriber at the exact current durable tail.
+    ///
+    /// The cross-process lock prevents another writer from appending between
+    /// the complete-known tail scan and subscriber registration, while actor
+    /// isolation prevents an in-process append from crossing the boundary.
+    /// Existing history is intentionally not replayed.
+    public func streamFromCurrentDurableTail()
+        throws -> AsyncStream<Envelope>
+    {
+        let lock = try EventLogFileLock.acquire(
+            at: lockURL,
+            mode: .exclusive)
+        defer { lock.release() }
+        try Self.recoverJournalIfNeeded(
+            fileURL: fileURL,
+            journalURL: journalURL,
+            temporaryURL: journalTemporaryURL,
+            session: session,
+            decoder: decoder)
+        let data = try Self.readLogData(
+            at: fileURL)
+        let scan = try Self.checkedScan(
+            data: data,
+            expectedSession: session,
+            decoder: decoder,
+            from: 0)
+        guard !scan.containsUnknownEventTypes else {
+            throw EventLogError.unsupportedEventTypes
+        }
+        guard scan.envelopes.enumerated()
+            .allSatisfy({
+                offset, envelope in
+                envelope.seq == offset
+            }) else {
+            throw EventLogError.incompleteEventHistory
+        }
+        nextSeq = max(nextSeq, scan.nextSeq)
+        let (stream, continuation) =
+            AsyncStream<Envelope>.makeStream()
+        let id = UUID()
+        subscribers[id] = continuation
+        continuation.onTermination = {
+            [weak self] _ in
+            Task {
+                await self?.removeSubscriber(id)
+            }
+        }
+        return stream
+    }
+
     private func removeSubscriber(_ id: UUID) {
         subscribers[id] = nil
     }
@@ -1062,7 +1263,9 @@ public actor EventLog {
             let lineNumber = index + 1
             let header: EnvelopeSequenceHeader
             do {
-                header = try decoder.decode(EnvelopeSequenceHeader.self, from: Data(line))
+                header = try decoder.decode(
+                    EnvelopeSequenceHeader.self,
+                    from: Data(line))
             } catch {
                 throw EventLogError.corruptedEvent(line: lineNumber)
             }
@@ -1093,7 +1296,9 @@ public actor EventLog {
             }
             let envelope: Envelope
             do {
-                envelope = try decoder.decode(Envelope.self, from: Data(line))
+                envelope = try decoder.decode(
+                    Envelope.self,
+                    from: Data(line))
             } catch {
                 throw EventLogError.corruptedEvent(line: lineNumber)
             }

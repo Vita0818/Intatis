@@ -9,12 +9,18 @@ public enum ModelHistoryItemKind: String, Codable, Equatable, Sendable {
     case message
     case functionCallBatch = "function_call_batch"
     case functionCallOutput = "function_call_output"
+    case toolSearchOutput = "tool_search_output"
     case reasoning
 }
 
 public enum ModelHistoryMessageRole: String, Codable, Equatable, Sendable {
     case user
     case assistant
+}
+
+public enum ModelHistoryCallKind: String, Codable, Equatable, Sendable {
+    case function
+    case toolSearch = "tool_search"
 }
 
 public struct ModelHistoryFunctionCall: Codable, Equatable, Sendable {
@@ -24,17 +30,87 @@ public struct ModelHistoryFunctionCall: Codable, Equatable, Sendable {
     /// Sensitive calls use a fixed valid placeholder instead of raw input.
     public var arguments: String
     public var argumentsRedacted: Bool
+    /// Provider-native call kind. Missing values in v1 history decode as the
+    /// historical function-call shape.
+    public var kind: ModelHistoryCallKind
+    /// Responses namespace for a deferred function. The execution registry
+    /// continues to use `name` as its exact flat routing key.
+    public var namespace: String?
+    public var status: String?
+    public var execution: String?
 
     public init(
         callID: String,
         name: String,
         arguments: String,
-        argumentsRedacted: Bool = false
+        argumentsRedacted: Bool = false,
+        kind: ModelHistoryCallKind = .function,
+        namespace: String? = nil,
+        status: String? = nil,
+        execution: String? = nil
     ) {
         self.callID = callID
         self.name = name
         self.arguments = arguments
         self.argumentsRedacted = argumentsRedacted
+        self.kind = kind
+        self.namespace = namespace
+        self.status = status
+        self.execution = execution
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case callID
+        case name
+        case arguments
+        case argumentsRedacted
+        case kind
+        case namespace
+        case status
+        case execution
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        callID = try container.decode(String.self, forKey: .callID)
+        name = try container.decode(String.self, forKey: .name)
+        arguments = try container.decode(String.self, forKey: .arguments)
+        argumentsRedacted = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .argumentsRedacted) ?? false
+        kind = try container.decodeIfPresent(
+            ModelHistoryCallKind.self,
+            forKey: .kind) ?? .function
+        namespace = try container.decodeIfPresent(
+            String.self,
+            forKey: .namespace)
+        status = try container.decodeIfPresent(
+            String.self,
+            forKey: .status)
+        execution = try container.decodeIfPresent(
+            String.self,
+            forKey: .execution)
+    }
+}
+
+/// Provider-neutral payload for a Responses `tool_search_output` input item.
+///
+/// The returned deferred tool definitions belong to history, not the next
+/// request's top-level `tools` array. This is the contract used by Codex to
+/// make searched tools callable without widening subsequent tool exposure.
+public struct ModelToolSearchOutput: Codable, Equatable, Sendable {
+    public var status: String
+    public var execution: String
+    public var tools: [JSONValue]
+
+    public init(
+        status: String = "completed",
+        execution: String = "client",
+        tools: [JSONValue]
+    ) {
+        self.status = status
+        self.execution = execution
+        self.tools = tools
     }
 }
 
@@ -56,6 +132,7 @@ public struct ModelHistoryItemPayload: Codable, Equatable, Sendable {
     public var functionCalls: [ModelHistoryFunctionCall]?
     public var callID: String?
     public var output: String?
+    public var toolSearchOutput: ModelToolSearchOutput?
     public var reasoningSummary: [String]?
     public var reasoningContent: String?
     public var encryptedReasoningContent: String?
@@ -75,6 +152,7 @@ public struct ModelHistoryItemPayload: Codable, Equatable, Sendable {
         functionCalls: [ModelHistoryFunctionCall]? = nil,
         callID: String? = nil,
         output: String? = nil,
+        toolSearchOutput: ModelToolSearchOutput? = nil,
         reasoningSummary: [String]? = nil,
         reasoningContent: String? = nil,
         encryptedReasoningContent: String? = nil
@@ -93,6 +171,7 @@ public struct ModelHistoryItemPayload: Codable, Equatable, Sendable {
         self.functionCalls = functionCalls
         self.callID = callID
         self.output = output
+        self.toolSearchOutput = toolSearchOutput
         self.reasoningSummary = reasoningSummary
         self.reasoningContent = reasoningContent
         self.encryptedReasoningContent = encryptedReasoningContent
@@ -164,5 +243,32 @@ public struct ModelHistoryItemPayload: Codable, Equatable, Sendable {
             kind: .functionCallOutput,
             callID: callID,
             output: output)
+    }
+
+    public static func toolSearchOutput(
+        itemID: String,
+        turnID: TurnID,
+        agent: AgentID,
+        taskID: TaskID?,
+        submissionID: SubmissionID?,
+        taskAttempt: Int?,
+        callID: String,
+        status: String = "completed",
+        execution: String = "client",
+        tools: [JSONValue]
+    ) -> ModelHistoryItemPayload {
+        ModelHistoryItemPayload(
+            itemID: itemID,
+            turnID: turnID,
+            agent: agent,
+            taskID: taskID,
+            submissionID: submissionID,
+            taskAttempt: taskAttempt,
+            kind: .toolSearchOutput,
+            callID: callID,
+            toolSearchOutput: ModelToolSearchOutput(
+                status: status,
+                execution: execution,
+                tools: tools))
     }
 }

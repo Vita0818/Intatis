@@ -341,6 +341,11 @@ final class InferenceCatalogTests: XCTestCase {
         let decoded = try JSONDecoder().decode(InferenceCatalog.self, from: data)
 
         XCTAssertEqual(decoded, catalog)
+        XCTAssertTrue(
+            decoded.profiles.allSatisfy {
+                $0.declaredCapabilities
+                    .contains(.toolSearch)
+            })
         let snapshot = try InferenceCatalogSnapshot(catalog: decoded)
         XCTAssertNoThrow(try snapshot.resolve(XCTUnwrap(first.currentProfileRefs.first)))
         XCTAssertNoThrow(try snapshot.resolve(XCTUnwrap(catalog.currentProfileRefs.first)))
@@ -408,7 +413,12 @@ final class InferenceCatalogTests: XCTestCase {
                 "reasoning": .object(["effort": .string("high")]),
             ],
             profileRequestOptions: profileOptions,
-            declaredCapabilities: [.toolCalling, .chat, .toolCalling],
+            declaredCapabilities: [
+                .toolCalling,
+                .chat,
+                .toolSearch,
+                .toolCalling,
+            ],
             safeRouteLabel: "Primary gateway")
     }
 }

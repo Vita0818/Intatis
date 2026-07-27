@@ -3,6 +3,8 @@ import Foundation
 import Darwin
 #elseif canImport(Glibc)
 import Glibc
+#elseif canImport(Musl)
+import Musl
 #endif
 
 /// File-backed owner of the immutable inference catalog. Callers inject the
@@ -64,7 +66,7 @@ public actor InferenceCatalogStore {
     private func withExclusiveStoreLock<T>(_ operation: () throws -> T) throws -> T {
         try ensureStoreDirectory()
 
-        #if canImport(Darwin) || canImport(Glibc)
+        #if canImport(Darwin) || canImport(Glibc) || canImport(Musl)
         Self.processMutationLock.lock()
         defer { Self.processMutationLock.unlock() }
 
@@ -103,7 +105,7 @@ public actor InferenceCatalogStore {
         }
     }
 
-    #if canImport(Darwin) || canImport(Glibc)
+    #if canImport(Darwin) || canImport(Glibc) || canImport(Musl)
     private func openLockFile() throws -> Int32 {
         let lockURL = fileURL.deletingLastPathComponent().appendingPathComponent(
             ".\(fileURL.lastPathComponent).lock",
@@ -374,5 +376,56 @@ private func systemFcntlSetFD(_ descriptor: Int32, _ flags: Int32) -> Int32 {
 
 private func systemEffectiveUserID() -> uid_t {
     Glibc.geteuid()
+}
+#elseif canImport(Musl)
+private func systemOpen(_ path: UnsafePointer<CChar>,
+                        _ flags: Int32,
+                        _ mode: mode_t) -> Int32 {
+    Musl.open(path, flags, mode)
+}
+
+private func systemClose(_ descriptor: Int32) -> Int32 {
+    Musl.close(descriptor)
+}
+
+private func systemLockExclusive(_ descriptor: Int32) -> Int32 {
+    var lock = flock()
+    lock.l_type = Int16(F_WRLCK)
+    lock.l_whence = Int16(SEEK_SET)
+    lock.l_start = 0
+    lock.l_len = 0
+    return Musl.fcntl(descriptor, F_SETLKW, &lock)
+}
+
+private func systemUnlock(_ descriptor: Int32) -> Int32 {
+    var lock = flock()
+    lock.l_type = Int16(F_UNLCK)
+    lock.l_whence = Int16(SEEK_SET)
+    lock.l_start = 0
+    lock.l_len = 0
+    return Musl.fcntl(descriptor, F_SETLK, &lock)
+}
+
+private func systemFchmod(_ descriptor: Int32, _ mode: mode_t) -> Int32 {
+    Musl.fchmod(descriptor, mode)
+}
+
+private func systemFstat(
+    _ descriptor: Int32,
+    _ metadata: UnsafeMutablePointer<stat>
+) -> Int32 {
+    Musl.fstat(descriptor, metadata)
+}
+
+private func systemFcntlGetFD(_ descriptor: Int32) -> Int32 {
+    Musl.fcntl(descriptor, F_GETFD)
+}
+
+private func systemFcntlSetFD(_ descriptor: Int32, _ flags: Int32) -> Int32 {
+    Musl.fcntl(descriptor, F_SETFD, flags)
+}
+
+private func systemEffectiveUserID() -> uid_t {
+    Musl.geteuid()
 }
 #endif

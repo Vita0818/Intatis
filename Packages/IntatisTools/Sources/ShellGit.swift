@@ -8,6 +8,8 @@ import IntatisPTYLauncher
 import Darwin
 #elseif canImport(Glibc)
 import Glibc
+#elseif canImport(Musl)
+import Musl
 #endif
 
 // MARK: - Shell
@@ -605,7 +607,7 @@ private func signalProcessGroupAndDescendants(root: Int32?, descendants: Set<Int
         _ = Darwin.kill(descendant, value)
     }
     if let root { _ = Darwin.kill(-root, value) }
-    #elseif canImport(Glibc)
+    #elseif canImport(Glibc) || canImport(Musl)
     for descendant in descendants { _ = kill(descendant, value) }
     if let root { _ = kill(-root, value) }
     #endif
@@ -617,7 +619,7 @@ private func waitForProcessGroupToEmpty(leader: Int32, descendants: Set<Int32>) 
         #if canImport(Darwin)
         let groupExists = Darwin.kill(-leader, 0) == 0 || errno == EPERM
         let descendantExists = descendants.contains { Darwin.kill($0, 0) == 0 || errno == EPERM }
-        #elseif canImport(Glibc)
+        #elseif canImport(Glibc) || canImport(Musl)
         let groupExists = kill(-leader, 0) == 0 || errno == EPERM
         let descendantExists = descendants.contains { kill($0, 0) == 0 || errno == EPERM }
         #else
@@ -981,8 +983,13 @@ func spawnManagedProcess(spec: ManagedProcessSpec,
                          stdinDescriptor: Int32? = nil,
                          stdoutDescriptor: Int32,
                          stderrDescriptor: Int32) throws -> Int32 {
+    #if canImport(Darwin)
     var actions: posix_spawn_file_actions_t? = nil
     var attributes: posix_spawnattr_t? = nil
+    #else
+    var actions = posix_spawn_file_actions_t()
+    var attributes = posix_spawnattr_t()
+    #endif
     guard posix_spawn_file_actions_init(&actions) == 0,
           posix_spawnattr_init(&attributes) == 0 else {
         throw IntatisError.io("could not initialize managed process attributes")

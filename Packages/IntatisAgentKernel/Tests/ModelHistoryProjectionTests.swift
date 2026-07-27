@@ -157,6 +157,125 @@ final class ModelHistoryProjectionTests: XCTestCase {
         ])
     }
 
+    func testToolSearchHistoryReplaysAsDedicatedOutputWithSchemas()
+        throws {
+        let priorID = SubmissionID(rawValue: "sub_search")
+        let currentID = SubmissionID(rawValue: "sub_after_search")
+        let priorTask = rootTask(
+            "task_search",
+            priorID,
+            "find calendar tools")
+        let currentTask = rootTask(
+            "task_after_search",
+            currentID,
+            "continue")
+        let turnID = TurnID(rawValue: "turn_search")
+        let deferred: JSONValue = .object([
+            "type": .string("namespace"),
+            "name": .string("mcp__calendar__"),
+            "description": .string("Calendar tools."),
+            "tools": .array([
+                .object([
+                    "type": .string("function"),
+                    "name": .string("create_event"),
+                    "description": .string("Create an event."),
+                    "strict": .bool(false),
+                    "defer_loading": .bool(true),
+                    "parameters": .object([
+                        "type": .string("object"),
+                    ]),
+                ]),
+            ]),
+        ])
+        let events = [
+            envelope(1, .userMessage(UserMessagePayload(
+                text: priorTask.objective,
+                to: main,
+                submissionID: priorID))),
+            envelope(2, .taskCreated(TaskCreatedPayload(
+                contract: priorTask))),
+            envelope(3, .modelHistoryItem(.message(
+                itemID: "search-user",
+                turnID: turnID,
+                agent: main,
+                taskID: priorTask.id,
+                submissionID: priorID,
+                taskAttempt: 1,
+                role: .user,
+                content: priorTask.objective))),
+            envelope(4, .modelHistoryItem(.functionCallBatch(
+                itemID: "search-call",
+                turnID: turnID,
+                agent: main,
+                taskID: priorTask.id,
+                submissionID: priorID,
+                taskAttempt: 1,
+                content: nil,
+                calls: [
+                    ModelHistoryFunctionCall(
+                        callID: "search-1",
+                        name: "tool_search",
+                        arguments: #"{"query":"calendar"}"#,
+                        kind: .toolSearch,
+                        status: "completed",
+                        execution: "client"),
+                ]))),
+            envelope(5, .modelHistoryItem(.toolSearchOutput(
+                itemID: "search-output",
+                turnID: turnID,
+                agent: main,
+                taskID: priorTask.id,
+                submissionID: priorID,
+                taskAttempt: 1,
+                callID: "search-1",
+                tools: [deferred]))),
+            envelope(6, .modelHistoryItem(.message(
+                itemID: "search-answer",
+                turnID: turnID,
+                agent: main,
+                taskID: priorTask.id,
+                submissionID: priorID,
+                taskAttempt: 1,
+                role: .assistant,
+                content: "found it"))),
+            envelope(7, .userMessage(UserMessagePayload(
+                text: currentTask.objective,
+                to: main,
+                submissionID: currentID))),
+            envelope(8, .taskCreated(TaskCreatedPayload(
+                contract: currentTask))),
+        ]
+
+        let messages = try AgentModelHistoryProjector().project(
+            agentID: main,
+            currentTask: currentTask,
+            events: events)
+
+        XCTAssertEqual(messages.count, 4)
+        XCTAssertEqual(messages[1].toolCalls?.first?.kind, .toolSearch)
+        XCTAssertEqual(messages[1].toolCalls?.first?.id, "search-1")
+        XCTAssertEqual(
+            messages[2].toolSearchOutput,
+            ModelToolSearchOutput(tools: [deferred]))
+        XCTAssertNil(messages[2].content)
+        XCTAssertEqual(messages[3], .assistant("found it"))
+
+        let input = AgentInputItem.from(messages: messages)
+        XCTAssertTrue(input.contains {
+            guard case .toolSearchOutput(
+                let callID,
+                let status,
+                let execution,
+                let tools) = $0 else {
+                return false
+            }
+            return callID == "search-1"
+                && status == "completed"
+                && execution == "client"
+                && tools == [deferred]
+        })
+    }
+
     func testConflictingReuseOfItemIDFailsClosed() throws {
         let priorID = SubmissionID(rawValue: "sub_conflict")
         let currentID = SubmissionID(rawValue: "sub_conflict_current")

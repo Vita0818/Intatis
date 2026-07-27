@@ -7,6 +7,8 @@ import IntatisConversation
 import IntatisArtifacts
 import IntatisMultimodal
 import IntatisSharedUI
+import IntatisMCP
+import IntatisAgentKernel
 
 struct AppSessionRuntimeKey: Hashable, Sendable {
     let kind: SessionKind
@@ -146,6 +148,14 @@ final class AppSessionRuntimeManager: ObservableObject {
         case ready(CoworkViewModel)
     }
 
+    private enum MCPSlot {
+        case creating(
+            UUID,
+            Task<MCPShippingSessionRuntime, Error>
+        )
+        case ready(MCPShippingSessionRuntime)
+    }
+
     static let shared = AppSessionRuntimeManager()
 
     @Published private(set) var state: State = .running
@@ -156,6 +166,10 @@ final class AppSessionRuntimeManager: ObservableObject {
     private var chatRuntimes: [SessionID: AppChatSessionRuntime] = [:]
     private var codeRuntimes: [SessionID: CodeViewModel] = [:]
     private var coworkRuntimes: [SessionID: CoworkSlot] = [:]
+    private var mcpRuntimes: [AppSessionRuntimeKey: MCPSlot] = [:]
+    private var mcpConversationHosts:
+        [AppSessionRuntimeKey:
+            MCPConversationRuntimeHost] = [:]
     private var entries: [AppSessionRuntimeKey: RuntimeEntry] = [:]
     private var currentRegistry: ProviderRegistry?
     private var currentInferenceOptions: [AppInferenceProfileOption] = []
@@ -215,6 +229,136 @@ final class AppSessionRuntimeManager: ObservableObject {
 
     func cachedCodeRuntime(sessionID: SessionID) -> CodeViewModel? {
         codeRuntimes[sessionID]
+    }
+
+    /// Returns the process-owned MCP runtime for one exact Code/Cowork
+    /// session. Views never retain or create connection pools directly.
+    func mcpRuntime(
+        kind: SessionKind,
+        sessionID: SessionID,
+        create: @escaping @MainActor () async throws
+            -> MCPShippingSessionRuntime
+    ) async throws -> MCPShippingSessionRuntime {
+        guard kind.rawValue == SessionKind.code.rawValue
+                || kind.rawValue == SessionKind.cowork.rawValue else {
+            throw IntatisError.config(
+                "MCP is available only to Code and Cowork sessions")
+        }
+        guard state == .running else {
+            throw AppSessionRuntimeManagerError.quiescing
+        }
+        let key = AppSessionRuntimeKey(
+            kind: kind,
+            sessionID: sessionID)
+        guard !removingKeys.contains(key) else {
+            throw AppSessionRuntimeManagerError
+                .runtimeBeingRemoved(key)
+        }
+        if let slot = mcpRuntimes[key] {
+            switch slot {
+            case .ready(let owner):
+                return owner
+            case .creating(let generation, let task):
+                return try await finishMCPCreation(
+                    key: key,
+                    generation: generation,
+                    task: task)
+            }
+        }
+        let generation = UUID()
+        let task = Task { @MainActor in
+            try await create()
+        }
+        mcpRuntimes[key] = .creating(generation, task)
+        return try await finishMCPCreation(
+            key: key,
+            generation: generation,
+            task: task)
+    }
+
+    func cachedMCPRuntime(
+        kind: SessionKind,
+        sessionID: SessionID
+    ) -> MCPShippingSessionRuntime? {
+        let key = AppSessionRuntimeKey(
+            kind: kind,
+            sessionID: sessionID)
+        guard case .ready(let owner)? = mcpRuntimes[key] else {
+            return nil
+        }
+        return owner
+    }
+
+    func mcpConversationRuntimeHost(
+        kind: SessionKind,
+        sessionID: SessionID,
+        create: @MainActor ()
+            -> MCPConversationRuntimeHost
+    ) -> MCPConversationRuntimeHost {
+        let key = AppSessionRuntimeKey(
+            kind: kind,
+            sessionID: sessionID)
+        if let existing =
+                mcpConversationHosts[key] {
+            return existing
+        }
+        let host = create()
+        mcpConversationHosts[key] = host
+        return host
+    }
+
+    private func finishMCPCreation(
+        key: AppSessionRuntimeKey,
+        generation: UUID,
+        task: Task<MCPShippingSessionRuntime, Error>
+    ) async throws -> MCPShippingSessionRuntime {
+        do {
+            let owner = try await task.value
+            if case .ready(let existing)? = mcpRuntimes[key] {
+                return existing
+            }
+            guard case .creating(let current, _)? =
+                    mcpRuntimes[key],
+                  current == generation,
+                  state == .running,
+                  !removingKeys.contains(key) else {
+                _ = await owner.shutdown(
+                    reason:
+                        "Application lifecycle raced MCP runtime creation")
+                throw AppSessionRuntimeManagerError.quiescing
+            }
+            mcpRuntimes[key] = .ready(owner)
+            return owner
+        } catch {
+            if case .creating(let current, _)? =
+                    mcpRuntimes[key],
+               current == generation {
+                mcpRuntimes.removeValue(forKey: key)
+            }
+            throw error
+        }
+    }
+
+    private func shutdownMCPRuntime(
+        key: AppSessionRuntimeKey,
+        reason: String
+    ) async {
+        if let host =
+                mcpConversationHosts.removeValue(
+                    forKey: key) {
+            await host.shutdown()
+        }
+        guard let slot = mcpRuntimes.removeValue(
+            forKey: key) else { return }
+        switch slot {
+        case .ready(let owner):
+            _ = await owner.shutdown(reason: reason)
+        case .creating(_, let creation):
+            creation.cancel()
+            if let owner = try? await creation.value {
+                _ = await owner.shutdown(reason: reason)
+            }
+        }
     }
 
     func registerCodeRuntime(_ runtime: CodeViewModel) throws -> CodeViewModel {
@@ -429,6 +573,7 @@ final class AppSessionRuntimeManager: ObservableObject {
                 await runtime.stop(reason: reason)
             }
         }
+        await shutdownMCPRuntime(key: key, reason: reason)
 
         let storageError: Error?
         do {
@@ -475,6 +620,53 @@ final class AppSessionRuntimeManager: ObservableObject {
                 stop: {
                     await entry.shutdown(reason)
                 })
+        }
+
+        // MCP-only runtimes (for example a session explicitly connected from
+        // Project Settings before its primary view opened) still participate
+        // in the same bounded Command-Q drain. Keys that also own a primary
+        // runtime are folded into that primary stop below.
+        let mcpOnlyKeys =
+            Set(mcpRuntimes.keys)
+                .union(
+                    mcpConversationHosts.keys)
+        for key in mcpOnlyKeys where entries[key] == nil {
+            requests.append(SessionRuntimeStopRequest(
+                identity: SessionRuntimeIdentity(
+                    kind: key.kind,
+                    sessionID: key.sessionID),
+                stop: { [weak self] in
+                    await self?.shutdownMCPRuntime(
+                        key: key,
+                        reason: reason)
+                }))
+        }
+
+        for (key, entry) in entries {
+            guard mcpRuntimes[key] != nil
+                    || mcpConversationHosts[key] != nil
+            else { continue }
+            if let index = requests.firstIndex(where: {
+                $0.identity == SessionRuntimeIdentity(
+                    kind: key.kind,
+                    sessionID: key.sessionID)
+            }) {
+                requests[index] = SessionRuntimeStopRequest(
+                    identity: SessionRuntimeIdentity(
+                        kind: key.kind,
+                        sessionID: key.sessionID),
+                    stop: { [weak self] in
+                        let primary = Task { @MainActor in
+                            await entry.shutdown(reason)
+                        }
+                        let mcp = Task { @MainActor [weak self] in
+                            await self?.shutdownMCPRuntime(
+                                key: key,
+                                reason: reason)
+                        }
+                        _ = await (primary.value, mcp.value)
+                    })
+            }
         }
 
         // A Cowork factory can be suspended in migration before a ViewModel is

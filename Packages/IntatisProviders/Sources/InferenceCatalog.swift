@@ -1,4 +1,10 @@
+#if canImport(CryptoKit)
 import CryptoKit
+#elseif canImport(Crypto)
+import Crypto
+#else
+#error("IntatisProviders requires CryptoKit or swift-crypto")
+#endif
 import Foundation
 import IntatisCore
 import IntatisProtocol

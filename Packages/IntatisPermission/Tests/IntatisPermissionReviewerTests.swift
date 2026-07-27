@@ -52,9 +52,12 @@ final class IntatisPermissionReviewerTests: XCTestCase {
             provider: CannedChat(text: #"{"decision":"allow","risk":"low","reason":"fine"}"#),
             model: ModelID(rawValue: "rev"))
         let engine = PermissionEngine(reviewer: reviewer)
-        let out = await engine.decide(writeCall(), reviewCtx(profile: .reviewed))
-        XCTAssertEqual(out.decision, .allow)
-        XCTAssertEqual(out.reason, "fine")
+        let decision = await engine.decideDetailed(
+            writeCall(),
+            reviewCtx(profile: .reviewed))
+        XCTAssertEqual(decision.outcome.decision, .allow)
+        XCTAssertEqual(decision.outcome.reason, "fine")
+        XCTAssertTrue(decision.reviewerConsulted)
     }
 
     func testHardDenyNeverReachesReviewer() async {
@@ -65,7 +68,10 @@ final class IntatisPermissionReviewerTests: XCTestCase {
         let engine = PermissionEngine(reviewer: reviewer)
         let sensitive = ToolCallContext(toolName: "read_file", sideEffect: .readOnly,
                                         touchedPaths: [".env"], risksNetwork: false, rawArgs: "{}")
-        let out = await engine.decide(sensitive, reviewCtx())
-        XCTAssertEqual(out.decision, .deny)
+        let decision = await engine.decideDetailed(
+            sensitive,
+            reviewCtx())
+        XCTAssertEqual(decision.outcome.decision, .deny)
+        XCTAssertFalse(decision.reviewerConsulted)
     }
 }

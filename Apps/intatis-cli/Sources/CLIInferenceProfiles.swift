@@ -1,4 +1,10 @@
+#if canImport(CryptoKit)
 import CryptoKit
+#elseif canImport(Crypto)
+import Crypto
+#else
+#error("IntatisCLI requires CryptoKit or swift-crypto")
+#endif
 import Foundation
 import IntatisCore
 import IntatisProtocol
@@ -283,7 +289,8 @@ struct CLIInferenceProfiles: Sendable {
             variantID: durableVariant,
             modelBaseRequestOptions: model.requestOptions,
             variantRequestOptions: variant?.requestOptions ?? [:],
-            declaredCapabilities: [.chat, .toolCalling],
+            declaredCapabilities:
+                model.declaredCapabilities,
             safeRouteLabel: routeLabel)
     }
 

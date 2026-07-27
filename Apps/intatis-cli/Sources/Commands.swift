@@ -27,6 +27,9 @@ func printHelp() {
       intatis settings        Interactive settings (endpoint, key, model, reasoning, mode)
       intatis config          Print the resolved config
       intatis selftest        Offline smoke test (no key)
+      intatis mcp help        Manage external MCP servers and session access
+      intatis exec --session <id> --agent <id> [--task <id>] --prompt <text> [--yes]
+                              Run one exact durable Code/MCP turn
       intatis help
 
     CONFIG  (env var > advanced Intatis config > legacy config > default)

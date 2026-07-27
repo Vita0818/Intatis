@@ -555,7 +555,21 @@ public struct CoworkProjection: Equatable, Sendable {
              .agentSpawnRequested, .agentToAgentMessage, .workspaceLeaseRequested,
              .workspaceLeaseDenied, .permissionReview, .permissionReviewRequested,
              .permissionReviewSettled, .artifactAdded,
-             .artifactProgress, .turnStats, .turnOutcome:
+             .artifactProgress, .turnStats, .turnOutcome,
+             .mcpServerAttached, .mcpServerDetached, .mcpAttachmentPolicyUpdated,
+             .mcpConsentGranted, .mcpConsentRevoked,
+             .mcpControlOperationRequested, .mcpControlOperationSettled,
+             .mcpGrantGranted, .mcpGrantRevoked,
+             .mcpRememberedApprovalGranted,
+             .mcpRememberedApprovalRevoked,
+             .mcpRootsPolicyUpdated, .mcpNetworkPolicyUpdated, .mcpPromptInserted,
+             .mcpSamplingRequested, .mcpSamplingDecided, .mcpSamplingSettled,
+             .mcpElicitationRequested, .mcpElicitationDecided, .mcpElicitationSettled,
+             .mcpRemoteTaskRequested, .mcpRemoteTaskMapped,
+             .mcpRemoteTaskStateChanged, .mcpRemoteTaskSettled,
+             .mcpClientTaskRequested, .mcpClientTaskStateChanged, .mcpClientTaskSettled,
+             .mcpConnectionTerminal, .mcpCatalogTerminal, .mcpExecutionUncertain,
+             .mcpRequestProgress:
             break
         }
     }

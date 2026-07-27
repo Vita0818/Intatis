@@ -5,6 +5,7 @@ import IntatisProviders
 import IntatisTools
 import IntatisPermission
 import IntatisConversation
+import IntatisMCP
 
 public typealias ToolAuthorizationRevalidator = @Sendable (
     ResolvedToolAuthorization
@@ -433,6 +434,7 @@ public struct AgentLoop: Sendable {
     private let tokenBudgetMeter: AgentTokenBudgetMeter?
     private let authorizationPreparer: ToolAuthorizationPreparer?
     private let authorizationRevalidator: ToolAuthorizationRevalidator?
+    private let toolSnapshotProvider: AgentRequestToolSnapshotProvider?
 
     public init(log: EventLog,
                 provider: ToolCallingProvider,
@@ -461,7 +463,8 @@ public struct AgentLoop: Sendable {
                 executionScope: AgentExecutionScope? = nil,
                 tokenBudgetMeter: AgentTokenBudgetMeter? = nil,
                 authorizationPreparer: ToolAuthorizationPreparer? = nil,
-                authorizationRevalidator: ToolAuthorizationRevalidator? = nil) {
+                authorizationRevalidator: ToolAuthorizationRevalidator? = nil,
+                toolSnapshotProvider: AgentRequestToolSnapshotProvider? = nil) {
         self.log = log
         self.provider = provider
         self.registry = registry
@@ -490,6 +493,7 @@ public struct AgentLoop: Sendable {
         self.tokenBudgetMeter = tokenBudgetMeter
         self.authorizationPreparer = authorizationPreparer
         self.authorizationRevalidator = authorizationRevalidator
+        self.toolSnapshotProvider = toolSnapshotProvider
     }
 
     /// Runs the loop and returns the agent's explicitly completed final answer.
@@ -500,7 +504,12 @@ public struct AgentLoop: Sendable {
                      userMessage: UserMessagePayload? = nil,
                      recordUserMessage: Bool = true,
                      submissionID: SubmissionID? = nil) async throws -> String {
-        let turnID = TurnID.new()
+        // A first attempt uses the identity frozen at the user submission
+        // boundary. Whole-task Retry is a distinct turn and must not create a
+        // second terminal outcome under the prior TurnID.
+        let turnID = (taskAttempt ?? 1) == 1
+            ? (userMessage?.turnID ?? TurnID.new())
+            : TurnID.new()
         let effectiveSubmissionID = submissionID ?? userMessage?.submissionID
         let start = Date()
         var firstTokenAt: Date?
@@ -528,6 +537,9 @@ public struct AgentLoop: Sendable {
             var durableUserMessage = userMessage ?? UserMessagePayload(text: userText)
             if durableUserMessage.submissionID == nil {
                 durableUserMessage.submissionID = effectiveSubmissionID
+            }
+            if durableUserMessage.turnID == nil {
+                durableUserMessage.turnID = turnID
             }
             let appended = try await log.append(.userMessage(durableUserMessage))
             recoveredCoworkEvents?.append(appended)
@@ -563,10 +575,22 @@ public struct AgentLoop: Sendable {
         }
         try await log.append(.agentStatus(AgentStatusPayload(agent: agent.name, state: .thinking)))
 
-        var convo = context.initialMessages(history: history, userText: userText, userImages: images)
-        let specs = context.toolSpecs(registry)
+        var convo = context.initialMessages(
+            history: history,
+            userText: userText,
+            userImages: images,
+            externalContexts:
+                acceptedCurrentUserMessage?
+                    .untrustedExternalContexts
+                    ?? [])
         let denialCircuitBreaker = ToolDenialCircuitBreaker()
         let sideEffectEvidence = SideEffectEvidenceLedger()
+        let mcpTurnResultBudget =
+            MCPToolResultAggregateBudget(
+                scope: .turn,
+                maximumBytes:
+                    MCPToolResultAggregateLimits
+                        .maximumTurnBytes)
         var usedToolCallIDs = Set<String>()
         var syntheticToolCallOrdinal = 0
         if context.runtimeEnvironment.mode == .cowork,
@@ -580,6 +604,16 @@ public struct AgentLoop: Sendable {
 
         for _ in 0..<maxIterations {
             try Task.checkCancellation()
+            let toolSnapshot: AgentRequestToolSnapshot
+            if let toolSnapshotProvider {
+                toolSnapshot = try await toolSnapshotProvider(
+                    provider.toolCallingCapabilities,
+                    mcpTurnResultBudget)
+            } else {
+                toolSnapshot = AgentRequestToolSnapshot(registry: registry)
+            }
+            let specs = toolSnapshot.providerToolSpecs
+                ?? context.toolSpecs(toolSnapshot.registry)
             var assistantText = ""
             var pendingToolCalls: [ToolCall] = []
             var responseUsage: Usage?
@@ -588,7 +622,11 @@ public struct AgentLoop: Sendable {
             let assistantID = MessageID.new()
 
             var request = AgentRequest(model: agent.model, messages: convo, tools: specs,
-                                       reasoningEffort: reasoningEffort, includeUsage: includeUsage)
+                                       reasoningEffort: reasoningEffort, includeUsage: includeUsage,
+                                       parallelToolCalls:
+                                        specs.contains(where: \.supportsParallelCalls)
+                                            ? true
+                                            : nil)
             let estimatedInputTokens = Self.estimatedInputTokens(request: request)
             // Cowork always supplies its one session-lifetime meter, including
             // while enforcement is disabled. A disabled meter returns a
@@ -618,7 +656,7 @@ public struct AgentLoop: Sendable {
                                 textDelta: d,
                                 submissionID: effectiveSubmissionID)))
                     case .toolCalls(let calls):
-                        pendingToolCalls = calls
+                        pendingToolCalls.append(contentsOf: calls)
                     case .usage(let u):
                         responseUsage = Usage.merging(responseUsage, with: u)
                     case .done(let reason):
@@ -685,6 +723,9 @@ public struct AgentLoop: Sendable {
                 pendingToolCalls,
                 usedCallIDs: &usedToolCallIDs,
                 syntheticOrdinal: &syntheticToolCallOrdinal)
+            pendingToolCalls = Self.normalizedToolCallKinds(
+                pendingToolCalls,
+                registry: toolSnapshot.registry)
             if pendingToolCalls.isEmpty,
                Self.finishReasonRequiresToolCalls(finishReason) {
                 throw AgentLoopError.completionExpectedToolCalls(
@@ -728,7 +769,8 @@ public struct AgentLoop: Sendable {
                             taskAttempt: modelHistoryScope.taskAttempt,
                             content: assistantText.isEmpty ? nil : assistantText,
                             calls: try modelHistoryFunctionCalls(
-                                pendingToolCalls))))
+                                pendingToolCalls,
+                                registry: toolSnapshot.registry))))
                 }
             }
             if !completedResponseEvents.isEmpty {
@@ -764,10 +806,23 @@ public struct AgentLoop: Sendable {
                 turnID: turnID,
                 denialCircuitBreaker: denialCircuitBreaker,
                 sideEffectEvidence: sideEffectEvidence,
-                modelHistoryScope: modelHistoryScope)
+                modelHistoryScope: modelHistoryScope,
+                registry: toolSnapshot.registry)
             for (toolCall, observation) in zip(pendingToolCalls, observations) {
                 try Task.checkCancellation()
-                convo.append(.tool(id: toolCall.id, content: observation))
+                if toolCall.kind == .toolSearch {
+                    convo.append(.toolSearchOutput(
+                        id: toolCall.id,
+                        output: observation.toolSearchOutput
+                            ?? ModelToolSearchOutput(
+                                execution:
+                                    toolCall.execution ?? "client",
+                                tools: [])))
+                } else {
+                    convo.append(.tool(
+                        id: toolCall.id,
+                        content: observation.text))
+                }
             }
         }
 
@@ -784,12 +839,12 @@ public struct AgentLoop: Sendable {
             }
             let interruption = Self.turnInterruption(for: error)
             if interruption == nil {
-                try? await log.append(.error(Self.terminalErrorPayload(
+                _ = try? await log.append(.error(Self.terminalErrorPayload(
                     for: error,
                     submissionID: effectiveSubmissionID)))
             }
-            try? await log.append(.agentStatus(AgentStatusPayload(agent: agent.name, state: .idle)))
-            try? await log.append(.turnOutcome(TurnOutcomePayload(
+            _ = try? await log.append(.agentStatus(AgentStatusPayload(agent: agent.name, state: .idle)))
+            _ = try? await log.append(.turnOutcome(TurnOutcomePayload(
                 turnID: turnID,
                 outcome: interruption == nil ? .failed : .interrupted,
                 failureSource: interruption?.failureSource ?? .runtimeFailed,
@@ -1061,7 +1116,7 @@ public struct AgentLoop: Sendable {
 
     private func appendTurnStats(start: Date, firstTokenAt: Date?, usage: Usage?) async {
         let now = Date()
-        try? await log.append(.turnStats(TurnStatsPayload(
+        _ = try? await log.append(.turnStats(TurnStatsPayload(
             promptTokens: usage?.promptTokens,
             cachedPromptTokens: usage?.cachedPromptTokens,
             completionTokens: usage?.completionTokens,
@@ -1085,11 +1140,13 @@ public struct AgentLoop: Sendable {
                               turnID: TurnID,
                               denialCircuitBreaker: ToolDenialCircuitBreaker,
                               sideEffectEvidence: SideEffectEvidenceLedger,
-                              modelHistoryScope: ModelHistoryRecordingScope?) async throws -> [String] {
+                              modelHistoryScope: ModelHistoryRecordingScope?,
+                              registry: ToolRegistry) async throws
+        -> [ToolObservation] {
         let parallelCollaborationTools = Set(["ask_agent", "delegate_task"])
         guard toolCalls.count > 1,
               toolCalls.allSatisfy({ parallelCollaborationTools.contains($0.name) }) else {
-            var results: [String] = []
+            var results: [ToolObservation] = []
             results.reserveCapacity(toolCalls.count)
             for toolCall in toolCalls {
                 try Task.checkCancellation()
@@ -1098,13 +1155,17 @@ public struct AgentLoop: Sendable {
                     turnID: turnID,
                     denialCircuitBreaker: denialCircuitBreaker,
                     sideEffectEvidence: sideEffectEvidence,
-                    modelHistoryScope: modelHistoryScope)
+                    modelHistoryScope: modelHistoryScope,
+                    registry: registry)
                 results.append(observation)
             }
             return results
         }
 
-        return try await withThrowingTaskGroup(of: (Int, String).self, returning: [String].self) { group in
+        return try await withThrowingTaskGroup(
+            of: (Int, ToolObservation).self,
+            returning: [ToolObservation].self
+        ) { group in
             for (index, toolCall) in toolCalls.enumerated() {
                 group.addTask {
                     let observation = try await runTool(
@@ -1112,11 +1173,12 @@ public struct AgentLoop: Sendable {
                         turnID: turnID,
                         denialCircuitBreaker: denialCircuitBreaker,
                         sideEffectEvidence: sideEffectEvidence,
-                        modelHistoryScope: modelHistoryScope)
+                        modelHistoryScope: modelHistoryScope,
+                        registry: registry)
                     return (index, observation)
                 }
             }
-            var indexed: [(Int, String)] = []
+            var indexed: [(Int, ToolObservation)] = []
             indexed.reserveCapacity(toolCalls.count)
             for try await result in group { indexed.append(result) }
             return indexed.sorted { $0.0 < $1.0 }.map(\.1)
@@ -1127,9 +1189,28 @@ public struct AgentLoop: Sendable {
         to events: [Event],
         toolCall: ToolCall,
         observation: String,
+        toolSearchOutput: ModelToolSearchOutput?,
         scope: ModelHistoryRecordingScope?
     ) -> [Event] {
         guard let scope else { return events }
+        if toolCall.kind == .toolSearch {
+            let output = toolSearchOutput
+                ?? ModelToolSearchOutput(
+                    execution: toolCall.execution ?? "client",
+                    tools: [])
+            return events + [.modelHistoryItem(.toolSearchOutput(
+                itemID:
+                    "model-history-output:\(scope.turnID.rawValue):\(toolCall.id)",
+                turnID: scope.turnID,
+                agent: agent.name,
+                taskID: scope.taskID,
+                submissionID: scope.submissionID,
+                taskAttempt: scope.taskAttempt,
+                callID: toolCall.id,
+                status: output.status,
+                execution: output.execution,
+                tools: output.tools))]
+        }
         let sanitized = PermissionReviewTextSanitizer.sanitize(
             observation,
             maxCharacters: 65_536)
@@ -1148,12 +1229,14 @@ public struct AgentLoop: Sendable {
         _ events: [Event],
         toolCall: ToolCall,
         observation: String,
+        toolSearchOutput: ModelToolSearchOutput? = nil,
         modelHistoryScope: ModelHistoryRecordingScope?
     ) async throws {
         try await log.append(appendingModelHistoryToolOutput(
             to: events,
             toolCall: toolCall,
             observation: observation,
+            toolSearchOutput: toolSearchOutput,
             scope: modelHistoryScope))
     }
 
@@ -1161,10 +1244,12 @@ public struct AgentLoop: Sendable {
                          turnID: TurnID,
                          denialCircuitBreaker: ToolDenialCircuitBreaker,
                          sideEffectEvidence: SideEffectEvidenceLedger,
-                         modelHistoryScope: ModelHistoryRecordingScope?) async throws -> String {
+                         modelHistoryScope: ModelHistoryRecordingScope?,
+                         registry: ToolRegistry) async throws
+        -> ToolObservation {
         try Task.checkCancellation()
 
-        guard let tool = registry.tool(named: toolCall.name) else {
+        guard let registration = registry.registration(named: toolCall.name) else {
             let safeUnknownToolName = PermissionReviewTextSanitizer.sanitizeDiagnostic(
                 toolCall.name,
                 maxCharacters: 128).text
@@ -1194,14 +1279,17 @@ public struct AgentLoop: Sendable {
                 observation: message,
                 modelHistoryScope: modelHistoryScope)
             await denialCircuitBreaker.recordDenial(signature: denialSignature)
-            return message
+            return ToolObservation(text: message)
         }
 
-        let descriptor = type(of: tool).descriptor
+        let descriptor = registration.descriptor
         let effectiveWorkspaceRoot = workspaceLease.map { URL(fileURLWithPath: $0.rootPath) }
             ?? agent.workspaceRoot
         let normalizedArguments: String
-        switch normalizeToolArguments(toolCall.arguments, descriptor: descriptor) {
+        switch normalizeToolArguments(
+            toolCall.arguments,
+            registration: registration,
+            descriptor: descriptor) {
         case .valid(let arguments):
             normalizedArguments = arguments
             try await appendDurableToolCall(
@@ -1235,18 +1323,20 @@ public struct AgentLoop: Sendable {
             await sideEffectEvidence.recordDenied(
                 tool: descriptor.name,
                 intent: invalidInputIntent(
-                    tool: tool,
+                    registration: registration,
                     descriptor: descriptor,
                     rawArguments: toolCall.arguments,
                     workspaceRoot: effectiveWorkspaceRoot),
                 authorization: nil)
-            return message
+            return ToolObservation(text: message)
         }
 
         let args = ToolArgs(raw: normalizedArguments)
-        let touchedPaths = tool.touchedPaths(args)
-        let baseIntent = tool.permissionIntent(args, workspaceRoot: effectiveWorkspaceRoot)
-        let risksNetwork = tool.risksNetwork(args)
+        let touchedPaths = registration.touchedPaths(args)
+        let baseIntent = registration.permissionIntent(
+            args,
+            workspaceRoot: effectiveWorkspaceRoot)
+        let risksNetwork = registration.risksNetwork(args)
         if descriptor.name == "rename_session",
            Self.sessionRenameContainsSecret(normalizedArguments) {
             let reason = "the proposed session name appears to contain a secret"
@@ -1279,7 +1369,7 @@ public struct AgentLoop: Sendable {
                 tool: descriptor.name,
                 intent: baseIntent,
                 authorization: nil)
-            return message
+            return ToolObservation(text: message)
         }
         let sessionID = await log.sessionID
         let authorizationInvocation = ToolAuthorizationInvocationContext(
@@ -1325,7 +1415,7 @@ public struct AgentLoop: Sendable {
                 tool: descriptor.name,
                 intent: baseIntent,
                 authorization: nil)
-            return message
+            return ToolObservation(text: message)
         }
 
         let authorizationID = IDGen.random(prefix: "tool-authorization")
@@ -1371,7 +1461,7 @@ public struct AgentLoop: Sendable {
                 tool: descriptor.name,
                 intent: baseIntent,
                 authorization: nil)
-            return message
+            return ToolObservation(text: message)
         }
         let intent = preparation.intent
 
@@ -1417,7 +1507,7 @@ public struct AgentLoop: Sendable {
                 tool: descriptor.name,
                 intent: intent,
                 authorization: nil)
-            return message
+            return ToolObservation(text: message)
         }
         if let leaseFailure = workspaceLeaseFailure(
             intent: intent,
@@ -1449,7 +1539,7 @@ public struct AgentLoop: Sendable {
                 tool: descriptor.name,
                 intent: intent,
                 authorization: authorization)
-            return message
+            return ToolObservation(text: message)
         }
         let callContext = ToolCallContext(
             toolName: descriptor.name,
@@ -1468,12 +1558,16 @@ public struct AgentLoop: Sendable {
             agent: agent.name)
 
         let engineDecision = await engine.decideDetailed(callContext, permissionContext)
-        let outcome = engineDecision.outcome
+        let outcome = MCPApprovalInteractionPolicy.decide(
+            engineDecision: engineDecision,
+            authorization: authorization,
+            responderMode: responder.approvalMode)
         authorization = authorization.withDeterministicGate(
             Self.gateSnapshot(engineDecision.gate))
         if outcome.decision != .deny,
            let authorizationFailure = await authorizationRevalidationFailure(
             authorization,
+            registry: registry,
             toolName: descriptor.name,
             normalizedArguments: normalizedArguments,
             intent: intent,
@@ -1508,7 +1602,7 @@ public struct AgentLoop: Sendable {
                 tool: descriptor.name,
                 intent: intent,
                 authorization: authorization)
-            return message
+            return ToolObservation(text: message)
         }
         try Task.checkCancellation()
         let executionID = IDGen.random(prefix: "tool-execution")
@@ -1543,11 +1637,12 @@ public struct AgentLoop: Sendable {
                 tool: descriptor.name,
                 intent: intent,
                 authorization: authorization)
-            return message
+            return ToolObservation(text: message)
         }
 
         if let authorizationFailure = await authorizationRevalidationFailure(
             authorization,
+            registry: registry,
             toolName: descriptor.name,
             normalizedArguments: normalizedArguments,
             intent: intent,
@@ -1582,7 +1677,7 @@ public struct AgentLoop: Sendable {
                 tool: descriptor.name,
                 intent: intent,
                 authorization: authorization)
-            return message
+            return ToolObservation(text: message)
         }
 
         // Permission review can be arbitrarily slow. Revalidate the pinned
@@ -1619,7 +1714,7 @@ public struct AgentLoop: Sendable {
                 tool: descriptor.name,
                 intent: intent,
                 authorization: authorization)
-            return message
+            return ToolObservation(text: message)
         }
 
         try Task.checkCancellation()
@@ -1642,6 +1737,7 @@ public struct AgentLoop: Sendable {
 
         if let authorizationFailure = await authorizationRevalidationFailure(
             authorization,
+            registry: registry,
             toolName: descriptor.name,
             normalizedArguments: normalizedArguments,
             intent: intent,
@@ -1681,7 +1777,7 @@ public struct AgentLoop: Sendable {
                 tool: descriptor.name,
                 intent: intent,
                 authorization: authorization)
-            return message
+            return ToolObservation(text: message)
         }
 
         // The durable prepare append is another suspension point. Check once
@@ -1723,7 +1819,7 @@ public struct AgentLoop: Sendable {
                 tool: descriptor.name,
                 intent: intent,
                 authorization: authorization)
-            return message
+            return ToolObservation(text: message)
         }
 
         let toolContext = ToolContext(workspaceRoot: effectiveWorkspaceRoot,
@@ -1768,7 +1864,7 @@ public struct AgentLoop: Sendable {
             throw CancellationError()
         }
         do {
-            observation = try await tool.execute(args, in: toolContext)
+            observation = try await registration.execute(args, in: toolContext)
         } catch is CancellationError {
             let message = replayPolicy == .requiresManualReconciliation
                 ? "tool cancelled; manual reconciliation required because the side effect may already have occurred"
@@ -1816,7 +1912,7 @@ public struct AgentLoop: Sendable {
                 intent: intent,
                 authorization: authorization)
             await denialCircuitBreaker.recordDenial(signature: denialSignature)
-            return message
+            return ToolObservation(text: message)
         } catch let rejection as ToolExecutionRejectedWithoutSideEffect {
             let message = "tool error: \(rejection.message)"
             try await appendToolCompletion(
@@ -1840,7 +1936,7 @@ public struct AgentLoop: Sendable {
                 tool: descriptor.name,
                 intent: intent,
                 authorization: authorization)
-            return message
+            return ToolObservation(text: message)
         } catch {
             let underlying = RuntimeErrorPresentation.message(for: error)
             if replayPolicy == .requiresManualReconciliation {
@@ -1885,7 +1981,43 @@ public struct AgentLoop: Sendable {
                 tool: descriptor.name,
                 intent: intent,
                 authorization: authorization)
-            return message
+            return ToolObservation(text: message)
+        }
+
+        if observation.structuredResult?.isError == true {
+            let reason = "MCP server reported tool execution failure"
+            try await appendToolCompletion(
+                [
+                    .toolResult(ToolResultPayload(
+                        toolCallId: toolCall.id,
+                        observation: observation.text,
+                        truncated: observation.truncated,
+                        outcome: .failed,
+                        failureSource: .runtimeFailed,
+                        turnID: turnID,
+                        structuredResult: observation.structuredResult,
+                        provenance: observation.structuredResult?.content
+                            .compactMap(\.provenance)
+                            .first)),
+                    .toolExecutionSettled(ToolExecutionSettledPayload(
+                        prepared: prepared,
+                        outcome: .failed,
+                        effectDisposition: .unknown,
+                        reason: reason)),
+                ],
+                toolCall: toolCall,
+                observation: observation.text,
+                modelHistoryScope: modelHistoryScope)
+            // MCP `isError` is a typed tool failure, not proof that a remote
+            // side effect never crossed its commit boundary. Keep mutating
+            // completion evidence unresolved and let the model recover from
+            // the durable failed tool result without replaying automatically.
+            await sideEffectEvidence.recordDenied(
+                tool: descriptor.name,
+                intent: intent,
+                authorization: authorization)
+            try Task.checkCancellation()
+            return observation
         }
 
         var completionEvents: [Event] = []
@@ -1898,7 +2030,11 @@ public struct AgentLoop: Sendable {
             observation: observation.text,
             truncated: observation.truncated,
             outcome: .succeeded,
-            turnID: turnID)))
+            turnID: turnID,
+            structuredResult: observation.structuredResult,
+            provenance: observation.structuredResult?.content
+                .compactMap(\.provenance)
+                .first)))
         completionEvents.append(.toolExecutionSettled(ToolExecutionSettledPayload(
             prepared: prepared,
             outcome: .succeeded,
@@ -1907,13 +2043,14 @@ public struct AgentLoop: Sendable {
             completionEvents,
             toolCall: toolCall,
             observation: observation.text,
+            toolSearchOutput: observation.toolSearchOutput,
             modelHistoryScope: modelHistoryScope)
         await sideEffectEvidence.recordSucceeded(
             intent: intent,
             authorization: authorization)
         // Persist completed side effects before surfacing a concurrent cancel.
         try Task.checkCancellation()
-        return observation.text
+        return observation
     }
 
     /// Provider call IDs are opaque correlation keys, but some compatible
@@ -1940,7 +2077,39 @@ public struct AgentLoop: Sendable {
             return ToolCall(
                 id: candidate,
                 name: call.name,
-                arguments: call.arguments)
+                arguments: call.arguments,
+                kind: call.kind,
+                namespace: call.namespace,
+                status: call.status,
+                execution: call.execution)
+        }
+    }
+
+    /// The immutable request snapshot is authoritative for model-facing call
+    /// kinds. This also upgrades a Chat-compatible `tool_search` function-call
+    /// shape into the native history kind without trusting a mutable catalog.
+    private static func normalizedToolCallKinds(
+        _ calls: [ToolCall],
+        registry: ToolRegistry
+    ) -> [ToolCall] {
+        calls.map { call in
+            guard let descriptor =
+                    registry.registration(named: call.name)?.descriptor else {
+                return call
+            }
+            let kind: ToolCallKind = descriptor.modelSpecKind == .toolSearch
+                ? .toolSearch
+                : .function
+            return ToolCall(
+                id: call.id,
+                name: call.name,
+                arguments: call.arguments,
+                kind: kind,
+                namespace: call.namespace,
+                status: call.status,
+                execution: kind == .toolSearch
+                    ? (call.execution ?? "client")
+                    : call.execution)
         }
     }
 
@@ -1949,7 +2118,8 @@ public struct AgentLoop: Sendable {
     /// arguments; restart history keeps exact canonical JSON only when it is
     /// schema-valid, bounded, and contains no scrubbed secret material.
     private func modelHistoryFunctionCalls(
-        _ toolCalls: [ToolCall]
+        _ toolCalls: [ToolCall],
+        registry: ToolRegistry
     ) throws -> [ModelHistoryFunctionCall] {
         var seenCallIDs = Set<String>()
         var result: [ModelHistoryFunctionCall] = []
@@ -1964,7 +2134,7 @@ public struct AgentLoop: Sendable {
                     call.id)
             }
 
-            guard let tool = registry.tool(named: call.name) else {
+            guard let registration = registry.registration(named: call.name) else {
                 let sanitizedName = PermissionReviewTextSanitizer
                     .sanitizeDiagnostic(call.name, maxCharacters: 128)
                     .text
@@ -1973,15 +2143,22 @@ public struct AgentLoop: Sendable {
                     callID: call.id,
                     name: sanitizedName.isEmpty ? "unknown_tool" : sanitizedName,
                     arguments: #"{"_intatis":"arguments_redacted"}"#,
-                    argumentsRedacted: true))
+                    argumentsRedacted: true,
+                    kind: call.kind == .toolSearch
+                        ? .toolSearch
+                        : .function,
+                    namespace: call.namespace,
+                    status: call.status,
+                    execution: call.execution))
                 continue
             }
 
-            let descriptor = type(of: tool).descriptor
+            let descriptor = registration.descriptor
             let durableArguments: String
             let argumentsRedacted: Bool
             switch normalizeToolArguments(
                 call.arguments,
+                registration: registration,
                 descriptor: descriptor)
             {
             case .valid(let canonical)
@@ -2005,7 +2182,13 @@ public struct AgentLoop: Sendable {
                 callID: call.id,
                 name: descriptor.name,
                 arguments: durableArguments,
-                argumentsRedacted: argumentsRedacted))
+                argumentsRedacted: argumentsRedacted,
+                kind: call.kind == .toolSearch
+                    ? .toolSearch
+                    : .function,
+                namespace: call.namespace,
+                status: call.status,
+                execution: call.execution))
         }
         return result
     }
@@ -2075,15 +2258,17 @@ public struct AgentLoop: Sendable {
         case invalid(String)
     }
 
-    private func invalidInputIntent(tool: any Tool,
+    private func invalidInputIntent(registration: ToolRegistration,
                                     descriptor: ToolDescriptor,
                                     rawArguments: String,
                                     workspaceRoot: URL) -> PermissionIntent {
         let args = ToolArgs(raw: rawArguments)
-        var intent = tool.permissionIntent(args, workspaceRoot: workspaceRoot)
+        var intent = registration.permissionIntent(
+            args,
+            workspaceRoot: workspaceRoot)
         guard intent.resources.isEmpty else { return intent }
 
-        var paths = tool.touchedPaths(args)
+        var paths = registration.touchedPaths(args)
         if paths.isEmpty,
            let data = rawArguments.data(using: .utf8),
            let decoded = try? JSONDecoder().decode(JSONValue.self, from: data),
@@ -2103,13 +2288,23 @@ public struct AgentLoop: Sendable {
         return intent
     }
 
-    private func normalizeToolArguments(_ raw: String, descriptor: ToolDescriptor) -> ToolArgumentNormalization {
+    private func normalizeToolArguments(
+        _ raw: String,
+        registration: ToolRegistration,
+        descriptor: ToolDescriptor
+    ) -> ToolArgumentNormalization {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         let allowsEmptyObject = requiredArguments(in: descriptor).isEmpty
 
         guard !trimmed.isEmpty else {
             if allowsEmptyObject {
-                return .valid("{}")
+                do {
+                    try registration.validateArguments(ToolArgs(raw: "{}"))
+                    return .valid("{}")
+                } catch {
+                    return .invalid(
+                        "invalid tool input: arguments for \(descriptor.name) do not match the complete schema. \(RuntimeErrorPresentation.message(for: error))")
+                }
             }
             return .invalid("invalid tool input: arguments for \(descriptor.name) must be a JSON object matching the tool schema; received empty arguments.")
         }
@@ -2130,9 +2325,23 @@ public struct AgentLoop: Sendable {
                 guard let canonical = try? encoder.encode(JSONValue.object(object)) else {
                     return .invalid("invalid tool input: arguments for \(descriptor.name) could not be normalized.")
                 }
-                return .valid(String(decoding: canonical, as: UTF8.self))
+                let normalized = String(decoding: canonical, as: UTF8.self)
+                do {
+                    try registration.validateArguments(
+                        ToolArgs(raw: normalized))
+                } catch {
+                    return .invalid(
+                        "invalid tool input: arguments for \(descriptor.name) do not match the complete schema. \(RuntimeErrorPresentation.message(for: error))")
+                }
+                return .valid(normalized)
             case .null where allowsEmptyObject:
-                return .valid("{}")
+                do {
+                    try registration.validateArguments(ToolArgs(raw: "{}"))
+                    return .valid("{}")
+                } catch {
+                    return .invalid(
+                        "invalid tool input: arguments for \(descriptor.name) do not match the complete schema. \(RuntimeErrorPresentation.message(for: error))")
+                }
             default:
                 return .invalid("invalid tool input: arguments for \(descriptor.name) must be a JSON object matching the tool schema.")
             }
@@ -2308,6 +2517,7 @@ public struct AgentLoop: Sendable {
 
     private func authorizationRevalidationFailure(
         _ authorization: ResolvedToolAuthorization,
+        registry: ToolRegistry,
         toolName: String,
         normalizedArguments: String,
         intent: PermissionIntent,

@@ -1,8 +1,13 @@
 # PROJECT_MAP
 
-最近自查日期：2026-07-23
+最近自查日期：2026-07-26
 
 本文描述当前仓库结构。判断依据来自 `Package.swift`、`project.yml`、`Makefile`、源码、测试文件和脚本。
+
+## 2026-07-26 独立 Web renderer parity 实验
+
+- `Experiments/WebRendererParity/` 是 source-tree-only 的 React/Vite 渲染与 session-lifecycle 实验，带独立 npm lockfile、DOM/lifecycle tests、许可证扫描、README 与 native 接入评估。`src/renderer/` 实现 Markdown、bounded KaTeX/MathML 和 read-only CodeMirror；`src/session/` 提供 3 个合成 session fixture 与可取消的 30 秒 warm-residency store；`src/components/ConversationPane.tsx` / `ViewportMessage.tsx` 实现 newest-first 分页、exact-generation subtree replacement 和近视口 mount；`DiagnosticsPanel.tsx` 与 `window.rendererHarness` 提供无消息正文的生命周期计数。它不在 `Package.swift`、`project.yml`、`Makefile`、App target、Swift package 或 release resource graph 中。
+- 生产 renderer 仍只有 `IntatisSharedUI` → `Vendor/SwiftStreamingMarkdown` / iosMath 与 `.plainSafe` 两条路径。本实验不能读取或替代 EventLog、session、permission、agent、workspace 或 credential 边界；后续若采用其行为，优先在既有 native renderer seam 内移植。
 
 ## 2026-07-23 UI 活跃状态接线
 
@@ -26,20 +31,32 @@ Intatis/
 │   ├── IntatisiOS/    Chat-only iOS app（7-product 子集）
 │   └── intatis-cli/   CLI
 ├── ARCHITECTURE.md    Intatis 架构设计（draft-0，2026-06-11，中文）
+├── Experiments/       不接入生产 build graph 的独立实验；当前含 WebRendererParity
 ├── Makefile           build/test/release/install/app 便利 target
 ├── NOTICE.md          项目来源、当前上游采用状态 + 第三方依赖声明
-├── ThirdPartyNotices/ Markdown / syntax / math 完整分发声明
-├── Vendor/            仓内维护的第三方派生源码；当前含 SwiftStreamingMarkdown thin derivative + 相邻许可证/patch ledger
-├── Package.swift      SwiftPM manifest（11 lib + CLI + 11 test target）
-├── Packages/          11 个库模块（各 Sources/，SharedUI 现有渲染 Tests）
+├── ThirdPartyNotices/ Markdown / syntax / math / MCP SDK / tool_search / HTTP / Swift Crypto 完整分发声明
+├── Vendor/            仓内维护的第三方派生源码
+│   ├── SwiftStreamingMarkdown/ Microsoft v0.6.0 thin derivative
+│   └── MCPClientSDK/  官方 Swift MCP SDK 0.12.1 的 client-only derivative + upstream/patch ledger
+├── Package.swift      SwiftPM manifest（13 public libraries + 3 internal C targets + CLI + 13 tests + dev conformance executable）
+├── Packages/          Intatis Swift/C targets
+│   ├── IntatisMCP/    外部 MCP client core、HTTP/OAuth、catalog/content/callback/tasks 与 tests
+│   ├── IntatisMCPStdio/ 本地 stdio owner、sandbox/network/exec guard
+│   ├── IntatisCurlTransport/ libcurl C boundary
+│   └── IntatisMCPConformanceClient/ 仅开发期 official/extended client conformance driver
 ├── README.md          Intatis readme
+├── Tests/
+│   ├── MCPConformance/ pinned official 0.1.16 + Intatis task interoperability + W10 runner
+│   └── MCPBM25ParityOracle/ 不进入产品图的 Codex BM25 Rust 差分 oracle
+├── scripts/
+│   └── validate-linux-cli.sh 双架构 musl 静态 CLI 交叉构建 gate
 ├── docs/              项目状态/架构/测试/禁区说明 + Cowork 设计文档
 └── project.yml        XcodeGen spec（生成 Intatis.xcodeproj）
 ```
 
 ## Target / 模块
 
-### Intatis 库 target（11）+ 内部 C helper
+### Intatis public library products（13）+ internal C targets（3）
 
 | Target | 类型 | 依赖 | 职责 |
 |---|---|---|---|
@@ -51,22 +68,29 @@ Intatis/
 | `IntatisPTYLauncher` | internal C helper | libc / macOS `forkpty` | 为 managed terminal 建立真实 controlling PTY；child 在 fork 后只执行 C/POSIX signal/FD/chdir/exec，CLOEXEC error pipe 把启动错误返回父进程；非 macOS 返回不支持 |
 | `IntatisTools` | lib | Core, Protocol, PTYLauncher | 哑工具执行器与 task/goal host 接口（ToolProtocol/TaskGoalManagement/FileTools/PatchTool/PathConfinement/ShellGit/TerminalTools/DocumentMediaTools/BrowserTools）；`ToolRegistration` / `ToolRegistry` 是 schema、concrete tool、canonical permission、lease resolver、semantic preview 与 executor 的单一事实源 |
 | `IntatisPermission` | lib | Core, Protocol, Providers | 3 层权限门（PermissionTypes/PermissionEngine/DeterministicPolicyGate/ModelPermissionReviewer/SecretScanner） |
-| `IntatisAgentKernel` | lib | Core, Protocol, Providers, Tools, Permission, Conversation, Artifacts | 共享 headless 单 agent runtime（AgentRuntime/RuntimeEnvironmentManifest/AgentLoop/ContextBuilder/ContextProjector/AgentModelHistoryProjector/AgentExecutionBudget/PermissionResponder） |
+| `IntatisCurlTransport` | internal C target | system/SDK libcurl | MCP Streamable HTTP 的 native socket-binding boundary；Darwin 链系统 libcurl，Linux 静态 CLI 链官方 Static Linux SDK closure；iOS 不链接 |
+| `IntatisMCP` | lib | Core, Protocol, Tools, MCPClientSDK, CurlTransport(macOS/Linux), Crypto(Linux) | 外部 MCP Server 的 client-only core：配置/import/catalog、authority/session runtime、Streamable HTTP/OAuth、protocol negotiation、tools/resources/prompts/completions/roots、sampling/elicitation、logging/progress/cancel/subscription、tasks、输出安全与可靠性；无 Server target/API/product seam |
+| `IntatisMCPStdioGuard` | internal C target | libc/kernel API | Linux stdio 后代 exec/network 的 seccomp/ptrace guard；Apple 平台为空实现，不进入 portable client core |
+| `IntatisMCPStdio` | lib | MCP, Core, Protocol, Tools, MCPClientSDK, StdioGuard, Crypto(Linux) | 本地 MCP stdio process ownership：exact launch artifact、direct exec/pipe、Seatbelt 或 Linux bwrap+guard、exact network gateway、TERM→KILL/drain；独立 linkage 使 App Store 保持 HTTP-only |
+| `IntatisAgentKernel` | lib | Core, Protocol, Providers, Tools, Permission, Conversation, Artifacts, MCP | 共享 headless 单 agent runtime（AgentRuntime/RuntimeEnvironmentManifest/AgentLoop/ContextBuilder/ContextProjector/AgentModelHistoryProjector/AgentExecutionBudget/PermissionResponder）；每次 provider dispatch 冻结 exact `AgentRequestToolSnapshot` |
 | `IntatisCowork` | lib | Core, Protocol, Providers, Tools, Permission, Conversation, AgentKernel | 多 agent 编排与 Goal 控制面（Orchestrator/AgentScheduler/MessageBus/Mediator/AgentRegistry/WorkTaskTools/GoalTools/GoalVerifierControlPlane/CoordinatorTools/AgentPermissionResponder/PermissionReviewControlPlane） |
 | `IntatisMultimodal` | lib | Core, Protocol, Providers, Artifacts, Conversation | 图像/视频/转写 → artifacts |
 | `IntatisSharedUI` | lib | Core, Protocol, Providers, Conversation, Artifacts, `Vendor/SwiftStreamingMarkdown` thin derivative（Microsoft v0.6.0 basis；传递 exact iosMath 2.5.0，仅 iOS/macOS） | 跨平台 SwiftUI；`MessageRendering` 以 `.microsoft` / `.plainSafe` 做产品熔断，rich 结构/原生布局与 code-aware 单美元行内公式由经审计的 Microsoft 派生包负责；iosMath 只提供 Apple-native TeX parse/layout，plain-safe 完全绕开二者。公式通过两平台 TextKit 2 live `MTMathUILabel` attachment 展示，1024×256-point preflight、semantic appearance 与 Dynamic Type revision 共同控制 literal fallback/更新，不保留 raster cache。Intatis 只做 64 KiB admission、process-wide 1-running/32-pending latest-only Markdown parse permits、每 view 最新 raw revision、50 ms incomplete parse debounce、100 ms fixed-window raw leading/trailing projection、stale publication guard与安全链接。`ExecutionTracePresentation.swift` 另在 Code/Cowork 展示边界默认隐藏 verbose tool/patch/note/agent-to-agent trace 和由 `CodeProjection` 标记的同-task exact `task_completed` 回答镜像，并由后台启动参数/环境变量 opt in 恢复；它不改变 EventLog 或 durable task settlement。当前仍不分发语法高亮、远程 Markdown 图片或 block math |
 
-### App target
+`IntatisMCPConformanceClient` 是只供固定 conformance runner 启动的开发期 executable，不是发行 product，也不是 MCP Server。
+
+### App / executable target
 
 | Target | 类型 | 平台 | Bundle ID | 链接 |
 |---|---|---|---|---|
-| `IntatisMac` | application | macOS 26+ | `com.Vita0818.IntatisMac` | 全部 11 个 product；默认 DeveloperID/non-sandbox workbench |
-| `IntatisiOS` | application | iOS 26+ | `com.Vita0818.Intatis` | 7 个 chat 子集 product（无 Tools/Permission/AgentKernel/Cowork） |
-| `intatis-cli` | executable | CLI（macOS/Linux） | — | Core, Protocol, Providers, Conversation, Tools, Permission, AgentKernel, Cowork |
+| `IntatisMac` | application | macOS 26+ | `com.Vita0818.IntatisMac` | 完整 Chat/Code/Cowork，链接 `IntatisMCP` + `IntatisMCPStdio`，DeveloperID/non-sandbox workbench 支持 stdio/HTTP |
+| `IntatisMacAppStore` | application | macOS 26+ | `com.Vita0818.IntatisMac` | 完整 Chat/Code/Cowork UI，链接 `IntatisMCP` 但不链接 `IntatisMCPStdio`/guard；remote HTTP-only |
+| `IntatisiOS` | application | iOS 26+ | `com.Vita0818.Intatis` | 7 个 chat 子集 products；无 MCP client runtime/transport/product surface，也无 Tools/Permission/AgentKernel/Cowork |
+| `intatis-cli` | executable | CLI（macOS/Linux） | — | Code/Cowork + external MCP client；macOS/Linux 支持 stdio/HTTP，CLI 持有 exact session MCP owner |
 
-### 测试 target（11）— `Packages/<Mod>/Tests`
+### 测试 target（13）
 
-`IntatisCoreTests`、`IntatisProtocolTests`（+V02/V03/V04/InferenceProfile）、`IntatisProvidersTests`（+Multimodal/ToolCalling/InferenceCatalog/StoreResolver）、`IntatisArtifactsTests`、`IntatisConversationTests`（+Code）、`IntatisToolsTests`、`IntatisPermissionTests`（+Reviewer）、`IntatisAgentKernelTests`、`IntatisCoworkTests`（含 `AutomaticPermissionReviewTests` / `PerAgentInferenceProfileTests`）、`IntatisMultimodalTests`、`IntatisSharedUITests`（`MessageRendererModeTests` / `MessageRenderingTests` / `CoworkInferencePresentationTests` / `ExecutionTracePresentationTests`）。`swift test` 无头。
+`IntatisCoreTests`、`IntatisProtocolTests`（+V02/V03/V04/InferenceProfile/MCP events/results）、`IntatisProvidersTests`、`IntatisArtifactsTests`、`IntatisConversationTests`、`IntatisToolsTests`、`IntatisPermissionTests`、`IntatisMCPTests`、`IntatisCLITests`、`IntatisAgentKernelTests`、`IntatisCoworkTests`、`IntatisMultimodalTests`、`IntatisSharedUITests`。`swift test` 无头；official/extended MCP conformance 另由 `Tests/MCPConformance/` 驱动开发期 executable。
 
 ## 关键文件
 

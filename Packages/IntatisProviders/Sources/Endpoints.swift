@@ -78,31 +78,42 @@ public struct ProviderEndpoint: Codable, Equatable, Sendable {
     public var id: String
     public var baseURL: URL
     public var chatEndpoint: URL?
+    public var responsesEndpoint: URL?
     public var apiKeyRef: KeychainRef
     public var wire: WireFormat
     /// Arbitrary model-scoped request body options from the user's provider
     /// configuration. Wire adapters merge the selected model's object into the
     /// outgoing request without enumerating provider-specific keys.
     public var modelRequestOptions: [String: [String: JSONValue]]
+    /// Explicit route-scoped model capabilities. Absence is intentionally
+    /// conservative: an OpenAI-compatible URL alone never proves Responses
+    /// `tool_search` support.
+    public var modelCapabilities: [String: [Capability]]
 
     public init(id: String, baseURL: URL, chatEndpoint: URL? = nil,
+                responsesEndpoint: URL? = nil,
                 apiKeyRef: KeychainRef, wire: WireFormat,
-                modelRequestOptions: [String: [String: JSONValue]] = [:]) {
+                modelRequestOptions: [String: [String: JSONValue]] = [:],
+                modelCapabilities: [String: [Capability]] = [:]) {
         self.id = id
         self.baseURL = baseURL
         self.chatEndpoint = chatEndpoint
+        self.responsesEndpoint = responsesEndpoint
         self.apiKeyRef = apiKeyRef
         self.wire = wire
         self.modelRequestOptions = modelRequestOptions
+        self.modelCapabilities = modelCapabilities
     }
 
     private enum CodingKeys: String, CodingKey {
         case id
         case baseURL
         case chatEndpoint
+        case responsesEndpoint
         case apiKeyRef
         case wire
         case modelRequestOptions
+        case modelCapabilities
     }
 
     public init(from decoder: Decoder) throws {
@@ -110,11 +121,17 @@ public struct ProviderEndpoint: Codable, Equatable, Sendable {
         self.id = try container.decode(String.self, forKey: .id)
         self.baseURL = try container.decode(URL.self, forKey: .baseURL)
         self.chatEndpoint = try container.decodeIfPresent(URL.self, forKey: .chatEndpoint)
+        self.responsesEndpoint = try container.decodeIfPresent(
+            URL.self,
+            forKey: .responsesEndpoint)
         self.apiKeyRef = try container.decode(KeychainRef.self, forKey: .apiKeyRef)
         self.wire = try container.decode(WireFormat.self, forKey: .wire)
         self.modelRequestOptions = try container.decodeIfPresent(
             [String: [String: JSONValue]].self,
             forKey: .modelRequestOptions) ?? [:]
+        self.modelCapabilities = try container.decodeIfPresent(
+            [String: [Capability]].self,
+            forKey: .modelCapabilities) ?? [:]
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -122,10 +139,18 @@ public struct ProviderEndpoint: Codable, Equatable, Sendable {
         try container.encode(id, forKey: .id)
         try container.encode(baseURL, forKey: .baseURL)
         try container.encodeIfPresent(chatEndpoint, forKey: .chatEndpoint)
+        try container.encodeIfPresent(
+            responsesEndpoint,
+            forKey: .responsesEndpoint)
         try container.encode(apiKeyRef, forKey: .apiKeyRef)
         try container.encode(wire, forKey: .wire)
         if !modelRequestOptions.isEmpty {
             try container.encode(modelRequestOptions, forKey: .modelRequestOptions)
+        }
+        if !modelCapabilities.isEmpty {
+            try container.encode(
+                modelCapabilities,
+                forKey: .modelCapabilities)
         }
     }
 
@@ -133,8 +158,18 @@ public struct ProviderEndpoint: Codable, Equatable, Sendable {
         chatEndpoint ?? baseURL.appendingPathComponent("chat/completions")
     }
 
+    public var responsesURL: URL {
+        responsesEndpoint ?? baseURL.appendingPathComponent("responses")
+    }
+
     public func requestOptions(for model: ModelID) -> [String: JSONValue] {
         modelRequestOptions[model.rawValue] ?? [:]
+    }
+
+    public func capabilities(
+        for model: ModelID
+    ) -> [Capability] {
+        modelCapabilities[model.rawValue] ?? []
     }
 }
 
@@ -145,6 +180,17 @@ extension ProviderEndpoint {
                                          endpointID: id,
                                          field: field,
                                          operation: operation)
+    }
+
+    func validatedResponsesURL(operation: String) throws -> URL {
+        let field = responsesEndpoint == nil
+            ? "Base URL"
+            : "Responses endpoint"
+        return try Self.validatedHTTPURL(
+            responsesURL,
+            endpointID: id,
+            field: field,
+            operation: operation)
     }
 
     func validatedBaseURLAppendingPathComponent(_ pathComponent: String,

@@ -26,13 +26,25 @@ public struct UserMessagePayload: Codable, Equatable, Sendable {
     /// selector again. `nil` covers Chat, legacy Cowork messages, and direct
     /// messages to ordinary agents.
     public var mainAgentInferenceBinding: AgentInferenceBinding?
+    /// Stable execution identity selected at the user submission boundary.
+    /// Legacy events decode as `nil`; AgentLoop supplies a fresh identity
+    /// before appending such a message.
+    public var turnID: TurnID?
+    /// Server-originated data explicitly selected for this user submission.
+    /// It is one-shot: conversation/model-history projection never promotes or
+    /// carries this field into a later turn.
+    public var untrustedExternalContexts:
+        [UntrustedExternalContext]?
     public init(text: String,
                 attachments: [ArtifactID]? = nil,
                 to: AgentID? = nil,
                 tags: [String]? = nil,
                 goal: String? = nil,
                 submissionID: SubmissionID? = nil,
-                mainAgentInferenceBinding: AgentInferenceBinding? = nil) {
+                mainAgentInferenceBinding: AgentInferenceBinding? = nil,
+                turnID: TurnID? = nil,
+                untrustedExternalContexts:
+                    [UntrustedExternalContext]? = nil) {
         self.text = text
         self.attachments = attachments
         self.to = to
@@ -40,6 +52,11 @@ public struct UserMessagePayload: Codable, Equatable, Sendable {
         self.goal = goal
         self.submissionID = submissionID
         self.mainAgentInferenceBinding = mainAgentInferenceBinding
+        self.turnID = turnID
+        self.untrustedExternalContexts =
+            untrustedExternalContexts?.isEmpty == false
+                ? untrustedExternalContexts
+                : nil
     }
 }
 
@@ -207,13 +224,17 @@ public struct ToolResultPayload: Codable, Equatable, Sendable {
     public var failureSource: ExecutionFailureSource?
     public var turnID: TurnID?
     public var permissionRequestID: RequestID?
+    public var structuredResult: MCPStructuredToolResult?
+    public var provenance: MCPContentProvenance?
     public init(toolCallId: String,
                 observation: String,
                 truncated: Bool? = nil,
                 outcome: ToolCallOutcome? = nil,
                 failureSource: ExecutionFailureSource? = nil,
                 turnID: TurnID? = nil,
-                permissionRequestID: RequestID? = nil) {
+                permissionRequestID: RequestID? = nil,
+                structuredResult: MCPStructuredToolResult? = nil,
+                provenance: MCPContentProvenance? = nil) {
         self.toolCallId = toolCallId
         self.observation = observation
         self.truncated = truncated
@@ -221,6 +242,8 @@ public struct ToolResultPayload: Codable, Equatable, Sendable {
         self.failureSource = failureSource
         self.turnID = turnID
         self.permissionRequestID = permissionRequestID
+        self.structuredResult = structuredResult
+        self.provenance = provenance
     }
 }
 
@@ -631,6 +654,40 @@ public enum Event: Equatable, Sendable {
     // v0.4 (Multimodal)
     case artifactAdded(ArtifactAddedPayload)
     case artifactProgress(ArtifactProgressPayload)
+    // external MCP client durable control/data-plane facts
+    case mcpServerAttached(MCPServerAttachedPayload)
+    case mcpServerDetached(MCPServerDetachedPayload)
+    case mcpAttachmentPolicyUpdated(MCPAttachmentPolicyUpdatedPayload)
+    case mcpConsentGranted(MCPConsentGrantedPayload)
+    case mcpConsentRevoked(MCPConsentRevokedPayload)
+    case mcpControlOperationRequested(MCPControlOperationRequestedPayload)
+    case mcpControlOperationSettled(MCPControlOperationSettledPayload)
+    case mcpGrantGranted(MCPGrantGrantedPayload)
+    case mcpGrantRevoked(MCPGrantRevokedPayload)
+    case mcpRememberedApprovalGranted(
+        MCPRememberedApprovalGrantedPayload)
+    case mcpRememberedApprovalRevoked(
+        MCPRememberedApprovalRevokedPayload)
+    case mcpRootsPolicyUpdated(MCPRootsPolicyUpdatedPayload)
+    case mcpNetworkPolicyUpdated(MCPNetworkPolicyUpdatedPayload)
+    case mcpPromptInserted(MCPPromptInsertedPayload)
+    case mcpSamplingRequested(MCPSamplingRequestedPayload)
+    case mcpSamplingDecided(MCPSamplingDecidedPayload)
+    case mcpSamplingSettled(MCPSamplingSettledPayload)
+    case mcpElicitationRequested(MCPElicitationRequestedPayload)
+    case mcpElicitationDecided(MCPElicitationDecidedPayload)
+    case mcpElicitationSettled(MCPElicitationSettledPayload)
+    case mcpRemoteTaskRequested(MCPRemoteTaskRequestedPayload)
+    case mcpRemoteTaskMapped(MCPRemoteTaskMappedPayload)
+    case mcpRemoteTaskStateChanged(MCPRemoteTaskStateChangedPayload)
+    case mcpRemoteTaskSettled(MCPRemoteTaskSettledPayload)
+    case mcpClientTaskRequested(MCPClientTaskRequestedPayload)
+    case mcpClientTaskStateChanged(MCPClientTaskStateChangedPayload)
+    case mcpClientTaskSettled(MCPClientTaskSettledPayload)
+    case mcpConnectionTerminal(MCPConnectionTerminalPayload)
+    case mcpCatalogTerminal(MCPCatalogTerminalPayload)
+    case mcpExecutionUncertain(MCPExecutionUncertainPayload)
+    case mcpRequestProgress(MCPRequestProgressPayload)
     // stats
     case turnStats(TurnStatsPayload)
     // typed terminal turn lifecycle (Phase C)
@@ -720,6 +777,39 @@ public enum Event: Equatable, Sendable {
         case continuationRunRecovered = "continuation_run_recovered"
         case artifactAdded = "artifact_added"
         case artifactProgress = "artifact_progress"
+        case mcpServerAttached = "mcp_server_attached"
+        case mcpServerDetached = "mcp_server_detached"
+        case mcpAttachmentPolicyUpdated = "mcp_attachment_policy_updated"
+        case mcpConsentGranted = "mcp_consent_granted"
+        case mcpConsentRevoked = "mcp_consent_revoked"
+        case mcpControlOperationRequested = "mcp_control_operation_requested"
+        case mcpControlOperationSettled = "mcp_control_operation_settled"
+        case mcpGrantGranted = "mcp_grant_granted"
+        case mcpGrantRevoked = "mcp_grant_revoked"
+        case mcpRememberedApprovalGranted =
+            "mcp_remembered_approval_granted"
+        case mcpRememberedApprovalRevoked =
+            "mcp_remembered_approval_revoked"
+        case mcpRootsPolicyUpdated = "mcp_roots_policy_updated"
+        case mcpNetworkPolicyUpdated = "mcp_network_policy_updated"
+        case mcpPromptInserted = "mcp_prompt_inserted"
+        case mcpSamplingRequested = "mcp_sampling_requested"
+        case mcpSamplingDecided = "mcp_sampling_decided"
+        case mcpSamplingSettled = "mcp_sampling_settled"
+        case mcpElicitationRequested = "mcp_elicitation_requested"
+        case mcpElicitationDecided = "mcp_elicitation_decided"
+        case mcpElicitationSettled = "mcp_elicitation_settled"
+        case mcpRemoteTaskRequested = "mcp_remote_task_requested"
+        case mcpRemoteTaskMapped = "mcp_remote_task_mapped"
+        case mcpRemoteTaskStateChanged = "mcp_remote_task_state_changed"
+        case mcpRemoteTaskSettled = "mcp_remote_task_settled"
+        case mcpClientTaskRequested = "mcp_client_task_requested"
+        case mcpClientTaskStateChanged = "mcp_client_task_state_changed"
+        case mcpClientTaskSettled = "mcp_client_task_settled"
+        case mcpConnectionTerminal = "mcp_connection_terminal"
+        case mcpCatalogTerminal = "mcp_catalog_terminal"
+        case mcpExecutionUncertain = "mcp_execution_uncertain"
+        case mcpRequestProgress = "mcp_request_progress"
         case turnStats = "turn_stats"
         case turnOutcome = "turn_outcome"
     }
@@ -808,6 +898,39 @@ public enum Event: Equatable, Sendable {
         case .continuationRunRecovered: return .continuationRunRecovered
         case .artifactAdded:       return .artifactAdded
         case .artifactProgress:    return .artifactProgress
+        case .mcpServerAttached: return .mcpServerAttached
+        case .mcpServerDetached: return .mcpServerDetached
+        case .mcpAttachmentPolicyUpdated: return .mcpAttachmentPolicyUpdated
+        case .mcpConsentGranted: return .mcpConsentGranted
+        case .mcpConsentRevoked: return .mcpConsentRevoked
+        case .mcpControlOperationRequested: return .mcpControlOperationRequested
+        case .mcpControlOperationSettled: return .mcpControlOperationSettled
+        case .mcpGrantGranted: return .mcpGrantGranted
+        case .mcpGrantRevoked: return .mcpGrantRevoked
+        case .mcpRememberedApprovalGranted:
+            return .mcpRememberedApprovalGranted
+        case .mcpRememberedApprovalRevoked:
+            return .mcpRememberedApprovalRevoked
+        case .mcpRootsPolicyUpdated: return .mcpRootsPolicyUpdated
+        case .mcpNetworkPolicyUpdated: return .mcpNetworkPolicyUpdated
+        case .mcpPromptInserted: return .mcpPromptInserted
+        case .mcpSamplingRequested: return .mcpSamplingRequested
+        case .mcpSamplingDecided: return .mcpSamplingDecided
+        case .mcpSamplingSettled: return .mcpSamplingSettled
+        case .mcpElicitationRequested: return .mcpElicitationRequested
+        case .mcpElicitationDecided: return .mcpElicitationDecided
+        case .mcpElicitationSettled: return .mcpElicitationSettled
+        case .mcpRemoteTaskRequested: return .mcpRemoteTaskRequested
+        case .mcpRemoteTaskMapped: return .mcpRemoteTaskMapped
+        case .mcpRemoteTaskStateChanged: return .mcpRemoteTaskStateChanged
+        case .mcpRemoteTaskSettled: return .mcpRemoteTaskSettled
+        case .mcpClientTaskRequested: return .mcpClientTaskRequested
+        case .mcpClientTaskStateChanged: return .mcpClientTaskStateChanged
+        case .mcpClientTaskSettled: return .mcpClientTaskSettled
+        case .mcpConnectionTerminal: return .mcpConnectionTerminal
+        case .mcpCatalogTerminal: return .mcpCatalogTerminal
+        case .mcpExecutionUncertain: return .mcpExecutionUncertain
+        case .mcpRequestProgress: return .mcpRequestProgress
         case .turnStats:           return .turnStats
         case .turnOutcome:         return .turnOutcome
         }

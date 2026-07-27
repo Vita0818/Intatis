@@ -79,7 +79,14 @@ public actor ProviderRegistry {
             let apiKey = try await resolver.secret(for: endpoint.apiKeyRef)
             switch endpoint.wire {
             case .openai:
-                let provider = OpenAIWireProvider(endpoint: endpoint, apiKey: apiKey, http: http)
+                let provider = OpenAIWireProvider(
+                    endpoint: endpoint,
+                    apiKey: apiKey,
+                    http: http,
+                    toolCallingCapabilities:
+                        toolCallingCapabilities(
+                            endpoint: endpoint,
+                            model: ref.model))
                 switch role {
                 case .chat:
                     var report = await ProviderHealthChecker.checkChat(
@@ -132,7 +139,14 @@ public actor ProviderRegistry {
         let apiKey = try await resolver.secret(for: endpoint.apiKeyRef)
         switch endpoint.wire {
         case .openai:
-            return OpenAIWireProvider(endpoint: endpoint, apiKey: apiKey, http: http)
+            return OpenAIWireProvider(
+                endpoint: endpoint,
+                apiKey: apiKey,
+                http: http,
+                toolCallingCapabilities:
+                    toolCallingCapabilities(
+                        endpoint: endpoint,
+                        model: ref.model))
         }
     }
 
@@ -183,16 +197,40 @@ public actor ProviderRegistry {
             chatEndpoint: connection.chatEndpoint,
             apiKeyRef: connection.credentialRef,
             wire: connection.wire,
-            modelRequestOptions: [profile.modelID.rawValue: profile.effectiveRequestOptions])
+            modelRequestOptions: [
+                profile.modelID.rawValue:
+                    profile.effectiveRequestOptions,
+            ],
+            modelCapabilities: [
+                profile.modelID.rawValue:
+                    profile.declaredCapabilities,
+            ])
         let provider: ToolCallingProvider
         switch connection.wire {
         case .openai:
-            provider = OpenAIWireProvider(endpoint: endpoint, apiKey: apiKey, http: http)
+            provider = OpenAIWireProvider(
+                endpoint: endpoint,
+                apiKey: apiKey,
+                http: http,
+                toolCallingCapabilities:
+                    toolCallingCapabilities(
+                        endpoint: endpoint,
+                        model: profile.modelID))
         }
         return ResolvedInferenceProfile(
             binding: resolution.binding,
             model: profile.modelID,
             provider: provider)
+    }
+
+    private func toolCallingCapabilities(
+        endpoint: ProviderEndpoint,
+        model: ModelID
+    ) -> ToolCallingProviderCapabilities {
+        ToolCallingProviderCapabilities(
+            supportsToolSearch:
+                endpoint.capabilities(for: model)
+                    .contains(.toolSearch))
     }
 
     // MARK: Multimodal (v0.4)

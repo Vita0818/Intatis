@@ -60,6 +60,20 @@ final class ModelHistoryProtocolTests: XCTestCase {
                 taskAttempt: metadata.taskAttempt,
                 callID: "call_read",
                 output: "README contents"),
+            .toolSearchOutput(
+                itemID: "item_tool_search_output",
+                turnID: metadata.turnID,
+                agent: metadata.agent,
+                taskID: metadata.taskID,
+                submissionID: metadata.submissionID,
+                taskAttempt: metadata.taskAttempt,
+                callID: "call_search",
+                tools: [
+                    .object([
+                        "type": .string("function"),
+                        "name": .string("calendar_create"),
+                    ]),
+                ]),
             ModelHistoryItemPayload(
                 itemID: "item_reasoning",
                 turnID: metadata.turnID,
@@ -135,5 +149,25 @@ final class ModelHistoryProtocolTests: XCTestCase {
                 messageId: MessageID(rawValue: "msg_legacy"),
                 role: .assistant,
                 text: "legacy answer")))
+    }
+
+    func testLegacyFunctionCallDecodesWithFunctionKindDefaults()
+        throws {
+        let legacy = #"""
+        {
+          "callID": "legacy-call",
+          "name": "read_file",
+          "arguments": "{\"path\":\"README.md\"}",
+          "argumentsRedacted": false
+        }
+        """#
+        let decoded = try JSONDecoder().decode(
+            ModelHistoryFunctionCall.self,
+            from: Data(legacy.utf8))
+
+        XCTAssertEqual(decoded.kind, .function)
+        XCTAssertNil(decoded.namespace)
+        XCTAssertNil(decoded.status)
+        XCTAssertNil(decoded.execution)
     }
 }

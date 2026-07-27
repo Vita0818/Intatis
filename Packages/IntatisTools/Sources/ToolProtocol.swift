@@ -1,5 +1,11 @@
 import Foundation
+#if canImport(CryptoKit)
 import CryptoKit
+#elseif canImport(Crypto)
+import Crypto
+#else
+#error("IntatisTools requires CryptoKit or swift-crypto")
+#endif
 import IntatisCore
 import IntatisProtocol
 
@@ -26,26 +32,66 @@ public struct ToolObservation: Equatable, Sendable {
     public var truncated: Bool
     public var diff: String?
     public var changedFiles: [String]?
-    public init(text: String, truncated: Bool = false, diff: String? = nil, changedFiles: [String]? = nil) {
+    /// Optional SDK-independent MCP content preserved beside the legacy text
+    /// projection. Existing tools and callers continue to use `text` only.
+    public var structuredResult: MCPStructuredToolResult?
+    /// Provider-native deferred tool definitions returned by `tool_search`.
+    /// AgentKernel persists this as a dedicated Responses input item; it must
+    /// never be merged into the next request's top-level tool catalog.
+    public var toolSearchOutput: ModelToolSearchOutput?
+    public init(text: String,
+                truncated: Bool = false,
+                diff: String? = nil,
+                changedFiles: [String]? = nil,
+                structuredResult: MCPStructuredToolResult? = nil,
+                toolSearchOutput: ModelToolSearchOutput? = nil) {
         self.text = text
         self.truncated = truncated
         self.diff = diff
         self.changedFiles = changedFiles
+        self.structuredResult = structuredResult
+        self.toolSearchOutput = toolSearchOutput
     }
 }
 
 /// Static metadata the permission gate reads. Tools are dumb executors; they do
 /// not decide whether they may run (ARCHITECTURE.md §1.2 principle E).
-public struct ToolDescriptor: Sendable {
+public enum ToolModelSpecKind: String, Equatable, Sendable {
+    case function
+    case toolSearch = "tool_search"
+}
+
+public struct ToolDescriptor: Equatable, Sendable {
     public let name: String
     public let description: String
     public let sideEffect: SideEffect
     public let parameters: JSONValue   // JSON-Schema object
-    public init(name: String, description: String, sideEffect: SideEffect, parameters: JSONValue) {
+    /// Provider-facing metadata retained with the exact registration.
+    /// Permission and execution never infer these fields from a later catalog.
+    public let modelSpecKind: ToolModelSpecKind
+    public let strict: Bool?
+    public let deferLoading: Bool?
+    public let outputSchema: JSONValue?
+    public let supportsParallelCalls: Bool
+
+    public init(name: String,
+                description: String,
+                sideEffect: SideEffect,
+                parameters: JSONValue,
+                modelSpecKind: ToolModelSpecKind = .function,
+                strict: Bool? = nil,
+                deferLoading: Bool? = nil,
+                outputSchema: JSONValue? = nil,
+                supportsParallelCalls: Bool = false) {
         self.name = name
         self.description = description
         self.sideEffect = sideEffect
         self.parameters = parameters
+        self.modelSpecKind = modelSpecKind
+        self.strict = strict
+        self.deferLoading = deferLoading
+        self.outputSchema = outputSchema
+        self.supportsParallelCalls = supportsParallelCalls
     }
 }
 
@@ -405,10 +451,18 @@ public protocol Tool: Sendable {
     /// `workspaceRoot` is context only; it is not an approval or a replacement
     /// for CapabilityLease / WorkspaceLease enforcement in AgentKernel.
     func permissionIntent(_ args: ToolArgs, workspaceRoot: URL) -> PermissionIntent
+    /// Instance-descriptor-aware permission derivation for dynamic
+    /// registrations. Existing static tools keep using the overload above.
+    func permissionIntent(_ args: ToolArgs,
+                          descriptor: ToolDescriptor,
+                          workspaceRoot: URL) -> PermissionIntent
     /// Bounded semantic fields for the reviewer. The returned value is
     /// redacted by `PermissionActionPreview` and never substitutes for the raw
     /// argument digest used by host validation.
     func permissionActionPreview(_ args: ToolArgs) -> PermissionActionPreview?
+    /// Instance-descriptor-aware reviewer preview for dynamic registrations.
+    func permissionActionPreview(_ args: ToolArgs,
+                                 descriptor: ToolDescriptor) -> PermissionActionPreview?
     /// Secret-safe material used to bind the in-memory invocation to its
     /// immutable authorization snapshot. Most tools use the normalized raw
     /// JSON. Tools that accept secret-like interactive bytes may instead
@@ -422,7 +476,15 @@ public extension Tool {
     func touchedPaths(_ args: ToolArgs) -> [String] { [] }
     func risksNetwork(_ args: ToolArgs) -> Bool { false }
     func permissionIntent(_ args: ToolArgs, workspaceRoot: URL) -> PermissionIntent {
-        let descriptor = Self.descriptor
+        permissionIntent(
+            args,
+            descriptor: Self.descriptor,
+            workspaceRoot: workspaceRoot)
+    }
+
+    func permissionIntent(_ args: ToolArgs,
+                          descriptor: ToolDescriptor,
+                          workspaceRoot: URL) -> PermissionIntent {
         var intent = PermissionIntent.derived(
             toolName: descriptor.name,
             sideEffect: descriptor.sideEffect,
@@ -456,6 +518,11 @@ public extension Tool {
     }
 
     func permissionActionPreview(_ args: ToolArgs) -> PermissionActionPreview? {
+        permissionActionPreview(args, descriptor: Self.descriptor)
+    }
+
+    func permissionActionPreview(_ args: ToolArgs,
+                                 descriptor: ToolDescriptor) -> PermissionActionPreview? {
         guard let object = Self.permissionArgumentObject(args) else { return nil }
         let semanticKeys = [
             "command", "content", "diff", "question", "objective", "reason",
@@ -478,7 +545,7 @@ public extension Tool {
             }
         }
         guard !fields.isEmpty else { return nil }
-        return PermissionActionPreview(kind: Self.descriptor.name, fields: fields)
+        return PermissionActionPreview(kind: descriptor.name, fields: fields)
     }
 
     func authorizationArgumentIdentity(_ args: ToolArgs) -> String { args.raw }
@@ -495,19 +562,155 @@ public extension Tool {
 /// its schema and executor; `grantingCapabilities` records which lease
 /// capability aliases may expose that concrete entry in a scoped registry.
 public struct ToolRegistration: Sendable {
+    /// The exact instance-level descriptor advertised, authorized, and
+    /// executed by this registration. Dynamic tools must supply this value
+    /// explicitly; static tools use the compatibility initializer below.
+    public let descriptor: ToolDescriptor
     public let tool: any Tool
+    public let canonicalPermission: String?
     public let grantingCapabilities: Set<ToolCapability>
     public let requiredCommunication: ToolCommunicationRequirement
     public let requiredDelegation: ToolDelegationRequirement
+    /// Exact MCP authority embedded in permission and durable execution
+    /// evidence. Ordinary registrations keep this nil.
+    public let mcpAuthorization: MCPToolAuthorizationSnapshot?
+    /// Invocation-specific MCP resource routes selected from normalized
+    /// arguments before permission review. Fixed aggregate resource tools use
+    /// this seam because one registration can select one or many servers.
+    private let mcpResourceAuthorizationResolver:
+        (@Sendable (
+            ToolArgs
+        ) throws -> MCPResourceInvocationAuthorizationSnapshot?)?
+    private let usesStaticToolMetadata: Bool
+    private let argumentValidator:
+        @Sendable (ToolArgs) throws -> Void
 
+    /// Compatibility initializer for the existing static tool surface.
     public init(tool: any Tool,
                 grantingCapabilities: Set<ToolCapability> = [],
                 requiredCommunication: ToolCommunicationRequirement = .none,
                 requiredDelegation: ToolDelegationRequirement = .none) {
+        self.init(
+            descriptor: type(of: tool).descriptor,
+            tool: tool,
+            canonicalPermission: type(of: tool).canonicalPermission,
+            grantingCapabilities: grantingCapabilities,
+            requiredCommunication: requiredCommunication,
+            requiredDelegation: requiredDelegation,
+            mcpAuthorization: nil,
+            mcpResourceAuthorizationResolver: nil,
+            argumentValidator: { _ in },
+            usesStaticToolMetadata: true)
+    }
+
+    /// Registers one executor under an exact instance-level descriptor.
+    ///
+    /// Callers that construct dynamic registrations must also construct a
+    /// registry with a fresh, immutable `registryVersion`.
+    public init(descriptor: ToolDescriptor,
+                tool: any Tool,
+                canonicalPermission: String? = nil,
+                grantingCapabilities: Set<ToolCapability> = [],
+                requiredCommunication: ToolCommunicationRequirement = .none,
+                requiredDelegation: ToolDelegationRequirement = .none,
+                mcpAuthorization: MCPToolAuthorizationSnapshot? = nil,
+                mcpResourceAuthorizationResolver:
+                    (@Sendable (
+                        ToolArgs
+                    ) throws -> MCPResourceInvocationAuthorizationSnapshot?)?
+                        = nil,
+                argumentValidator:
+                    @escaping @Sendable (ToolArgs) throws -> Void = { _ in }) {
+        self.init(
+            descriptor: descriptor,
+            tool: tool,
+            canonicalPermission: canonicalPermission,
+            grantingCapabilities: grantingCapabilities,
+            requiredCommunication: requiredCommunication,
+            requiredDelegation: requiredDelegation,
+            mcpAuthorization: mcpAuthorization,
+            mcpResourceAuthorizationResolver:
+                mcpResourceAuthorizationResolver,
+            argumentValidator: argumentValidator,
+            usesStaticToolMetadata: false)
+    }
+
+    private init(descriptor: ToolDescriptor,
+                 tool: any Tool,
+                 canonicalPermission: String?,
+                 grantingCapabilities: Set<ToolCapability>,
+                 requiredCommunication: ToolCommunicationRequirement,
+                 requiredDelegation: ToolDelegationRequirement,
+                 mcpAuthorization: MCPToolAuthorizationSnapshot?,
+                 mcpResourceAuthorizationResolver:
+                    (@Sendable (
+                        ToolArgs
+                    ) throws -> MCPResourceInvocationAuthorizationSnapshot?)?,
+                 argumentValidator:
+                    @escaping @Sendable (ToolArgs) throws -> Void,
+                 usesStaticToolMetadata: Bool) {
+        self.descriptor = descriptor
         self.tool = tool
+        self.canonicalPermission = canonicalPermission
         self.grantingCapabilities = grantingCapabilities
         self.requiredCommunication = requiredCommunication
         self.requiredDelegation = requiredDelegation
+        self.mcpAuthorization = mcpAuthorization
+        self.mcpResourceAuthorizationResolver =
+            mcpResourceAuthorizationResolver
+        self.argumentValidator = argumentValidator
+        self.usesStaticToolMetadata = usesStaticToolMetadata
+    }
+
+    public func touchedPaths(_ args: ToolArgs) -> [String] {
+        tool.touchedPaths(args)
+    }
+
+    public func risksNetwork(_ args: ToolArgs) -> Bool {
+        tool.risksNetwork(args)
+    }
+
+    public func permissionIntent(_ args: ToolArgs,
+                                 workspaceRoot: URL) -> PermissionIntent {
+        if usesStaticToolMetadata {
+            return tool.permissionIntent(args, workspaceRoot: workspaceRoot)
+        }
+        return tool.permissionIntent(
+            args,
+            descriptor: descriptor,
+            workspaceRoot: workspaceRoot)
+    }
+
+    public func permissionActionPreview(
+        _ args: ToolArgs
+    ) -> PermissionActionPreview? {
+        if usesStaticToolMetadata {
+            return tool.permissionActionPreview(args)
+        }
+        return tool.permissionActionPreview(args, descriptor: descriptor)
+    }
+
+    public func authorizationArgumentIdentity(_ args: ToolArgs) -> String {
+        tool.authorizationArgumentIdentity(args)
+    }
+
+    public func resolveMCPResourceAuthorization(
+        _ args: ToolArgs
+    ) throws -> MCPResourceInvocationAuthorizationSnapshot? {
+        try mcpResourceAuthorizationResolver?(args)
+    }
+
+    public var requiresDynamicMCPResourceAuthorization: Bool {
+        mcpResourceAuthorizationResolver != nil
+    }
+
+    public func validateArguments(_ args: ToolArgs) throws {
+        try argumentValidator(args)
+    }
+
+    public func execute(_ args: ToolArgs,
+                        in context: ToolContext) async throws -> ToolObservation {
+        try await tool.execute(args, in: context)
     }
 }
 
@@ -526,6 +729,7 @@ public enum ToolRegistryAuthorizationError: Error, Equatable, Sendable, Localize
     case authorizationCapabilityMismatch(tool: String)
     case authorizationLeaseMismatch(tool: String)
     case authorizationInvocationMismatch(tool: String)
+    case mcpGrantNotGranted(tool: String)
     case communicationNotGranted(tool: String, required: ToolCommunicationRequirement)
     case delegationNotGranted(tool: String, required: ToolDelegationRequirement)
     case leaseTaskMismatch(tool: String)
@@ -560,6 +764,8 @@ public enum ToolRegistryAuthorizationError: Error, Equatable, Sendable, Localize
             return "authorization lease identity no longer matches the reviewed invocation for \(tool)"
         case .authorizationInvocationMismatch(let tool):
             return "authorization invocation identity no longer matches the current call for \(tool)"
+        case .mcpGrantNotGranted(let tool):
+            return "tool \(tool) is not granted by the exact active MCP grant"
         case .communicationNotGranted(let tool, let required):
             return "tool \(tool) requires communication grant \(required.rawValue)"
         case .delegationNotGranted(let tool, let required):
@@ -575,6 +781,41 @@ public enum ToolRegistryAuthorizationError: Error, Equatable, Sendable, Localize
 }
 
 public struct ToolRegistry: Sendable {
+    /// An immutable registry construction path. Dynamic registrations can only
+    /// enter an existing registry through a builder whose replacement version
+    /// was supplied up front.
+    public struct Builder: Sendable {
+        public let registryVersion: String
+        private let registrations: [ToolRegistration]
+        private let inheritedConflicts: Set<String>
+
+        fileprivate init(registryVersion: String,
+                         registrations: [ToolRegistration],
+                         inheritedConflicts: Set<String>) {
+            self.registryVersion = registryVersion
+            self.registrations = registrations
+            self.inheritedConflicts = inheritedConflicts
+        }
+
+        public func adding(registrations extra: [ToolRegistration]) -> Builder {
+            Builder(
+                registryVersion: registryVersion,
+                registrations: registrations + extra,
+                inheritedConflicts: inheritedConflicts)
+        }
+
+        public func adding(_ extra: [any Tool]) -> Builder {
+            adding(registrations: extra.map { ToolRegistration(tool: $0) })
+        }
+
+        public func build() -> ToolRegistry {
+            ToolRegistry(
+                registrations: registrations,
+                registryVersion: registryVersion,
+                inheritedConflicts: inheritedConflicts)
+        }
+    }
+
     public let registryVersion: String
     private let registrations: [String: ToolRegistration]
     private let conflictedNames: Set<String>
@@ -600,7 +841,7 @@ public struct ToolRegistry: Sendable {
         var resolved: [String: ToolRegistration] = [:]
         var conflicts = inheritedConflicts
         for registration in registrations {
-            let name = type(of: registration.tool).descriptor.name
+            let name = registration.descriptor.name
             guard !conflicts.contains(name) else { continue }
             if resolved.removeValue(forKey: name) != nil {
                 conflicts.insert(name)
@@ -620,8 +861,16 @@ public struct ToolRegistry: Sendable {
         guard !conflictedNames.contains(name) else { return nil }
         return registrations[name]
     }
-    public func all() -> [any Tool] { registrations.values.map(\.tool) }
-    public func descriptors() -> [ToolDescriptor] { all().map { type(of: $0).descriptor } }
+    public func all() -> [any Tool] {
+        registrations.values
+            .sorted { $0.descriptor.name < $1.descriptor.name }
+            .map(\.tool)
+    }
+    public func descriptors() -> [ToolDescriptor] {
+        registrations.values
+            .map(\.descriptor)
+            .sorted { $0.name < $1.name }
+    }
 
     /// Resolves immutable host facts for this exact invocation. Scoped Cowork
     /// registries fail closed when their capability alias no longer belongs to
@@ -641,11 +890,16 @@ public struct ToolRegistry: Sendable {
             }
             throw ToolRegistryAuthorizationError.unregisteredTool(toolName)
         }
-        let descriptor = type(of: registration.tool).descriptor
+        let descriptor = registration.descriptor
         let granting = registration.grantingCapabilities.sorted { $0.rawValue < $1.rawValue }
+        let arguments = ToolArgs(raw: normalizedArguments)
+        let mcpResource = try registration
+            .resolveMCPResourceAuthorization(arguments)
         let requiresLease = !granting.isEmpty
             || registration.requiredCommunication != .none
             || registration.requiredDelegation != .none
+            || registration.mcpAuthorization != nil
+            || registration.requiresDynamicMCPResourceAuthorization
         let membership: ToolAuthorizationMembership
         if !requiresLease {
             membership = .notRequired
@@ -675,6 +929,22 @@ public struct ToolRegistry: Sendable {
                     tool: toolName,
                     required: registration.requiredDelegation)
             }
+            if let mcp = registration.mcpAuthorization,
+               !Self.capabilityLease(
+                    capabilityLease,
+                    grants: mcp,
+                    invocation: invocation) {
+                throw ToolRegistryAuthorizationError.mcpGrantNotGranted(
+                    tool: toolName)
+            }
+            if let mcpResource,
+               !Self.capabilityLease(
+                    capabilityLease,
+                    grants: mcpResource,
+                    invocation: invocation) {
+                throw ToolRegistryAuthorizationError.mcpGrantNotGranted(
+                    tool: toolName)
+            }
             if let leaseTaskID = capabilityLease.taskID,
                leaseTaskID != invocation.taskID {
                 throw ToolRegistryAuthorizationError.leaseTaskMismatch(tool: toolName)
@@ -685,8 +955,8 @@ public struct ToolRegistry: Sendable {
            workspaceTaskID != invocation.taskID {
             throw ToolRegistryAuthorizationError.leaseTaskMismatch(tool: toolName)
         }
-        let authorizationArguments = registration.tool.authorizationArgumentIdentity(
-            ToolArgs(raw: normalizedArguments))
+        let authorizationArguments =
+            registration.authorizationArgumentIdentity(arguments)
         return ResolvedToolAuthorization(
             authorizationID: authorizationID ?? IDGen.random(prefix: "tool-authorization"),
             registryVersion: registryVersion,
@@ -694,8 +964,8 @@ public struct ToolRegistry: Sendable {
             descriptorFingerprint: Self.descriptorFingerprint(descriptor),
             toolName: descriptor.name,
             canonicalAction: intent.action,
-            canonicalPermission: type(of: registration.tool).canonicalPermission ?? intent.action,
-            actionPreview: registration.tool.permissionActionPreview(
+            canonicalPermission: registration.canonicalPermission ?? intent.action,
+            actionPreview: registration.permissionActionPreview(
                 ToolArgs(raw: normalizedArguments)),
             requiredCapabilities: granting,
             membership: membership,
@@ -718,7 +988,9 @@ public struct ToolRegistry: Sendable {
             workspaceTaskID: workspaceLease?.taskID,
             workspaceRootPath: workspaceLease?.rootPath,
             workspaceLeaseFingerprint: workspaceLease.map(Self.authorizationFingerprint),
-            targetAgentInferenceBinding: targetAgentInferenceBinding)
+            targetAgentInferenceBinding: targetAgentInferenceBinding,
+            mcp: registration.mcpAuthorization,
+            mcpResource: mcpResource)
     }
 
     /// Rechecks the immutable authorization identity against the exact
@@ -763,26 +1035,31 @@ public struct ToolRegistry: Sendable {
             }
             throw ToolRegistryAuthorizationError.unregisteredTool(toolName)
         }
-        let descriptor = type(of: registration.tool).descriptor
+        let descriptor = registration.descriptor
         guard authorization.descriptorFingerprint == Self.descriptorFingerprint(descriptor),
               authorization.sideEffect == descriptor.sideEffect else {
             throw ToolRegistryAuthorizationError.authorizationDescriptorMismatch(tool: toolName)
         }
-        let authorizationArguments = registration.tool.authorizationArgumentIdentity(
-            ToolArgs(raw: normalizedArguments))
+        let arguments = ToolArgs(raw: normalizedArguments)
+        let authorizationArguments =
+            registration.authorizationArgumentIdentity(arguments)
         guard authorization.normalizedArgumentsDigest == Self.sha256(Data(authorizationArguments.utf8)),
               authorization.normalizedArgumentsCharacterCount == authorizationArguments.count else {
             throw ToolRegistryAuthorizationError.authorizationArgumentsMismatch(tool: toolName)
         }
-        let expectedCanonicalPermission = type(of: registration.tool).canonicalPermission ?? intent.action
-        let expectedPreview = registration.tool.permissionActionPreview(
-            ToolArgs(raw: normalizedArguments))
+        let expectedCanonicalPermission = registration.canonicalPermission ?? intent.action
+        let expectedPreview = registration.permissionActionPreview(
+            arguments)
+        let expectedMCPResource = try registration
+            .resolveMCPResourceAuthorization(arguments)
         guard authorization.intent == intent,
               authorization.canonicalAction == intent.action,
               authorization.canonicalPermission == expectedCanonicalPermission,
               authorization.actionPreview == expectedPreview,
               authorization.risksNetwork == risksNetwork,
-              authorization.replayPolicy == intent.replayPolicy else {
+              authorization.replayPolicy == intent.replayPolicy,
+              authorization.mcp == registration.mcpAuthorization,
+              authorization.mcpResource == expectedMCPResource else {
             throw ToolRegistryAuthorizationError.authorizationIntentMismatch(tool: toolName)
         }
         let required = registration.grantingCapabilities.sorted { $0.rawValue < $1.rawValue }
@@ -794,6 +1071,8 @@ public struct ToolRegistry: Sendable {
         let requiresLease = !required.isEmpty
             || registration.requiredCommunication != .none
             || registration.requiredDelegation != .none
+            || registration.mcpAuthorization != nil
+            || registration.requiresDynamicMCPResourceAuthorization
         guard authorization.membership == (requiresLease ? .granted : .notRequired) else {
             throw ToolRegistryAuthorizationError.authorizationCapabilityMismatch(tool: toolName)
         }
@@ -813,6 +1092,44 @@ public struct ToolRegistry: Sendable {
                   Self.delegation(capabilityLease.delegation,
                                   satisfies: registration.requiredDelegation) else {
                 throw ToolRegistryAuthorizationError.authorizationLeaseMismatch(tool: toolName)
+            }
+            if let mcp = registration.mcpAuthorization {
+                let resolvedInvocation = invocation
+                    ?? ToolAuthorizationInvocationContext(
+                        sessionID: authorization.sessionID,
+                        agent: authorization.agent,
+                        taskID: authorization.taskID,
+                        rootTaskID: authorization.rootTaskID,
+                        parentTaskID: authorization.parentTaskID,
+                        attempt: authorization.attempt,
+                        toolCallID: authorization.toolCallID,
+                        taskObjective: authorization.taskObjective)
+                guard Self.capabilityLease(
+                    capabilityLease,
+                    grants: mcp,
+                    invocation: resolvedInvocation) else {
+                    throw ToolRegistryAuthorizationError.mcpGrantNotGranted(
+                        tool: toolName)
+                }
+            }
+            if let mcpResource = expectedMCPResource {
+                let resolvedInvocation = invocation
+                    ?? ToolAuthorizationInvocationContext(
+                        sessionID: authorization.sessionID,
+                        agent: authorization.agent,
+                        taskID: authorization.taskID,
+                        rootTaskID: authorization.rootTaskID,
+                        parentTaskID: authorization.parentTaskID,
+                        attempt: authorization.attempt,
+                        toolCallID: authorization.toolCallID,
+                        taskObjective: authorization.taskObjective)
+                guard Self.capabilityLease(
+                    capabilityLease,
+                    grants: mcpResource,
+                    invocation: resolvedInvocation) else {
+                    throw ToolRegistryAuthorizationError.mcpGrantNotGranted(
+                        tool: toolName)
+                }
             }
         }
         let pinsWorkspaceLease = authorization.workspaceLeaseID != nil
@@ -862,14 +1179,22 @@ public struct ToolRegistry: Sendable {
     }
 
     public static func authorizationFingerprint(_ lease: CapabilityLease) -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let mcpGrants = lease.mcpGrants
+            .sorted { $0.grantID.rawValue < $1.grantID.rawValue }
+            .compactMap { try? encoder.encode($0) }
+            .map { $0.base64EncodedString() }
+            .joined(separator: "\u{1f}")
         let fields = [
-            "capability-lease-v1",
+            "capability-lease-v2",
             lease.id.rawValue,
             lease.taskID?.rawValue ?? "",
             lease.tools.map(\.rawValue).sorted().joined(separator: "\u{1f}"),
             communicationFingerprint(lease.communication),
             delegationFingerprint(lease.delegation),
             lease.expiresAtTaskCompletion ? "1" : "0",
+            mcpGrants,
         ]
         return sha256(Data(framed(fields).utf8))
     }
@@ -931,6 +1256,78 @@ public struct ToolRegistry: Sendable {
         return capabilityMatch
             && communication(lease.communication, satisfies: requirement)
             && delegation(lease.delegation, satisfies: delegationRequirement)
+    }
+
+    private static func capabilityLease(
+        _ lease: CapabilityLease,
+        grants snapshot: MCPToolAuthorizationSnapshot,
+        invocation: ToolAuthorizationInvocationContext
+    ) -> Bool {
+        guard snapshot.rawCatalogRevision.rawValue.isEmpty == false,
+              snapshot.agentCatalogViewRevision.rawValue.isEmpty == false,
+              snapshot.bindingID.rawValue.isEmpty == false,
+              snapshot.schemaHash.isEmpty == false,
+              snapshot.authorityFingerprint.isEmpty == false else {
+            return false
+        }
+        return lease.mcpGrants.contains { grant in
+            grant.grantID == snapshot.grantID
+                && grant.attachmentID == snapshot.attachmentID
+                && grant.server == snapshot.server
+                && grant.agentID == invocation.agent
+                && grant.grantFingerprint == snapshot.grantFingerprint
+                && grant.authorityFingerprint
+                    == snapshot.authorityFingerprint
+                && grant.revocationGeneration
+                    == snapshot.revocationGeneration
+                && grant.grants(.tools)
+                && grant.isActive()
+                && grant.filter.tools.allows(snapshot.remoteToolName)
+        }
+    }
+
+    private static func capabilityLease(
+        _ lease: CapabilityLease,
+        grants snapshot:
+            MCPResourceInvocationAuthorizationSnapshot,
+        invocation: ToolAuthorizationInvocationContext
+    ) -> Bool {
+        guard snapshot.schemaVersion == 1,
+              !snapshot.operation.isEmpty,
+              !snapshot.routes.isEmpty else {
+            return false
+        }
+        return snapshot.routes.allSatisfy { route in
+            guard route.capabilityLeaseID == lease.id,
+                  route.capabilityTaskID == lease.taskID,
+                  route.agentID == invocation.agent,
+                  !route.serverAlias.isEmpty,
+                  !route.grantFingerprint.isEmpty,
+                  !route.rawCatalogRevision.rawValue.isEmpty,
+                  !route.agentCatalogViewRevision.rawValue.isEmpty,
+                  !route.bindingID.rawValue.isEmpty,
+                  !route.authorityFingerprint.isEmpty,
+                  !route.resourcePolicyFingerprint.isEmpty else {
+                return false
+            }
+            return lease.mcpGrants.contains { grant in
+                grant.grantID == route.grantID
+                    && grant.attachmentID == route.attachmentID
+                    && grant.server == route.server
+                    && grant.agentID == route.agentID
+                    && grant.capabilityLeaseID
+                        == route.capabilityLeaseID
+                    && grant.taskID == route.capabilityTaskID
+                    && grant.grantFingerprint
+                        == route.grantFingerprint
+                    && grant.authorityFingerprint
+                        == route.authorityFingerprint
+                    && grant.revocationGeneration
+                        == route.revocationGeneration
+                    && grant.grants(.resources)
+                    && grant.isActive()
+            }
+        }
     }
 
     private static func framed(_ fields: [String]) -> String {
@@ -1009,8 +1406,31 @@ public struct ToolRegistry: Sendable {
         material.append(0)
         material.append(Data(descriptor.sideEffect.rawValue.utf8))
         material.append(0)
+        material.append(Data(descriptor.modelSpecKind.rawValue.utf8))
+        material.append(0)
+        material.append(Data(Self.optionalBool(descriptor.strict).utf8))
+        material.append(0)
+        material.append(Data(Self.optionalBool(descriptor.deferLoading).utf8))
+        material.append(0)
+        material.append(Data(String(descriptor.supportsParallelCalls).utf8))
+        material.append(0)
         material.append(schema)
+        if let outputSchema = descriptor.outputSchema {
+            material.append(0)
+            material.append((try? encoder.encode(outputSchema)) ?? Data())
+        }
         return sha256(material)
+    }
+
+    private static func optionalBool(_ value: Bool?) -> String {
+        switch value {
+        case .none:
+            return "unset"
+        case .some(true):
+            return "true"
+        case .some(false):
+            return "false"
+        }
     }
 
     private static func sha256(_ data: Data) -> String {
@@ -1018,12 +1438,52 @@ public struct ToolRegistry: Sendable {
     }
 
     /// A new registry with extra tools added (e.g. Cowork's `ask_agent`).
+    ///
+    /// This compatibility API is intentionally limited to static `Tool`
+    /// values. Dynamic `ToolRegistration`s must use the explicit-version
+    /// overload or builder below so a catalog/schema change cannot retain an
+    /// old authorization identity.
     public func adding(_ extra: [any Tool]) -> ToolRegistry {
         ToolRegistry(
             registrations: Array(registrations.values)
                 + extra.map { ToolRegistration(tool: $0) },
             registryVersion: registryVersion,
             inheritedConflicts: conflictedNames)
+    }
+
+    /// Adds static tools while replacing the immutable registry identity.
+    public func adding(_ extra: [any Tool],
+                       registryVersion newRegistryVersion: String) -> ToolRegistry {
+        rebuilding(registryVersion: newRegistryVersion)
+            .adding(extra)
+            .build()
+    }
+
+    /// Adds instance-level registrations while replacing the immutable
+    /// registry identity. There is deliberately no overload that omits the
+    /// replacement version.
+    public func adding(registrations extra: [ToolRegistration],
+                       registryVersion newRegistryVersion: String) -> ToolRegistry {
+        rebuilding(registryVersion: newRegistryVersion)
+            .adding(registrations: extra)
+            .build()
+    }
+
+    /// Starts an immutable rebuild from this registry under a required,
+    /// caller-computed replacement version.
+    public func rebuilding(registryVersion newRegistryVersion: String) -> Builder {
+        Builder(
+            registryVersion: newRegistryVersion,
+            registrations: Array(registrations.values),
+            inheritedConflicts: conflictedNames)
+    }
+
+    /// Starts an empty immutable registry builder.
+    public static func builder(registryVersion: String) -> Builder {
+        Builder(
+            registryVersion: registryVersion,
+            registrations: [],
+            inheritedConflicts: [])
     }
 
     /// The production read/write/Git/document/browser tool set. Raw `run_shell`

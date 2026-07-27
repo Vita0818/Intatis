@@ -16,15 +16,22 @@ struct CLIProviderModel: Equatable, Sendable {
     let displayName: String
     let requestOptions: [String: JSONValue]
     let variants: [CLIProviderVariant]
+    let declaredCapabilities: [Capability]
 
     init(id: String,
          displayName: String,
          requestOptions: [String: JSONValue] = [:],
-         variants: [CLIProviderVariant] = []) {
+         variants: [CLIProviderVariant] = [],
+         declaredCapabilities: [Capability] = [
+            .chat,
+            .toolCalling,
+         ]) {
         self.id = id
         self.displayName = displayName
         self.requestOptions = requestOptions
         self.variants = variants
+        self.declaredCapabilities =
+            declaredCapabilities
     }
 }
 
@@ -302,7 +309,11 @@ struct CLIModernProviderConfig: Sendable {
                     id: modelID,
                     displayName: name,
                     requestOptions: modelOptions,
-                    variants: variants)
+                    variants: variants,
+                    declaredCapabilities:
+                        ModelCapabilityMetadata
+                            .declaredCapabilities(
+                                in: object))
             default:
                 return nil
             }

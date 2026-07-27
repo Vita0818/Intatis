@@ -435,6 +435,39 @@ public struct CodeProjection: Equatable, Sendable {
             items.append(CodeItem(id: p.artifactId.rawValue, kind: .note, title: "artifact",
                                   body: "📎 \(p.kind)" + (p.prompt.map { ": \($0)" } ?? "")))
 
+        case .mcpRequestProgress(let p):
+            let id = [
+                "mcp-progress",
+                p.connectionGeneration.rawValue,
+                p.requestIDFingerprint,
+            ].joined(separator: ":")
+            let status: String
+            if let total = p.total, total > 0 {
+                let percent = min(
+                    100,
+                    max(0, Int((p.progress / total * 100).rounded())))
+                status = "\(percent)% · \(p.phase.rawValue)"
+            } else {
+                status = "\(p.progress) · \(p.phase.rawValue)"
+            }
+            let body = p.diagnostic.map {
+                "\(status)\n\($0.summary)"
+            } ?? status
+            if let index = items.firstIndex(where: { $0.id == id }) {
+                items[index].body = body
+                items[index].complete = p.phase != .reported
+                items[index].timestamp = envelope.ts
+            } else {
+                items.append(CodeItem(
+                    id: id,
+                    kind: .note,
+                    title:
+                        "MCP · \(p.server.serverID.rawValue) · \(p.requestMethod)",
+                    body: body,
+                    complete: p.phase != .reported,
+                    timestamp: envelope.ts))
+            }
+
         case .sessionSettingsUpdated, .sessionStorageMigrated, .modelHistoryItem,
              .toolExecutionPrepared, .toolExecutionSettled,
              .permissionRequest, .permissionReviewRequested, .permissionReviewSettled,
@@ -448,7 +481,20 @@ public struct CodeProjection: Equatable, Sendable {
              .goalBudgetLimited, .goalUsageLimited, .goalCompleted, .goalCleared,
              .continuationRunCreated, .continuationRunStarted, .continuationRunCheckpointed,
              .continuationRunCompleted, .continuationRunCancelled, .continuationRunRecovered,
-             .artifactProgress, .turnStats, .turnOutcome:
+             .artifactProgress, .turnStats, .turnOutcome,
+             .mcpServerAttached, .mcpServerDetached, .mcpAttachmentPolicyUpdated,
+             .mcpConsentGranted, .mcpConsentRevoked,
+             .mcpControlOperationRequested, .mcpControlOperationSettled,
+             .mcpGrantGranted, .mcpGrantRevoked,
+             .mcpRememberedApprovalGranted,
+             .mcpRememberedApprovalRevoked,
+             .mcpRootsPolicyUpdated, .mcpNetworkPolicyUpdated, .mcpPromptInserted,
+             .mcpSamplingRequested, .mcpSamplingDecided, .mcpSamplingSettled,
+             .mcpElicitationRequested, .mcpElicitationDecided, .mcpElicitationSettled,
+             .mcpRemoteTaskRequested, .mcpRemoteTaskMapped,
+             .mcpRemoteTaskStateChanged, .mcpRemoteTaskSettled,
+             .mcpClientTaskRequested, .mcpClientTaskStateChanged, .mcpClientTaskSettled,
+             .mcpConnectionTerminal, .mcpCatalogTerminal, .mcpExecutionUncertain:
             break
         }
     }

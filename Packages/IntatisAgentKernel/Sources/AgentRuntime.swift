@@ -108,7 +108,9 @@ public struct AgentRuntime: Sendable {
                          executionScope: AgentExecutionScope? = nil,
                          tokenBudgetMeter: AgentTokenBudgetMeter? = nil,
                          authorizationPreparer: ToolAuthorizationPreparer? = nil,
-                         authorizationRevalidator: ToolAuthorizationRevalidator? = nil) -> AgentLoop {
+                         authorizationRevalidator: ToolAuthorizationRevalidator? = nil,
+                         toolSnapshotProvider:
+                            AgentRequestToolSnapshotProvider? = nil) -> AgentLoop {
         let supplied = context ?? ContextBuilder()
         let runtimeContext = ContextBuilder(
             systemPrompt: supplied.systemPrompt,
@@ -144,6 +146,7 @@ public struct AgentRuntime: Sendable {
             executionScope: executionScope,
             tokenBudgetMeter: tokenBudgetMeter,
             authorizationPreparer: authorizationPreparer,
-            authorizationRevalidator: authorizationRevalidator)
+            authorizationRevalidator: authorizationRevalidator,
+            toolSnapshotProvider: toolSnapshotProvider)
     }
 }

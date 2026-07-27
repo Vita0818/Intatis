@@ -86,6 +86,124 @@ external-runtime 以独立 helper/process/service 运行上游实现
 - 本轮复用形式是 `reference`：参考同一 thread 持有有序 model items、completed item 单次入历史、function call/output 按 call ID 配对、请求前对 missing/orphan pair 做 prompt-only 归一化、resume 从 rollout 重建，以及 compaction 保存完整 `replacement_history` 的行为。
 - Intatis 的 `ModelHistoryItemPayload`、EventLog wire event、Swift projector、legacy bridge、AgentLoop 接线和测试均为独立实现；没有复制、逐行翻译、vendor 或链接 Codex Rust 源码、prompt、测试、文案、名称、Logo 或 UI 资产。因此本轮没有新增第三方分发物，也没有修改 `NOTICE.md`。后续若直接采用上游任何文件或表达，必须重新按目标 commit 核对来源与 Apache-2.0 NOTICE，并把复用类型改为 `derived` / `vendored` / `dependency`。
 
+## 官方 Swift MCP SDK 当前准入结论
+
+- 上游：`https://github.com/modelcontextprotocol/swift-sdk`
+- 固定版本与 commit：`0.12.1` /
+  `a0ae212ebf6eab5f754c3129608bc5557637e605`
+- 复用形式：`vendored` + `derived`；本地 client-only package 位于
+  `Vendor/MCPClientSDK`。
+- 许可证：上游处于许可迁移期；完整组合文本同时保留 Apache-2.0、未完成
+  relicensing 的既有 MIT contribution，以及非 specification 文档的
+  CC-BY-4.0 声明。不得把整批源码简写成单一许可证。
+- 最终 SwiftPM 依赖闭包固定为 `swift-system 1.4.0`、
+  `swift-log 1.6.2` 与 Apple 平台 `EventSource 1.1.0`；精确 revision
+  由本地 manifest 和根 `Package.resolved` 双重固定。`swift-nio`、
+  docc plugin、swift-atomics 与 swift-collections 不进入 MCP 产品依赖图。
+- Linux CLI/MCP 图额外使用官方 `apple/swift-crypto 4.5.1`
+  （commit `47d3869a7291f085c1fb9fb1e6d3b97a793f45c6`）的 `Crypto`
+  product，替代 Linux 不存在的 CryptoKit；所有 root target dependency
+  都有 `.linux` 平台条件，macOS/iOS 继续只链接系统 CryptoKit。
+  其传递闭包包括 `swift-asn1 1.7.1`，且 swift-crypto 内 vendored
+  BoringSSL `0226f30467f540a3f62ef48d453f93927da199b6` 和 XKCP
+  `11297f566178023faba59ff14b6b399241488283` 的完整许可证/NOTICE、
+  精确来源和完整性散列均登记在 `ThirdPartyNotices/SwiftCrypto.md`
+  与 `ThirdPartyNotices/Licenses/`；不得换成自制散列/加密 fallback。
+- 上游 `MCP` product 同时含 client/server API，不满足 Intatis
+  client-only 边界。因此本地衍生包排除 `Server` actor、HTTP Server
+  transports、conformance executables、paired in-memory/custom network
+  transports 与 server-side OAuth publishing/validation types；只保留
+  Client、Base client closure 以及客户端必须使用的 tools/resources/
+  prompts/completion/logging wire schema。
+- `Vendor/MCPClientSDK/UPSTREAM.md` 固定源码 inventory，
+  `Vendor/MCPClientSDK/PATCHES.md` 记录逐项修改与升级重放要求，
+  `ThirdPartyNotices/MCPClient.md` 和 `ThirdPartyNotices/Licenses/`
+  提供分发声明与完整许可证。根 `NOTICE.md` 已登记本次实际采用项。
+- 任何升级都必须重新验证 client-only 编译闭包、per-server version
+  patch、HTTP/OAuth/stdio/tasks conformance、Swift/macOS/Linux compatibility
+  和无 Server API/target/binary/seam；Linux 还必须重跑 portable crypto
+  KAT 与 glibc/musl 双架构静态构建。不能直接切回上游单一 `MCP`
+  product。
+
+## Codex MCP tool_search 派生复用记录
+
+- 上游：`https://github.com/openai/codex`，固定 commit
+  `61a44880a85d2fd0d8770908dea5733495e571c8`；许可证 Apache-2.0。
+- 复用形式：公开 `tool_search` wire/history 合同、MCP 搜索文本字段和
+  stdio schema cache 行为按 `derived` 登记；未采用 Codex MCP Server、
+  UI、品牌资产、私有 prompt 或 Rust runtime。
+- Codex 固定使用 `bm25 2.3.2` 的 English default tokenizer。Intatis
+  对 scoring/embedder/tokenizer/Snowball/fxhash 做 Swift 派生实现，
+  base64 封装 deunicode 1.6.2 未修改数据，并复制 stop-words 0.9.0 的
+  179 项英文表。对应 MIT/BSD-3-Clause/Apache-2.0 来源、crate
+  checksum、文件级修改和完整声明见
+  `ThirdPartyNotices/MCPToolSearch.md`。
+- `Tests/MCPBM25ParityOracle` 是不进入产品 target 的 source-only Rust
+  差分工具；语料由代码生成，不分发 `rust-stemmers/test_data`。Swift
+  测试固定 tokenizer、stemmer、逐位 BM25 分数和 10,000 文档压力结果。
+- 任何 Codex 或 tokenizer 依赖升级都必须重新固定源码/包 checksum，
+  运行 Rust oracle 与 Swift digest/bit-pattern 对照，并重新核对
+  `tool_search_output` history、deferred tools 不进入后续顶层 `tools`、
+  stale catalog fail-closed 及 32-entry/30-minute stdio LRU 边界。
+
+## MCP 原生 HTTP transport 准入结论
+
+- `Packages/IntatisCurlTransport` 是 Intatis 自有的 C/Swift 边界实现；
+  没有复制 curl、BoringSSL 或 zlib 源码。复用形式是 `dependency`：
+  macOS 链接 Apple SDK/系统提供的 libcurl，Linux CLI 链接官方 Swift
+  Static Linux SDK 提供的静态 archive。iOS 不链接该 target。
+- Apple 路径不 vendor 或随 App bundle 复制 Darwin libcurl；release
+  必须用最终 App linkage/bundle inventory 复核这一点。Linux 路径会把
+  实际使用的 object code 合入单文件静态 CLI，因此必须随 CLI 提供完整
+  第三方声明，不能把 SDK 中的库误当成终端用户系统库。
+- Linux 构建制品固定为官方
+  `swift-6.3.3-RELEASE_static-linux-0.1.0` artifact，Swift.org 公布的
+  archive SHA-256 为
+  `87c3eaf908e67c0e13a84367119e12273cec1d2cd3d81f7d74bb36722d6b607b`；
+  提取后的 SPDX SBOM SHA-256 为
+  `bef245e3aa47c9623dfc7e5d4df01510f283722b6e8d9a80a38cc3c1cb4040a0`。
+  `libcurl.pc` 的静态闭包是
+  `-lcurl -lssl -lcrypto -lz`，两套 architecture archive 的逐文件
+  hash 见 `ThirdPartyNotices/MCPHTTPTransport.md`。
+- curl 的 SBOM 条目为 `8.15.0`/`MIT`，但 SDK 自带
+  `curlver.h`/`libcurl.pc` 标成 `8.15.0-DEV`，后者文件头使用精确
+  SPDX `curl`。准入采用更保守的 curl 原始 `COPYING` 条款，不能只按
+  泛化 MIT 处理。zlib 由 SBOM 与 header 共同确认是 1.3.1 / `Zlib`。
+- SDK 的 `libssl.a` / `libcrypto.a` headers 明确是 BoringSSL，SBOM
+  许可证表达式为 `OpenSSL AND ISC AND MIT`，但 `versionInfo` 为空。
+  该 SBOM 缺项已通过 Swift 官方 Static Linux SDK 构建 recipe
+  `swiftlang/swift-docker@cdfdf30bef6f1529ad34662274db00781d87ab61`
+  与双架构 header 字节身份交叉校验收口：curl 固定
+  `curl-8_15_0` / `cfbfb65047e85e6b08af65fe9cdbcf68e9ad496a`，
+  BoringSSL 固定
+  `817ab07ebb53da35afea409ab9328f578492832d`，zlib 固定 `v1.3.1` /
+  `51b7f2abdade71cd9bb0e7a373ef2610ec6f9daf`。SDK 中 `aarch64` 与
+  `x86_64` 的 `curlver.h`、`openssl/base.h`、`zlib.h` Git blob
+  分别与上述固定源码完全一致；详细 blob ID 见
+  `ThirdPartyNotices/MCPHTTPTransport.md`。
+- Swift Crypto 4.5.1 的 BoringSSL commit
+  `0226f30467f540a3f62ef48d453f93927da199b6` 是另一套依赖，不能与
+  Static Linux SDK 的
+  `817ab07ebb53da35afea409ab9328f578492832d` 相互冒充。官方 artifact
+  checksum、SBOM hash、Swift recipe/source pins、headers/pkg-config
+  与逐 architecture archive hash 共同构成可复验 provenance；SDK 未
+  提供单 archive 的 signed source attestation 或 reproducible-build
+  声明，文档不能把 header identity 夸大为 `.a` 的逐位复现证明。
+  Linux 分发仍须附带 OpenSSL、Original SSLeay、ISC 与 fiat-crypto
+  MIT 的完整组合文本及必要 acknowledgement。
+- 完整来源、二进制 hash、许可证文本和分发义务位于
+  `ThirdPartyNotices/MCPHTTPTransport.md` 与
+  `ThirdPartyNotices/Licenses/curl-8.15.0-COPYING.txt`、
+  `ThirdPartyNotices/Licenses/zlib-1.3.1-LICENSE.txt` 与
+  `ThirdPartyNotices/Licenses/BoringSSL-817ab07ebb53da35afea409ab9328f578492832d-LICENSE.txt`；
+  根 `NOTICE.md` 已区分 Apple system library、Linux static archive
+  与 Swift Crypto 的另一套 BoringSSL closure。
+- 升级 Swift toolchain/Static Linux SDK、替换 archive、改变 link
+  flags 或新增 TLS/compression backend 时，必须重新下载核验官方
+  checksum、读取完整 SBOM/pkg-config/headers、重算双架构 archive
+  hash、比较许可证/NOTICE、更新上述记录，并重跑双架构静态 build。
+  仅复用旧 notice 或仅看到库名相同不构成升级准入。
+
 ## 上游升级规则
 
 - 每个已采用上游维护一个 pinned commit 和本地 patch/translation 摘要。

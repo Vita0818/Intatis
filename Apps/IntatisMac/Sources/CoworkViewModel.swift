@@ -10,6 +10,7 @@ import IntatisPermission
 import IntatisConversation
 import IntatisAgentKernel
 import IntatisCowork
+import IntatisMCP
 import IntatisTools
 import IntatisSharedUI
 import UniformTypeIdentifiers
@@ -225,6 +226,7 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
     @Published private(set) var projectSettings: CoworkProjectSettings
     @Published var input: String = ""
     @Published private(set) var draftAttachments: [CoworkDraftAttachment] = []
+    @Published private(set) var pendingMCPExternalContextCount = 0
     @Published private(set) var isAcceptingSubmission = false
     @Published private(set) var isWorking = false {
         didSet { refreshRuntimeBusy() }
@@ -311,10 +313,20 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
     }
 
     private let log: EventLog
+    var mcpEventLog: EventLog { log }
+    var mcpWorkspacePaths: [String] {
+        projectSettings.workspaces.map(\.path)
+    }
+    var mcpArtifactStore: ArtifactStore {
+        artifactStore
+    }
     private let sessionNaming: SessionNamingService
     private let artifactStore: ArtifactStore
     private let submittedIntentStore: SubmittedIntentStore
     private let registryBox: ProviderRegistryBox
+    private let mcpSnapshots:
+        (@MainActor @Sendable () async throws
+            -> MCPAgentRequestToolSnapshotSource)?
     private var orchestrator: Orchestrator?
     private var goalRuntime: GoalRuntimeController?
     private var subscription: Task<Void, Never>?
@@ -340,6 +352,10 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
     private var submissionRetryTasks: [SubmissionID: CoworkTaskView] = [:]
     private var restoredSubmissionIDs: Set<SubmissionID> = []
     private var outboxEntries: [SubmissionID: SubmittedIntentOutboxEntry] = [:]
+    private var pendingMCPExternalContexts:
+        [UntrustedExternalContext] = []
+    private var pendingMCPExternalContextAgentID:
+        AgentID?
     private var submissionDrainRunning = false
     private var retryableTasks: [String: CoworkTaskView] = [:]
     private var latestCoworkProjection = CoworkProjection()
@@ -358,7 +374,11 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
          projectSettings: CoworkProjectSettings,
          launchMode: CoworkSessionLaunchMode = .restored,
          sessionStorageWarning: String? = nil,
-         initialWorkspaceAccess: WorkspaceAccessLease? = nil) {
+         initialWorkspaceAccess: WorkspaceAccessLease? = nil,
+         mcpSnapshots:
+            (@MainActor @Sendable () async throws
+                -> MCPAgentRequestToolSnapshotSource)?
+                = nil) {
         self.sessionID = sessionID
         self.log = log
         self.sessionNaming = sessionNaming
@@ -367,6 +387,7 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         self.registryBox = ProviderRegistryBox(
             registry,
             controlPlaneBinding: nil)
+        self.mcpSnapshots = mcpSnapshots
         self.inferenceProfileOptions = inferenceProfileOptions
         self.nextMainInferenceOption = nil
         self.projectSettings = projectSettings
@@ -461,6 +482,8 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         guard !didStop, orchestrator == nil, shutdownTask == nil else { return }
         setPermissionReviewerStatus(.enabling)
         let registryBox = registryBox
+        let makeMCPSnapshots = mcpSnapshots
+        let mcpLog = log
         do {
             let runtime = try Orchestrator.runtime(
                 log: log,
@@ -470,6 +493,47 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                 availableInferenceProfiles: inferenceProfileOptions.map(\.binding),
                 requiresInferenceBindings: true,
                 imageGeneratorFor: { _ in await registryBox.imageToolService() },
+                toolSnapshotProvider:
+                    makeMCPSnapshots.map { makeSource in
+                        {
+                            agent,
+                            capabilityLease,
+                            workspaceLease,
+                            baseRegistry,
+                            isResume,
+                            providerCapabilities,
+                            outputBudget in
+                            let state =
+                                try await MCPDurableSessionState
+                                    .load(from: mcpLog)
+                            guard !state.attachments.isEmpty else {
+                                return nil
+                            }
+                            guard let workspaceLease else {
+                                throw IntatisError.config(
+                                    "MCP dispatch requires an exact workspace lease")
+                            }
+                            let source =
+                                try await makeSource()
+                            return try await source.snapshot(
+                                for: MCPAgentDispatchInput(
+                                    agentID: agent.name,
+                                    capabilityLease:
+                                        capabilityLease,
+                                    workspaceLease:
+                                        workspaceLease,
+                                    baseRegistry:
+                                        baseRegistry,
+                                    activationReason:
+                                        isResume
+                                            ? .resume
+                                            : .send),
+                                providerCapabilities:
+                                    providerCapabilities,
+                                turnResultBudget:
+                                    outputBudget)
+                        }
+                    },
                 sessionNaming: sessionNaming,
                 resolvedInferenceFor: { agent in
                     try await registryBox.resolvedInference(for: agent)
@@ -573,6 +637,130 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                 self.applyCoworkProjection(coworkProjection)
             }
         }
+    }
+
+    func mcpProjectAgents()
+        async throws -> [MCPProductAgentDescriptor]
+    {
+        let projection = latestCoworkProjection
+        let main = AgentID(
+            rawValue: projectSettings.mainAgentName)
+        return projection.capabilityLeaseAgents
+            .compactMap { leaseID, agentID in
+                guard let lease =
+                        projection.capabilityLeases[
+                            leaseID],
+                      projection.agentRoster[
+                        agentID] != nil else {
+                    return nil
+                }
+                let reviewer =
+                    MCPReservedControlPlaneIdentity
+                        .deniesMCP(agentID)
+                let taskSuffix = lease.taskID.map {
+                    " · task \($0.rawValue)"
+                } ?? ""
+                return MCPProductAgentDescriptor(
+                    agentID: agentID,
+                    displayName:
+                        "\(agentID.rawValue)\(taskSuffix)",
+                    parentAgentID:
+                        projection.agentOwners[
+                            agentID],
+                    isWorker:
+                        agentID != main,
+                    isPermissionReviewer:
+                        reviewer,
+                    capabilityLeaseID:
+                        lease.id,
+                    taskID: lease.taskID,
+                    mcpCapabilityCeiling:
+                        reviewer
+                            ? []
+                            : Set(
+                                MCPServerEditorCapabilities
+                                    .all))
+            }
+            .sorted {
+                if $0.agentID != $1.agentID {
+                    return $0.agentID.rawValue
+                        < $1.agentID.rawValue
+                }
+                return $0.capabilityLeaseID.rawValue
+                    < $1.capabilityLeaseID.rawValue
+            }
+    }
+
+    func mcpDispatchInput(
+        for descriptor:
+            MCPProductAgentDescriptor,
+        reason: MCPRuntimeActivationReason
+    ) async throws -> MCPAgentDispatchInput {
+        let projection = latestCoworkProjection
+        guard !didStop,
+              !descriptor.isPermissionReviewer,
+              !MCPReservedControlPlaneIdentity
+                .deniesMCP(
+                    descriptor.agentID),
+              projection.capabilityLeaseAgents[
+                descriptor.capabilityLeaseID]
+                == descriptor.agentID,
+              var capabilityLease =
+                projection.capabilityLeases[
+                    descriptor.capabilityLeaseID],
+              capabilityLease.taskID
+                == descriptor.taskID else {
+            throw IntatisError.permissionDenied(
+                "The selected Cowork Agent capability lease is no longer active.")
+        }
+        let workspaceCandidates =
+            projection.workspaceLeaseAgents
+                .compactMap {
+                    leaseID, agentID
+                    -> WorkspaceLease? in
+                    guard agentID
+                            == descriptor.agentID,
+                          let lease =
+                            projection.workspaceLeases[
+                                leaseID],
+                          lease.taskID
+                            == descriptor.taskID
+                    else {
+                        return nil
+                    }
+                    return lease
+                }
+        guard workspaceCandidates.count == 1,
+              let workspaceLease =
+                workspaceCandidates.first,
+              workspaceLease.rootIdentity?
+                .matchesCurrentDirectory(
+                    rootPath:
+                        workspaceLease.rootPath)
+                == true else {
+            throw IntatisError.permissionDenied(
+                "The selected Cowork Agent does not have one exact live workspace lease.")
+        }
+        let durable =
+            try await MCPDurableSessionState.load(
+                from: log)
+        capabilityLease.mcpGrants =
+            durable.grants(
+                agentID: descriptor.agentID,
+                capabilityLeaseID:
+                    descriptor
+                        .capabilityLeaseID,
+                taskID: descriptor.taskID)
+        return MCPAgentDispatchInput(
+            agentID: descriptor.agentID,
+            capabilityLease:
+                capabilityLease,
+            workspaceLease: workspaceLease,
+            baseRegistry: ToolRegistry.standard(
+                includesTerminal:
+                    PlatformProfile.current
+                        .allowsShell),
+            activationReason: reason)
     }
 
     func stop(reason: String = "Cowork session stopped") async {
@@ -1833,6 +2021,71 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         draftAttachments.removeAll { $0.id == id }
     }
 
+    /// Records one confirmed server-prompt selection and stages its typed
+    /// untrusted content for the next submission to that exact Agent.
+    func acceptMCPPromptInsertion(
+        _ insertion: MCPPromptInsertion
+    ) async throws {
+        guard acceptsNewOperations else {
+            throw IntatisError.config(
+                "The Cowork session is stopping.")
+        }
+        let selectedAgentID =
+            insertion.event.selectedByAgentID
+        if let existing =
+                pendingMCPExternalContextAgentID,
+           let selectedAgentID,
+           existing != selectedAgentID {
+            throw IntatisError.permissionDenied(
+                "External MCP context for different agents cannot be combined in one submission.")
+        }
+        let candidate =
+            pendingMCPExternalContexts
+                + insertion.externalContexts.map {
+                    $0.providerNeutralContext()
+                }
+        try Self.validateMCPExternalContexts(candidate)
+        try await log.append(
+            .mcpPromptInserted(insertion.event))
+        pendingMCPExternalContexts = candidate
+        pendingMCPExternalContextAgentID =
+            pendingMCPExternalContextAgentID
+                ?? selectedAgentID
+        pendingMCPExternalContextCount = candidate.count
+    }
+
+    /// Stages another explicit MCP selection (for example server
+    /// instructions) through the same one-shot user-context boundary.
+    func stageMCPExternalContexts(
+        _ contexts: [MCPUntrustedExternalContext],
+        selectedByAgentID: AgentID? = nil
+    ) throws {
+        if let existing =
+                pendingMCPExternalContextAgentID,
+           let selectedByAgentID,
+           existing != selectedByAgentID {
+            throw IntatisError.permissionDenied(
+                "External MCP context for different agents cannot be combined in one submission.")
+        }
+        let candidate =
+            pendingMCPExternalContexts
+                + contexts.map {
+                    $0.providerNeutralContext()
+                }
+        try Self.validateMCPExternalContexts(candidate)
+        pendingMCPExternalContexts = candidate
+        pendingMCPExternalContextAgentID =
+            pendingMCPExternalContextAgentID
+                ?? selectedByAgentID
+        pendingMCPExternalContextCount = candidate.count
+    }
+
+    func cancelPendingMCPExternalContexts() {
+        pendingMCPExternalContexts.removeAll()
+        pendingMCPExternalContextAgentID = nil
+        pendingMCPExternalContextCount = 0
+    }
+
     func reportAttachmentImportFailure(_ error: Error) {
         guard acceptsNewOperations else { return }
         composerError = IntatisLocalization.format(
@@ -1844,9 +2097,14 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         guard acceptsNewOperations, !isAcceptingSubmission else { return }
         let originalInput = input
         let originalAttachments = draftAttachments
+        let frozenExternalContexts =
+            pendingMCPExternalContexts
+        let frozenExternalContextAgentID =
+            pendingMCPExternalContextAgentID
         let initialParsed: ParsedUserInput
         if originalInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-           !originalAttachments.isEmpty {
+           !originalAttachments.isEmpty
+                || !frozenExternalContexts.isEmpty {
             initialParsed = ParsedUserInput(text: "")
         } else {
             switch GoalInputParser.parse(originalInput) {
@@ -1874,6 +2132,14 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             composerError = Self.presentationMessage(for: error)
             return
         case .send(let text, let target):
+            if let frozenExternalContextAgentID,
+               frozenExternalContextAgentID != target {
+                composerError = IntatisLocalization.format(
+                    "The selected MCP context belongs to @%@, but this message targets @%@.",
+                    frozenExternalContextAgentID.rawValue,
+                    target.rawValue)
+                return
+            }
             let finalParsed: ParsedUserInput
             switch GoalInputParser.parse(text) {
             case .success(let parsed) where parsed.isGoal:
@@ -1908,7 +2174,12 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                 tags: finalParsed.tags.isEmpty ? nil : finalParsed.tags,
                 goal: finalParsed.goal,
                 submissionID: SubmissionID.new(),
-                mainAgentInferenceBinding: frozenMainInferenceBinding)
+                mainAgentInferenceBinding: frozenMainInferenceBinding,
+                turnID: TurnID.new(),
+                untrustedExternalContexts:
+                    frozenExternalContexts.isEmpty
+                        ? nil
+                        : frozenExternalContexts)
             isAcceptingSubmission = true
             let operationID = UUID()
             let operation = Task { @MainActor [weak self] in
@@ -1919,6 +2190,8 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                 }
                 do {
                     let acceptance = try await self.submittedIntentStore.accept(payload: payload)
+                    self.consumeMCPExternalContexts(
+                        frozenExternalContexts)
                     guard let submissionID = payload.submissionID else { return }
                     // Clear only the exact draft that was frozen. Any text the
                     // user typed while persistence ran belongs to the next
@@ -1958,6 +2231,37 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                 }
             }
             activeOperations[operationID] = operation
+        }
+    }
+
+    private func consumeMCPExternalContexts(
+        _ frozen: [UntrustedExternalContext]
+    ) {
+        guard !frozen.isEmpty,
+              pendingMCPExternalContexts
+                .starts(with: frozen) else {
+            return
+        }
+        pendingMCPExternalContexts.removeFirst(
+            frozen.count)
+        if pendingMCPExternalContexts.isEmpty {
+            pendingMCPExternalContextAgentID = nil
+        }
+        pendingMCPExternalContextCount =
+            pendingMCPExternalContexts.count
+    }
+
+    private static func validateMCPExternalContexts(
+        _ contexts: [UntrustedExternalContext]
+    ) throws {
+        guard contexts.count <= 16 else {
+            throw IntatisError.config(
+                "A submission can include at most 16 external MCP context items.")
+        }
+        let encoded = try JSONEncoder().encode(contexts)
+        guard encoded.count <= 512 * 1_024 else {
+            throw IntatisError.config(
+                "External MCP context exceeds the 512 KiB submission limit.")
         }
     }
 
@@ -2669,11 +2973,14 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         request: PermissionRequestPayload
     ) -> PermissionApprovalResolution {
         switch action {
-        case .approve:
+        case .approve, .approveAndRemember:
             return PermissionApprovalResolution(
                 decision: .allow,
-                action: .approve,
-                reason: "Permission approved by user",
+                action: action,
+                reason:
+                    action == .approveAndRemember
+                        ? "Permission approved and exact MCP tool approval remembered by user"
+                        : "Permission approved by user",
                 risk: request.risk,
                 source: .user)
         case .decline:

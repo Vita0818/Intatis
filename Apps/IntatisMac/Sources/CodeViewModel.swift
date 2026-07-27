@@ -9,6 +9,8 @@ import IntatisTools
 import IntatisPermission
 import IntatisConversation
 import IntatisAgentKernel
+import IntatisArtifacts
+import IntatisMCP
 
 private final class CodePermissionWaiter: @unchecked Sendable {
     private let lock = NSLock()
@@ -64,13 +66,22 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
     @Published private(set) var permissionNotice: PermissionResolutionNotice?
     @Published private(set) var latestTurnStats: TurnStatsSnapshot?
     @Published private(set) var composerError: String?
+    @Published private(set) var pendingMCPExternalContextCount = 0
 
     let sessionID: SessionID
     let workspaceName: String
+    var mcpEventLog: EventLog { log }
+    var mcpWorkspacePaths: [String] {
+        [workspaceRoot.path]
+    }
+    var mcpArtifactStore: ArtifactStore {
+        artifactStore
+    }
 
     private let workspaceRoot: URL
     private var workspaceAccess: WorkspaceAccessLease?
     private let log: EventLog
+    private let artifactStore: ArtifactStore
     private let sessionNaming: SessionNamingService
     private let terminal = ProcessTerminalSessionManager()
     private var registry: ProviderRegistry
@@ -80,19 +91,33 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
     private var runningOperation: Task<Void, Never>?
     private var shutdownTask: Task<Void, Never>?
     private var isShutdown = false
+    private var pendingMCPExternalContexts:
+        [UntrustedExternalContext] = []
+    private var pendingMCPExternalContextAgentID:
+        AgentID?
+    private let mcpSnapshots:
+        (@MainActor @Sendable () async throws
+            -> MCPAgentRequestToolSnapshotSource)?
 
     init(sessionID: SessionID,
          workspaceAccess: WorkspaceAccessLease,
          log: EventLog,
+         artifactStore: ArtifactStore,
          sessionNaming: SessionNamingService,
-         registry: ProviderRegistry) {
+         registry: ProviderRegistry,
+         mcpSnapshots:
+            (@MainActor @Sendable () async throws
+                -> MCPAgentRequestToolSnapshotSource)?
+                = nil) {
         self.sessionID = sessionID
         self.workspaceAccess = workspaceAccess
         self.workspaceRoot = workspaceAccess.canonicalURL
         self.workspaceName = workspaceAccess.canonicalURL.lastPathComponent
         self.log = log
+        self.artifactStore = artifactStore
         self.sessionNaming = sessionNaming
         self.registry = registry
+        self.mcpSnapshots = mcpSnapshots
     }
 
     deinit {
@@ -145,6 +170,57 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
         Task { await terminal.terminateAll(reason: "Code turn cancelled") }
     }
 
+    /// Records one confirmed server-prompt selection, then stages its typed
+    /// untrusted contexts for exactly the next Code submission.
+    func acceptMCPPromptInsertion(
+        _ insertion: MCPPromptInsertion
+    ) async throws {
+        let codeAgentID =
+            AgentID(rawValue: "Coder")
+        guard insertion.event.selectedByAgentID == nil
+                || insertion.event.selectedByAgentID
+                    == codeAgentID else {
+            throw IntatisError.permissionDenied(
+                "The selected MCP prompt belongs to a different agent.")
+        }
+        let candidate =
+            pendingMCPExternalContexts
+                + insertion.externalContexts.map {
+                    $0.providerNeutralContext()
+                }
+        try Self.validateMCPExternalContexts(candidate)
+        try await log.append(
+            .mcpPromptInserted(insertion.event))
+        pendingMCPExternalContexts = candidate
+        pendingMCPExternalContextAgentID =
+            codeAgentID
+        pendingMCPExternalContextCount = candidate.count
+    }
+
+    /// Used by other explicit user selections, including server instructions.
+    /// The context remains data-only and is consumed only after the next user
+    /// message has been durably appended.
+    func stageMCPExternalContexts(
+        _ contexts: [MCPUntrustedExternalContext]
+    ) throws {
+        let candidate =
+            pendingMCPExternalContexts
+                + contexts.map {
+                    $0.providerNeutralContext()
+                }
+        try Self.validateMCPExternalContexts(candidate)
+        pendingMCPExternalContexts = candidate
+        pendingMCPExternalContextAgentID =
+            AgentID(rawValue: "Coder")
+        pendingMCPExternalContextCount = candidate.count
+    }
+
+    func cancelPendingMCPExternalContexts() {
+        pendingMCPExternalContexts.removeAll()
+        pendingMCPExternalContextAgentID = nil
+        pendingMCPExternalContextCount = 0
+    }
+
     /// Permanently stops this session runtime and waits until the active turn,
     /// permission waiters, projection subscription, and workspace scope have
     /// all settled. Page/session switching must never call this method.
@@ -189,8 +265,17 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
     func send() {
         guard !isShutdown, !isWorking else { return }
         let originalInput = input
+        let frozenExternalContexts =
+            pendingMCPExternalContexts
         let parsed: ParsedUserInput
-        switch GoalInputParser.parse(originalInput) {
+        if originalInput
+            .trimmingCharacters(
+                in: .whitespacesAndNewlines)
+            .isEmpty,
+           !frozenExternalContexts.isEmpty {
+            parsed = ParsedUserInput(text: "")
+        } else {
+            switch GoalInputParser.parse(originalInput) {
         case .success(let value):
             parsed = value
         case .failure(.empty):
@@ -198,7 +283,17 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
         case .failure(let error):
             composerError = error.message
             return
+            }
         }
+        var durableUserMessage =
+            parsed.userMessagePayload
+        durableUserMessage.submissionID =
+            SubmissionID.new()
+        durableUserMessage.turnID = TurnID.new()
+        durableUserMessage.untrustedExternalContexts =
+            frozenExternalContexts.isEmpty
+                ? nil
+                : frozenExternalContexts
         input = ""
         isWorking = true
         composerError = nil
@@ -212,13 +307,50 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
                                   workspaceRoot: self.workspaceRoot,
                                   model: model,
                                   profile: .reviewed)
+                var capabilityLease =
+                    CapabilityLease.coordinator(
+                        workspaceAccess: .readWrite)
+                capabilityLease.id = CapabilityLeaseID(
+                    rawValue:
+                        "clease_code_\(self.sessionID.rawValue)")
+                capabilityLease.expiresAtTaskCompletion =
+                    false
+                let durableMCP =
+                    try await MCPDurableSessionState.load(
+                        from: self.log)
+                capabilityLease.mcpGrants =
+                    durableMCP.grants(
+                        agentID: agent.name,
+                        capabilityLeaseID:
+                            capabilityLease.id)
                 let workspaceLease = WorkspaceLease(
+                    id: WorkspaceLeaseID(
+                        rawValue:
+                            "wlease_code_\(self.sessionID.rawValue)"),
+                    workspaceID: WorkspaceID(
+                        rawValue:
+                            "workspace_code_\(self.sessionID.rawValue)"),
                     rootPath: self.workspaceRoot.path,
                     access: .readWrite)
                 let allowsShell = PlatformProfile.current.allowsShell
+                let baseRegistry =
+                    ToolRegistry.standard(
+                        includesTerminal: allowsShell)
                 let runtime = AgentRuntime.code(
-                    registry: .standard(includesTerminal: allowsShell),
+                    registry: baseRegistry,
                     allowsShell: allowsShell)
+                let mcpSource:
+                    MCPAgentRequestToolSnapshotSource?
+                if durableMCP.attachments.isEmpty {
+                    mcpSource = nil
+                } else {
+                    guard let makeSource =
+                            self.mcpSnapshots else {
+                        throw IntatisError.config(
+                            "This Code session has MCP attachments, but its process-owned MCP runtime is unavailable.")
+                    }
+                    mcpSource = try await makeSource()
+                }
                 let loop = runtime.makeLoop(
                     log: self.log,
                     provider: provider,
@@ -227,9 +359,42 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
                     terminal: self.terminal,
                     imageGenerator: ProviderImageGenerationToolService(registry: self.registry),
                     sessionNaming: self.sessionNaming,
-                    workspaceLease: workspaceLease)
+                    capabilityLease: capabilityLease,
+                    workspaceLease: workspaceLease,
+                    toolSnapshotProvider:
+                        mcpSource.map { source in
+                            {
+                                providerCapabilities,
+                                outputBudget in
+                                try await source.snapshot(
+                                    for: MCPAgentDispatchInput(
+                                        agentID:
+                                            agent.name,
+                                        capabilityLease:
+                                            capabilityLease,
+                                        workspaceLease:
+                                            workspaceLease,
+                                        baseRegistry:
+                                            baseRegistry,
+                                        activationReason:
+                                            .send),
+                                    providerCapabilities:
+                                        providerCapabilities,
+                                    turnResultBudget:
+                                        outputBudget)
+                            }
+                        })
+                try await self.log.append(
+                    .userMessage(durableUserMessage))
+                self.consumeMCPExternalContexts(
+                    frozenExternalContexts)
                 didEnterAgentLoop = true
-                try await loop.send(parsed.text, userMessage: parsed.userMessagePayload)
+                try await loop.send(
+                    parsed.text,
+                    userMessage: durableUserMessage,
+                    recordUserMessage: false,
+                    submissionID:
+                        durableUserMessage.submissionID)
             } catch {
                 let isInterruption = error is AgentTurnInterruptedError
                     || IntatisCancellation.isCurrentTaskCancellation(error)
@@ -244,6 +409,112 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
             self.runningOperation = nil
         }
         runningOperation = operation
+    }
+
+    private func consumeMCPExternalContexts(
+        _ frozen: [UntrustedExternalContext]
+    ) {
+        guard !frozen.isEmpty,
+              pendingMCPExternalContexts
+                .starts(with: frozen) else {
+            return
+        }
+        pendingMCPExternalContexts.removeFirst(
+            frozen.count)
+        if pendingMCPExternalContexts.isEmpty {
+            pendingMCPExternalContextAgentID = nil
+        }
+        pendingMCPExternalContextCount =
+            pendingMCPExternalContexts.count
+    }
+
+    private static func validateMCPExternalContexts(
+        _ contexts: [UntrustedExternalContext]
+    ) throws {
+        guard contexts.count <= 16 else {
+            throw IntatisError.config(
+                "A submission can include at most 16 external MCP context items.")
+        }
+        let encoded = try JSONEncoder().encode(contexts)
+        guard encoded.count <= 512 * 1_024 else {
+            throw IntatisError.config(
+                "External MCP context exceeds the 512 KiB submission limit.")
+        }
+    }
+
+    func mcpProjectAgents()
+        async throws -> [MCPProductAgentDescriptor]
+    {
+        let agentID = AgentID(rawValue: "Coder")
+        return [
+            MCPProductAgentDescriptor(
+                agentID: agentID,
+                displayName: "Coder",
+                isWorker: false,
+                capabilityLeaseID:
+                    CapabilityLeaseID(
+                        rawValue:
+                            "clease_code_\(sessionID.rawValue)"),
+                mcpCapabilityCeiling:
+                    Set(
+                        MCPServerEditorCapabilities
+                            .all)),
+        ]
+    }
+
+    func mcpDispatchInput(
+        for descriptor:
+            MCPProductAgentDescriptor,
+        reason: MCPRuntimeActivationReason
+    ) async throws -> MCPAgentDispatchInput {
+        guard descriptor.agentID
+                == AgentID(rawValue: "Coder"),
+              descriptor.capabilityLeaseID
+                == CapabilityLeaseID(
+                    rawValue:
+                        "clease_code_\(sessionID.rawValue)"),
+              descriptor.taskID == nil,
+              workspaceAccess != nil,
+              !isShutdown else {
+            throw IntatisError.permissionDenied(
+                "The Code MCP Agent or workspace lease is no longer active.")
+        }
+        var capabilityLease =
+            CapabilityLease.coordinator(
+                workspaceAccess: .readWrite)
+        capabilityLease.id =
+            descriptor.capabilityLeaseID
+        capabilityLease.expiresAtTaskCompletion =
+            false
+        let durable =
+            try await MCPDurableSessionState.load(
+                from: log)
+        capabilityLease.mcpGrants =
+            durable.grants(
+                agentID: descriptor.agentID,
+                capabilityLeaseID:
+                    descriptor
+                        .capabilityLeaseID,
+                taskID: descriptor.taskID)
+        let workspaceLease = WorkspaceLease(
+            id: WorkspaceLeaseID(
+                rawValue:
+                    "wlease_code_\(sessionID.rawValue)"),
+            workspaceID: WorkspaceID(
+                rawValue:
+                    "workspace_code_\(sessionID.rawValue)"),
+            rootPath: workspaceRoot.path,
+            access: .readWrite)
+        return MCPAgentDispatchInput(
+            agentID: descriptor.agentID,
+            capabilityLease:
+                capabilityLease,
+            workspaceLease: workspaceLease,
+            baseRegistry: ToolRegistry.standard(
+                includesTerminal:
+                    PlatformProfile.current
+                        .allowsShell),
+            activationReason: reason)
     }
 
     // MARK: PermissionResponder
@@ -345,11 +616,14 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
         request: PermissionRequestPayload
     ) -> PermissionApprovalResolution {
         switch action {
-        case .approve:
+        case .approve, .approveAndRemember:
             return PermissionApprovalResolution(
                 decision: .allow,
-                action: .approve,
-                reason: "Permission approved by user",
+                action: action,
+                reason:
+                    action == .approveAndRemember
+                        ? "Permission approved and exact MCP tool approval remembered by user"
+                        : "Permission approved by user",
                 risk: request.risk,
                 source: .user)
         case .decline:

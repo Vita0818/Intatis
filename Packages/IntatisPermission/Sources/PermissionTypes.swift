@@ -88,10 +88,17 @@ public struct PermissionOutcome: Equatable, Sendable {
 public struct PermissionEngineDecision: Equatable, Sendable {
     public let gate: GateResult
     public let outcome: PermissionOutcome
+    /// `true` only when the in-engine model reviewer actually inspected this
+    /// call. Downstream policy overlays may add an interaction after an allow,
+    /// but must never reinterpret or bypass a reviewer deny/ask.
+    public let reviewerConsulted: Bool
 
-    public init(gate: GateResult, outcome: PermissionOutcome) {
+    public init(gate: GateResult,
+                outcome: PermissionOutcome,
+                reviewerConsulted: Bool = false) {
         self.gate = gate
         self.outcome = outcome
+        self.reviewerConsulted = reviewerConsulted
     }
 }
 

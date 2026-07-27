@@ -130,6 +130,7 @@ struct IntatisMacRootView: View {
             }
         }
         .navigationTitle("")
+        .mcpInteractionHost(env.mcp.interactionCenter)
         .task {
             guard !didInit else { return }
             didInit = true
@@ -204,6 +205,11 @@ struct IntatisMacRootView: View {
                 vm: vm,
                 sessionTitle: sessionTitle(kind: .code, sessionID: vm.sessionID),
                 catalog: env.providerCatalog,
+                mcpProjectSettingsHost:
+                    env.mcpProjectSettingsHost(for: vm),
+                mcpContentHost:
+                    env.mcpConversationContentHost(
+                        for: vm),
                 onSelectModel: env.selectProviderModel(providerID:modelID:variantID:),
                 onShowSessions: showCodeSessions,
                 onNewSession: startNewCodeSession,
@@ -235,6 +241,11 @@ struct IntatisMacRootView: View {
                 vm: vm,
                 sessionTitle: sessionTitle(kind: .cowork, sessionID: vm.sessionID),
                 catalog: env.providerCatalog,
+                mcpProjectSettingsHost:
+                    env.mcpProjectSettingsHost(for: vm),
+                mcpContentHost:
+                    env.mcpConversationContentHost(
+                        for: vm),
                 onShowSessions: showCoworkSessions,
                 onNewSession: startNewCoworkSession,
                 onSessionDidBecomeReady: refreshCoworkSessions,

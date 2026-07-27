@@ -158,6 +158,23 @@ private func validatedToolCallArguments(_ arguments: String,
 extension OpenAIWireProvider: ToolCallingProvider {
 
     public func stream(_ request: AgentRequest) -> AsyncThrowingStream<AgentChunk, Error> {
+        if request.requiresResponsesAPI {
+            guard toolCallingCapabilities.supportsToolSearch else {
+                return AsyncThrowingStream { continuation in
+                    continuation.finish(
+                        throwing:
+                            ToolCallingProviderCapabilityError
+                                .toolSearchUnsupported)
+                }
+            }
+            return streamResponses(request)
+        }
+        return streamChatCompletions(request)
+    }
+
+    private func streamChatCompletions(
+        _ request: AgentRequest
+    ) -> AsyncThrowingStream<AgentChunk, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
@@ -302,7 +319,216 @@ extension OpenAIWireProvider: ToolCallingProvider {
         }
     }
 
+    private func streamResponses(
+        _ request: AgentRequest
+    ) -> AsyncThrowingStream<AgentChunk, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    let urlRequest = try buildResponsesAgentRequest(request)
+                    var attempt = 1
+
+                    while true {
+                        let parser = SSEParser()
+                        var completed = false
+                        var receivedResponseBytes = false
+                        var emittedText = ""
+
+                        func handle(_ payload: String) throws -> Bool {
+                            if payload == "[DONE]" {
+                                guard completed else {
+                                    throw ProviderErrorFormatting
+                                        .incompleteStream(
+                                            operation:
+                                                "Responses tool-calling streaming request")
+                                }
+                                continuation.finish()
+                                return true
+                            }
+                            let trimmed = payload.trimmingCharacters(
+                                in: .whitespacesAndNewlines)
+                            guard !trimmed.isEmpty,
+                                  let data = trimmed.data(using: .utf8)
+                            else {
+                                return false
+                            }
+                            if let providerError =
+                                ProviderErrorFormatting
+                                    .streamErrorPayload(data) {
+                                throw providerError
+                            }
+                            let value: JSONValue
+                            do {
+                                value = try JSONDecoder().decode(
+                                    JSONValue.self,
+                                    from: data)
+                            } catch {
+                                throw ProviderErrorFormatting
+                                    .invalidStreamPayload(
+                                        trimmed,
+                                        underlying: error)
+                            }
+                            guard case .object(let event) = value,
+                                  case .string(let eventType)? =
+                                    event["type"] else {
+                                throw IntatisError.decoding(
+                                    "Responses stream event is missing its type.")
+                            }
+
+                            switch eventType {
+                            case "response.output_text.delta":
+                                if case .string(let delta)? = event["delta"],
+                                   !delta.isEmpty {
+                                    emittedText += delta
+                                    continuation.yield(.textDelta(delta))
+                                }
+
+                            case "response.output_item.done":
+                                guard case .object(let item)? =
+                                        event["item"],
+                                      case .string(let itemType)? =
+                                        item["type"] else {
+                                    throw IntatisError.decoding(
+                                        "Responses output_item.done is missing a typed item.")
+                                }
+                                switch itemType {
+                                case "function_call":
+                                    continuation.yield(.toolCalls([
+                                        try Self.responsesFunctionCall(
+                                            item),
+                                    ]))
+                                case "tool_search_call":
+                                    continuation.yield(.toolCalls([
+                                        try Self.responsesToolSearchCall(
+                                            item),
+                                    ]))
+                                case "message":
+                                    let fullText =
+                                        Self.responsesMessageText(item)
+                                    if !fullText.isEmpty,
+                                       fullText.hasPrefix(emittedText) {
+                                        let suffix = String(
+                                            fullText.dropFirst(
+                                                emittedText.count))
+                                        if !suffix.isEmpty {
+                                            emittedText += suffix
+                                            continuation.yield(
+                                                .textDelta(suffix))
+                                        }
+                                    } else if emittedText.isEmpty,
+                                              !fullText.isEmpty {
+                                        emittedText = fullText
+                                        continuation.yield(
+                                            .textDelta(fullText))
+                                    }
+                                default:
+                                    break
+                                }
+
+                            case "response.completed":
+                                guard case .object(let response)? =
+                                        event["response"],
+                                      case .string(let responseID)? =
+                                        response["id"],
+                                      !responseID.isEmpty else {
+                                    throw IntatisError.decoding(
+                                        "Responses completion is missing its response ID.")
+                                }
+                                if let usage =
+                                    Self.responsesUsage(response) {
+                                    continuation.yield(.usage(usage))
+                                }
+                                continuation.yield(
+                                    .done(finishReason: "completed"))
+                                completed = true
+                                continuation.finish()
+                                return true
+
+                            case "response.failed":
+                                let message =
+                                    Self.responsesFailureMessage(event)
+                                throw IntatisError.provider(
+                                    "Responses request failed. \(message)")
+
+                            case "response.incomplete":
+                                let reason =
+                                    Self.responsesIncompleteReason(event)
+                                throw IntatisError.decoding(
+                                    "Responses request was incomplete: \(reason).")
+
+                            default:
+                                break
+                            }
+                            return false
+                        }
+
+                        do {
+                            for try await chunk in http.stream(urlRequest) {
+                                receivedResponseBytes = true
+                                for payload in parser.consume(chunk) {
+                                    if try handle(payload) { return }
+                                }
+                            }
+                            for payload in parser.flush() {
+                                if try handle(payload) { return }
+                            }
+                            guard completed else {
+                                continuation.finish(
+                                    throwing: ProviderErrorFormatting
+                                        .incompleteStream(
+                                            operation:
+                                                "Responses tool-calling streaming request"))
+                                return
+                            }
+                            continuation.finish()
+                            return
+                        } catch {
+                            if ProviderRuntime.shouldRetry(
+                                error: error,
+                                attempt: attempt,
+                                policy: runtimePolicy,
+                                receivedResponseBytes:
+                                    receivedResponseBytes) {
+                                attempt += 1
+                                try await ProviderRuntime.sleepBeforeRetry(
+                                    nextAttempt: attempt,
+                                    policy: runtimePolicy,
+                                    retryHint: ProviderErrorFormatting
+                                        .retryHint(from: error))
+                                continue
+                            }
+                            continuation.finish(
+                                throwing: ProviderRuntime.exhausted(
+                                    error,
+                                    attempts: attempt,
+                                    operation:
+                                        "Responses tool-calling streaming request"))
+                            return
+                        }
+                    }
+                } catch {
+                    continuation.finish(
+                        throwing: ProviderErrorFormatting.transport(error))
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
     func buildAgentRequest(_ request: AgentRequest) throws -> URLRequest {
+        if request.requiresResponsesAPI {
+            guard toolCallingCapabilities.supportsToolSearch else {
+                throw ToolCallingProviderCapabilityError
+                    .toolSearchUnsupported
+            }
+            return try buildResponsesAgentRequest(request)
+        }
+        return try buildChatCompletionsAgentRequest(request)
+    }
+
+    private func buildChatCompletionsAgentRequest(
+        _ request: AgentRequest
+    ) throws -> URLRequest {
         var root = Self.configuredRequestBody(endpoint: endpoint, model: request.model)
         root["model"] = .string(request.model.rawValue)
         root["messages"] = .array(request.messages.map(Self.messageJSON))
@@ -310,6 +536,9 @@ extension OpenAIWireProvider: ToolCallingProvider {
         root["n"] = .number(1)
         if !request.tools.isEmpty {
             root["tools"] = .array(request.tools.map(Self.toolJSON))
+        }
+        if let parallelToolCalls = request.parallelToolCalls {
+            root["parallel_tool_calls"] = .bool(parallelToolCalls)
         }
         if let t = request.temperature {
             root["temperature"] = .number(t)
@@ -338,8 +567,86 @@ extension OpenAIWireProvider: ToolCallingProvider {
         r.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         r.setValue(ProviderAuthorization.bearerHeaderValue(apiKey: apiKey),
                    forHTTPHeaderField: "Authorization")
-        r.httpBody = try JSONEncoder().encode(JSONValue.object(root))
+        r.httpBody = try Self.encodeRequestBody(root)
         return r
+    }
+
+    private func buildResponsesAgentRequest(
+        _ request: AgentRequest
+    ) throws -> URLRequest {
+        var root = Self.configuredRequestBody(
+            endpoint: endpoint,
+            model: request.model)
+        let instructions = request.messages
+            .filter { $0.role == .system }
+            .compactMap(\.content)
+            .joined(separator: "\n\n")
+        let input = request.effectiveInputItems.compactMap {
+            Self.responsesInputJSON($0)
+        }
+
+        root["model"] = .string(request.model.rawValue)
+        if instructions.isEmpty {
+            root.removeValue(forKey: "instructions")
+        } else {
+            root["instructions"] = .string(instructions)
+        }
+        root["input"] = .array(input)
+        root["stream"] = .bool(true)
+        root["store"] = .bool(false)
+        root["tool_choice"] = .string("auto")
+        // Responses requires the switch even when no individual tool advertises
+        // parallel execution. The host still serializes non-parallel tools.
+        root["parallel_tool_calls"] = .bool(
+            request.parallelToolCalls ?? false)
+        root.removeValue(forKey: "messages")
+        root.removeValue(forKey: "n")
+
+        if request.tools.isEmpty {
+            root.removeValue(forKey: "tools")
+        } else {
+            root["tools"] = .array(
+                request.tools.map(Self.responsesToolJSON))
+        }
+        if let temperature = request.temperature {
+            root["temperature"] = .number(temperature)
+        }
+        if let effort = request.reasoningEffort {
+            root["reasoning"] = .object([
+                "effort": .string(effort.rawValue),
+            ])
+            root.removeValue(forKey: "reasoning_effort")
+        }
+        if let maxOutputTokens = request.maxOutputTokens {
+            for key in Array(root.keys)
+            where Self.isOutputTokenCeilingKey(key) {
+                root.removeValue(forKey: key)
+            }
+            root["max_output_tokens"] = .number(
+                Double(maxOutputTokens))
+        }
+        if request.includeUsage {
+            root["stream_options"] = .object([
+                "include_usage": .bool(true),
+            ])
+        }
+
+        var urlRequest = URLRequest(
+            url: try endpoint.validatedResponsesURL(
+                operation: "Responses tool-calling streaming request"))
+        ProviderRuntime.apply(runtimePolicy, to: &urlRequest)
+        urlRequest.httpMethod = "POST"
+        urlRequest.setValue(
+            "application/json",
+            forHTTPHeaderField: "Content-Type")
+        urlRequest.setValue(
+            "text/event-stream",
+            forHTTPHeaderField: "Accept")
+        urlRequest.setValue(
+            ProviderAuthorization.bearerHeaderValue(apiKey: apiKey),
+            forHTTPHeaderField: "Authorization")
+        urlRequest.httpBody = try Self.encodeRequestBody(root)
+        return urlRequest
     }
 
     private static func isOutputTokenCeilingKey(_ rawKey: String) -> Bool {
@@ -353,6 +660,279 @@ extension OpenAIWireProvider: ToolCallingProvider {
             "maxoutputtokens",
             "maxnewtokens",
         ].contains(normalized)
+    }
+
+    static func responsesInputJSON(
+        _ item: AgentInputItem
+    ) -> JSONValue? {
+        switch item {
+        case .message(let role, let content, let images):
+            // Responses carries trusted system instructions outside `input`.
+            guard role != .system else { return nil }
+            let textType = role == .assistant
+                ? "output_text"
+                : "input_text"
+            var parts: [JSONValue] = []
+            if let content, !content.isEmpty {
+                parts.append(.object([
+                    "type": .string(textType),
+                    "text": .string(content),
+                ]))
+            }
+            if role == .user {
+                parts.append(contentsOf: images.map {
+                    .object([
+                        "type": .string("input_image"),
+                        "image_url": .string($0.url),
+                    ])
+                })
+            }
+            guard !parts.isEmpty else { return nil }
+            return .object([
+                "type": .string("message"),
+                "role": .string(role.rawValue),
+                "content": .array(parts),
+            ])
+
+        case .functionCall(let call):
+            let wireName = responsesWireFunctionName(call)
+            var object: [String: JSONValue] = [
+                "type": .string("function_call"),
+                "call_id": .string(call.id),
+                "name": .string(wireName),
+                "arguments": .string(call.arguments),
+            ]
+            if let namespace = call.namespace {
+                object["namespace"] = .string(namespace)
+            }
+            return .object(object)
+
+        case .functionCallOutput(let callID, let output):
+            return .object([
+                "type": .string("function_call_output"),
+                "call_id": .string(callID),
+                "output": .string(output),
+            ])
+
+        case .toolSearchCall(
+            let callID,
+            let status,
+            let execution,
+            let arguments):
+            var object: [String: JSONValue] = [
+                "type": .string("tool_search_call"),
+                "call_id": .string(callID),
+                "execution": .string(execution),
+                "arguments": arguments,
+            ]
+            if let status {
+                object["status"] = .string(status)
+            }
+            return .object(object)
+
+        case .toolSearchOutput(
+            let callID,
+            let status,
+            let execution,
+            let tools):
+            return .object([
+                "type": .string("tool_search_output"),
+                "call_id": .string(callID),
+                "status": .string(status),
+                "execution": .string(execution),
+                "tools": .array(tools),
+            ])
+        }
+    }
+
+    static func responsesToolJSON(_ tool: ToolSpec) -> JSONValue {
+        switch tool.kind {
+        case .function:
+            return .object([
+                "type": .string("function"),
+                "name": .string(tool.name),
+                "description": .string(tool.description),
+                "parameters": tool.parameters,
+            ].merging(functionOptionalFields(tool)) {
+                _, replacement in replacement
+            })
+        case .namespace, .toolSearch:
+            // These two shapes are already Responses-native.
+            return toolJSON(tool)
+        }
+    }
+
+    private static func responsesWireFunctionName(
+        _ call: ToolCall
+    ) -> String {
+        guard let namespace = call.namespace,
+              call.name.hasPrefix(namespace) else {
+            return call.name
+        }
+        let child = String(call.name.dropFirst(namespace.count))
+        return child.isEmpty ? call.name : child
+    }
+
+    private static func responsesFunctionCall(
+        _ item: [String: JSONValue]
+    ) throws -> ToolCall {
+        guard case .string(let callID)? = item["call_id"],
+              !callID.isEmpty,
+              case .string(let wireName)? = item["name"],
+              !wireName.isEmpty,
+              case .string(let arguments)? = item["arguments"] else {
+            throw ProviderErrorFormatting.invalidToolCallStream(
+                "Responses function_call omitted call_id, name, or arguments.")
+        }
+        let namespace: String?
+        if case .string(let value)? = item["namespace"],
+           !value.isEmpty {
+            namespace = value
+        } else {
+            namespace = nil
+        }
+        let routingName = namespace.map { $0 + wireName } ?? wireName
+        try validateResponsesArgumentObject(
+            arguments,
+            callID: callID,
+            kind: "function_call")
+        return ToolCall(
+            id: callID,
+            name: routingName,
+            arguments: arguments,
+            namespace: namespace)
+    }
+
+    private static func responsesToolSearchCall(
+        _ item: [String: JSONValue]
+    ) throws -> ToolCall {
+        guard case .string(let callID)? = item["call_id"],
+              !callID.isEmpty,
+              let arguments = item["arguments"] else {
+            throw ProviderErrorFormatting.invalidToolCallStream(
+                "Responses tool_search_call omitted call_id or arguments.")
+        }
+        guard case .object = arguments else {
+            throw ProviderErrorFormatting.invalidToolCallStream(
+                "Responses tool_search_call arguments were not a JSON object.")
+        }
+        let data = try JSONEncoder().encode(arguments)
+        guard let argumentString = String(
+            data: data,
+            encoding: .utf8) else {
+            throw ProviderErrorFormatting.invalidToolCallStream(
+                "Responses tool_search_call arguments were not UTF-8.")
+        }
+        let status: String?
+        if case .string(let value)? = item["status"] {
+            status = value
+        } else {
+            status = nil
+        }
+        let execution: String
+        if case .string(let value)? = item["execution"],
+           !value.isEmpty {
+            execution = value
+        } else {
+            execution = "client"
+        }
+        return ToolCall(
+            id: callID,
+            name: "tool_search",
+            arguments: argumentString,
+            kind: .toolSearch,
+            status: status,
+            execution: execution)
+    }
+
+    private static func validateResponsesArgumentObject(
+        _ arguments: String,
+        callID: String,
+        kind: String
+    ) throws {
+        guard let data = arguments.data(using: .utf8),
+              let value = try? JSONDecoder().decode(
+                  JSONValue.self,
+                  from: data),
+              case .object = value else {
+            throw ProviderErrorFormatting.invalidToolCallStream(
+                "Responses \(kind) \(callID) arguments were not a JSON object.")
+        }
+    }
+
+    private static func responsesMessageText(
+        _ item: [String: JSONValue]
+    ) -> String {
+        guard case .array(let content)? = item["content"] else {
+            return ""
+        }
+        return content.compactMap { part -> String? in
+            guard case .object(let object) = part,
+                  case .string(let type)? = object["type"],
+                  type == "output_text",
+                  case .string(let text)? = object["text"] else {
+                return nil
+            }
+            return text
+        }.joined()
+    }
+
+    private static func responsesUsage(
+        _ response: [String: JSONValue]
+    ) -> Usage? {
+        guard case .object(let usage)? = response["usage"] else {
+            return nil
+        }
+        func integer(_ key: String) -> Int? {
+            guard case .number(let value)? = usage[key],
+                  value.isFinite else {
+                return nil
+            }
+            return Int(value)
+        }
+        var cachedTokens: Int?
+        if case .object(let details)? =
+                usage["input_tokens_details"],
+           case .number(let value)? = details["cached_tokens"],
+           value.isFinite {
+            cachedTokens = Int(value)
+        }
+        return Usage(
+            promptTokens: integer("input_tokens"),
+            cachedPromptTokens: cachedTokens,
+            completionTokens: integer("output_tokens"),
+            totalTokens: integer("total_tokens"))
+    }
+
+    private static func responsesFailureMessage(
+        _ event: [String: JSONValue]
+    ) -> String {
+        guard case .object(let response)? = event["response"],
+              case .object(let error)? = response["error"] else {
+            return "The provider did not include an error message."
+        }
+        if case .string(let message)? = error["message"],
+           !message.isEmpty {
+            return PermissionReviewTextSanitizer.sanitizeDiagnostic(
+                message,
+                maxCharacters: 360).text
+        }
+        return "The provider did not include an error message."
+    }
+
+    private static func responsesIncompleteReason(
+        _ event: [String: JSONValue]
+    ) -> String {
+        guard case .object(let response)? = event["response"],
+              case .object(let details)? =
+                response["incomplete_details"],
+              case .string(let reason)? = details["reason"],
+              !reason.isEmpty else {
+            return "unknown"
+        }
+        return PermissionReviewTextSanitizer.sanitizeDiagnostic(
+            reason,
+            maxCharacters: 160).text
     }
 
     static func messageJSON(_ m: AgentMessage) -> JSONValue {
@@ -390,14 +970,62 @@ extension OpenAIWireProvider: ToolCallingProvider {
         return .object(obj)
     }
 
-    static func toolJSON(_ t: ToolSpec) -> JSONValue {
+    static func toolJSON(_ tool: ToolSpec) -> JSONValue {
+        switch tool.kind {
+        case .function:
+            return .object([
+                "type": .string("function"),
+                "function": functionToolJSON(tool),
+            ])
+        case .namespace:
+            return .object([
+                "type": .string("namespace"),
+                "name": .string(tool.name),
+                "description": .string(tool.description),
+                "tools": .array(tool.namespaceTools.map { nested in
+                    .object([
+                        "type": .string("function"),
+                        "name": .string(nested.name),
+                        "description": .string(nested.description),
+                        "parameters": nested.parameters,
+                    ].merging(functionOptionalFields(nested)) {
+                        _, replacement in replacement
+                    })
+                }),
+            ])
+        case .toolSearch:
+            return .object([
+                "type": .string("tool_search"),
+                "execution": .string(tool.execution ?? "client"),
+                "description": .string(tool.description),
+                "parameters": tool.parameters,
+            ])
+        }
+    }
+
+    private static func functionToolJSON(_ tool: ToolSpec) -> JSONValue {
         .object([
-            "type": .string("function"),
-            "function": .object([
-                "name": .string(t.name),
-                "description": .string(t.description),
-                "parameters": t.parameters,
-            ]),
-        ])
+            "name": .string(tool.name),
+            "description": .string(tool.description),
+            "parameters": tool.parameters,
+        ].merging(functionOptionalFields(tool)) { _, replacement in
+            replacement
+        })
+    }
+
+    private static func functionOptionalFields(
+        _ tool: ToolSpec
+    ) -> [String: JSONValue] {
+        var fields: [String: JSONValue] = [:]
+        if let strict = tool.strict {
+            fields["strict"] = .bool(strict)
+        }
+        if let deferLoading = tool.deferLoading {
+            fields["defer_loading"] = .bool(deferLoading)
+        }
+        if let outputSchema = tool.outputSchema {
+            fields["output_schema"] = outputSchema
+        }
+        return fields
     }
 }

@@ -107,12 +107,19 @@ struct PhaseCPermissionFixtureView: View {
 
     private func resolveManual(_ action: PermissionResponseAction) {
         let permission = manualPermission
-        let decision: PermissionDecision = action == .approve ? .allow : .deny
+        let decision: PermissionDecision =
+            action == .approve
+                || action == .approveAndRemember
+                ? .allow
+                : .deny
         let reason: String
         let failureSource: ExecutionFailureSource?
         switch action {
-        case .approve:
-            reason = "Permission approved by user"
+        case .approve, .approveAndRemember:
+            reason =
+                action == .approveAndRemember
+                    ? "Permission approved and exact MCP tool approval remembered by user"
+                    : "Permission approved by user"
             failureSource = nil
         case .decline:
             reason = "Permission declined by user"

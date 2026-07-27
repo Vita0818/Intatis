@@ -253,6 +253,16 @@ private func withTaskTimeout<T: Sendable>(
 /// agent-to-agent exchange through the Message Bus. An `actor`, so concurrent /
 /// reentrant agent runs serialize safely.
 public actor Orchestrator {
+    public typealias ToolSnapshotProvider =
+        @Sendable (
+            Agent,
+            CapabilityLease,
+            WorkspaceLease?,
+            ToolRegistry,
+            Bool,
+            ToolCallingProviderCapabilities,
+            AgentExternalToolOutputBudget
+        ) async throws -> AgentRequestToolSnapshot?
     public static let mainAgentID = AgentID(rawValue: "main")
     public static let automaticPermissionReviewerID = AgentID(rawValue: "permission-reviewer")
     private static let carryForwardBlockerPrefix = "carry-forward blocked: "
@@ -343,6 +353,8 @@ public actor Orchestrator {
     private let resolvedInferenceFor: (@Sendable (Agent) async throws -> ResolvedInferenceProfile)?
     private let providerFor: @Sendable (Agent) async throws -> ToolCallingProvider
     private let imageGeneratorFor: @Sendable (Agent) async -> ImageGenerationToolService?
+    private let toolSnapshotProvider:
+        ToolSnapshotProvider?
     private let sessionNaming: SessionNamingService?
     private var messageConsumptionAppender: (@Sendable (AgentMessageConsumedPayload) async throws -> Void)?
     private var taskLifecycleEventAppender: (@Sendable (Event) async throws -> Void)?
@@ -375,6 +387,8 @@ public actor Orchestrator {
         availableInferenceProfiles: [AgentInferenceBinding] = [],
         requiresInferenceBindings: Bool = false,
         imageGeneratorFor: @escaping @Sendable (Agent) async -> ImageGenerationToolService? = { _ in nil },
+        toolSnapshotProvider:
+            ToolSnapshotProvider? = nil,
         sessionNaming: SessionNamingService? = nil,
         providerFor: @escaping @Sendable (Agent) async throws -> ToolCallingProvider
     ) throws -> Orchestrator {
@@ -397,6 +411,8 @@ public actor Orchestrator {
             availableInferenceProfiles: availableInferenceProfiles,
             requiresInferenceBindings: requiresInferenceBindings,
             imageGeneratorFor: imageGeneratorFor,
+            toolSnapshotProvider:
+                toolSnapshotProvider,
             sessionNaming: sessionNaming,
             writerLease: writerLease,
             providerFor: providerFor)
@@ -420,6 +436,8 @@ public actor Orchestrator {
         availableInferenceProfiles: [AgentInferenceBinding] = [],
         requiresInferenceBindings: Bool = true,
         imageGeneratorFor: @escaping @Sendable (Agent) async -> ImageGenerationToolService? = { _ in nil },
+        toolSnapshotProvider:
+            ToolSnapshotProvider? = nil,
         sessionNaming: SessionNamingService? = nil,
         resolvedInferenceFor: @escaping @Sendable (Agent) async throws -> ResolvedInferenceProfile
     ) throws -> Orchestrator {
@@ -438,6 +456,8 @@ public actor Orchestrator {
             availableInferenceProfiles: availableInferenceProfiles,
             requiresInferenceBindings: requiresInferenceBindings,
             imageGeneratorFor: imageGeneratorFor,
+            toolSnapshotProvider:
+                toolSnapshotProvider,
             sessionNaming: sessionNaming,
             writerLease: writerLease,
             resolvedInferenceFor: resolvedInferenceFor,
@@ -462,6 +482,8 @@ public actor Orchestrator {
                 availableInferenceProfiles: [AgentInferenceBinding] = [],
                 requiresInferenceBindings: Bool = false,
                 imageGeneratorFor: @escaping @Sendable (Agent) async -> ImageGenerationToolService? = { _ in nil },
+                toolSnapshotProvider:
+                    ToolSnapshotProvider? = nil,
                 sessionNaming: SessionNamingService? = nil,
                 writerLease: EventLogWriterLease? = nil,
                 resolvedInferenceFor: (@Sendable (Agent) async throws -> ResolvedInferenceProfile)? = nil,
@@ -518,6 +540,8 @@ public actor Orchestrator {
         self.resolvedInferenceFor = resolvedInferenceFor
         self.providerFor = providerFor
         self.imageGeneratorFor = imageGeneratorFor
+        self.toolSnapshotProvider =
+            toolSnapshotProvider
         self.sessionNaming = sessionNaming
         self.messageConsumptionAppender = nil
         self.taskLifecycleEventAppender = nil
@@ -6251,8 +6275,19 @@ public actor Orchestrator {
             throw IntatisError.config(
                 "configurationUnresolved: task and agent inference profile revisions differ")
         }
-        let capabilityLease = try capabilityLease(for: agent, taskContract: taskContract)
+        var capabilityLease = try capabilityLease(
+            for: agent,
+            taskContract: taskContract)
         let workspaceLease = try workspaceLease(for: agent, taskContract: taskContract)
+        let contextEvents = try await log.replayChecked()
+        let durableMCP =
+            MCPDurableSessionState.project(contextEvents)
+        capabilityLease.mcpGrants =
+            durableMCP.grants(
+                agentID: agent.name,
+                capabilityLeaseID:
+                    capabilityLease.id,
+                taskID: taskContract?.id)
         let provider = try await resolvedProvider(for: agent)
         let messenger = BusMessenger(from: agent.name, currentTaskID: taskContract?.id, orchestrator: self)
         let manager = OrchestratorManager(
@@ -6286,7 +6321,6 @@ public actor Orchestrator {
             name: agent.name.rawValue, folder: agent.workspaceRoot.path,
             coordinationDepth: agent.coordinationDepth,
             canCoordinate: canCoordinate)
-        let contextEvents = try await log.replayChecked()
         let usesMainConversationHistory =
             agent.name == Self.mainAgentID
             && taskContract?.kind == .root
@@ -6310,6 +6344,32 @@ public actor Orchestrator {
             reasoningEffort: agent.agentInferenceBinding == nil ? reasoningEffort : nil,
             includeUsage: includeUsage || executionPolicy.tokenBudget != nil,
             maxIterations: maxSteps)
+        let requestToolSnapshotProvider:
+            AgentRequestToolSnapshotProvider?
+        let requestCapabilityLease = capabilityLease
+        if let provider = toolSnapshotProvider {
+            let resumesContinuation =
+                taskContract?.continuationRunID != nil
+            requestToolSnapshotProvider = {
+                providerCapabilities,
+                outputBudget in
+                if let snapshot = try await provider(
+                    agent,
+                    requestCapabilityLease,
+                    workspaceLease,
+                    toolRegistry,
+                    resumesContinuation,
+                    providerCapabilities,
+                    outputBudget)
+                {
+                    return snapshot
+                }
+                return AgentRequestToolSnapshot(
+                    registry: toolRegistry)
+            }
+        } else {
+            requestToolSnapshotProvider = nil
+        }
         let loop = runtime.makeLoop(
             log: log,
             provider: provider,
@@ -6345,7 +6405,9 @@ public actor Orchestrator {
             },
             authorizationRevalidator: { [self] authorization in
                 await toolExecutionAuthorizationRevalidationFailure(authorization)
-            }
+            },
+            toolSnapshotProvider:
+                requestToolSnapshotProvider
         )
         let output = try await loop.send(
             input,

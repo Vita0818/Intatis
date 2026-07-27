@@ -88,6 +88,7 @@ private let replHelp = """
   /model [name]             show or switch the model for this session
   /reasoning [level|off]    show or set reasoning (minimal|low|medium|high)
   /verbose [on|off]         expand tool calls & terminal output (default: collapsed)
+  /mcp <command> [options]  manage/connect MCP for the current exact Code session
   /mode <chat|code|cowork>  switch mode
   /clear                    start a fresh session (clears history)
   /config                   show endpoint / model / reasoning
@@ -107,6 +108,16 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
     var reasoning = config.reasoningEffort
     var pending = PendingAttachments()
     var log = try sessionLog()
+    var codeMCPHost =
+        mode == .code
+            ? MCPCLIInteractiveCodeHost(
+                log: log,
+                workspace: workspace)
+            : nil
+    if let codeMCPHost {
+        _ = try await codeMCPHost
+            .activationIfAttached()
+    }
     let spinner = TurnSpinner()
     let editor = LineEditor()
     let options = RenderOptions()
@@ -115,6 +126,11 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
     defer { render.cancel(); spinner.stop() }
 
     func finishChatCode(_ exit: REPLExit) async -> REPLExit {
+        if let codeMCPHost {
+            await codeMCPHost.shutdown(
+                reason:
+                    "CLI Code session ended")
+        }
         await terminal.shutdown(reason: "CLI \(mode.rawValue) session ended")
         return exit
     }
@@ -196,9 +212,52 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
                         errOut(message + "\n")
                     }
                 }
+            case "mcp":
+                guard mode == .code,
+                      let codeMCPHost
+                else {
+                    out("MCP is available in CLI Code and Cowork sessions, not Chat.\n")
+                    continue
+                }
+                do {
+                    let activation =
+                        try await codeMCPHost
+                            .activate()
+                    try await runInteractiveMCPCommand(
+                        arg,
+                        context:
+                            activation.context,
+                        sessionID:
+                            activation.session
+                                .sessionID,
+                        agentID:
+                            activation.session
+                                .agentID)
+                } catch {
+                    errOut(
+                        "MCP command failed: \(error.localizedDescription)\n")
+                }
             case "clear":
                 await terminal.terminateAll(reason: "CLI session history cleared")
-                render.cancel(); log = try sessionLog(); render = Task { await renderLoop(log, spinner: spinner, options: options) }
+                if let old = codeMCPHost {
+                    await old.shutdown(
+                        reason:
+                            "CLI Code /clear replaced the exact session")
+                }
+                log = try sessionLog()
+                codeMCPHost =
+                    mode == .code
+                        ? MCPCLIInteractiveCodeHost(
+                            log: log,
+                            workspace: workspace)
+                        : nil
+                render.cancel()
+                render = Task {
+                    await renderLoop(
+                        log,
+                        spinner: spinner,
+                        options: options)
+                }
                 out("(new session)\n")
             case "config":
                 out("\(config.selectedRouteLabel) · endpoint hidden · model \(model) · reasoning \(reasoning?.rawValue ?? "off")\n")
@@ -223,23 +282,124 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
                                    reasoningEffort: reasoning, includeUsage: config.includeUsage)
                     .send(sendText, images: sendImages)
             case .code:
+                let mcpActivation:
+                    MCPCLIInteractiveCodeActivation?
+                if let codeMCPHost {
+                    mcpActivation =
+                        try await codeMCPHost
+                            .activationIfAttached()
+                } else {
+                    mcpActivation = nil
+                }
                 let provider = try await registry.defaultAgentProvider()
-                let agent = Agent(name: AgentID(rawValue: "cli"), workspaceRoot: workspace,
-                                  model: ModelID(rawValue: model), profile: .reviewed)
-                let workspaceLease = WorkspaceLease(
-                    rootPath: workspace.path,
-                    access: .readWrite)
-                _ = try await AgentLoop(log: log, provider: provider,
-                                        registry: .standard(includesTerminal: true),
-                                        engine: PermissionEngine(), responder: TerminalResponder(),
-                                        agent: agent, allowsShell: true,
-                                        terminal: terminal,
-                                        imageGenerator: ProviderImageGenerationToolService(registry: registry),
-                                        sessionNaming: EventLogSessionNamingService(log: log, kind: .code),
-                                        reasoningEffort: reasoning, includeUsage: config.includeUsage,
-                                        maxIterations: config.maxSteps,
-                                        workspaceLease: workspaceLease)
-                    .send(sendText, images: sendImages)
+                if let mcpActivation {
+                    let codeMCPSession =
+                        mcpActivation.session
+                    let agent = Agent(
+                        name:
+                            codeMCPSession.agentID,
+                        workspaceRoot: workspace,
+                        model:
+                            ModelID(rawValue: model),
+                        profile: .reviewed)
+                    let baseRegistry =
+                        ToolRegistry.standard(
+                            includesTerminal: true)
+                    let runtime = AgentRuntime.code(
+                        registry: baseRegistry,
+                        allowsShell: true,
+                        reasoningEffort: reasoning,
+                        includeUsage:
+                            config.includeUsage,
+                        maxIterations:
+                            config.maxSteps)
+                    let loop = runtime.makeLoop(
+                        log: log,
+                        provider: provider,
+                        responder: TerminalResponder(),
+                        agent: agent,
+                        terminal: terminal,
+                        imageGenerator:
+                            ProviderImageGenerationToolService(
+                                registry: registry),
+                        sessionNaming:
+                            EventLogSessionNamingService(
+                                log: log,
+                                kind: .code),
+                        capabilityLease:
+                            codeMCPSession
+                                .capabilityLease,
+                        workspaceLease:
+                            codeMCPSession
+                                .workspaceLease,
+                        toolSnapshotProvider: {
+                            providerCapabilities,
+                            outputBudget in
+                            try await codeMCPSession
+                                .owner.runtime.snapshot(
+                                    agentID:
+                                        codeMCPSession
+                                            .agentID,
+                                    capabilityLease:
+                                        codeMCPSession
+                                            .capabilityLease,
+                                    workspaceLease:
+                                        codeMCPSession
+                                            .workspaceLease,
+                                    baseRegistry:
+                                        baseRegistry,
+                                    reason: .send,
+                                    providerCapabilities:
+                                        providerCapabilities,
+                                    turnResultBudget:
+                                        outputBudget,
+                                    consentConfirmation:
+                                        nil)
+                        })
+                    _ = try await loop.send(
+                        sendText,
+                        images: sendImages)
+                } else {
+                    let agent = Agent(
+                        name:
+                            AgentID(rawValue: "cli"),
+                        workspaceRoot: workspace,
+                        model:
+                            ModelID(rawValue: model),
+                        profile: .reviewed)
+                    let workspaceLease =
+                        WorkspaceLease(
+                            rootPath: workspace.path,
+                            access: .readWrite)
+                    _ = try await AgentLoop(
+                        log: log,
+                        provider: provider,
+                        registry:
+                            .standard(
+                                includesTerminal: true),
+                        engine: PermissionEngine(),
+                        responder: TerminalResponder(),
+                        agent: agent,
+                        allowsShell: true,
+                        terminal: terminal,
+                        imageGenerator:
+                            ProviderImageGenerationToolService(
+                                registry: registry),
+                        sessionNaming:
+                            EventLogSessionNamingService(
+                                log: log,
+                                kind: .code),
+                        reasoningEffort: reasoning,
+                        includeUsage:
+                            config.includeUsage,
+                        maxIterations:
+                            config.maxSteps,
+                        workspaceLease:
+                            workspaceLease)
+                        .send(
+                            sendText,
+                            images: sendImages)
+                }
             case .cowork:
                 break
             }
@@ -270,6 +430,7 @@ private let coworkHelp = """
   /default                            disable automatic permission review
   /model [name]                       compatibility display only; never rebinds
   /verbose [on|off]                   expand tool calls & terminal output
+  /mcp <command> [options]            manage/connect MCP for this exact Cowork session
   /attach <path>                      queue an image/text file for the next message
   @name <message>                     send to a specific agent
   <message>                           send to @main
@@ -291,6 +452,12 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
     let controlPlaneInference = CLIControlPlaneInferenceBinding()
     var pending = PendingAttachments()
     let log = try coworkSessionLog(workspace: workspace)
+    let coworkMCPHost =
+        MCPCLIInteractiveCoworkHost(
+            log: log,
+            workspace: workspace)
+    _ = try await coworkMCPHost
+        .activationIfAttached()
     let spinner = TurnSpinner()
     let editor = LineEditor()
     let options = RenderOptions()
@@ -306,6 +473,39 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
         availableInferenceProfiles: inferenceProfiles.bindings,
         requiresInferenceBindings: true,
         imageGeneratorFor: { _ in ProviderImageGenerationToolService(registry: registry) },
+        toolSnapshotProvider: {
+            agent,
+            capabilityLease,
+            workspaceLease,
+            baseRegistry,
+            isResume,
+            providerCapabilities,
+            outputBudget in
+            let state =
+                try await MCPDurableSessionState
+                    .load(from: log)
+            guard !state.attachments.isEmpty else {
+                return nil
+            }
+            guard let workspaceLease else {
+                throw IntatisError.config(
+                    "MCP dispatch requires an exact workspace lease")
+            }
+            let activation =
+                try await coworkMCPHost.activate()
+            return try await activation.owner.runtime.snapshot(
+                agentID: agent.name,
+                capabilityLease: capabilityLease,
+                workspaceLease: workspaceLease,
+                baseRegistry: baseRegistry,
+                reason:
+                    isResume ? .resume : .send,
+                providerCapabilities:
+                    providerCapabilities,
+                turnResultBudget:
+                    outputBudget,
+                consentConfirmation: nil)
+        },
         sessionNaming: EventLogSessionNamingService(log: log, kind: .cowork),
         resolvedInferenceFor: { agent in
             guard let binding = agent.agentInferenceBinding else {
@@ -674,6 +874,9 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
     func finishCowork(_ exit: REPLExit) async -> REPLExit {
         await goalRuntime.shutdown()
         await orchestrator.cancelAll(reason: "CLI Cowork session ended")
+        await coworkMCPHost.shutdown(
+            reason:
+                "CLI Cowork session ended")
         return exit
     }
 
@@ -848,6 +1051,25 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
                     case .text(let name, let content): pending.textFiles.append((name, content)); out("attached \(name) · \(pending.count) queued\n")
                     case .failure(let message): errOut(message + "\n")
                     }
+                }
+            case "mcp":
+                do {
+                    let activation =
+                        try await coworkMCPHost
+                            .activate()
+                    try await runInteractiveMCPCommand(
+                        commandArgument,
+                        context:
+                            activation.context,
+                        sessionID:
+                            activation.owner.runtime
+                                .sessionID,
+                        agentID:
+                            Orchestrator.mainAgentID,
+                        confinesAgent: false)
+                } catch {
+                    errOut(
+                        "MCP command failed: \(error.localizedDescription)\n")
                 }
             case "agent":
                 if parts.count == 4, parts[1] == "restore-main" {

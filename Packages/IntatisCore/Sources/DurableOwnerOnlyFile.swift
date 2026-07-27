@@ -4,6 +4,8 @@ import Foundation
 import Darwin
 #elseif canImport(Glibc)
 import Glibc
+#elseif canImport(Musl)
+import Musl
 #endif
 
 public enum DurableOwnerOnlyFileError: Error, LocalizedError, Equatable, Sendable {
@@ -89,8 +91,12 @@ public enum DurableOwnerOnlyFile {
                 guard let base = rawBuffer.baseAddress else { return 0 }
                 #if canImport(Darwin)
                 return Darwin.read(descriptor, base, rawBuffer.count)
-                #else
+                #elseif canImport(Glibc)
                 return Glibc.read(descriptor, base, rawBuffer.count)
+                #elseif canImport(Musl)
+                return Musl.read(descriptor, base, rawBuffer.count)
+                #else
+                return -1
                 #endif
             }
             if count == 0 { break }
@@ -247,11 +253,18 @@ public enum DurableOwnerOnlyFile {
                     descriptor,
                     base.advanced(by: offset),
                     rawBuffer.count - offset)
-                #else
+                #elseif canImport(Glibc)
                 count = Glibc.write(
                     descriptor,
                     base.advanced(by: offset),
                     rawBuffer.count - offset)
+                #elseif canImport(Musl)
+                count = Musl.write(
+                    descriptor,
+                    base.advanced(by: offset),
+                    rawBuffer.count - offset)
+                #else
+                count = -1
                 #endif
                 if count < 0, errno == EINTR { continue }
                 guard count > 0 else { return false }

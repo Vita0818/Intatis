@@ -1092,7 +1092,7 @@ public struct ContextProjector: Sendable {
                         taskID: taskID,
                         callID: call.callID))
                 }
-            case .functionCallOutput:
+            case .functionCallOutput, .toolSearchOutput:
                 if let callID = payload.callID {
                     directOutputKeys.insert(ModelHistoryToolKey(
                         taskID: taskID,

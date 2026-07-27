@@ -611,6 +611,36 @@ final class IntatisProvidersToolCallingTests: XCTestCase {
         }
         XCTAssertEqual(messages.count, 1)
         XCTAssertEqual(tools.count, 1)
+
+        let explicitParallel = try provider.buildAgentRequest(AgentRequest(
+            model: ModelID(rawValue: "vendor/model"),
+            messages: [.user("hi")],
+            tools: [],
+            parallelToolCalls: true))
+        let explicitParallelValue = try JSONDecoder().decode(
+            JSONValue.self,
+            from: XCTUnwrap(explicitParallel.httpBody))
+        guard case .object(let explicitParallelBody) =
+                explicitParallelValue else {
+            return XCTFail("request body is not an object")
+        }
+        XCTAssertEqual(
+            explicitParallelBody["parallel_tool_calls"],
+            .bool(true))
+    }
+
+    func testProviderRequestBodyEncodingSortsNestedObjectKeys() throws {
+        let encoded = try OpenAIWireProvider.encodeRequestBody([
+            "zeta": .bool(true),
+            "alpha": .object([
+                "zeta": .bool(false),
+                "alpha": .string("value"),
+            ]),
+        ])
+
+        XCTAssertEqual(
+            String(decoding: encoded, as: UTF8.self),
+            #"{"alpha":{"alpha":"value","zeta":false},"zeta":true}"#)
     }
 
     func testAgentMessageWithImageEncodesAsContentArray() {

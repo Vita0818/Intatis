@@ -1,6 +1,10 @@
 import Foundation
 import IntatisCore
 
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
+
 public enum ChatRole: String, Codable, Sendable {
     case system
     case user

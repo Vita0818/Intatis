@@ -724,9 +724,28 @@ public struct PermissionCard: View {
                         .accessibilityIdentifier("permission.cancel-turn")
                     Button("Decline Call") { onResolve(.decline) }
                         .accessibilityIdentifier("permission.decline-call")
-                    Button("Approve Call") { onResolve(.approve) }
+                    Button(
+                        request.context?.authorization?
+                            .mcp == nil
+                            ? "Approve Call"
+                            : "Allow Call Once"
+                    ) {
+                        onResolve(.approve)
+                    }
                         .keyboardShortcut(.defaultAction)
                         .accessibilityIdentifier("permission.approve-call")
+                    if request.context?.authorization?
+                        .permitsMCPRememberedApproval
+                            == true {
+                        Button(
+                            "Remember Exact Tool Approval"
+                        ) {
+                            onResolve(
+                                .approveAndRemember)
+                        }
+                        .accessibilityIdentifier(
+                            "permission.approve-and-remember")
+                    }
                 }
             }
         }

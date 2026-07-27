@@ -79,6 +79,11 @@ struct AppProviderModel: Identifiable, Codable, Equatable {
             modelMetadata: configurationMetadata,
             requestOptions: requestOptions).reasoningLabel
     }
+
+    var declaredCapabilities: [Capability] {
+        ModelCapabilityMetadata.declaredCapabilities(
+            in: configurationMetadata)
+    }
 }
 
 struct AppProviderAPIKeySource: Codable, Equatable {
@@ -265,8 +270,13 @@ private struct AppProviderSelection: Codable, Equatable {
 enum AppConfig {
     static let legacyAPIKeyAccount = "default-openai"
 
-    /// Use `.macAppStore` only for a future sandboxed AppStore/chat-only build.
+    /// The two macOS products share sources but compile with exact distribution
+    /// profiles. The App Store target cannot link or enable MCP stdio.
+    #if INTATIS_MAC_APP_STORE
+    static let platformProfile: PlatformProfile = .macAppStore
+    #else
     static let platformProfile: PlatformProfile = .macDeveloperID
+    #endif
 
     static let defaultSession = SessionID(rawValue: "sess_default")
 
@@ -473,7 +483,12 @@ enum AppConfig {
                 chatEndpoint: URL(string: provider.chatEndpoint),
                 apiKeyRef: apiKeyRef(for: provider),
                 wire: .openai,
-                modelRequestOptions: modelRequestOptions(for: provider, catalog: catalog))
+                modelRequestOptions:
+                    modelRequestOptions(
+                        for: provider,
+                        catalog: catalog),
+                modelCapabilities:
+                    modelCapabilities(for: provider))
         }
         let chat = ModelRef(endpoint: selectedProvider.id, model: ModelID(rawValue: selectedModel.id))
         var models = ResolvedModels(chat: chat, agent: chat)
@@ -645,7 +660,12 @@ enum AppConfig {
             chatEndpoint: URL(string: provider.chatEndpoint),
             apiKeyRef: apiKeyRef(for: provider),
             wire: .openai,
-            modelRequestOptions: modelRequestOptions(for: provider, catalog: providerCatalog))
+            modelRequestOptions:
+                modelRequestOptions(
+                    for: provider,
+                    catalog: providerCatalog),
+            modelCapabilities:
+                modelCapabilities(for: provider))
     }
 
     private static func modelRequestOptions(for provider: AppProviderSettings,
@@ -660,6 +680,15 @@ enum AppConfig {
             }
             return options.isEmpty ? nil : (model.id, options)
         })
+    }
+
+    private static func modelCapabilities(
+        for provider: AppProviderSettings
+    ) -> [String: [Capability]] {
+        Dictionary(uniqueKeysWithValues:
+            provider.models.map {
+                ($0.id, $0.declaredCapabilities)
+            })
     }
 
     static func apiKeyRef(for provider: AppProviderSettings) -> KeychainRef {

@@ -120,6 +120,22 @@ final class TurnOutcomeProtocolTests: XCTestCase {
     }
 
     func testExplicitPermissionResponseActionsRoundTripAndLegacyActionIsDerived() throws {
+        let rememberResolution =
+            PermissionApprovalResolution(
+                decision: .allow,
+                action: .approveAndRemember,
+                reason: "Approve and remember",
+                source: .user)
+        XCTAssertEqual(
+            try JSONDecoder().decode(
+                PermissionApprovalResolution.self,
+                from: JSONEncoder().encode(
+                    rememberResolution)),
+            rememberResolution)
+        XCTAssertEqual(
+            rememberResolution.effectiveAction,
+            .approveAndRemember)
+
         let cancelResolution = PermissionApprovalResolution(
             decision: .deny,
             action: .cancelTurn,

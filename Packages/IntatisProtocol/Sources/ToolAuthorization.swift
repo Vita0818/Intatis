@@ -254,6 +254,315 @@ public struct ToolAuthorizationInvocationContext: Equatable, Sendable {
     }
 }
 
+public enum MCPApprovalDecision: String, Codable, Equatable, Hashable, Sendable {
+    case allow
+    case deny
+    case askUser = "ask_user"
+}
+
+public enum MCPApprovalPolicySource: String, Codable, Equatable, Hashable, Sendable {
+    case serverDefault = "server_default"
+    case toolOverride = "tool_override"
+    case attachment
+    case agentGrant = "agent_grant"
+    case hostPolicy = "host_policy"
+}
+
+/// Secret-free MCP route and policy facts bound to an ordinary Intatis tool
+/// authorization. Non-MCP tools and legacy events keep this value `nil`.
+public struct MCPToolAuthorizationSnapshot: Codable, Equatable, Hashable, Sendable {
+    public let server: MCPServerReference
+    public let attachmentID: MCPAttachmentID
+    public let grantID: MCPGrantID
+    public let grantFingerprint: String
+    public let connectionGeneration: MCPConnectionGeneration
+    public let rawCatalogRevision: MCPRawCatalogRevision
+    public let agentCatalogViewRevision: MCPAgentCatalogViewRevision
+    public let bindingID: MCPBindingID
+    public let remoteToolName: String
+    public let schemaHash: String
+    public let protocolProfile: MCPProtocolProfile
+    public let maximumProtocolVersion: MCPProtocolVersion
+    public let negotiatedProtocolVersion: MCPNegotiatedProtocolVersion
+    public let effectiveApprovalMode: MCPApprovalMode
+    public let approvalDecision: MCPApprovalDecision
+    public let approvalPolicySource: MCPApprovalPolicySource
+    public let accountReference: MCPAccountReference?
+    public let environmentReference: MCPEnvironmentReference
+    public let authorityFingerprint: String
+    public let revocationGeneration: MCPRevocationGeneration
+
+    public init(server: MCPServerReference,
+                attachmentID: MCPAttachmentID,
+                grantID: MCPGrantID,
+                grantFingerprint: String,
+                connectionGeneration: MCPConnectionGeneration,
+                rawCatalogRevision: MCPRawCatalogRevision,
+                agentCatalogViewRevision: MCPAgentCatalogViewRevision,
+                bindingID: MCPBindingID,
+                remoteToolName: String,
+                schemaHash: String,
+                protocolProfile: MCPProtocolProfile,
+                maximumProtocolVersion: MCPProtocolVersion? = nil,
+                negotiatedProtocolVersion: MCPNegotiatedProtocolVersion,
+                effectiveApprovalMode: MCPApprovalMode,
+                approvalDecision: MCPApprovalDecision,
+                approvalPolicySource: MCPApprovalPolicySource,
+                accountReference: MCPAccountReference? = nil,
+                environmentReference: MCPEnvironmentReference,
+                authorityFingerprint: String,
+                revocationGeneration: MCPRevocationGeneration) {
+        self.server = server
+        self.attachmentID = attachmentID
+        self.grantID = grantID
+        self.grantFingerprint = grantFingerprint
+        self.connectionGeneration = connectionGeneration
+        self.rawCatalogRevision = rawCatalogRevision
+        self.agentCatalogViewRevision = agentCatalogViewRevision
+        self.bindingID = bindingID
+        self.remoteToolName = remoteToolName
+        self.schemaHash = schemaHash
+        self.protocolProfile = protocolProfile
+        self.maximumProtocolVersion = maximumProtocolVersion ?? protocolProfile.defaultMaximumVersion
+        self.negotiatedProtocolVersion = negotiatedProtocolVersion
+        self.effectiveApprovalMode = effectiveApprovalMode
+        self.approvalDecision = approvalDecision
+        self.approvalPolicySource = approvalPolicySource
+        self.accountReference = accountReference
+        self.environmentReference = environmentReference
+        self.authorityFingerprint = authorityFingerprint
+        self.revocationGeneration = revocationGeneration
+    }
+}
+
+/// One exact resource-capable connection route selected by the arguments of a
+/// fixed MCP resource tool. Unlike `MCPToolAuthorizationSnapshot`, this
+/// snapshot authorizes the `.resources` capability and does not pretend that
+/// the fixed aggregate tool is a remote server tool.
+public struct MCPResourceAuthorizationRouteSnapshot:
+    Codable, Equatable, Hashable, Sendable
+{
+    public let server: MCPServerReference
+    public let serverAlias: String
+    public let attachmentID: MCPAttachmentID
+    public let grantID: MCPGrantID
+    public let grantFingerprint: String
+    public let agentID: AgentID
+    public let capabilityLeaseID: CapabilityLeaseID
+    public let capabilityTaskID: TaskID?
+    public let workspaceLeaseID: WorkspaceLeaseID?
+    public let connectionGeneration: MCPConnectionGeneration
+    public let rawCatalogRevision: MCPRawCatalogRevision
+    public let agentCatalogViewRevision: MCPAgentCatalogViewRevision
+    public let bindingID: MCPBindingID
+    public let protocolProfile: MCPProtocolProfile
+    public let maximumProtocolVersion: MCPProtocolVersion
+    public let negotiatedProtocolVersion: MCPNegotiatedProtocolVersion
+    public let accountReference: MCPAccountReference?
+    public let environmentReference: MCPEnvironmentReference
+    public let authorityFingerprint: String
+    public let revocationGeneration: MCPRevocationGeneration
+    public let resourcePolicyFingerprint: String
+
+    public init(
+        server: MCPServerReference,
+        serverAlias: String,
+        attachmentID: MCPAttachmentID,
+        grantID: MCPGrantID,
+        grantFingerprint: String,
+        agentID: AgentID,
+        capabilityLeaseID: CapabilityLeaseID,
+        capabilityTaskID: TaskID?,
+        workspaceLeaseID: WorkspaceLeaseID?,
+        connectionGeneration: MCPConnectionGeneration,
+        rawCatalogRevision: MCPRawCatalogRevision,
+        agentCatalogViewRevision: MCPAgentCatalogViewRevision,
+        bindingID: MCPBindingID,
+        protocolProfile: MCPProtocolProfile,
+        maximumProtocolVersion: MCPProtocolVersion,
+        negotiatedProtocolVersion: MCPNegotiatedProtocolVersion,
+        accountReference: MCPAccountReference?,
+        environmentReference: MCPEnvironmentReference,
+        authorityFingerprint: String,
+        revocationGeneration: MCPRevocationGeneration,
+        resourcePolicyFingerprint: String
+    ) {
+        self.server = server
+        self.serverAlias = serverAlias
+        self.attachmentID = attachmentID
+        self.grantID = grantID
+        self.grantFingerprint = grantFingerprint
+        self.agentID = agentID
+        self.capabilityLeaseID = capabilityLeaseID
+        self.capabilityTaskID = capabilityTaskID
+        self.workspaceLeaseID = workspaceLeaseID
+        self.connectionGeneration = connectionGeneration
+        self.rawCatalogRevision = rawCatalogRevision
+        self.agentCatalogViewRevision = agentCatalogViewRevision
+        self.bindingID = bindingID
+        self.protocolProfile = protocolProfile
+        self.maximumProtocolVersion = maximumProtocolVersion
+        self.negotiatedProtocolVersion = negotiatedProtocolVersion
+        self.accountReference = accountReference
+        self.environmentReference = environmentReference
+        self.authorityFingerprint = authorityFingerprint
+        self.revocationGeneration = revocationGeneration
+        self.resourcePolicyFingerprint = resourcePolicyFingerprint
+    }
+}
+
+/// Invocation-specific authorization for the three fixed MCP resource tools.
+/// The exact URI is bound by digest instead of being copied into durable
+/// events, because resource URIs may contain private paths or query secrets.
+/// Aggregate list calls carry every selected route in deterministic order.
+public struct MCPResourceInvocationAuthorizationSnapshot:
+    Codable, Equatable, Hashable, Sendable
+{
+    public let schemaVersion: Int
+    public let operation: String
+    public let requestedServerAlias: String?
+    public let requestedResourceURIDigest: String?
+    public let requestedResourceURICharacterCount: Int?
+    public let requestedResourceURIScheme: String?
+    public let routes: [MCPResourceAuthorizationRouteSnapshot]
+
+    public init(
+        schemaVersion: Int = 1,
+        operation: String,
+        requestedServerAlias: String?,
+        requestedResourceURIDigest: String?,
+        requestedResourceURICharacterCount: Int?,
+        requestedResourceURIScheme: String?,
+        routes: [MCPResourceAuthorizationRouteSnapshot]
+    ) {
+        self.schemaVersion = schemaVersion
+        self.operation = operation
+        self.requestedServerAlias = requestedServerAlias
+        self.requestedResourceURIDigest =
+            requestedResourceURIDigest
+        self.requestedResourceURICharacterCount =
+            requestedResourceURICharacterCount
+        self.requestedResourceURIScheme =
+            requestedResourceURIScheme
+        self.routes = routes
+    }
+}
+
+public enum MCPRememberedApprovalError:
+    Error, Equatable, Sendable
+{
+    case modeIsNotAuto
+}
+
+/// Exact durable allow decision created only by an explicit approval of an
+/// `auto` MCP tool. It deliberately excludes connection generation/binding ID
+/// (which change per request) and includes every stable authority/catalog
+/// dimension that must invalidate a prior decision.
+public struct MCPRememberedToolApproval:
+    Codable, Equatable, Hashable, Sendable
+{
+    public let approvalID:
+        MCPRememberedApprovalID
+    public let server: MCPServerReference
+    public let attachmentID: MCPAttachmentID
+    public let grantID: MCPGrantID
+    public let grantFingerprint: String
+    public let remoteToolName: String
+    public let schemaHash: String
+    public let authorityFingerprint: String
+    public let accountReference:
+        MCPAccountReference?
+    public let environmentReference:
+        MCPEnvironmentReference
+    public let rawCatalogRevision:
+        MCPRawCatalogRevision
+    public let agentCatalogViewRevision:
+        MCPAgentCatalogViewRevision
+    public let revocationGeneration:
+        MCPRevocationGeneration
+    public let createdAt: Date
+    public let expiresAt: Date?
+
+    public init(
+        approvalID:
+            MCPRememberedApprovalID = .new(),
+        authorization:
+            MCPToolAuthorizationSnapshot,
+        createdAt: Date = Date(),
+        expiresAt: Date? = nil
+    ) throws {
+        guard authorization.effectiveApprovalMode
+                == .auto else {
+            throw MCPRememberedApprovalError
+                .modeIsNotAuto
+        }
+        self.approvalID = approvalID
+        server = authorization.server
+        attachmentID =
+            authorization.attachmentID
+        grantID = authorization.grantID
+        grantFingerprint =
+            authorization.grantFingerprint
+        remoteToolName =
+            authorization.remoteToolName
+        schemaHash = authorization.schemaHash
+        authorityFingerprint =
+            authorization.authorityFingerprint
+        accountReference =
+            authorization.accountReference
+        environmentReference =
+            authorization.environmentReference
+        rawCatalogRevision =
+            authorization.rawCatalogRevision
+        agentCatalogViewRevision =
+            authorization
+                .agentCatalogViewRevision
+        revocationGeneration =
+            authorization.revocationGeneration
+        self.createdAt = createdAt
+        self.expiresAt = expiresAt
+    }
+
+    public func isActive(
+        at date: Date = Date()
+    ) -> Bool {
+        expiresAt.map { $0 > date } ?? true
+    }
+
+    public func exactlyMatches(
+        _ authorization:
+            MCPToolAuthorizationSnapshot,
+        at date: Date = Date()
+    ) -> Bool {
+        authorization.effectiveApprovalMode == .auto
+            && isActive(at: date)
+            && server == authorization.server
+            && attachmentID
+                == authorization.attachmentID
+            && grantID == authorization.grantID
+            && grantFingerprint
+                == authorization.grantFingerprint
+            && remoteToolName
+                == authorization.remoteToolName
+            && schemaHash == authorization.schemaHash
+            && authorityFingerprint
+                == authorization
+                    .authorityFingerprint
+            && accountReference
+                == authorization.accountReference
+            && environmentReference
+                == authorization
+                    .environmentReference
+            && rawCatalogRevision
+                == authorization.rawCatalogRevision
+            && agentCatalogViewRevision
+                == authorization
+                    .agentCatalogViewRevision
+            && revocationGeneration
+                == authorization.revocationGeneration
+    }
+}
+
 /// Immutable authorization facts resolved from the same registry entry that
 /// supplies the model schema and executor. It is copied into review and tool
 /// execution events so an approval can be audited against the exact action
@@ -302,6 +611,11 @@ public struct ResolvedToolAuthorization: Codable, Equatable, Sendable {
     public let risksNetwork: Bool
     public let replayPolicy: ToolExecutionReplayPolicy
     public let deterministicGate: PermissionReviewGateSnapshot?
+    public let mcp: MCPToolAuthorizationSnapshot?
+    /// Dynamic route authorization for fixed MCP resource tools. Legacy
+    /// events and ordinary/direct MCP tools decode this additive field as nil.
+    public let mcpResource:
+        MCPResourceInvocationAuthorizationSnapshot?
 
     public init(schemaVersion: Int = 1,
                 authorizationID: String,
@@ -334,7 +648,10 @@ public struct ResolvedToolAuthorization: Codable, Equatable, Sendable {
                 workspaceTaskID: TaskID? = nil,
                 workspaceRootPath: String? = nil,
                 workspaceLeaseFingerprint: String? = nil,
-                targetAgentInferenceBinding: AgentInferenceBinding? = nil) {
+                targetAgentInferenceBinding: AgentInferenceBinding? = nil,
+                mcp: MCPToolAuthorizationSnapshot? = nil,
+                mcpResource:
+                    MCPResourceInvocationAuthorizationSnapshot? = nil) {
         self.schemaVersion = schemaVersion
         self.authorizationID = authorizationID
         self.registryVersion = registryVersion
@@ -374,6 +691,8 @@ public struct ResolvedToolAuthorization: Codable, Equatable, Sendable {
         self.risksNetwork = risksNetwork
         self.replayPolicy = replayPolicy
         self.deterministicGate = deterministicGate
+        self.mcp = mcp
+        self.mcpResource = mcpResource
     }
 
     public func withDeterministicGate(_ gate: PermissionReviewGateSnapshot) -> ResolvedToolAuthorization {
@@ -417,7 +736,17 @@ public struct ResolvedToolAuthorization: Codable, Equatable, Sendable {
             workspaceTaskID: workspaceTaskID,
             workspaceRootPath: workspaceRootPath,
             workspaceLeaseFingerprint: workspaceLeaseFingerprint,
-            targetAgentInferenceBinding: targetAgentInferenceBinding)
+            targetAgentInferenceBinding: targetAgentInferenceBinding,
+            mcp: mcp,
+            mcpResource: mcpResource)
+    }
+
+    /// The UI may offer the separate "approve and remember" action only for
+    /// a host-proven read-only MCP call whose effective mode is exactly auto.
+    /// EventLog independently revalidates the same predicate at settlement.
+    public var permitsMCPRememberedApproval: Bool {
+        sideEffect == .readOnly
+            && mcp?.effectiveApprovalMode == .auto
     }
 }
 
@@ -452,9 +781,11 @@ public enum PermissionApprovalFailureKind: String, Codable, Equatable, Sendable 
 /// Explicit user/control-plane response to one permission request. `decline`
 /// denies only the current call, while `cancelTurn` interrupts its enclosing
 /// turn and must not be represented to the model as a fabricated denied tool
-/// result.
+/// result. `approveAndRemember` is a distinct, explicit action; an ordinary
+/// approve can never create durable remembered authority.
 public enum PermissionResponseAction: String, Codable, Equatable, Sendable {
     case approve
+    case approveAndRemember = "approve_and_remember"
     case decline
     case cancelTurn = "cancel_turn"
 }

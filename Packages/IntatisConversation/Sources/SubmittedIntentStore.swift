@@ -6,6 +6,8 @@ import IntatisProtocol
 import Darwin
 #elseif canImport(Glibc)
 import Glibc
+#elseif canImport(Musl)
+import Musl
 #endif
 
 private final class SubmittedIntentOutboxFileLock {
@@ -359,8 +361,12 @@ public enum SubmittedIntentOutboxStore {
             let count: Int
             #if canImport(Darwin)
             count = Darwin.read(descriptor, &buffer, buffer.count)
-            #else
+            #elseif canImport(Glibc)
             count = Glibc.read(descriptor, &buffer, buffer.count)
+            #elseif canImport(Musl)
+            count = Musl.read(descriptor, &buffer, buffer.count)
+            #else
+            count = -1
             #endif
             if count == 0 { break }
             if count < 0 {
@@ -411,11 +417,18 @@ public enum SubmittedIntentOutboxStore {
                     descriptor,
                     base.advanced(by: offset),
                     rawBuffer.count - offset)
-                #else
+                #elseif canImport(Glibc)
                 count = Glibc.write(
                     descriptor,
                     base.advanced(by: offset),
                     rawBuffer.count - offset)
+                #elseif canImport(Musl)
+                count = Musl.write(
+                    descriptor,
+                    base.advanced(by: offset),
+                    rawBuffer.count - offset)
+                #else
+                count = -1
                 #endif
                 if count < 0, errno == EINTR { continue }
                 guard count > 0 else { return false }

@@ -35,7 +35,7 @@ settings:
 
 targets:
 
-  # ---- macOS app: full Chat / Code / Cowork (links all 11 library products) ----
+  # ---- macOS DeveloperID app: Chat / Code / Cowork + stdio/HTTP MCP client ----
   IntatisMac:
     type: application
     platform: macOS
@@ -57,9 +57,9 @@ targets:
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
         INFOPLIST_KEY_NSHumanReadableCopyright: "Copyright © 2026 Intatis contributors. See NOTICE.md."
         CODE_SIGN_ENTITLEMENTS: Apps/IntatisMac/IntatisMac.DeveloperID.entitlements
-        # AppStore/chat-only builds can still switch back to:
-        #   CODE_SIGN_ENTITLEMENTS: Apps/IntatisMac/IntatisMac.AppStore.entitlements
-        #   and set AppConfig.platformProfile = .macAppStore
+        # The separately declared IntatisMacAppStore target is the only
+        # App-Store profile; do not turn this stdio-capable target into one by
+        # swapping entitlements.
     dependencies:
       - package: Intatis
         product: IntatisCore
@@ -83,6 +83,59 @@ targets:
         product: IntatisAgentKernel
       - package: Intatis
         product: IntatisCowork
+      - package: Intatis
+        product: IntatisMCP
+      - package: Intatis
+        product: IntatisMCPStdio
+
+  # ---- macOS App Store: full UI, remote MCP HTTP only, no stdio linkage ----
+  IntatisMacAppStore:
+    type: application
+    platform: macOS
+    sources:
+      - Apps/IntatisMac/Sources
+      - path: Apps/SharedResources
+        buildPhase: resources
+      - path: NOTICE.md
+        buildPhase: resources
+      - path: ThirdPartyNotices
+        type: folder
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.Vita0818.IntatisMac
+        PRODUCT_NAME: Intatis
+        GENERATE_INFOPLIST_FILE: "YES"
+        INFOPLIST_KEY_CFBundleDisplayName: Intatis
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
+        INFOPLIST_KEY_NSHumanReadableCopyright: "Copyright © 2026 Intatis contributors. See NOTICE.md."
+        CODE_SIGN_ENTITLEMENTS: Apps/IntatisMac/IntatisMac.AppStore.entitlements
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) INTATIS_MAC_APP_STORE"
+    dependencies:
+      - package: Intatis
+        product: IntatisCore
+      - package: Intatis
+        product: IntatisProtocol
+      - package: Intatis
+        product: IntatisProviders
+      - package: Intatis
+        product: IntatisConversation
+      - package: Intatis
+        product: IntatisArtifacts
+      - package: Intatis
+        product: IntatisMultimodal
+      - package: Intatis
+        product: IntatisSharedUI
+      - package: Intatis
+        product: IntatisTools
+      - package: Intatis
+        product: IntatisPermission
+      - package: Intatis
+        product: IntatisAgentKernel
+      - package: Intatis
+        product: IntatisCowork
+      - package: Intatis
+        product: IntatisMCP
 
   # ---- iOS app: chat-only SUBSET (deliberately no workspace stack) ----
   IntatisiOS:
@@ -135,6 +188,17 @@ schemes:
       orderHint: 0
       isShown: true
 
+  IntatisMacAppStore:
+    build:
+      targets:
+        IntatisMacAppStore: all
+    run:
+      config: Debug
+    management:
+      shared: true
+      orderHint: 1
+      isShown: true
+
   IntatisiOS:
     build:
       targets:
@@ -143,5 +207,5 @@ schemes:
       config: Debug
     management:
       shared: true
-      orderHint: 1
+      orderHint: 2
       isShown: true

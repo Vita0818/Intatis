@@ -10,6 +10,12 @@ final class IntatisCoreTests: XCTestCase {
         XCTAssertEqual(PlatformProfile.iOS.surfaces, [.chat])
         XCTAssertTrue(PlatformProfile.macAppStore.supports(.cowork))
         XCTAssertFalse(PlatformProfile.iOS.supports(.code))
+        XCTAssertFalse(PlatformProfile.iOS.allowsMCPRemoteHTTP)
+        XCTAssertFalse(PlatformProfile.iOS.allowsMCPStdio)
+        XCTAssertTrue(PlatformProfile.macAppStore.allowsMCPRemoteHTTP)
+        XCTAssertFalse(PlatformProfile.macAppStore.allowsMCPStdio)
+        XCTAssertTrue(PlatformProfile.macDeveloperID.allowsMCPRemoteHTTP)
+        XCTAssertTrue(PlatformProfile.macDeveloperID.allowsMCPStdio)
     }
 
     func testIDCodesAsBareString() throws {

@@ -76,6 +76,8 @@ enum AppInferenceCatalogCompiler {
                     modelBaseRequestOptions: model.requestOptions,
                     variantRequestOptions: [:],
                     profileRequestOptions: [:],
+                    declaredCapabilities:
+                        model.declaredCapabilities,
                     safeRouteLabel: routeLabel))
 
                 for variant in model.variants {
@@ -100,6 +102,8 @@ enum AppInferenceCatalogCompiler {
                         modelBaseRequestOptions: model.requestOptions,
                         variantRequestOptions: variant.requestOptions,
                         profileRequestOptions: [:],
+                        declaredCapabilities:
+                            model.declaredCapabilities,
                         safeRouteLabel: routeLabel))
                 }
             }

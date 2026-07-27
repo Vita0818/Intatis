@@ -8,6 +8,7 @@ import IntatisProviders
 import IntatisConversation
 import IntatisAgentKernel
 import IntatisArtifacts
+import IntatisMCP
 import IntatisMultimodal
 import IntatisSharedUI
 import UniformTypeIdentifiers
@@ -29,6 +30,7 @@ final class AppEnvironment: ObservableObject {
     @Published var needsAPIKey: Bool
 
     let runtimeManager: AppSessionRuntimeManager
+    let mcp: AppMCPService
     private var chatRuntime: AppChatSessionRuntime
     private let secrets: ConfigSecretResolver
     private let inferenceCatalogStore: InferenceCatalogStore
@@ -38,6 +40,7 @@ final class AppEnvironment: ObservableObject {
         PlatformProfile.current = AppConfig.platformProfile
 
         self.runtimeManager = runtimeManager
+        self.mcp = AppMCPService()
         self.secrets = ConfigSecretResolver()
         self.inferenceCatalogStore = InferenceCatalogStore(
             fileURL: AppConfig.appSupportDir()
@@ -238,8 +241,21 @@ final class AppEnvironment: ObservableObject {
                 sessionID: session,
                 workspaceAccess: workspace,
                 log: codeLog,
+                artifactStore:
+                    try ArtifactStore(
+                        root:
+                            AppConfig.artifactsDir(
+                                session)),
                 sessionNaming: makeSessionNamingService(log: codeLog, kind: .code),
-                registry: registry)
+                registry: registry,
+                mcpSnapshots:
+                    makeMCPSnapshotFactory(
+                        kind: .code,
+                        sessionID: session,
+                        log: codeLog,
+                        workspacePaths: [
+                            workspace.canonicalPath,
+                        ]))
             return try runtimeManager.registerCodeRuntime(runtime)
         } catch {
             if !hadRememberedAccess {
@@ -415,7 +431,149 @@ final class AppEnvironment: ObservableObject {
             projectSettings: projectSettings,
             launchMode: launchMode,
             sessionStorageWarning: sessionStorageWarning,
-            initialWorkspaceAccess: initialWorkspaceAccess)
+            initialWorkspaceAccess: initialWorkspaceAccess,
+            mcpSnapshots:
+                makeMCPSnapshotFactory(
+                    kind: .cowork,
+                    sessionID: session,
+                    log: coworkLog,
+                    workspacePaths:
+                        projectSettings.workspaces
+                            .map(\.path)))
+    }
+
+    private func makeMCPSnapshotFactory(
+        kind: SessionKind,
+        sessionID: SessionID,
+        log: EventLog,
+        workspacePaths: [String]
+    ) -> @MainActor @Sendable () async throws
+        -> MCPAgentRequestToolSnapshotSource
+    {
+        { [weak self] in
+            guard let self else {
+                throw IntatisError.io(
+                    "The application MCP runtime owner is unavailable.")
+            }
+            let runtime =
+                try await self.mcpSessionRuntime(
+                    kind: kind,
+                    sessionID: sessionID,
+                    log: log,
+                    workspacePaths:
+                        workspacePaths)
+            return runtime.snapshots
+        }
+    }
+
+    func mcpSessionRuntime(
+        kind: SessionKind,
+        sessionID: SessionID,
+        log: EventLog,
+        workspacePaths: [String]
+    ) async throws -> MCPShippingSessionRuntime {
+        let registry = self.registry
+        let bindings = Set(
+            inferenceProfileOptions.map(\.binding))
+        let catalog = try await mcp.catalogStore.load()
+        let allowedElicitationOrigins = Set<String>(
+            catalog.heads.compactMap { head -> String? in
+                guard !head.disabled,
+                      let revision =
+                        head.currentRevision,
+                      let definition =
+                        catalog.definition(
+                            for:
+                                MCPServerReference(
+                                    serverID:
+                                        head.serverID,
+                                    serverRevision:
+                                        revision)),
+                      definition.configuration
+                        .enabled,
+                      case .streamableHTTP(
+                        let configuration) =
+                        definition.configuration
+                            .transport
+                else {
+                    return nil
+                }
+                return configuration.canonicalOrigin
+            })
+        let runtimeIdentity =
+            Self.mcpRuntimeIdentityFingerprint(
+                kind: kind,
+                sessionID: sessionID,
+                workspacePaths: workspacePaths)
+        let shipping =
+            try await runtimeManager.mcpRuntime(
+                kind: kind,
+                sessionID: sessionID
+            ) { [mcp] in
+                let artifactStore =
+                    try ArtifactStore(
+                        root:
+                            AppConfig.artifactsDir(
+                                sessionID))
+                return try await mcp
+                    .makeShippingSessionRuntime(
+                        sessionID: sessionID,
+                        log: log,
+                        artifactStore:
+                            artifactStore,
+                        runtimeIdentityFingerprint:
+                            runtimeIdentity,
+                        samplingPolicy:
+                            MCPSamplingPolicy(
+                                enabled:
+                                    !bindings.isEmpty,
+                                allowedInferenceBindings:
+                                    bindings),
+                        samplingInference:
+                            MCPProviderSamplingInferenceService {
+                                binding in
+                                try await registry
+                                    .agentInference(
+                                        for: binding)
+                            },
+                        elicitationPolicy:
+                            MCPElicitationPolicy(
+                                formEnabled: true,
+                                urlEnabled:
+                                    !allowedElicitationOrigins
+                                        .isEmpty,
+                                allowedURLOrigins:
+                                    allowedElicitationOrigins))
+            }
+        await mcp.synchronizeRuntimeObservation(
+            sessionID: sessionID,
+            owner: shipping.owner)
+        return shipping
+    }
+
+    private static func mcpRuntimeIdentityFingerprint(
+        kind: SessionKind,
+        sessionID: SessionID,
+        workspacePaths: [String]
+    ) -> String {
+        var fields = [
+            "intatis-mac-mcp-runtime-v1",
+            kind.rawValue,
+            sessionID.rawValue,
+        ]
+        for path in Set(workspacePaths).sorted() {
+            let canonical =
+                URL(fileURLWithPath: path)
+                    .standardizedFileURL.path
+            fields.append(canonical)
+            fields.append(
+                WorkspaceRootIdentity.capture(
+                    rootPath: canonical).map {
+                        MCPHostDigest
+                            .workspaceRootIdentity($0)
+                    } ?? "missing-root")
+        }
+        return MCPHostDigest.sha256(fields)
     }
 
     private func makeSessionNamingService(
@@ -683,10 +841,16 @@ struct CodeSessionView: View {
     @ObservedObject var vm: CodeViewModel
     let sessionTitle: String
     let catalog: AppProviderCatalog
+    let mcpProjectSettingsHost:
+        MCPProjectSettingsHost
+    let mcpContentHost:
+        MCPConversationContentHost
     let onSelectModel: (String, String, String?) -> Void
     let onShowSessions: () -> Void
     let onNewSession: () -> Void
     @Binding var showsInspector: Bool
+    @State private var showMCPProjectSettings =
+        false
     @Environment(\.colorScheme) private var scheme
 
     var body: some View {
@@ -706,15 +870,59 @@ struct CodeSessionView: View {
                   threadStyle: .intatisMac(scheme),
                   onShowSessions: onShowSessions,
                   onNewSession: onNewSession,
-                  composerAccessory: AnyView(IntatisComposerModelControl(
-                    catalog: catalog,
-                    isBusy: vm.isWorking,
-                    onSelectModel: onSelectModel)),
+                  composerAccessory: AnyView(HStack(
+                    alignment: .center,
+                    spacing: IntatisComposerControlMetrics.rowSpacing
+                  ) {
+                    IntatisComposerModelControl(
+                        catalog: catalog,
+                        isBusy: vm.isWorking,
+                        onSelectModel: onSelectModel)
+                    MCPPendingExternalContextControl(
+                        count:
+                            vm.pendingMCPExternalContextCount,
+                        onCancel: {
+                            vm.cancelPendingMCPExternalContexts()
+                        })
+                  }),
                   showsInspector: $showsInspector,
                   input: $vm.input,
                   onSend: { vm.send() },
                   onCancelCurrent: { vm.cancelCurrentTurn() },
                   onResolve: { vm.resolvePermission($0) })
+            .toolbar {
+                ToolbarItem {
+                    MCPConversationCenterButton(
+                        host: mcpContentHost)
+                }
+                ToolbarItem {
+                    Button {
+                        showMCPProjectSettings = true
+                    } label: {
+                        Label(
+                            "MCP Project Settings",
+                            systemImage:
+                                "network.badge.shield.half.filled")
+                    }
+                    .help(
+                        "Attach servers and manage exact Agent MCP grants")
+                }
+            }
+            .sheet(
+                isPresented:
+                    $showMCPProjectSettings
+            ) {
+                NavigationStack {
+                    MCPProjectSettingsView(
+                        host:
+                            mcpProjectSettingsHost)
+                        .navigationTitle(
+                            "MCP Project Settings")
+                }
+                .frame(
+                    minWidth: 980,
+                    minHeight: 680)
+            }
     }
 
 }
@@ -723,6 +931,10 @@ struct CoworkSessionView: View {
     @ObservedObject var vm: CoworkViewModel
     let sessionTitle: String
     let catalog: AppProviderCatalog
+    let mcpProjectSettingsHost:
+        MCPProjectSettingsHost
+    let mcpContentHost:
+        MCPConversationContentHost
     let onShowSessions: () -> Void
     let onNewSession: () -> Void
     let onSessionDidBecomeReady: () -> Void
@@ -773,13 +985,24 @@ struct CoworkSessionView: View {
                         onShowSessions: onShowSessions,
                         onNewSession: onNewSession,
                         onShowProjectSettings: { showProjectSettings = true },
-                        composerAccessory: AnyView(CoworkInferenceAccessory(
-                            options: vm.inferenceProfileOptions,
-                            selectedBinding: vm.nextMainInferenceBinding,
-                            isDisabled: !hasMainAgent,
-                            onSelect: { binding in
-                                vm.selectMainInferenceProfileForNextSubmission(binding)
-                            })),
+                        composerAccessory: AnyView(HStack(
+                            alignment: .center,
+                            spacing: IntatisComposerControlMetrics.rowSpacing
+                        ) {
+                            CoworkInferenceAccessory(
+                                options: vm.inferenceProfileOptions,
+                                selectedBinding: vm.nextMainInferenceBinding,
+                                isDisabled: !hasMainAgent,
+                                onSelect: { binding in
+                                    vm.selectMainInferenceProfileForNextSubmission(binding)
+                                })
+                            MCPPendingExternalContextControl(
+                                count:
+                                    vm.pendingMCPExternalContextCount,
+                                onCancel: {
+                                    vm.cancelPendingMCPExternalContexts()
+                                })
+                        }),
                         composerInputAccessory: AnyView(HStack(
                             alignment: .center,
                             spacing: IntatisComposerControlMetrics.rowSpacing
@@ -859,6 +1082,12 @@ struct CoworkSessionView: View {
             vm.importDraftAttachments(urls)
             return true
         }
+        .toolbar {
+            ToolbarItem {
+                MCPConversationCenterButton(
+                    host: mcpContentHost)
+            }
+        }
         .alert("Clear this Goal?", isPresented: $showGoalClearConfirmation) {
             Button("Clear", role: .destructive) { vm.clearGoal() }
             Button("Cancel", role: .cancel) {}
@@ -891,16 +1120,41 @@ struct CoworkSessionView: View {
     }
 
     private var projectSettingsSheet: some View {
-        CoworkProjectSettingsSheet(
-            vm: vm,
-            catalog: catalog,
-            inferenceProfileOptions: vm.inferenceProfileOptions,
-            onAddWorkspace: {
-                if let url = WorkspaceAccess.choose(
-                    prompt: IntatisLocalization.string("Choose Project Workspace")) {
-                    vm.addProjectWorkspace(url)
+        TabView {
+            CoworkProjectSettingsSheet(
+                vm: vm,
+                catalog: catalog,
+                inferenceProfileOptions:
+                    vm.inferenceProfileOptions,
+                onAddWorkspace: {
+                    if let url = WorkspaceAccess.choose(
+                        prompt:
+                            IntatisLocalization.string(
+                                "Choose Project Workspace"))
+                    {
+                        vm.addProjectWorkspace(url)
+                    }
+                })
+                .tabItem {
+                    Label(
+                        "Project",
+                        systemImage: "folder")
                 }
-            })
+            NavigationStack {
+                MCPProjectSettingsView(
+                    host:
+                        mcpProjectSettingsHost)
+                    .navigationTitle(
+                        "MCP Project Settings")
+            }
+            .tabItem {
+                Label(
+                    "MCP",
+                    systemImage:
+                        "network.badge.shield.half.filled")
+            }
+        }
+        .frame(minWidth: 980, minHeight: 680)
     }
 
     private var goalEditorSheet: some View {

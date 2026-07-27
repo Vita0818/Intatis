@@ -239,6 +239,33 @@ private struct PolicyUncertainWriteTool: Tool {
     }
 }
 
+private struct PolicyMCPErrorResultTool: Tool {
+    static let descriptor = ToolDescriptor(
+        name: "mcp__test__reported_error",
+        description: "Test-only MCP tool returning a typed isError result.",
+        sideEffect: .network,
+        parameters: .object([
+            "type": .string("object"),
+            "properties": .object([:]),
+            "additionalProperties": .bool(false),
+        ]))
+
+    func execute(
+        _ args: ToolArgs,
+        in context: ToolContext
+    ) async throws -> ToolObservation {
+        ToolObservation(
+            text: "remote MCP failure",
+            structuredResult: MCPStructuredToolResult(
+                content: [
+                    MCPContentBlock(
+                        kind: .text,
+                        text: "remote MCP failure"),
+                ],
+                isError: true))
+    }
+}
+
 private struct PolicyTaskUpdateArguments: Decodable {
     var taskID: String
     var expectedRevision: Int
@@ -974,6 +1001,55 @@ final class AgentLoopPolicyTests: XCTestCase {
         XCTAssertFalse(observation.contains("permission denied: permission denied:"))
         let nextTurn = try XCTUnwrap(provider.requests.dropFirst().first)
         XCTAssertTrue(nextTurn.messages.contains { $0.content == observation })
+    }
+
+    func testMCPIsErrorResultIsDurableTypedFailureWithUnknownEffect()
+        async throws {
+        let (workspace, log) = try makeWorkspaceAndLog(
+            "mcp-typed-error-result")
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let provider = PolicyScriptedProvider([
+            [
+                .toolCalls([ToolCall(
+                    id: "mcp-error-call",
+                    name: "mcp__test__reported_error",
+                    arguments: "{}")]),
+                .done(finishReason: "tool_calls"),
+            ],
+            [
+                .textDelta("The remote tool reported failure."),
+                .done(finishReason: "stop"),
+            ],
+        ])
+        let loop = makeLoop(
+            workspace: workspace,
+            log: log,
+            provider: provider,
+            registry: ToolRegistry([PolicyMCPErrorResultTool()]))
+
+        let answer = try await loop.send("Call the remote tool.")
+
+        XCTAssertEqual(
+            answer,
+            "The remote tool reported failure.")
+        let events = await log.replay()
+        let result = try XCTUnwrap(events.compactMap {
+            envelope -> ToolResultPayload? in
+            guard case .toolResult(let payload) = envelope.event
+            else { return nil }
+            return payload
+        }.first)
+        XCTAssertEqual(result.outcome, .failed)
+        XCTAssertEqual(result.failureSource, .runtimeFailed)
+        XCTAssertEqual(result.structuredResult?.isError, true)
+        let settled = try XCTUnwrap(events.compactMap {
+            envelope -> ToolExecutionSettledPayload? in
+            guard case .toolExecutionSettled(let payload) =
+                    envelope.event else { return nil }
+            return payload
+        }.first)
+        XCTAssertEqual(settled.outcome, .failed)
+        XCTAssertEqual(settled.effectDisposition, .unknown)
     }
 
     func testNonReplayableToolFailureLeavesExecutionUnsettledForManualReconciliation() async throws {

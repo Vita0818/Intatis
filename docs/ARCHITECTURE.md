@@ -1,5 +1,74 @@
 # ARCHITECTURE
 
+## 2026-07-27 外部 MCP Server 客户端
+
+Intatis 只实现连接外部 MCP Server 的客户端角色；没有 Intatis MCP
+Server target、server transport、server OAuth、server executable、hosting
+API 或产品入口。SDK 中保留的 sampling、elicitation 和 client-hosted Tasks
+handler 是外部 server 向 client 发起的标准 request，由客户端宿主受控处理，
+不构成 MCP Server。开发期 `IntatisMCPConformanceClient` 也只是 official
+client conformance driver，不进入发行产品。
+
+平台/target 边界如下：
+
+| 产品 | External MCP client core | Streamable HTTP / OAuth | stdio | 产品表面 |
+|---|---|---|---|---|
+| `IntatisMac` | `IntatisMCP` | `IntatisCurlTransport` | `IntatisMCPStdio` + `IntatisMCPStdioGuard` | Code/Cowork 设置、会话内容与审批 |
+| `IntatisMacAppStore` | `IntatisMCP` | `IntatisCurlTransport` | 不链接 | 与 DeveloperID 相同的 macOS 内容面，HTTP-only |
+| `intatis` CLI | `IntatisMCP` | 原生 HTTP/OAuth | `IntatisMCPStdio` + guard | 管理命令、Code/Cowork exact-session owner |
+| `IntatisiOS` | 不链接 | 不链接 | 不链接 | 无 MCP runtime、transport 或产品 UI |
+
+`IntatisProtocol` 中 SDK-independent、可旧日志解码的 MCP payload 仍可由共享
+模块编译；这不等于 iOS 获得 MCP 客户端能力。
+
+每次模型 dispatch 的主链是：
+
+```text
+global MCP catalog
+  -> session attachment + exact per-Agent MCPGrant
+  -> session-owned MCPSessionRuntimeOwner
+  -> authority-isolated connection generation
+  -> complete raw catalog snapshot
+  -> lease/filter constrained Agent catalog view
+  -> immutable AgentRequestToolSnapshot
+  -> direct tools or Codex-compatible tool_search
+  -> AgentLoop + three-layer PermissionEngine
+  -> durable tool_execution_prepared
+  -> exact live authority/grant/schema/catalog/binding revalidation
+  -> external MCP call
+  -> bounded/redacted result or ArtifactStore reference
+  -> durable settlement
+```
+
+`MCPRawCatalogRevision`、`MCPAgentCatalogViewRevision`、`MCPBindingID` 与
+`MCPConnectionGeneration` 各自表达不同事实。provider response 只能回到生成
+它的 immutable snapshot route；catalog refresh、grant/lease/revision/authority
+变化或 revocation 都不能把旧 call 重绑定到新连接。Cowork child grant 只能是
+parent 与 child lease 的显式交集，worker 默认无 MCP；permission reviewer 与
+GoalVerifier 永远无 MCP。
+
+Streamable HTTP 使用原始 origin、request-time DNS 冻结与原生 libcurl socket
+binding；默认 direct、无 cookie/cache、受控 redirect、无自动重放已发送
+operation。响应头中的 `MCP-Session-Id` 在任何 JSON/SSE body 发布前同步校验并
+注册进 session exact-value redactor。OAuth 绑定 exact origin/resource/account/
+scope/generation，token refresh single-flight；macOS MCP secret 使用
+Security.framework data-protection Keychain，CLI 使用 owner-only 认证加密
+store，EventLog/catalog 只保存 opaque reference。
+
+stdio 由 runtime-owned process owner 启动。macOS 以 Seatbelt 限定 workspace、
+launch artifact 与 exact generation-local network gateway；Linux 使用 bwrap
+与 seccomp/ptrace guard 跟踪 fork/clone/exec/connect，并由宿主完成 exact
+sockaddr connect。gateway 的本地 `serve` 只处理有 generation credential 的
+CONNECT egress tunnel，不解析 MCP JSON-RPC，因此不是 MCP Server。取消、
+timeout、task terminal 与 runtime shutdown 都先 drain 子进程/transport，再
+发布上层 terminal。
+
+所有外部 server 文本、URI、MIME、cursor、icon/annotation 结构字段、JSON key
+和 artifact bytes 都在 session boundary 清洗；macOS reader-facing catalog
+还在展示 sink 前用同一 session redactor 再校验。text/binary/structured/
+artifact、单次 result、provider request 与 turn 共享有界预算，sanitization
+扩张按最终字节收费；失败不得先提交 loaded state 或部分 catalog。
+
 ## 2026-07-24 Session runtime 与展示生命周期隔离
 
 macOS session 页面明确分成三层：

@@ -6,6 +6,8 @@ import IntatisProtocol
 import Darwin
 #elseif canImport(Glibc)
 import Glibc
+#elseif canImport(Musl)
+import Musl
 #endif
 
 /// Serializes rebuild/refresh writers across EventLog instances and processes.
@@ -857,11 +859,18 @@ public enum SessionProjectionStore {
                     descriptor,
                     base.advanced(by: offset),
                     rawBuffer.count - offset)
-                #else
+                #elseif canImport(Glibc)
                 let count = Glibc.write(
                     descriptor,
                     base.advanced(by: offset),
                     rawBuffer.count - offset)
+                #elseif canImport(Musl)
+                let count = Musl.write(
+                    descriptor,
+                    base.advanced(by: offset),
+                    rawBuffer.count - offset)
+                #else
+                let count = -1
                 #endif
                 guard count > 0 else { return false }
                 offset += count

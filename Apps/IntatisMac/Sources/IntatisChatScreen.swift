@@ -592,6 +592,11 @@ struct IntatisSettingsPanel: View {
 
                 settingsCard(layout: layout)
 
+                IntatisMCPSettingsView()
+                    .frame(
+                        maxWidth: layout.settingsCardMaxWidth,
+                        alignment: .leading)
+
                 messageRenderingCard
                     .frame(maxWidth: layout.settingsCardMaxWidth, alignment: .leading)
 

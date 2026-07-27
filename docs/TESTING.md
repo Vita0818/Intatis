@@ -1,5 +1,139 @@
 # TESTING
 
+## External MCP client 完整验收
+
+外部 MCP 客户端改动不能只跑一个 transport 或 fixture。最终验收至少覆盖：
+
+```sh
+# SwiftPM 主图与 13 个 test targets
+swift build --disable-sandbox
+swift build --disable-sandbox --product intatis
+swift test --disable-sandbox
+
+# client-only SDK/source/linkage、Codex tool_search、W7、W9、HTTP/OAuth、
+# managed stdio、portable crypto、CLI owner 等可按失败域聚焦重跑
+swift test --disable-sandbox --filter SDKClientOnlySurfaceTests
+swift test --disable-sandbox --filter MCPToolSearchParityTests
+swift test --disable-sandbox --filter MCPW7CatalogResourceTests
+swift test --disable-sandbox --filter MCPW9StandardExtensionsTests
+swift test --disable-sandbox --filter MCPStreamableHTTPTests
+swift test --disable-sandbox --filter MCPOAuthTests
+swift test --disable-sandbox --filter MCPManagedStdioTests
+swift test --disable-sandbox --filter MCPPortableCryptoTests
+swift test --disable-sandbox --filter IntatisCLITests
+
+# pinned official client conformance + Intatis Tasks interoperability + W10 suites
+Tests/MCPConformance/run-w10.sh
+```
+
+`swift test --disable-sandbox` 只关闭 SwiftPM 自己的构建 sandbox，不会让嵌套的
+`sandbox-exec`、loopback socket、Keychain 或子进程自动获得 Codex/CI 宿主
+权限。若日志明确显示 `sandbox_apply: Operation not permitted`、loopback bind
+`EPERM` 或 unsigned Keychain host，应在有相应能力的 runner 重跑；不得修改
+产品 sandbox、网络策略或 Keychain 代码来迎合受限测试宿主。最终报告必须把
+“确定性实现通过”与“外部环境证据受限”分开。
+
+Apple 产品图必须分别使用独立 DerivedData 验证：
+
+```sh
+xcodebuild -project Intatis.xcodeproj -scheme IntatisMac \
+  -configuration Debug -destination 'platform=macOS' \
+  -derivedDataPath /private/tmp/intatis-mcp-mac-developerid \
+  CODE_SIGNING_ALLOWED=NO COMPILER_INDEX_STORE_ENABLE=NO build
+
+xcodebuild -project Intatis.xcodeproj -scheme IntatisMacAppStore \
+  -configuration Debug -destination 'platform=macOS' \
+  -derivedDataPath /private/tmp/intatis-mcp-mac-appstore \
+  CODE_SIGNING_ALLOWED=NO COMPILER_INDEX_STORE_ENABLE=NO build
+
+xcodebuild -project Intatis.xcodeproj -scheme IntatisiOS \
+  -configuration Debug -destination 'generic/platform=iOS Simulator' \
+  -derivedDataPath /private/tmp/intatis-mcp-ios \
+  CODE_SIGNING_ALLOWED=NO COMPILER_INDEX_STORE_ENABLE=NO build
+```
+
+构建成功后还要检查：
+
+- DeveloperID/CLI 能解析 external MCP stdio + HTTP 客户端符号；
+- App Store bundle/linked products 不含 `IntatisMCPStdio`、
+  `IntatisMCPStdioGuard`、本地 launch/guard 符号；
+- iOS target graph/bundle 不含 `IntatisMCP`、Curl/stdio transport 或 MCP UI；
+- 发行产品不含 `IntatisMCPConformanceClient`；
+- entitlements、`Localizable.xcstrings`、NOTICE/ThirdPartyNotices 与 SDK
+  provenance/patch ledger 一致；
+- `scripts/validate-linux-cli.sh` 在最终 Swift source state 上重新生成
+  aarch64/x86_64 静态 ELF 与 SHA-256，不能沿用较早源码的 hash。
+
+official conformance runner 当前固定 `@modelcontextprotocol/conformance@0.1.16`。
+计数必须区分 official client scenarios 与 Intatis 自有扩展：official 为
+`codex-compat` 5 + `standard-extended` 18；3 个 Tasks interoperability
+scenario 另列，不能称为 official。
+
+### 2026-07-27 最终源码结算
+
+- `swift test --disable-sandbox`：1362 tests、16 个显式 opt-in 环境 skip、
+  0 failures。16 个 skip 分别是 1 个真实 Git smoke、13 个真实 browser
+  smokes和 2 个仅允许 signed/unsandboxed host 的 Keychain CRUD；没有 MCP
+  源码测试 skip。
+- `Tests/MCPConformance/run-w10.sh`：official 23/23、Tasks interoperability
+  3/3、七个 focused suites 102/102，全部 0 failures；managed stdio 是
+  40/40。
+- P1 聚焦命令覆盖 `MCPToolSearchParityTests`、
+  `MCPToolResultConversionTests`、`AgentRequestToolSnapshotTests`、
+  `ResponsesToolSearchParityTests`、`MCPProtocolLifecycleTests`、
+  `MCPRuntimeAuthorityTests`、`MCPCLIProcessOwnerTests` 和
+  `MCPNoAttachmentRegressionTests`：80/80、0 skipped、0 failures。真实本机
+  loopback 的 CLI `connect → status → refresh → disconnect` 未跳过，lazy
+  transport negotiated-version 顺序和无 MCP lazy owner 均通过。
+- `swift build --disable-sandbox` 与
+  `swift build --disable-sandbox --product intatis` 均 exit 0。
+- Xcode 26.6 (17F113)、Apple Swift 6.3.3、macOS/iOS Simulator SDK 26.5
+  下，`IntatisMac`、`IntatisMacAppStore`、`IntatisiOS` 三个当前源码 Debug
+  build 均 exit 0。主 dylib SHA-256 分别为
+  `518eb87c097a23189c01c575cbb3e5d7501496e077c5044d612700571cbb53dd`、
+  `0b6cf6ecd6692ff88d5e71e447df022997b0c852fcde775afd8e3f5f65e39db7`
+  和
+  `10afba6a9471ca9652a19efe0a930b9160c727ad9838cc3eca440ee7c592d67c`。
+  这些命令设置 `CODE_SIGNING_ALLOWED=NO`；linker-generated ad-hoc wrapper
+  不是 Developer ID/App Store 分发签名。
+- 最终 Mach-O/target graph 复核：DeveloperID 含 `IntatisMCP` +
+  `IntatisMCPStdio`，支持 stdio+HTTP；App Store 含 `IntatisMCP` 但无
+  `IntatisMCPStdio` 符号，为 HTTP-only；iOS 无 `IntatisMCP`、
+  `IntatisMCPStdio`、`IntatisTools` 符号或 MCP 产品面。
+- 受限 Codex filesystem sandbox 首次无法写
+  `~/.cache/clang/ModuleCache`；上述 SwiftPM 权威结果来自随后获准的真实本机
+  环境。该宿主错误发生在 manifest/test 前，不是源码失败。
+
+## 2026-07-26 独立 conversation renderer lifecycle lab
+
+该实验不进入 SwiftPM、XcodeGen 或 App bundle；验证命令必须在独立目录运行：
+
+```sh
+cd /Users/vita/Vitemis/Intatis/Experiments/WebRendererParity
+npm test
+# 4 files, 46 tests, 0 failures
+
+npm run licenses
+# 266 packages, rejected = []
+
+npm run build
+# TypeScript + Vite succeeded
+# main JS 941.04 kB minified / 290.19 kB gzip
+```
+
+自动化冻结的合同包括：GFM/hard-break/source position、literal raw HTML、URL/image policy、KaTeX HTML+MathML 与错误回退、代码内公式隔离、known/unknown language、canonical copy、CodeMirror Strict Mode cleanup、500 ms streaming tail、append suffix 不重建 editor、30 秒 warm eviction、快速切回取消 timer、manual release/dispose/no-op、stable external-store snapshot、outer shell 复用、旧 session message subtree disconnect、newest-12/older-10 pagination、stream 在 session generation 切换前取消，以及 CodeMirror view 随旧 subtree 销毁。
+
+手工运行只允许：
+
+```sh
+npm run dev
+# only http://127.0.0.1:4173
+```
+
+浏览器验收应读取 DOM、accessibility roles、computed styles、canonical clipboard 和 bounded `window.rendererHarness`，不能以截图作为渲染/释放证据。至少检查：页面只存在一个 `[data-message-subtree]`；保存的旧 subtree 在切换后 `isConnected === false`；30 秒内切回取消旧 eviction；超时或 `Release warm` 后 resident 变 cold；离屏消息不保留 Markdown/KaTeX/CodeMirror child；active editor view 数与 `.cm-editor` DOM 一致；math cache 不超过 256 entries / 512 Ki characters；remote Markdown image 不创建 `<img>` 或网络请求；所有资源仍来自 localhost。
+
+本实验的通过不替代 native `MessageRenderingTests`、SwiftUI/TextKit、VoiceOver、真实 selection/clipboard、最低 macOS/iOS、长期 memory plateau 或 release 验证。当前没有做新 lifecycle 页的手工浏览器验收，且没有运行 Swift build/test，因为本轮没有修改或接线 production Swift target。
+
 ## 2026-07-25 Cowork `@main` 持久模型历史
 
 本轮专项命令使用独立 module cache，并复用仓内已解析的 SwiftPM dependencies：
@@ -411,7 +545,60 @@ plutil -lint /private/tmp/intatis-render-ios-dd/Build/Products/Debug-iphonesimul
 - Agent 文档/媒体工具任务：至少运行 `swift test --filter IntatisToolsTests`、`swift test --filter IntatisAgentKernelTests`、`swift test --filter CapabilityLeaseTests`、`swift test --filter IntatisCoworkTests`、`swift build`；改 macOS/CLI 接入时还应跑 IntatisMac Xcode build。真实 CLI 后端/provider/key/真机无法验证时，必须在最终报告中写明 UNKNOWN。
 - Agent 网络/浏览器工具任务：至少运行 `swift test --filter IntatisToolsTests`、`swift test --filter IntatisPermissionTests`、`swift test --filter CapabilityLeaseTests`、`swift test --filter IntatisCoworkTests`、`swift test --filter IntatisAgentKernelTests`、`swift build`；改 macOS/CLI 接入时还应跑 IntatisMac Xcode build。表单/动态页面能力变更需覆盖 click/type（含敏感目标拒绝）/submit/select-option/press-key/scroll/wait/reload/back/forward/handoff/upload/download/downloads/history 和交互控件摘要输出的 fake-shell 测试；profile 并发语义变更需覆盖同 profile 命令不重叠、不同 profile 不全局串行的 fake-shell 测试。本机允许启动浏览器和访问外网时，可额外运行 `INTATIS_REAL_BROWSER_SMOKE=1 swift test --filter IntatisToolsTests/testRealBrowserBackendSmokeWhenEnabled` 验证真实 Playwright/CDP 后端，运行 `INTATIS_REAL_BROWSER_SMOKE=1 swift test --filter IntatisToolsTests/testRealBrowserSearchWhenEnabled` 验证真实搜索页访问和 search history metadata；允许启动本地 HTTP 服务和浏览器时，可运行 `INTATIS_REAL_BROWSER_SMOKE=1 swift test --filter IntatisToolsTests/testRealBrowserProfilePersistsCookieLocalStorageAndHistoryWhenEnabled` 验证同一 profile 的持久 cookie/localStorage/history 持久化，运行 `INTATIS_REAL_BROWSER_SMOKE=1 swift test --filter IntatisToolsTests/testRealBrowserProfilesRemainIsolatedWhenEnabled` 验证两个 profile 的状态隔离，运行 `INTATIS_REAL_BROWSER_SMOKE=1 swift test --filter IntatisToolsTests/testRealBrowserBackForwardWhenEnabled` 验证真实前进/后退导航栈，并运行 `INTATIS_REAL_BROWSER_SMOKE=1 swift test --filter IntatisToolsTests/testRealBrowserScrollAndWaitWhenEnabled` 验证真实滚动和动态等待；允许启动浏览器时，可运行 `INTATIS_REAL_BROWSER_SMOKE=1 swift test --filter IntatisToolsTests/testRealBrowserUploadDownloadWhenEnabled` 验证真实 file input 上传和 browser download 保存/metadata 路径，运行 `INTATIS_REAL_BROWSER_SMOKE=1 swift test --filter IntatisToolsTests/testRealBrowserSelectAndPressKeyWhenEnabled` 验证真实下拉选择、按键分发和交互控件摘要，运行 `INTATIS_REAL_BROWSER_SMOKE=1 swift test --filter IntatisToolsTests/testRealBrowserSubmitWhenEnabled` 验证本地 HTTP 表单提交和 submit history metadata，运行 `INTATIS_REAL_BROWSER_SMOKE=1 swift test --filter IntatisToolsTests/testRealBrowserDynamicFeedAndOnlineTaskWhenEnabled` 验证真实动态信息流浏览与本地在线任务提交，并运行 `INTATIS_REAL_BROWSER_HANDOFF_SMOKE=1 swift test --filter IntatisToolsTests/testRealBrowserHandoffWhenEnabled` 验证真实 headed handoff profile。验证不同 profile 的真实并发启动时，运行 `INTATIS_REAL_BROWSER_CONCURRENCY_SMOKE=1 swift test --filter IntatisToolsTests/testRealBrowserDifferentProfilesCanLaunchConcurrentlyWhenEnabled`。真实第三方网站表单提交、真实浏览器 smoke 在 Codex sandbox 内可能因浏览器进程无法暴露 DevTools port 或审批失败而无法运行，必要时需按权限提示允许脱离 sandbox 启动浏览器。真实 Playwright/Chromium/Chrome、第三方站点登录、社交媒体、代办网站、真实第三方网站下载/上传/表单提交、长期 profile 清理或真实同时启动多 profile 管理无法验证时，必须在最终报告中写明 UNKNOWN；若只新增工具表面/lease，应额外覆盖 ToolRegistryLease、MessageDelegationSplit、CoworkEndToEnd 的 worker/coordinator 工具面。
 
+## External MCP Linux CLI gate
+
+Linux MCP/CLI 改动必须先运行 portable crypto known-answer tests：
+
+```sh
+swift test --disable-sandbox --filter MCPPortableCryptoTests
+```
+
+双架构交叉构建使用仓内 `scripts/validate-linux-cli.sh`。调用方必须显式
+传入已经过来源/校验和验证的 Swift executable、两个已安装 Static Linux
+SDK ID 和输出目录；脚本不猜测 Swiftly、home 或临时目录：
+
+```sh
+INTATIS_SWIFT_BIN=/absolute/path/to/swift \
+INTATIS_LINUX_SDKS_PATH=/absolute/path/to/swift-sdks \
+INTATIS_LINUX_SDK_AARCH64=<installed-aarch64-sdk-id> \
+INTATIS_LINUX_SDK_X86_64=<installed-x86_64-sdk-id> \
+INTATIS_LINUX_VALIDATION_ROOT=/absolute/path/to/validation-output \
+scripts/validate-linux-cli.sh
+```
+
+脚本分别执行 `swift build --product intatis`，并要求产物确实是目标架构的
+静态 ELF；输出保留每个二进制的 SHA-256。macOS 上成功生成 aarch64 与
+x86_64 静态 ELF 只证明交叉编译/链接，不代表二进制已经执行。真实 CLI
+启动、OAuth/HTTP、stdio、bwrap、DNS/TLS 和进程清理仍须在匹配架构的
+Linux host 上单独运行并报告。
+
+2026-07-27 最终源码使用 Swift 6.3.3 RELEASE static SDK
+`swift-6.3.3-RELEASE_static-linux-0.1.0` 执行：
+
+```sh
+INTATIS_SWIFT_BIN=/private/tmp/intatis-swiftly/toolchains/swift-6.3.3-RELEASE.xctoolchain/usr/bin/swift \
+INTATIS_LINUX_SDKS_PATH=/private/tmp/intatis-swift-sdks \
+INTATIS_LINUX_SDK_AARCH64=aarch64-swift-linux-musl \
+INTATIS_LINUX_SDK_X86_64=x86_64-swift-linux-musl \
+INTATIS_LINUX_VALIDATION_ROOT=/private/tmp/intatis-linux-mcp-validation \
+scripts/validate-linux-cli.sh
+```
+
+最终结果：
+
+- aarch64 static ELF：266,529,224 bytes；SHA-256
+  `8f03fbccb3b8d3301e04ff7e6aca635286771c414ed124407e0fc532718856a9`。
+- x86_64 static ELF：271,031,728 bytes；SHA-256
+  `0a8071e5d01877c823d634f7a4613b267da64f159714939f10b61f8d65f06a20`。
+- product 存在性、静态链接和架构匹配全部通过，脚本 exit 0。
+- `RUNTIME_EXECUTION=NOT_RUN host=Darwin/arm64
+  reason=cross_build_gate_only`。本机没有 bwrap、Docker、Podman、QEMU、
+  Lima 或 Colima，因此 Linux 实机行为、bwrap、真实 stdio/HTTP/OAuth 仍为
+  `I-ENV`。
+
 ## 常见问题
 
-- **Linux 构建**：`IntatisSharedUI` 用 `#if canImport(SwiftUI)` 守卫，包应能在 Linux 无头构建。
+- **Linux 构建**：`IntatisSharedUI` 用 `#if canImport(SwiftUI)` 守卫；
+  External MCP CLI 还要求 `CryptoKit`/`Crypto` 双后端和
+  `Glibc`/`Musl` 双 libc 源码分支通过上述双架构静态构建。
 - **Cowork 原则 vs 实现**：当前实现与 `docs/COWORK_PRINCIPLES.md` 原则有已知差距（见该文档 §6"当前已知 Cowork 问题"）。改动前先核对差距清单。

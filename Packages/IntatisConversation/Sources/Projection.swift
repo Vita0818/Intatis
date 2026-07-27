@@ -126,7 +126,21 @@ public struct ConversationProjection: Equatable, Sendable {
              .goalBudgetLimited, .goalUsageLimited, .goalCompleted, .goalCleared,
              .continuationRunCreated, .continuationRunStarted, .continuationRunCheckpointed,
              .continuationRunCompleted, .continuationRunCancelled, .continuationRunRecovered,
-             .artifactProgress, .turnStats, .turnOutcome:
+             .artifactProgress, .turnStats, .turnOutcome,
+             .mcpServerAttached, .mcpServerDetached, .mcpAttachmentPolicyUpdated,
+             .mcpConsentGranted, .mcpConsentRevoked,
+             .mcpControlOperationRequested, .mcpControlOperationSettled,
+             .mcpGrantGranted, .mcpGrantRevoked,
+             .mcpRememberedApprovalGranted,
+             .mcpRememberedApprovalRevoked,
+             .mcpRootsPolicyUpdated, .mcpNetworkPolicyUpdated, .mcpPromptInserted,
+             .mcpSamplingRequested, .mcpSamplingDecided, .mcpSamplingSettled,
+             .mcpElicitationRequested, .mcpElicitationDecided, .mcpElicitationSettled,
+             .mcpRemoteTaskRequested, .mcpRemoteTaskMapped,
+             .mcpRemoteTaskStateChanged, .mcpRemoteTaskSettled,
+             .mcpClientTaskRequested, .mcpClientTaskStateChanged, .mcpClientTaskSettled,
+             .mcpConnectionTerminal, .mcpCatalogTerminal, .mcpExecutionUncertain,
+             .mcpRequestProgress:
             break   // tool/permission/agent/task/progress/stats events are not shown in the chat text view
         }
     }
