@@ -67,6 +67,12 @@ enum WorkspaceAccess {
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
         panel.prompt = prompt
+        IntatisMacProcessDiagnostics.shared
+            .setKnownModalPresented(true)
+        defer {
+            IntatisMacProcessDiagnostics.shared
+                .setKnownModalPresented(false)
+        }
         guard panel.runModal() == .OK, let url = panel.url else { return nil }
         return try? WorkspaceAccessLease(scopedURL: url)
         #else

@@ -13,6 +13,29 @@ third-party names, logos, icons, screenshots, UI assets, trademarks, or brand
 copy as its product identity. Open-source reuse does not bypass Intatis'
 permission, workspace, event-log, secret, or Apple-platform boundaries.
 
+## OpenAI Codex Skill Creator derivative
+
+The project-local `.agents/skills/intatis-skill-creator/` Skill is a modified
+derivative of the public `skill-creator` sample in OpenAI Codex release
+`rust-v0.145.0`, fixed at commit
+`25af12f7e61572b0bc18ddb1008be543b91519b0`.
+
+- **OpenAI Codex `skill-creator` sample** (`openai/codex`): Apache License
+  2.0, Copyright 2025 OpenAI. Reuse type: `vendored` + `derived`.
+- Intatis renamed and adapted the instructions, references, initializer,
+  validator, and metadata generator for project-local roots, Intatis
+  invocation and permission semantics, secret scanning, resource bounds, and
+  a Python-standard-library-only runtime.
+- The upstream `agents/openai.yaml`, icons, images, branded assets, other
+  system Skills, and Codex runtime are not copied or distributed by this
+  adoption.
+
+Exact source paths, upstream blob identities, the modification and execution
+boundary, and upgrade procedure are recorded in
+`ThirdPartyNotices/OpenAICodexSkillCreator.md`. The complete Apache-2.0 text is
+preserved at
+`ThirdPartyNotices/Licenses/Codex-61a44880-Apache-2.0.txt`.
+
 ## Current Markdown and math renderer integration
 
 The current working tree replaces the former MarkdownUI/highlight.js renderer
@@ -28,10 +51,12 @@ resolution of this package.
   `c7b12f7b3d77caa188fd1fc056d0f7ce305ef5cd`: MIT. The Intatis candidate is a
   modified derivative whose initial cutover removed optional runtimes and
   branded assets, then selectively restored only exact iosMath 2.5.0 for the
-  bounded single-dollar path. It hardens the ownership/concurrency boundary
-  and retains the upstream Markdown parser and SwiftUI/AppKit/UIKit rendering
-  structure; the removed highlighting, animation, image, citation, and legacy
-  regex-math runtimes remain absent.
+  code-aware LaTeX path. It hardens the ownership/concurrency boundary
+  and the macOS native paragraph measurement boundary, giving SwiftUI sole
+  ownership of paragraph width while retaining only one exact-width height
+  measurement. It retains the upstream Markdown parser and
+  SwiftUI/AppKit/UIKit rendering structure; the removed highlighting,
+  animation, image, citation, and legacy regex-math runtimes remain absent.
   **Derivative location: `Vendor/SwiftStreamingMarkdown` in the Intatis root
   revision being built or distributed.**
 - **swift-markdown 0.8.0** (`swiftlang/swift-markdown`), revision
@@ -143,14 +168,13 @@ as provenance for the other.
   no HighlightSwift or highlight.js package, and the former vendored
   `highlight.min.js` and a11y CSS resources are removed. See
   `ThirdPartyNotices/SyntaxHighlighting.md`.
-- The Microsoft renderer supports code-aware inline TeX delimited by a normal
-  single dollar pair, for example `$x^2$`, through iosMath on macOS and iOS.
-  Admission is capped at 32 formulas per message and 8 KiB UTF-8 per formula;
-  crossing either cap leaves that message's candidates literal.
-  Fenced and inline code remain byte-exact literal text. Block `$$...$$`,
-  `\(...\)`, and `\[...\]` forms are not enabled by this first math
-  profile and remain literal/ordinary Markdown input. The permanent
-  `.plainSafe` mode bypasses Markdown and math parsing entirely.
+- The Microsoft renderer supports code-aware TeX delimited by `$...$` or
+  `\(...\)` for inline math and `$$...$$` or `\[...\]` for display math
+  through iosMath on macOS and iOS. The derivative adds no formula-count,
+  per-formula UTF-8, or fixed attachment-size cap. Fenced and inline code
+  remain byte-exact literal text; currency, escaped delimiters, and malformed
+  formulas remain literal. The permanent `.plainSafe` mode bypasses Markdown
+  and math parsing entirely.
 - The derivative also removes Shimmer, SnapshotTesting, upstream branded color
   and media asset catalogs, and their associated first-release surface. Its
   directly owned package resource remains the localization catalog. iosMath
@@ -166,15 +190,16 @@ as provenance for the other.
   EventLog records, capability leases, permission decisions, workspace paths,
   credentials, or provider requests.
 - The current first-release profile disables images, citations, animation,
-  syntax highlighting, and block math. Single-dollar inline math is native;
-  code blocks remain plain text with a native copy control.
+  and syntax highlighting. Inline and display LaTeX math are native; code
+  blocks remain plain text with a native copy control.
 - iosMath uses AppKit/UIKit/Core Text and its bundled OpenType math data. It
   does not add a WebView, JavaScript runtime, network request, shell, Git,
   workspace-agent, or Cowork capability. The bundled math fonts are
   typesetting resources and do not change Intatis' separately selected
   product-interface font. Intatis hosts formulas as live TextKit 2 attachment
-  views with a 1024×256-point bound, semantic appearance, and Dynamic Type;
-  it does not retain a formula raster cache.
+  views using iosMath intrinsic layout, semantic appearance, and Dynamic Type,
+  without a derivative formula-count, source-size, or fixed attachment-size
+  cap; it does not retain a formula raster cache.
 - Distributed macOS and iOS artifacts must make this file and the referenced
   detailed notices readable in the application. Merely keeping them in the
   source tree is not sufficient.

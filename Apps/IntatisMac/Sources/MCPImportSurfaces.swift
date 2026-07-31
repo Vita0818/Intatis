@@ -312,6 +312,12 @@ private final class MCPImportViewModel:
         panel.allowedContentTypes = [.json]
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
+        IntatisMacProcessDiagnostics.shared
+            .setKnownModalPresented(true)
+        defer {
+            IntatisMacProcessDiagnostics.shared
+                .setKnownModalPresented(false)
+        }
         guard panel.runModal() == .OK,
               let value = panel.url else { return }
         fileURL = value

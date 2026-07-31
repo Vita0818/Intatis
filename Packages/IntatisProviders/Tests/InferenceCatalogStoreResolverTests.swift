@@ -277,6 +277,11 @@ final class InferenceCatalogStoreResolverTests: XCTestCase {
 
         let low = try await registry.agentInference(for: XCTUnwrap(snapshot.currentProfileRef(for: lowID)))
         let high = try await registry.agentInference(for: XCTUnwrap(snapshot.currentProfileRef(for: highID)))
+        let lowProvider = try XCTUnwrap(low.provider as? OpenAIWireProvider)
+        let highProvider = try XCTUnwrap(high.provider as? OpenAIWireProvider)
+        XCTAssertEqual(lowProvider.runtimePolicy, .agentStreaming)
+        XCTAssertEqual(highProvider.runtimePolicy, .agentStreaming)
+        XCTAssertEqual(lowProvider.runtimePolicy.requestTimeoutSeconds, 180)
         try await performRequest(low)
         try await performRequest(high)
 
@@ -320,6 +325,93 @@ final class InferenceCatalogStoreResolverTests: XCTestCase {
         let efforts = try http.requests.map { try XCTUnwrap(requestBody($0)["reasoning_effort"]) }
         XCTAssertEqual(efforts.filter { $0 == .string("low") }.count, 20)
         XCTAssertEqual(efforts.filter { $0 == .string("high") }.count, 20)
+    }
+
+    func testExactAgentProfileCanonicalizesSDKReasoningAliasAtWireBoundary()
+        async throws {
+        let profileID =
+            InferenceProfileID(
+                rawValue: "sdk-reasoning-alias")
+        let profile = InferenceProfileDraft(
+            inferenceProfileID: profileID,
+            inferenceConnectionID:
+                InferenceConnectionID(
+                    rawValue: "route"),
+            modelID:
+                ModelID(
+                    rawValue: "same/model"),
+            profileRequestOptions: [
+                "reasoningEffort":
+                    .string("xhigh"),
+                "provider": .object([
+                    "only": .array([
+                        .string("deepseek"),
+                    ]),
+                    "allow_fallbacks": .bool(false),
+                    "require_parameters": .bool(true),
+                ]),
+            ],
+            declaredCapabilities: [
+                .chat,
+                .toolCalling,
+            ])
+        let catalog =
+            try InferenceCatalogReconciler.reconcile(
+                draft: makeDraft(
+                    profiles: [profile],
+                    requestAdapter:
+                        .openAICompatible))
+        let snapshot =
+            try InferenceCatalogSnapshot(
+                catalog: catalog)
+        let http = InferenceCapturingHTTP()
+        let registry = makeRegistry(
+            snapshot: snapshot,
+            resolver:
+                MutableInferenceSecretResolver(
+                    values: [
+                        "ROUTE_KEY":
+                            "host-secret",
+                    ]),
+            http: http)
+        let resolved =
+            try await registry.agentInference(
+                for: XCTUnwrap(
+                    snapshot.currentProfileRef(
+                        for: profileID)))
+        let frozenProfile =
+            try snapshot.resolve(
+                resolved.binding
+                    .inferenceProfileRef)
+                .profile
+
+        XCTAssertEqual(
+            frozenProfile
+                .effectiveRequestOptions[
+                    "reasoningEffort"],
+            .string("xhigh"))
+        XCTAssertNil(
+            frozenProfile
+                .effectiveRequestOptions[
+                    "reasoning_effort"])
+
+        try await performRequest(resolved)
+
+        let body = try requestBody(
+            XCTUnwrap(http.requests.first))
+        XCTAssertEqual(
+            body["reasoning_effort"],
+            .string("xhigh"))
+        XCTAssertNil(body["reasoningEffort"])
+        XCTAssertEqual(
+            body["provider"],
+            .object([
+                "only": .array([
+                    .string("deepseek"),
+                ]),
+                "allow_fallbacks": .bool(false),
+                "require_parameters": .bool(true),
+            ]))
     }
 
     func testHostOwnedRequestFieldsAndOutputCeilingClampApprovedProfileOptions() async throws {
@@ -555,26 +647,192 @@ final class InferenceCatalogStoreResolverTests: XCTestCase {
             .chatCompletionsOnly)
     }
 
+    func testExactResolverCarriesModelContextPolicyAtomically()
+        async throws {
+        let profileID =
+            InferenceProfileID(
+                rawValue: "context-policy")
+        let policy =
+            AgentModelContextPolicy(
+                contextWindowTokens: 100_000,
+                autoCompactTokenLimit: 80_000,
+                compHash: "context-v1")
+        let catalog =
+            try InferenceCatalogReconciler.reconcile(
+                draft: makeDraft(profiles: [
+                    InferenceProfileDraft(
+                        inferenceProfileID:
+                            profileID,
+                        inferenceConnectionID:
+                            InferenceConnectionID(
+                                rawValue: "route"),
+                        modelID:
+                            ModelID(
+                                rawValue: "same/model"),
+                        modelContextPolicy:
+                            policy,
+                        declaredCapabilities: [
+                            .chat,
+                            .toolCalling,
+                        ]),
+                ]))
+        let snapshot =
+            try InferenceCatalogSnapshot(
+                catalog: catalog)
+        let registry = makeRegistry(
+            snapshot: snapshot,
+            resolver:
+                MutableInferenceSecretResolver(
+                    values: [
+                        "ROUTE_KEY": "secret",
+                    ]),
+            http: InferenceCapturingHTTP())
+
+        let resolved =
+            try await registry.agentInference(
+                for: XCTUnwrap(
+                    snapshot.currentProfileRef(
+                        for: profileID)))
+
+        XCTAssertEqual(
+            resolved.modelContextPolicy,
+            policy)
+        XCTAssertEqual(
+            resolved.modelContextPolicy
+                .resolvedAutoCompactTokenLimit,
+            80_000)
+    }
+
+    func testVisibleAgentRouteAttachesContextPolicyOnlyForOneExactBaseProfile()
+        async throws
+    {
+        let policy = AgentModelContextPolicy(
+            contextWindowTokens: 120_000,
+            autoCompactTokenLimit: 96_000,
+            compHash: "route-context-v1")
+        let catalog = try InferenceCatalogReconciler.reconcile(
+            draft: makeDraft(profiles: [
+                InferenceProfileDraft(
+                    inferenceProfileID:
+                        InferenceProfileID(rawValue: "base"),
+                    inferenceConnectionID:
+                        InferenceConnectionID(rawValue: "route"),
+                    modelID: ModelID(rawValue: "same/model"),
+                    modelContextPolicy: policy,
+                    declaredCapabilities: [.chat, .toolCalling]),
+            ]))
+        let snapshot = try InferenceCatalogSnapshot(catalog: catalog)
+        let registry = ProviderRegistry(
+            config: ProviderConfig(
+                endpoints: [
+                    ProviderEndpoint(
+                        id: "route",
+                        baseURL:
+                            URL(string:
+                                "https://route.example.test/v1")!,
+                        apiKeyRef:
+                            .environment("ROUTE_KEY"),
+                        wire: .openai),
+                ],
+                models: ResolvedModels(
+                    chat: ModelRef(
+                        endpoint: "route",
+                        model: ModelID(rawValue: "same/model")))),
+            resolver:
+                MutableInferenceSecretResolver(
+                    values: ["ROUTE_KEY": "secret"]),
+            http: InferenceCapturingHTTP(),
+            inferenceCatalogSnapshot: snapshot)
+
+        let route = try await registry.defaultAgentRuntimeRoute()
+
+        XCTAssertEqual(route.model, ModelID(rawValue: "same/model"))
+        XCTAssertEqual(route.modelContextPolicy, policy)
+        let provider = try XCTUnwrap(
+            route.provider as? OpenAIWireProvider)
+        XCTAssertEqual(provider.runtimePolicy, .agentStreaming)
+    }
+
+    func testAmbiguousBaseProfilesKeepVisibleAgentCompactionDisabled()
+        async throws
+    {
+        let policy = AgentModelContextPolicy(
+            contextWindowTokens: 120_000)
+        let profiles = ["base-a", "base-b"].map { profileID in
+            InferenceProfileDraft(
+                inferenceProfileID:
+                    InferenceProfileID(rawValue: profileID),
+                inferenceConnectionID:
+                    InferenceConnectionID(rawValue: "route"),
+                modelID: ModelID(rawValue: "same/model"),
+                modelContextPolicy: policy,
+                declaredCapabilities: [.chat, .toolCalling])
+        }
+        let catalog = try InferenceCatalogReconciler.reconcile(
+            draft: makeDraft(profiles: profiles))
+        let snapshot = try InferenceCatalogSnapshot(catalog: catalog)
+        let registry = ProviderRegistry(
+            config: ProviderConfig(
+                endpoints: [
+                    ProviderEndpoint(
+                        id: "route",
+                        baseURL:
+                            URL(string:
+                                "https://route.example.test/v1")!,
+                        apiKeyRef:
+                            .environment("ROUTE_KEY"),
+                        wire: .openai),
+                ],
+                models: ResolvedModels(
+                    chat: ModelRef(
+                        endpoint: "route",
+                        model: ModelID(rawValue: "same/model")))),
+            resolver:
+                MutableInferenceSecretResolver(
+                    values: ["ROUTE_KEY": "secret"]),
+            http: InferenceCapturingHTTP(),
+            inferenceCatalogSnapshot: snapshot)
+
+        let route = try await registry.defaultAgentRuntimeRoute()
+
+        XCTAssertEqual(route.model, ModelID(rawValue: "same/model"))
+        XCTAssertEqual(route.modelContextPolicy, .unspecified)
+    }
+
     private func temporaryRoot() -> URL {
         FileManager.default.temporaryDirectory
             .appendingPathComponent("intatis-inference-store-\(UUID().uuidString)", isDirectory: true)
     }
 
-    private func makeDraft(profiles: [InferenceProfileDraft]) -> InferenceCatalogDraft {
+    private func makeDraft(
+        profiles: [InferenceProfileDraft],
+        requestAdapter:
+            ProviderRequestAdapter =
+                .legacyOpenAIWire
+    ) -> InferenceCatalogDraft {
         InferenceCatalogDraft(
             connections: [connectionDraft(
                 id: "route",
                 baseURL: URL(string: "https://route.example.test/v1")!,
-                credentialAccount: "ROUTE_KEY")],
+                credentialAccount: "ROUTE_KEY",
+                requestAdapter:
+                    requestAdapter)],
             profiles: profiles)
     }
 
     private func connectionDraft(id: String,
                                  baseURL: URL,
-                                 credentialAccount: String) -> InferenceConnectionDraft {
+                                 credentialAccount: String,
+                                 requestAdapter:
+                                     ProviderRequestAdapter =
+                                         .legacyOpenAIWire)
+        -> InferenceConnectionDraft
+    {
         InferenceConnectionDraft(
             inferenceConnectionID: InferenceConnectionID(rawValue: id),
             wire: .openai,
+            requestAdapter:
+                requestAdapter,
             baseURL: baseURL,
             credentialRef: .environment(credentialAccount),
             trust: InferenceConnectionTrust(

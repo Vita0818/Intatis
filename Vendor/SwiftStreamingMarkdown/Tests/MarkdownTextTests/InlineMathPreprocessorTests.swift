@@ -12,18 +12,31 @@ final class InlineMathPreprocessorTests: XCTestCase {
     InlineMathPreprocessor.preprocess(
       source: source,
       protectedUTF8Ranges: [],
-      config: .singleDollarInline,
+      config: .latex,
       namespace: namespace
     )
   }
 
-  func testDelimiterMatrixAcceptsConservativeSingleDollarSyntax() {
-    let cases: [(source: String, formula: String, literal: String)] = [
-      ("$x$", "x", "$x$"),
-      ("$x_i$", "x_i", "$x_i$"),
-      (#"$\frac{a}{b}$"#, #"\frac{a}{b}"#, #"$\frac{a}{b}$"#),
-      ("中文🙂 $E=mc^2$ 后缀", "E=mc^2", "$E=mc^2$"),
-      (#"$x\$y$"#, #"x\$y"#, #"$x\$y$"#)
+  func testDelimiterMatrixAcceptsCommonInlineAndDisplaySyntax() {
+    let cases: [
+      (
+        source: String,
+        formula: String,
+        literal: String,
+        presentation: MathPresentation
+      )
+    ] = [
+      ("$x$", "x", "$x$", .inline),
+      (#"\( x_i \)"#, "x_i", #"\( x_i \)"#, .inline),
+      (
+        #"$$\frac{a}{b}$$"#,
+        #"\frac{a}{b}"#,
+        #"$$\frac{a}{b}$$"#,
+        .display
+      ),
+      (#"\[E=mc^2\]"#, "E=mc^2", #"\[E=mc^2\]"#, .display),
+      ("中文🙂 $E=mc^2$ 后缀", "E=mc^2", "$E=mc^2$", .inline),
+      (#"$x\$y$"#, #"x\$y"#, #"$x\$y$"#, .inline)
     ]
 
     for item in cases {
@@ -35,13 +48,13 @@ final class InlineMathPreprocessorTests: XCTestCase {
         item.literal
       )
       XCTAssertEqual(
-        output?.catalog.entries.first?.rendering,
-        .attachment
+        output?.catalog.entries.first?.presentation,
+        item.presentation
       )
     }
   }
 
-  func testDelimiterMatrixKeepsCurrencyEscapesWhitespaceAndMalformedPairsLiteral() {
+  func testDelimiterMatrixKeepsCurrencyEscapesAndMalformedPairsLiteral() {
     let cases = [
       #"\$x$"#,
       "$29.99",
@@ -52,12 +65,44 @@ final class InlineMathPreprocessorTests: XCTestCase {
       "x$",
       "$x$1",
       "$x\nx$",
-      "$$x$$"
+      #"\\(x\)"#,
+      #"\(x"#,
+      #"\[x"#,
+      "$$x"
     ]
 
     for source in cases {
       XCTAssertNil(preprocess(source), source)
     }
+  }
+
+  func testDisplayDelimitersMaySpanLines() {
+    let source = #"""
+    $$
+    \frac{
+      a
+    }{b}
+    $$
+
+    \[
+    x^2 + y^2
+    \]
+    """#
+    let output = preprocess(source)
+    let multilineFormula = #"""
+    \frac{
+      a
+    }{b}
+    """#
+
+    XCTAssertEqual(
+      output?.catalog.entries.map(\.source),
+      [multilineFormula, "x^2 + y^2"]
+    )
+    XCTAssertEqual(
+      output?.catalog.entries.map(\.presentation),
+      [.display, .display]
+    )
   }
 
   func testUnicodeIndicesAndProtectedRangesRemainByteSafe() {
@@ -66,7 +111,7 @@ final class InlineMathPreprocessorTests: XCTestCase {
     let output = InlineMathPreprocessor.preprocess(
       source: source,
       document: document,
-      config: .singleDollarInline
+      config: .latex
     )
 
     XCTAssertEqual(output?.catalog.entries.map(\.source), ["向量_α"])
@@ -77,7 +122,7 @@ final class InlineMathPreprocessorTests: XCTestCase {
     let crlfOutput = InlineMathPreprocessor.preprocess(
       source: crlfSource,
       document: Document(parsing: crlfSource),
-      config: .singleDollarInline
+      config: .latex
     )
     XCTAssertEqual(crlfOutput?.catalog.entries.map(\.source), ["a", "y"])
     XCTAssertTrue(crlfOutput?.transformedSource.contains("`$code$`") == true)
@@ -109,7 +154,7 @@ final class InlineMathPreprocessorTests: XCTestCase {
     let output = InlineMathPreprocessor.preprocess(
       source: source,
       document: document,
-      config: .singleDollarInline
+      config: .latex
     )
 
     XCTAssertEqual(output?.catalog.entries.map(\.source), ["a", "b"])
@@ -166,7 +211,7 @@ final class InlineMathPreprocessorTests: XCTestCase {
       let output = InlineMathPreprocessor.preprocess(
         source: item.source,
         document: document,
-        config: .singleDollarInline
+        config: .latex
       )
       XCTAssertEqual(
         output?.catalog.entries.map(\.source),
@@ -190,7 +235,7 @@ final class InlineMathPreprocessorTests: XCTestCase {
       InlineMathPreprocessor.preprocess(
         source: unclosedFence,
         document: fencedDocument,
-        config: .singleDollarInline
+        config: .latex
       )
     )
 
@@ -199,7 +244,7 @@ final class InlineMathPreprocessorTests: XCTestCase {
     let output = InlineMathPreprocessor.preprocess(
       source: unmatchedBacktick,
       document: unmatchedDocument,
-      config: .singleDollarInline
+      config: .latex
     )
     XCTAssertEqual(output?.catalog.entries.map(\.source), ["outside"])
 
@@ -213,75 +258,22 @@ final class InlineMathPreprocessorTests: XCTestCase {
     )
   }
 
-  func testFormulaUTF8BudgetUsesAllOrNothingLiteralMode() {
-    for byteCount in [
-      MathRenderConfig.maximumFormulaUTF8Bytes - 1,
-      MathRenderConfig.maximumFormulaUTF8Bytes
-    ] {
-      let source = String(repeating: "x", count: byteCount)
-      let output = preprocess("$\(source)$")
-      XCTAssertEqual(output?.catalog.entries.first?.rendering, .attachment)
-    }
+  func testFormulaSourceHasNoIntatisByteAdmissionCap() {
+    let formula = String(repeating: "x", count: 12 * 1_024)
+    let output = preprocess("$\(formula)$")
 
-    let oversized = String(
-      repeating: "x",
-      count: MathRenderConfig.maximumFormulaUTF8Bytes + 1
-    )
-    let output = preprocess("$small$ then $\(oversized)$")
-    XCTAssertEqual(output?.catalog.entries.count, 2)
-    XCTAssertTrue(
-      output?.catalog.entries.allSatisfy {
-        $0.rendering == .literalOnly
-      } == true
-    )
+    XCTAssertEqual(output?.catalog.entries.count, 1)
+    XCTAssertEqual(output?.catalog.entries.first?.source, formula)
   }
 
-  func testFormulaCountBudgetUsesAllOrNothingLiteralMode() {
-    for count in [31, MathRenderConfig.maximumFormulaCount] {
-      let source = (0..<count)
-        .map { "$x_{\($0)}$" }
-        .joined(separator: " ")
-      let output = preprocess(source)
-      XCTAssertEqual(output?.catalog.entries.count, count)
-      XCTAssertTrue(
-        output?.catalog.entries.allSatisfy {
-          $0.rendering == .attachment
-        } == true
-      )
-    }
-
-    let count = MathRenderConfig.maximumFormulaCount + 1
+  func testFormulaCountHasNoLegacyThirtyTwoAdmissionCap() {
+    let count = 64
     let source = (0..<count)
       .map { "$x_{\($0)}$" }
       .joined(separator: " ")
     let output = preprocess(source)
+
     XCTAssertEqual(output?.catalog.entries.count, count)
-    XCTAssertTrue(
-      output?.catalog.entries.allSatisfy {
-        $0.rendering == .literalOnly
-      } == true
-    )
-  }
-
-  func testLiteralOnlyCatalogRestoresExactSourceAndAttributes() {
-    let oversized = String(
-      repeating: "x",
-      count: MathRenderConfig.maximumFormulaUTF8Bytes + 1
-    )
-    guard let output = preprocess("prefix $\(oversized)$ suffix") else {
-      return XCTFail("Expected a literal-only catalog")
-    }
-    let key = NSAttributedString.Key("InlineMathPreprocessorTests")
-    let attributed = output.catalog.attributedString(
-      replacingTokensIn: output.transformedSource,
-      attributes: [key: "preserved"]
-    )
-
-    XCTAssertEqual(attributed?.string, "prefix $\(oversized)$ suffix")
-    XCTAssertEqual(
-      attributed?.attribute(key, at: 0, effectiveRange: nil) as? String,
-      "preserved"
-    )
   }
 
   func testRequestNamespacesDoNotResolveTokensAcrossCatalogs() {
@@ -318,7 +310,7 @@ final class InlineMathPreprocessorTests: XCTestCase {
       InlineMathPreprocessor.preprocess(
         source: "$x$",
         protectedUTF8Ranges: [0..<100],
-        config: .singleDollarInline,
+        config: .latex,
         namespace: "INVALID"
       )
     )
@@ -334,7 +326,7 @@ final class InlineMathPreprocessorTests: XCTestCase {
       InlineMathPreprocessor.preprocess(
         source: "$x$",
         document: constructed,
-        config: .singleDollarInline
+        config: .latex
       )
     )
   }
@@ -342,10 +334,10 @@ final class InlineMathPreprocessorTests: XCTestCase {
   func testDisabledAndNoDelimiterFastPathsProduceNoCatalog() {
     let ordinary = "A paragraph with **bold**, `code`, and no math."
     XCTAssertFalse(
-      InlineMathPreprocessor.mightContainSingleDollarDelimiter(ordinary)
+      InlineMathPreprocessor.mightContainMathDelimiter(ordinary)
     )
     XCTAssertFalse(
-      InlineMathPreprocessor.mightContainSingleDollarDelimiter(#"\$x\$"#)
+      InlineMathPreprocessor.mightContainMathDelimiter(#"\$x\$"#)
     )
     XCTAssertNil(
       InlineMathPreprocessor.preprocess(

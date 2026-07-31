@@ -16,7 +16,7 @@ final class InlineMathParserTests: XCTestCase {
           let source = "$x_{\(index)}$"
           let document = await MarkdownDocumentParser.parse(
             text: source,
-            config: MarkdownRenderConfig(mathConfig: .singleDollarInline)
+            config: MarkdownRenderConfig(mathConfig: .latex)
           )
           let attachmentCount = document.attributedStrings.reduce(into: 0) {
             count, string in
@@ -61,7 +61,7 @@ final class InlineMathParserTests: XCTestCase {
       text: source,
       option: .init(
         speculativeRewrite: false,
-        mathConfig: .singleDollarInline
+        mathConfig: .latex
       )
     )
 
@@ -73,17 +73,38 @@ final class InlineMathParserTests: XCTestCase {
       result.inlineMathCatalog?.entries.map(\.originalLiteral),
       [#"$\vec{x}_i * y^{2}$"#]
     )
+  }
+
+  func testParserCatalogCarriesAllSupportedDelimiterPresentations() {
+    let source =
+      #"inline \(x\), dollar $y$, display $$z$$, bracket \[w\]"#
+    let result = MarkdownParserImpl().parseSynchronously(
+      text: source,
+      option: .init(
+        speculativeRewrite: false,
+        mathConfig: .latex
+      )
+    )
+
     XCTAssertEqual(
-      result.inlineMathCatalog?.entries.first?.rendering,
-      .attachment
+      result.inlineMathCatalog?.entries.map(\.source),
+      ["x", "y", "z", "w"]
+    )
+    XCTAssertEqual(
+      result.inlineMathCatalog?.entries.map(\.presentation),
+      [.inline, .inline, .display, .display]
+    )
+    XCTAssertEqual(
+      result.inlineMathCatalog?.entries.map(\.originalLiteral),
+      [#"\(x\)"#, "$y$", "$$z$$", #"\[w\]"#]
     )
   }
 
   func testParserDisabledAndRejectedCandidatesRetainFirstAST() {
     let parser = MarkdownParserImpl()
     for (source, config) in [
-      ("ordinary **Markdown**", MathRenderConfig.singleDollarInline),
-      ("price is $29.99", MathRenderConfig.singleDollarInline),
+      ("ordinary **Markdown**", MathRenderConfig.latex),
+      ("price is $29.99", MathRenderConfig.latex),
       ("formula $x$", MathRenderConfig.disabled)
     ] {
       let result = parser.parseSynchronously(
@@ -107,7 +128,7 @@ final class InlineMathParserTests: XCTestCase {
       text: "## Partial **heading with $x_i$",
       option: .init(
         speculativeRewrite: true,
-        mathConfig: .singleDollarInline
+        mathConfig: .latex
       )
     )
 
@@ -134,7 +155,7 @@ final class InlineMathParserTests: XCTestCase {
       text: source,
       option: .init(
         speculativeRewrite: false,
-        mathConfig: .singleDollarInline
+        mathConfig: .latex
       )
     )
 
@@ -150,7 +171,7 @@ final class InlineMathParserTests: XCTestCase {
     let document = await MarkdownDocumentParser.parse(
       text: source,
       config: MarkdownRenderConfig(
-        mathConfig: .singleDollarInline
+        mathConfig: .latex
       )
     )
 
@@ -185,7 +206,7 @@ final class InlineMathParserTests: XCTestCase {
     """#
     let document = await MarkdownDocumentParser.parse(
       text: source,
-      config: MarkdownRenderConfig(mathConfig: .singleDollarInline)
+      config: MarkdownRenderConfig(mathConfig: .latex)
     )
 
     var attachmentCounts: [String: Int] = [:]
@@ -226,7 +247,7 @@ final class InlineMathParserTests: XCTestCase {
 
   @MainActor
   func testTableMathCapturesFinalHeaderAndBodyForegroundColors() async {
-    let config = MarkdownRenderConfig(mathConfig: .singleDollarInline)
+    let config = MarkdownRenderConfig(mathConfig: .latex)
     let expectedHeaderColor = MDColor(config.tableStyle.headerTextColor)
     let expectedBodyColor = MDColor(config.tableStyle.regularTextColor)
     let document = await MarkdownDocumentParser.parse(
@@ -260,7 +281,7 @@ final class InlineMathParserTests: XCTestCase {
   func testListAccessibilityUsesLocalizedMathDescriptionInsteadOfRawSource() async {
     let document = await MarkdownDocumentParser.parse(
       text: "- Before $x_i$ after",
-      config: MarkdownRenderConfig(mathConfig: .singleDollarInline)
+      config: MarkdownRenderConfig(mathConfig: .latex)
     )
     guard case .unorderedList(_, let items, _) = document.renderables.first,
           case .paragraph(_, let contents) = items.first?.children.first else {
@@ -288,7 +309,7 @@ final class InlineMathParserTests: XCTestCase {
     let fenced = "```swift\n\(fencedBody)\n```"
     let fencedDocument = await MarkdownDocumentParser.parse(
       text: fenced,
-      config: MarkdownRenderConfig(mathConfig: .singleDollarInline)
+      config: MarkdownRenderConfig(mathConfig: .latex)
     )
     guard case .codeBlock(_, let language, let code) =
       fencedDocument.renderables.first
@@ -301,7 +322,7 @@ final class InlineMathParserTests: XCTestCase {
     let inlinePayload = #"$x_i$ and $$not_math$$"#
     let inlineDocument = await MarkdownDocumentParser.parse(
       text: "`\(inlinePayload)`",
-      config: MarkdownRenderConfig(mathConfig: .singleDollarInline)
+      config: MarkdownRenderConfig(mathConfig: .latex)
     )
     guard case .paragraph(_, let content) =
       inlineDocument.renderables.first
@@ -312,21 +333,22 @@ final class InlineMathParserTests: XCTestCase {
   }
 
   @MainActor
-  func testMessageBudgetFallbackStillRendersOrdinaryMarkdownAndExactMathLiterals() async {
-    let formulas = (0...MathRenderConfig.maximumFormulaCount)
+  func testMoreThanThirtyTwoFormulasAllMaterialize() async {
+    let count = 64
+    let formulas = (0..<count)
       .map { "$x_{\($0)}$" }
       .joined(separator: " ")
     let source = "**bold** \(formulas)"
     let document = await MarkdownDocumentParser.parse(
       text: source,
-      config: MarkdownRenderConfig(mathConfig: .singleDollarInline)
+      config: MarkdownRenderConfig(mathConfig: .latex)
     )
 
     guard case .paragraph(_, let content) = document.renderables.first else {
       return XCTFail("Expected a paragraph")
     }
     XCTAssertEqual(
-      content.string,
+      content.plainTextRestoringInlineMath,
       "bold \(formulas)"
     )
     var attachmentCount = 0
@@ -338,7 +360,7 @@ final class InlineMathParserTests: XCTestCase {
         attachmentCount += 1
       }
     }
-    XCTAssertEqual(attachmentCount, 0)
+    XCTAssertEqual(attachmentCount, count)
   }
 
   func testEveryBuilderPreservesImageMathAndRequestCatalogFields() {
@@ -353,13 +375,13 @@ final class InlineMathParserTests: XCTestCase {
         .init(
           source: "x",
           originalLiteral: "$x$",
-          rendering: .literalOnly
+          presentation: .inline
         )
       ]
     )
     let config = MarkdownRenderConfig(
       imageConfig: image,
-      mathConfig: .singleDollarInline
+      mathConfig: .latex
     ).withInlineMathCatalog(catalog)
 
     let copies = [
@@ -376,25 +398,25 @@ final class InlineMathParserTests: XCTestCase {
       config.withTextSelectionConfig(value: config.textSelectionConfig),
       config.withThematicBreakColor(value: config.thematicBreakColor),
       config.withImageConfig(image),
-      config.withMathConfig(.singleDollarInline)
+      config.withMathConfig(.latex)
     ]
 
     for copy in copies {
       XCTAssertEqual(copy.imageConfig, image)
-      XCTAssertEqual(copy.mathConfig, .singleDollarInline)
+      XCTAssertEqual(copy.mathConfig, .latex)
       XCTAssertEqual(copy.inlineMathCatalog, catalog)
     }
   }
 
   func testFirstReleaseProfilePreservesExplicitMathKillSwitch() {
     let enabled = MarkdownRenderConfig(
-      mathConfig: .singleDollarInline
+      mathConfig: .latex
     ).firstReleaseParseConfiguration()
     let disabled = MarkdownRenderConfig(
       mathConfig: .disabled
     ).firstReleaseParseConfiguration()
 
-    XCTAssertEqual(enabled.mathConfig, .singleDollarInline)
+    XCTAssertEqual(enabled.mathConfig, .latex)
     XCTAssertEqual(disabled.mathConfig, .disabled)
     XCTAssertFalse(enabled.imageConfig.enabled)
     XCTAssertFalse(enabled.citationConfig.isEnabled)

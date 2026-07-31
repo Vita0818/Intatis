@@ -9,6 +9,7 @@ import IntatisTools
 import IntatisPermission
 import IntatisConversation
 import IntatisAgentKernel
+import IntatisSkills
 import IntatisArtifacts
 import IntatisMCP
 
@@ -86,6 +87,12 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
     private let terminal = ProcessTerminalSessionManager()
     private var registry: ProviderRegistry
     private var subscription: Task<Void, Never>?
+    private var projectionPump:
+        SessionProjectionPump<
+            CodeSessionProjectionState,
+            ContinuousClock>?
+    private var projectionCommitFence:
+        SessionProjectionCommitFence?
     private var permissionWaiters: [RequestID: CodePermissionWaiter] = [:]
     private var permissionQueue: [PendingPermission] = []
     private var runningOperation: Task<Void, Never>?
@@ -132,28 +139,121 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
 
     func start() {
         guard !isShutdown, subscription == nil else { return }
+        let identity = SessionProjectionIdentity(
+            sessionID: sessionID)
+        let pump = SessionProjectionPump<
+            CodeSessionProjectionState,
+            ContinuousClock>(
+                identity: identity,
+                clock: ContinuousClock())
+        projectionCommitFence =
+            SessionProjectionCommitFence(
+                identity: identity)
+        projectionPump = pump
         subscription = Task { @MainActor [weak self] in
             guard let self else { return }
-            let replayed = await self.log.replay()
-            var projection = CodeProjection.build(from: replayed)
-            var permissions = PermissionProjection.build(from: replayed, markNeedsRerun: true)
-            var turnStats = TurnStatsProjection.build(from: replayed)
-            self.items = projection.items
-            self.pendingPermission = permissions.latest
-            self.permissionNotice = permissions.latestResolved
-            self.latestTurnStats = turnStats.latest
-            let stream = await self.log.stream(from: (replayed.last?.seq ?? -1) + 1)
-            for await envelope in stream {
-                projection.apply(envelope)
-                permissions.apply(envelope)
-                turnStats.apply(envelope)
-                self.items = projection.items
-                self.pendingPermission = permissions.latest
-                self.permissionNotice = permissions.latestResolved
-                self.latestTurnStats = turnStats.latest
-                if case .agentStatus(let p) = envelope.event { self.agentState = p.state.rawValue }
+            do {
+                let replayed = await self.log.replay()
+                let initial = try await pump.loadInitialReplay(
+                    replayed)
+                self.commitProjectionSnapshot(initial)
+                let stream = await self.log.stream(
+                    from: (replayed.last?.seq ?? -1) + 1)
+                let publications =
+                    try await pump.publications(
+                        consuming: stream)
+                for await output in publications {
+                    guard !Task.isCancelled else { break }
+                    switch output {
+                    case .snapshot(let snapshot):
+                        self.commitProjectionSnapshot(
+                            snapshot)
+                    case .failed(let failure):
+                        guard self.projectionCommitFence?
+                                .identity == identity else {
+                            continue
+                        }
+                        self.composerError =
+                            failure.localizedDescription
+                    }
+                }
+            } catch {
+                guard self.projectionCommitFence?
+                        .identity == identity,
+                      !Task.isCancelled else {
+                    return
+                }
+                self.composerError =
+                    error.localizedDescription
             }
         }
+    }
+
+    private func commitProjectionSnapshot(
+        _ snapshot: CodeSessionProjectionSnapshot
+    ) {
+        let commitStart =
+            DispatchTime.now().uptimeNanoseconds
+        var published = false
+        defer {
+            let commitEnd =
+                DispatchTime.now()
+                    .uptimeNanoseconds
+            snapshot.projectionBatch?.finish(
+                commitDurationNanoseconds:
+                    commitEnd >= commitStart
+                    ? commitEnd - commitStart
+                    : 0,
+                published: published)
+        }
+        guard projectionCommitFence?
+                .accept(
+                    identity:
+                        snapshot.identity,
+                    throughSeq:
+                        snapshot.throughSeq)
+                == true else {
+            return
+        }
+        published = true
+
+        if let nextItems = snapshot.items,
+           nextItems != items {
+            items = nextItems
+        }
+        if let permission = snapshot.permission {
+            let nextPending = permission.latest
+            if nextPending != pendingPermission {
+                pendingPermission = nextPending
+            }
+            let nextNotice =
+                permission.latestResolved
+            if nextNotice != permissionNotice {
+                permissionNotice = nextNotice
+            }
+        }
+        if let turnStats = snapshot.turnStats,
+           turnStats.latest != latestTurnStats {
+            latestTurnStats = turnStats.latest
+        }
+        if let nextAgentState = snapshot.agentState,
+           nextAgentState != agentState {
+            agentState = nextAgentState
+        }
+    }
+
+    /// Reattaching a process-owned session to a window must present the
+    /// pump's latest exact snapshot immediately. Continuous subscription
+    /// normally keeps this view model current; this idempotent flush closes
+    /// the race where the window returns while a trailing delta publication is
+    /// still pending. The commit fence rejects stale or duplicate snapshots.
+    func flushProjectionForPresentation() async {
+        guard !isShutdown,
+              let projectionPump,
+              let snapshot = await projectionPump.flushNow() else {
+            return
+        }
+        commitProjectionSnapshot(snapshot)
     }
 
     func stop() {
@@ -230,6 +330,12 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
             return
         }
         isShutdown = true
+        if let projectionPump,
+           let finalSnapshot =
+                await projectionPump.finishAndFlush()
+        {
+            commitProjectionSnapshot(finalSnapshot)
+        }
         subscription?.cancel()
         let runningSubscription = subscription
         subscription = nil
@@ -255,6 +361,8 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
             }
             self.runningOperation = nil
             self.isWorking = false
+            self.projectionPump = nil
+            self.projectionCommitFence = nil
             self.workspaceAccess?.release()
             self.workspaceAccess = nil
         }
@@ -301,11 +409,11 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
             guard let self else { return }
             var didEnterAgentLoop = false
             do {
-                let provider = try await self.registry.defaultAgentProvider()
-                let model = await self.registry.agentModel()
+                let route =
+                    try await self.registry.defaultAgentRuntimeRoute()
                 let agent = Agent(name: AgentID(rawValue: "Coder"),
                                   workspaceRoot: self.workspaceRoot,
-                                  model: model,
+                                  model: route.model,
                                   profile: .reviewed)
                 var capabilityLease =
                     CapabilityLease.coordinator(
@@ -333,12 +441,22 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
                     rootPath: self.workspaceRoot.path,
                     access: .readWrite)
                 let allowsShell = PlatformProfile.current.allowsShell
-                let baseRegistry =
+                let skillSnapshot =
+                    try await SkillCatalogService.shared.snapshot(
+                        configuration: .standard(
+                            workspaceRoot: self.workspaceRoot,
+                            access: AppConfig.skillRootAccess),
+                        catalogBudget:
+                            route.modelContextPolicy
+                                .skillCatalogMetadataBudget)
+                let baseRegistry = skillSnapshot.augmenting(
                     ToolRegistry.standard(
-                        includesTerminal: allowsShell)
+                        includesTerminal: allowsShell))
                 let runtime = AgentRuntime.code(
                     registry: baseRegistry,
-                    allowsShell: allowsShell)
+                    allowsShell: allowsShell,
+                    modelContextPolicy:
+                        route.modelContextPolicy)
                 let mcpSource:
                     MCPAgentRequestToolSnapshotSource?
                 if durableMCP.attachments.isEmpty {
@@ -351,39 +469,48 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
                     }
                     mcpSource = try await makeSource()
                 }
+                let dispatchCapabilityLease = capabilityLease
+                let toolSnapshotProvider:
+                    AgentRequestToolSnapshotProvider?
+                if let source = mcpSource {
+                    toolSnapshotProvider = {
+                        providerCapabilities,
+                        outputBudget in
+                        try await source.snapshot(
+                            for: MCPAgentDispatchInput(
+                                agentID:
+                                    agent.name,
+                                capabilityLease:
+                                    dispatchCapabilityLease,
+                                workspaceLease:
+                                    workspaceLease,
+                                baseRegistry:
+                                    baseRegistry,
+                                activationReason:
+                                    .send),
+                            providerCapabilities:
+                                providerCapabilities,
+                            turnResultBudget:
+                                outputBudget)
+                    }
+                } else {
+                    toolSnapshotProvider = nil
+                }
                 let loop = runtime.makeLoop(
                     log: self.log,
-                    provider: provider,
+                    provider: route.provider,
                     responder: self,
                     agent: agent,
+                    context: ContextBuilder(
+                        skillSnapshot: skillSnapshot,
+                        runtimeEnvironment: .code),
                     terminal: self.terminal,
                     imageGenerator: ProviderImageGenerationToolService(registry: self.registry),
                     sessionNaming: self.sessionNaming,
                     capabilityLease: capabilityLease,
                     workspaceLease: workspaceLease,
                     toolSnapshotProvider:
-                        mcpSource.map { source in
-                            {
-                                providerCapabilities,
-                                outputBudget in
-                                try await source.snapshot(
-                                    for: MCPAgentDispatchInput(
-                                        agentID:
-                                            agent.name,
-                                        capabilityLease:
-                                            capabilityLease,
-                                        workspaceLease:
-                                            workspaceLease,
-                                        baseRegistry:
-                                            baseRegistry,
-                                        activationReason:
-                                            .send),
-                                    providerCapabilities:
-                                        providerCapabilities,
-                                    turnResultBudget:
-                                        outputBudget)
-                            }
-                        })
+                        toolSnapshotProvider)
                 try await self.log.append(
                     .userMessage(durableUserMessage))
                 self.consumeMCPExternalContexts(
@@ -505,15 +632,22 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
                     "workspace_code_\(sessionID.rawValue)"),
             rootPath: workspaceRoot.path,
             access: .readWrite)
+        let allowsShell =
+            PlatformProfile.current.allowsShell
+        let skillSnapshot =
+            try await SkillCatalogService.shared.snapshot(
+                configuration: .standard(
+                    workspaceRoot: workspaceRoot,
+                    access: AppConfig.skillRootAccess))
         return MCPAgentDispatchInput(
             agentID: descriptor.agentID,
             capabilityLease:
                 capabilityLease,
             workspaceLease: workspaceLease,
-            baseRegistry: ToolRegistry.standard(
-                includesTerminal:
-                    PlatformProfile.current
-                        .allowsShell),
+            baseRegistry: skillSnapshot.augmenting(
+                ToolRegistry.standard(
+                    includesTerminal:
+                        allowsShell)),
             activationReason: reason)
     }
 

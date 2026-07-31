@@ -140,6 +140,44 @@ public protocol ShellRunner: Sendable {
     func run(_ command: String, cwd: URL) async throws -> ShellResult
 }
 
+/// Opaque invocation accepted by the dedicated browser backend. Production
+/// callers cannot turn this into a general shell: only Intatis browser tools
+/// construct the fixed Node source, encoded structured arguments, and exact
+/// workspace access plan.
+struct BrowserBackendInvocation: Sendable {
+    let javaScript: String
+    let encodedArguments: String
+    let readableWorkspacePaths: [String]
+    let writableWorkspacePaths: [String]
+
+    var injectedShellCommand: String {
+        """
+        set -e
+        command -v node >/dev/null 2>&1 || { echo "node is not installed; install Node.js to use Intatis browser tools" >&2; exit 127; }
+        INTATIS_BROWSER_ARGS='\(encodedArguments)' node <<'INTATIS_BROWSER_INJECTED_NODE'
+        \(javaScript)
+        INTATIS_BROWSER_INJECTED_NODE
+        """
+    }
+}
+
+protocol BrowserBackendRunner: Sendable {
+    func run(_ invocation: BrowserBackendInvocation,
+             cwd: URL) async throws -> ShellResult
+}
+
+/// Compatibility seam for injected test/custom shell runners. Shipping
+/// ProcessShellRunner hosts never use this adapter; they always receive the
+/// dedicated browser process runner below.
+struct InjectedShellBrowserBackendRunner: BrowserBackendRunner {
+    let shell: ShellRunner
+
+    func run(_ invocation: BrowserBackendInvocation,
+             cwd: URL) async throws -> ShellResult {
+        try await shell.run(invocation.injectedShellCommand, cwd: cwd)
+    }
+}
+
 /// Immutable host identity for a terminal process. The model receives only the
 /// opaque session ID; it cannot choose or widen this owner binding.
 public struct TerminalSessionOwner: Equatable, Sendable {
@@ -341,6 +379,10 @@ public struct ToolContext: Sendable {
     /// Keeping this separate prevents a document/LaTeX wrapper from inheriting
     /// browser network authority merely because both are process-backed.
     public let networkStructuredShell: ShellRunner
+    /// Dedicated backend for Intatis-generated Playwright/CDP browser
+    /// invocations. It accepts only the opaque structured invocation above,
+    /// never a model-authored shell string.
+    let browserBackend: BrowserBackendRunner
     /// Long-lived, runtime-owned terminal service used by `exec_command` and
     /// `write_stdin`. It is optional so isolated tool hosts must opt in rather
     /// than silently creating a process manager with the wrong lifetime.
@@ -357,6 +399,11 @@ public struct ToolContext: Sendable {
     /// Durable executor operation identifier used to make session renames
     /// idempotent across retries and reconciliation.
     public let executionID: String?
+    /// Exact MCP server/tool identifiers frozen for the provider response that
+    /// selected this tool call. Skill readers consume this narrow value for
+    /// dependency preflight; it never contains transport configuration or
+    /// credentials and defaults to an explicitly unavailable host.
+    public let mcpAvailability: MCPToolAvailabilitySnapshot
     /// Immutable host authorization for the exact executor invocation. Tools
     /// that need a host-resolved target (for example delegate_task(to:auto))
     /// must consume this snapshot instead of resolving a different target from
@@ -367,6 +414,7 @@ public struct ToolContext: Sendable {
                 shell: ShellRunner = ProcessShellRunner(),
                 structuredShell: ShellRunner? = nil,
                 networkStructuredShell: ShellRunner? = nil,
+                browserBackendShell: ShellRunner? = nil,
                 terminal: (any TerminalSessionManaging)? = nil,
                 git: GitService = ProcessGitService(),
                 messenger: AgentMessenger? = nil,
@@ -376,6 +424,8 @@ public struct ToolContext: Sendable {
                 imageGenerator: ImageGenerationToolService? = nil,
                 sessionNaming: SessionNamingService? = nil,
                 executionID: String? = nil,
+                mcpAvailability:
+                    MCPToolAvailabilitySnapshot = .unavailable,
                 authorization: ResolvedToolAuthorization? = nil) {
         let effectiveLease = workspaceLease ?? WorkspaceLease(
             rootPath: workspaceRoot.resolvingSymlinksInPath().standardizedFileURL.path,
@@ -403,21 +453,41 @@ public struct ToolContext: Sendable {
             resolvedStructuredShell = shell
         }
         self.structuredShell = resolvedStructuredShell
+        let resolvedNetworkStructuredShell: ShellRunner
         if let networkStructuredShell {
             if let processShell = networkStructuredShell as? StructuredProcessShellRunner {
-                self.networkStructuredShell = processShell.scoped(to: effectiveLease)
+                resolvedNetworkStructuredShell = processShell.scoped(to: effectiveLease)
             } else if let processShell = networkStructuredShell as? ProcessShellRunner {
-                self.networkStructuredShell = processShell.scoped(to: effectiveLease)
+                resolvedNetworkStructuredShell = processShell.scoped(to: effectiveLease)
             } else {
-                self.networkStructuredShell = networkStructuredShell
+                resolvedNetworkStructuredShell = networkStructuredShell
             }
         } else if shell is ProcessShellRunner, structuredShell == nil {
-            self.networkStructuredShell = StructuredProcessShellRunner(
+            resolvedNetworkStructuredShell = StructuredProcessShellRunner(
                 allowsNetwork: true,
                 workspaceLease: effectiveLease)
         } else {
             // Preserve the pre-existing single fake-runner injection behavior.
-            self.networkStructuredShell = resolvedStructuredShell
+            resolvedNetworkStructuredShell = resolvedStructuredShell
+        }
+        self.networkStructuredShell = resolvedNetworkStructuredShell
+        if let browserBackendShell {
+            let resolvedShell: ShellRunner
+            if let processShell = browserBackendShell as? StructuredProcessShellRunner {
+                resolvedShell = processShell.scoped(to: effectiveLease)
+            } else if let processShell = browserBackendShell as? ProcessShellRunner {
+                resolvedShell = processShell.scoped(to: effectiveLease)
+            } else {
+                resolvedShell = browserBackendShell
+            }
+            self.browserBackend = InjectedShellBrowserBackendRunner(shell: resolvedShell)
+        } else if shell is ProcessShellRunner {
+            self.browserBackend = BrowserBackendProcessRunner(
+                workspaceLease: effectiveLease)
+        } else {
+            // Preserve the pre-existing single fake-runner injection behavior.
+            self.browserBackend = InjectedShellBrowserBackendRunner(
+                shell: resolvedNetworkStructuredShell)
         }
         self.terminal = terminal
         if let processGit = git as? ProcessGitService {
@@ -432,6 +502,7 @@ public struct ToolContext: Sendable {
         self.imageGenerator = imageGenerator
         self.sessionNaming = sessionNaming
         self.executionID = executionID
+        self.mcpAvailability = mcpAvailability
         self.authorization = authorization
     }
 }

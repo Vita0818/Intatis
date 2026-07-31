@@ -104,7 +104,7 @@ public struct AgentTurnInterruptedError: Error, Sendable, Equatable, LocalizedEr
 
 private struct ModelHistoryRecordingScope: Sendable {
     var turnID: TurnID
-    var taskID: TaskID
+    var taskID: TaskID?
     var submissionID: SubmissionID
     var taskAttempt: Int
 }
@@ -425,6 +425,7 @@ public struct AgentLoop: Sendable {
     private let sessionNaming: SessionNamingService?
     private let reasoningEffort: ReasoningEffort?
     private let includeUsage: Bool
+    private let modelContextPolicy: AgentModelContextPolicy
     private let maxIterations: Int
     private let capabilityLease: CapabilityLease?
     private let workspaceLease: WorkspaceLease?
@@ -455,6 +456,7 @@ public struct AgentLoop: Sendable {
                 sessionNaming: SessionNamingService? = nil,
                 reasoningEffort: ReasoningEffort? = nil,
                 includeUsage: Bool = false,
+                modelContextPolicy: AgentModelContextPolicy = .unspecified,
                 maxIterations: Int = 50,
                 capabilityLease: CapabilityLease? = nil,
                 workspaceLease: WorkspaceLease? = nil,
@@ -484,6 +486,7 @@ public struct AgentLoop: Sendable {
         self.sessionNaming = sessionNaming
         self.reasoningEffort = reasoningEffort
         self.includeUsage = includeUsage
+        self.modelContextPolicy = modelContextPolicy
         self.maxIterations = maxIterations
         self.capabilityLease = capabilityLease
         self.workspaceLease = workspaceLease
@@ -510,16 +513,32 @@ public struct AgentLoop: Sendable {
         let turnID = (taskAttempt ?? 1) == 1
             ? (userMessage?.turnID ?? TurnID.new())
             : TurnID.new()
-        let effectiveSubmissionID = submissionID ?? userMessage?.submissionID
+        let effectiveSubmissionID =
+            submissionID
+            ?? userMessage?.submissionID
+            ?? (
+                context.runtimeEnvironment.mode == .code
+                    && context.conversationHistoryPolicy == .conversation
+                    && recordUserMessage
+                    ? SubmissionID.new()
+                    : nil
+            )
         let start = Date()
         var firstTokenAt: Date?
         var usage: Usage?
         var turnStatsAppended = false
 
         do {
-        var recoveredCoworkEvents: [Envelope]?
-        if context.runtimeEnvironment.mode == .cowork,
-           context.taskContract?.id != nil {
+        let modelHistoryScope = try modelHistoryRecordingScope(
+            turnID: turnID,
+            effectiveSubmissionID: effectiveSubmissionID)
+        var recoveredModelHistoryEvents: [Envelope]?
+        if modelHistoryScope != nil
+            || (
+                context.runtimeEnvironment.mode == .cowork
+                    && context.taskContract?.id != nil
+            )
+        {
             // A missing/corrupt/unknown event must not be confused with a
             // shorter model history. Verify a complete sequence-zero snapshot
             // before this run adds any new events or asks a provider to
@@ -528,9 +547,9 @@ public struct AgentLoop: Sendable {
             guard replay.hasCompleteKnownHistory else {
                 throw EventLogError.unsupportedEventTypes
             }
-            recoveredCoworkEvents = replay.envelopes
+            recoveredModelHistoryEvents = replay.envelopes
         } else {
-            recoveredCoworkEvents = nil
+            recoveredModelHistoryEvents = nil
         }
         var acceptedCurrentUserMessage = userMessage
         if recordUserMessage {
@@ -542,17 +561,81 @@ public struct AgentLoop: Sendable {
                 durableUserMessage.turnID = turnID
             }
             let appended = try await log.append(.userMessage(durableUserMessage))
-            recoveredCoworkEvents?.append(appended)
+            recoveredModelHistoryEvents?.append(appended)
             acceptedCurrentUserMessage = durableUserMessage
         }
-        let history = try await projectedHistory(
-            recoveredEvents: recoveredCoworkEvents,
-            excludingCurrentAndLaterSubmissionsFrom: effectiveSubmissionID)
-        let modelHistoryScope = try modelHistoryRecordingScope(
-            turnID: turnID,
-            effectiveSubmissionID: effectiveSubmissionID)
+        var modelHistoryProjection = try await projectedModelHistoryState(
+            currentSubmissionID: effectiveSubmissionID,
+            recoveredEvents: recoveredModelHistoryEvents)
+        var history: [AgentMessage]
+        if let modelHistoryProjection {
+            history = modelHistoryProjection.messages
+        } else {
+            history = try await projectedHistory(
+                recoveredEvents: recoveredModelHistoryEvents,
+                excludingCurrentAndLaterSubmissionsFrom:
+                    effectiveSubmissionID)
+        }
+        let mcpTurnResultBudget =
+            MCPToolResultAggregateBudget(
+                scope: .turn,
+                maximumBytes:
+                    MCPToolResultAggregateLimits
+                        .maximumTurnBytes)
+        // Stable Code/Cowork main-thread history must measure the exact tool
+        // surface that the first ordinary provider request will receive. Freeze
+        // that request-owned snapshot before pre-turn compaction, then consume
+        // the same value on the first loop iteration. A snapshot-resolution
+        // failure therefore stops before current-turn model-history items are
+        // committed and cannot fall back to the base registry.
+        var frozenRequestToolSnapshot: AgentRequestToolSnapshot?
+        let explicitSkillNeedsMCPAvailability =
+            context
+                .explicitSkillActivationRequiresMCPAvailability(
+                    in: userText)
+        if modelHistoryScope != nil
+            || explicitSkillNeedsMCPAvailability {
+            frozenRequestToolSnapshot = try await resolveToolSnapshot(
+                outputBudget: mcpTurnResultBudget)
+        }
+        if modelHistoryScope != nil,
+           let projection = modelHistoryProjection {
+            let preTurnContext = context.initialMessages(
+                history: history,
+                userText: userText,
+                includeCurrentUser: false,
+                includeCurrentTurnContext: false)
+            guard let frozenRequestToolSnapshot else {
+                throw AgentModelHistoryProjectionError.invalidItem(
+                    "model-history-preturn-tools",
+                    "stable main-thread tool snapshot is missing")
+            }
+            let preTurnTools = providerToolSpecs(
+                for: frozenRequestToolSnapshot)
+            if shouldCompact(
+                messages: preTurnContext,
+                tools: preTurnTools)
+            {
+                let compacted = try await compactModelHistory(
+                    projection: projection,
+                    summaryHistory: preTurnContext,
+                    contextualReplacementMessages: [],
+                    tools: preTurnTools)
+                usage = Usage.adding(usage, compacted.usage)
+                modelHistoryProjection = compacted.projection
+                history = compacted.projection.messages
+                recoveredModelHistoryEvents?.append(compacted.envelope)
+            }
+        }
+        let resolvedSkillActivation =
+            context.resolveExplicitSkillActivation(
+                in: userText,
+                mcpAvailability:
+                    frozenRequestToolSnapshot?
+                        .mcpAvailability
+                        ?? .unavailable)
         if let modelHistoryScope {
-            guard let recoveredCoworkEvents else {
+            guard let recoveredEvents = recoveredModelHistoryEvents else {
                 throw AgentModelHistoryProjectionError.missingAcceptedSubmission(
                     modelHistoryScope.submissionID)
             }
@@ -561,8 +644,24 @@ public struct AgentLoop: Sendable {
                 agentID: agent.name,
                 expectedText: userText,
                 preferredPayload: acceptedCurrentUserMessage,
-                events: recoveredCoworkEvents)
-            try await log.append(.modelHistoryItem(.message(
+                events: recoveredEvents)
+            var durableItems: [Event] = []
+            if let explicitSkillContext =
+                resolvedSkillActivation.prompt
+            {
+                durableItems.append(.modelHistoryItem(.message(
+                    itemID:
+                        "model-history-context-skill:\(turnID.rawValue)",
+                    turnID: turnID,
+                    agent: agent.name,
+                    taskID: modelHistoryScope.taskID,
+                    submissionID: modelHistoryScope.submissionID,
+                    taskAttempt: modelHistoryScope.taskAttempt,
+                    role: .user,
+                    content: explicitSkillContext,
+                    messageClassification: .contextual)))
+            }
+            durableItems.append(.modelHistoryItem(.message(
                 itemID: "model-history-user:\(turnID.rawValue)",
                 turnID: turnID,
                 agent: agent.name,
@@ -571,7 +670,22 @@ public struct AgentLoop: Sendable {
                 taskAttempt: modelHistoryScope.taskAttempt,
                 role: .user,
                 content: userText,
-                attachmentIDs: acceptedCurrentUserMessage?.attachments)))
+                attachmentIDs: acceptedCurrentUserMessage?.attachments,
+                messageClassification: .realUser)))
+            let appendedItems = try await log.append(durableItems)
+            recoveredModelHistoryEvents?.append(contentsOf: appendedItems)
+            if var projection = modelHistoryProjection {
+                projection.latestAgentHistorySequence =
+                    appendedItems.last?.seq
+                        ?? projection.latestAgentHistorySequence
+                projection.realUserMessages.append(
+                    AgentModelHistoryRealUserMessage(
+                        content: userText,
+                        submissionID: modelHistoryScope.submissionID,
+                        attachmentIDs:
+                            acceptedCurrentUserMessage?.attachments))
+                modelHistoryProjection = projection
+            }
         }
         try await log.append(.agentStatus(AgentStatusPayload(agent: agent.name, state: .thinking)))
 
@@ -582,38 +696,33 @@ public struct AgentLoop: Sendable {
             externalContexts:
                 acceptedCurrentUserMessage?
                     .untrustedExternalContexts
-                    ?? [])
+                    ?? [],
+            resolvedSkillActivation:
+                resolvedSkillActivation)
         let denialCircuitBreaker = ToolDenialCircuitBreaker()
         let sideEffectEvidence = SideEffectEvidenceLedger()
-        let mcpTurnResultBudget =
-            MCPToolResultAggregateBudget(
-                scope: .turn,
-                maximumBytes:
-                    MCPToolResultAggregateLimits
-                        .maximumTurnBytes)
         var usedToolCallIDs = Set<String>()
         var syntheticToolCallOrdinal = 0
         if context.runtimeEnvironment.mode == .cowork,
            let taskID = context.taskContract?.id,
-           let recoveredCoworkEvents {
+           let recoveredModelHistoryEvents {
             await sideEffectEvidence.restore(
-                from: recoveredCoworkEvents,
+                from: recoveredModelHistoryEvents,
                 taskID: taskID,
                 throughAttempt: taskAttempt)
         }
 
-        for _ in 0..<maxIterations {
+        for iteration in 0..<maxIterations {
             try Task.checkCancellation()
             let toolSnapshot: AgentRequestToolSnapshot
-            if let toolSnapshotProvider {
-                toolSnapshot = try await toolSnapshotProvider(
-                    provider.toolCallingCapabilities,
-                    mcpTurnResultBudget)
+            if let frozen = frozenRequestToolSnapshot {
+                toolSnapshot = frozen
+                frozenRequestToolSnapshot = nil
             } else {
-                toolSnapshot = AgentRequestToolSnapshot(registry: registry)
+                toolSnapshot = try await resolveToolSnapshot(
+                    outputBudget: mcpTurnResultBudget)
             }
-            let specs = toolSnapshot.providerToolSpecs
-                ?? context.toolSpecs(toolSnapshot.registry)
+            let specs = providerToolSpecs(for: toolSnapshot)
             var assistantText = ""
             var pendingToolCalls: [ToolCall] = []
             var responseUsage: Usage?
@@ -807,7 +916,9 @@ public struct AgentLoop: Sendable {
                 denialCircuitBreaker: denialCircuitBreaker,
                 sideEffectEvidence: sideEffectEvidence,
                 modelHistoryScope: modelHistoryScope,
-                registry: toolSnapshot.registry)
+                registry: toolSnapshot.registry,
+                mcpAvailability:
+                    toolSnapshot.mcpAvailability)
             for (toolCall, observation) in zip(pendingToolCalls, observations) {
                 try Task.checkCancellation()
                 if toolCall.kind == .toolSearch {
@@ -823,6 +934,59 @@ public struct AgentLoop: Sendable {
                         id: toolCall.id,
                         content: observation.text))
                 }
+            }
+            // Resolve the exact tool surface for the next ordinary provider
+            // request before deciding whether its input requires compaction.
+            // The same request-owned snapshot is frozen for the next loop
+            // iteration, so neither the trigger nor the 95% replacement
+            // postcondition can race a dynamic catalog refresh. The final
+            // allowed tool iteration has no continuation request to prepare.
+            guard iteration + 1 < maxIterations else {
+                continue
+            }
+            try Task.checkCancellation()
+            let nextToolSnapshot = try await resolveToolSnapshot(
+                outputBudget: mcpTurnResultBudget)
+            let nextSpecs = providerToolSpecs(for: nextToolSnapshot)
+            frozenRequestToolSnapshot = nextToolSnapshot
+            if modelHistoryScope != nil,
+               var projection = modelHistoryProjection,
+               shouldCompact(messages: convo, tools: nextSpecs)
+            {
+                let replay = try await log.replayForProjectionChecked()
+                guard replay.hasCompleteKnownHistory else {
+                    throw EventLogError.unsupportedEventTypes
+                }
+                projection.latestAgentHistorySequence =
+                    Self.latestModelHistorySequence(
+                        agentID: agent.name,
+                        events: replay.envelopes)
+                let currentContexts =
+                    context.currentTurnContextMessages(
+                        userText: userText,
+                        externalContexts:
+                            acceptedCurrentUserMessage?
+                                .untrustedExternalContexts
+                                ?? [],
+                        resolvedSkillActivation:
+                            resolvedSkillActivation)
+                let compacted = try await compactModelHistory(
+                    projection: projection,
+                    summaryHistory: convo,
+                    contextualReplacementMessages:
+                        currentContexts,
+                    tools: nextSpecs)
+                usage = Usage.adding(usage, compacted.usage)
+                modelHistoryProjection = compacted.projection
+                recoveredModelHistoryEvents?.append(compacted.envelope)
+                // The replacement already contains the canonical current-turn
+                // context and real user immediately before its final summary.
+                // Rebuild only fresh trusted system/developer instructions.
+                convo = context.initialMessages(
+                    history: compacted.projection.messages,
+                    userText: userText,
+                    includeCurrentUser: false,
+                    includeCurrentTurnContext: false)
             }
         }
 
@@ -856,10 +1020,43 @@ public struct AgentLoop: Sendable {
         }
     }
 
+    private func resolveToolSnapshot(
+        outputBudget: MCPToolResultAggregateBudget
+    ) async throws -> AgentRequestToolSnapshot {
+        if let toolSnapshotProvider {
+            return try await toolSnapshotProvider(
+                provider.toolCallingCapabilities,
+                outputBudget)
+        }
+        return AgentRequestToolSnapshot(registry: registry)
+    }
+
+    private func providerToolSpecs(
+        for snapshot: AgentRequestToolSnapshot
+    ) -> [ToolSpec] {
+        snapshot.providerToolSpecs
+            ?? context.toolSpecs(snapshot.registry)
+    }
+
     private func modelHistoryRecordingScope(
         turnID: TurnID,
         effectiveSubmissionID: SubmissionID?
     ) throws -> ModelHistoryRecordingScope? {
+        if context.conversationHistoryPolicy == .conversation,
+           context.runtimeEnvironment.mode == .code {
+            guard let submissionID = effectiveSubmissionID else {
+                // Host-only control probes may intentionally bypass durable
+                // user-message recording. They keep the legacy ephemeral Code
+                // behavior and cannot create a provenance-bearing checkpoint.
+                return nil
+            }
+            return ModelHistoryRecordingScope(
+                turnID: turnID,
+                taskID: nil,
+                submissionID: submissionID,
+                taskAttempt: 1)
+        }
+
         guard context.conversationHistoryPolicy == .coworkMainThread else {
             return nil
         }
@@ -885,6 +1082,202 @@ public struct AgentLoop: Sendable {
             taskID: contract.id,
             submissionID: submissionID,
             taskAttempt: attempt)
+    }
+
+    private func shouldCompact(
+        messages: [AgentMessage],
+        tools: [ToolSpec]
+    ) -> Bool {
+        guard context.conversationHistoryPolicy != .taskScoped,
+              let limit =
+                modelContextPolicy
+                    .automaticCompactionTriggerTokens else {
+            return false
+        }
+        return AgentTokenEstimator.approximateInputTokens(
+            messages: messages,
+            tools: tools) >= limit
+    }
+
+    private func compactModelHistory(
+        projection: AgentModelHistoryProjection,
+        summaryHistory: [AgentMessage],
+        contextualReplacementMessages: [AgentMessage],
+        tools: [ToolSpec]
+    ) async throws -> (
+        projection: AgentModelHistoryProjection,
+        usage: Usage?,
+        envelope: Envelope
+    ) {
+        let maximumReplacementInputTokens: Int?
+        if let hardLimit =
+            modelContextPolicy.hardUsableContextWindowTokens {
+            let fixedPrefix = context.initialMessages(
+                history: [],
+                userText: "",
+                includeCurrentUser: false,
+                includeCurrentTurnContext: false)
+            let reservedTokens =
+                AgentTokenEstimator.approximateInputTokens(
+                    messages:
+                        fixedPrefix
+                        + contextualReplacementMessages,
+                    tools: tools)
+            let available = hardLimit - reservedTokens
+            guard available > 0 else {
+                throw AgentModelHistoryCompactionError
+                    .replacementBudgetUnavailable(limit: hardLimit)
+            }
+            maximumReplacementInputTokens = available
+        } else {
+            maximumReplacementInputTokens = nil
+        }
+
+        let result = try await AgentModelHistoryCompactor(
+            provider: provider,
+            model: agent.model,
+            reasoningEffort: reasoningEffort,
+            includeUsage: includeUsage,
+            tokenBudgetMeter: tokenBudgetMeter)
+            .compact(
+                history: summaryHistory,
+                realUserMessages: projection.realUserMessages,
+                maximumReplacementInputTokens:
+                    maximumReplacementInputTokens)
+
+        var replacement = result.replacementHistory
+        var providerHistory = result.providerHistory
+        if !contextualReplacementMessages.isEmpty {
+            guard let insertionIndex = replacement.lastIndex(where: {
+                $0.messageClassification == .realUser
+            }),
+            contextualReplacementMessages.allSatisfy({
+                $0.role == .user
+                    && $0.content != nil
+                    && $0.toolCalls == nil
+                    && $0.toolCallId == nil
+                    && $0.images.isEmpty
+                    && $0.toolSearchOutput == nil
+            }) else {
+                throw AgentModelHistoryCompactionError
+                    .invalidContextualReplacement
+            }
+            let contextualItems = contextualReplacementMessages.map {
+                ModelHistoryReplacementItem(
+                    itemID:
+                        "model-history-compacted-context:\(UUID().uuidString.lowercased())",
+                    kind: .message,
+                    role: .user,
+                    messageClassification: .contextual,
+                    content: $0.content)
+            }
+            replacement.insert(
+                contentsOf: contextualItems,
+                at: insertionIndex)
+            providerHistory.insert(
+                contentsOf: contextualReplacementMessages,
+                at: insertionIndex)
+        }
+
+        if let hardLimit =
+            modelContextPolicy.hardUsableContextWindowTokens {
+            let replacementRequestMessages =
+                context.initialMessages(
+                    history: providerHistory,
+                    userText: "",
+                    includeCurrentUser: false,
+                    includeCurrentTurnContext: false)
+            let estimated =
+                AgentTokenEstimator.approximateInputTokens(
+                    messages: replacementRequestMessages,
+                    tools: tools)
+            guard estimated <= hardLimit else {
+                throw AgentModelHistoryCompactionError
+                    .replacementExceedsUsableContext(
+                        estimated: estimated,
+                        limit: hardLimit)
+            }
+        }
+
+        let windowNumber: UInt64
+        let firstWindowID: String
+        let previousWindowID: String
+        if let latest = projection.latestCheckpoint {
+            let (next, overflow) =
+                latest.payload.windowNumber.addingReportingOverflow(1)
+            guard !overflow else {
+                throw AgentModelHistoryCompactionError
+                    .windowNumberExhausted
+            }
+            windowNumber = next
+            firstWindowID = latest.payload.firstWindowID
+            previousWindowID = latest.payload.windowID
+        } else {
+            windowNumber = 1
+            let initial = AgentModelHistoryWindowID.new()
+            firstWindowID = initial
+            previousWindowID = initial
+        }
+        var windowID = AgentModelHistoryWindowID.new()
+        while windowID == previousWindowID
+            || windowID == firstWindowID
+        {
+            windowID = AgentModelHistoryWindowID.new()
+        }
+        let checkpoint = ModelHistoryCompactedPayload(
+            agent: agent.name,
+            message: result.message,
+            replacementHistory: replacement,
+            windowNumber: windowNumber,
+            firstWindowID: firstWindowID,
+            previousWindowID: previousWindowID,
+            windowID: windowID)
+        let envelope = try await log.appendModelHistoryCompaction(
+            checkpoint,
+            expectedLatestAgentHistorySeq:
+                projection.latestAgentHistorySequence)
+        let cursor = AgentModelHistoryCheckpointCursor(
+            sequence: envelope.seq,
+            payload: checkpoint)
+        let realUsers = replacement.compactMap {
+            item -> AgentModelHistoryRealUserMessage? in
+            guard item.messageClassification == .realUser,
+                  let content = item.content else {
+                return nil
+            }
+            return AgentModelHistoryRealUserMessage(
+                content: content,
+                submissionID: item.sourceSubmissionID,
+                attachmentIDs: item.attachmentIDs,
+                contentTruncated: item.contentTruncated == true)
+        }
+        return (
+            AgentModelHistoryProjection(
+                messages: providerHistory,
+                realUserMessages: realUsers,
+                baseCheckpoint: cursor,
+                latestCheckpoint: cursor,
+                latestAgentHistorySequence: envelope.seq),
+            result.usage,
+            envelope)
+    }
+
+    private static func latestModelHistorySequence(
+        agentID: AgentID,
+        events: [Envelope]
+    ) -> Int? {
+        events.compactMap { envelope -> Int? in
+            switch envelope.event {
+            case .modelHistoryItem(let payload)
+                where payload.agent == agentID:
+                return envelope.seq
+            case .modelHistoryCompacted(let payload)
+                where payload.agent == agentID:
+                return envelope.seq
+            default:
+                return nil
+            }
+        }.max()
     }
 
     private static func acceptedUserMessage(
@@ -1003,26 +1396,16 @@ public struct AgentLoop: Sendable {
     private static func estimatedTokens(request: AgentRequest,
                                         assistantText: String,
                                         toolCalls: [ToolCall]) -> Int {
-        let requestCharacters = request.messages.reduce(0) { partial, message in
-            partial
-                + (message.content?.count ?? 0)
-                + (message.toolCalls?.reduce(0) { $0 + $1.name.count + $1.arguments.count } ?? 0)
-        }
-        let responseCharacters = assistantText.count
-            + toolCalls.reduce(0) { $0 + $1.name.count + $1.arguments.count }
-        return max(1, Int(ceil(Double(requestCharacters + responseCharacters) / 4.0)))
+        AgentTokenEstimator.approximateTotalTokens(
+            request: request,
+            assistantText: assistantText,
+            toolCalls: toolCalls)
     }
 
     private static func estimatedInputTokens(request: AgentRequest) -> Int {
-        let messageCharacters = request.messages.reduce(0) { partial, message in
-            partial
-                + (message.content?.count ?? 0)
-                + (message.toolCalls?.reduce(0) { $0 + $1.name.count + $1.arguments.count } ?? 0)
-        }
-        let toolCharacters = request.tools.reduce(0) { partial, tool in
-            partial + tool.name.count + tool.description.count + String(describing: tool.parameters).count
-        }
-        return max(1, Int(ceil(Double(messageCharacters + toolCharacters) / 4.0)))
+        AgentTokenEstimator.approximateInputTokens(
+            messages: request.messages,
+            tools: request.tools)
     }
 
     private func workspaceLeaseFailure(intent: PermissionIntent,
@@ -1141,7 +1524,9 @@ public struct AgentLoop: Sendable {
                               denialCircuitBreaker: ToolDenialCircuitBreaker,
                               sideEffectEvidence: SideEffectEvidenceLedger,
                               modelHistoryScope: ModelHistoryRecordingScope?,
-                              registry: ToolRegistry) async throws
+                              registry: ToolRegistry,
+                              mcpAvailability:
+                                MCPToolAvailabilitySnapshot) async throws
         -> [ToolObservation] {
         let parallelCollaborationTools = Set(["ask_agent", "delegate_task"])
         guard toolCalls.count > 1,
@@ -1156,7 +1541,9 @@ public struct AgentLoop: Sendable {
                     denialCircuitBreaker: denialCircuitBreaker,
                     sideEffectEvidence: sideEffectEvidence,
                     modelHistoryScope: modelHistoryScope,
-                    registry: registry)
+                    registry: registry,
+                    mcpAvailability:
+                        mcpAvailability)
                 results.append(observation)
             }
             return results
@@ -1174,7 +1561,9 @@ public struct AgentLoop: Sendable {
                         denialCircuitBreaker: denialCircuitBreaker,
                         sideEffectEvidence: sideEffectEvidence,
                         modelHistoryScope: modelHistoryScope,
-                        registry: registry)
+                        registry: registry,
+                        mcpAvailability:
+                            mcpAvailability)
                     return (index, observation)
                 }
             }
@@ -1245,7 +1634,9 @@ public struct AgentLoop: Sendable {
                          denialCircuitBreaker: ToolDenialCircuitBreaker,
                          sideEffectEvidence: SideEffectEvidenceLedger,
                          modelHistoryScope: ModelHistoryRecordingScope?,
-                         registry: ToolRegistry) async throws
+                         registry: ToolRegistry,
+                         mcpAvailability:
+                            MCPToolAvailabilitySnapshot) async throws
         -> ToolObservation {
         try Task.checkCancellation()
 
@@ -1834,6 +2225,8 @@ public struct AgentLoop: Sendable {
                                       imageGenerator: imageGenerator,
                                       sessionNaming: sessionNaming,
                                       executionID: executionID,
+                                      mcpAvailability:
+                                        mcpAvailability,
                                       authorization: authorization)
         let observation: ToolObservation
         do {
@@ -2810,29 +3203,59 @@ public struct AgentLoop: Sendable {
         case .taskScoped:
             return []
         case .coworkMainThread:
+            return try await projectedModelHistoryState(
+                currentSubmissionID: submissionID,
+                recoveredEvents: recoveredEvents)?.messages ?? []
+        case .conversation:
+            if context.runtimeEnvironment.mode == .code,
+               submissionID != nil {
+                return try await projectedModelHistoryState(
+                    currentSubmissionID: submissionID,
+                    recoveredEvents: recoveredEvents)?.messages ?? []
+            }
+            return await priorHistory(
+                recoveredEvents: recoveredEvents,
+                excludingCurrentAndLaterSubmissionsFrom: submissionID)
+        }
+    }
+
+    private func projectedModelHistoryState(
+        currentSubmissionID: SubmissionID?,
+        recoveredEvents: [Envelope]? = nil
+    ) async throws -> AgentModelHistoryProjection? {
+        let events: [Envelope]
+        if let recoveredEvents {
+            events = recoveredEvents
+        } else {
+            let replay = try await log.replayForProjectionChecked()
+            guard replay.hasCompleteKnownHistory else {
+                throw EventLogError.unsupportedEventTypes
+            }
+            events = replay.envelopes
+        }
+        switch context.conversationHistoryPolicy {
+        case .coworkMainThread:
             guard context.runtimeEnvironment.mode == .cowork,
                   context.contextBundle != nil,
                   let currentTask = context.taskContract else {
-                return []
+                return nil
             }
-            let events: [Envelope]
-            if let recoveredEvents {
-                events = recoveredEvents
-            } else {
-                let replay = try await log.replayForProjectionChecked()
-                guard replay.hasCompleteKnownHistory else {
-                    throw EventLogError.unsupportedEventTypes
-                }
-                events = replay.envelopes
-            }
-            return try AgentModelHistoryProjector().project(
+            return try AgentModelHistoryProjector().projectState(
                 agentID: agent.name,
                 currentTask: currentTask,
                 events: events)
         case .conversation:
-            return await priorHistory(
-                recoveredEvents: recoveredEvents,
-                excludingCurrentAndLaterSubmissionsFrom: submissionID)
+            guard context.runtimeEnvironment.mode == .code,
+                  let currentSubmissionID else {
+                return nil
+            }
+            return try AgentModelHistoryProjector()
+                .projectConversationState(
+                    agentID: agent.name,
+                    currentSubmissionID: currentSubmissionID,
+                    events: events)
+        case .taskScoped:
+            return nil
         }
     }
 

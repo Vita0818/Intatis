@@ -43,6 +43,7 @@ public struct InferenceConnectionTrust: Codable, Equatable, Sendable {
 public struct InferenceConnectionDefinition: Codable, Equatable, Sendable {
     public let connectionRef: InferenceConnectionRef
     public let wire: WireFormat
+    public let requestAdapter: ProviderRequestAdapter
     public let baseURL: URL
     public let chatEndpoint: URL?
     public let credentialRef: KeychainRef
@@ -51,6 +52,7 @@ public struct InferenceConnectionDefinition: Codable, Equatable, Sendable {
 
     public init(connectionRef: InferenceConnectionRef,
                 wire: WireFormat,
+                requestAdapter: ProviderRequestAdapter = .legacyOpenAIWire,
                 baseURL: URL,
                 chatEndpoint: URL? = nil,
                 credentialRef: KeychainRef,
@@ -58,22 +60,94 @@ public struct InferenceConnectionDefinition: Codable, Equatable, Sendable {
                 defaultRequestOptions: [String: JSONValue] = [:]) {
         self.connectionRef = connectionRef
         self.wire = wire
+        self.requestAdapter = requestAdapter
         self.baseURL = baseURL
         self.chatEndpoint = chatEndpoint
         self.credentialRef = credentialRef
         self.trust = trust
         self.defaultRequestOptions = defaultRequestOptions
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case connectionRef
+        case wire
+        case requestAdapter
+        case baseURL
+        case chatEndpoint
+        case credentialRef
+        case trust
+        case defaultRequestOptions
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(
+            keyedBy: CodingKeys.self)
+        connectionRef = try container.decode(
+            InferenceConnectionRef.self,
+            forKey: .connectionRef)
+        wire = try container.decode(
+            WireFormat.self,
+            forKey: .wire)
+        requestAdapter = try container.decodeIfPresent(
+            ProviderRequestAdapter.self,
+            forKey: .requestAdapter) ?? .legacyOpenAIWire
+        baseURL = try container.decode(
+            URL.self,
+            forKey: .baseURL)
+        chatEndpoint = try container.decodeIfPresent(
+            URL.self,
+            forKey: .chatEndpoint)
+        credentialRef = try container.decode(
+            KeychainRef.self,
+            forKey: .credentialRef)
+        trust = try container.decode(
+            InferenceConnectionTrust.self,
+            forKey: .trust)
+        defaultRequestOptions = try container.decodeIfPresent(
+            [String: JSONValue].self,
+            forKey: .defaultRequestOptions) ?? [:]
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(
+            keyedBy: CodingKeys.self)
+        try container.encode(
+            connectionRef,
+            forKey: .connectionRef)
+        try container.encode(wire, forKey: .wire)
+        if requestAdapter != .legacyOpenAIWire {
+            try container.encode(
+                requestAdapter,
+                forKey: .requestAdapter)
+        }
+        try container.encode(baseURL, forKey: .baseURL)
+        try container.encodeIfPresent(
+            chatEndpoint,
+            forKey: .chatEndpoint)
+        try container.encode(
+            credentialRef,
+            forKey: .credentialRef)
+        try container.encode(trust, forKey: .trust)
+        // Schema v1 readers predate requestAdapter and decode this original
+        // field as required. Keep emitting it even when empty so the additive
+        // adapter field does not break reverse compatibility.
+        try container.encode(
+            defaultRequestOptions,
+            forKey: .defaultRequestOptions)
+    }
 }
 
 /// One immutable profile revision. `effectiveRequestOptions` is the already
-/// resolved, shallow overlay of connection/model/variant/profile layers.
+/// resolved OpenCode-compatible deep overlay of
+/// connection/model/variant/profile layers.
 public struct InferenceProfileDefinition: Codable, Equatable, Sendable {
     public let profileRef: InferenceProfileRef
     public let connectionRef: InferenceConnectionRef
     public let modelID: ModelID
     public let variantID: String?
     public let effectiveRequestOptions: [String: JSONValue]
+    public let requestAdapter: ProviderRequestAdapter
+    public let modelContextPolicy: AgentModelContextPolicy
     public let declaredCapabilities: [Capability]
     public let safeRouteLabel: String?
 
@@ -82,6 +156,8 @@ public struct InferenceProfileDefinition: Codable, Equatable, Sendable {
                 modelID: ModelID,
                 variantID: String? = nil,
                 effectiveRequestOptions: [String: JSONValue] = [:],
+                requestAdapter: ProviderRequestAdapter = .legacyOpenAIWire,
+                modelContextPolicy: AgentModelContextPolicy = .unspecified,
                 declaredCapabilities: [Capability] = [],
                 safeRouteLabel: String? = nil) {
         self.profileRef = profileRef
@@ -89,8 +165,93 @@ public struct InferenceProfileDefinition: Codable, Equatable, Sendable {
         self.modelID = modelID
         self.variantID = variantID
         self.effectiveRequestOptions = effectiveRequestOptions
+        self.requestAdapter = requestAdapter
+        self.modelContextPolicy = modelContextPolicy
         self.declaredCapabilities = declaredCapabilities
         self.safeRouteLabel = safeRouteLabel
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case profileRef
+        case connectionRef
+        case modelID
+        case variantID
+        case effectiveRequestOptions
+        case requestAdapter
+        case modelContextPolicy
+        case declaredCapabilities
+        case safeRouteLabel
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        profileRef =
+            try container.decode(
+                InferenceProfileRef.self,
+                forKey: .profileRef)
+        connectionRef =
+            try container.decode(
+                InferenceConnectionRef.self,
+                forKey: .connectionRef)
+        modelID =
+            try container.decode(
+                ModelID.self,
+                forKey: .modelID)
+        variantID =
+            try container.decodeIfPresent(
+                String.self,
+                forKey: .variantID)
+        effectiveRequestOptions =
+            try container.decodeIfPresent(
+                [String: JSONValue].self,
+                forKey: .effectiveRequestOptions)
+            ?? [:]
+        requestAdapter =
+            try container.decodeIfPresent(
+                ProviderRequestAdapter.self,
+                forKey: .requestAdapter)
+            ?? .legacyOpenAIWire
+        modelContextPolicy =
+            try container.decodeIfPresent(
+                AgentModelContextPolicy.self,
+                forKey: .modelContextPolicy)
+            ?? .unspecified
+        declaredCapabilities =
+            try container.decodeIfPresent(
+                [Capability].self,
+                forKey: .declaredCapabilities)
+            ?? []
+        safeRouteLabel =
+            try container.decodeIfPresent(
+                String.self,
+                forKey: .safeRouteLabel)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(profileRef, forKey: .profileRef)
+        try container.encode(connectionRef, forKey: .connectionRef)
+        try container.encode(modelID, forKey: .modelID)
+        try container.encodeIfPresent(variantID, forKey: .variantID)
+        try container.encode(
+            effectiveRequestOptions,
+            forKey: .effectiveRequestOptions)
+        if requestAdapter != .legacyOpenAIWire {
+            try container.encode(
+                requestAdapter,
+                forKey: .requestAdapter)
+        }
+        if modelContextPolicy != .unspecified {
+            try container.encode(
+                modelContextPolicy,
+                forKey: .modelContextPolicy)
+        }
+        try container.encode(
+            declaredCapabilities,
+            forKey: .declaredCapabilities)
+        try container.encodeIfPresent(
+            safeRouteLabel,
+            forKey: .safeRouteLabel)
     }
 
     /// A route-safe digest for durable binding revalidation. The digest covers
@@ -101,7 +262,7 @@ public struct InferenceProfileDefinition: Codable, Equatable, Sendable {
         connection: InferenceConnectionDefinition
     ) -> String {
         let capabilities = declaredCapabilities.map(\.rawValue).sorted().joined(separator: ",")
-        return InferenceIdentityFingerprint.sha256([
+        var fields = [
             "profile",
             profileRef.inferenceProfileID.rawValue,
             profileRef.inferenceProfileRevision.rawValue,
@@ -121,7 +282,20 @@ public struct InferenceProfileDefinition: Codable, Equatable, Sendable {
             InferenceIdentityFingerprint.canonical(effectiveRequestOptions),
             capabilities,
             safeRouteLabel ?? "",
-        ])
+        ]
+        if connection.requestAdapter !=
+            .legacyOpenAIWire {
+            fields.append(
+                "connection-request-adapter")
+            fields.append(
+                connection.requestAdapter.rawValue)
+        }
+        if requestAdapter != .legacyOpenAIWire {
+            fields.append("profile-request-adapter")
+            fields.append(requestAdapter.rawValue)
+        }
+        fields.append(contentsOf: modelContextPolicy.fingerprintComponents)
+        return InferenceIdentityFingerprint.sha256(fields)
     }
 }
 
@@ -130,6 +304,7 @@ public struct InferenceProfileDefinition: Codable, Equatable, Sendable {
 public struct InferenceConnectionDraft: Equatable, Sendable {
     public var inferenceConnectionID: InferenceConnectionID
     public var wire: WireFormat
+    public var requestAdapter: ProviderRequestAdapter
     public var baseURL: URL
     public var chatEndpoint: URL?
     public var credentialRef: KeychainRef
@@ -138,6 +313,7 @@ public struct InferenceConnectionDraft: Equatable, Sendable {
 
     public init(inferenceConnectionID: InferenceConnectionID,
                 wire: WireFormat,
+                requestAdapter: ProviderRequestAdapter = .legacyOpenAIWire,
                 baseURL: URL,
                 chatEndpoint: URL? = nil,
                 credentialRef: KeychainRef,
@@ -145,6 +321,7 @@ public struct InferenceConnectionDraft: Equatable, Sendable {
                 defaultRequestOptions: [String: JSONValue] = [:]) {
         self.inferenceConnectionID = inferenceConnectionID
         self.wire = wire
+        self.requestAdapter = requestAdapter
         self.baseURL = baseURL
         self.chatEndpoint = chatEndpoint
         self.credentialRef = credentialRef
@@ -153,9 +330,9 @@ public struct InferenceConnectionDraft: Equatable, Sendable {
     }
 }
 
-/// Mutable profile input. Provider-specific keys remain opaque and are merged
-/// at the top level only; nested objects are replaced, never guessed or
-/// normalized by Intatis.
+/// Mutable profile input. Provider-specific keys remain opaque. Shared plain
+/// objects are recursively overlaid with later layers winning; arrays and
+/// scalar/null values are replaced, matching OpenCode's `mergeDeep` behavior.
 public struct InferenceProfileDraft: Equatable, Sendable {
     public var inferenceProfileID: InferenceProfileID
     public var inferenceConnectionID: InferenceConnectionID
@@ -164,6 +341,8 @@ public struct InferenceProfileDraft: Equatable, Sendable {
     public var modelBaseRequestOptions: [String: JSONValue]
     public var variantRequestOptions: [String: JSONValue]
     public var profileRequestOptions: [String: JSONValue]
+    public var requestAdapterOverride: ProviderRequestAdapter?
+    public var modelContextPolicy: AgentModelContextPolicy
     public var declaredCapabilities: [Capability]
     public var safeRouteLabel: String?
 
@@ -174,6 +353,8 @@ public struct InferenceProfileDraft: Equatable, Sendable {
                 modelBaseRequestOptions: [String: JSONValue] = [:],
                 variantRequestOptions: [String: JSONValue] = [:],
                 profileRequestOptions: [String: JSONValue] = [:],
+                requestAdapterOverride: ProviderRequestAdapter? = nil,
+                modelContextPolicy: AgentModelContextPolicy = .unspecified,
                 declaredCapabilities: [Capability] = [],
                 safeRouteLabel: String? = nil) {
         self.inferenceProfileID = inferenceProfileID
@@ -183,6 +364,8 @@ public struct InferenceProfileDraft: Equatable, Sendable {
         self.modelBaseRequestOptions = modelBaseRequestOptions
         self.variantRequestOptions = variantRequestOptions
         self.profileRequestOptions = profileRequestOptions
+        self.requestAdapterOverride = requestAdapterOverride
+        self.modelContextPolicy = modelContextPolicy
         self.declaredCapabilities = declaredCapabilities
         self.safeRouteLabel = safeRouteLabel
     }
@@ -565,6 +748,57 @@ public enum InferenceRequestOptionMerge {
         }
         return result
     }
+
+    /// OpenCode uses Remeda `mergeDeep`: shared values recurse only when both
+    /// sides are plain objects; arrays and every scalar/null value from the
+    /// newer layer replace the older value.
+    public static func deepMerge(
+        _ layers: [[String: JSONValue]]
+    ) throws -> [String: JSONValue] {
+        for layer in layers {
+            try InferenceRequestOptionValidation
+                .validateDurableRequestOptions(layer)
+        }
+        return deepOverlay(layers)
+    }
+
+    /// Pure JSON overlay used by non-durable Chat configuration after decoding.
+    /// Callers persisting the result must use `deepMerge` so validation remains
+    /// part of the durable transaction.
+    public static func deepOverlay(
+        _ layers: [[String: JSONValue]]
+    ) -> [String: JSONValue] {
+        var result: [String: JSONValue] = [:]
+        for layer in layers {
+            result = deepOverlay(
+                destination: result,
+                source: layer)
+        }
+        return result
+    }
+
+    private static func deepOverlay(
+        destination: [String: JSONValue],
+        source: [String: JSONValue]
+    ) -> [String: JSONValue] {
+        var result = destination
+        for (key, sourceValue) in source {
+            if case .object(let destinationObject)? =
+                    destination[key],
+               case .object(let sourceObject) =
+                    sourceValue {
+                result[key] = .object(
+                    deepOverlay(
+                        destination:
+                            destinationObject,
+                        source:
+                            sourceObject))
+            } else {
+                result[key] = sourceValue
+            }
+        }
+        return result
+    }
 }
 
 /// Immutable exact-ref resolver. It never substitutes a current/default
@@ -698,7 +932,8 @@ public struct InferenceCatalogSnapshot: Sendable {
             throw InferenceCatalogError.invalidProfile
         }
         let capabilityNames = definition.declaredCapabilities.map(\.rawValue)
-        guard Set(capabilityNames).count == capabilityNames.count else {
+        guard Set(capabilityNames).count == capabilityNames.count,
+              definition.modelContextPolicy.isValidForCatalog else {
             throw InferenceCatalogError.invalidProfile
         }
         try InferenceRequestOptionValidation.validateDurableRequestOptions(
@@ -780,6 +1015,8 @@ public enum InferenceCatalogReconciler {
                 definition = InferenceConnectionDefinition(
                     connectionRef: ref,
                     wire: normalized.wire,
+                    requestAdapter:
+                        normalized.requestAdapter,
                     baseURL: normalized.baseURL,
                     chatEndpoint: normalized.chatEndpoint,
                     credentialRef: normalized.credentialRef,
@@ -817,6 +1054,9 @@ public enum InferenceCatalogReconciler {
                     modelID: normalized.modelID,
                     variantID: normalized.variantID,
                     effectiveRequestOptions: normalized.effectiveRequestOptions,
+                    requestAdapter:
+                        normalized.requestAdapter,
+                    modelContextPolicy: normalized.modelContextPolicy,
                     declaredCapabilities: normalized.declaredCapabilities,
                     safeRouteLabel: normalized.safeRouteLabel)
                 profiles.append(definition)
@@ -843,6 +1083,8 @@ public enum InferenceCatalogReconciler {
         var modelID: ModelID
         var variantID: String?
         var effectiveRequestOptions: [String: JSONValue]
+        var requestAdapter: ProviderRequestAdapter
+        var modelContextPolicy: AgentModelContextPolicy
         var declaredCapabilities: [Capability]
         var safeRouteLabel: String?
     }
@@ -870,7 +1112,10 @@ public enum InferenceCatalogReconciler {
         if let label = draft.safeRouteLabel, !validRouteLabel(label) {
             throw InferenceCatalogError.invalidProfile
         }
-        let effective = try InferenceRequestOptionMerge.shallowMerge([
+        guard draft.modelContextPolicy.isValidForCatalog else {
+            throw InferenceCatalogError.invalidProfile
+        }
+        let effective = try InferenceRequestOptionMerge.deepMerge([
             connection.defaultRequestOptions,
             draft.modelBaseRequestOptions,
             draft.variantRequestOptions,
@@ -885,6 +1130,10 @@ public enum InferenceCatalogReconciler {
             modelID: draft.modelID,
             variantID: draft.variantID,
             effectiveRequestOptions: effective,
+            requestAdapter:
+                draft.requestAdapterOverride
+                    ?? connection.requestAdapter,
+            modelContextPolicy: draft.modelContextPolicy,
             declaredCapabilities: capabilitiesByName.keys.sorted().compactMap { capabilitiesByName[$0] },
             safeRouteLabel: draft.safeRouteLabel)
     }
@@ -901,6 +1150,8 @@ public enum InferenceCatalogReconciler {
     private static func semanticallyEqual(_ definition: InferenceConnectionDefinition,
                                           _ draft: InferenceConnectionDraft) -> Bool {
         definition.wire == draft.wire
+            && definition.requestAdapter
+                == draft.requestAdapter
             && definition.baseURL == draft.baseURL
             && definition.chatEndpoint == draft.chatEndpoint
             && definition.credentialRef == draft.credentialRef
@@ -915,6 +1166,9 @@ public enum InferenceCatalogReconciler {
             && definition.modelID == draft.modelID
             && definition.variantID == draft.variantID
             && definition.effectiveRequestOptions == draft.effectiveRequestOptions
+            && definition.requestAdapter
+                == draft.requestAdapter
+            && definition.modelContextPolicy == draft.modelContextPolicy
             && definition.declaredCapabilities.map(\.rawValue).sorted()
                 == draft.declaredCapabilities.map(\.rawValue).sorted()
             && definition.safeRouteLabel == draft.safeRouteLabel

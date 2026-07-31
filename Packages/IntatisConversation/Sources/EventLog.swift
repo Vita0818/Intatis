@@ -27,6 +27,12 @@ public enum EventLogError: Error, Equatable, LocalizedError, Sendable {
     case sequenceExhausted
     case unsupportedEventTypes
     case incompleteEventHistory
+    case staleModelHistory(
+        expectedLatestAgentHistorySeq: Int?,
+        actualLatestAgentHistorySeq: Int?)
+    case invalidModelHistoryWindowLineage
+    case reusedModelHistoryWindowID
+    case modelHistoryCompactionRequiresValidatedAppend
     case permissionRequestNotFound
     case conflictingPermissionRequest
     case conflictingPermissionSettlement
@@ -58,7 +64,21 @@ public enum EventLogError: Error, Equatable, LocalizedError, Sendable {
         case .unsupportedEventTypes:
             return "The session contains newer event types that this Intatis version cannot update safely."
         case .incompleteEventHistory:
-            return "The session event history is incomplete and cannot safely settle a permission request."
+            return "The session event history is incomplete and cannot be updated safely."
+        case .staleModelHistory(
+            let expectedLatestAgentHistorySeq,
+            let actualLatestAgentHistorySeq):
+            let expected = expectedLatestAgentHistorySeq.map(String.init)
+                ?? "none"
+            let actual = actualLatestAgentHistorySeq.map(String.init)
+                ?? "none"
+            return "The agent model history changed before its compaction checkpoint could be persisted (expected \(expected), found \(actual))."
+        case .invalidModelHistoryWindowLineage:
+            return "The model history compaction window does not continue the agent's canonical checkpoint chain."
+        case .reusedModelHistoryWindowID:
+            return "The model history compaction reuses a window identifier from the agent's canonical checkpoint chain."
+        case .modelHistoryCompactionRequiresValidatedAppend:
+            return "Model history compaction checkpoints require the validated compare-and-append operation."
         case .permissionRequestNotFound:
             return "The permission request is not durably registered in this session."
         case .conflictingPermissionRequest:
@@ -83,7 +103,16 @@ public enum EventLogError: Error, Equatable, LocalizedError, Sendable {
             return "Start a new session."
         case .unsupportedEventTypes:
             return "Open this session with a compatible newer Intatis version before changing its settings."
-        case .incompleteEventHistory, .permissionRequestNotFound,
+        case .staleModelHistory:
+            return "Reload the agent's canonical model history, rebuild the replacement checkpoint, and retry."
+        case .invalidModelHistoryWindowLineage,
+             .reusedModelHistoryWindowID:
+            return "Reload the agent's canonical checkpoint chain, create the next unique window, and retry."
+        case .modelHistoryCompactionRequiresValidatedAppend:
+            return "Use the model-history compaction append operation so revision and window lineage are checked atomically."
+        case .incompleteEventHistory:
+            return "Stop writing to this session and inspect or restore its canonical event log before retrying."
+        case .permissionRequestNotFound,
              .conflictingPermissionRequest, .conflictingPermissionSettlement:
             return "Reload the session from its canonical event log and inspect the permission history before retrying."
         }
@@ -429,6 +458,16 @@ public final class EventLogWriterLease: @unchecked Sendable {
 /// is just "read from a `seq`". The actor serializes one instance, while a
 /// cross-process file lock serializes all instances targeting the same file.
 public actor EventLog {
+    static let journaledSingleEventByteThreshold = 64 * 1_024
+
+    static func shouldJournalWrite(
+        eventCount: Int,
+        byteCount: Int
+    ) -> Bool {
+        eventCount > 1
+            || byteCount >= journaledSingleEventByteThreshold
+    }
+
     private let session: SessionID
     private let fileURL: URL
     public nonisolated let sessionDirectoryURL: URL
@@ -585,6 +624,85 @@ public actor EventLog {
             return []
         }
         return try persistLocked(events, ts: ts, state: state)
+    }
+
+    /// Persists one full replacement-history checkpoint only if the target
+    /// agent's durable model history is still the exact source revision used
+    /// to build it.
+    ///
+    /// Unrelated agents and non-model-history events may advance the shared
+    /// EventLog tail without invalidating this compare-and-append. Unknown
+    /// event types or a sequence gap fail closed because they make absence and
+    /// ordering proofs unsafe.
+    @discardableResult
+    public func appendModelHistoryCompaction(
+        _ checkpoint: ModelHistoryCompactedPayload,
+        expectedLatestAgentHistorySeq: Int?,
+        ts: Date = Date()
+    ) throws -> Envelope {
+        try checkpoint.validate()
+
+        let lock = try EventLogFileLock.acquire(at: lockURL, mode: .exclusive)
+        defer { lock.release() }
+
+        try Self.recoverJournalIfNeeded(
+            fileURL: fileURL,
+            journalURL: journalURL,
+            temporaryURL: journalTemporaryURL,
+            session: session,
+            decoder: decoder)
+        let data = try Self.readLogData(at: fileURL)
+        let scan = try Self.checkedScan(
+            data: data,
+            expectedSession: session,
+            decoder: decoder,
+            from: 0)
+        guard !scan.containsUnknownEventTypes else {
+            throw EventLogError.unsupportedEventTypes
+        }
+        guard scan.nextSeq == scan.envelopes.count,
+              scan.envelopes.enumerated().allSatisfy({
+                  offset, envelope in
+                  envelope.seq == offset
+              }) else {
+            throw EventLogError.incompleteEventHistory
+        }
+
+        let actualLatestAgentHistorySeq =
+            Self.latestModelHistorySequence(
+                for: checkpoint.agent,
+                in: scan.envelopes)
+        guard actualLatestAgentHistorySeq ==
+                expectedLatestAgentHistorySeq else {
+            throw EventLogError.staleModelHistory(
+                expectedLatestAgentHistorySeq:
+                    expectedLatestAgentHistorySeq,
+                actualLatestAgentHistorySeq:
+                    actualLatestAgentHistorySeq)
+        }
+
+        try Self.validateModelHistoryCheckpointLineage(
+            appending: checkpoint,
+            in: scan.envelopes)
+
+        let state = try Self.tailSequenceState(
+            at: fileURL,
+            expectedSession: session,
+            decoder: decoder)
+        guard state.nextSeq >= nextSeq else {
+            throw EventLogError.sequenceRegressed(
+                expectedAtLeast: nextSeq,
+                found: state.nextSeq)
+        }
+        guard let envelope = try persistLocked(
+            [.modelHistoryCompacted(checkpoint)],
+            ts: ts,
+            state: state,
+            allowsModelHistoryCompaction: true).first else {
+            preconditionFailure(
+                "a model history compaction must persist one event")
+        }
+        return envelope
     }
 
     /// Atomically settles one durably registered permission request.
@@ -980,9 +1098,20 @@ public actor EventLog {
     private func persistLocked(
         _ events: [Event],
         ts: Date,
-        state: EventLogSequenceState
+        state: EventLogSequenceState,
+        allowsModelHistoryCompaction: Bool = false
     ) throws -> [Envelope] {
         guard !events.isEmpty else { return [] }
+        guard allowsModelHistoryCompaction
+                || !events.contains(where: {
+                    if case .modelHistoryCompacted = $0 {
+                        return true
+                    }
+                    return false
+                }) else {
+            throw EventLogError
+                .modelHistoryCompactionRequiresValidatedAppend
+        }
 
         var envelopes: [Envelope] = []
         envelopes.reserveCapacity(events.count)
@@ -1018,7 +1147,10 @@ public actor EventLog {
 
         let (advancedNextSeq, overflow) = state.nextSeq.addingReportingOverflow(events.count)
         guard !overflow else { throw EventLogError.sequenceExhausted }
-        if events.count > 1 {
+        if Self.shouldJournalWrite(
+            eventCount: events.count,
+            byteCount: bytes.count)
+        {
             let snapshot = try Self.fileSnapshot(at: fileURL)
             let journal = EventLogWriteAheadJournal(
                 session: session,
@@ -1312,6 +1444,79 @@ public actor EventLog {
             containsEnvelopeHeader: containsEnvelopeHeader,
             containsUnknownEventTypes: containsUnknownEventTypes,
             nextSeq: nextSequence)
+    }
+
+    private static func latestModelHistorySequence(
+        for agent: AgentID,
+        in envelopes: [Envelope]
+    ) -> Int? {
+        for envelope in envelopes.reversed() {
+            switch envelope.event {
+            case .modelHistoryItem(let payload)
+                where payload.agent == agent:
+                return envelope.seq
+            case .modelHistoryCompacted(let payload)
+                where payload.agent == agent:
+                return envelope.seq
+            default:
+                continue
+            }
+        }
+        return nil
+    }
+
+    /// Validates the complete same-agent checkpoint chain while the EventLog
+    /// lock is held. The candidate is checked after its source-history CAS and
+    /// before any envelope or WAL bytes are created.
+    private static func validateModelHistoryCheckpointLineage(
+        appending candidate: ModelHistoryCompactedPayload,
+        in envelopes: [Envelope]
+    ) throws {
+        var checkpoints = envelopes.compactMap {
+            envelope -> ModelHistoryCompactedPayload? in
+            guard case .modelHistoryCompacted(let payload) =
+                    envelope.event,
+                  payload.agent == candidate.agent else {
+                return nil
+            }
+            return payload
+        }
+        checkpoints.append(candidate)
+
+        var previous: ModelHistoryCompactedPayload?
+        var usedWindowIDs = Set<String>()
+        for checkpoint in checkpoints {
+            try checkpoint.validate()
+            if let previous {
+                let (expectedWindowNumber, overflow) =
+                    previous.windowNumber.addingReportingOverflow(1)
+                guard !overflow,
+                      checkpoint.windowNumber == expectedWindowNumber,
+                      checkpoint.firstWindowID
+                        == previous.firstWindowID,
+                      checkpoint.previousWindowID
+                        == previous.windowID else {
+                    throw EventLogError
+                        .invalidModelHistoryWindowLineage
+                }
+            } else {
+                guard checkpoint.windowNumber == 1,
+                      checkpoint.previousWindowID
+                        == checkpoint.firstWindowID,
+                      checkpoint.windowID
+                        != checkpoint.firstWindowID else {
+                    throw EventLogError
+                        .invalidModelHistoryWindowLineage
+                }
+                usedWindowIDs.insert(checkpoint.firstWindowID)
+            }
+
+            guard usedWindowIDs.insert(
+                checkpoint.windowID).inserted else {
+                throw EventLogError.reusedModelHistoryWindowID
+            }
+            previous = checkpoint
+        }
     }
 
     private static func fileSnapshot(at fileURL: URL) throws -> EventLogFileSnapshot {

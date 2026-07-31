@@ -1,4 +1,5 @@
 import Foundation
+import IntatisAgentKernel
 import IntatisCore
 import IntatisProviders
 
@@ -36,7 +37,10 @@ struct CLIConfig {
     let reasoningEffort: ReasoningEffort?
     let mode: Mode
     let includeUsage: Bool
+    /// Code keeps its conservative default while Cowork gets the larger
+    /// long-running budget. An explicit host override applies to both modes.
     let maxSteps: Int
+    let coworkMaxSteps: Int
     /// Every host-configured route eligible for this CLI process. Chat/Code
     /// continue to use the selected route while Cowork compiles all routes into
     /// exact, versioned inference profiles.
@@ -59,6 +63,7 @@ struct CLIConfig {
          mode: Mode,
          includeUsage: Bool,
          maxSteps: Int,
+         coworkMaxSteps: Int? = nil,
          providerRoutes: [CLIProviderRoute]? = nil,
          selectedProviderID: String? = nil,
          selectedVariantID: String? = nil,
@@ -71,6 +76,7 @@ struct CLIConfig {
         self.mode = mode
         self.includeUsage = includeUsage
         self.maxSteps = maxSteps
+        self.coworkMaxSteps = coworkMaxSteps ?? maxSteps
         let legacy = CLIProviderRoute.legacy(
             baseURL: baseURL,
             apiKey: apiKey,
@@ -111,11 +117,22 @@ struct CLIConfig {
         let includeUsage = !(usageStr == "0" || usageStr == "false" || usageStr == "off")
         // How many tool round-trips one turn may take before giving up. Long
         // agentic tasks need plenty; override with INTATIS_MAX_STEPS.
-        let maxSteps = max(1, Int(value("INTATIS_MAX_STEPS", "maxSteps", fallback: "50")!) ?? 50)
+        let configuredMaxSteps = value(
+            "INTATIS_MAX_STEPS",
+            "maxSteps",
+            fallback: nil)
+        let maxSteps = max(
+            1,
+            Int(configuredMaxSteps ?? "\(AgentRuntime.defaultCodeMaxIterations)")
+                ?? AgentRuntime.defaultCodeMaxIterations)
+        let coworkMaxSteps = configuredMaxSteps == nil
+            ? AgentRuntime.defaultCoworkMaxIterations
+            : maxSteps
 
         return CLIConfig(baseURL: baseURL, apiKey: apiKey, model: model, wire: .openai,
                          reasoningEffort: reasoning, mode: mode, includeUsage: includeUsage,
                          maxSteps: maxSteps,
+                         coworkMaxSteps: coworkMaxSteps,
                          selectedVariantID: reasoning.map { "reasoning-\($0.rawValue)" })
     }
 
@@ -195,7 +212,16 @@ struct CLIConfig {
         let mode = Mode(rawValue: value("INTATIS_MODE", fallback: "chat")!.lowercased()) ?? .chat
         let usageStr = value("INTATIS_USAGE", fallback: "1")!.lowercased()
         let includeUsage = !(usageStr == "0" || usageStr == "false" || usageStr == "off")
-        let maxSteps = max(1, Int(value("INTATIS_MAX_STEPS", fallback: "50")!) ?? 50)
+        let configuredMaxSteps = value(
+            "INTATIS_MAX_STEPS",
+            fallback: nil)
+        let maxSteps = max(
+            1,
+            Int(configuredMaxSteps ?? "\(AgentRuntime.defaultCodeMaxIterations)")
+                ?? AgentRuntime.defaultCodeMaxIterations)
+        let coworkMaxSteps = configuredMaxSteps == nil
+            ? AgentRuntime.defaultCoworkMaxIterations
+            : maxSteps
         let selectedVariantID = try document.selectedVariantID(
             providerID: selectedRoute.id,
             modelID: selectedModelID,
@@ -219,6 +245,7 @@ struct CLIConfig {
             mode: mode,
             includeUsage: includeUsage,
             maxSteps: maxSteps,
+            coworkMaxSteps: coworkMaxSteps,
             providerRoutes: routes,
             selectedProviderID: selectedRoute.id,
             selectedVariantID: selectedVariantID,
@@ -237,15 +264,52 @@ struct CLIConfig {
 
     func providerConfig() -> ProviderConfig {
         let endpoints = providerRoutes.map { route in
-            ProviderEndpoint(
+            let requestOptions =
+                Dictionary(
+                    uniqueKeysWithValues:
+                        route.models.map { configuredModel in
+                            var options =
+                                configuredModel.requestOptions
+                            if route.id == selectedProviderID,
+                               configuredModel.id == model,
+                               let selectedVariantID,
+                               let variant =
+                                   configuredModel.variants.first(
+                                       where: {
+                                           $0.id
+                                               == selectedVariantID
+                                       }) {
+                                options =
+                                    InferenceRequestOptionMerge
+                                        .deepOverlay([
+                                            options,
+                                            variant.requestOptions,
+                                        ])
+                            }
+                            return (
+                                configuredModel.id,
+                                options)
+                        })
+            return ProviderEndpoint(
                 id: CLIInferenceRouteIdentity.endpointID(route: route),
                 baseURL: route.baseURL,
                 chatEndpoint: route.chatEndpoint,
                 apiKeyRef: route.credentialRef,
                 wire: route.wire,
-                modelRequestOptions: Dictionary(uniqueKeysWithValues: route.models.map {
-                    ($0.id, $0.requestOptions)
-                }),
+                requestAdapter:
+                    route.requestAdapter,
+                modelRequestAdapters:
+                    Dictionary(
+                        uniqueKeysWithValues:
+                            route.models.compactMap {
+                                model in
+                                model.requestAdapterOverride
+                                    .map {
+                                        (model.id, $0)
+                                    }
+                            }),
+                modelRequestOptions:
+                    requestOptions,
                 modelCapabilities: Dictionary(
                     uniqueKeysWithValues:
                         route.models.map {

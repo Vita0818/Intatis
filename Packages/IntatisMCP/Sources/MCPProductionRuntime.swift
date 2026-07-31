@@ -8,6 +8,7 @@ import Crypto
 import Foundation
 import IntatisCore
 import IntatisProtocol
+import IntatisTools
 import Logging
 import MCP
 
@@ -1607,6 +1608,24 @@ public enum MCPConnectionIdentityBuilder {
                 .definitionIdentityMismatch
         }
         let configuration = definition.configuration
+        // Skill dependency metadata intentionally accepts a narrower transport
+        // subset than the MCP runtime. Unsupported-but-valid runtime
+        // configurations (for example explicitly enabled development
+        // loopback HTTP) carry no supported locator assertion and therefore
+        // fail Skill preflight closed without preventing the MCP connection
+        // itself from starting.
+        let skillDependencyLocatorFingerprint: String?
+        switch configuration.transport {
+        case .streamableHTTP(let http):
+            skillDependencyLocatorFingerprint =
+                try? MCPDependencyLocatorFingerprint
+                    .streamableHTTP(http.endpoint)
+        case .stdio(let stdio):
+            skillDependencyLocatorFingerprint =
+                try? MCPDependencyLocatorFingerprint
+                    .stdio(
+                        stdio.executableCanonicalPath)
+        }
         let authorityFingerprint = digest([
             definition.reference.serverID.rawValue,
             definition.reference.serverRevision.rawValue,
@@ -1675,7 +1694,9 @@ public enum MCPConnectionIdentityBuilder {
             launchArtifactFingerprint:
                 configuration.transport.launchArtifactFingerprint,
             runtimeIdentityFingerprint:
-                inputs.runtimeIdentityFingerprint)
+                inputs.runtimeIdentityFingerprint,
+            skillDependencyLocatorFingerprint:
+                skillDependencyLocatorFingerprint)
         let viewDigest = digest([
             inputs.attachment.policy.revision.rawValue,
             inputs.agentID.rawValue,

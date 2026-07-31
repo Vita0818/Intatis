@@ -564,18 +564,72 @@ final class IntatisProvidersToolCallingTests: XCTestCase {
         XCTAssertNil(body2["max_tokens"])
     }
 
+    func testOpenRouterAdapterUsesNestedRuntimeReasoning()
+        throws {
+        let configuredEndpoint = ProviderEndpoint(
+            id: "openrouter",
+            baseURL: URL(
+                string: "https://example.test/v1")!,
+            apiKeyRef: KeychainRef(
+                service: "s",
+                account: "a"),
+            wire: .openai,
+            requestAdapter:
+                .openRouter,
+            modelRequestOptions: [
+                "m": [
+                    "reasoning": .object([
+                        "effort": .string("low"),
+                        "summary": .string("auto"),
+                    ]),
+                ],
+            ])
+        let provider = OpenAIWireProvider(
+            endpoint: configuredEndpoint,
+            apiKey: "k",
+            http: FakeHTTP2(chunks: []))
+
+        let request = try provider.buildAgentRequest(
+            AgentRequest(
+                model: ModelID(rawValue: "m"),
+                messages: [.user("hi")],
+                tools: [],
+                reasoningEffort: .high))
+        let value = try JSONDecoder().decode(
+            JSONValue.self,
+            from: XCTUnwrap(request.httpBody))
+        guard case .object(let body) = value else {
+            return XCTFail(
+                "request body is not an object")
+        }
+        XCTAssertNil(body["reasoning_effort"])
+        XCTAssertEqual(
+            body["reasoning"],
+            .object([
+                "effort": .string("high"),
+                "summary": .string("auto"),
+            ]))
+    }
+
     func testConfiguredModelOptionsPassThroughAgentBodyAndExplicitRuntimeValuesWin() throws {
         let configuredEndpoint = ProviderEndpoint(
             id: "generic",
             baseURL: URL(string: "https://example.test/v1")!,
             apiKeyRef: KeychainRef(service: "s", account: "a"),
             wire: .openai,
+            requestAdapter:
+                .openAICompatible,
             modelRequestOptions: [
                 "vendor/model": [
                     "provider": .object(["allow_fallbacks": .bool(false)]),
                     "parallel_tool_calls": .bool(false),
                     "max_tokens": .number(999),
                     "reasoning_effort": .string("low"),
+                    "reasoningEffort": .string("xhigh"),
+                    "reasoning": .object([
+                        "effort": .string("medium"),
+                        "summary": .string("auto"),
+                    ]),
                     "model": .string("must-not-win"),
                     "messages": .array([]),
                     "tools": .array([]),
@@ -599,6 +653,13 @@ final class IntatisProvidersToolCallingTests: XCTestCase {
         XCTAssertEqual(body["parallel_tool_calls"], JSONValue.bool(false))
         XCTAssertEqual(body["max_tokens"], JSONValue.number(321))
         XCTAssertEqual(body["reasoning_effort"], JSONValue.string("high"))
+        XCTAssertNil(body["reasoningEffort"])
+        XCTAssertEqual(
+            body["reasoning"],
+            .object([
+                "effort": .string("medium"),
+                "summary": .string("auto"),
+            ]))
         XCTAssertEqual(body["model"], JSONValue.string("vendor/model"))
         XCTAssertEqual(body["stream"], JSONValue.bool(true))
         guard let messageValue = body["messages"],
@@ -626,7 +687,131 @@ final class IntatisProvidersToolCallingTests: XCTestCase {
         }
         XCTAssertEqual(
             explicitParallelBody["parallel_tool_calls"],
-            .bool(true))
+            .bool(false))
+        XCTAssertNil(explicitParallelBody["n"])
+    }
+
+    func testOpenAICompatibleStrictRoutingBodyDoesNotSynthesizeUnsupportedControls()
+        throws {
+        let configuredEndpoint = ProviderEndpoint(
+            id: "openrouter-compatible",
+            baseURL: URL(
+                string: "https://example.test/v1")!,
+            apiKeyRef: KeychainRef(
+                service: "s",
+                account: "a"),
+            wire: .openai,
+            requestAdapter:
+                .openAICompatible,
+            modelRequestOptions: [
+                "deepseek/deepseek-v4-pro": [
+                    "reasoningEffort":
+                        .string("xhigh"),
+                    "provider": .object([
+                        "only": .array([
+                            .string("deepseek"),
+                        ]),
+                        "allow_fallbacks": .bool(false),
+                        "require_parameters":
+                            .bool(true),
+                    ]),
+                ],
+            ])
+        let provider = OpenAIWireProvider(
+            endpoint: configuredEndpoint,
+            apiKey: "k",
+            http: FakeHTTP2(chunks: []))
+
+        let encoded = try provider.buildAgentRequest(
+            AgentRequest(
+                model: ModelID(
+                    rawValue:
+                        "deepseek/deepseek-v4-pro"),
+                messages: [.user("hi")],
+                tools: [
+                    ToolSpec(
+                        name: "activate_skill",
+                        description:
+                            "Activate a skill",
+                        parameters: .object([:]),
+                        supportsParallelCalls: true),
+                ],
+                parallelToolCalls: true))
+        let decoded = try JSONDecoder().decode(
+            JSONValue.self,
+            from: XCTUnwrap(encoded.httpBody))
+        guard case .object(let body) = decoded else {
+            return XCTFail(
+                "request body is not an object")
+        }
+
+        XCTAssertEqual(
+            Set(body.keys),
+            Set([
+                "model",
+                "messages",
+                "stream",
+                "tools",
+                "reasoning_effort",
+                "provider",
+            ]))
+        XCTAssertNil(body["n"])
+        XCTAssertNil(body["parallel_tool_calls"])
+        XCTAssertEqual(
+            body["reasoning_effort"],
+            .string("xhigh"))
+        XCTAssertEqual(
+            body["provider"],
+            .object([
+                "only": .array([
+                    .string("deepseek"),
+                ]),
+                "allow_fallbacks": .bool(false),
+                "require_parameters":
+                    .bool(true),
+            ]))
+    }
+
+    func testOpenRouterAdapterAlsoOmitsSyntheticCandidateAndParallelControls()
+        throws {
+        let configuredEndpoint = ProviderEndpoint(
+            id: "openrouter",
+            baseURL: URL(
+                string: "https://example.test/v1")!,
+            apiKeyRef: KeychainRef(
+                service: "s",
+                account: "a"),
+            wire: .openai,
+            requestAdapter:
+                .openRouter)
+        let provider = OpenAIWireProvider(
+            endpoint: configuredEndpoint,
+            apiKey: "k",
+            http: FakeHTTP2(chunks: []))
+
+        let encoded = try provider.buildAgentRequest(
+            AgentRequest(
+                model: ModelID(
+                    rawValue: "deepseek/model"),
+                messages: [.user("hi")],
+                tools: [
+                    ToolSpec(
+                        name: "inspect",
+                        description: "Inspect",
+                        parameters: .object([:]),
+                        supportsParallelCalls: true),
+                ],
+                parallelToolCalls: true))
+        let decoded = try JSONDecoder().decode(
+            JSONValue.self,
+            from: XCTUnwrap(encoded.httpBody))
+        guard case .object(let body) = decoded else {
+            return XCTFail(
+                "request body is not an object")
+        }
+
+        XCTAssertNil(body["n"])
+        XCTAssertNil(body["parallel_tool_calls"])
     }
 
     func testProviderRequestBodyEncodingSortsNestedObjectKeys() throws {

@@ -2,61 +2,38 @@
 //  Copyright (c) Microsoft Corporation. All rights reserved.
 //  Licensed under the MIT License. See LICENSE in the project root for license information.
 //
-//  Intatis derivative modification: optional single-dollar math admission.
+//  Intatis derivative modification: optional LaTeX delimiter support.
 //
 
-/// Configuration for the package's optional inline-math grammar extension.
+/// Configuration for the package's optional LaTeX grammar extension.
 ///
-/// Math rendering is disabled by default. The first supported grammar is a
-/// conservative, single-line `$...$` form. Admission limits are intentionally
-/// fixed so a caller cannot accidentally opt the renderer into unbounded math
-/// parsing or attachment creation.
+/// Math rendering is disabled by default. Enabling it recognizes the common
+/// inline `$...$` and `\(...\)` forms plus display `$$...$$` and `\[...\]`
+/// forms outside protected Markdown literals. Formula admission does not add
+/// Intatis-specific count or source-size limits.
 public struct MathRenderConfig: Hashable, Sendable {
-  /// The inline-math grammar selected for a parse request.
+  /// The math grammar selected for a parse request.
   public enum Mode: Hashable, Sendable {
     /// Leave all math delimiters as ordinary Markdown text.
     case disabled
-    /// Recognize conservative, single-line `$...$` candidates outside code.
-    case singleDollarInline
+    /// Recognize common inline and display LaTeX delimiters outside code.
+    case latex
   }
-
-  /// Maximum UTF-8 size of one formula source, excluding delimiters.
-  public static let maximumFormulaUTF8Bytes = 8 * 1_024
-  /// Maximum number of formulas admitted in one message.
-  public static let maximumFormulaCount = 32
 
   /// The selected math grammar.
   public let mode: Mode
-  /// Maximum UTF-8 size admitted for one formula source.
-  public let maxFormulaUTF8Bytes: Int
-  /// Maximum number of formulas admitted for one message.
-  public let maxFormulaCount: Int
 
-  private init(
-    mode: Mode,
-    maxFormulaUTF8Bytes: Int,
-    maxFormulaCount: Int
-  ) {
+  private init(mode: Mode) {
     self.mode = mode
-    self.maxFormulaUTF8Bytes = maxFormulaUTF8Bytes
-    self.maxFormulaCount = maxFormulaCount
   }
 
   /// Math is off unless a caller explicitly enables it.
-  public static let disabled = MathRenderConfig(
-    mode: .disabled,
-    maxFormulaUTF8Bytes: maximumFormulaUTF8Bytes,
-    maxFormulaCount: maximumFormulaCount
-  )
+  public static let disabled = MathRenderConfig(mode: .disabled)
 
-  /// Conservative single-dollar inline math with fixed admission limits.
-  public static let singleDollarInline = MathRenderConfig(
-    mode: .singleDollarInline,
-    maxFormulaUTF8Bytes: maximumFormulaUTF8Bytes,
-    maxFormulaCount: maximumFormulaCount
-  )
+  /// Common inline and display LaTeX delimiters without local formula caps.
+  public static let latex = MathRenderConfig(mode: .latex)
 
-  var isSingleDollarInlineEnabled: Bool {
-    mode == .singleDollarInline
+  var isEnabled: Bool {
+    mode == .latex
   }
 }

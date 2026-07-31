@@ -30,6 +30,8 @@ func printHelp() {
       intatis mcp help        Manage external MCP servers and session access
       intatis exec --session <id> --agent <id> [--task <id>] --prompt <text> [--yes]
                               Run one exact durable Code/MCP turn
+      intatis diagnose-hang --pid <pid> [--output <directory>]
+                              Capture a 10s sample and 5m Intatis logs into an owner-only bundle
       intatis help
 
     CONFIG  (env var > advanced Intatis config > legacy config > default)

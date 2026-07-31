@@ -170,23 +170,35 @@ public struct OpenAIWireProvider: ChatProvider {
         r.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         r.setValue(ProviderAuthorization.bearerHeaderValue(apiKey: apiKey),
                    forHTTPHeaderField: "Authorization")
-        var root = Self.configuredRequestBody(endpoint: endpoint, model: request.model)
+        let requestAdapter =
+            endpoint.requestAdapter(for: request.model)
+        var root = try Self.configuredRequestBody(
+            endpoint: endpoint,
+            model: request.model)
         root["model"] = .string(request.model.rawValue)
         root["messages"] = .array(request.messages.map(Self.chatMessageJSON))
         root["stream"] = .bool(true)
-        root["n"] = .number(1)
+        try Self.applyChatCompletionsInvocationControls(
+            to: &root,
+            requestAdapter: requestAdapter)
         if let t = request.temperature { root["temperature"] = .number(t) }
-        if let reasoning = request.reasoningEffort { root["reasoning_effort"] = .string(reasoning.rawValue) }
+        Self.applyChatCompletionsReasoningOptions(
+            to: &root,
+            runtimeEffort: request.reasoningEffort,
+            requestAdapter: requestAdapter)
         if request.includeUsage { root["stream_options"] = .object(["include_usage": .bool(true)]) }
         r.httpBody = try Self.encodeRequestBody(root)
         return r
     }
 
     /// Model options are an open JSON extension point. Intatis protects only
-    /// the structural fields that must match the actual runtime request; every
-    /// other key is preserved verbatim for the selected wire endpoint.
+    /// the structural fields that must match the actual runtime request.
+    /// Unknown keys remain verbatim. Known provider SDK options are lowered by
+    /// the exact package adapter frozen for the selected model.
     static func configuredRequestBody(endpoint: ProviderEndpoint,
-                                      model: ModelID) -> [String: JSONValue] {
+                                      model: ModelID)
+        throws -> [String: JSONValue]
+    {
         var body = endpoint.requestOptions(for: model)
         for key in [
             "model", "messages", "tools", "stream",
@@ -195,7 +207,195 @@ public struct OpenAIWireProvider: ChatProvider {
         ] {
             body.removeValue(forKey: key)
         }
+        try applyConfiguredChatCompletionsOptions(
+            to: &body,
+            requestAdapter:
+                endpoint.requestAdapter(for: model))
         return body
+    }
+
+    /// Applies only controls that the selected package adapter would synthesize
+    /// for this invocation. The pinned OpenCode adapters do not send `n`, and
+    /// neither turns parallel-safe tool metadata into `parallel_tool_calls`.
+    /// Historical Intatis endpoints retain their previous wire behavior.
+    static func applyChatCompletionsInvocationControls(
+        to body: inout [String: JSONValue],
+        requestAdapter: ProviderRequestAdapter,
+        parallelToolCalls: Bool? = nil
+    ) throws {
+        switch try requestAdapter
+            .chatCompletionsAdapter()
+        {
+        case .legacyOpenAIWire:
+            body["n"] = .number(1)
+            if let parallelToolCalls {
+                body["parallel_tool_calls"] =
+                    .bool(parallelToolCalls)
+            }
+
+        case .openAICompatible,
+             .openRouter:
+            // @ai-sdk/openai-compatible@2.0.41 omits both fields.
+            // @openrouter/ai-sdk-provider@2.9.0 also omits `n` and
+            // emits parallel_tool_calls only from explicit model settings,
+            // not from call-level tool metadata. Any explicitly configured
+            // wire option has already been lowered into `body` above.
+            return
+        }
+    }
+
+    /// Mirrors the package-specific option boundary used by OpenCode. The
+    /// configuration remains untouched; only this request-owned body is
+    /// lowered. This is deliberately not a global camel/snake normalizer.
+    private static func applyConfiguredChatCompletionsOptions(
+        to body: inout [String: JSONValue],
+        requestAdapter: ProviderRequestAdapter
+    ) throws {
+        switch try requestAdapter
+            .chatCompletionsAdapter()
+        {
+        case .legacyOpenAIWire:
+            return
+
+        case .openAICompatible:
+            // @ai-sdk/openai-compatible@2.0.41 treats these camelCase names as
+            // SDK options. The explicit wire properties are written after its
+            // unknown-option spread, so an absent camelCase value also removes
+            // a same-named raw-wire alias from the final JSON.
+            let reasoningEffort =
+                body.removeValue(
+                    forKey: "reasoningEffort")
+            body.removeValue(
+                forKey: "reasoning_effort")
+            if let reasoningEffort {
+                guard case .string = reasoningEffort else {
+                    throw IntatisError.config(
+                        "reasoningEffort must be a string for the selected provider adapter")
+                }
+                body["reasoning_effort"] =
+                    reasoningEffort
+            }
+
+            let textVerbosity =
+                body.removeValue(
+                    forKey: "textVerbosity")
+            body.removeValue(forKey: "verbosity")
+            if let textVerbosity {
+                guard case .string = textVerbosity else {
+                    throw IntatisError.config(
+                        "textVerbosity must be a string for the selected provider adapter")
+                }
+                body["verbosity"] = textVerbosity
+            }
+
+            if let strictJSONSchema =
+                body.removeValue(
+                    forKey: "strictJsonSchema") {
+                guard case .bool = strictJSONSchema else {
+                    throw IntatisError.config(
+                        "strictJsonSchema must be a boolean for the selected provider adapter")
+                }
+                // This option controls SDK-side response-format construction;
+                // it is never itself a wire field.
+            }
+
+            if let user = body["user"],
+               case .string = user {
+                // Recognized by the SDK and emitted with the same wire name.
+            } else if body["user"] != nil {
+                throw IntatisError.config(
+                    "user must be a string for the selected provider adapter")
+            }
+
+        case .openRouter:
+            // The OpenRouter SDK spreads provider options without translating
+            // reasoningEffort. Its one compatibility alias in this boundary is
+            // cacheControl -> cache_control.
+            if let cacheControl =
+                body.removeValue(
+                    forKey: "cacheControl"),
+               cacheControl != .null,
+               body["cache_control"] == nil {
+                body["cache_control"] =
+                    cacheControl
+            }
+        }
+    }
+
+    /// Runtime reasoning remains host-owned, but its wire shape is chosen by
+    /// the frozen package adapter instead of by endpoint-name heuristics.
+    static func applyChatCompletionsReasoningOptions(
+        to body: inout [String: JSONValue],
+        runtimeEffort: ReasoningEffort?,
+        requestAdapter: ProviderRequestAdapter
+    ) {
+        guard let runtimeEffort else {
+            return
+        }
+        switch try? requestAdapter
+            .chatCompletionsAdapter()
+        {
+        case .openRouter:
+            var reasoning: [String: JSONValue] = [:]
+            if case .object(let configured)? =
+                body["reasoning"] {
+                reasoning = configured
+            }
+            reasoning["effort"] =
+                .string(runtimeEffort.rawValue)
+            body["reasoning"] = .object(reasoning)
+
+        case .legacyOpenAIWire,
+             .openAICompatible:
+            body["reasoning_effort"] =
+                .string(runtimeEffort.rawValue)
+
+        case nil:
+            // Unsupported adapters were rejected while lowering configured
+            // options, before this host overlay is reached.
+            return
+        }
+    }
+
+    /// Responses uses the nested `reasoning.effort` shape. Normalize both the
+    /// Chat Completions shorthand and the SDK-only camelCase alias at this wire
+    /// boundary while preserving unrelated nested reasoning options.
+    static func applyResponsesReasoningOptions(
+        to body: inout [String: JSONValue],
+        runtimeEffort: ReasoningEffort?
+    ) {
+        let sdkAlias =
+            body.removeValue(forKey: "reasoningEffort")
+        let chatCompletionsAlias =
+            body.removeValue(forKey: "reasoning_effort")
+
+        if let runtimeEffort {
+            var reasoning: [String: JSONValue] = [:]
+            if case .object(let configured)? =
+                body["reasoning"] {
+                reasoning = configured
+            }
+            reasoning["effort"] =
+                .string(runtimeEffort.rawValue)
+            body["reasoning"] = .object(reasoning)
+            return
+        }
+
+        let compatibleEffort =
+            chatCompletionsAlias ?? sdkAlias
+        guard let compatibleEffort else { return }
+
+        if case .object(var reasoning)? =
+            body["reasoning"] {
+            if reasoning["effort"] == nil {
+                reasoning["effort"] = compatibleEffort
+                body["reasoning"] = .object(reasoning)
+            }
+        } else if body["reasoning"] == nil {
+            body["reasoning"] = .object([
+                "effort": compatibleEffort,
+            ])
+        }
     }
 
     /// Provider request bodies are compared, cached, and audited as bytes in

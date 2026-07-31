@@ -93,6 +93,10 @@ private struct UntrustedStaleWorkTaskManager: WorkTaskManager {
     }
 }
 
+private enum WorkTaskRuntimeTestError: Error, Equatable {
+    case lostAcknowledgementAfterAppend
+}
+
 final class WorkTaskRuntimeTests: XCTestCase {
     private let main = AgentID(rawValue: "main")
     private let worker = AgentID(rawValue: "worker")
@@ -203,6 +207,197 @@ final class WorkTaskRuntimeTests: XCTestCase {
             canManage: true,
             taskID: created.task.id)
         XCTAssertEqual(unchanged.task, created.task)
+    }
+
+    func testWorkerCanCompleteOwnedTaskWhenSnapshotRepeatsFrozenContractFields() async throws {
+        let workspace = try workTaskWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let (orchestrator, _) = try await makeOrchestrator(workspace: workspace)
+        let runID = ContinuationRunID.new()
+        let created = try await orchestrator.createWorkTask(
+            requestedBy: main,
+            currentRunID: runID,
+            currentGoalID: nil,
+            canManage: true,
+            request: WorkTaskCreateRequest(
+                title: "Count workspace files",
+                description: "Return a verified count by extension",
+                acceptanceCriteria: ["count every regular file"],
+                expectedArtifacts: ["file-count summary"],
+                owner: worker,
+                priority: .normal))
+        let started = try await orchestrator.updateWorkTask(
+            requestedBy: main,
+            currentWorkTaskID: nil,
+            currentRunID: runID,
+            canManage: true,
+            canUpdateOwned: false,
+            request: WorkTaskUpdateRequest(
+                taskID: created.task.id,
+                expectedRevision: created.task.revision,
+                status: .inProgress))
+        let manager = OrchestratorWorkTaskManager(
+            orchestrator: orchestrator,
+            requester: worker,
+            currentWorkTaskID: started.task.id,
+            currentRunID: runID,
+            currentGoalID: nil,
+            canManage: false,
+            canUpdateOwned: true)
+        let context = ToolContext(
+            workspaceRoot: workspace,
+            workTaskManager: manager)
+        let rawArgs = """
+        {
+          "task_id": "\(started.task.id.rawValue)",
+          "expected_revision": \(started.task.revision),
+          "title": "Count workspace files",
+          "description": "Return a verified count by extension",
+          "acceptance_criteria": ["count every regular file"],
+          "expected_artifacts": ["file-count summary"],
+          "owner": "worker",
+          "depends_on": [],
+          "priority": "normal",
+          "progress_note": "count reconciled",
+          "status": "completed",
+          "result": "251 regular files",
+          "evidence": [{
+            "kind": "workspace_scan",
+            "reference": "workspace-root",
+            "summary": "category totals reconcile to 251"
+          }],
+          "retry": false
+        }
+        """
+
+        _ = try await TaskUpdateTool().execute(
+            ToolArgs(raw: rawArgs),
+            in: context)
+
+        let completed = try await orchestrator.getWorkTask(
+            requestedBy: main,
+            currentWorkTaskID: nil,
+            currentRunID: runID,
+            currentGoalID: nil,
+            canManage: true,
+            taskID: started.task.id)
+        XCTAssertEqual(completed.task.status, .completed)
+        XCTAssertEqual(completed.task.result, "251 regular files")
+        XCTAssertEqual(completed.task.title, started.task.title)
+        XCTAssertEqual(completed.task.description, started.task.description)
+        XCTAssertEqual(completed.task.acceptanceCriteria, started.task.acceptanceCriteria)
+        XCTAssertEqual(completed.task.expectedArtifacts, started.task.expectedArtifacts)
+        XCTAssertEqual(completed.task.owner, worker)
+        XCTAssertEqual(completed.task.dependsOn, [])
+        XCTAssertEqual(completed.task.priority, .normal)
+        XCTAssertEqual(completed.task.revision, started.task.revision + 1)
+    }
+
+    func testManagerFrozenContractRejectionIsProvenNotStarted() async throws {
+        let workspace = try workTaskWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let (orchestrator, log) = try await makeOrchestrator(workspace: workspace)
+        let runID = ContinuationRunID.new()
+        let created = try await orchestrator.createWorkTask(
+            requestedBy: main,
+            currentRunID: runID,
+            currentGoalID: nil,
+            canManage: true,
+            request: WorkTaskCreateRequest(
+                title: "Frozen ownership",
+                description: "Keep the worker binding stable",
+                owner: worker))
+        let started = try await orchestrator.updateWorkTask(
+            requestedBy: main,
+            currentWorkTaskID: nil,
+            currentRunID: runID,
+            canManage: true,
+            canUpdateOwned: false,
+            request: WorkTaskUpdateRequest(
+                taskID: created.task.id,
+                expectedRevision: created.task.revision,
+                status: .inProgress))
+        let manager = OrchestratorWorkTaskManager(
+            orchestrator: orchestrator,
+            requester: main,
+            currentWorkTaskID: nil,
+            currentRunID: runID,
+            currentGoalID: nil,
+            canManage: true,
+            canUpdateOwned: true)
+        let beforeEvents = await log.replay()
+
+        do {
+            _ = try await manager.updateWorkTask(WorkTaskUpdateRequest(
+                taskID: started.task.id,
+                expectedRevision: started.task.revision,
+                owner: .agent(main),
+                status: .completed,
+                result: "must not commit"))
+            XCTFail("changing a frozen owner must be rejected")
+        } catch let rejection as ToolExecutionRejectedWithoutSideEffect {
+            XCTAssertEqual(rejection.code, "permission_denied")
+            XCTAssertTrue(rejection.message.contains("without applying changes"))
+            XCTAssertTrue(rejection.message.contains("execution contract is frozen"))
+        }
+
+        let afterEvents = await log.replay()
+        XCTAssertEqual(afterEvents, beforeEvents)
+        let unchanged = try await orchestrator.getWorkTask(
+            requestedBy: main,
+            currentWorkTaskID: nil,
+            currentRunID: runID,
+            currentGoalID: nil,
+            canManage: true,
+            taskID: started.task.id)
+        XCTAssertEqual(unchanged.task, started.task)
+    }
+
+    func testPostAppendFailureIsNotMisclassifiedAsNoEffect() async throws {
+        let workspace = try workTaskWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let (orchestrator, log) = try await makeOrchestrator(workspace: workspace)
+        let runID = ContinuationRunID.new()
+        let created = try await orchestrator.createWorkTask(
+            requestedBy: main,
+            currentRunID: runID,
+            currentGoalID: nil,
+            canManage: true,
+            request: WorkTaskCreateRequest(
+                title: "Lost acknowledgement",
+                description: "Persist before returning an error"))
+        await orchestrator.setAdmissionEventsAppender { events in
+            try await log.append(events)
+            throw WorkTaskRuntimeTestError.lostAcknowledgementAfterAppend
+        }
+        let manager = OrchestratorWorkTaskManager(
+            orchestrator: orchestrator,
+            requester: main,
+            currentWorkTaskID: nil,
+            currentRunID: runID,
+            currentGoalID: nil,
+            canManage: true,
+            canUpdateOwned: true)
+
+        do {
+            _ = try await manager.updateWorkTask(WorkTaskUpdateRequest(
+                taskID: created.task.id,
+                expectedRevision: created.task.revision,
+                progressNote: "durably appended"))
+            XCTFail("the simulated lost acknowledgement must surface")
+        } catch is ToolExecutionRejectedWithoutSideEffect {
+            XCTFail("a post-append failure must remain side-effect-unknown")
+        } catch let error as WorkTaskRuntimeTestError {
+            XCTAssertEqual(error, .lostAcknowledgementAfterAppend)
+        }
+
+        let replayed = CoworkProjection.build(from: await log.replay())
+        XCTAssertEqual(
+            replayed.workTasks[created.task.id]?.revision,
+            created.task.revision + 1)
+        XCTAssertEqual(
+            replayed.workTasks[created.task.id]?.progressNote,
+            "durably appended")
     }
 
     func testConcurrentCreatesPreserveBothTasksAcrossPersistenceAwait() async throws {

@@ -11,7 +11,7 @@ linked into the Intatis Markdown renderer on macOS and iOS.
 - Tree: `a01638e2bffe9064cb77c66f766ce67c83ca3201`
 - Local reuse mode: `dependency`
 - Product role: native TeX math parsing and layout for code-aware
-  single-dollar inline math on macOS and iOS
+  inline and display math on macOS and iOS
 - License files reviewed: root `LICENSE`, `iosMath/fonts/*.txt`, the bundled
   per-font README files, and the font inventory at the pinned revision
 - Engine license: MIT
@@ -24,9 +24,9 @@ parser/layout engine or its sample wrapper. The code-aware delimiter
 preprocessing, attachment integration, accessibility source preservation, and
 first-release feature policy are changes maintained in the vendored
 SwiftStreamingMarkdown derivative and recorded in its adjacent patch ledger.
-The derivative caps admission at 32 formulas per message and 8 KiB UTF-8 per
-formula; a message exceeding either limit remains literal rather than creating
-a partial attachment set.
+The derivative recognizes `$...$` / `\(...\)` inline and `$$...$$` /
+`\[...\]` display delimiters outside protected Markdown literals. It adds no
+formula-count, per-formula UTF-8, or fixed attachment-size cap.
 
 iosMath uses Foundation, Core Graphics, QuartzCore, Core Text, and UIKit or
 AppKit. It does not use a WebView, JavaScript runtime, network service, shell,
@@ -55,8 +55,8 @@ macOS SwiftPM Release, compile-only `swift build --build-tests`, and an
 unsigned iOS Simulator Release build all completed at the pinned revision.
 The upstream test executables were not run, so this evidence must not be
 described as an upstream test pass. Intatis' renderer integration, streaming,
-accessibility, resource, and bounded GUI-performance gates remain separate
-release obligations.
+accessibility, resource, and GUI-performance gates remain separate release
+obligations.
 
 Intatis explicitly approved use of iosMath 2.5.0 and distribution of the
 audited unmodified GUST/LPPL and OFL font resources on 2026-07-23.

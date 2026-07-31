@@ -1361,8 +1361,14 @@ private struct CoworkInferenceAccessory: View {
 @MainActor
 final class IntatisApplicationDelegate: NSObject, NSApplicationDelegate {
     private var terminationTask: Task<Void, Never>?
+    #if INTATIS_RENDERER_VALIDATION
+    private var rendererValidationWindowController:
+        NSWindowController?
+    #endif
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        IntatisMacProcessDiagnostics.shared.start(
+            application: NSApplication.shared)
         #if INTATIS_RENDERER_VALIDATION
         let arguments = ProcessInfo.processInfo.arguments
         guard arguments.contains("-IntatisRendererFixture"),
@@ -1371,20 +1377,61 @@ final class IntatisApplicationDelegate: NSObject, NSApplicationDelegate {
               let seconds = Double(rawSeconds),
               (1...300).contains(seconds)
         else { return }
+        let finalizeFixtureResult =
+            RendererFixtureResultLifecycle.configure(
+            arguments: arguments)
+        _ = NSApplication.shared.setActivationPolicy(
+            .regular)
+        let controller = NSHostingController(
+            rootView:
+                RendererFixtureView(
+                    arguments: arguments))
+        let window = NSWindow(
+            contentRect: NSRect(
+                x: 0,
+                y: 0,
+                width: 1_280,
+                height: 900),
+            styleMask: [
+                .titled,
+                .closable,
+                .miniaturizable,
+                .resizable,
+            ],
+            backing: .buffered,
+            defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentViewController = controller
+        window.title =
+            "Intatis Renderer Validation"
+        window.center()
+        let windowController =
+            NSWindowController(
+                window: window)
+        rendererValidationWindowController =
+            windowController
+        windowController.showWindow(nil)
+        window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
+        NSApplication.shared.activate(
+            ignoringOtherApps: true)
 
         // Keep watchdog auto-exit independent of SwiftUI view-task lifetime.
         DispatchQueue.main.asyncAfter(deadline: .now() + seconds) {
+            _ = finalizeFixtureResult?()
             NSApplication.shared.terminate(nil)
         }
         #endif
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        IntatisMacProcessDiagnostics.shared.beginTermination()
         #if INTATIS_RENDERER_VALIDATION
         // The offline renderer fixture never creates AppEnvironment or session runtimes.
         // Let its watchdog-owned auto-exit complete inside the containment window
         // instead of paying the production runtime-drain deadline.
         if ProcessInfo.processInfo.arguments.contains("-IntatisRendererFixture") {
+            RendererFixtureResultLifecycle.sealForExit()
             return .terminateNow
         }
         #endif
@@ -1412,6 +1459,10 @@ final class IntatisApplicationDelegate: NSObject, NSApplicationDelegate {
             self?.terminationTask = nil
         }
         return .terminateLater
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        IntatisMacProcessDiagnostics.shared.beginTermination()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -1461,7 +1512,13 @@ struct IntatisMacApp: App {
             }
             #else
             if ProcessInfo.processInfo.arguments.contains("-IntatisRendererFixture") {
-                RendererFixtureView()
+                // The validation-only AppDelegate owns the single deterministic
+                // NSHostingController fixture window. Keeping this scene inert
+                // avoids running the exact workload twice while preserving the
+                // normal Debug fixture scene unchanged.
+                Color.clear
+                    .accessibilityIdentifier(
+                        "renderer.validation.host.placeholder")
                     .preferredColorScheme(launchAppearance)
             } else {
                 IntatisProductionRootView(launchAppearance: launchAppearance)

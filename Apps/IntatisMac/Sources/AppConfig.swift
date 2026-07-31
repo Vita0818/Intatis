@@ -4,6 +4,7 @@ import IntatisCore
 import IntatisProtocol
 import IntatisProviders
 import IntatisConversation
+import IntatisSkills
 
 typealias AppSessionSummary = SessionSummary
 
@@ -83,6 +84,17 @@ struct AppProviderModel: Identifiable, Codable, Equatable {
     var declaredCapabilities: [Capability] {
         ModelCapabilityMetadata.declaredCapabilities(
             in: configurationMetadata)
+    }
+
+    var requestAdapterOverride: ProviderRequestAdapter? {
+        guard case .object(let provider)? =
+                configurationMetadata["provider"],
+              case .string(let npm)? =
+                provider["npm"] else {
+            return nil
+        }
+        return ProviderRequestAdapter
+            .configuredModelOverride(npm)
     }
 }
 
@@ -184,6 +196,7 @@ struct AppProviderAPIKeySource: Codable, Equatable {
 struct AppProviderSettings: Identifiable, Codable, Equatable {
     var id: String
     var displayName: String
+    var npm: String
     var baseURL: String
     var chatEndpoint: String
     var apiKeyAccount: String
@@ -192,6 +205,8 @@ struct AppProviderSettings: Identifiable, Codable, Equatable {
 
     init(id: String,
          displayName: String,
+         npm: String = ProviderRequestAdapter
+             .openAICompatible.rawValue,
          baseURL: String,
          chatEndpoint: String? = nil,
          apiKeyAccount: String,
@@ -199,6 +214,8 @@ struct AppProviderSettings: Identifiable, Codable, Equatable {
          models: [AppProviderModel]) {
         self.id = id
         self.displayName = displayName
+        self.npm = ProviderRequestAdapter
+            .configuredProvider(npm).rawValue
         self.baseURL = baseURL
         self.chatEndpoint = chatEndpoint ?? AppConfig.chatEndpoint(forBaseURL: baseURL)
         self.apiKeyAccount = apiKeyAccount
@@ -209,6 +226,7 @@ struct AppProviderSettings: Identifiable, Codable, Equatable {
     enum CodingKeys: String, CodingKey {
         case id
         case displayName
+        case npm
         case baseURL
         case chatEndpoint
         case apiKeyAccount
@@ -221,6 +239,10 @@ struct AppProviderSettings: Identifiable, Codable, Equatable {
         let baseURL = try container.decode(String.self, forKey: .baseURL)
         self.id = try container.decode(String.self, forKey: .id)
         self.displayName = try container.decode(String.self, forKey: .displayName)
+        self.npm = ProviderRequestAdapter.configuredProvider(
+            try container.decodeIfPresent(
+                String.self,
+                forKey: .npm)).rawValue
         self.baseURL = baseURL
         self.chatEndpoint = try container.decodeIfPresent(String.self, forKey: .chatEndpoint)
             ?? AppConfig.chatEndpoint(forBaseURL: baseURL)
@@ -234,6 +256,10 @@ struct AppProviderSettings: Identifiable, Codable, Equatable {
         let trimmed = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty { return trimmed }
         return URL(string: baseURL)?.host ?? id
+    }
+
+    var requestAdapter: ProviderRequestAdapter {
+        ProviderRequestAdapter.configuredProvider(npm)
     }
 }
 
@@ -274,8 +300,10 @@ enum AppConfig {
     /// profiles. The App Store target cannot link or enable MCP stdio.
     #if INTATIS_MAC_APP_STORE
     static let platformProfile: PlatformProfile = .macAppStore
+    static let skillRootAccess: SkillRootAccess = .workspaceOnly
     #else
     static let platformProfile: PlatformProfile = .macDeveloperID
+    static let skillRootAccess: SkillRootAccess = .workspaceAndGlobal
     #endif
 
     static let defaultSession = SessionID(rawValue: "sess_default")
@@ -483,6 +511,11 @@ enum AppConfig {
                 chatEndpoint: URL(string: provider.chatEndpoint),
                 apiKeyRef: apiKeyRef(for: provider),
                 wire: .openai,
+                requestAdapter:
+                    provider.requestAdapter,
+                modelRequestAdapters:
+                    modelRequestAdapters(
+                        for: provider),
                 modelRequestOptions:
                     modelRequestOptions(
                         for: provider,
@@ -538,6 +571,7 @@ enum AppConfig {
             return AppProviderSettings(
                 id: id,
                 displayName: provider.displayName.trimmingCharacters(in: .whitespacesAndNewlines),
+                npm: provider.npm,
                 baseURL: baseURL,
                 chatEndpoint: chatEndpoint,
                 apiKeyAccount: provider.apiKeyAccount.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -660,6 +694,11 @@ enum AppConfig {
             chatEndpoint: URL(string: provider.chatEndpoint),
             apiKeyRef: apiKeyRef(for: provider),
             wire: .openai,
+            requestAdapter:
+                provider.requestAdapter,
+            modelRequestAdapters:
+                modelRequestAdapters(
+                    for: provider),
             modelRequestOptions:
                 modelRequestOptions(
                     for: provider,
@@ -676,10 +715,26 @@ enum AppConfig {
             if provider.id == catalog.selectedProviderID,
                model.id == catalog.selectedModelID,
                let variant = catalog.selectedVariant {
-                options.merge(variant.requestOptions) { _, variantValue in variantValue }
+                options = InferenceRequestOptionMerge
+                    .deepOverlay([
+                        options,
+                        variant.requestOptions,
+                    ])
             }
             return options.isEmpty ? nil : (model.id, options)
         })
+    }
+
+    private static func modelRequestAdapters(
+        for provider: AppProviderSettings
+    ) -> [String: ProviderRequestAdapter] {
+        Dictionary(
+            uniqueKeysWithValues:
+                provider.models.compactMap { model in
+                    model.requestAdapterOverride.map {
+                        (model.id, $0)
+                    }
+                })
     }
 
     private static func modelCapabilities(
@@ -962,7 +1017,8 @@ enum AppConfig {
         var providerMap = root["provider"] as? [String: Any] ?? [:]
         for provider in catalog.providers {
             var providerObject = providerMap[provider.id] as? [String: Any] ?? [:]
-            providerObject["npm"] = providerObject["npm"] as? String ?? "@ai-sdk/openai-compatible"
+            providerObject["npm"] =
+                provider.requestAdapter.rawValue
             providerObject["name"] = provider.title
 
             var options = providerObject["options"] as? [String: Any] ?? [:]
@@ -1228,12 +1284,13 @@ private struct AppProviderConfigTemplate: Encodable {
 }
 
 private struct AppProviderConfigTemplateProvider: Encodable {
-    var npm = "@ai-sdk/openai-compatible"
+    var npm: String
     var name: String
     var options: AppProviderConfigTemplateOptions
     var models: [String: AppProviderConfigTemplateModel]
 
     init(provider: AppProviderSettings, apiKey: String?) {
+        self.npm = provider.requestAdapter.rawValue
         self.name = provider.title
         self.options = AppProviderConfigTemplateOptions(provider: provider, apiKey: apiKey)
         self.models = Dictionary(uniqueKeysWithValues: provider.models.map { model in
@@ -1476,6 +1533,8 @@ private struct AppProviderConfigFileProvider: Decodable {
         return AppProviderSettings(
             id: id,
             displayName: displayName ?? name ?? AppConfig.defaultProviderDisplayName(forProviderID: id),
+            npm: ProviderRequestAdapter
+                .configuredProvider(npm).rawValue,
             baseURL: base,
             chatEndpoint: options?.chatEndpoint ?? chatEndpoint,
             apiKeyAccount: apiKeyAccount ?? (id == "default" ? AppConfig.legacyAPIKeyAccount : "provider-\(id)"),

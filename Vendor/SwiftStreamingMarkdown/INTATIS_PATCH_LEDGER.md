@@ -149,10 +149,10 @@ Paths:
 Changes and reason:
 
 - At the initial cutover, delete the upstream regex-based math implementation
-  and all syntax-highlighting implementations and APIs. Patch group 10 does
-  not restore those deleted files: it adds a code-aware single-dollar path
-  with a smaller public/configuration surface. Syntax highlighting remains
-  deleted.
+  and all syntax-highlighting implementations and APIs. Patch group 10 added
+  a smaller request-local, code-aware single-dollar path without restoring
+  those files; patch group 12 supersedes only that path's delimiter and
+  admission policy. Syntax highlighting remains deleted.
 - Force animation, citations, and images off in
   `firstReleaseParseConfiguration()` for the production off-main parser.
 - Keep any still-compiled legacy image/citation compatibility source out of the
@@ -240,6 +240,9 @@ Regression obligations:
 - Lifecycle stress testing while rapidly replacing streamed documents.
 
 ### 8. View diff, layout invalidation, and selection-overlay hardening
+
+The AppKit width-invalidation portion of this patch group is historical and
+is superseded by patch group 11. UIKit retains the patch-group-8 contract.
 
 Paths:
 
@@ -333,6 +336,10 @@ Regression obligations:
   a signed GUI host through Computer Use.
 
 ### 10. Code-aware single-dollar inline math
+
+Historical note: this section records the 2026-07-24 implementation exactly as
+introduced. Patch group 12 supersedes its delimiter exclusions, 32-formula /
+8-KiB admission caps, and 1024×256-point attachment cap.
 
 Paths:
 
@@ -465,12 +472,144 @@ Dependency-only audit evidence:
   also reproduced as separate evidence below; long soak and real
   selection/clipboard/VoiceOver remain separate release gates.
 
+### 11. macOS paragraph width ownership and bounded measurement
+
+Paths:
+
+- `Sources/MarkdownText/UI/Paragraph/AppKit/ParagraphView+macOS.swift`
+- `Sources/MarkdownText/UI/Paragraph/AppKit/ParagraphNSView.swift`
+- `Tests/MarkdownTextTests/ParagraphNSViewTests.swift`
+- `Tests/MarkdownTextTests/ViewEquatableContractTests.swift`
+
+Changes and reason:
+
+- Make the SwiftUI proposal the sole horizontal size owner on macOS.
+  `ParagraphNSView` now reports `NSView.noIntrinsicMetric` for width while
+  retaining a width-validated intrinsic height.
+- `ParagraphView.sizeThatFits` returns the exact finite positive proposal
+  width and the measured TextKit height. It no longer feeds glyph used width
+  back into SwiftUI layout.
+- Bounds-width changes clear the local height measurement and schedule TextKit
+  2 viewport layout, but no longer call `invalidateIntrinsicContentSize`.
+  Content and line-spacing changes may still invalidate intrinsic height.
+- Replace the unbounded historical-width dictionary with a one-entry
+  exact-width/height memo. No rounding or width bucketing is allowed because
+  adjacent proposals may cross a line-wrap boundary.
+- This supersedes the AppKit width-invalidation portion of patch group 8.
+  UIKit retains the patch-group-8 contract.
+
+Regression obligations:
+
+- 10,000 changing widths produce zero width-driven intrinsic invalidations.
+- 10,000 cache stores retain exactly one entry.
+- Adjacent exact widths do not alias.
+- Intrinsic height is validated against the current width.
+- A live `NSHostingView` survives repeated A-B-A width cycles with finite,
+  reversible paragraph geometry.
+- Repeat strict Release warnings-as-errors and real on-window zoom/scroll
+  validation.
+
+Current patch-group-11 evidence (2026-07-30):
+
+- Strict Release warnings-as-errors passed with 77 XCTest tests and 11 Swift
+  Testing tests, zero failures.
+- The same final validation executable completed three 180-second rich
+  `CodeShell` soaks. All three passed memory plateau, heartbeat,
+  multiple-updates-per-frame, process cleanup, exact 1,249-delta/17-message
+  final input, and two session switches; the first two no-AX runs recorded zero
+  invalid geometry.
+- A normal Release product build completed the real issue-session A-B-A,
+  zoom/restore, scroll, and multiwindow matrix without reproducing the
+  paragraph layout hang.
+- A roughly 90-second final-executable Hangs/Time Profiler capture reported
+  zero Potential Hang rows and zero Hang Risk rows. It still sampled short
+  ordinary layout bursts, so this is not a claim that layout work disappeared.
+- The interactive Computer Use soak recorded 18 AppKit negative-geometry
+  issues in the Intatis PID. Each cluster immediately followed system
+  ThemeWidget/AX/ReplayKit activation, while two identical no-AX runs recorded
+  zero. Preserve the count as automation-correlated evidence; do not describe
+  the interactive runtime audit as all-zero or globally ignore future
+  uncorrelated geometry faults.
+
+### 12. Common LaTeX delimiters without derivative formula caps
+
+Paths:
+
+- `README.md`
+- `Sources/MarkdownText/Models/MathRenderConfig.swift`
+- `Sources/MarkdownText/Models/InlineMathCatalog.swift`
+- `Sources/MarkdownText/Models/MathAttachmentData.swift`
+- `Sources/MarkdownText/Parser/InlineMathPreprocessor.swift`
+- `Sources/MarkdownText/UI/Paragraph/InlineMathAttachment.swift`
+- `Tests/MarkdownTextTests/InlineMathAttachmentTests.swift`
+- `Tests/MarkdownTextTests/InlineMathParserTests.swift`
+- `Tests/MarkdownTextTests/InlineMathPreprocessorTests.swift`
+- containing Intatis revision:
+  `Packages/IntatisSharedUI/Sources/MessageRendering/IntatisMicrosoftMarkdownPipeline.swift`
+- containing Intatis revision:
+  `Packages/IntatisSharedUI/Tests/MessageRenderingTests.swift`
+- containing Intatis revision:
+  `Apps/IntatisMac/Sources/{IntatisChatScreen,RendererFixtureView}.swift`
+- containing Intatis revision:
+  `NOTICE.md`, `ThirdPartyNotices/{MarkdownRendering,MathRendering}.md`, and
+  the renderer sections of `docs/**`
+
+Changes and reason:
+
+- Replace the single-dollar-only mode with one code-aware LaTeX mode that
+  recognizes `$...$` and `\(...\)` as inline math, plus `$$...$$` and
+  `\[...\]` as display math. Display delimiters may span lines.
+- Preserve the existing first raw Markdown AST as the authority for fenced
+  code, inline code, link/image, autolink, and raw-HTML protection. The
+  request-local token catalog and exact-source copy/accessibility projection
+  remain unchanged.
+- Remove the derivative's 32-formula-per-message and 8-KiB-per-formula
+  admission caps. Accepted candidates are no longer switched as a group to
+  literal output because a local formula budget was crossed.
+- Remove the derivative's 1024×256-point attachment cutoff. Preflight now
+  accepts any finite, positive intrinsic size returned by iosMath; invalid TeX
+  or invalid platform geometry still restores the exact source literal.
+- Carry inline/display presentation through the request-local catalog and
+  scalar attachment payload. Live `MTMathUILabel` views use `.text` for inline
+  delimiters and `.display` for display delimiters.
+- Do not restore the deleted upstream regex preprocessing or legacy block
+  views, add a WebView/raster cache, change EventLog/provider source, or change
+  the exact iosMath dependency and resource inventory.
+- Intatis SharedUI's syntax-agnostic whole-message rich-admission boundary and
+  process-wide parser scheduler backpressure are separate renderer resource
+  controls; they are not formula-count or per-formula caps and are unchanged.
+
+Regression obligations:
+
+- Exercise all four delimiter forms, multiline display content, protected
+  Markdown literals, currency/escape/malformed input, exact source
+  restoration, and inline/display iosMath modes.
+- Exercise more than 32 accepted formulas and formula source larger than the
+  removed 8-KiB threshold without a literal-only admission fallback.
+- Exercise a valid attachment wider than the removed 1024-point cutoff.
+- Retain strict concurrency/build, source-copy/accessibility, Light/Dark,
+  Dynamic Type, streaming replacement, memory, cancellation, and real-window
+  validation gates.
+
+Current patch-group-12 evidence (2026-07-31):
+
+- `swift test --disable-sandbox --filter InlineMath` passed 39/39 focused
+  tests with zero failures on macOS.
+- The full derivative Release suite with strict concurrency warnings promoted
+  to errors passed 79 XCTest + 11 Swift Testing tests (90/90 total).
+- Root `MessageRenderingTests` passed 41/41; `swift build --disable-sandbox
+  --target IntatisSharedUI`, `xcodegen generate`, IntatisMac macOS Debug, and
+  IntatisiOS generic Simulator Debug all succeeded.
+- The full root suite, Release app matrix, and user-approved real-window
+  validation were not run for patch group 12. The automated evidence above
+  does not by itself establish renderer release readiness.
+
 ## Current validation evidence
 
-Unless explicitly identified as patch-group-10 evidence above, the renderer
-evidence below predates the single-dollar/iosMath change. It remains a useful
-baseline for the earlier derivative but cannot be promoted to current
-math-integration evidence. Re-run the same checks with Swift 6.3.3 / Xcode
+Unless explicitly identified as patch-group-10 or patch-group-12 evidence
+above, the renderer evidence below predates the relevant math change. It
+remains a useful baseline for the earlier derivative but cannot be promoted
+to current math-integration evidence. Re-run the same checks with Swift 6.3.3 / Xcode
 26.6 whenever this vendored snapshot or any exact dependency pin changes.
 
 - Post-hygiene `swift package dump-package` reports exactly one library
@@ -555,6 +694,13 @@ result was `FAIL / ABORTED`; they do not erase the historical incident or
 establish release readiness. A >160-second single-instance soak, real
 selection/clipboard-byte checks, real VoiceOver operation, minimum-supported
 macOS runtime and representative iOS device validation remain open.
+
+That sentence is the dated 2026-07-24 patch-group-10 boundary. The 2026-07-30
+patch-group-11 evidence above subsequently completed three >160-second
+single-instance soaks for the current macOS paragraph path. Real
+selection/clipboard bytes, VoiceOver, minimum-supported macOS and
+representative iOS devices remain open, as does the historical multi-instance
+retaining edge.
 
 Warm offscreen single-paragraph plain-text timings (parse plus host, six
 Release samples across two test processes, each after an explicit 1 KiB

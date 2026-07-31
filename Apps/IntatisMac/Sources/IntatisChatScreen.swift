@@ -73,6 +73,7 @@ private struct IntatisChatSessionScreen: View {
     @ObservedObject var model: ChatViewModel
     let sessionTitle: String
     @Environment(\.colorScheme) private var scheme
+    @State private var historyWindowUpperBound: Int?
     private static let bottomAnchorID = "intatis-chat-thread-bottom"
 
     var body: some View {
@@ -98,7 +99,11 @@ private struct IntatisChatSessionScreen: View {
 
             IntatisComposer(model: model,
                             catalog: env.providerCatalog,
-                            onSelectModel: env.selectProviderModel(providerID:modelID:variantID:))
+                            onSelectModel: env.selectProviderModel(providerID:modelID:variantID:),
+                            onSend: {
+                                historyWindowUpperBound = nil
+                                model.send()
+                            })
                 .frame(maxWidth: layout.contentMaxWidth)
                 .padding(.horizontal, layout.horizontalPadding)
                 .padding(.top, 10)
@@ -136,20 +141,38 @@ private struct IntatisChatSessionScreen: View {
         if model.messages.isEmpty {
             emptyState
         } else {
+            let historyWindow = threadHistoryWindow
             ScrollViewReader { proxy in
                 ScrollView {
-                    IntatisAdaptiveThreadStack(
-                        visibleRowCount: model.messages.count
-                            + ((model.isStreaming && model.messages.last?.role == .user) ? 1 : 0),
-                        spacing: 14) {
-                        ForEach(model.messages) { msg in
+                    VStack(spacing: 14) {
+                        if historyWindow.hasEarlier || historyWindow.hasLater {
+                            IntatisThreadHistoryPager(
+                                lowerBound: historyWindow.lowerBound,
+                                upperBound: historyWindow.upperBound,
+                                totalCount: historyWindow.totalCount,
+                                hasEarlier: historyWindow.hasEarlier,
+                                hasLater: historyWindow.hasLater,
+                                accessibilityPrefix: "chat.history",
+                                onEarlier: {
+                                    historyWindowUpperBound =
+                                        historyWindow.earlierRequestedUpperBound
+                                },
+                                onNewer: {
+                                    historyWindowUpperBound =
+                                        historyWindow.newerRequestedUpperBound
+                                },
+                                onLatest: {
+                                    historyWindowUpperBound = nil
+                                })
+                        }
+                        ForEach(historyWindow.items) { msg in
                             IntatisMessageBubble(message: msg,
                                                  rowWidth: layout.contentWidth,
                                                  maxWidth: layout.messageMaxWidth,
                                                  gutter: layout.messageGutter)
                                 .id(msg.id)
                         }
-                        if model.isStreaming, model.messages.last?.role == .user {
+                        if showsVisibleThinkingIndicator {
                             thinkingRow(layout: layout)
                                 .id("intatis-chat-thinking-\(chatThinkingPhaseID)")
                         }
@@ -170,19 +193,44 @@ private struct IntatisChatSessionScreen: View {
                 .onChange(of: chatScrollSignature) { _ in
                     scrollToBottom(proxy)
                 }
+                .overlay(alignment: .bottomTrailing) {
+                    if historyWindow.hasLater {
+                        IntatisJumpToLatestButton(
+                            accessibilityIdentifier: "chat.jump-to-latest"
+                        ) {
+                            historyWindowUpperBound = nil
+                        }
+                    }
+                }
             }
+            .id(historyWindowUpperBound.map(String.init) ?? "latest")
         }
     }
 
     private var chatScrollSignature: String {
-        guard let last = model.messages.last else { return "0" }
+        let historyWindow = threadHistoryWindow
+        guard let last = historyWindow.items.last else { return "0" }
         return [
-            "\(model.messages.count)",
+            "\(historyWindow.lowerBound)",
+            "\(historyWindow.upperBound)",
             last.id.rawValue,
             "\(last.text.count)",
             "\(last.isComplete)",
-            "\(model.isStreaming)"
+            "\(historyWindow.isLatest && model.isStreaming)"
         ].joined(separator: ":")
+    }
+
+    private var threadHistoryWindow:
+        IntatisThreadHistoryWindow<ChatMessageView> {
+        .resolve(
+            allItems: model.messages,
+            requestedUpperBound: historyWindowUpperBound)
+    }
+
+    private var showsVisibleThinkingIndicator: Bool {
+        threadHistoryWindow.isLatest
+            && model.isStreaming
+            && model.messages.last?.role == .user
     }
 
     private var chatThinkingPhaseID: String {
@@ -496,6 +544,7 @@ struct IntatisComposer: View {
     @ObservedObject var model: ChatViewModel
     let catalog: AppProviderCatalog
     let onSelectModel: (String, String, String?) -> Void
+    let onSend: () -> Void
     @Environment(\.colorScheme) private var scheme
 
     private var canSend: Bool {
@@ -530,7 +579,7 @@ struct IntatisComposer: View {
                     stats: model.latestTurnStats,
                     style: .intatisMac(scheme))
             },
-            onSend: { model.send() })
+            onSend: onSend)
     }
 }
 
@@ -686,7 +735,7 @@ struct IntatisSettingsPanel: View {
                 label)
         }
         return IntatisLocalization.string(
-            "This choice is saved and applied immediately; it is independent of provider Save. Rich Markdown uses the audited upstream renderer with images, math typesetting, and syntax highlighting disabled for the first release. Plain text safe mode bypasses Markdown entirely. Raw session data is unchanged.")
+            "This choice is saved and applied immediately; it is independent of provider Save. Rich Markdown uses the audited upstream renderer with LaTeX math typesetting enabled; remote images and syntax highlighting remain disabled for the first release. Plain text safe mode bypasses Markdown entirely. Raw session data is unchanged.")
     }
 
     @ViewBuilder private func settingsCard(layout: IntatisMacScreenLayout) -> some View {

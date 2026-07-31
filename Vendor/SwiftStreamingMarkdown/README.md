@@ -19,20 +19,21 @@ upstream basis and all local patch groups are recorded in
   transitive package dependency
 - headings, emphasis, links, lists, task lists, block quotes, tables,
   thematic breaks, selectable plain code blocks, and exact code copying
-- code-aware paired single-dollar inline math on Apple platforms through a
-  live TextKit 2 `MTMathUILabel` attachment provider; formulas preserve their
-  source for literal fallback, copy, selection, and accessibility
-- Intatis production profile performs no syntax highlighting, block math,
-  image loading, or inline citation handling
+- code-aware `$...$` / `\(...\)` inline and `$$...$$` / `\[...\]` display
+  math on Apple platforms through a live TextKit 2 `MTMathUILabel` attachment
+  provider; formulas preserve their source for literal fallback, copy,
+  selection, and accessibility
+- Intatis production profile performs no syntax highlighting, image loading,
+  or inline citation handling
 - no table download/copy actions, bundled media, or paragraph-view reuse cache
 
-The math profile is independently configurable and bounded to 32 formulas per
-message, 8 KiB UTF-8 per formula, and a 1024×256-point live attachment. It
-does not recognize `$$...$$`, `\(...\)`, or `\[...\]`; code, currency,
-escapes, malformed input, and budget overflow stay literal. Formula views
-follow semantic appearance and Dynamic Type. They are not rasterized or kept
-in a bitmap cache. The derivative's own UI font choices remain independent of
-the eight typesetting fonts distributed by iosMath.
+The math profile is independently configurable and adds no Intatis-specific
+formula-count, per-formula byte, or fixed attachment-size cap. Code, currency,
+escaped delimiters, and malformed input stay literal. Formula views follow
+their inline/display presentation, semantic appearance, and Dynamic Type.
+They are not rasterized or kept in a bitmap cache. The derivative's own UI
+font choices remain independent of the eight typesetting fonts distributed by
+iosMath.
 
 The supported off-main boundary is `MarkdownDocumentParser.parse(text:config:)`.
 It consumes a parse-only `MarkdownRenderConfig` and returns a `sending`
@@ -58,8 +59,9 @@ swift test -c release \
 The package test target covers parser rewrites, task lists, tables, TextKit
 attribute types, paragraph measurement, the ownership-transfer boundary,
 the zero-cache contract, the real code-copy `Button` contract, delimiter and
-budget behavior, final attachments across Markdown structures, live formula
-view providers, source-preserving copy/accessibility, and appearance fallback.
+no-local-cap behavior, final attachments across Markdown structures, live
+formula view providers, source-preserving copy/accessibility, and appearance
+fallback.
 
 ## License and provenance
 

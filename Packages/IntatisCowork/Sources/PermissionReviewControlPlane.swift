@@ -20,15 +20,15 @@ public struct PermissionReviewControlPlanePolicy: Equatable, Sendable {
     public var maxOutputCharacters: Int
     public var maxPendingReviews: Int
 
-    public init(timeoutSeconds: Double = 45,
+    public init(timeoutSeconds: Double = 120,
                 tokenBudget: Int? = nil,
-                reservedCompletionTokens: Int = 1_024,
+                reservedCompletionTokens: Int = 4_096,
                 maxRecentEvents: Int = 36,
                 maxOutputCharacters: Int = 8_000,
                 maxPendingReviews: Int = 64) {
         self.timeoutSeconds = min(300, max(0.01, timeoutSeconds))
         self.tokenBudget = tokenBudget.map { max(1, $0) }
-        self.reservedCompletionTokens = min(4_096, max(1, reservedCompletionTokens))
+        self.reservedCompletionTokens = min(16_384, max(1, reservedCompletionTokens))
         self.maxRecentEvents = min(200, max(1, maxRecentEvents))
         self.maxOutputCharacters = min(32_000, max(256, maxOutputCharacters))
         self.maxPendingReviews = min(1_024, max(1, maxPendingReviews))

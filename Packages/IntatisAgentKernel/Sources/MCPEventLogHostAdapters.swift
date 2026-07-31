@@ -938,6 +938,30 @@ public enum MCPAgentRequestToolSnapshotBuilder {
             policies: policies,
             rememberedApprovals:
                 rememberedApprovals)
+        let mcpAvailability =
+            try MCPToolAvailabilitySnapshot.frozen(
+                snapshotID: view.stableFingerprint,
+                serverIdentifiers:
+                    Set(view.entries.map {
+                        $0.authorization.server.serverID.rawValue
+                    }),
+                toolIdentifiers:
+                    Set(view.entries.map(\.qualifiedName.value)),
+                dependencyIdentities:
+                    Set(view.entries.compactMap { entry in
+                        guard let fingerprint =
+                                entry.connection.reuseIdentity
+                                    .skillDependencyLocatorFingerprint
+                        else {
+                            return nil
+                        }
+                        return MCPServerDependencyIdentity(
+                            serverID:
+                                entry.authorization.server
+                                    .serverID.rawValue,
+                            transportLocatorFingerprint:
+                                fingerprint)
+                    }))
         let resourceView =
             try MCPAgentResourceCatalogView.build(
                 connectionSet: connectionSet,
@@ -994,7 +1018,8 @@ public enum MCPAgentRequestToolSnapshotBuilder {
             return AgentRequestToolSnapshot(
                 snapshotID:
                     connectionSet.snapshotID.rawValue,
-                registry: searchable.registry)
+                registry: searchable.registry,
+                mcpAvailability: mcpAvailability)
         }
         let registry = MCPToolRegistryBuilder.build(
             base: resourceRegistry,
@@ -1006,7 +1031,8 @@ public enum MCPAgentRequestToolSnapshotBuilder {
         return AgentRequestToolSnapshot(
             snapshotID:
                 connectionSet.snapshotID.rawValue,
-            registry: registry)
+            registry: registry,
+            mcpAvailability: mcpAvailability)
     }
 }
 

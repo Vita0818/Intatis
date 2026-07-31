@@ -105,7 +105,7 @@ public struct ConversationProjection: Equatable, Sendable {
                                             timestamp: timestamp))
 
         case .sessionSettingsUpdated, .sessionStorageMigrated, .submissionStatusChanged,
-             .modelHistoryItem,
+             .modelHistoryItem, .modelHistoryCompacted,
              .toolCall, .toolResult, .toolExecutionPrepared, .toolExecutionSettled,
              .permissionRequest, .permissionResolved, .patchProposed, .agentStatus,
              .agentAttached, .agentAttachRequested, .agentDetached, .agentSpawnRequested, .agentSpawned,

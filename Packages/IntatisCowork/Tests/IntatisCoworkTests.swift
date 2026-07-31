@@ -234,6 +234,101 @@ final class IntatisCoworkTests: XCTestCase {
         XCTAssertEqual(workerProvider.requests.count, 0)
     }
 
+    func testEachAgentInvocationBuildsSkillsFromItsOwnWorkspace() async throws {
+        let log = try tempLog()
+        let wsA = try tempWorkspace()
+        let wsB = try tempWorkspace()
+        defer {
+            try? FileManager.default.removeItem(at: wsA)
+            try? FileManager.default.removeItem(at: wsB)
+        }
+
+        func installSkill(
+            _ name: String,
+            marker: String,
+            in workspace: URL
+        ) throws {
+            let directory = workspace
+                .appendingPathComponent(
+                    ".agents/skills/\(name)",
+                    isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true)
+            try """
+            ---
+            name: \(name)
+            description: Workspace-local \(name) workflow.
+            ---
+            \(marker)
+            """.write(
+                to: directory.appendingPathComponent("SKILL.md"),
+                atomically: true,
+                encoding: .utf8)
+        }
+
+        try installSkill("alpha", marker: "ALPHA_BODY", in: wsA)
+        try installSkill("beta", marker: "BETA_BODY", in: wsB)
+        let providerA = CapturingProvider([
+            .textDelta("alpha done"),
+            .done(finishReason: "stop"),
+        ])
+        let providerB = CapturingProvider([
+            .textDelta("beta done"),
+            .done(finishReason: "stop"),
+        ])
+        let orchestrator = Orchestrator(
+            log: log,
+            allowsShell: false,
+            responder: FixedResponder(.allow)
+        ) { agent in
+            agent.name == A ? providerA : providerB
+        }
+
+        let attachedA = await orchestrator.attach(Agent(
+            name: A,
+            workspaceRoot: wsA,
+            model: ModelID(rawValue: "m"),
+            profile: .reviewed))
+        let attachedB = await orchestrator.attach(Agent(
+            name: B,
+            workspaceRoot: wsB,
+            model: ModelID(rawValue: "m"),
+            profile: .reviewed))
+        XCTAssertTrue(attachedA)
+        XCTAssertTrue(attachedB)
+
+        let sentA =
+            await orchestrator.send("Use $alpha.", to: A)
+        let sentB =
+            await orchestrator.send("Use $beta.", to: B)
+        XCTAssertEqual(sentA, .sent)
+        XCTAssertEqual(sentB, .sent)
+
+        let requestA = try XCTUnwrap(providerA.requests.first)
+        let requestB = try XCTUnwrap(providerB.requests.first)
+        let textA = requestA.messages.compactMap(\.content)
+            .joined(separator: "\n")
+        let textB = requestB.messages.compactMap(\.content)
+            .joined(separator: "\n")
+        XCTAssertTrue(textA.contains("alpha"))
+        XCTAssertTrue(textA.contains("ALPHA_BODY"))
+        XCTAssertFalse(textA.contains("beta"))
+        XCTAssertFalse(textA.contains("BETA_BODY"))
+        XCTAssertTrue(textB.contains("beta"))
+        XCTAssertTrue(textB.contains("BETA_BODY"))
+        XCTAssertFalse(textB.contains("alpha"))
+        XCTAssertFalse(textB.contains("ALPHA_BODY"))
+        XCTAssertEqual(
+            Set(requestA.tools.map(\.name))
+                .intersection(["activate_skill", "read_skill_resource"]),
+            ["activate_skill", "read_skill_resource"])
+        XCTAssertEqual(
+            Set(requestB.tools.map(\.name))
+                .intersection(["activate_skill", "read_skill_resource"]),
+            ["activate_skill", "read_skill_resource"])
+    }
+
     func testMainProviderRequestCarriesCompletedConversationAcrossTurns() async throws {
         let log = try tempLog()
         let main = AgentID(rawValue: "main")
@@ -713,6 +808,15 @@ final class IntatisCoworkTests: XCTestCase {
 
     func testSpawnAgentDescriptorIsNotReadOnly() {
         XCTAssertEqual(SpawnAgentTool.descriptor.sideEffect, .write)
+        XCTAssertTrue(
+            SpawnAgentTool.descriptor.description
+                .contains("recommended default"))
+        XCTAssertTrue(
+            SpawnAgentTool.descriptor.description
+                .contains("list_inference_profiles"))
+        XCTAssertTrue(
+            ListInferenceProfilesTool.descriptor.description
+                .contains("label/model/variant"))
     }
 
     func testSpawnAgentIntentIsControlPlaneAndDefaultsToReadOnly() throws {

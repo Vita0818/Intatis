@@ -29,6 +29,16 @@ public struct ProviderRuntimePolicy: Equatable, Sendable {
         initialRetryDelaySeconds: 0.25,
         maxRetryDelaySeconds: 2)
 
+    /// Tool-calling Agent requests can legitimately spend longer reasoning
+    /// before their first response byte than interactive Chat requests. Keep
+    /// this separate from `streaming` so Chat responsiveness does not drift
+    /// when Code/Cowork execution budgets are adjusted.
+    public static let agentStreaming = ProviderRuntimePolicy(
+        maxAttempts: 2,
+        requestTimeoutSeconds: 180,
+        initialRetryDelaySeconds: 0.25,
+        maxRetryDelaySeconds: 2)
+
     public static let nonStreaming = ProviderRuntimePolicy(
         maxAttempts: 2,
         requestTimeoutSeconds: 180,
@@ -73,7 +83,8 @@ enum ProviderRuntime {
 
     static func exhausted(_ error: Error, attempts: Int, operation: String) -> Error {
         let normalized = ProviderErrorFormatting.transport(error)
-        if normalized is ProviderUsageLimitError {
+        if normalized is ProviderUsageLimitError
+            || normalized is ProviderContextWindowExceededError {
             return normalized
         }
         guard attempts > 1 else { return normalized }
@@ -180,6 +191,7 @@ enum ProviderRuntime {
     private static func isRetryable(_ error: Error) -> Bool {
         if error is CancellationError { return false }
         if error is ProviderUsageLimitError { return false }
+        if error is ProviderContextWindowExceededError { return false }
         if let intatis = error as? IntatisError {
             switch intatis {
             case .cancelled, .config, .decoding, .permissionDenied, .notFound:

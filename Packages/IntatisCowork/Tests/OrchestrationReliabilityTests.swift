@@ -739,7 +739,142 @@ private func appendLegacyTaskUpdateRevisionConflict(
     return (taskID, workTaskID, executionID)
 }
 
+@discardableResult
+private func appendLegacyFrozenTaskUpdateRejection(
+    to log: EventLog,
+    agent: AgentID,
+    manager: Bool,
+    tamperArgumentDigest: Bool = false
+) async throws -> (taskID: TaskID, workTaskID: WorkTaskID, executionID: String) {
+    let suffix = manager ? "manager" : "worker"
+    let taskID = TaskID(rawValue: "legacy-frozen-\(suffix)-invocation")
+    let workTaskID = WorkTaskID(rawValue: "legacy-frozen-\(suffix)-work-task")
+    let runID = ContinuationRunID(rawValue: "legacy-frozen-\(suffix)-run")
+    let capabilityLease = manager
+        ? CapabilityLease.coordinator()
+        : CapabilityLease.worker(taskID: taskID)
+    let contract = TaskContract(
+        id: taskID,
+        kind: manager ? .root : .agentInvocation,
+        issuer: manager ? nil : AgentID(rawValue: "main"),
+        assignee: agent,
+        workTaskID: manager ? nil : workTaskID,
+        continuationRunID: runID,
+        objective: "settle one durable WorkTask",
+        roleHint: manager ? "root coordinator" : "bounded worker",
+        expectedDeliverable: "a durable completion",
+        capabilityLeaseID: capabilityLease.id,
+        replyMode: manager ? TaskReplyMode.none : .taskReport,
+        maxAttempts: 3)
+    let durableTask = WorkTask(
+        id: workTaskID,
+        runID: runID,
+        title: "Frozen title",
+        description: "Frozen description",
+        status: .inProgress,
+        owner: AgentID(rawValue: "worker"),
+        revision: 4)
+    let rawArguments: String
+    if manager {
+        rawArguments = """
+        {"task_id":"\(workTaskID.rawValue)","expected_revision":4,"owner":"main","status":"completed","result":"done"}
+        """
+    } else {
+        rawArguments = """
+        {"task_id":"\(workTaskID.rawValue)","expected_revision":4,"title":"Frozen title","description":"Frozen description","owner":"worker","status":"completed","result":"done"}
+        """
+    }
+    let argumentDigest = ToolRegistry.authorizationDigest(rawArguments)
+    let callID = "legacy-frozen-\(suffix)-call"
+    let intent = PermissionIntent(
+        action: "task.update",
+        resources: [PermissionResource(kind: .task, value: workTaskID.rawValue)],
+        metadata: [
+            "expectedRevision": .number(4),
+            "status": .string(WorkTaskStatus.completed.rawValue),
+            "retry": .bool(false),
+        ],
+        dataEffects: [.none],
+        controlEffects: [.updateTask],
+        risks: [.controlPlaneMutation],
+        replayPolicy: .requiresManualReconciliation)
+    let authorization = ResolvedToolAuthorization(
+        authorizationID: "legacy-frozen-\(suffix)-authorization",
+        registryVersion: "intatis.cowork.legacy-test",
+        concreteToolID: "intatis.cowork.legacy-test/task_update",
+        descriptorFingerprint: "legacy-task-update-descriptor",
+        toolName: "task_update",
+        canonicalAction: "task.update",
+        canonicalPermission: "task.update",
+        requiredCapabilities: [
+            manager ? .manageWorkTasks : .updateOwnedWorkTask,
+        ],
+        membership: .granted,
+        capabilityLeaseID: capabilityLease.id,
+        capabilityTaskID: capabilityLease.taskID,
+        workspaceLeaseID: nil,
+        workspaceAccess: nil,
+        workspaceRootIdentity: nil,
+        invocation: ToolAuthorizationInvocationContext(
+            sessionID: await log.sessionID,
+            agent: agent,
+            taskID: taskID,
+            rootTaskID: manager ? taskID : nil,
+            parentTaskID: nil,
+            attempt: 1,
+            toolCallID: callID,
+            taskObjective: contract.objective),
+        normalizedArgumentsDigest: argumentDigest,
+        normalizedArgumentsCharacterCount: rawArguments.count,
+        intent: intent,
+        sideEffect: .write,
+        risksNetwork: false,
+        replayPolicy: .requiresManualReconciliation)
+    let executionID = "legacy-frozen-\(suffix)-execution"
+    let prepared = ToolExecutionPreparedPayload(
+        executionID: executionID,
+        taskID: taskID,
+        attempt: 1,
+        toolCallID: callID,
+        agent: agent,
+        tool: "task_update",
+        sideEffect: .write,
+        intent: intent,
+        authorization: authorization,
+        replayPolicy: .requiresManualReconciliation)
+    try await log.append([
+        .capabilityLeaseCreated(CapabilityLeaseCreatedPayload(
+            agent: agent,
+            lease: capabilityLease)),
+        .taskCreated(TaskCreatedPayload(contract: contract)),
+        .taskAssigned(TaskAssignedPayload(contract: contract)),
+        .workTaskCreated(WorkTaskCreatedPayload(task: durableTask)),
+        .toolCall(ToolCallPayload(
+            toolCallId: callID,
+            agent: agent,
+            name: "task_update",
+            args: rawArguments,
+            argsDigest: tamperArgumentDigest ? "tampered-digest" : argumentDigest,
+            argsCharacterCount: rawArguments.count,
+            argsRedacted: false)),
+        .toolExecutionPrepared(prepared),
+        .toolResult(ToolResultPayload(
+            toolCallId: callID,
+            observation: "tool error: legacy runtime classified this as uncertain")),
+    ])
+    return (taskID, workTaskID, executionID)
+}
+
 final class OrchestrationReliabilityTests: XCTestCase {
+    func testDefaultExecutionPolicyAllowsTenMinuteCoworkInvocations() {
+        let policy = CoworkExecutionPolicy()
+
+        XCTAssertEqual(policy.maxConcurrentTasks, 4)
+        XCTAssertEqual(policy.taskTimeoutSeconds, 600)
+        XCTAssertEqual(policy.maxAttempts, 3)
+        XCTAssertNil(policy.tokenBudget)
+    }
+
     private let main = AgentID(rawValue: "main")
 
     func testPublicRuntimeFactoryRetainsExclusiveSessionWriterLease() throws {
@@ -1226,6 +1361,8 @@ final class OrchestrationReliabilityTests: XCTestCase {
         }.first)
         XCTAssertNil(root.parentTaskID)
         XCTAssertNil(root.issuer)
+        XCTAssertEqual(root.executionTimeoutSeconds, 600)
+        XCTAssertEqual(root.maxAttempts, 3)
         let projection = CoworkProjection.build(from: events)
         XCTAssertEqual(projection.tasks[root.id]?.status, .completed)
         XCTAssertEqual(projection.tasks[root.id]?.attempt, 1)
@@ -2631,6 +2768,73 @@ final class OrchestrationReliabilityTests: XCTestCase {
         XCTAssertEqual(repeatedSettlements.count, 1, "legacy recovery must be idempotent")
     }
 
+    func testLegacyRepairProvesWorkerSnapshotRejectionWasNotStarted() async throws {
+        let log = try reliabilityLog()
+        let fixture = try await appendLegacyFrozenTaskUpdateRejection(
+            to: log,
+            agent: AgentID(rawValue: "worker"),
+            manager: false)
+        let events = try await log.replayChecked()
+        let projection = CoworkProjection.build(from: events)
+
+        let repair = Orchestrator.provenTaskUpdateNoEffectSettlementEvents(
+            events: events,
+            projection: projection)
+        let settlement = try XCTUnwrap(repair.compactMap { event -> ToolExecutionSettledPayload? in
+            guard case .toolExecutionSettled(let payload) = event,
+                  payload.executionID == fixture.executionID else { return nil }
+            return payload
+        }.first)
+        XCTAssertEqual(settlement.outcome, .failed)
+        XCTAssertEqual(settlement.effectDisposition, .notStarted)
+        XCTAssertTrue(settlement.reason?.contains("legacy worker task_update") == true)
+        XCTAssertTrue(settlement.reason?.contains("no side effect was applied") == true)
+        XCTAssertFalse(repair.contains { event in
+            guard case .toolResult = event else { return false }
+            return true
+        }, "the existing model-visible failure result must not be duplicated")
+    }
+
+    func testLegacyRepairProvesManagerFrozenContractRejectionWasNotStarted() async throws {
+        let log = try reliabilityLog()
+        let fixture = try await appendLegacyFrozenTaskUpdateRejection(
+            to: log,
+            agent: main,
+            manager: true)
+        let events = try await log.replayChecked()
+        let projection = CoworkProjection.build(from: events)
+
+        let repair = Orchestrator.provenTaskUpdateNoEffectSettlementEvents(
+            events: events,
+            projection: projection)
+        let settlement = try XCTUnwrap(repair.compactMap { event -> ToolExecutionSettledPayload? in
+            guard case .toolExecutionSettled(let payload) = event,
+                  payload.executionID == fixture.executionID else { return nil }
+            return payload
+        }.first)
+        XCTAssertEqual(settlement.effectDisposition, .notStarted)
+        XCTAssertTrue(settlement.reason?.contains("legacy manager task_update") == true)
+        XCTAssertTrue(settlement.reason?.contains("frozen execution contract") == true)
+    }
+
+    func testLegacyFrozenRepairRequiresExactDurableArgumentDigest() async throws {
+        let log = try reliabilityLog()
+        let fixture = try await appendLegacyFrozenTaskUpdateRejection(
+            to: log,
+            agent: main,
+            manager: true,
+            tamperArgumentDigest: true)
+        let events = try await log.replayChecked()
+        let projection = CoworkProjection.build(from: events)
+
+        XCTAssertTrue(Orchestrator.provenTaskUpdateNoEffectSettlementEvents(
+            events: events,
+            projection: projection).isEmpty)
+        XCTAssertEqual(
+            projection.unresolvedNonReplayableToolExecutions.map(\.id),
+            [fixture.executionID])
+    }
+
     func testRestoreDoesNotGuessNoEffectWhenExpectedRevisionCouldStillBeReached() async throws {
         let log = try reliabilityLog()
         let workspace = try reliabilityWorkspace()
@@ -2694,7 +2898,7 @@ final class OrchestrationReliabilityTests: XCTestCase {
         let events = try await log.replayChecked()
         let projection = CoworkProjection.build(from: events)
 
-        XCTAssertTrue(Orchestrator.provenStaleTaskUpdateSettlementEvents(
+        XCTAssertTrue(Orchestrator.provenTaskUpdateNoEffectSettlementEvents(
             events: events,
             projection: projection).isEmpty)
         XCTAssertTrue(projection.toolExecutions["reused-execution-id"]?
@@ -2752,7 +2956,7 @@ final class OrchestrationReliabilityTests: XCTestCase {
         let execution = try XCTUnwrap(projection.toolExecutions[prepared.executionID])
         XCTAssertTrue(execution.hasAmbiguousDurableHistory)
         XCTAssertNil(execution.validatedSettlement)
-        XCTAssertTrue(Orchestrator.provenStaleTaskUpdateSettlementEvents(
+        XCTAssertTrue(Orchestrator.provenTaskUpdateNoEffectSettlementEvents(
             events: events,
             projection: projection).isEmpty)
         XCTAssertEqual(
@@ -2842,7 +3046,7 @@ final class OrchestrationReliabilityTests: XCTestCase {
         let projection = CoworkProjection.build(from: events)
 
         XCTAssertEqual(Double(unsafeRevision), 9_007_199_254_740_992)
-        XCTAssertTrue(Orchestrator.provenStaleTaskUpdateSettlementEvents(
+        XCTAssertTrue(Orchestrator.provenTaskUpdateNoEffectSettlementEvents(
             events: events,
             projection: projection).isEmpty)
     }

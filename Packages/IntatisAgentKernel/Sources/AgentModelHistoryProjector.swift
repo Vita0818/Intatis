@@ -3,8 +3,45 @@ import IntatisCore
 import IntatisProtocol
 import IntatisProviders
 
+public struct AgentModelHistoryCheckpointCursor: Equatable, Sendable {
+    public var sequence: Int
+    public var payload: ModelHistoryCompactedPayload
+
+    public init(sequence: Int, payload: ModelHistoryCompactedPayload) {
+        self.sequence = sequence
+        self.payload = payload
+    }
+}
+
+public struct AgentModelHistoryProjection: Equatable, Sendable {
+    public var messages: [AgentMessage]
+    public var realUserMessages: [AgentModelHistoryRealUserMessage]
+    /// Checkpoint selected as the base of the reconstructed provider history.
+    /// This may be older than `latestCheckpoint` after a whole-task retry.
+    public var baseCheckpoint: AgentModelHistoryCheckpointCursor?
+    /// Newest valid durable window in the lineage. New checkpoints must always
+    /// advance from this cursor even when reconstruction used an older base.
+    public var latestCheckpoint: AgentModelHistoryCheckpointCursor?
+    public var latestAgentHistorySequence: Int?
+
+    public init(
+        messages: [AgentMessage],
+        realUserMessages: [AgentModelHistoryRealUserMessage],
+        baseCheckpoint: AgentModelHistoryCheckpointCursor? = nil,
+        latestCheckpoint: AgentModelHistoryCheckpointCursor?,
+        latestAgentHistorySequence: Int?
+    ) {
+        self.messages = messages
+        self.realUserMessages = realUserMessages
+        self.baseCheckpoint = baseCheckpoint
+        self.latestCheckpoint = latestCheckpoint
+        self.latestAgentHistorySequence = latestAgentHistorySequence
+    }
+}
+
 /// Rebuilds the model-facing Cowork `@main` history from durable
-/// `model_history_item` records.
+/// `model_history_item` records and the newest eligible full replacement
+/// checkpoint.
 ///
 /// This is deliberately separate from `ConversationProjection` and the
 /// bounded tool-call audit events. It follows the same split as Codex's
@@ -18,11 +55,288 @@ public struct AgentModelHistoryProjector: Sendable {
         currentTask: TaskContract,
         events: [Envelope]
     ) throws -> [AgentMessage] {
+        try projectState(
+            agentID: agentID,
+            currentTask: currentTask,
+            events: events).messages
+    }
+
+    public func projectState(
+        agentID: AgentID,
+        currentTask: TaskContract,
+        events: [Envelope]
+    ) throws -> AgentModelHistoryProjection {
         guard currentTask.kind == .root,
               currentTask.issuer == nil,
               currentTask.assignee == agentID,
               let currentSubmissionID = currentTask.submissionID else {
-            return []
+            return AgentModelHistoryProjection(
+                messages: [],
+                realUserMessages: [],
+                baseCheckpoint: nil,
+                latestCheckpoint: nil,
+                latestAgentHistorySequence: nil)
+        }
+
+        let accepted = Self.acceptedSubmissions(from: events)
+        guard let current = accepted[currentSubmissionID] else {
+            throw AgentModelHistoryProjectionError.missingAcceptedSubmission(
+                currentSubmissionID)
+        }
+        guard !current.conflicted else {
+            throw AgentModelHistoryProjectionError.conflictingAcceptedSubmission(
+                currentSubmissionID)
+        }
+
+        let checkpoints = try Self.validatedCheckpointChain(
+            agentID: agentID,
+            accepted: accepted,
+            events: events)
+        let eligibleCheckpoint = checkpoints.last { checkpoint in
+            Self.isEligibleBase(
+                checkpoint,
+                currentSubmissionID: currentSubmissionID,
+                current: current,
+                accepted: accepted,
+                agentID: agentID,
+                events: events)
+        }
+        if let eligibleCheckpoint {
+            var projection = try checkpointedProjection(
+                agentID: agentID,
+                currentTask: currentTask,
+                currentSubmissionID: currentSubmissionID,
+                current: current,
+                accepted: accepted,
+                checkpoint: eligibleCheckpoint,
+                events: events)
+            projection.latestCheckpoint = checkpoints.last.map {
+                AgentModelHistoryCheckpointCursor(
+                    sequence: $0.sequence,
+                    payload: $0.payload)
+            }
+            return projection
+        }
+        var projection = try uncheckpointedProjection(
+            agentID: agentID,
+            currentTask: currentTask,
+            events: events)
+        projection.latestCheckpoint = checkpoints.last.map {
+            AgentModelHistoryCheckpointCursor(
+                sequence: $0.sequence,
+                payload: $0.payload)
+        }
+        return projection
+    }
+
+    /// Reconstructs one visible Code conversation from the same durable
+    /// model-history/checkpoint protocol used by Cowork `@main`. Code has no
+    /// root `TaskContract`, so the accepted `SubmissionID` and stable AgentID
+    /// form the exact binding and every direct item must keep `taskID == nil`.
+    public func projectConversationState(
+        agentID: AgentID,
+        currentSubmissionID: SubmissionID,
+        events: [Envelope]
+    ) throws -> AgentModelHistoryProjection {
+        let accepted = Self.acceptedSubmissions(from: events)
+        guard let current = accepted[currentSubmissionID] else {
+            throw AgentModelHistoryProjectionError.missingAcceptedSubmission(
+                currentSubmissionID)
+        }
+        guard !current.conflicted else {
+            throw AgentModelHistoryProjectionError
+                .conflictingAcceptedSubmission(currentSubmissionID)
+        }
+        guard current.payload.to == nil
+                || current.payload.to == agentID else {
+            throw AgentModelHistoryProjectionError.invalidItem(
+                "accepted-submission:\(currentSubmissionID.rawValue)",
+                "accepted Code user target does not match the current agent")
+        }
+
+        let checkpoints = try Self.validatedCheckpointChain(
+            agentID: agentID,
+            accepted: accepted,
+            events: events)
+        let eligibleCheckpoint = checkpoints.last { checkpoint in
+            Self.isEligibleBase(
+                checkpoint,
+                currentSubmissionID: currentSubmissionID,
+                current: current,
+                accepted: accepted,
+                agentID: agentID,
+                events: events)
+        }
+        var projection: AgentModelHistoryProjection
+        if let eligibleCheckpoint {
+            projection = try conversationCheckpointedProjection(
+                agentID: agentID,
+                currentSubmissionID: currentSubmissionID,
+                current: current,
+                accepted: accepted,
+                checkpoint: eligibleCheckpoint,
+                events: events)
+        } else {
+            projection = try conversationUncheckpointedProjection(
+                agentID: agentID,
+                currentSubmissionID: currentSubmissionID,
+                current: current,
+                accepted: accepted,
+                events: events)
+        }
+        projection.latestCheckpoint = checkpoints.last.map {
+            AgentModelHistoryCheckpointCursor(
+                sequence: $0.sequence,
+                payload: $0.payload)
+        }
+        return projection
+    }
+
+    private func conversationUncheckpointedProjection(
+        agentID: AgentID,
+        currentSubmissionID: SubmissionID,
+        current: AcceptedSubmission,
+        accepted: [SubmissionID: AcceptedSubmission],
+        events: [Envelope]
+    ) throws -> AgentModelHistoryProjection {
+        let priorSubmissionIDs = Self.priorConversationSubmissionIDs(
+            currentSubmissionID: currentSubmissionID,
+            current: current,
+            accepted: accepted,
+            agentID: agentID)
+        let direct = try Self.conversationDirectTurns(
+            agentID: agentID,
+            priorSubmissionIDs: priorSubmissionIDs,
+            accepted: accepted,
+            events: events)
+        var turns = Self.conversationLegacyTurns(
+            agentID: agentID,
+            priorSubmissionIDs: priorSubmissionIDs,
+            accepted: accepted,
+            events: events)
+        for (submissionID, turn) in direct {
+            turns[submissionID] = turn
+        }
+        var ordered = Array(turns.values)
+        ordered.append(contentsOf:
+            Self.uncorrelatedLegacyConversationTurns(
+                agentID: agentID,
+                beforeSequence: current.sequence,
+                events: events))
+        ordered.sort {
+            if $0.acceptedSequence == $1.acceptedSequence {
+                return $0.firstHistorySequence < $1.firstHistorySequence
+            }
+            return $0.acceptedSequence < $1.acceptedSequence
+        }
+        return AgentModelHistoryProjection(
+            messages: ordered.flatMap(\.messages),
+            realUserMessages: ordered.compactMap(\.realUser),
+            baseCheckpoint: nil,
+            latestCheckpoint: nil,
+            latestAgentHistorySequence: Self.latestAgentHistorySequence(
+                agentID: agentID,
+                events: events))
+    }
+
+    private func conversationCheckpointedProjection(
+        agentID: AgentID,
+        currentSubmissionID: SubmissionID,
+        current: AcceptedSubmission,
+        accepted: [SubmissionID: AcceptedSubmission],
+        checkpoint: SequencedCheckpoint,
+        events: [Envelope]
+    ) throws -> AgentModelHistoryProjection {
+        let priorSubmissionIDs = Self.priorConversationSubmissionIDs(
+            currentSubmissionID: currentSubmissionID,
+            current: current,
+            accepted: accepted,
+            agentID: agentID)
+        let base = try Self.projectReplacement(
+            checkpoint,
+            agentID: agentID,
+            accepted: accepted,
+            bindings: nil)
+        let directSuffix = try Self.conversationDirectTurns(
+            agentID: agentID,
+            priorSubmissionIDs: priorSubmissionIDs,
+            accepted: accepted,
+            events: events,
+            afterSequence: checkpoint.sequence,
+            allowsCheckpointContinuation: true)
+        let directSubmissionsAnywhere = Set(events.compactMap {
+            envelope -> SubmissionID? in
+            guard case .modelHistoryItem(let payload) = envelope.event,
+                  payload.agent == agentID,
+                  payload.taskID == nil else {
+                return nil
+            }
+            return payload.submissionID
+        })
+        let baseRealSubmissionIDs = Set(
+            base.realUserMessages.compactMap(\.submissionID))
+        var suffixTurns = Array(directSuffix.values)
+        for (submissionID, legacy) in Self.conversationLegacyTurns(
+            agentID: agentID,
+            priorSubmissionIDs: priorSubmissionIDs,
+            accepted: accepted,
+            events: events)
+        where legacy.firstHistorySequence > checkpoint.sequence
+            && !directSubmissionsAnywhere.contains(submissionID)
+        {
+            let alreadyRetained =
+                baseRealSubmissionIDs.contains(submissionID)
+            suffixTurns.append(ProjectedTurn(
+                acceptedSequence: legacy.acceptedSequence,
+                firstHistorySequence: legacy.firstHistorySequence,
+                messages: alreadyRetained
+                    ? Array(legacy.messages.dropFirst())
+                    : legacy.messages,
+                realUser: alreadyRetained ? nil : legacy.realUser))
+        }
+        suffixTurns.sort {
+            if $0.firstHistorySequence == $1.firstHistorySequence {
+                return $0.acceptedSequence < $1.acceptedSequence
+            }
+            return $0.firstHistorySequence < $1.firstHistorySequence
+        }
+
+        var realUsers = base.realUserMessages
+        var seen = Set(realUsers.compactMap(\.submissionID))
+        for user in suffixTurns.compactMap(\.realUser) {
+            if let submissionID = user.submissionID,
+               !seen.insert(submissionID).inserted {
+                continue
+            }
+            realUsers.append(user)
+        }
+        return AgentModelHistoryProjection(
+            messages: base.messages + suffixTurns.flatMap(\.messages),
+            realUserMessages: realUsers,
+            baseCheckpoint: AgentModelHistoryCheckpointCursor(
+                sequence: checkpoint.sequence,
+                payload: checkpoint.payload),
+            latestCheckpoint: nil,
+            latestAgentHistorySequence: Self.latestAgentHistorySequence(
+                agentID: agentID,
+                events: events))
+    }
+
+    private func uncheckpointedProjection(
+        agentID: AgentID,
+        currentTask: TaskContract,
+        events: [Envelope]
+    ) throws -> AgentModelHistoryProjection {
+        guard currentTask.kind == .root,
+              currentTask.issuer == nil,
+              currentTask.assignee == agentID,
+              let currentSubmissionID = currentTask.submissionID else {
+            return AgentModelHistoryProjection(
+                messages: [],
+                realUserMessages: [],
+                baseCheckpoint: nil,
+                latestCheckpoint: nil,
+                latestAgentHistorySequence: nil)
         }
 
         let accepted = Self.acceptedSubmissions(from: events)
@@ -71,15 +385,26 @@ public struct AgentModelHistoryProjector: Sendable {
                     agentID: agentID,
                     currentTask: currentTask,
                     events: events)
-                .map {
+                .map { legacy in
                     (
-                        $0.submissionID,
+                        legacy.submissionID,
                         ProjectedTurn(
-                            acceptedSequence: $0.acceptedSequence,
+                            acceptedSequence: legacy.acceptedSequence,
+                            firstHistorySequence: legacy.acceptedSequence,
                             messages: [
-                                .user($0.userText),
-                                .assistant($0.assistantText),
-                            ])
+                                .user(legacy.userText),
+                                .assistant(legacy.assistantText),
+                            ],
+                            realUser: accepted[legacy.submissionID].map {
+                                acceptedSubmission in
+                                AgentModelHistoryRealUserMessage(
+                                    content:
+                                        acceptedSubmission.payload.text,
+                                    submissionID:
+                                        legacy.submissionID,
+                                    attachmentIDs:
+                                        acceptedSubmission.payload.attachments)
+                            })
                     )
                 })
 
@@ -90,11 +415,144 @@ public struct AgentModelHistoryProjector: Sendable {
             turnsBySubmission[submissionID] = turn
         }
 
-        return turnsBySubmission.values
+        let ordered = turnsBySubmission.values
             .sorted { lhs, rhs in
                 lhs.acceptedSequence < rhs.acceptedSequence
             }
-            .flatMap(\.messages)
+        return AgentModelHistoryProjection(
+            messages: ordered.flatMap {
+                $0.messages
+            },
+            realUserMessages: ordered.compactMap {
+                $0.realUser
+            },
+            baseCheckpoint: nil,
+            latestCheckpoint: nil,
+            latestAgentHistorySequence: Self.latestAgentHistorySequence(
+                agentID: agentID,
+                events: events))
+    }
+
+    private func checkpointedProjection(
+        agentID: AgentID,
+        currentTask: TaskContract,
+        currentSubmissionID: SubmissionID,
+        current: AcceptedSubmission,
+        accepted: [SubmissionID: AcceptedSubmission],
+        checkpoint: SequencedCheckpoint,
+        events: [Envelope]
+    ) throws -> AgentModelHistoryProjection {
+        guard current.payload.to == nil
+                || current.payload.to == agentID else {
+            throw AgentModelHistoryProjectionError.invalidItem(
+                "accepted-submission:\(currentSubmissionID.rawValue)",
+                "accepted user target does not match the current root assignee")
+        }
+        let bindings = Self.rootBindings(
+            currentTask: currentTask,
+            events: events)
+        try Self.requireRootBinding(
+            taskID: currentTask.id,
+            submissionID: currentSubmissionID,
+            agentID: agentID,
+            bindings: bindings)
+
+        let priorSubmissionIDs: Set<SubmissionID> = Set(
+            accepted.compactMap { submissionID, value in
+                guard submissionID != currentSubmissionID,
+                      !value.conflicted,
+                      value.sequence < current.sequence else {
+                    return nil
+                }
+                return submissionID
+            })
+        let base = try Self.projectReplacement(
+            checkpoint,
+            agentID: agentID,
+            accepted: accepted,
+            bindings: bindings)
+
+        let directSuffix = try Self.directTurns(
+            agentID: agentID,
+            priorSubmissionIDs: priorSubmissionIDs,
+            accepted: accepted,
+            bindings: bindings,
+            events: events,
+            afterSequence: checkpoint.sequence,
+            allowsCheckpointContinuation: true)
+        let directSubmissionsAnywhere = Set(events.compactMap {
+            envelope -> SubmissionID? in
+            guard case .modelHistoryItem(let payload) = envelope.event,
+                  payload.agent == agentID else {
+                return nil
+            }
+            return payload.submissionID
+        })
+        let baseRealSubmissionIDs = Set(
+            base.realUserMessages.compactMap {
+                $0.submissionID
+            })
+        var suffixTurns = Array(directSuffix.values)
+        for legacy in AgentThreadHistoryProjector().turns(
+            agentID: agentID,
+            currentTask: currentTask,
+            events: events)
+        where legacy.completedSequence > checkpoint.sequence
+            && !directSubmissionsAnywhere.contains(legacy.submissionID)
+        {
+            let acceptedUser = accepted[legacy.submissionID]?.payload
+            let alreadyRetained =
+                baseRealSubmissionIDs.contains(legacy.submissionID)
+            suffixTurns.append(ProjectedTurn(
+                acceptedSequence: legacy.acceptedSequence,
+                firstHistorySequence: legacy.completedSequence,
+                messages: alreadyRetained
+                    ? [.assistant(legacy.assistantText)]
+                    : [
+                        .user(legacy.userText),
+                        .assistant(legacy.assistantText),
+                    ],
+                realUser: alreadyRetained
+                    ? nil
+                    : acceptedUser.map {
+                        AgentModelHistoryRealUserMessage(
+                            content: $0.text,
+                            submissionID: legacy.submissionID,
+                            attachmentIDs: $0.attachments)
+                    }))
+        }
+        suffixTurns.sort {
+            if $0.firstHistorySequence == $1.firstHistorySequence {
+                return $0.acceptedSequence < $1.acceptedSequence
+            }
+            return $0.firstHistorySequence < $1.firstHistorySequence
+        }
+
+        var realUsers = base.realUserMessages
+        var seenRealSubmissionIDs = Set(
+            realUsers.compactMap {
+                $0.submissionID
+            })
+        for user in suffixTurns.compactMap(\.realUser) {
+            if let submissionID = user.submissionID {
+                guard seenRealSubmissionIDs.insert(submissionID).inserted else {
+                    continue
+                }
+            }
+            realUsers.append(user)
+        }
+        return AgentModelHistoryProjection(
+            messages:
+                base.messages
+                + suffixTurns.flatMap(\.messages),
+            realUserMessages: realUsers,
+            baseCheckpoint: AgentModelHistoryCheckpointCursor(
+                sequence: checkpoint.sequence,
+                payload: checkpoint.payload),
+            latestCheckpoint: nil,
+            latestAgentHistorySequence: Self.latestAgentHistorySequence(
+                agentID: agentID,
+                events: events))
     }
 
     private struct AcceptedSubmission {
@@ -115,7 +573,9 @@ public struct AgentModelHistoryProjector: Sendable {
 
     private struct ProjectedTurn {
         var acceptedSequence: Int
+        var firstHistorySequence: Int
         var messages: [AgentMessage]
+        var realUser: AgentModelHistoryRealUserMessage?
     }
 
     private struct SequencedOutput {
@@ -128,12 +588,555 @@ public struct AgentModelHistoryProjector: Sendable {
         var callID: String
     }
 
+    private struct SequencedCheckpoint {
+        var sequence: Int
+        var payload: ModelHistoryCompactedPayload
+        var coveredSubmissions: Set<SubmissionID>
+    }
+
+    private struct ReplacementProjection {
+        var messages: [AgentMessage]
+        var realUserMessages: [AgentModelHistoryRealUserMessage]
+    }
+
+    private static func validatedCheckpointChain(
+        agentID: AgentID,
+        accepted: [SubmissionID: AcceptedSubmission],
+        events: [Envelope]
+    ) throws -> [SequencedCheckpoint] {
+        let rawCheckpoints = events.sorted(by: { $0.seq < $1.seq })
+            .compactMap { envelope -> SequencedCheckpoint? in
+                guard case .modelHistoryCompacted(let payload) =
+                        envelope.event,
+                      payload.agent == agentID else {
+                    return nil
+                }
+                return SequencedCheckpoint(
+                    sequence: envelope.seq,
+                    payload: payload,
+                    coveredSubmissions: [])
+            }
+        var checkpoints: [SequencedCheckpoint] = []
+        var previous: SequencedCheckpoint?
+        var seenWindowIDs = Set<String>()
+        for var checkpoint in rawCheckpoints {
+            let payload = checkpoint.payload
+            guard payload.schemaVersion
+                    == ModelHistoryCompactedPayload.currentSchemaVersion else {
+                throw AgentModelHistoryProjectionError
+                    .unsupportedCheckpointSchema(
+                        sequence: checkpoint.sequence,
+                        version: payload.schemaVersion)
+            }
+            do {
+                try payload.validate()
+            } catch {
+                throw AgentModelHistoryProjectionError.invalidCheckpoint(
+                    sequence: checkpoint.sequence,
+                    reason:
+                        "checkpoint payload failed v1 structural validation")
+            }
+            for (field, value) in [
+                ("firstWindowID", payload.firstWindowID),
+                ("previousWindowID", payload.previousWindowID),
+                ("windowID", payload.windowID),
+            ] {
+                guard Self.isUUIDVersion7(value) else {
+                    throw AgentModelHistoryProjectionError.invalidCheckpoint(
+                        sequence: checkpoint.sequence,
+                        reason: "\(field) is not UUIDv7")
+                }
+            }
+            guard seenWindowIDs.insert(payload.windowID).inserted else {
+                throw AgentModelHistoryProjectionError.invalidCheckpoint(
+                    sequence: checkpoint.sequence,
+                    reason: "windowID was reused")
+            }
+            if let previous {
+                let (expectedWindow, overflow) =
+                    previous.payload.windowNumber.addingReportingOverflow(1)
+                guard !overflow,
+                      payload.windowNumber == expectedWindow,
+                      payload.firstWindowID
+                        == previous.payload.firstWindowID,
+                      payload.previousWindowID
+                        == previous.payload.windowID,
+                      payload.windowID
+                        != previous.payload.windowID else {
+                    throw AgentModelHistoryProjectionError.invalidCheckpoint(
+                        sequence: checkpoint.sequence,
+                        reason: "window lineage is not contiguous")
+                }
+            } else {
+                guard payload.windowNumber == 1,
+                      payload.previousWindowID
+                        == payload.firstWindowID,
+                      payload.windowID
+                        != payload.firstWindowID else {
+                    throw AgentModelHistoryProjectionError.invalidCheckpoint(
+                        sequence: checkpoint.sequence,
+                        reason: "first checkpoint has an invalid initial window")
+                }
+            }
+            _ = try Self.projectReplacement(
+                checkpoint,
+                agentID: agentID,
+                accepted: accepted,
+                bindings: nil)
+            var covered = previous?.coveredSubmissions ?? []
+            let lowerBound = previous?.sequence ?? Int.min
+            for envelope in events
+                where envelope.seq > lowerBound
+                    && envelope.seq < checkpoint.sequence
+            {
+                guard case .modelHistoryItem(let item) =
+                        envelope.event,
+                      item.agent == agentID,
+                      Self.isRealUserMessage(item),
+                      let submissionID = item.submissionID else {
+                    continue
+                }
+                covered.insert(submissionID)
+            }
+            for item in payload.replacementHistory
+                where item.messageClassification == .realUser
+            {
+                if let submissionID = item.sourceSubmissionID {
+                    covered.insert(submissionID)
+                }
+            }
+            checkpoint.coveredSubmissions = covered
+            checkpoints.append(checkpoint)
+            previous = checkpoint
+        }
+        return checkpoints
+    }
+
+    private static func isEligibleBase(
+        _ checkpoint: SequencedCheckpoint,
+        currentSubmissionID: SubmissionID,
+        current: AcceptedSubmission,
+        accepted: [SubmissionID: AcceptedSubmission],
+        agentID: AgentID,
+        events: [Envelope]
+    ) -> Bool {
+        guard !checkpoint.coveredSubmissions
+                .contains(currentSubmissionID),
+              checkpoint.coveredSubmissions.allSatisfy({
+                  guard let source = accepted[$0],
+                        !source.conflicted else {
+                      return false
+                  }
+                  return source.sequence < current.sequence
+              }) else {
+            return false
+        }
+
+        // A newer invocation for a submission already summarized by this
+        // checkpoint supersedes that summary. Until another checkpoint covers
+        // the retry, reconstruct from an older base so the failed attempt
+        // cannot leak into later turns.
+        return !events.contains { envelope in
+            guard envelope.seq > checkpoint.sequence,
+                  case .modelHistoryItem(let item) = envelope.event,
+                  item.agent == agentID,
+                  Self.isRealUserMessage(item),
+                  let submissionID = item.submissionID,
+                  checkpoint.coveredSubmissions.contains(submissionID),
+                  let source = accepted[submissionID] else {
+                return false
+            }
+            return source.sequence < current.sequence
+        }
+    }
+
+    private static func projectReplacement(
+        _ checkpoint: SequencedCheckpoint,
+        agentID: AgentID,
+        accepted: [SubmissionID: AcceptedSubmission],
+        bindings: [TaskID: Set<RootBinding>]?
+    ) throws -> ReplacementProjection {
+        let payload = checkpoint.payload
+        guard !payload.replacementHistory.isEmpty,
+              let final = payload.replacementHistory.last else {
+            throw AgentModelHistoryProjectionError.invalidCheckpoint(
+                sequence: checkpoint.sequence,
+                reason: "replacement history is empty")
+        }
+        guard final.kind == .message,
+              final.role == .user,
+              final.messageClassification == .compactionSummary,
+              final.content == payload.message,
+              final.contentTruncated != true,
+              final.sourceSubmissionID == nil else {
+            throw AgentModelHistoryProjectionError.invalidCheckpoint(
+                sequence: checkpoint.sequence,
+                reason: "final replacement item is not the exact compaction summary")
+        }
+
+        var messages: [AgentMessage] = []
+        var realUsers: [AgentModelHistoryRealUserMessage] = []
+        var seenRealSubmissionIDs = Set<SubmissionID>()
+        var contextualIndices: [Int] = []
+        var realUserIndices: [Int] = []
+        for (index, item) in payload.replacementHistory.enumerated() {
+            guard item.kind == .message,
+                  item.role == .user,
+                  let content = item.content,
+                  item.functionCalls == nil,
+                  item.callID == nil,
+                  item.output == nil,
+                  item.toolSearchOutput == nil,
+                  item.reasoningSummary == nil,
+                  item.reasoningContent == nil,
+                  item.encryptedReasoningContent == nil else {
+                throw AgentModelHistoryProjectionError.invalidCheckpoint(
+                    sequence: checkpoint.sequence,
+                    reason: "replacement item \(item.itemID) has an unsupported v1 shape")
+            }
+            if index == payload.replacementHistory.count - 1 {
+                guard item.messageClassification == .compactionSummary,
+                      item.contentTruncated != true else {
+                    throw AgentModelHistoryProjectionError.invalidCheckpoint(
+                        sequence: checkpoint.sequence,
+                        reason: "summary is not final")
+                }
+            } else if item.messageClassification == .realUser {
+                guard
+                      let submissionID = item.sourceSubmissionID,
+                      let source = accepted[submissionID],
+                      !source.conflicted,
+                      source.sequence < checkpoint.sequence,
+                      seenRealSubmissionIDs.insert(submissionID).inserted
+                else {
+                    throw AgentModelHistoryProjectionError.invalidCheckpoint(
+                        sequence: checkpoint.sequence,
+                        reason: "retained real user \(item.itemID) lacks valid provenance")
+                }
+                if item.contentTruncated == true {
+                    let marker = AgentModelHistoryCompactor
+                        .retainedRealUserTruncationMarker
+                    guard content.hasPrefix(marker) else {
+                        throw AgentModelHistoryProjectionError
+                            .invalidCheckpoint(
+                                sequence: checkpoint.sequence,
+                                reason: "truncated real user lacks its marker")
+                    }
+                    let suffix = String(content.dropFirst(marker.count))
+                    guard !suffix.isEmpty,
+                          source.payload.text.hasSuffix(suffix) else {
+                        throw AgentModelHistoryProjectionError
+                            .invalidCheckpoint(
+                                sequence: checkpoint.sequence,
+                                reason: "truncated real user is not a source suffix")
+                    }
+                } else {
+                    guard source.payload.text == content else {
+                        throw AgentModelHistoryProjectionError
+                            .invalidCheckpoint(
+                                sequence: checkpoint.sequence,
+                                reason: "retained real user text does not match its source")
+                    }
+                }
+                if let explicitTarget = source.payload.to,
+                   explicitTarget != agentID {
+                    throw AgentModelHistoryProjectionError.invalidCheckpoint(
+                        sequence: checkpoint.sequence,
+                        reason: "retained real user targets another agent")
+                }
+                if let bindings {
+                    let matching = bindings.values
+                        .flatMap(Array.init)
+                        .filter {
+                            $0.submissionID == submissionID
+                                && $0.assignee == agentID
+                        }
+                    guard matching.count == 1 else {
+                        throw AgentModelHistoryProjectionError
+                            .invalidCheckpoint(
+                                sequence: checkpoint.sequence,
+                                reason: "retained real user has no unique root binding")
+                    }
+                }
+                realUsers.append(AgentModelHistoryRealUserMessage(
+                    content: content,
+                    submissionID: submissionID,
+                    attachmentIDs: item.attachmentIDs,
+                    contentTruncated: item.contentTruncated == true))
+                realUserIndices.append(index)
+            } else if item.messageClassification == .contextual {
+                guard item.sourceSubmissionID == nil,
+                      item.contentTruncated != true else {
+                    throw AgentModelHistoryProjectionError.invalidCheckpoint(
+                        sequence: checkpoint.sequence,
+                        reason: "contextual replacement item has invalid provenance")
+                }
+                contextualIndices.append(index)
+            } else {
+                throw AgentModelHistoryProjectionError.invalidCheckpoint(
+                    sequence: checkpoint.sequence,
+                    reason: "replacement item \(item.itemID) has an invalid classification")
+            }
+            messages.append(.user(content))
+        }
+        if !contextualIndices.isEmpty {
+            guard let lastRealUserIndex = realUserIndices.last else {
+                throw AgentModelHistoryProjectionError.invalidCheckpoint(
+                    sequence: checkpoint.sequence,
+                    reason: "contextual replacement items are not immediately before the newest real user")
+            }
+            let firstContextualIndex =
+                lastRealUserIndex - contextualIndices.count
+            let expectedContextualIndices =
+                Array(firstContextualIndex..<lastRealUserIndex)
+            guard contextualIndices.last == lastRealUserIndex - 1,
+                  contextualIndices == expectedContextualIndices else {
+                throw AgentModelHistoryProjectionError.invalidCheckpoint(
+                    sequence: checkpoint.sequence,
+                    reason: "contextual replacement items are not immediately before the newest real user")
+            }
+        }
+        return ReplacementProjection(
+            messages: messages,
+            realUserMessages: realUsers)
+    }
+
+    private static func latestAgentHistorySequence(
+        agentID: AgentID,
+        events: [Envelope]
+    ) -> Int? {
+        events.compactMap { envelope -> Int? in
+            switch envelope.event {
+            case .modelHistoryItem(let payload)
+                where payload.agent == agentID:
+                return envelope.seq
+            case .modelHistoryCompacted(let payload)
+                where payload.agent == agentID:
+                return envelope.seq
+            default:
+                return nil
+            }
+        }.max()
+    }
+
+    private static func isUUIDVersion7(_ value: String) -> Bool {
+        guard let uuid = UUID(uuidString: value) else { return false }
+        var raw = uuid.uuid
+        return withUnsafeBytes(of: &raw) {
+            ($0[6] >> 4) == 0x7
+                && ($0[8] & 0b1100_0000) == 0b1000_0000
+        }
+    }
+
+    private static func priorConversationSubmissionIDs(
+        currentSubmissionID: SubmissionID,
+        current: AcceptedSubmission,
+        accepted: [SubmissionID: AcceptedSubmission],
+        agentID: AgentID
+    ) -> Set<SubmissionID> {
+        Set(accepted.compactMap { submissionID, value in
+            guard submissionID != currentSubmissionID,
+                  !value.conflicted,
+                  value.sequence < current.sequence,
+                  value.payload.to == nil
+                    || value.payload.to == agentID else {
+                return nil
+            }
+            return submissionID
+        })
+    }
+
+    private static func conversationDirectTurns(
+        agentID: AgentID,
+        priorSubmissionIDs: Set<SubmissionID>,
+        accepted: [SubmissionID: AcceptedSubmission],
+        events: [Envelope],
+        afterSequence: Int? = nil,
+        allowsCheckpointContinuation: Bool = false
+    ) throws -> [SubmissionID: ProjectedTurn] {
+        var seenItemIDs: [String: ModelHistoryItemPayload] = [:]
+        var grouped: [SubmissionID: [SequencedItem]] = [:]
+
+        for envelope in events.sorted(by: { $0.seq < $1.seq }) {
+            guard case .modelHistoryItem(let payload) = envelope.event,
+                  payload.agent == agentID,
+                  let submissionID = payload.submissionID,
+                  priorSubmissionIDs.contains(submissionID),
+                  afterSequence.map({ envelope.seq > $0 }) ?? true else {
+                continue
+            }
+            guard payload.taskID == nil else {
+                throw AgentModelHistoryProjectionError.invalidItem(
+                    payload.itemID,
+                    "Code model history must not claim a Cowork task binding")
+            }
+            guard let acceptedSubmission = accepted[submissionID],
+                  !acceptedSubmission.conflicted,
+                  envelope.seq > acceptedSubmission.sequence else {
+                throw AgentModelHistoryProjectionError.invalidItem(
+                    payload.itemID,
+                    "Code item is not after one unambiguous accepted submission")
+            }
+            guard acceptedSubmission.payload.to == nil
+                    || acceptedSubmission.payload.to == agentID else {
+                throw AgentModelHistoryProjectionError.invalidItem(
+                    payload.itemID,
+                    "accepted Code user target does not match the item agent")
+            }
+            let trimmedItemID = payload.itemID.trimmingCharacters(
+                in: .whitespacesAndNewlines)
+            guard !trimmedItemID.isEmpty else {
+                throw AgentModelHistoryProjectionError.invalidItem(
+                    payload.itemID,
+                    "itemID is empty")
+            }
+            if let existing = seenItemIDs[payload.itemID] {
+                guard existing == payload else {
+                    throw AgentModelHistoryProjectionError.conflictingItemID(
+                        payload.itemID)
+                }
+                continue
+            }
+            seenItemIDs[payload.itemID] = payload
+            grouped[submissionID, default: []].append(
+                SequencedItem(sequence: envelope.seq, payload: payload))
+        }
+
+        var result: [SubmissionID: ProjectedTurn] = [:]
+        for (submissionID, items) in grouped {
+            guard let acceptedSubmission = accepted[submissionID] else {
+                continue
+            }
+            let selected = try selectLatestInvocation(
+                submissionID: submissionID,
+                items: items,
+                allowsCheckpointContinuation:
+                    allowsCheckpointContinuation)
+            let hasRealUser = selected.contains {
+                Self.isRealUserMessage($0.payload)
+            }
+            result[submissionID] = ProjectedTurn(
+                acceptedSequence: acceptedSubmission.sequence,
+                firstHistorySequence:
+                    selected.first?.sequence
+                    ?? acceptedSubmission.sequence,
+                messages: try projectInvocation(
+                    acceptedUser:
+                        hasRealUser ? acceptedSubmission.payload : nil,
+                    items: selected),
+                realUser: hasRealUser
+                    ? AgentModelHistoryRealUserMessage(
+                        content: acceptedSubmission.payload.text,
+                        submissionID: submissionID,
+                        attachmentIDs:
+                            acceptedSubmission.payload.attachments)
+                    : nil)
+        }
+        return result
+    }
+
+    private static func conversationLegacyTurns(
+        agentID: AgentID,
+        priorSubmissionIDs: Set<SubmissionID>,
+        accepted: [SubmissionID: AcceptedSubmission],
+        events: [Envelope]
+    ) -> [SubmissionID: ProjectedTurn] {
+        var completedBySubmission:
+            [SubmissionID: (sequence: Int, text: String)] = [:]
+        for envelope in events.sorted(by: { $0.seq < $1.seq }) {
+            guard case .messageCompleted(let payload) = envelope.event,
+                  let submissionID = payload.submissionID,
+                  priorSubmissionIDs.contains(submissionID),
+                  payload.role == .assistant || payload.role == .agent,
+                  payload.agent == nil || payload.agent == agentID,
+                  let acceptedSubmission = accepted[submissionID],
+                  envelope.seq > acceptedSubmission.sequence else {
+                continue
+            }
+            completedBySubmission[submissionID] =
+                (envelope.seq, payload.text)
+        }
+
+        return Dictionary(uniqueKeysWithValues:
+            priorSubmissionIDs.compactMap { submissionID in
+                guard let source = accepted[submissionID] else {
+                    return nil
+                }
+                let completed = completedBySubmission[submissionID]
+                var messages: [AgentMessage] = [
+                    .user(source.payload.text),
+                ]
+                if let completed {
+                    messages.append(.assistant(completed.text))
+                }
+                return (
+                    submissionID,
+                    ProjectedTurn(
+                        acceptedSequence: source.sequence,
+                        firstHistorySequence:
+                            completed?.sequence ?? source.sequence,
+                        messages: messages,
+                        realUser:
+                            AgentModelHistoryRealUserMessage(
+                                content: source.payload.text,
+                                submissionID: submissionID,
+                                attachmentIDs:
+                                    source.payload.attachments))
+                )
+            })
+    }
+
+    /// Migration bridge for old Code/CLI logs whose UI events predate
+    /// SubmissionID. These turns remain available to the summarizer, but they
+    /// are intentionally not represented as provenance-bearing retained users.
+    private static func uncorrelatedLegacyConversationTurns(
+        agentID: AgentID,
+        beforeSequence: Int,
+        events: [Envelope]
+    ) -> [ProjectedTurn] {
+        var turns: [ProjectedTurn] = []
+        for envelope in events.sorted(by: { $0.seq < $1.seq })
+            where envelope.seq < beforeSequence
+        {
+            switch envelope.event {
+            case .userMessage(let payload)
+                where payload.submissionID == nil
+                    && (payload.to == nil || payload.to == agentID):
+                turns.append(ProjectedTurn(
+                    acceptedSequence: envelope.seq,
+                    firstHistorySequence: envelope.seq,
+                    messages: [.user(payload.text)],
+                    realUser: nil))
+
+            case .messageCompleted(let payload)
+                where payload.submissionID == nil
+                    && (payload.role == .assistant
+                        || payload.role == .agent)
+                    && (payload.agent == nil
+                        || payload.agent == agentID):
+                guard let index = turns.lastIndex(where: {
+                    $0.messages.count == 1
+                        && $0.messages[0].role == .user
+                }) else {
+                    continue
+                }
+                turns[index].messages.append(.assistant(payload.text))
+
+            default:
+                continue
+            }
+        }
+        return turns
+    }
+
     private static func directTurns(
         agentID: AgentID,
         priorSubmissionIDs: Set<SubmissionID>,
         accepted: [SubmissionID: AcceptedSubmission],
         bindings: [TaskID: Set<RootBinding>],
-        events: [Envelope]
+        events: [Envelope],
+        afterSequence: Int? = nil,
+        allowsCheckpointContinuation: Bool = false
     ) throws -> [SubmissionID: ProjectedTurn] {
         var seenItemIDs: [String: ModelHistoryItemPayload] = [:]
         var grouped: [SubmissionID: [SequencedItem]] = [:]
@@ -141,7 +1144,8 @@ public struct AgentModelHistoryProjector: Sendable {
         for envelope in events.sorted(by: { $0.seq < $1.seq }) {
             guard case .modelHistoryItem(let payload) = envelope.event,
                   let submissionID = payload.submissionID,
-                  priorSubmissionIDs.contains(submissionID) else {
+                  priorSubmissionIDs.contains(submissionID),
+                  afterSequence.map({ envelope.seq > $0 }) ?? true else {
                 continue
             }
             guard let acceptedSubmission = accepted[submissionID],
@@ -205,12 +1209,28 @@ public struct AgentModelHistoryProjector: Sendable {
             }
             let selected = try selectLatestInvocation(
                 submissionID: submissionID,
-                items: items)
+                items: items,
+                allowsCheckpointContinuation:
+                    allowsCheckpointContinuation)
+            let hasRealUser = selected.contains {
+                Self.isRealUserMessage($0.payload)
+            }
             result[submissionID] = ProjectedTurn(
                 acceptedSequence: acceptedSubmission.sequence,
+                firstHistorySequence:
+                    selected.first?.sequence
+                    ?? acceptedSubmission.sequence,
                 messages: try projectInvocation(
-                    acceptedUser: acceptedSubmission.payload,
-                    items: selected))
+                    acceptedUser:
+                        hasRealUser ? acceptedSubmission.payload : nil,
+                    items: selected),
+                realUser: hasRealUser
+                    ? AgentModelHistoryRealUserMessage(
+                        content: acceptedSubmission.payload.text,
+                        submissionID: submissionID,
+                        attachmentIDs:
+                            acceptedSubmission.payload.attachments)
+                    : nil)
         }
         return result
     }
@@ -221,7 +1241,8 @@ public struct AgentModelHistoryProjector: Sendable {
     /// message while retaining all items from the chosen provider turn.
     private static func selectLatestInvocation(
         submissionID: SubmissionID,
-        items: [SequencedItem]
+        items: [SequencedItem],
+        allowsCheckpointContinuation: Bool = false
     ) throws -> [SequencedItem] {
         for item in items {
             guard item.payload.schemaVersion == ModelHistoryItemPayload.currentSchemaVersion else {
@@ -241,19 +1262,32 @@ public struct AgentModelHistoryProjector: Sendable {
             ($0.payload.taskAttempt ?? 1) == selectedAttempt
         }
         let userItems = attemptItems.filter {
-            $0.payload.kind == .message && $0.payload.role == .user
+            Self.isRealUserMessage($0.payload)
         }
-        guard let selectedUser = userItems.max(by: { $0.sequence < $1.sequence }) else {
+        if let selectedUser = userItems.max(
+            by: { $0.sequence < $1.sequence })
+        {
+            return attemptItems
+                .filter { $0.payload.turnID == selectedUser.payload.turnID }
+                .sorted { $0.sequence < $1.sequence }
+        }
+        guard allowsCheckpointContinuation else {
             throw AgentModelHistoryProjectionError.missingUserItem(
                 submissionID)
         }
+        let turnIDs = Set(attemptItems.map(\.payload.turnID))
+        guard turnIDs.count == 1 else {
+            throw AgentModelHistoryProjectionError.invalidItem(
+                attemptItems.first?.payload.itemID
+                    ?? "checkpoint-suffix:\(submissionID.rawValue)",
+                "checkpoint suffix without a real user spans multiple turn IDs")
+        }
         return attemptItems
-            .filter { $0.payload.turnID == selectedUser.payload.turnID }
             .sorted { $0.sequence < $1.sequence }
     }
 
     private static func projectInvocation(
-        acceptedUser: UserMessagePayload,
+        acceptedUser: UserMessagePayload?,
         items: [SequencedItem]
     ) throws -> [AgentMessage] {
         guard let first = items.first else { return [] }
@@ -265,21 +1299,36 @@ public struct AgentModelHistoryProjector: Sendable {
         }
 
         let userItems = items.filter {
-            $0.payload.kind == .message && $0.payload.role == .user
+            Self.isRealUserMessage($0.payload)
         }
-        guard userItems.count == 1,
-              let userContent = userItems[0].payload.content,
-              userContent == acceptedUser.text else {
-            throw AgentModelHistoryProjectionError.invalidItem(
-                userItems.first?.payload.itemID ?? first.payload.itemID,
-                "durable user item does not exactly match the accepted submission")
-        }
-        guard items.firstIndex(where: {
-            $0.payload.itemID == userItems[0].payload.itemID
-        }) == 0 else {
-            throw AgentModelHistoryProjectionError.invalidItem(
-                userItems[0].payload.itemID,
-                "user item is not first in its invocation")
+        if let acceptedUser {
+            guard userItems.count == 1,
+                  let userContent = userItems[0].payload.content,
+                  userContent == acceptedUser.text else {
+                throw AgentModelHistoryProjectionError.invalidItem(
+                    userItems.first?.payload.itemID
+                        ?? first.payload.itemID,
+                    "durable user item does not exactly match the accepted submission")
+            }
+            guard let realUserIndex = items.firstIndex(where: {
+                $0.payload.itemID == userItems[0].payload.itemID
+            }),
+                  items[..<realUserIndex].allSatisfy({
+                      Self.isContextualUserMessage($0.payload)
+                  }) else {
+                throw AgentModelHistoryProjectionError.invalidItem(
+                    userItems[0].payload.itemID,
+                    "only contextual user items may precede the real user item")
+            }
+        } else {
+            guard userItems.isEmpty,
+                  !items.contains(where: {
+                      Self.isContextualUserMessage($0.payload)
+                  }) else {
+                throw AgentModelHistoryProjectionError.invalidItem(
+                    first.payload.itemID,
+                    "checkpoint continuation contains an unexpected user item")
+            }
         }
 
         var callSequenceByKey: [CallKey: Int] = [:]
@@ -324,8 +1373,19 @@ public struct AgentModelHistoryProjector: Sendable {
                 }
                 switch role {
                 case .user:
+                    guard item.payload.messageClassification
+                            != .compactionSummary else {
+                        throw AgentModelHistoryProjectionError.invalidItem(
+                            item.payload.itemID,
+                            "a direct item cannot impersonate a compaction summary")
+                    }
                     messages.append(.user(content))
                 case .assistant:
+                    guard item.payload.messageClassification == nil else {
+                        throw AgentModelHistoryProjectionError.invalidItem(
+                            item.payload.itemID,
+                            "assistant messages cannot carry a user classification")
+                    }
                     messages.append(.assistant(content))
                 }
 
@@ -417,6 +1477,14 @@ public struct AgentModelHistoryProjector: Sendable {
                   payload.toolSearchOutput == nil else {
                 try invalid("message fields are inconsistent")
             }
+            if payload.role == .assistant,
+               payload.messageClassification != nil {
+                try invalid("assistant message classification is inconsistent")
+            }
+            if payload.role == .user,
+               payload.messageClassification == .compactionSummary {
+                try invalid("direct history cannot contain a compaction summary")
+            }
 
         case .functionCallBatch:
             guard payload.role == nil,
@@ -472,6 +1540,23 @@ public struct AgentModelHistoryProjector: Sendable {
                 try invalid("reasoning fields are inconsistent")
             }
         }
+    }
+
+    private static func isRealUserMessage(
+        _ payload: ModelHistoryItemPayload
+    ) -> Bool {
+        payload.kind == .message
+            && payload.role == .user
+            && (payload.messageClassification == nil
+                || payload.messageClassification == .realUser)
+    }
+
+    private static func isContextualUserMessage(
+        _ payload: ModelHistoryItemPayload
+    ) -> Bool {
+        payload.kind == .message
+            && payload.role == .user
+            && payload.messageClassification == .contextual
     }
 
     private static func isJSONObject(_ string: String) -> Bool {
@@ -591,6 +1676,8 @@ public enum AgentModelHistoryProjectionError:
     case conflictingAcceptedSubmission(SubmissionID)
     case ambiguousRootBinding(TaskID)
     case unsupportedSchema(itemID: String, version: Int)
+    case unsupportedCheckpointSchema(sequence: Int, version: Int)
+    case invalidCheckpoint(sequence: Int, reason: String)
     case conflictingItemID(String)
     case invalidItem(String, String)
     case missingUserItem(SubmissionID)
@@ -607,6 +1694,10 @@ public enum AgentModelHistoryProjectionError:
             return "Model history root task \(taskID.rawValue) has no unique durable submission/agent binding."
         case .unsupportedSchema(let itemID, let version):
             return "Model history item \(itemID) uses unsupported schema version \(version)."
+        case .unsupportedCheckpointSchema(let sequence, let version):
+            return "Model history checkpoint at sequence \(sequence) uses unsupported schema version \(version)."
+        case .invalidCheckpoint(let sequence, let reason):
+            return "Model history checkpoint at sequence \(sequence) is invalid: \(reason)."
         case .conflictingItemID(let itemID):
             return "Model history item ID \(itemID) was reused with conflicting payloads."
         case .invalidItem(let itemID, let reason):

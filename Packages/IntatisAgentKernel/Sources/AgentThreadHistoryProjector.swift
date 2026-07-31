@@ -110,6 +110,7 @@ public struct AgentThreadHistoryProjector: Sendable {
             projectedTurns.append(AgentLegacyThreadTurn(
                 submissionID: turn.submissionID,
                 acceptedSequence: turn.sequence,
+                completedSequence: assistant.sequence,
                 userText: turn.payload.text,
                 assistantText: assistant.text))
         }
@@ -233,6 +234,7 @@ public struct AgentThreadHistoryProjector: Sendable {
 struct AgentLegacyThreadTurn: Equatable, Sendable {
     var submissionID: SubmissionID
     var acceptedSequence: Int
+    var completedSequence: Int
     var userText: String
     var assistantText: String
 }

@@ -38,6 +38,9 @@ struct IntatisCLI {
             case "exec":
                 try await runExecCommand(
                     args.dropFirst())
+            case "diagnose-hang":
+                try await runDiagnoseHangCommand(
+                    args.dropFirst())
             case "help", "--help", "-h":
                 printHelp()
             default:

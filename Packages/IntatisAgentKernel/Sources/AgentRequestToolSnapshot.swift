@@ -14,22 +14,32 @@ public struct AgentRequestToolSnapshot: Sendable {
     /// Exact provider-visible specs for this dispatch. This may be narrower
     /// than the execution registry when deferred tools are searchable.
     public let providerToolSpecs: [ToolSpec]?
+    /// Exact MCP identifiers visible through this same request-owned
+    /// snapshot. Skill dependency preflight must use this value rather than
+    /// process-global catalog/config state.
+    public let mcpAvailability: MCPToolAvailabilitySnapshot
 
     public init(snapshotID: String,
                 registry: ToolRegistry,
-                providerToolSpecs: [ToolSpec]? = nil) {
+                providerToolSpecs: [ToolSpec]? = nil,
+                mcpAvailability:
+                    MCPToolAvailabilitySnapshot = .unavailable) {
         self.snapshotID = snapshotID
         self.registry = registry
         self.providerToolSpecs = providerToolSpecs
+        self.mcpAvailability = mcpAvailability
     }
 
     public init(registry: ToolRegistry) {
-        self.init(snapshotID: registry.registryVersion, registry: registry)
+        self.init(
+            snapshotID: registry.registryVersion,
+            registry: registry,
+            mcpAvailability: .unavailable)
     }
 }
 
 /// Host-neutral seam used by Code/Cowork session owners to publish a fresh,
-/// response-owned registry for each provider request.
+/// request-owned registry for each provider request.
 public typealias AgentRequestToolSnapshotProvider =
     @Sendable (
         ToolCallingProviderCapabilities,

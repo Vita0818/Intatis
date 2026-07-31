@@ -219,6 +219,62 @@ final class ResponsesToolSearchParityTests: XCTestCase {
             .string("create_event"))
     }
 
+    func testResponsesCanonicalizesReasoningAliasesToNestedWireShape()
+        throws {
+        let configuredEndpoint = ProviderEndpoint(
+            id: "responses",
+            baseURL: URL(
+                string: "https://example.test/v1")!,
+            apiKeyRef: KeychainRef(
+                service: "s",
+                account: "a"),
+            wire: .openai,
+            modelRequestOptions: [
+                "gpt-responses": [
+                    "reasoningEffort":
+                        .string("xhigh"),
+                    "reasoning": .object([
+                        "summary": .string("auto"),
+                    ]),
+                ],
+            ])
+        let provider = OpenAIWireProvider(
+            endpoint: configuredEndpoint,
+            apiKey: "key",
+            http: ResponsesParityHTTP(chunks: []),
+            toolCallingCapabilities:
+                .responsesToolSearch)
+
+        let encoded = try provider.buildAgentRequest(
+            AgentRequest(
+                model: ModelID(
+                    rawValue: "gpt-responses"),
+                messages: [.user("find a tool")],
+                tools: [
+                    .toolSearch(
+                        description: "Search",
+                        parameters: .object([
+                            "type": .string("object"),
+                        ])),
+                ]))
+        let value = try JSONDecoder().decode(
+            JSONValue.self,
+            from: try XCTUnwrap(encoded.httpBody))
+        guard case .object(let body) = value else {
+            return XCTFail(
+                "request body is not an object")
+        }
+
+        XCTAssertNil(body["reasoningEffort"])
+        XCTAssertNil(body["reasoning_effort"])
+        XCTAssertEqual(
+            body["reasoning"],
+            .object([
+                "effort": .string("xhigh"),
+                "summary": .string("auto"),
+            ]))
+    }
+
     func testResponsesStreamParsesToolSearchAndNamespaceFunctionCalls()
         async throws {
         let stream = """

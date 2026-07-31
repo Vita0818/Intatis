@@ -626,7 +626,15 @@ struct IntatisMacRootView: View {
         selection = .code
         isSettings = false
         do {
-            codeVM = try env.makeCodeViewModel(session: sessionID, workspace: workspace)
+            let runtime =
+                try env.makeCodeViewModel(
+                    session: sessionID,
+                    workspace: workspace)
+            codeVM = runtime
+            Task { @MainActor [weak runtime] in
+                await runtime?
+                    .flushProjectionForPresentation()
+            }
             codeSessionError = nil
             refreshCodeSessions()
         } catch {
@@ -680,6 +688,8 @@ struct IntatisMacRootView: View {
             guard coworkTransitionID == transitionID else { return }
             do {
                 let runtime = try await env.makeCoworkViewModel(session: sessionID)
+                guard coworkTransitionID == transitionID else { return }
+                await runtime.flushProjectionForPresentation()
                 guard coworkTransitionID == transitionID else { return }
                 coworkVM = runtime
                 coworkSessionError = nil

@@ -7,6 +7,7 @@ import IntatisTools
 import IntatisPermission
 import IntatisAgentKernel
 import IntatisCowork
+import IntatisSkills
 
 enum REPLExit { case quit; case switchTo(Mode) }
 
@@ -291,7 +292,16 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
                 } else {
                     mcpActivation = nil
                 }
-                let provider = try await registry.defaultAgentProvider()
+                let route = try await registry.agentRuntimeRoute(
+                    model: ModelID(rawValue: model))
+                let skillSnapshot =
+                    try await SkillCatalogService.shared.snapshot(
+                        configuration: .standard(
+                            workspaceRoot: workspace,
+                            access: .workspaceAndGlobal),
+                        catalogBudget:
+                            route.modelContextPolicy
+                                .skillCatalogMetadataBudget)
                 if let mcpActivation {
                     let codeMCPSession =
                         mcpActivation.session
@@ -299,12 +309,11 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
                         name:
                             codeMCPSession.agentID,
                         workspaceRoot: workspace,
-                        model:
-                            ModelID(rawValue: model),
+                        model: route.model,
                         profile: .reviewed)
-                    let baseRegistry =
+                    let baseRegistry = skillSnapshot.augmenting(
                         ToolRegistry.standard(
-                            includesTerminal: true)
+                            includesTerminal: true))
                     let runtime = AgentRuntime.code(
                         registry: baseRegistry,
                         allowsShell: true,
@@ -312,12 +321,17 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
                         includeUsage:
                             config.includeUsage,
                         maxIterations:
-                            config.maxSteps)
+                            config.maxSteps,
+                        modelContextPolicy:
+                            route.modelContextPolicy)
                     let loop = runtime.makeLoop(
                         log: log,
-                        provider: provider,
+                        provider: route.provider,
                         responder: TerminalResponder(),
                         agent: agent,
+                        context: ContextBuilder(
+                            skillSnapshot: skillSnapshot,
+                            runtimeEnvironment: .code),
                         terminal: terminal,
                         imageGenerator:
                             ProviderImageGenerationToolService(
@@ -364,23 +378,31 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
                         name:
                             AgentID(rawValue: "cli"),
                         workspaceRoot: workspace,
-                        model:
-                            ModelID(rawValue: model),
+                        model: route.model,
                         profile: .reviewed)
                     let workspaceLease =
                         WorkspaceLease(
                             rootPath: workspace.path,
                             access: .readWrite)
-                    _ = try await AgentLoop(
+                    let baseRegistry = skillSnapshot.augmenting(
+                        ToolRegistry.standard(
+                            includesTerminal: true))
+                    let runtime = AgentRuntime.code(
+                        registry: baseRegistry,
+                        allowsShell: true,
+                        reasoningEffort: reasoning,
+                        includeUsage: config.includeUsage,
+                        maxIterations: config.maxSteps,
+                        modelContextPolicy:
+                            route.modelContextPolicy)
+                    _ = try await runtime.makeLoop(
                         log: log,
-                        provider: provider,
-                        registry:
-                            .standard(
-                                includesTerminal: true),
-                        engine: PermissionEngine(),
+                        provider: route.provider,
                         responder: TerminalResponder(),
                         agent: agent,
-                        allowsShell: true,
+                        context: ContextBuilder(
+                            skillSnapshot: skillSnapshot,
+                            runtimeEnvironment: .code),
                         terminal: terminal,
                         imageGenerator:
                             ProviderImageGenerationToolService(
@@ -389,11 +411,6 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
                             EventLogSessionNamingService(
                                 log: log,
                                 kind: .code),
-                        reasoningEffort: reasoning,
-                        includeUsage:
-                            config.includeUsage,
-                        maxIterations:
-                            config.maxSteps,
                         workspaceLease:
                             workspaceLease)
                         .send(
@@ -469,7 +486,8 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
         // Reasoning and arbitrary request options are frozen into each exact
         // profile revision. A session-wide override must never drift agents.
         reasoningEffort: nil, includeUsage: config.includeUsage,
-        maxSteps: config.maxSteps,
+        maxSteps: config.coworkMaxSteps,
+        skillRootAccess: .workspaceAndGlobal,
         availableInferenceProfiles: inferenceProfiles.bindings,
         requiresInferenceBindings: true,
         imageGeneratorFor: { _ in ProviderImageGenerationToolService(registry: registry) },

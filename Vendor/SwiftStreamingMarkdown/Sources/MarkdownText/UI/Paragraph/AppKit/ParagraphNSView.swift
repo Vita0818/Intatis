@@ -80,17 +80,24 @@ class ParagraphNSView: NSTextView {
   // MARK: - Intrinsic Content Size
 
   override var intrinsicContentSize: NSSize {
-    if let cachedSize {
-      return cachedSize.size
-    }
     var targetWidth = bounds.width
     if targetWidth <= 0 || targetWidth.isInfinite {
       targetWidth = NSScreen.main?.frame.width ?? 800
     }
+    if let cachedSize, cachedSize.targetWidth == targetWidth {
+      return cachedSize.size
+    }
 
     let measuredSize = measureSize(fittingWidth: targetWidth)
-    cachedSize = CachedParagraphNSViewSize(size: measuredSize, targetWidth: targetWidth)
-    return measuredSize
+    let intrinsicSize = NSSize(
+      width: NSView.noIntrinsicMetric,
+      height: measuredSize.height
+    )
+    cachedSize = CachedParagraphNSViewSize(
+      size: intrinsicSize,
+      targetWidth: targetWidth
+    )
+    return intrinsicSize
   }
 
   /// Measures the size required to lay out the current content within `width`.
@@ -132,7 +139,6 @@ class ParagraphNSView: NSTextView {
 
     lastLaidOutWidth = width
     invalidateCachedSize()
-    invalidateIntrinsicContentSize()
     scheduleTextKitTwoViewportLayout()
   }
 

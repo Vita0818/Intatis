@@ -1707,7 +1707,7 @@ final class AutomaticPermissionReviewTests: XCTestCase {
         let reviewRequest = try XCTUnwrap(reviewerProvider.requests.first)
         XCTAssertEqual(reviewRequest.model, ModelID(rawValue: "reviewer-model"))
         XCTAssertTrue(reviewRequest.tools.isEmpty)
-        XCTAssertEqual(reviewRequest.maxOutputTokens, 1_024)
+        XCTAssertEqual(reviewRequest.maxOutputTokens, 4_096)
         let prompt = reviewRequest.messages.compactMap(\.content).joined(separator: "\n")
         XCTAssertTrue(prompt.contains("Active agent roster:"))
         XCTAssertTrue(prompt.contains("@main"))

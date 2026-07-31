@@ -1,6 +1,8 @@
 #if os(macOS)
+import AppKit
 import Combine
 import CryptoKit
+import IntatisCore
 import SwiftUI
 import XCTest
 @testable import IntatisSharedUI
@@ -21,6 +23,218 @@ private struct SanitizedIncidentFixture: Decodable {
     let sourceDeltaCount: Int
     let sanitizer: String
     let messages: [Message]
+}
+
+@MainActor
+private final class ViewportAdmissionFixtureModel: ObservableObject {
+    @Published var admission: IntatisMessageViewportAdmission
+
+    init(admission: IntatisMessageViewportAdmission) {
+        self.admission = admission
+    }
+}
+
+private struct ViewportAdmissionHostingFixture: View {
+    @ObservedObject var model: ViewportAdmissionFixtureModel
+
+    var body: some View {
+        IntatisMessageContentView(
+            messageID: "viewport-host",
+            rawText: "# Heading\n\nA paragraph with **rich** content.",
+            isComplete: true,
+            policy: .richText,
+            style: .standard(.light))
+            .environment(
+                \.intatisMessageViewportAdmission,
+                model.admission)
+            .frame(width: 560)
+    }
+}
+
+private struct StableThreadWindowHostingFixture: View {
+    @ObservedObject var coordinator: IntatisThreadScrollCoordinator
+    let rowCount: Int
+    private let scope = IntatisThreadPresentationScope(
+        kind: "cowork",
+        sessionID: "stable-window")
+        .historyWindowScope(requestedUpperBound: nil)
+
+    init(
+        coordinator: IntatisThreadScrollCoordinator,
+        rowCount: Int = 13
+    ) {
+        self.coordinator = coordinator
+        self.rowCount = rowCount
+    }
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(0..<rowCount, id: \.self) { index in
+                        row(index)
+                    }
+                    Color.clear
+                        .frame(height: 1)
+                        .id(IntatisThreadBottomAnchorID(scope: scope))
+                        .intatisThreadBottomAnchorFrameProbe()
+                }
+                .environment(
+                    \.intatisMessageViewportAdmission,
+                    coordinator.effectiveViewportAdmission(
+                        for: scope,
+                        defersUntilInitialRestore: true))
+                .environment(
+                    \.intatisThreadScrollCoordinator,
+                    coordinator)
+                .environment(
+                    \.intatisThreadRichSettleSource,
+                    coordinator.effectiveRichSettleSource(for: scope))
+                .frame(width: 560)
+                .padding(.vertical, 16)
+            }
+            .intatisThreadViewportFrameProbe()
+            .onPreferenceChange(
+                IntatisThreadViewportFramesPreferenceKey.self
+            ) { frames in
+                guard let isVisible =
+                        IntatisThreadViewportFrames
+                            .isBottomAnchorVisible(frames) else {
+                    return
+                }
+                coordinator.enqueueBottomAnchorVisibility(
+                    isVisible,
+                    scope: scope)
+            }
+            .onScrollGeometryChange(
+                for: IntatisThreadScrollGeometry.self
+            ) { geometry in
+                IntatisThreadScrollGeometry.measure(
+                    contentOffsetY: geometry.contentOffset.y,
+                    containerHeight: geometry.containerSize.height,
+                    bottomInset: geometry.contentInsets.bottom,
+                    contentHeight: geometry.contentSize.height)
+            } action: { _, current in
+                coordinator.enqueueGeometryObservation(
+                    current.isAtBottom,
+                    contentHeight: current.contentHeight,
+                    scope: scope)
+            }
+            .onAppear {
+                coordinator.activate(
+                    scope: scope,
+                    defersRichUntilInitialRestore: true)
+                coordinator.request(
+                    scope: scope,
+                    reason: .initialRestore
+                ) { request in
+                    proxy.scrollTo(
+                        IntatisThreadBottomAnchorID(scope: request.scope),
+                        anchor: .bottom)
+                }
+            }
+        }
+        .frame(width: 600, height: 400)
+    }
+
+    @ViewBuilder private func row(_ index: Int) -> some View {
+        if [7, 8, 10, 11, 12, 13, 14, 15].contains(index) {
+            IntatisMessageContentView(
+                messageID: "lazy-entry-\(index)",
+                rawText: richText(index),
+                isComplete: true,
+                policy: .richText,
+                style: .standard(.light))
+                .frame(maxWidth: .infinity, alignment: .leading)
+        } else {
+            Text(verbatim: "Stable raw row \(index)")
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private func richText(_ index: Int) -> String {
+        guard index == 8 else {
+            return "**Completed** rich row \(index) with `inline code`."
+        }
+        return """
+        # Entry regression
+
+        A completed response with variable native layout.
+
+        ```swift
+        let rows = \(rowCount)
+        let mode = "stable-eager-window"
+        ```
+
+        | Path | State |
+        | --- | --- |
+        | raw restore | complete |
+        | rich mount | deferred |
+
+        - First item
+        - Second item with **strong text**
+        - Third item with `inline code`
+
+        Final paragraph.
+        """
+    }
+}
+
+@MainActor
+private func withHostingWindow<Content: View>(
+    rootView: Content,
+    frame: NSRect = NSRect(x: 0, y: 0, width: 600, height: 400),
+    operation: (
+        NSHostingView<AnyView>,
+        NSWindow
+    ) async throws -> Void
+) async rethrows {
+    let host = NSHostingView(rootView: AnyView(rootView))
+    host.frame = frame
+    let window = NSWindow(
+        contentRect: frame,
+        styleMask: .borderless,
+        backing: .buffered,
+        defer: false)
+    window.contentView = host
+    window.makeKeyAndOrderFront(nil)
+    window.displayIfNeeded()
+    host.layoutSubtreeIfNeeded()
+    host.displayIfNeeded()
+    pumpAppKitRunLoop(host: host)
+
+    do {
+        try await operation(host, window)
+    } catch {
+        dismantleHostingWindow(window, host: host)
+        throw error
+    }
+    dismantleHostingWindow(window, host: host)
+}
+
+@MainActor
+private func dismantleHostingWindow(
+    _ window: NSWindow,
+    host: NSHostingView<AnyView>
+) {
+    window.orderOut(nil)
+    host.rootView = AnyView(EmptyView())
+    host.layoutSubtreeIfNeeded()
+    pumpAppKitRunLoop(host: host)
+    window.contentView = nil
+}
+
+@MainActor
+private func pumpAppKitRunLoop(
+    host: NSView,
+    cycles: Int = 4
+) {
+    for _ in 0..<cycles {
+        _ = RunLoop.main.run(
+            mode: .default,
+            before: Date(timeIntervalSinceNow: 0.01))
+        host.layoutSubtreeIfNeeded()
+    }
 }
 
 @MainActor
@@ -49,6 +263,81 @@ private func waitForPublishedMarkdown(
             return published
         }
         try await Task.sleep(for: .milliseconds(1))
+    }
+    throw MarkdownRenderingTestError.timedOut
+}
+
+@MainActor
+private func containsParagraphNativeView(_ root: NSView) -> Bool {
+    if String(describing: type(of: root)).contains("ParagraphNSView") {
+        return true
+    }
+    return root.subviews.contains(where: containsParagraphNativeView)
+}
+
+@MainActor
+private func paragraphNativeViewIDs(_ root: NSView) -> Set<ObjectIdentifier> {
+    var result: Set<ObjectIdentifier> = []
+    if String(describing: type(of: root)).contains("ParagraphNSView") {
+        result.insert(ObjectIdentifier(root))
+    }
+    for subview in root.subviews {
+        result.formUnion(paragraphNativeViewIDs(subview))
+    }
+    return result
+}
+
+@MainActor
+private func firstNativeScrollView(_ root: NSView) -> NSScrollView? {
+    if let scrollView = root as? NSScrollView {
+        return scrollView
+    }
+    for subview in root.subviews {
+        if let scrollView = firstNativeScrollView(subview) {
+            return scrollView
+        }
+    }
+    return nil
+}
+
+@MainActor
+private func waitForParagraphNativeView(
+    _ host: NSView,
+    attempts: Int = 400
+) async throws -> Bool {
+    for _ in 0..<attempts {
+        host.layoutSubtreeIfNeeded()
+        if containsParagraphNativeView(host) {
+            return true
+        }
+        try await Task.sleep(for: .milliseconds(5))
+    }
+    throw MarkdownRenderingTestError.timedOut
+}
+
+@MainActor
+private func waitForStableParagraphNativeViewIDs(
+    _ host: NSView,
+    minimumCount: Int,
+    attempts: Int = 500,
+    consecutiveStableAttempts: Int = 50
+) async throws -> Set<ObjectIdentifier> {
+    var previous: Set<ObjectIdentifier> = []
+    var stableAttempts = 0
+
+    for _ in 0..<attempts {
+        host.layoutSubtreeIfNeeded()
+        let current = paragraphNativeViewIDs(host)
+        if current.count >= minimumCount, current == previous {
+            stableAttempts += 1
+            if stableAttempts >= consecutiveStableAttempts {
+                return current
+            }
+        } else {
+            stableAttempts = 0
+        }
+        previous = current
+        try await Task.sleep(for: .milliseconds(5))
     }
     throw MarkdownRenderingTestError.timedOut
 }
@@ -126,6 +415,9 @@ final class MessageRenderingTests: XCTestCase {
 
         XCTAssertFalse(richBranch.contains(".textSelection(.enabled)"))
         XCTAssertTrue(plainBranch.contains(".textSelection(.enabled)"))
+        XCTAssertFalse(source.contains(".task(id:"))
+        XCTAssertTrue(
+            source.contains(".onChange(of: finalRichSettleToken)"))
     }
 
     @MainActor
@@ -192,6 +484,419 @@ final class MessageRenderingTests: XCTestCase {
         XCTAssertNil(richState.publishedDocument)
         XCTAssertEqual(rawState.displayedText, "# rich")
         gate.deactivate(rawState: rawState, richState: richState)
+    }
+
+    @MainActor
+    func testViewportInteractionBlocksAdmissionUntilLatestExactDwell() {
+        let initial = rawRevision(
+            lane: .richFallback,
+            text: "initial",
+            isComplete: false)
+        let rawState = IntatisRawTextProjectionState(revision: initial)
+        let richState = IntatisMicrosoftMarkdownRenderState()
+        let gate = IntatisMessageProjectionLifecycleGate()
+        let request = renderRequest(
+            messageID: "viewport",
+            text: "initial",
+            isComplete: false)
+        let suspended = IntatisMessageProjectionInput(
+            rawRevision: initial,
+            richRequest: request,
+            usesRichRenderer: true,
+            viewportAdmission: .suspended(generation: 1))
+
+        gate.activate(
+            suspended,
+            rawState: rawState,
+            richState: richState)
+        XCTAssertEqual(richState.submittedRequestCount, 0)
+        XCTAssertFalse(richState.hasActiveConsumer)
+        XCTAssertNil(gate.pendingViewportDwellGeneration)
+
+        let dwell = IntatisMessageProjectionInput(
+            rawRevision: initial,
+            richRequest: request,
+            usesRichRenderer: true,
+            viewportAdmission: .idleDwell(generation: 2))
+        gate.receive(dwell, rawState: rawState, richState: richState)
+        XCTAssertEqual(gate.pendingViewportDwellGeneration, 2)
+        XCTAssertEqual(richState.submittedRequestCount, 0)
+
+        gate.viewportDwellDidElapse(
+            generation: 1,
+            richState: richState)
+        XCTAssertEqual(richState.submittedRequestCount, 0)
+        gate.viewportDwellDidElapse(
+            generation: 2,
+            richState: richState)
+        XCTAssertEqual(richState.submittedRequestCount, 1)
+        XCTAssertEqual(gate.richAdmissionCount, 1)
+        XCTAssertEqual(gate.completedViewportDwellGeneration, 2)
+
+        gate.viewportDwellDidElapse(
+            generation: 2,
+            richState: richState)
+        XCTAssertEqual(richState.submittedRequestCount, 1)
+
+        for index in 1...20 {
+            let text = "initial \(index)"
+            let revision = rawRevision(
+                lane: .richFallback,
+                text: text,
+                isComplete: false)
+            gate.receive(
+                IntatisMessageProjectionInput(
+                    rawRevision: revision,
+                    richRequest: renderRequest(
+                        messageID: "viewport",
+                        text: text,
+                        isComplete: false),
+                    usesRichRenderer: true,
+                    viewportAdmission: .idleDwell(generation: 2)),
+                rawState: rawState,
+                richState: richState)
+        }
+        XCTAssertEqual(richState.submittedRequestCount, 21)
+        XCTAssertNil(gate.pendingViewportDwellGeneration)
+        gate.deactivate(rawState: rawState, richState: richState)
+    }
+
+    @MainActor
+    func testThirteenRowStableWindowKeepsFiveRichRowsRawUntilExactDwell() {
+        let window = IntatisThreadHistoryWindow.resolve(
+            allItems: Array(0..<13),
+            requestedUpperBound: nil)
+        XCTAssertEqual(window.items.count, 13)
+        XCTAssertTrue(
+            IntatisThreadRichEntryPolicy.defersUntilInitialRestore(
+                richRowCount: window.items.count))
+        var rows: [(
+            gate: IntatisMessageProjectionLifecycleGate,
+            raw: IntatisRawTextProjectionState,
+            rich: IntatisMicrosoftMarkdownRenderState,
+            input: IntatisMessageProjectionInput
+        )] = []
+
+        for index in 0..<5 {
+            let text = "# Completed \(index)\n\nBody with **rich** content."
+            let revision = rawRevision(
+                messageID: "entry-\(index)",
+                lane: .richFallback,
+                text: text,
+                isComplete: true)
+            let rawState = IntatisRawTextProjectionState(revision: revision)
+            let richState = IntatisMicrosoftMarkdownRenderState()
+            let gate = IntatisMessageProjectionLifecycleGate()
+            let input = IntatisMessageProjectionInput(
+                rawRevision: revision,
+                richRequest: renderRequest(
+                    messageID: "entry-\(index)",
+                    text: text),
+                usesRichRenderer: true,
+                viewportAdmission: .suspended(generation: 100))
+            gate.activate(
+                input,
+                rawState: rawState,
+                richState: richState)
+            XCTAssertEqual(rawState.displayedText, text)
+            XCTAssertEqual(richState.submittedRequestCount, 0)
+            rows.append((gate, rawState, richState, input))
+        }
+
+        for row in rows {
+            row.gate.viewportDwellDidElapse(
+                generation: 100,
+                richState: row.rich)
+            XCTAssertEqual(row.rich.submittedRequestCount, 0)
+
+            let dwellInput = IntatisMessageProjectionInput(
+                rawRevision: row.input.rawRevision,
+                richRequest: row.input.richRequest,
+                usesRichRenderer: true,
+                viewportAdmission: .idleDwell(generation: 101))
+            row.gate.receive(
+                dwellInput,
+                rawState: row.raw,
+                richState: row.rich)
+            row.gate.viewportDwellDidElapse(
+                generation: 100,
+                richState: row.rich)
+            XCTAssertEqual(row.rich.submittedRequestCount, 0)
+            row.gate.viewportDwellDidElapse(
+                generation: 101,
+                richState: row.rich)
+            row.gate.viewportDwellDidElapse(
+                generation: 101,
+                richState: row.rich)
+            XCTAssertEqual(row.rich.submittedRequestCount, 1)
+            row.gate.deactivate(
+                rawState: row.raw,
+                richState: row.rich)
+        }
+    }
+
+    @MainActor
+    func testViewportDwellRejectsSupersededRevision() {
+        let initial = rawRevision(
+            lane: .richFallback,
+            text: "first",
+            isComplete: false)
+        let rawState = IntatisRawTextProjectionState(revision: initial)
+        let richState = IntatisMicrosoftMarkdownRenderState()
+        let gate = IntatisMessageProjectionLifecycleGate()
+        let first = IntatisMessageProjectionInput(
+            rawRevision: initial,
+            richRequest: renderRequest(
+                messageID: "viewport-stale",
+                text: "first",
+                isComplete: false),
+            usesRichRenderer: true,
+            viewportAdmission: .idleDwell(generation: 10))
+        let latestRevision = rawRevision(
+            lane: .richFallback,
+            text: "first latest",
+            isComplete: false)
+        let latest = IntatisMessageProjectionInput(
+            rawRevision: latestRevision,
+            richRequest: renderRequest(
+                messageID: "viewport-stale",
+                text: "first latest",
+                isComplete: false),
+            usesRichRenderer: true,
+            viewportAdmission: .idleDwell(generation: 10))
+
+        gate.activate(first, rawState: rawState, richState: richState)
+        gate.receive(latest, rawState: rawState, richState: richState)
+        gate.viewportDwellDidElapse(
+            generation: 10,
+            richState: richState)
+        XCTAssertEqual(richState.submittedRequestCount, 1)
+        XCTAssertEqual(richState.currentRequestSnapshot, latest.richRequest)
+        gate.deactivate(rawState: rawState, richState: richState)
+    }
+
+    @MainActor
+    func testSuspensionRetainsOnlyExactPublishedDocument() async throws {
+        let initial = rawRevision(
+            lane: .richFallback,
+            text: "# exact",
+            isComplete: true)
+        let rawState = IntatisRawTextProjectionState(revision: initial)
+        let richState = IntatisMicrosoftMarkdownRenderState()
+        let gate = IntatisMessageProjectionLifecycleGate()
+        let exactRequest = renderRequest(
+            messageID: "viewport-exact",
+            text: "# exact")
+        let immediate = IntatisMessageProjectionInput(
+            rawRevision: initial,
+            richRequest: exactRequest,
+            usesRichRenderer: true)
+
+        gate.activate(immediate, rawState: rawState, richState: richState)
+        _ = try await waitForPublishedMarkdown(
+            richState,
+            request: exactRequest)
+
+        let suspendedExact = IntatisMessageProjectionInput(
+            rawRevision: initial,
+            richRequest: exactRequest,
+            usesRichRenderer: true,
+            viewportAdmission: .suspended(generation: 20))
+        gate.receive(
+            suspendedExact,
+            rawState: rawState,
+            richState: richState)
+        XCTAssertEqual(richState.publishedDocument?.request, exactRequest)
+        XCTAssertFalse(richState.hasActiveConsumer)
+
+        let replacementRevision = rawRevision(
+            lane: .richFallback,
+            text: "# replacement",
+            isComplete: true)
+        let suspendedReplacement = IntatisMessageProjectionInput(
+            rawRevision: replacementRevision,
+            richRequest: renderRequest(
+                messageID: "viewport-exact",
+                text: "# replacement"),
+            usesRichRenderer: true,
+            viewportAdmission: .suspended(generation: 20))
+        gate.receive(
+            suspendedReplacement,
+            rawState: rawState,
+            richState: richState)
+        XCTAssertNil(richState.publishedDocument)
+        XCTAssertEqual(rawState.displayedText, "# replacement")
+        gate.deactivate(rawState: rawState, richState: richState)
+    }
+
+    @MainActor
+    func testNSHostingViewportFixtureDoesNotMountRichDuringInteraction() async throws {
+        let model = ViewportAdmissionFixtureModel(
+            admission: .suspended(generation: 30))
+        let host = NSHostingView(
+            rootView: ViewportAdmissionHostingFixture(model: model))
+        host.frame = NSRect(x: 0, y: 0, width: 600, height: 400)
+        host.layoutSubtreeIfNeeded()
+        try await Task.sleep(for: .milliseconds(220))
+        host.layoutSubtreeIfNeeded()
+
+        XCTAssertFalse(containsParagraphNativeView(host))
+
+        model.admission = .idleDwell(generation: 31)
+        host.layoutSubtreeIfNeeded()
+        try await Task.sleep(for: .milliseconds(100))
+        host.layoutSubtreeIfNeeded()
+        XCTAssertFalse(containsParagraphNativeView(host))
+
+        let mounted = try await waitForParagraphNativeView(host)
+        XCTAssertTrue(mounted)
+    }
+
+    @MainActor
+    func testNSHostingStableWindowRestoresRawBeforeMountingRichRows() async throws {
+        let previousMode = UserDefaults.standard.string(
+            forKey: IntatisMessageRendererMode.defaultsKey)
+        UserDefaults.standard.set(
+            IntatisMessageRendererMode.microsoft.rawValue,
+            forKey: IntatisMessageRendererMode.defaultsKey)
+        defer {
+            if let previousMode {
+                UserDefaults.standard.set(
+                    previousMode,
+                    forKey: IntatisMessageRendererMode.defaultsKey)
+            } else {
+                UserDefaults.standard.removeObject(
+                    forKey: IntatisMessageRendererMode.defaultsKey)
+            }
+        }
+
+        let coordinator = IntatisThreadScrollCoordinator()
+        try await withHostingWindow(
+            rootView: StableThreadWindowHostingFixture(
+                coordinator: coordinator)
+        ) { host, _ in
+            host.layoutSubtreeIfNeeded()
+            for _ in 0..<20 {
+                host.layoutSubtreeIfNeeded()
+                if case .idleDwell = coordinator.viewportAdmission {
+                    break
+                }
+                try await Task.sleep(for: .milliseconds(5))
+            }
+
+            guard case .idleDwell = coordinator.viewportAdmission else {
+                let nativeScrollView = firstNativeScrollView(host)
+                return XCTFail(
+                    "raw bottom geometry must confirm before rich dwell; " +
+                    "observations=\(coordinator.geometryObservationCount), " +
+                    "position=\(nativeScrollView?.verticalScroller?.doubleValue ?? -1)")
+            }
+            XCTAssertFalse(containsParagraphNativeView(host))
+            let nativeScrollView = try XCTUnwrap(firstNativeScrollView(host))
+            XCTAssertGreaterThan(
+                nativeScrollView.documentView?.bounds.height ?? 0,
+                nativeScrollView.contentView.bounds.height)
+            XCTAssertGreaterThan(
+                nativeScrollView.verticalScroller?.doubleValue ?? 0,
+                0.95,
+                "raw layout must actually be positioned at the bottom")
+
+            let mounted = try await waitForParagraphNativeView(host)
+            XCTAssertTrue(mounted)
+            for _ in 0..<100 {
+                host.layoutSubtreeIfNeeded()
+                XCTAssertTrue(host.frame.width.isFinite)
+                XCTAssertTrue(host.frame.height.isFinite)
+            }
+        }
+    }
+
+    @MainActor
+    func testNSHostingSixteenRowStableWindowScrollsAndKeepsNativeRichViews()
+        async throws {
+        let previousMode = UserDefaults.standard.string(
+            forKey: IntatisMessageRendererMode.defaultsKey)
+        UserDefaults.standard.set(
+            IntatisMessageRendererMode.microsoft.rawValue,
+            forKey: IntatisMessageRendererMode.defaultsKey)
+        defer {
+            if let previousMode {
+                UserDefaults.standard.set(
+                    previousMode,
+                    forKey: IntatisMessageRendererMode.defaultsKey)
+            } else {
+                UserDefaults.standard.removeObject(
+                    forKey: IntatisMessageRendererMode.defaultsKey)
+            }
+        }
+
+        let coordinator = IntatisThreadScrollCoordinator()
+        try await withHostingWindow(
+            rootView: StableThreadWindowHostingFixture(
+                coordinator: coordinator,
+                rowCount: 16)
+        ) { host, _ in
+            host.layoutSubtreeIfNeeded()
+            let before: Set<ObjectIdentifier>
+            do {
+                before = try await waitForStableParagraphNativeViewIDs(
+                    host,
+                    minimumCount: 8)
+            } catch {
+                let nativeScrollView = firstNativeScrollView(host)
+                XCTFail(
+                    "rich rows did not stabilize before teardown; " +
+                    "error=\(error), " +
+                    "paragraphs=\(paragraphNativeViewIDs(host).count), " +
+                    "admission=\(coordinator.viewportAdmission), " +
+                    "observations=\(coordinator.geometryObservationCount), " +
+                    "position=\(nativeScrollView?.verticalScroller?.doubleValue ?? -1)")
+                throw error
+            }
+            XCTAssertFalse(before.isEmpty)
+            let admission = coordinator.viewportAdmission
+            let nativeScrollView = try XCTUnwrap(firstNativeScrollView(host))
+            let documentView = try XCTUnwrap(nativeScrollView.documentView)
+            let clipView = nativeScrollView.contentView
+            XCTAssertGreaterThan(
+                documentView.bounds.height,
+                clipView.bounds.height)
+
+            var scrollerPositions: [Double] = []
+            for _ in 0..<4 {
+                clipView.scroll(to: NSPoint(
+                    x: clipView.bounds.origin.x,
+                    y: documentView.bounds.minY))
+                nativeScrollView.reflectScrolledClipView(clipView)
+                host.layoutSubtreeIfNeeded()
+                try await Task.sleep(for: .milliseconds(5))
+                scrollerPositions.append(
+                    nativeScrollView.verticalScroller?.doubleValue ?? -1)
+
+                let bottomY = max(
+                    documentView.bounds.minY,
+                    documentView.bounds.maxY - clipView.bounds.height)
+                clipView.scroll(to: NSPoint(
+                    x: clipView.bounds.origin.x,
+                    y: bottomY))
+                nativeScrollView.reflectScrolledClipView(clipView)
+                host.layoutSubtreeIfNeeded()
+                try await Task.sleep(for: .milliseconds(5))
+                scrollerPositions.append(
+                    nativeScrollView.verticalScroller?.doubleValue ?? -1)
+            }
+
+            XCTAssertEqual(coordinator.viewportAdmission, admission)
+            XCTAssertLessThan(
+                try XCTUnwrap(scrollerPositions.min()),
+                0.1,
+                "the native scroll view must reach the top")
+            XCTAssertGreaterThan(
+                try XCTUnwrap(scrollerPositions.max()),
+                0.9,
+                "the native scroll view must return to the bottom")
+            XCTAssertEqual(paragraphNativeViewIDs(host), before)
+        }
     }
 
     @MainActor
@@ -615,7 +1320,7 @@ final class MessageRenderingTests: XCTestCase {
         XCTAssertFalse(empty.isAdmitted)
     }
 
-    func testAdaptiveThreadStackKeepsOnlySmallTopLevelThreadsEager() {
+    func testAdaptiveThreadStackRetainsItsNonProductionCompatibilityPolicy() {
         XCTAssertEqual(
             IntatisThreadStackLayoutMode.resolve(visibleRowCount: 2),
             .eager)
@@ -625,9 +1330,157 @@ final class MessageRenderingTests: XCTestCase {
         XCTAssertEqual(
             IntatisThreadStackLayoutMode.resolve(visibleRowCount: 5),
             .lazy)
+    }
+
+    func testThreadHistoryWindowKeepsThirteenRowsInOneLatestPage() {
+        XCTAssertEqual(IntatisThreadHistoryWindowPolicy.capacity, 16)
+
+        let window = IntatisThreadHistoryWindow.resolve(
+            allItems: Array(0..<13),
+            requestedUpperBound: nil)
+
+        XCTAssertEqual(window.items, Array(0..<13))
+        XCTAssertEqual(window.lowerBound, 0)
+        XCTAssertEqual(window.upperBound, 13)
+        XCTAssertEqual(window.totalCount, 13)
+        XCTAssertFalse(window.hasEarlier)
+        XCTAssertFalse(window.hasLater)
+        XCTAssertTrue(window.isLatest)
+        XCTAssertNil(window.earlierRequestedUpperBound)
+        XCTAssertNil(window.newerRequestedUpperBound)
+    }
+
+    func testThreadHistoryWindowLatestPageMountsAtMostSixteenRows() {
+        let window = IntatisThreadHistoryWindow.resolve(
+            allItems: Array(0..<40),
+            requestedUpperBound: nil)
+
+        XCTAssertEqual(window.items, Array(24..<40))
+        XCTAssertEqual(window.items.count, 16)
+        XCTAssertEqual(window.lowerBound, 24)
+        XCTAssertEqual(window.upperBound, 40)
+        XCTAssertEqual(window.totalCount, 40)
+        XCTAssertTrue(window.hasEarlier)
+        XCTAssertFalse(window.hasLater)
+        XCTAssertTrue(window.isLatest)
+        XCTAssertEqual(window.earlierRequestedUpperBound, 24)
+        XCTAssertNil(window.newerRequestedUpperBound)
+    }
+
+    func testThreadHistoryWindowEarlierAndNewerUseStablePageBoundaries() {
+        let items = Array(0..<40)
+        let middle = IntatisThreadHistoryWindow.resolve(
+            allItems: items,
+            requestedUpperBound: 24)
+
+        XCTAssertEqual(middle.items, Array(8..<24))
+        XCTAssertEqual(middle.lowerBound, 8)
+        XCTAssertEqual(middle.upperBound, 24)
+        XCTAssertTrue(middle.hasEarlier)
+        XCTAssertTrue(middle.hasLater)
+        XCTAssertFalse(middle.isLatest)
+        XCTAssertEqual(middle.earlierRequestedUpperBound, 8)
+        XCTAssertNil(
+            middle.newerRequestedUpperBound,
+            "the adjacent newer page is represented by nil when it is Latest")
+
+        let oldest = IntatisThreadHistoryWindow.resolve(
+            allItems: items,
+            requestedUpperBound: middle.earlierRequestedUpperBound)
+
+        XCTAssertEqual(oldest.items, Array(0..<8))
+        XCTAssertEqual(oldest.lowerBound, 0)
+        XCTAssertEqual(oldest.upperBound, 8)
+        XCTAssertFalse(oldest.hasEarlier)
+        XCTAssertTrue(oldest.hasLater)
+        XCTAssertFalse(oldest.isLatest)
+        XCTAssertNil(oldest.earlierRequestedUpperBound)
+        XCTAssertEqual(oldest.newerRequestedUpperBound, 24)
+
+        let newer = IntatisThreadHistoryWindow.resolve(
+            allItems: items,
+            requestedUpperBound: oldest.newerRequestedUpperBound)
+        XCTAssertEqual(newer.items, middle.items)
+        XCTAssertEqual(newer.lowerBound, middle.lowerBound)
+        XCTAssertEqual(newer.upperBound, middle.upperBound)
+    }
+
+    func testThreadHistoryWindowExplicitOlderPageDoesNotDriftOnAppend() {
+        let before = IntatisThreadHistoryWindow.resolve(
+            allItems: Array(0..<40),
+            requestedUpperBound: 24)
+        let after = IntatisThreadHistoryWindow.resolve(
+            allItems: Array(0..<41),
+            requestedUpperBound: 24)
+
+        XCTAssertEqual(before.items, Array(8..<24))
+        XCTAssertEqual(after.items, before.items)
+        XCTAssertEqual(after.lowerBound, before.lowerBound)
+        XCTAssertEqual(after.upperBound, before.upperBound)
+        XCTAssertEqual(after.totalCount, 41)
+        XCTAssertTrue(after.hasLater)
+        XCTAssertFalse(after.isLatest)
+    }
+
+    func testThreadHistoryWindowLatestPageFollowsAppendWithoutExceedingCapacity() {
+        let totals = [0, 1, 13, 16, 17, 40, 41, 106]
+
+        for total in totals {
+            let window = IntatisThreadHistoryWindow.resolve(
+                allItems: Array(0..<total),
+                requestedUpperBound: nil)
+
+            XCTAssertLessThanOrEqual(
+                window.items.count,
+                IntatisThreadHistoryWindowPolicy.capacity)
+            XCTAssertEqual(window.upperBound, total)
+            XCTAssertEqual(window.totalCount, total)
+            XCTAssertTrue(window.isLatest)
+        }
+
+        let before = IntatisThreadHistoryWindow.resolve(
+            allItems: Array(0..<40),
+            requestedUpperBound: nil)
+        let after = IntatisThreadHistoryWindow.resolve(
+            allItems: Array(0..<41),
+            requestedUpperBound: nil)
+        XCTAssertEqual(before.items, Array(24..<40))
+        XCTAssertEqual(after.items, Array(25..<41))
+    }
+
+    func testThreadHistoryWindowScopesAreStableAndIsolatedByPage() {
+        let base = IntatisThreadPresentationScope(
+            kind: "cowork",
+            sessionID: "scope")
+        let latestBeforeAppend = base.historyWindowScope(
+            requestedUpperBound: nil)
+        let latestAfterAppend = base.historyWindowScope(
+            requestedUpperBound: nil)
+        let older = base.historyWindowScope(
+            requestedUpperBound: 24)
+
+        XCTAssertEqual(latestBeforeAppend, latestAfterAppend)
+        XCTAssertNotEqual(latestBeforeAppend, older)
         XCTAssertEqual(
-            IntatisThreadStackLayoutMode.resolve(visibleRowCount: 17),
-            .lazy)
+            older,
+            base.historyWindowScope(requestedUpperBound: 24))
+        XCTAssertEqual(older.kind, base.kind)
+        XCTAssertEqual(older.sessionID, base.sessionID)
+    }
+
+    func testThreadHistorySelectionCannotLeakAcrossSessions() {
+        let first = IntatisThreadPresentationScope(
+            kind: "cowork",
+            sessionID: "first")
+        let second = IntatisThreadPresentationScope(
+            kind: "cowork",
+            sessionID: "second")
+        let selection = IntatisThreadHistorySelection(
+            scope: first,
+            requestedUpperBound: 24)
+
+        XCTAssertEqual(selection.upperBound(for: first), 24)
+        XCTAssertNil(selection.upperBound(for: second))
     }
 
     @MainActor
@@ -645,10 +1498,10 @@ final class MessageRenderingTests: XCTestCase {
         XCTAssertEqual(configuration.blockSpacing, 18)
     }
 
-    func testSingleDollarMathIsDefaultAndHasAnIndependentLaunchKillSwitch() {
+    func testLatexMathIsDefaultAndHasAnIndependentLaunchKillSwitch() {
         XCTAssertEqual(
             IntatisMarkdownMathMode.resolve(arguments: ["Intatis"]),
-            .singleDollarInline)
+            .latex)
         XCTAssertEqual(
             IntatisMarkdownMathMode.resolve(arguments: [
                 "Intatis",
@@ -656,8 +1509,8 @@ final class MessageRenderingTests: XCTestCase {
             ]),
             .disabled)
         XCTAssertEqual(
-            IntatisMarkdownMathMode.singleDollarInline.renderConfig.mode,
-            .singleDollarInline)
+            IntatisMarkdownMathMode.latex.renderConfig.mode,
+            .latex)
         XCTAssertEqual(
             IntatisMarkdownMathMode.disabled.renderConfig.mode,
             .disabled)
@@ -690,6 +1543,30 @@ final class MessageRenderingTests: XCTestCase {
 
         XCTAssertEqual(Data(published.revision.rawText.utf8), Data(raw.utf8))
         XCTAssertEqual(published.revision, revision)
+        state.deactivate()
+    }
+
+    @MainActor
+    func testMarkdownDiagnosticsAggregateQueueParseAndMainActorPublish() async throws {
+        let diagnostics = IntatisPerformanceDiagnostics()
+        let state = IntatisMicrosoftMarkdownRenderState(
+            performanceDiagnostics: diagnostics)
+        let request = renderRequest(
+            messageID: "diagnostic-aggregate",
+            text: "# Heading\n\nA bounded diagnostic fixture.")
+
+        state.submit(request: request)
+        state.submit(request: request)
+        _ = try await waitForPublishedMarkdown(state, request: request)
+        state.submit(request: request)
+
+        let snapshot = diagnostics.snapshot()
+        XCTAssertEqual(snapshot.value(for: .markdownQueueWaits), 1)
+        XCTAssertEqual(snapshot.value(for: .markdownParses), 1)
+        XCTAssertEqual(snapshot.value(for: .markdownPublishes), 1)
+        XCTAssertNil(snapshot.counters["message"])
+        XCTAssertNil(snapshot.counters["paragraph"])
+        XCTAssertNil(snapshot.counters["frame"])
         state.deactivate()
     }
 
@@ -847,6 +1724,69 @@ final class MessageRenderingTests: XCTestCase {
                 Data(expected.rawText.utf8))
             state.deactivate()
         }
+    }
+
+    @MainActor
+    func testViewportInteractionAdmitsZeroRichWorkAcross1249Deltas() throws {
+        let fixtureURL = try XCTUnwrap(Bundle.module.url(
+            forResource: "incident-1249-sanitized-v1",
+            withExtension: "json",
+            subdirectory: "Fixtures"))
+        let fixture = try JSONDecoder().decode(
+            SanitizedIncidentFixture.self,
+            from: Data(contentsOf: fixtureURL))
+        var replayed = 0
+
+        for message in fixture.messages {
+            let initial = rawRevision(
+                messageID: message.id,
+                lane: .richFallback,
+                text: "",
+                isComplete: false)
+            let rawState = IntatisRawTextProjectionState(revision: initial)
+            let richState = IntatisMicrosoftMarkdownRenderState()
+            let gate = IntatisMessageProjectionLifecycleGate()
+            var snapshot = ""
+
+            for (index, delta) in message.deltas.enumerated() {
+                snapshot += delta
+                replayed += 1
+                let isComplete = index
+                    == message.deltas.index(before: message.deltas.endIndex)
+                let revision = rawRevision(
+                    messageID: message.id,
+                    lane: .richFallback,
+                    text: snapshot,
+                    isComplete: isComplete)
+                let input = IntatisMessageProjectionInput(
+                    rawRevision: revision,
+                    richRequest: renderRequest(
+                        messageID: message.id,
+                        text: snapshot,
+                        isComplete: isComplete),
+                    usesRichRenderer: true,
+                    viewportAdmission: .suspended(generation: 99))
+                if index == message.deltas.startIndex {
+                    gate.activate(
+                        input,
+                        rawState: rawState,
+                        richState: richState)
+                } else {
+                    gate.receive(
+                        input,
+                        rawState: rawState,
+                        richState: richState)
+                }
+            }
+
+            XCTAssertEqual(richState.submittedRequestCount, 0)
+            XCTAssertFalse(richState.hasActiveConsumer)
+            XCTAssertEqual(
+                Data(rawState.displayedText.utf8),
+                Data(snapshot.utf8))
+            gate.deactivate(rawState: rawState, richState: richState)
+        }
+        XCTAssertEqual(replayed, 1_249)
     }
 }
 #endif

@@ -6,6 +6,7 @@ import IntatisTools
 import IntatisPermission
 import IntatisConversation
 import IntatisAgentKernel
+import IntatisSkills
 
 public enum OrchestratorSendResult: Equatable, Sendable {
     case sent
@@ -86,7 +87,7 @@ public struct CoworkExecutionPolicy: Equatable, Sendable {
     public var tokenBudget: Int?
 
     public init(maxConcurrentTasks: Int = 4,
-                taskTimeoutSeconds: Double = 300,
+                taskTimeoutSeconds: Double = 600,
                 maxAttempts: Int = 3,
                 tokenBudget: Int? = nil) {
         self.maxConcurrentTasks = max(1, maxConcurrentTasks)
@@ -179,6 +180,13 @@ private enum RootTaskCreationResult: Sendable {
 private enum CoworkTaskTimeoutRace<Value: Sendable>: Sendable {
     case operation(Value)
     case timeout
+}
+
+/// Provider and model-history limits from one exact resolver snapshot. Legacy
+/// provider seams deliberately carry no context metadata.
+private struct ResolvedAgentRuntimeInference: Sendable {
+    let provider: ToolCallingProvider
+    let modelContextPolicy: AgentModelContextPolicy
 }
 
 /// Races one request-owned operation against its deadline, then joins both
@@ -283,6 +291,9 @@ public actor Orchestrator {
     private let bus: MessageBus
     private let engine: PermissionEngine
     private let allowsShell: Bool
+    /// Host policy for Skill discovery. Tests and sandboxed hosts default to
+    /// workspace-only; Developer ID/CLI hosts must opt into global roots.
+    private let skillRootAccess: SkillRootAccess
     private let terminal: ProcessTerminalSessionManager
     private let responder: PermissionResponder
     private var automaticPermissionResponder: AgentPermissionResponder?
@@ -381,9 +392,10 @@ public actor Orchestrator {
         responder: PermissionResponder,
         reasoningEffort: ReasoningEffort? = nil,
         includeUsage: Bool = false,
-        maxSteps: Int = 50,
+        maxSteps: Int = AgentRuntime.defaultCoworkMaxIterations,
         executionPolicy: CoworkExecutionPolicy = .default,
         taskGraphPolicy: TaskGraphPolicy = .default,
+        skillRootAccess: SkillRootAccess = .workspaceOnly,
         availableInferenceProfiles: [AgentInferenceBinding] = [],
         requiresInferenceBindings: Bool = false,
         imageGeneratorFor: @escaping @Sendable (Agent) async -> ImageGenerationToolService? = { _ in nil },
@@ -408,6 +420,7 @@ public actor Orchestrator {
             maxSteps: maxSteps,
             executionPolicy: executionPolicy,
             taskGraphPolicy: taskGraphPolicy,
+            skillRootAccess: skillRootAccess,
             availableInferenceProfiles: availableInferenceProfiles,
             requiresInferenceBindings: requiresInferenceBindings,
             imageGeneratorFor: imageGeneratorFor,
@@ -430,9 +443,10 @@ public actor Orchestrator {
         responder: PermissionResponder,
         reasoningEffort: ReasoningEffort? = nil,
         includeUsage: Bool = false,
-        maxSteps: Int = 50,
+        maxSteps: Int = AgentRuntime.defaultCoworkMaxIterations,
         executionPolicy: CoworkExecutionPolicy = .default,
         taskGraphPolicy: TaskGraphPolicy = .default,
+        skillRootAccess: SkillRootAccess = .workspaceOnly,
         availableInferenceProfiles: [AgentInferenceBinding] = [],
         requiresInferenceBindings: Bool = true,
         imageGeneratorFor: @escaping @Sendable (Agent) async -> ImageGenerationToolService? = { _ in nil },
@@ -453,6 +467,7 @@ public actor Orchestrator {
             maxSteps: maxSteps,
             executionPolicy: executionPolicy,
             taskGraphPolicy: taskGraphPolicy,
+            skillRootAccess: skillRootAccess,
             availableInferenceProfiles: availableInferenceProfiles,
             requiresInferenceBindings: requiresInferenceBindings,
             imageGeneratorFor: imageGeneratorFor,
@@ -476,9 +491,10 @@ public actor Orchestrator {
                 responder: PermissionResponder,
                 reasoningEffort: ReasoningEffort? = nil,
                 includeUsage: Bool = false,
-                maxSteps: Int = 50,
+                maxSteps: Int = AgentRuntime.defaultCoworkMaxIterations,
                 executionPolicy: CoworkExecutionPolicy = .default,
                 taskGraphPolicy: TaskGraphPolicy = .default,
+                skillRootAccess: SkillRootAccess = .workspaceOnly,
                 availableInferenceProfiles: [AgentInferenceBinding] = [],
                 requiresInferenceBindings: Bool = false,
                 imageGeneratorFor: @escaping @Sendable (Agent) async -> ImageGenerationToolService? = { _ in nil },
@@ -494,6 +510,7 @@ public actor Orchestrator {
         self.bus = MessageBus(log: log, mediator: mediator)
         self.engine = engine
         self.allowsShell = allowsShell
+        self.skillRootAccess = skillRootAccess
         self.terminal = ProcessTerminalSessionManager()
         self.responder = responder
         self.automaticPermissionResponder = nil
@@ -558,13 +575,17 @@ public actor Orchestrator {
         self.executionPolicyUpdateInProgress = false
     }
 
-    /// Returns the provider only after an atomic exact-profile resolution has
-    /// been proven to describe this same live Agent. Internal tests that use
-    /// the unlocked initializer retain the legacy provider seam; public
-    /// runtimes that require bindings cannot enter through that seam.
-    private func resolvedProvider(for agent: Agent) async throws -> ToolCallingProvider {
+    /// Resolves provider and model-history limits from the same exact profile
+    /// snapshot, then proves that snapshot still describes this live Agent.
+    /// Legacy provider seams deliberately return `.unspecified`; neither they
+    /// nor callers without model metadata may guess a window from a model slug.
+    private func resolvedRuntimeInference(
+        for agent: Agent
+    ) async throws -> ResolvedAgentRuntimeInference {
         guard let resolvedInferenceFor else {
-            return try await providerFor(agent)
+            return ResolvedAgentRuntimeInference(
+                provider: try await providerFor(agent),
+                modelContextPolicy: .unspecified)
         }
         guard let binding = agent.agentInferenceBinding,
               binding.modelID == agent.model else {
@@ -577,7 +598,14 @@ public actor Orchestrator {
             throw IntatisError.config(
                 "configurationUnresolved: resolved inference profile does not match the agent binding and model")
         }
-        return resolved.provider
+        return ResolvedAgentRuntimeInference(
+            provider: resolved.provider,
+            modelContextPolicy: resolved.modelContextPolicy)
+    }
+
+    /// Provider-only compatibility view used by admission preflight paths.
+    private func resolvedProvider(for agent: Agent) async throws -> ToolCallingProvider {
+        try await resolvedRuntimeInference(for: agent).provider
     }
 
     /// Freezes the reviewer identity and exact inference binding while giving
@@ -2207,18 +2235,18 @@ public actor Orchestrator {
         }
         var projection = CoworkProjection.build(from: events)
         // Older AgentLoop builds left every failed non-replayable tool ticket
-        // unresolved, even when optimistic concurrency had already made a
-        // task_update impossible before its executor could mutate anything.
-        // Repair only the narrow case the pre-prepare EventLog can prove: the
-        // durable WorkTask revision was already newer than expected. A lower
-        // revision could still advance while the executor waits for admission,
-        // and every other unresolved side effect remains fail-closed.
-        let staleTaskUpdateSettlements = Self.provenStaleTaskUpdateSettlementEvents(
+        // unresolved, including task_update requests that the built-in Cowork
+        // executor deterministically rejected before its first EventLog
+        // append. Repair only cases proven from exact durable arguments,
+        // authorization/lease identity, and the pre-prepare WorkTask snapshot.
+        // Persistence failures and every ambiguous side effect remain
+        // fail-closed.
+        let taskUpdateNoEffectSettlements = Self.provenTaskUpdateNoEffectSettlementEvents(
             events: events,
             projection: projection)
-        if !staleTaskUpdateSettlements.isEmpty {
+        if !taskUpdateNoEffectSettlements.isEmpty {
             do {
-                try await appendAdmissionEvents(staleTaskUpdateSettlements)
+                try await appendAdmissionEvents(taskUpdateNoEffectSettlements)
                 let replay = try await log.replayForProjectionChecked()
                 guard replay.hasCompleteKnownHistory else {
                     throw EventLogError.unsupportedEventTypes
@@ -2227,7 +2255,7 @@ public actor Orchestrator {
                 projection = CoworkProjection.build(from: events)
             } catch {
                 workTaskRecoveryFailure =
-                    "proven stale task_update recovery could not be persisted: \(error.localizedDescription)"
+                    "proven no-effect task_update recovery could not be persisted: \(error.localizedDescription)"
                 releaseAdmissionLock()
                 resumeScheduler(suspension: restoreSuspension, ensureRunning: false)
                 return
@@ -2650,11 +2678,124 @@ public actor Orchestrator {
         resumeScheduler(suspension: restoreSuspension, ensureRunning: false)
     }
 
-    /// Produces an additive compatibility settlement for the one legacy
-    /// unresolved write failure that can be proven to have had no effect from
-    /// durable history alone. This deliberately does not infer from free-form
-    /// error text or from the latest projection after the prepared boundary.
-    static func provenStaleTaskUpdateSettlementEvents(
+    private static func hasLegacyWorkerProhibitedWorkTaskUpdateFields(
+        _ request: WorkTaskUpdateRequest
+    ) -> Bool {
+        request.title != nil
+            || request.description != nil
+            || request.acceptanceCriteria != nil
+            || request.expectedArtifacts != nil
+            || request.owner != .unchanged
+            || request.dependsOn != nil
+            || request.priority != nil
+            || request.isRetry
+            || request.status == .ready
+            || request.status == .cancelled
+    }
+
+    private static func hasLegacyFrozenWorkTaskContractFields(
+        _ request: WorkTaskUpdateRequest
+    ) -> Bool {
+        request.title != nil
+            || request.description != nil
+            || request.acceptanceCriteria != nil
+            || request.expectedArtifacts != nil
+            || request.owner != .unchanged
+            || request.dependsOn != nil
+            || request.priority != nil
+    }
+
+    /// Proves that a legacy built-in task_update request was rejected before
+    /// Orchestrator's first WorkTask EventLog append. The proof is intentionally
+    /// based on exact raw-argument identity and durable pre-prepare state; it
+    /// never parses a later free-form error message.
+    private static func legacyTaskUpdatePreflightNoEffectReason(
+        prepared: ToolExecutionPreparedPayload,
+        toolCallsBeforePrepare: [ToolCallPayload],
+        intent: PermissionIntent,
+        workTaskID: WorkTaskID,
+        expectedRevision: Int,
+        prefix: CoworkProjection
+    ) -> String? {
+        guard toolCallsBeforePrepare.count == 1,
+              let toolCall = toolCallsBeforePrepare.first,
+              toolCall.name == "task_update",
+              toolCall.agent == prepared.agent,
+              toolCall.argsRedacted == false,
+              let argumentDigest = toolCall.argsDigest,
+              ToolRegistry.authorizationDigest(toolCall.args) == argumentDigest,
+              let authorization = prepared.authorization,
+              intent.action == "task.update",
+              authorization.membership == .granted,
+              authorization.concreteToolID.hasSuffix("/task_update"),
+              authorization.toolName == "task_update",
+              authorization.canonicalAction == "task.update",
+              authorization.canonicalPermission == "task.update",
+              authorization.toolCallID == prepared.toolCallID,
+              authorization.agent == prepared.agent,
+              authorization.taskID == prepared.taskID,
+              authorization.intent == intent,
+              authorization.sideEffect == .write,
+              authorization.replayPolicy == .requiresManualReconciliation,
+              authorization.normalizedArgumentsDigest == argumentDigest,
+              let invocationTaskID = prepared.taskID,
+              let requestingAgent = prepared.agent,
+              let invocationContract = prefix.tasks[invocationTaskID]?.contract,
+              invocationContract.id == invocationTaskID,
+              invocationContract.assignee == requestingAgent,
+              invocationContract.continuationRunID
+                == prefix.workTasks[workTaskID]?.runID,
+              let capabilityLeaseID = authorization.capabilityLeaseID,
+              capabilityLeaseID == invocationContract.capabilityLeaseID,
+              let capabilityLease = prefix.capabilityLeases[capabilityLeaseID],
+              prefix.capabilityLeaseAgents[capabilityLeaseID] == requestingAgent,
+              capabilityLease.taskID == nil
+                || capabilityLease.taskID == invocationTaskID,
+              authorization.capabilityTaskID == capabilityLease.taskID,
+              let request = try? TaskUpdateTool.decodeRequest(
+                ToolArgs(raw: toolCall.args)),
+              request.taskID == workTaskID,
+              request.expectedRevision == expectedRevision,
+              let durableTaskBeforePrepare = prefix.workTasks[workTaskID] else {
+            return nil
+        }
+
+        guard durableTaskBeforePrepare.revision == expectedRevision else {
+            // A lower revision might advance to the requested revision while
+            // waiting for admission, so it cannot prove a no-effect outcome.
+            return nil
+        }
+
+        let isWorkerLease =
+            capabilityLease.tools.contains(.updateOwnedWorkTask)
+                && !capabilityLease.tools.contains(.manageWorkTasks)
+                && authorization.requiredCapabilities.contains(.updateOwnedWorkTask)
+        if isWorkerLease,
+           hasLegacyWorkerProhibitedWorkTaskUpdateFields(request) {
+            return "permission_denied: legacy worker task_update supplied frozen "
+                + "contract/control fields and was deterministically rejected before "
+                + "the WorkTask mutation boundary; no side effect was applied. "
+                + "Read task_get, then retry with only progress, status, result, and evidence."
+        }
+
+        let isManagerLease =
+            capabilityLease.tools.contains(.manageWorkTasks)
+                && authorization.requiredCapabilities.contains(.manageWorkTasks)
+        if isManagerLease,
+           durableTaskBeforePrepare.status == .inProgress,
+           hasLegacyFrozenWorkTaskContractFields(request) {
+            return "permission_denied: legacy manager task_update supplied fields from "
+                + "an in-progress WorkTask's frozen execution contract and was "
+                + "deterministically rejected before the WorkTask mutation boundary; "
+                + "no side effect was applied. Read task_get, then retry without contract fields."
+        }
+        return nil
+    }
+
+    /// Produces additive compatibility settlements for legacy unresolved
+    /// task_update failures whose lack of effect can be proven from durable
+    /// history alone.
+    static func provenTaskUpdateNoEffectSettlementEvents(
         events: [Envelope],
         projection: CoworkProjection
     ) -> [Event] {
@@ -2673,10 +2814,16 @@ public actor Orchestrator {
             return payload.executionID
         })
         var prefix = CoworkProjection()
+        var toolCallsByID: [String: [ToolCallPayload]] = [:]
         var recoveryEvents: [Event] = []
 
         for envelope in events {
-            defer { prefix.apply(envelope) }
+            defer {
+                prefix.apply(envelope)
+                if case .toolCall(let payload) = envelope.event {
+                    toolCallsByID[payload.toolCallId, default: []].append(payload)
+                }
+            }
             guard case .toolExecutionPrepared(let prepared) = envelope.event,
                   let currentExecution = projection.toolExecutions[prepared.executionID],
                   currentExecution.preparedSeq == envelope.seq,
@@ -2703,15 +2850,29 @@ public actor Orchestrator {
                   !taskResources[0].value.isEmpty else { continue }
             let workTaskID = WorkTaskID(rawValue: taskResources[0].value)
             let expectedRevision = Int(rawExpectedRevision)
-            guard let durableTaskBeforePrepare = prefix.workTasks[workTaskID],
-                  durableTaskBeforePrepare.revision > expectedRevision else {
+            guard let durableTaskBeforePrepare = prefix.workTasks[workTaskID] else {
                 continue
             }
+            let reason: String?
+            if durableTaskBeforePrepare.revision > expectedRevision {
+                // Optimistic concurrency alone proves the executor could not
+                // cross the mutation boundary, even for older logs that did
+                // not retain exact raw-argument identity.
+                reason = "stale_revision: WorkTask \(workTaskID.rawValue) expected revision "
+                    + "\(expectedRevision), but durable revision "
+                    + "\(durableTaskBeforePrepare.revision) was already committed before execution; "
+                    + "no side effect was applied. Read task_get before retrying."
+            } else {
+                reason = legacyTaskUpdatePreflightNoEffectReason(
+                    prepared: prepared,
+                    toolCallsBeforePrepare: toolCallsByID[prepared.toolCallID] ?? [],
+                    intent: intent,
+                    workTaskID: workTaskID,
+                    expectedRevision: expectedRevision,
+                    prefix: prefix)
+            }
+            guard let reason else { continue }
 
-            let reason = "stale_revision: WorkTask \(workTaskID.rawValue) expected revision "
-                + "\(expectedRevision), but durable revision "
-                + "\(durableTaskBeforePrepare.revision) was already committed before execution; "
-                + "no side effect was applied. Read task_get before retrying."
             if (latestToolResultSeq[prepared.toolCallID] ?? -1) <= envelope.seq {
                 recoveryEvents.append(.toolResult(ToolResultPayload(
                     toolCallId: prepared.toolCallID,
@@ -4884,158 +5045,276 @@ public actor Orchestrator {
         return workTaskDetail(created)
     }
 
+    private static func normalizingRepeatedWorkTaskContractFields(
+        _ request: WorkTaskUpdateRequest,
+        against current: WorkTask
+    ) -> WorkTaskUpdateRequest {
+        var normalized = request
+        if normalized.title == current.title {
+            normalized.title = nil
+        }
+        if normalized.description == current.description {
+            normalized.description = nil
+        }
+        if normalized.acceptanceCriteria == current.acceptanceCriteria {
+            normalized.acceptanceCriteria = nil
+        }
+        if normalized.expectedArtifacts == current.expectedArtifacts {
+            normalized.expectedArtifacts = nil
+        }
+        switch normalized.owner {
+        case .unchanged:
+            break
+        case .unassigned where current.owner == nil:
+            normalized.owner = .unchanged
+        case .agent(let owner) where current.owner == owner:
+            normalized.owner = .unchanged
+        case .unassigned, .agent:
+            break
+        }
+        if normalized.dependsOn == current.dependsOn {
+            normalized.dependsOn = nil
+        }
+        if normalized.priority == current.priority {
+            normalized.priority = nil
+        }
+        return normalized
+    }
+
+    private static func provenWorkTaskUpdatePreflightRejection(
+        _ error: Error,
+        request: WorkTaskUpdateRequest
+    ) -> ToolExecutionRejectedWithoutSideEffect {
+        if let violation = error as? WorkTaskGraphViolation {
+            if violation.kind == .staleRevision,
+               violation.taskID == request.taskID,
+               violation.expectedRevision == request.expectedRevision,
+               let actualRevision = violation.actualRevision {
+                return ToolExecutionRejectedWithoutSideEffect(
+                    code: violation.kind.rawValue,
+                    message: "task_update rejected without applying changes: expected_revision \(request.expectedRevision) is stale; the current revision is \(actualRevision). Call task_get for task_id \"\(request.taskID.rawValue)\", merge against the authoritative task state, then retry task_update using that revision as expected_revision.")
+            }
+            return ToolExecutionRejectedWithoutSideEffect(
+                code: violation.kind.rawValue,
+                message: "task_update rejected without applying changes: \(violation.message). Call task_get for task_id \"\(request.taskID.rawValue)\", then retry with the authoritative revision and only the fields that must change.")
+        }
+
+        let code: String
+        if let intatisError = error as? IntatisError {
+            switch intatisError {
+            case .permissionDenied:
+                code = "permission_denied"
+            case .notFound:
+                code = "not_found"
+            case .decoding:
+                code = "invalid_update"
+            case .config:
+                code = "invalid_state"
+            case .provider:
+                code = "provider_error"
+            case .io:
+                code = "io_error"
+            case .cancelled:
+                code = "cancelled"
+            }
+        } else {
+            code = "preflight_rejected"
+        }
+        return ToolExecutionRejectedWithoutSideEffect(
+            code: code,
+            message: "task_update rejected without applying changes: \(error.localizedDescription). Call task_get for task_id \"\(request.taskID.rawValue)\", then retry with the authoritative revision and only the fields that must change.")
+    }
+
     func updateWorkTask(requestedBy: AgentID,
                         currentWorkTaskID: WorkTaskID?,
                         currentRunID: ContinuationRunID?,
                         canManage: Bool,
                         canUpdateOwned: Bool,
-                        request: WorkTaskUpdateRequest) async throws -> WorkTaskDetail {
+                        request: WorkTaskUpdateRequest,
+                        provePreflightRejectionHasNoEffect: Bool = false) async throws -> WorkTaskDetail {
         await acquireAdmissionLock()
         defer { releaseAdmissionLock() }
-        try requireValidWorkTaskGraph()
 
-        guard let current = workTaskGraph.task(request.taskID) else {
-            throw IntatisError.notFound("WorkTask \(request.taskID.rawValue)")
-        }
-        guard current.runID == currentRunID else {
-            throw IntatisError.permissionDenied("only WorkTasks in the current ContinuationRun can be updated")
-        }
-        if !canManage {
-            guard canUpdateOwned,
-                  currentWorkTaskID == current.id,
-                  current.owner == requestedBy else {
-                throw IntatisError.permissionDenied("workers may update only their assigned WorkTask")
+        let preparedGraph: WorkTaskGraph
+        let preparedEvents: [Event]
+        let updatedTaskID = request.taskID
+        do {
+            try requireValidWorkTaskGraph()
+
+            guard let current = workTaskGraph.task(request.taskID) else {
+                throw IntatisError.notFound("WorkTask \(request.taskID.rawValue)")
             }
-            guard request.title == nil,
-                  request.description == nil,
-                  request.acceptanceCriteria == nil,
-                  request.expectedArtifacts == nil,
-                  request.owner == .unchanged,
-                  request.dependsOn == nil,
-                  request.priority == nil,
-                  !request.isRetry,
-                  request.status != .ready,
-                  request.status != .cancelled else {
-                throw IntatisError.permissionDenied(
-                    "workers cannot change WorkTask graph, ownership, priority, retry, or cancellation state")
+            guard current.runID == currentRunID else {
+                throw IntatisError.permissionDenied("only WorkTasks in the current ContinuationRun can be updated")
             }
-        }
-        if current.status == .inProgress {
-            var changedContractFields: [String] = []
-            if let value = request.title, value != current.title {
-                changedContractFields.append("title")
+            let normalizedRequest =
+                Self.normalizingRepeatedWorkTaskContractFields(
+                    request,
+                    against: current)
+            if !canManage {
+                guard canUpdateOwned,
+                      currentWorkTaskID == current.id,
+                      current.owner == requestedBy else {
+                    throw IntatisError.permissionDenied("workers may update only their assigned WorkTask")
+                }
+                guard normalizedRequest.title == nil,
+                      normalizedRequest.description == nil,
+                      normalizedRequest.acceptanceCriteria == nil,
+                      normalizedRequest.expectedArtifacts == nil,
+                      normalizedRequest.owner == .unchanged,
+                      normalizedRequest.dependsOn == nil,
+                      normalizedRequest.priority == nil,
+                      !normalizedRequest.isRetry,
+                      normalizedRequest.status != .ready,
+                      normalizedRequest.status != .cancelled else {
+                    throw IntatisError.permissionDenied(
+                        "workers cannot change WorkTask graph, ownership, priority, retry, or cancellation state")
+                }
             }
-            if let value = request.description, value != current.description {
-                changedContractFields.append("description")
+            if current.status == .inProgress {
+                var changedContractFields: [String] = []
+                if normalizedRequest.title != nil {
+                    changedContractFields.append("title")
+                }
+                if normalizedRequest.description != nil {
+                    changedContractFields.append("description")
+                }
+                if normalizedRequest.acceptanceCriteria != nil {
+                    changedContractFields.append("acceptance_criteria")
+                }
+                if normalizedRequest.expectedArtifacts != nil {
+                    changedContractFields.append("expected_artifacts")
+                }
+                if normalizedRequest.owner != .unchanged {
+                    changedContractFields.append("owner")
+                }
+                if normalizedRequest.dependsOn != nil {
+                    changedContractFields.append("depends_on")
+                }
+                if normalizedRequest.priority != nil {
+                    changedContractFields.append("priority")
+                }
+                guard changedContractFields.isEmpty else {
+                    throw IntatisError.permissionDenied(
+                        "in-progress WorkTask execution contract is frozen: "
+                            + changedContractFields.joined(separator: ", "))
+                }
             }
-            if let value = request.acceptanceCriteria, value != current.acceptanceCriteria {
-                changedContractFields.append("acceptance_criteria")
+
+            let hasMutation = normalizedRequest.title != nil
+                || normalizedRequest.description != nil
+                || normalizedRequest.acceptanceCriteria != nil
+                || normalizedRequest.expectedArtifacts != nil
+                || normalizedRequest.owner != .unchanged
+                || normalizedRequest.dependsOn != nil
+                || normalizedRequest.priority != nil
+                || normalizedRequest.progressNote != nil
+                || normalizedRequest.status != nil
+                || normalizedRequest.result != nil
+                || normalizedRequest.evidence != nil
+                || normalizedRequest.isRetry
+            guard hasMutation else {
+                throw IntatisError.decoding("task_update requires at least one mutable field")
             }
-            if let value = request.expectedArtifacts, value != current.expectedArtifacts {
-                changedContractFields.append("expected_artifacts")
+
+            var proposed = current
+            if let title = normalizedRequest.title { proposed.title = title }
+            if let description = normalizedRequest.description { proposed.description = description }
+            if let criteria = normalizedRequest.acceptanceCriteria {
+                proposed.acceptanceCriteria = criteria
             }
-            switch request.owner {
+            if let artifacts = normalizedRequest.expectedArtifacts {
+                proposed.expectedArtifacts = artifacts
+            }
+            switch normalizedRequest.owner {
             case .unchanged:
                 break
-            case .unassigned where current.owner != nil:
-                changedContractFields.append("owner")
-            case .agent(let owner) where owner != current.owner:
-                changedContractFields.append("owner")
-            case .unassigned, .agent:
-                break
+            case .unassigned:
+                proposed.owner = nil
+            case .agent(let owner):
+                guard owner != Self.automaticPermissionReviewerID,
+                      registry.agent(owner) != nil else {
+                    throw IntatisError.notFound("WorkTask owner is not an attached data-plane agent")
+                }
+                proposed.owner = owner
             }
-            if let value = request.dependsOn, value != current.dependsOn {
-                changedContractFields.append("depends_on")
+            if let dependencies = normalizedRequest.dependsOn {
+                proposed.dependsOn = dependencies
             }
-            if let value = request.priority, value != current.priority {
-                changedContractFields.append("priority")
+            if let priority = normalizedRequest.priority {
+                proposed.priority = priority
             }
-            guard changedContractFields.isEmpty else {
-                throw IntatisError.permissionDenied(
-                    "in-progress WorkTask execution contract is frozen: "
-                        + changedContractFields.joined(separator: ", "))
+            if let progressNote = normalizedRequest.progressNote {
+                proposed.progressNote = progressNote
             }
-        }
+            if let status = normalizedRequest.status {
+                proposed.status = status
+            }
+            if let result = normalizedRequest.result {
+                proposed.result = result
+            }
+            if let evidence = normalizedRequest.evidence {
+                proposed.evidence = evidence.map { $0.materialize() }
+            }
 
-        let hasMutation = request.title != nil
-            || request.description != nil
-            || request.acceptanceCriteria != nil
-            || request.expectedArtifacts != nil
-            || request.owner != .unchanged
-            || request.dependsOn != nil
-            || request.priority != nil
-            || request.progressNote != nil
-            || request.status != nil
-            || request.result != nil
-            || request.evidence != nil
-            || request.isRetry
-        guard hasMutation else {
-            throw IntatisError.decoding("task_update requires at least one mutable field")
-        }
-
-        var proposed = current
-        if let title = request.title { proposed.title = title }
-        if let description = request.description { proposed.description = description }
-        if let criteria = request.acceptanceCriteria { proposed.acceptanceCriteria = criteria }
-        if let artifacts = request.expectedArtifacts { proposed.expectedArtifacts = artifacts }
-        switch request.owner {
-        case .unchanged:
-            break
-        case .unassigned:
-            proposed.owner = nil
-        case .agent(let owner):
-            guard owner != Self.automaticPermissionReviewerID,
-                  registry.agent(owner) != nil else {
-                throw IntatisError.notFound("WorkTask owner is not an attached data-plane agent")
-            }
-            proposed.owner = owner
-        }
-        if let dependencies = request.dependsOn { proposed.dependsOn = dependencies }
-        if let priority = request.priority { proposed.priority = priority }
-        if let progressNote = request.progressNote { proposed.progressNote = progressNote }
-        if let status = request.status { proposed.status = status }
-        if let result = request.result { proposed.result = result }
-        if let evidence = request.evidence {
-            proposed.evidence = evidence.map { $0.materialize() }
-        }
-
-        var preflight = workTaskGraph
-        let updated: WorkTask
-        switch preflight.update(
-            proposed,
-            expectedRevision: request.expectedRevision,
-            isRetry: request.isRetry,
-            recomputeReadinessAfterDependencyChange:
-                request.dependsOn != nil && request.status == nil) {
-        case .success(let task):
-            updated = task
-        case .failure(let violation):
-            throw violation
-        }
-        if updated.status == .ready {
-            switch preflight.readiness(of: updated.id) {
-            case .success(.ready):
-                break
-            case .success(.waitingFor):
-                throw WorkTaskGraphViolation(
-                    kind: .dependenciesUnsatisfied,
-                    message: "WorkTask dependencies are not completed",
-                    taskID: updated.id)
-            case .success(.blockedBy):
-                throw WorkTaskGraphViolation(
-                    kind: .terminalDependency,
-                    message: "WorkTask has a failed or cancelled dependency",
-                    taskID: updated.id)
+            var preflight = workTaskGraph
+            let updated: WorkTask
+            switch preflight.update(
+                proposed,
+                expectedRevision: normalizedRequest.expectedRevision,
+                isRetry: normalizedRequest.isRetry,
+                recomputeReadinessAfterDependencyChange:
+                    normalizedRequest.dependsOn != nil
+                        && normalizedRequest.status == nil) {
+            case .success(let task):
+                updated = task
             case .failure(let violation):
                 throw violation
             }
+            if updated.status == .ready {
+                switch preflight.readiness(of: updated.id) {
+                case .success(.ready):
+                    break
+                case .success(.waitingFor):
+                    throw WorkTaskGraphViolation(
+                        kind: .dependenciesUnsatisfied,
+                        message: "WorkTask dependencies are not completed",
+                        taskID: updated.id)
+                case .success(.blockedBy):
+                    throw WorkTaskGraphViolation(
+                        kind: .terminalDependency,
+                        message: "WorkTask has a failed or cancelled dependency",
+                        taskID: updated.id)
+                case .failure(let violation):
+                    throw violation
+                }
+            }
+
+            var events = workTaskMutationEvents(previous: current, next: updated)
+            reconcileWorkTaskDependents(
+                changedTaskID: updated.id,
+                graph: &preflight,
+                events: &events)
+            preparedGraph = preflight
+            preparedEvents = events
+        } catch {
+            guard provePreflightRejectionHasNoEffect else {
+                throw error
+            }
+            // The catch scope ends before the first EventLog append. Only the
+            // production WorkTask adapter opts into this proof; persistence
+            // failures and lost acknowledgements below remain unresolved.
+            throw Self.provenWorkTaskUpdatePreflightRejection(
+                error,
+                request: request)
         }
 
-        var events = workTaskMutationEvents(previous: current, next: updated)
-        reconcileWorkTaskDependents(changedTaskID: updated.id, graph: &preflight, events: &events)
-        try await appendAdmissionEvents(events)
-        workTaskGraph = preflight
-        return workTaskDetail(preflight.task(updated.id) ?? updated)
+        try await appendAdmissionEvents(preparedEvents)
+        workTaskGraph = preparedGraph
+        guard let updated = preparedGraph.task(updatedTaskID) else {
+            throw IntatisError.notFound("WorkTask \(updatedTaskID.rawValue)")
+        }
+        return workTaskDetail(updated)
     }
 
     /// Host-only continuation primitive. This is intentionally module-internal
@@ -6288,7 +6567,9 @@ public actor Orchestrator {
                 capabilityLeaseID:
                     capabilityLease.id,
                 taskID: taskContract?.id)
-        let provider = try await resolvedProvider(for: agent)
+        let runtimeInference =
+            try await resolvedRuntimeInference(for: agent)
+        let provider = runtimeInference.provider
         let messenger = BusMessenger(from: agent.name, currentTaskID: taskContract?.id, orchestrator: self)
         let manager = OrchestratorManager(
             orchestrator: self,
@@ -6308,10 +6589,39 @@ public actor Orchestrator {
             explicitGoalIntent: explicitGoalIntent,
             canCreate: capabilityLease.tools.contains(.createGoal),
             canSubmitVerdict: capabilityLease.tools.contains(.submitGoalVerdict))
-        let toolRegistry = Self.toolRegistry(
+        let skillSnapshot: SkillSnapshot?
+        if let workspaceLease {
+            let canonicalWorkspace =
+                try PathConfinement.canonicalExistingDirectory(
+                    agent.workspaceRoot)
+            guard let rootIdentity = workspaceLease.rootIdentity,
+                  rootIdentity.canonicalPath == canonicalWorkspace.path,
+                  rootIdentity.matchesCurrentDirectory(
+                    rootPath: canonicalWorkspace.path)
+            else {
+                throw CoworkTaskExecutionError.invalidLease(
+                    "agent workspace does not match its reviewed workspace lease")
+            }
+            skillSnapshot = try await SkillCatalogService.shared.snapshot(
+                configuration: .standard(
+                    workspaceRoot: canonicalWorkspace,
+                    access: skillRootAccess),
+                catalogBudget:
+                    runtimeInference.modelContextPolicy
+                        .skillCatalogMetadataBudget)
+        } else {
+            // A legacy invocation without a reviewed workspace lease receives
+            // no Skill visibility. Skill discovery is never used to create or
+            // widen a workspace authority boundary.
+            skillSnapshot = nil
+        }
+        let baseToolRegistry = Self.toolRegistry(
             for: capabilityLease,
             agentID: agent.name,
             includesTerminal: allowsShell)
+        let toolRegistry =
+            skillSnapshot?.augmenting(baseToolRegistry)
+                ?? baseToolRegistry
         let imageGenerator = await imageGeneratorFor(agent)
         let allowedToolNames = toolRegistry.descriptors().map(\.name).sorted()
         let canCoordinate = Self.canCoordinate(capabilityLease)
@@ -6343,7 +6653,10 @@ public actor Orchestrator {
             // value here would overwrite that per-agent revision.
             reasoningEffort: agent.agentInferenceBinding == nil ? reasoningEffort : nil,
             includeUsage: includeUsage || executionPolicy.tokenBudget != nil,
-            maxIterations: maxSteps)
+            maxIterations: maxSteps,
+            modelContextPolicy: usesMainConversationHistory
+                ? runtimeInference.modelContextPolicy
+                : .unspecified)
         let requestToolSnapshotProvider:
             AgentRequestToolSnapshotProvider?
         let requestCapabilityLease = capabilityLease
@@ -6378,6 +6691,7 @@ public actor Orchestrator {
             context: ContextBuilder(systemPrompt: systemPrompt,
                                     taskContract: taskContract,
                                     contextBundle: contextBundle,
+                                    skillSnapshot: skillSnapshot,
                                     runtimeEnvironment: .cowork,
                                     conversationHistoryPolicy: usesMainConversationHistory
                                         ? .coworkMainThread
@@ -9634,30 +9948,18 @@ struct OrchestratorWorkTaskManager: WorkTaskManager {
     }
 
     func updateWorkTask(_ request: WorkTaskUpdateRequest) async throws -> WorkTaskDetail {
-        do {
-            return try await orchestrator.updateWorkTask(
-                requestedBy: requester,
-                currentWorkTaskID: currentWorkTaskID,
-                currentRunID: currentRunID,
-                canManage: canManage,
-                canUpdateOwned: canUpdateOwned,
-                request: request)
-        } catch let violation as WorkTaskGraphViolation {
-            guard violation.kind == .staleRevision,
-                  violation.taskID == request.taskID,
-                  violation.expectedRevision == request.expectedRevision,
-                  let actualRevision = violation.actualRevision else {
-                throw violation
-            }
-            // This adapter owns the proof boundary: Orchestrator performs the
-            // optimistic-concurrency check against a preflight graph and does
-            // not append WorkTask events or commit its in-memory graph on this
-            // failure. An arbitrary WorkTaskManager is not trusted to make the
-            // same no-side-effect claim.
-            throw ToolExecutionRejectedWithoutSideEffect(
-                code: violation.kind.rawValue,
-                message: "task_update rejected without applying changes: expected_revision \(request.expectedRevision) is stale; the current revision is \(actualRevision). Call task_get for task_id \"\(request.taskID.rawValue)\", merge against the authoritative task state, then retry task_update using that revision as expected_revision.")
-        }
+        try await orchestrator.updateWorkTask(
+            requestedBy: requester,
+            currentWorkTaskID: currentWorkTaskID,
+            currentRunID: currentRunID,
+            canManage: canManage,
+            canUpdateOwned: canUpdateOwned,
+            request: request,
+            // This adapter owns the concrete no-effect proof boundary:
+            // Orchestrator classifies only failures raised before its first
+            // EventLog append. Arbitrary WorkTaskManager implementations are
+            // not trusted to make the same claim.
+            provePreflightRejectionHasNoEffect: true)
     }
 
     func getWorkTask(_ taskID: WorkTaskID) async throws -> WorkTaskDetail {

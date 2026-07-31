@@ -183,7 +183,7 @@ public struct ToolCall: Codable, Equatable, Sendable {
 }
 
 public enum AgentRole: String, Codable, Sendable {
-    case system, user, assistant, tool
+    case system, developer, user, assistant, tool
 }
 
 /// A message in the tool-calling conversation. Assistant messages may carry
@@ -209,6 +209,9 @@ public struct AgentMessage: Equatable, Sendable {
     }
 
     public static func system(_ text: String) -> AgentMessage { .init(role: .system, content: text) }
+    public static func developer(_ text: String) -> AgentMessage {
+        .init(role: .developer, content: text)
+    }
     public static func user(_ text: String, images: [ImageAttachment] = []) -> AgentMessage {
         .init(role: .user, content: text, images: images)
     }

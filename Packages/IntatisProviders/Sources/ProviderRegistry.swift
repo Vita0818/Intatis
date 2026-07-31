@@ -8,13 +8,36 @@ public struct ResolvedInferenceProfile: Sendable {
     public let binding: AgentInferenceBinding
     public let model: ModelID
     public let provider: ToolCallingProvider
+    public let modelContextPolicy: AgentModelContextPolicy
 
     public init(binding: AgentInferenceBinding,
                 model: ModelID,
-                provider: ToolCallingProvider) {
+                provider: ToolCallingProvider,
+                modelContextPolicy: AgentModelContextPolicy = .unspecified) {
         self.binding = binding
         self.model = model
         self.provider = provider
+        self.modelContextPolicy = modelContextPolicy
+    }
+}
+
+/// Runtime route for visible Code sessions. When the selected legacy model
+/// maps unambiguously to one current base profile, provider/model/context
+/// metadata come from that same immutable resolution. Otherwise the legacy
+/// provider remains usable and compaction metadata stays unspecified.
+public struct ResolvedAgentRuntimeRoute: Sendable {
+    public let provider: ToolCallingProvider
+    public let model: ModelID
+    public let modelContextPolicy: AgentModelContextPolicy
+
+    public init(
+        provider: ToolCallingProvider,
+        model: ModelID,
+        modelContextPolicy: AgentModelContextPolicy
+    ) {
+        self.provider = provider
+        self.model = model
+        self.modelContextPolicy = modelContextPolicy
     }
 }
 
@@ -79,10 +102,14 @@ public actor ProviderRegistry {
             let apiKey = try await resolver.secret(for: endpoint.apiKeyRef)
             switch endpoint.wire {
             case .openai:
+                let runtimePolicy: ProviderRuntimePolicy = role == .agent
+                    ? .agentStreaming
+                    : .streaming
                 let provider = OpenAIWireProvider(
                     endpoint: endpoint,
                     apiKey: apiKey,
                     http: http,
+                    runtimePolicy: runtimePolicy,
                     toolCallingCapabilities:
                         toolCallingCapabilities(
                             endpoint: endpoint,
@@ -143,6 +170,7 @@ public actor ProviderRegistry {
                 endpoint: endpoint,
                 apiKey: apiKey,
                 http: http,
+                runtimePolicy: .agentStreaming,
                 toolCallingCapabilities:
                     toolCallingCapabilities(
                         endpoint: endpoint,
@@ -176,6 +204,62 @@ public actor ProviderRegistry {
         try await agentProvider(for: config.models.agent ?? config.models.chat)
     }
 
+    public func defaultAgentRuntimeRoute() async throws
+        -> ResolvedAgentRuntimeRoute
+    {
+        let legacyRef = config.models.agent ?? config.models.chat
+        return try await agentRuntimeRoute(for: legacyRef)
+    }
+
+    /// Resolves the provider, exact selected model, and optional context
+    /// metadata as one route. This overload preserves CLI `/model` switching:
+    /// the endpoint remains the configured agent endpoint while catalog
+    /// metadata is attached only for one unambiguous matching base profile.
+    public func agentRuntimeRoute(model: ModelID) async throws
+        -> ResolvedAgentRuntimeRoute
+    {
+        let configured = config.models.agent ?? config.models.chat
+        return try await agentRuntimeRoute(
+            for: ModelRef(
+                endpoint: configured.endpoint,
+                model: model))
+    }
+
+    public func agentRuntimeRoute(for legacyRef: ModelRef) async throws
+        -> ResolvedAgentRuntimeRoute
+    {
+        if let inferenceCatalogSnapshot {
+            let candidates = inferenceCatalogSnapshot.catalog
+                .currentProfileRefs.compactMap { profileRef
+                    -> InferenceProfileRef? in
+                    guard let profile = try? inferenceCatalogSnapshot
+                            .profile(for: profileRef),
+                          profile.modelID == legacyRef.model,
+                          profile.variantID == nil,
+                          profile.connectionRef
+                            .inferenceConnectionID.rawValue
+                            == legacyRef.endpoint else {
+                        return nil
+                    }
+                    return profileRef
+                }
+            if candidates.count == 1,
+               let profileRef = candidates.first {
+                let resolved = try await agentInference(
+                    for: profileRef)
+                return ResolvedAgentRuntimeRoute(
+                    provider: resolved.provider,
+                    model: resolved.model,
+                    modelContextPolicy:
+                        resolved.modelContextPolicy)
+            }
+        }
+        return ResolvedAgentRuntimeRoute(
+            provider: try await agentProvider(for: legacyRef),
+            model: legacyRef.model,
+            modelContextPolicy: .unspecified)
+    }
+
     public func agentModel() -> ModelID {
         (config.models.agent ?? config.models.chat).model
     }
@@ -197,6 +281,8 @@ public actor ProviderRegistry {
             chatEndpoint: connection.chatEndpoint,
             apiKeyRef: connection.credentialRef,
             wire: connection.wire,
+            requestAdapter:
+                profile.requestAdapter,
             modelRequestOptions: [
                 profile.modelID.rawValue:
                     profile.effectiveRequestOptions,
@@ -212,6 +298,7 @@ public actor ProviderRegistry {
                 endpoint: endpoint,
                 apiKey: apiKey,
                 http: http,
+                runtimePolicy: .agentStreaming,
                 toolCallingCapabilities:
                     toolCallingCapabilities(
                         endpoint: endpoint,
@@ -220,7 +307,8 @@ public actor ProviderRegistry {
         return ResolvedInferenceProfile(
             binding: resolution.binding,
             model: profile.modelID,
-            provider: provider)
+            provider: provider,
+            modelContextPolicy: profile.modelContextPolicy)
     }
 
     private func toolCallingCapabilities(

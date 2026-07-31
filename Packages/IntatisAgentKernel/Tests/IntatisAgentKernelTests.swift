@@ -118,6 +118,45 @@ private struct NoGit: GitService {
 
 final class IntatisAgentKernelTests: XCTestCase {
 
+    func testRuntimeModesKeepDistinctDefaultIterationBudgets() {
+        let code = AgentRuntime.code(allowsShell: false)
+        let cowork = AgentRuntime.cowork(
+            registry: .standard(),
+            engine: PermissionEngine(),
+            allowsShell: false)
+
+        XCTAssertEqual(code.maxIterations, 50)
+        XCTAssertEqual(
+            code.maxIterations,
+            AgentRuntime.defaultCodeMaxIterations)
+        XCTAssertEqual(cowork.maxIterations, 64)
+        XCTAssertEqual(
+            cowork.maxIterations,
+            AgentRuntime.defaultCoworkMaxIterations)
+        XCTAssertEqual(code.modelContextPolicy, .unspecified)
+        XCTAssertEqual(cowork.modelContextPolicy, .unspecified)
+
+        let exactPolicy = AgentModelContextPolicy(
+            contextWindowTokens: 200_000,
+            autoCompactTokenLimit: 120_000,
+            compHash: "exact-profile")
+        let stableMainRuntime = AgentRuntime.cowork(
+            registry: .standard(),
+            engine: PermissionEngine(),
+            allowsShell: false,
+            modelContextPolicy: exactPolicy)
+        XCTAssertEqual(
+            stableMainRuntime.modelContextPolicy,
+            exactPolicy)
+
+        let codeRuntimeWithExactMetadata = AgentRuntime.code(
+            allowsShell: false,
+            modelContextPolicy: exactPolicy)
+        XCTAssertEqual(
+            codeRuntimeWithExactMetadata.modelContextPolicy,
+            exactPolicy)
+    }
+
     private func workspaceAndLog() throws -> (URL, EventLog) {
         let ws = FileManager.default.temporaryDirectory
             .appendingPathComponent("intatis-kernel-\(UUID().uuidString)", isDirectory: true)

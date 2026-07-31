@@ -45,6 +45,46 @@ public struct ProviderUsageLimitError: Error, LocalizedError, Equatable, Sendabl
     }
 }
 
+/// Machine-classified provider rejection indicating that the request input
+/// exceeded the selected model's context window. Compaction may retry only
+/// this typed condition; arbitrary localized error text is never sufficient.
+public struct ProviderContextWindowExceededError:
+    Error, LocalizedError, Equatable, Sendable
+{
+    public var signal: String
+    public var providerMessage: String?
+    public var statusCode: Int?
+    public var operation: String?
+
+    public init(
+        signal: String,
+        providerMessage: String? = nil,
+        statusCode: Int? = nil,
+        operation: String? = nil
+    ) {
+        self.signal = signal
+        self.providerMessage = providerMessage
+        self.statusCode = statusCode
+        self.operation = operation
+    }
+
+    public var errorDescription: String? {
+        var parts = [operation.map { "\($0) exceeded the model context window." }
+            ?? "The request exceeded the model context window."]
+        if !signal.isEmpty {
+            parts.append("Provider signal: \(signal).")
+        }
+        if let providerMessage, !providerMessage.isEmpty {
+            parts.append(
+                "Provider said: "
+                + PermissionReviewTextSanitizer.sanitizeDiagnostic(
+                    providerMessage,
+                    maxCharacters: 360).text)
+        }
+        return parts.joined(separator: " ")
+    }
+}
+
 struct ProviderRetryHint: Equatable, Sendable {
     var delaySeconds: Double
     var source: String
@@ -62,6 +102,13 @@ enum ProviderErrorFormatting {
                            body: Data? = nil,
                            headers: [String: String] = [:],
                            operation: String) -> Error {
+        if let body,
+           let contextWindow = structuredContextWindowExceededError(
+               from: body,
+               statusCode: status,
+               operation: operation) {
+            return contextWindow
+        }
         if let body,
            let usageLimit = structuredUsageLimitError(
                from: body,
@@ -134,6 +181,10 @@ enum ProviderErrorFormatting {
         if let usageLimit = error as? ProviderUsageLimitError {
             return usageLimit
         }
+        if let contextWindow =
+            error as? ProviderContextWindowExceededError {
+            return contextWindow
+        }
         if let intatis = error as? IntatisError {
             return sanitized(intatis)
         }
@@ -144,6 +195,11 @@ enum ProviderErrorFormatting {
     }
 
     static func streamErrorPayload(_ data: Data) -> Error? {
+        if let contextWindow = structuredContextWindowExceededError(
+            from: data,
+            operation: "streaming request") {
+            return contextWindow
+        }
         if let usageLimit = structuredUsageLimitError(
             from: data,
             operation: "streaming request") {
@@ -152,6 +208,20 @@ enum ProviderErrorFormatting {
         guard let message = providerErrorMessage(from: data) else { return nil }
         return IntatisError.provider(
             "Provider rejected the streaming request. Provider said: \(message)")
+    }
+
+    static func contextWindowExceeded(
+        from value: JSONValue,
+        statusCode: Int? = nil,
+        operation: String? = nil
+    ) -> ProviderContextWindowExceededError? {
+        guard let data = try? JSONEncoder().encode(value) else {
+            return nil
+        }
+        return structuredContextWindowExceededError(
+            from: data,
+            statusCode: statusCode,
+            operation: operation)
     }
 
     static func invalidStreamPayload(_ payload: String, underlying: Error) -> IntatisError {
@@ -263,6 +333,57 @@ enum ProviderErrorFormatting {
                 return ProviderUsageLimitError(
                     signal: signal,
                     providerMessage: providerMessage(from: value).map { clean($0) },
+                    statusCode: statusCode,
+                    operation: operation)
+            }
+        }
+        return nil
+    }
+
+    private static func structuredContextWindowExceededError(
+        from data: Data,
+        statusCode: Int? = nil,
+        operation: String? = nil
+    ) -> ProviderContextWindowExceededError? {
+        let capped = Data(data.prefix(maxBodyBytes))
+        guard let value = try? JSONDecoder().decode(
+                  JSONValue.self,
+                  from: capped),
+              case .object(let root) = value else {
+            return nil
+        }
+        var objects: [[String: JSONValue]] = []
+        if let error = root["error"], case .object(let nested) = error {
+            objects.append(nested)
+        }
+        if let response = root["response"],
+           case .object(let responseObject) = response {
+            if let error = responseObject["error"],
+               case .object(let nested) = error {
+                objects.append(nested)
+            }
+            objects.append(responseObject)
+        }
+        objects.append(root)
+
+        let known = Set([
+            "context_length_exceeded",
+            "context_window_exceeded",
+            "maximum_context_length_exceeded",
+            "prompt_too_long",
+        ])
+        for object in objects {
+            for key in ["code", "type"] {
+                guard let rawValue = object[key]?.displayString else {
+                    continue
+                }
+                let value = rawValue.lowercased()
+                guard known.contains(value) else { continue }
+                return ProviderContextWindowExceededError(
+                    signal: value,
+                    providerMessage:
+                        providerMessage(from: .object(root))
+                            .map { clean($0) },
                     statusCode: statusCode,
                     operation: operation)
             }

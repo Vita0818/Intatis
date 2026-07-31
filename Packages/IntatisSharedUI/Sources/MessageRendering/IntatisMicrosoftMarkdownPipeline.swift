@@ -1,5 +1,6 @@
 #if canImport(SwiftUI) && canImport(SwiftStreamingMarkdown)
 import Foundation
+import IntatisCore
 import SwiftUI
 import SwiftStreamingMarkdown
 #if canImport(AppKit)
@@ -15,38 +16,39 @@ enum IntatisMarkdownRendererLimits {
     static let maximumConcurrentParses = 1
     static let maximumPendingMessages = 32
     static let incompleteMessageDebounce = Duration.milliseconds(50)
+    static let viewportIdleDwell = Duration.milliseconds(150)
     /// Raw text is the safety path, but rebuilding one ever-growing SwiftUI
     /// `Text` for every token can still monopolize the main actor. Keep the
     /// first/current/final source exact while bounding append-only projections.
     static let rawTextProjectionIntervalNanoseconds: UInt64 = 100_000_000
-    /// A process-scoped, non-persistent kill switch used by controlled
-    /// validation and emergency rollback. `plainSafe` remains the stronger
-    /// whole-renderer bypass.
+    /// Legacy-named, process-scoped kill switch retained for validation and
+    /// emergency rollback compatibility. It disables all math delimiters;
+    /// `plainSafe` remains the stronger whole-renderer bypass.
     static let disableSingleDollarMathLaunchArgument =
         "-IntatisDisableSingleDollarMath"
     static let mathMode = IntatisMarkdownMathMode.resolve(
         arguments: ProcessInfo.processInfo.arguments)
     static let configurationRevision =
-        mathMode == .singleDollarInline ? 2 : 3
+        mathMode == .latex ? 4 : 3
 }
 
 enum IntatisMarkdownMathMode: String, Hashable, Sendable {
     case disabled
-    case singleDollarInline
+    case latex
 
     static func resolve(arguments: [String]) -> IntatisMarkdownMathMode {
         arguments.contains(
             IntatisMarkdownRendererLimits.disableSingleDollarMathLaunchArgument)
             ? .disabled
-            : .singleDollarInline
+            : .latex
     }
 
     var renderConfig: MathRenderConfig {
         switch self {
         case .disabled:
             return .disabled
-        case .singleDollarInline:
-            return .singleDollarInline
+        case .latex:
+            return .latex
         }
     }
 }
@@ -467,6 +469,41 @@ private enum IntatisMarkdownParseBridge {
     }
 }
 
+private enum IntatisMarkdownDiagnosticFlag {
+    static let complete: Int64 = 1 << 0
+    static let admitted: Int64 = 1 << 1
+    static let schedulerPermitIssued: Int64 = 1 << 2
+    static let currentAfterParse: Int64 = 1 << 3
+    static let published: Int64 = 1 << 4
+}
+
+private extension IntatisMarkdownRenderRevision {
+    var diagnosticInputBytes: Int64 {
+        Int64(rawText.utf8.count)
+    }
+
+    var diagnosticSequence: Int64 {
+        Int64(configurationRevision)
+    }
+
+    var diagnosticFlags: Int64 {
+        var result: Int64 = 0
+        if isComplete {
+            result |= IntatisMarkdownDiagnosticFlag.complete
+        }
+        if isAdmitted {
+            result |= IntatisMarkdownDiagnosticFlag.admitted
+        }
+        return result
+    }
+}
+
+private func intatisElapsedMilliseconds(since startNanoseconds: UInt64) -> Int64 {
+    let now = DispatchTime.now().uptimeNanoseconds
+    let elapsed = now >= startNanoseconds ? now - startNanoseconds : 0
+    return Int64(min(elapsed / 1_000_000, UInt64(Int64.max)))
+}
+
 @MainActor
 final class IntatisMicrosoftMarkdownRenderState: ObservableObject {
     struct PublishedDocument {
@@ -494,6 +531,23 @@ final class IntatisMicrosoftMarkdownRenderState: ObservableObject {
     private var currentRequest: IntatisMarkdownRenderRequest?
     private var requestContinuation: AsyncStream<IntatisMarkdownRenderRequest>.Continuation?
     private var consumerTask: Task<Void, Never>?
+    private(set) var submittedRequestCount = 0
+    private(set) var suspensionCount = 0
+    private let performanceDiagnostics: IntatisPerformanceDiagnostics
+
+    init(
+        performanceDiagnostics: IntatisPerformanceDiagnostics = .shared
+    ) {
+        self.performanceDiagnostics = performanceDiagnostics
+    }
+
+    var hasActiveConsumer: Bool {
+        consumerTask != nil
+    }
+
+    var currentRequestSnapshot: IntatisMarkdownRenderRequest? {
+        currentRequest
+    }
 
     func submit(
         revision: IntatisMarkdownRenderRevision,
@@ -505,7 +559,10 @@ final class IntatisMicrosoftMarkdownRenderState: ObservableObject {
     }
 
     func submit(request: IntatisMarkdownRenderRequest) {
-        guard request != currentRequest else { return }
+        let alreadyPublished = publishedDocument?.request == request
+        let alreadyProcessing = currentRequest == request
+            && consumerTask != nil
+        guard !alreadyPublished, !alreadyProcessing else { return }
         if let published = publishedDocument, published.request != request {
             // Release the old native view/document graph immediately. The view
             // presents exact raw text until the latest rich projection is ready.
@@ -517,7 +574,22 @@ final class IntatisMicrosoftMarkdownRenderState: ObservableObject {
             return
         }
         startConsumerIfNeeded()
+        submittedRequestCount += 1
         requestContinuation?.yield(request)
+    }
+
+    /// Stops all pending/running parse admission while retaining an already
+    /// mounted exact document. A revision change clears the stale document
+    /// immediately; resuming the same request restarts only when no exact
+    /// document exists.
+    func suspend(keepingExact request: IntatisMarkdownRenderRequest) {
+        suspensionCount += 1
+        if let publishedDocument,
+           publishedDocument.request != request {
+            self.publishedDocument = nil
+        }
+        currentRequest = request
+        stopConsumer()
     }
 
     func deactivate() {
@@ -532,6 +604,10 @@ final class IntatisMicrosoftMarkdownRenderState: ObservableObject {
         if publishedDocument != nil {
             publishedDocument = nil
         }
+        stopConsumer()
+    }
+
+    private func stopConsumer() {
         activationID = nil
         requestContinuation?.finish()
         requestContinuation = nil
@@ -574,14 +650,48 @@ final class IntatisMicrosoftMarkdownRenderState: ObservableObject {
             guard isCurrent(request, activationID: activationID) else { return }
         }
 
+        let queueStarted = DispatchTime.now().uptimeNanoseconds
+        performanceDiagnostics.increment(.markdownQueueWaits)
+        let queueInterval = performanceDiagnostics.beginInterval(
+            .markdownQueueWait,
+            fields: .init(
+                primary: -1,
+                secondary: 0,
+                sequence: request.revision.diagnosticSequence,
+                flags: request.revision.diagnosticFlags))
         guard let permit = await Self.scheduler.acquire(for: schedulerKey) else {
+            performanceDiagnostics.endInterval(
+                queueInterval,
+                fields: .init(
+                    primary: 0,
+                    secondary: intatisElapsedMilliseconds(
+                        since: queueStarted),
+                    sequence: request.revision.diagnosticSequence,
+                    flags: request.revision.diagnosticFlags))
             return
         }
+        performanceDiagnostics.endInterval(
+            queueInterval,
+            fields: .init(
+                primary: 1,
+                secondary: intatisElapsedMilliseconds(
+                    since: queueStarted),
+                sequence: request.revision.diagnosticSequence,
+                flags: request.revision.diagnosticFlags
+                    | IntatisMarkdownDiagnosticFlag.schedulerPermitIssued))
         guard isCurrent(request, activationID: activationID) else {
             _ = await Self.scheduler.finish(permit, outcome: .cancelled)
             return
         }
 
+        performanceDiagnostics.increment(.markdownParses)
+        let parseInterval = performanceDiagnostics.beginInterval(
+            .markdownParse,
+            fields: .init(
+                primary: request.revision.diagnosticInputBytes,
+                secondary: 0,
+                sequence: request.revision.diagnosticSequence,
+                flags: request.revision.diagnosticFlags))
         let document = await IntatisMarkdownParseBridge.parse(
             text: request.revision.rawText,
             style: request.style,
@@ -589,6 +699,16 @@ final class IntatisMicrosoftMarkdownRenderState: ObservableObject {
 
         let isStillCurrent = isCurrent(request, activationID: activationID)
             && !Task.isCancelled
+        performanceDiagnostics.endInterval(
+            parseInterval,
+            fields: .init(
+                primary: 0,
+                secondary: 0,
+                sequence: request.revision.diagnosticSequence,
+                flags: request.revision.diagnosticFlags
+                    | (isStillCurrent
+                        ? IntatisMarkdownDiagnosticFlag.currentAfterParse
+                        : 0)))
         let schedulerAllowsPublication = await Self.scheduler.finish(
             permit,
             outcome: isStillCurrent ? .success : .cancelled)
@@ -600,6 +720,15 @@ final class IntatisMicrosoftMarkdownRenderState: ObservableObject {
 
         // This independent configuration is created only after the await and
         // stays MainActor-owned with the returned non-Sendable document.
+        let publishStarted = DispatchTime.now().uptimeNanoseconds
+        performanceDiagnostics.increment(.markdownPublishes)
+        let publishInterval = performanceDiagnostics.beginInterval(
+            .markdownPublish,
+            fields: .init(
+                primary: request.revision.diagnosticInputBytes,
+                secondary: 0,
+                sequence: request.revision.diagnosticSequence,
+                flags: request.revision.diagnosticFlags))
         let displayConfiguration = Self.makeConfiguration(
             style: request.style.threadStyle,
             typography: request.revision.typography)
@@ -607,6 +736,15 @@ final class IntatisMicrosoftMarkdownRenderState: ObservableObject {
             request: request,
             document: document,
             displayConfiguration: displayConfiguration)
+        performanceDiagnostics.endInterval(
+            publishInterval,
+            fields: .init(
+                primary: 1,
+                secondary: intatisElapsedMilliseconds(
+                    since: publishStarted),
+                sequence: request.revision.diagnosticSequence,
+                flags: request.revision.diagnosticFlags
+                    | IntatisMarkdownDiagnosticFlag.published))
     }
 
     private func isCurrent(

@@ -15,7 +15,8 @@ public struct SpawnAgentTool: Tool {
         name: "spawn_agent",
         description: "Create a new sub-agent bound to a folder so you can delegate work to it. "
             + "Give it a short name and an absolute folder path. Omit inference_profile_id to inherit "
-            + "your exact profile revision, or choose an ID from list_inference_profiles. "
+            + "your exact profile revision; this is the recommended default. Choose an ID from "
+            + "list_inference_profiles only when its host label/model/variant clearly fits the delegated work. "
             + "Set canCoordinate only when this sub-agent must manage lower-level agents. "
             + "New agents are read-only unless requestedAccess is explicitly read_write. "
             + "After spawning, assign work with delegate_task; the orchestrator recycles task-scoped agents when idle.",
@@ -31,7 +32,7 @@ public struct SpawnAgentTool: Tool {
                                   "description": .string("deprecated compatibility field; cannot change the parent profile")]),
                 "inference_profile_id": .object([
                     "type": .string("string"),
-                    "description": .string("optional host-approved inference profile ID; omission inherits your exact revision"),
+                    "description": .string("optional host-approved inference profile ID; recommended default is omission, which inherits your exact revision"),
                 ]),
                 "requestedAccess": .object([
                     "type": .string("string"),
@@ -180,7 +181,7 @@ public struct ListInferenceProfilesTool: Tool {
 
     public static let descriptor = ToolDescriptor(
         name: "list_inference_profiles",
-        description: "List inference profile IDs that may be selected for a new child agent. Omit a profile in spawn_agent to inherit your exact revision.",
+        description: "List host-approved inference profile IDs, safe labels, models, and variants for a new child agent. Recommended default: omit inference_profile_id in spawn_agent to inherit your exact revision; choose another profile only when its label/model/variant clearly fits the delegated work.",
         sideEffect: .readOnly,
         parameters: .object([
             "type": .string("object"),

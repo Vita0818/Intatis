@@ -106,7 +106,7 @@ public struct TaskUpdateTool: Tool {
 
     public static let descriptor = ToolDescriptor(
         name: "task_update",
-        description: "Update a durable WorkTask using optimistic concurrency. expected_revision is required. Only an explicit completed update with a non-empty result, and evidence when acceptance criteria exist, settles a WorkTask. AgentInvocation completion alone never does.",
+        description: "Patch a durable WorkTask using optimistic concurrency. expected_revision is required; send only fields that must change and omit repeated contract fields. Workers may update progress/status/result/evidence on their assigned task but cannot change its contract. Only an explicit completed update with a non-empty result, and evidence when acceptance criteria exist, settles a WorkTask. AgentInvocation completion alone never does.",
         sideEffect: .write,
         parameters: .object([
             "type": .string("object"),
@@ -202,11 +202,8 @@ public struct TaskUpdateTool: Tool {
             replayPolicy: .requiresManualReconciliation)
     }
 
-    public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {
+    static func decodeRequest(_ args: ToolArgs) throws -> WorkTaskUpdateRequest {
         let value = try args.decode(Args.self)
-        guard let manager = context.workTaskManager else {
-            return ToolObservation(text: "WorkTask management is not available in this session")
-        }
         let owner: WorkTaskOwnerUpdate
         if let rawOwner = value.owner {
             let normalized = rawOwner.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -216,7 +213,7 @@ public struct TaskUpdateTool: Tool {
         } else {
             owner = .unchanged
         }
-        let request = WorkTaskUpdateRequest(
+        return WorkTaskUpdateRequest(
             taskID: WorkTaskID(rawValue: value.taskID),
             expectedRevision: value.expectedRevision,
             title: value.title,
@@ -231,6 +228,13 @@ public struct TaskUpdateTool: Tool {
             result: value.result,
             evidence: value.evidence,
             isRetry: value.retry ?? false)
+    }
+
+    public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {
+        let request = try Self.decodeRequest(args)
+        guard let manager = context.workTaskManager else {
+            return ToolObservation(text: "WorkTask management is not available in this session")
+        }
         let detail = try await manager.updateWorkTask(request)
         return ToolObservation(text: try encodeWorkTaskToolResult(detail))
     }

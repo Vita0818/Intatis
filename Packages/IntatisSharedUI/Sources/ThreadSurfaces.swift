@@ -96,15 +96,37 @@ public enum IntatisMessageTimestampPresentation {
 public struct IntatisThreadPresentationScope: Hashable, Sendable {
     public let kind: String
     public let sessionID: String
+    public let presentationID: String
 
-    public init(kind: SessionKind, sessionID: SessionID) {
+    public init(
+        kind: SessionKind,
+        sessionID: SessionID,
+        presentationID: String = "thread"
+    ) {
         self.kind = kind.rawValue
         self.sessionID = sessionID.rawValue
+        self.presentationID = presentationID
     }
 
-    public init(kind: String, sessionID: String) {
+    public init(
+        kind: String,
+        sessionID: String,
+        presentationID: String = "thread"
+    ) {
         self.kind = kind
         self.sessionID = sessionID
+        self.presentationID = presentationID
+    }
+
+    public func historyWindowScope(
+        requestedUpperBound: Int?
+    ) -> Self {
+        let windowID = requestedUpperBound.map(String.init) ?? "latest"
+        return Self(
+            kind: kind,
+            sessionID: sessionID,
+            presentationID:
+                "\(presentationID):history-window:\(windowID)")
     }
 }
 
@@ -116,18 +138,103 @@ public struct IntatisThreadBottomAnchorID: Hashable, Sendable {
     }
 }
 
+struct IntatisThreadViewportFrames: Equatable {
+    var viewport: CGRect?
+    var bottomAnchor: CGRect?
+
+    init(viewport: CGRect? = nil, bottomAnchor: CGRect? = nil) {
+        self.viewport = viewport
+        self.bottomAnchor = bottomAnchor
+    }
+
+    static func isBottomAnchorVisible(
+        _ frames: Self,
+        tolerance: CGFloat = 1
+    ) -> Bool? {
+        guard let viewport = frames.viewport,
+              let bottomAnchor = frames.bottomAnchor,
+              viewport.width > 0,
+              viewport.height > 0 else {
+            return nil
+        }
+        return bottomAnchor.minY >= viewport.minY - tolerance
+            && bottomAnchor.maxY <= viewport.maxY + tolerance
+    }
+}
+
+struct IntatisThreadViewportFramesPreferenceKey: PreferenceKey {
+    static let defaultValue = IntatisThreadViewportFrames()
+
+    static func reduce(
+        value: inout IntatisThreadViewportFrames,
+        nextValue: () -> IntatisThreadViewportFrames
+    ) {
+        let next = nextValue()
+        if let viewport = next.viewport {
+            value.viewport = viewport
+        }
+        if let bottomAnchor = next.bottomAnchor {
+            value.bottomAnchor = bottomAnchor
+        }
+    }
+}
+
+extension View {
+    func intatisThreadViewportFrameProbe() -> some View {
+        background {
+            GeometryReader { geometry in
+                Color.clear.preference(
+                    key: IntatisThreadViewportFramesPreferenceKey.self,
+                    value: IntatisThreadViewportFrames(
+                        viewport: geometry.frame(in: .global)))
+            }
+        }
+    }
+
+    func intatisThreadBottomAnchorFrameProbe() -> some View {
+        background {
+            GeometryReader { geometry in
+                Color.clear.preference(
+                    key: IntatisThreadViewportFramesPreferenceKey.self,
+                    value: IntatisThreadViewportFrames(
+                        bottomAnchor: geometry.frame(in: .global)))
+            }
+        }
+    }
+}
+
 enum IntatisThreadScrollReason: Equatable, Sendable {
     case initialRestore
     case liveUpdate
     case completion
     case richHeightCorrection
+    case jumpToLatest
 
     var requiresBottomFollowing: Bool {
-        self != .initialRestore
+        self != .initialRestore && self != .jumpToLatest
     }
 
     var isAnimated: Bool {
-        self == .completion
+        false
+    }
+
+    var flushesCadence: Bool {
+        self != .liveUpdate
+    }
+
+    var diagnosticReason: IntatisScrollDiagnosticReason {
+        switch self {
+        case .initialRestore:
+            return .initialRestore
+        case .liveUpdate:
+            return .liveContent
+        case .completion:
+            return .completion
+        case .richHeightCorrection:
+            return .richSettle
+        case .jumpToLatest:
+            return .manualJump
+        }
     }
 }
 
@@ -152,6 +259,20 @@ struct IntatisThreadScrollGeometry: Equatable, Sendable {
     let isAtBottom: Bool
     let contentHeight: CGFloat
 
+    /// `onScrollGeometryChange` uses `Equatable` as its admission key. The
+    /// content height is payload for the rare bottom-threshold transition, not
+    /// a reason to run the SwiftUI action for every streaming layout pass.
+    /// Apple documents that scroll geometry changes frequently and recommends
+    /// transforming it to the smallest value the action needs. Bottom
+    /// proximity is that semantic value here; exact height-only churn is
+    /// intentionally coalesced before it reaches the action.
+    static func == (
+        lhs: IntatisThreadScrollGeometry,
+        rhs: IntatisThreadScrollGeometry
+    ) -> Bool {
+        lhs.isAtBottom == rhs.isAtBottom
+    }
+
     static func measure(
         contentOffsetY: CGFloat,
         containerHeight: CGFloat,
@@ -175,95 +296,599 @@ struct IntatisThreadScrollGeometry: Equatable, Sendable {
     }
 }
 
-/// One coordinator belongs to one visible SwiftUI thread subtree. It owns at
-/// most one pending task, invalidates generations on scope changes, and keeps
-/// user-driven scroll position separate from content-height movement.
+enum IntatisThreadFollowState: Equatable, Sendable {
+    case followingBottom
+    case gestureSuspended
+    case detachedByUser
+}
+
+/// Render admission is independent of bottom-following. Lazy thread entry
+/// suspends new rich work until either the raw bottom anchor is visibly
+/// restored or a newer native scroll-geometry observation confirms the same
+/// post-restore bottom state.
+/// Every message then owns its own 150 ms dwell for that stable epoch, so a
+/// row materialized later while the user scrolls still waits before starting
+/// rich work. The epoch is intentionally not republished for every gesture:
+/// doing so invalidates already-mounted native Markdown selection views.
+public enum IntatisMessageViewportAdmission: Equatable, Sendable {
+    case immediate
+    case suspended(generation: UInt64)
+    case idleDwell(generation: UInt64)
+
+    var allowsImmediateRichAdmission: Bool {
+        self == .immediate
+    }
+}
+
+private struct IntatisMessageViewportAdmissionEnvironmentKey: EnvironmentKey {
+    static let defaultValue = IntatisMessageViewportAdmission.immediate
+}
+
+extension EnvironmentValues {
+    public var intatisMessageViewportAdmission:
+        IntatisMessageViewportAdmission {
+        get { self[IntatisMessageViewportAdmissionEnvironmentKey.self] }
+        set { self[IntatisMessageViewportAdmissionEnvironmentKey.self] = newValue }
+    }
+}
+
+enum IntatisThreadRichSettleToken: Hashable, Sendable {
+    case finalDocument(
+        messageID: String,
+        contentUTF8Count: Int,
+        contentHash: Int,
+        appearance: String,
+        typography: String,
+        configurationRevision: Int)
+    case width(Int)
+}
+
+struct IntatisThreadRichSettleSource: Equatable, Sendable {
+    let scope: IntatisThreadPresentationScope
+    let activationGeneration: UInt64
+}
+
+private struct IntatisThreadScrollCoordinatorEnvironmentKey: EnvironmentKey {
+    static let defaultValue: IntatisThreadScrollCoordinator? = nil
+}
+
+private struct IntatisThreadRichSettleSourceEnvironmentKey: EnvironmentKey {
+    static let defaultValue: IntatisThreadRichSettleSource? = nil
+}
+
+extension EnvironmentValues {
+    var intatisThreadScrollCoordinator: IntatisThreadScrollCoordinator? {
+        get { self[IntatisThreadScrollCoordinatorEnvironmentKey.self] }
+        set { self[IntatisThreadScrollCoordinatorEnvironmentKey.self] = newValue }
+    }
+
+    var intatisThreadRichSettleSource: IntatisThreadRichSettleSource? {
+        get { self[IntatisThreadRichSettleSourceEnvironmentKey.self] }
+        set { self[IntatisThreadRichSettleSourceEnvironmentKey.self] = newValue }
+    }
+}
+
+/// Pure fixed-window leading/trailing cadence. Runtime sleeping lives in the
+/// coordinator; tests can advance this model with explicit monotonic times.
+struct IntatisThreadScrollCadenceModel: Sendable {
+    static let intervalNanoseconds: UInt64 = 100_000_000
+
+    struct Wake: Equatable, Sendable {
+        let deadlineNanoseconds: UInt64
+    }
+
+    struct Fire: Equatable, Sendable {
+        let request: IntatisThreadScrollRequest
+        let nextWake: Wake?
+    }
+
+    /// The request already admitted to the single serial executor. It is not
+    /// an accumulator entry: the one wake task owns this request until fire.
+    private(set) var executorRequest: IntatisThreadScrollRequest?
+    /// The only pending request. New live updates replace this exact slot.
+    private(set) var pendingRequest: IntatisThreadScrollRequest?
+    private(set) var executorDeadlineNanoseconds: UInt64?
+    private(set) var windowDeadlineNanoseconds: UInt64?
+
+    var pendingCount: Int {
+        pendingRequest == nil ? 0 : 1
+    }
+
+    var outstandingRequests: [IntatisThreadScrollRequest] {
+        [executorRequest, pendingRequest].compactMap { $0 }
+    }
+
+    mutating func submit(
+        _ request: IntatisThreadScrollRequest,
+        nowNanoseconds: UInt64
+    ) -> Wake? {
+        if request.reason.flushesCadence {
+            executorRequest = request
+            pendingRequest = nil
+            executorDeadlineNanoseconds = nowNanoseconds
+            windowDeadlineNanoseconds = nil
+            return Wake(deadlineNanoseconds: nowNanoseconds)
+        }
+
+        if windowDeadlineNanoseconds == nil
+            || nowNanoseconds >= windowDeadlineNanoseconds! {
+            windowDeadlineNanoseconds = nowNanoseconds
+                &+ Self.intervalNanoseconds
+            if let executorDeadlineNanoseconds,
+               executorDeadlineNanoseconds <= nowNanoseconds {
+                // Preserve the first request already owned by the serial
+                // executor and keep only the newest request in the one
+                // pending slot.
+                pendingRequest = request
+                return Wake(deadlineNanoseconds: executorDeadlineNanoseconds)
+            }
+            executorRequest = request
+            executorDeadlineNanoseconds = nowNanoseconds
+            return Wake(deadlineNanoseconds: nowNanoseconds)
+        }
+
+        let deadline = windowDeadlineNanoseconds!
+        if executorRequest != nil,
+           let executorDeadlineNanoseconds,
+           executorDeadlineNanoseconds < deadline {
+            // A leading request is already owned by the executor. It remains
+            // first; the sole pending slot is replaced without spawning
+            // another task.
+            pendingRequest = request
+            return Wake(deadlineNanoseconds: executorDeadlineNanoseconds)
+        }
+
+        // There is either no executor request or it is the trailing edge for
+        // this window. Keep only the newest exact executor request.
+        executorRequest = request
+        executorDeadlineNanoseconds = deadline
+        return Wake(deadlineNanoseconds: deadline)
+    }
+
+    mutating func fire(nowNanoseconds: UInt64) -> Fire? {
+        guard let request = executorRequest,
+              let deadline = executorDeadlineNanoseconds,
+              nowNanoseconds >= deadline else {
+            return nil
+        }
+
+        executorRequest = nil
+        executorDeadlineNanoseconds = nil
+        if request.reason == .liveUpdate {
+            windowDeadlineNanoseconds = nowNanoseconds
+                &+ Self.intervalNanoseconds
+        } else {
+            windowDeadlineNanoseconds = nil
+        }
+
+        var nextWake: Wake?
+        if let pendingRequest {
+            self.pendingRequest = nil
+            executorRequest = pendingRequest
+            let nextDeadline = request.reason == .liveUpdate
+                ? windowDeadlineNanoseconds!
+                : nowNanoseconds
+            executorDeadlineNanoseconds = nextDeadline
+            nextWake = Wake(deadlineNanoseconds: nextDeadline)
+        }
+        return Fire(request: request, nextWake: nextWake)
+    }
+
+    mutating func reset() {
+        executorRequest = nil
+        pendingRequest = nil
+        executorDeadlineNanoseconds = nil
+        windowDeadlineNanoseconds = nil
+    }
+}
+
+/// Pure one-shot quiet/hard-cap settle epoch. Geometry updates only mutate
+/// observations; the runtime wake checks this model later and closes the epoch
+/// before it asks the scroll cadence for one correction.
+struct IntatisThreadRichSettleModel: Sendable {
+    static let quietNanoseconds: UInt64 = 100_000_000
+    static let hardCapNanoseconds: UInt64 = 500_000_000
+    static let materialHeightEpsilon: CGFloat = 1
+
+    struct Epoch: Equatable, Sendable {
+        let token: IntatisThreadRichSettleToken
+        let openedNanoseconds: UInt64
+        let hardDeadlineNanoseconds: UInt64
+        var lastMaterialChangeNanoseconds: UInt64
+        var lastMaterialHeight: CGFloat?
+    }
+
+    enum Check: Equatable, Sendable {
+        case inactive
+        case wait(untilNanoseconds: UInt64)
+        case settled(token: IntatisThreadRichSettleToken)
+    }
+
+    private(set) var epoch: Epoch?
+    private(set) var lastOpenedToken: IntatisThreadRichSettleToken?
+
+    mutating func open(
+        token: IntatisThreadRichSettleToken,
+        contentHeight: CGFloat?,
+        nowNanoseconds: UInt64
+    ) -> Check {
+        guard token != lastOpenedToken else { return .inactive }
+        lastOpenedToken = token
+        epoch = Epoch(
+            token: token,
+            openedNanoseconds: nowNanoseconds,
+            hardDeadlineNanoseconds: nowNanoseconds
+                &+ Self.hardCapNanoseconds,
+            lastMaterialChangeNanoseconds: nowNanoseconds,
+            lastMaterialHeight: contentHeight)
+        return nextCheck(nowNanoseconds: nowNanoseconds)
+    }
+
+    mutating func observe(
+        contentHeight: CGFloat,
+        nowNanoseconds: UInt64
+    ) {
+        guard var epoch else { return }
+        if let previous = epoch.lastMaterialHeight,
+           abs(contentHeight - previous) < Self.materialHeightEpsilon {
+            return
+        }
+        epoch.lastMaterialHeight = contentHeight
+        epoch.lastMaterialChangeNanoseconds = nowNanoseconds
+        self.epoch = epoch
+    }
+
+    mutating func check(nowNanoseconds: UInt64) -> Check {
+        guard let epoch else { return .inactive }
+        let quietDeadline = epoch.lastMaterialChangeNanoseconds
+            &+ Self.quietNanoseconds
+        if nowNanoseconds >= quietDeadline
+            || nowNanoseconds >= epoch.hardDeadlineNanoseconds {
+            // Close before returning the settlement. Later geometry cannot
+            // reopen or retrigger this exact epoch.
+            self.epoch = nil
+            return .settled(token: epoch.token)
+        }
+        return nextCheck(nowNanoseconds: nowNanoseconds)
+    }
+
+    mutating func close() {
+        epoch = nil
+    }
+
+    mutating func reset() {
+        epoch = nil
+        lastOpenedToken = nil
+    }
+
+    private func nextCheck(nowNanoseconds: UInt64) -> Check {
+        guard let epoch else { return .inactive }
+        let quietDeadline = epoch.lastMaterialChangeNanoseconds
+            &+ Self.quietNanoseconds
+        return .wait(untilNanoseconds: min(
+            quietDeadline,
+            epoch.hardDeadlineNanoseconds))
+    }
+}
+
+/// One coordinator belongs to one visible SwiftUI thread subtree. Geometry is
+/// observation-only: it never calls `scrollTo` or publishes SwiftUI state.
+/// Semantic content, explicit user actions, and one-shot rich settle epochs are
+/// the only sources of automatic scrolling.
 @MainActor
 final class IntatisThreadScrollCoordinator: ObservableObject {
+    private struct PendingEntryRichAdmission: Equatable {
+        let scope: IntatisThreadPresentationScope
+        let admissionGeneration: UInt64
+        var restoreRequestGeneration: UInt64?
+        var geometryObservationCountAtRestore: Int?
+    }
+
+    private struct GeometryObservation {
+        let isAtBottom: Bool
+        let contentHeight: CGFloat
+        let scope: IntatisThreadPresentationScope
+    }
+
+    private struct BottomAnchorVisibilityObservation {
+        let isVisible: Bool
+        let scope: IntatisThreadPresentationScope
+    }
+
     private(set) var activeScope: IntatisThreadPresentationScope?
     private(set) var generation: UInt64 = 0
     private(set) var pendingRequest: IntatisThreadScrollRequest?
     private(set) var executionCount = 0
     private(set) var cancellationCount = 0
     private(set) var staleRejectionCount = 0
-    private(set) var isFollowingBottom = true
+    private(set) var geometryObservationCount = 0
+    private(set) var richSettleExecutionCount = 0
+    @Published private(set) var followState: IntatisThreadFollowState =
+        .followingBottom
+    @Published private(set) var viewportAdmission:
+        IntatisMessageViewportAdmission = .suspended(generation: 0)
+    @Published private(set) var richSettleSource:
+        IntatisThreadRichSettleSource? = nil
 
     private var pendingTask: Task<Void, Never>?
-    private var isUserInteracting = false
+    private var pendingWakeDeadlineNanoseconds: UInt64?
+    private var pendingWakeToken: UInt64 = 0
+    private var cadence = IntatisThreadScrollCadenceModel()
+    private var scrollExecutor:
+        (@MainActor (IntatisThreadScrollRequest) -> Void)?
+    private var viewportGeneration: UInt64 = 0
+    private var activationGeneration: UInt64 = 0
+    private var pendingEntryRichAdmission: PendingEntryRichAdmission?
+    private var interactionReleasesEntryAdmission = false
+    private var entryConfirmationTask: Task<Void, Never>?
+    private var entryConfirmationTaskToken: UInt64 = 0
     private var latestIsAtBottom = true
-    private var lastRichCorrectionContentHeight: CGFloat = 0
-    private var isAdjustingShrinkBaseline = false
-    private var didCompleteShrinkRecovery = false
+    private var latestContentHeight: CGFloat?
+    private var isBottomAnchorVisible = false
+    private var pendingBottomAnchorVisibility:
+        BottomAnchorVisibilityObservation?
+    private var bottomAnchorVisibilityTask: Task<Void, Never>?
+    private var bottomAnchorVisibilityTaskToken: UInt64 = 0
+    private var pendingGeometryObservation: GeometryObservation?
+    private var geometryObservationTask: Task<Void, Never>?
+    private var geometryObservationTaskToken: UInt64 = 0
+    private var richSettle = IntatisThreadRichSettleModel()
+    private var richSettleTask: Task<Void, Never>?
+    private var richSettleTaskToken: UInt64 = 0
+    private let performanceDiagnostics: IntatisPerformanceDiagnostics
 
-    func activate(scope: IntatisThreadPresentationScope) {
+    init(
+        performanceDiagnostics: IntatisPerformanceDiagnostics = .shared
+    ) {
+        self.performanceDiagnostics = performanceDiagnostics
+    }
+
+    var isFollowingBottom: Bool {
+        followState == .followingBottom
+    }
+
+    var isUserInteracting: Bool {
+        followState == .gestureSuspended
+    }
+
+    /// Returns an admission value that is safe for the subtree's first frame.
+    /// A new lazy scope must not inherit `.immediate` or an idle epoch from the
+    /// previously visible scope before its outer `onAppear` can call
+    /// `activate`. Small eager threads keep their existing immediate behavior.
+    func effectiveViewportAdmission(
+        for scope: IntatisThreadPresentationScope,
+        defersUntilInitialRestore: Bool
+    ) -> IntatisMessageViewportAdmission {
+        guard activeScope == scope else {
+            return defersUntilInitialRestore
+                ? .suspended(generation: viewportGeneration &+ 1)
+                : .immediate
+        }
+        return viewportAdmission
+    }
+
+    func effectiveRichSettleSource(
+        for scope: IntatisThreadPresentationScope
+    ) -> IntatisThreadRichSettleSource? {
+        guard activeScope == scope else { return nil }
+        return richSettleSource
+    }
+
+    func activate(
+        scope: IntatisThreadPresentationScope,
+        defersRichUntilInitialRestore: Bool = false
+    ) {
         guard activeScope != scope else { return }
         invalidatePending()
+        invalidateGeometryObservation()
+        invalidateBottomAnchorVisibility()
+        closeRichSettleEpoch()
+        pendingEntryRichAdmission = nil
+        interactionReleasesEntryAdmission = false
         activeScope = scope
-        isFollowingBottom = true
+        followState = .followingBottom
         latestIsAtBottom = true
-        isUserInteracting = false
-        lastRichCorrectionContentHeight = 0
-        isAdjustingShrinkBaseline = false
-        didCompleteShrinkRecovery = false
+        latestContentHeight = nil
+        isBottomAnchorVisible = false
+        richSettle.reset()
+        activationGeneration &+= 1
+        richSettleSource = IntatisThreadRichSettleSource(
+            scope: scope,
+            activationGeneration: activationGeneration)
+        viewportGeneration &+= 1
+        if defersRichUntilInitialRestore {
+            pendingEntryRichAdmission = PendingEntryRichAdmission(
+                scope: scope,
+                admissionGeneration: viewportGeneration,
+                restoreRequestGeneration: nil,
+                geometryObservationCountAtRestore: nil)
+            viewportAdmission = .suspended(generation: viewportGeneration)
+        } else {
+            viewportAdmission = .immediate
+        }
     }
 
     func deactivate(scope: IntatisThreadPresentationScope) {
         guard activeScope == scope else { return }
         invalidatePending()
+        invalidateGeometryObservation()
+        invalidateBottomAnchorVisibility()
+        closeRichSettleEpoch()
+        pendingEntryRichAdmission = nil
+        interactionReleasesEntryAdmission = false
         activeScope = nil
-        isUserInteracting = false
+        scrollExecutor = nil
+        richSettleSource = nil
+        viewportGeneration &+= 1
+        viewportAdmission = .suspended(generation: viewportGeneration)
     }
 
-    /// Starts a new raw-content or width layout epoch. A single epoch may
-    /// recover from one shrink→regrow cycle, but an oscillating native layout
-    /// cannot reopen that recovery window after the first corrective scroll.
-    func beginLayoutEpoch(scope: IntatisThreadPresentationScope) {
+    func installScrollExecutor(
+        scope: IntatisThreadPresentationScope,
+        perform: @escaping @MainActor (IntatisThreadScrollRequest) -> Void
+    ) {
         guard activeScope == scope else { return }
-        invalidatePending()
-        lastRichCorrectionContentHeight = 0
-        isAdjustingShrinkBaseline = false
-        didCompleteShrinkRecovery = false
+        scrollExecutor = perform
     }
 
+    /// The production `onScrollGeometryChange` entry point. SwiftUI can
+    /// produce several geometry values inside one update cycle while native
+    /// Markdown views are mounting. Keep only the latest exact observation
+    /// and apply it after yielding out of that layout callback. This prevents
+    /// a synchronous geometry-action feedback cycle without creating one task
+    /// per sample or weakening the observation-only boundary.
+    func enqueueGeometryObservation(
+        _ isAtBottom: Bool,
+        contentHeight: CGFloat,
+        scope: IntatisThreadPresentationScope
+    ) {
+        guard activeScope == scope,
+              contentHeight.isFinite else {
+            return
+        }
+        pendingGeometryObservation = GeometryObservation(
+            isAtBottom: isAtBottom,
+            contentHeight: contentHeight,
+            scope: scope)
+        guard geometryObservationTask == nil else { return }
+
+        geometryObservationTaskToken &+= 1
+        let token = geometryObservationTaskToken
+        geometryObservationTask = Task { @MainActor [weak self] in
+            await Task.yield()
+            guard !Task.isCancelled,
+                  let self,
+                  self.geometryObservationTaskToken == token else {
+                return
+            }
+            self.geometryObservationTask = nil
+            self.applyPendingGeometryObservation()
+        }
+    }
+
+    /// Bottom-anchor visibility is a stronger entry-restoration signal than
+    /// the synchronous return of `ScrollViewProxy.scrollTo`. Coalesce it out
+    /// of SwiftUI's layout callback before it can publish admission state.
+    func enqueueBottomAnchorVisibility(
+        _ isVisible: Bool,
+        scope: IntatisThreadPresentationScope
+    ) {
+        guard activeScope == scope else { return }
+        pendingBottomAnchorVisibility =
+            BottomAnchorVisibilityObservation(
+                isVisible: isVisible,
+                scope: scope)
+        guard bottomAnchorVisibilityTask == nil else { return }
+
+        bottomAnchorVisibilityTaskToken &+= 1
+        let token = bottomAnchorVisibilityTaskToken
+        bottomAnchorVisibilityTask = Task { @MainActor [weak self] in
+            await Task.yield()
+            guard !Task.isCancelled,
+                  let self,
+                  self.bottomAnchorVisibilityTaskToken == token else {
+                return
+            }
+            self.bottomAnchorVisibilityTask = nil
+            self.applyPendingBottomAnchorVisibility()
+        }
+    }
+
+    /// Deterministic primitive for tests. Production callbacks use the
+    /// coalescing entry point above.
+    func observeBottomAnchorVisibility(
+        _ isVisible: Bool,
+        scope: IntatisThreadPresentationScope
+    ) {
+        guard activeScope == scope else { return }
+        isBottomAnchorVisible = isVisible
+        confirmEntryRichAdmissionIfPossible(scope: scope)
+    }
+
+    /// Deterministic observation primitive used by tests and compatibility
+    /// callers. It never publishes, schedules a scroll request, or invokes the
+    /// executor.
+    func observeGeometry(
+        _ isAtBottom: Bool,
+        contentHeight: CGFloat,
+        scope: IntatisThreadPresentationScope
+    ) {
+        guard activeScope == scope,
+              contentHeight.isFinite else {
+            return
+        }
+        geometryObservationCount += 1
+        latestIsAtBottom = isAtBottom
+        latestContentHeight = contentHeight
+        richSettle.observe(
+            contentHeight: contentHeight,
+            nowNanoseconds: DispatchTime.now().uptimeNanoseconds)
+        confirmEntryRichAdmissionIfPossible(scope: scope)
+    }
+
+    /// Compatibility spelling for existing callers/tests. This remains
+    /// observation-only and intentionally cannot request a correction.
     func updateBottomProximity(
         _ isAtBottom: Bool,
         contentHeight: CGFloat? = nil,
         scope: IntatisThreadPresentationScope
     ) {
-        guard activeScope == scope else { return }
-        latestIsAtBottom = isAtBottom
-        if isAtBottom, let contentHeight {
-            if lastRichCorrectionContentHeight == 0 {
-                lastRichCorrectionContentHeight = contentHeight
-            } else if contentHeight < lastRichCorrectionContentHeight - 1,
-                      !didCompleteShrinkRecovery {
-                // Keep following a continuing shrink to its lowest observed
-                // bottom. The first subsequent regrowth closes this recovery
-                // window for the rest of the explicit layout epoch.
-                lastRichCorrectionContentHeight = contentHeight
-                isAdjustingShrinkBaseline = true
-            } else if contentHeight > lastRichCorrectionContentHeight {
-                lastRichCorrectionContentHeight = contentHeight
-            }
-        }
-        if isUserInteracting, isAtBottom {
-            isFollowingBottom = true
-        }
+        observeGeometry(
+            isAtBottom,
+            contentHeight: contentHeight ?? latestContentHeight ?? 0,
+            scope: scope)
     }
 
     func userInteractionDidBegin(scope: IntatisThreadPresentationScope) {
         guard activeScope == scope else { return }
-        isUserInteracting = true
+        guard followState != .gestureSuspended else { return }
+        interactionReleasesEntryAdmission =
+            pendingEntryRichAdmission != nil
+        pendingEntryRichAdmission = nil
+        invalidateEntryConfirmation()
+        followState = .gestureSuspended
         invalidatePending()
+        closeRichSettleEpoch()
     }
 
     func userInteractionDidEnd(scope: IntatisThreadPresentationScope) {
-        guard activeScope == scope, isUserInteracting else { return }
-        isUserInteracting = false
-        isFollowingBottom = latestIsAtBottom
-        if !isFollowingBottom {
+        guard activeScope == scope,
+              followState == .gestureSuspended else { return }
+        // The idle phase callback can arrive in the same update cycle as the
+        // final geometry sample. Consume that already-enqueued private value
+        // before deciding whether the user detached from the bottom.
+        applyPendingGeometryObservation()
+        followState = latestIsAtBottom
+            ? .followingBottom
+            : .detachedByUser
+        if interactionReleasesEntryAdmission {
+            interactionReleasesEntryAdmission = false
+            viewportGeneration &+= 1
+            viewportAdmission = .idleDwell(generation: viewportGeneration)
+        }
+        if followState == .detachedByUser {
             invalidatePending()
         }
+    }
+
+    func jumpToLatest(
+        scope: IntatisThreadPresentationScope,
+        perform: @escaping @MainActor (IntatisThreadScrollRequest) -> Void
+    ) {
+        guard activeScope == scope else {
+            staleRejectionCount += 1
+            performanceDiagnostics.recordScrollRequest(
+                reason: IntatisThreadScrollReason.jumpToLatest.diagnosticReason,
+                outcome: .stale,
+                pendingCount: cadence.pendingCount)
+            return
+        }
+        followState = .followingBottom
+        latestIsAtBottom = true
+        request(
+            scope: scope,
+            reason: .jumpToLatest,
+            perform: perform)
     }
 
     @discardableResult
@@ -274,81 +899,557 @@ final class IntatisThreadScrollCoordinator: ObservableObject {
     ) -> IntatisThreadScrollRequest? {
         guard activeScope == scope else {
             staleRejectionCount += 1
+            performanceDiagnostics.recordScrollRequest(
+                reason: reason.diagnosticReason,
+                outcome: .stale,
+                pendingCount: cadence.pendingCount)
             return nil
         }
         guard !reason.requiresBottomFollowing ||
-                (!isUserInteracting && isFollowingBottom) else {
+                (followState == .followingBottom) else {
+            performanceDiagnostics.recordScrollRequest(
+                reason: reason.diagnosticReason,
+                outcome: .cancelled,
+                pendingCount: cadence.pendingCount)
             return nil
         }
 
-        if pendingTask != nil {
-            pendingTask?.cancel()
-            cancellationCount += 1
-        }
+        scrollExecutor = perform
         generation &+= 1
         let request = IntatisThreadScrollRequest(
             scope: scope,
             generation: generation,
             reason: reason,
             animated: reason.isAnimated,
-            wasBottomFollowing: isFollowingBottom)
-        pendingRequest = request
-        pendingTask = Task { @MainActor [weak self] in
-            await Task.yield()
-            guard let self, !Task.isCancelled else { return }
-            guard self.activeScope == request.scope,
-                  self.generation == request.generation,
-                  self.pendingRequest == request else {
-                self.staleRejectionCount += 1
-                return
-            }
-            guard !request.reason.requiresBottomFollowing ||
-                    (!self.isUserInteracting && self.isFollowingBottom) else {
-                self.staleRejectionCount += 1
-                self.pendingRequest = nil
-                self.pendingTask = nil
-                return
-            }
-            self.pendingRequest = nil
-            self.pendingTask = nil
-            self.executionCount += 1
-            perform(request)
+            wasBottomFollowing: followState == .followingBottom)
+        let previouslyOutstanding = cadence.outstandingRequests
+        _ = cadence.submit(
+            request,
+            nowNanoseconds: DispatchTime.now().uptimeNanoseconds)
+        let currentlyOutstanding = cadence.outstandingRequests
+        performanceDiagnostics.recordScrollRequest(
+            reason: request.reason.diagnosticReason,
+            outcome: .requested,
+            pendingCount: cadence.pendingCount)
+        for replaced in previouslyOutstanding
+        where !currentlyOutstanding.contains(replaced) {
+            performanceDiagnostics.recordScrollRequest(
+                reason: replaced.reason.diagnosticReason,
+                outcome: .cancelled,
+                pendingCount: cadence.pendingCount)
         }
+        pendingRequest = cadence.pendingRequest
+        synchronizeCadenceWake()
         return request
     }
 
-    @discardableResult
-    func requestRichHeightCorrection(
+    func openWidthSettleEpoch(
         scope: IntatisThreadPresentationScope,
-        contentHeight: CGFloat,
+        width: CGFloat,
         perform: @escaping @MainActor (IntatisThreadScrollRequest) -> Void
-    ) -> IntatisThreadScrollRequest? {
-        guard contentHeight >= lastRichCorrectionContentHeight + 1 else {
-            return nil
+    ) {
+        guard activeScope == scope,
+              followState == .followingBottom,
+              pendingEntryRichAdmission == nil,
+              width.isFinite,
+              width > 0 else {
+            return
         }
-        guard let request = request(
+        scrollExecutor = perform
+        openRichSettleEpoch(
             scope: scope,
-            reason: .richHeightCorrection,
-            perform: perform
-        ) else {
-            return nil
+            token: .width(Int((width * 1_000).rounded())))
+    }
+
+    func richDocumentDidCommit(
+        token: IntatisThreadRichSettleToken,
+        source: IntatisThreadRichSettleSource
+    ) {
+        guard let activeScope,
+              activeScope == source.scope,
+              richSettleSource == source else {
+            return
         }
-        lastRichCorrectionContentHeight = contentHeight
-        if isAdjustingShrinkBaseline {
-            isAdjustingShrinkBaseline = false
-            didCompleteShrinkRecovery = true
+        applyPendingGeometryObservation()
+        openRichSettleEpoch(scope: activeScope, token: token)
+    }
+
+    private func openRichSettleEpoch(
+        scope: IntatisThreadPresentationScope,
+        token: IntatisThreadRichSettleToken
+    ) {
+        guard activeScope == scope,
+              followState == .followingBottom,
+              scrollExecutor != nil else {
+            return
         }
-        return request
+        let result = richSettle.open(
+            token: token,
+            contentHeight: latestContentHeight,
+            nowNanoseconds: DispatchTime.now().uptimeNanoseconds)
+        synchronizeRichSettleWake(result)
+    }
+
+    private func synchronizeCadenceWake() {
+        guard let deadline = cadence.executorDeadlineNanoseconds else {
+            if pendingTask != nil {
+                pendingTask?.cancel()
+                cancellationCount += 1
+            }
+            pendingTask = nil
+            pendingWakeDeadlineNanoseconds = nil
+            pendingRequest = cadence.pendingRequest
+            return
+        }
+        if pendingTask != nil,
+           pendingWakeDeadlineNanoseconds == deadline {
+            pendingRequest = cadence.pendingRequest
+            return
+        }
+
+        if pendingTask != nil {
+            pendingTask?.cancel()
+            cancellationCount += 1
+        }
+        pendingWakeToken &+= 1
+        let wakeToken = pendingWakeToken
+        pendingWakeDeadlineNanoseconds = deadline
+        pendingRequest = cadence.pendingRequest
+        pendingTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let now = DispatchTime.now().uptimeNanoseconds
+            if deadline > now {
+                do {
+                    try await Task.sleep(
+                        nanoseconds: deadline - now)
+                } catch {
+                    return
+                }
+            } else {
+                await Task.yield()
+            }
+            guard !Task.isCancelled,
+                  self.pendingWakeToken == wakeToken else {
+                return
+            }
+            self.pendingTask = nil
+            self.pendingWakeDeadlineNanoseconds = nil
+            self.fireCadence()
+        }
+    }
+
+    private func fireCadence() {
+        let now = DispatchTime.now().uptimeNanoseconds
+        guard let fire = cadence.fire(nowNanoseconds: now) else {
+            synchronizeCadenceWake()
+            return
+        }
+        pendingRequest = cadence.pendingRequest
+        let request = fire.request
+        guard activeScope == request.scope else {
+            staleRejectionCount += 1
+            performanceDiagnostics.recordScrollRequest(
+                reason: request.reason.diagnosticReason,
+                outcome: .stale,
+                pendingCount: cadence.pendingCount)
+            synchronizeCadenceWake()
+            return
+        }
+        guard !request.reason.requiresBottomFollowing
+                || followState == .followingBottom else {
+            staleRejectionCount += 1
+            performanceDiagnostics.recordScrollRequest(
+                reason: request.reason.diagnosticReason,
+                outcome: .stale,
+                pendingCount: cadence.pendingCount)
+            synchronizeCadenceWake()
+            return
+        }
+        executionCount += 1
+        performanceDiagnostics.recordScrollRequest(
+            reason: request.reason.diagnosticReason,
+            outcome: .executed,
+            pendingCount: cadence.pendingCount)
+        let executor = scrollExecutor
+        executor?(request)
+        if executor != nil {
+            markEntryRawBottomPlacementExecuted(request)
+        }
+        synchronizeCadenceWake()
+    }
+
+    /// The scroll executor is deliberately invoked while admission is still
+    /// suspended. Its `Void` return is not treated as proof that SwiftUI
+    /// resolved the anchor. Rich rows enter their existing per-row idle dwell
+    /// only after a raw-layout geometry sample confirms the active scope is at
+    /// the bottom.
+    private func markEntryRawBottomPlacementExecuted(
+        _ request: IntatisThreadScrollRequest
+    ) {
+        guard var pendingEntryRichAdmission,
+              pendingEntryRichAdmission.scope == request.scope,
+              activeScope == request.scope,
+              followState == .followingBottom,
+              viewportAdmission == .suspended(
+                generation:
+                    pendingEntryRichAdmission.admissionGeneration) else {
+            return
+        }
+        pendingEntryRichAdmission.restoreRequestGeneration =
+            request.generation
+        pendingEntryRichAdmission.geometryObservationCountAtRestore =
+            geometryObservationCount
+        self.pendingEntryRichAdmission = pendingEntryRichAdmission
+        scheduleEntryGeometryConfirmation(
+            scope: request.scope,
+            requestGeneration: request.generation)
+    }
+
+    private func scheduleEntryGeometryConfirmation(
+        scope: IntatisThreadPresentationScope,
+        requestGeneration: UInt64
+    ) {
+        invalidateEntryConfirmation()
+        entryConfirmationTaskToken &+= 1
+        let token = entryConfirmationTaskToken
+        entryConfirmationTask = Task { @MainActor [weak self] in
+            await Task.yield()
+            guard !Task.isCancelled,
+                  let self,
+                  self.entryConfirmationTaskToken == token,
+                  let pending = self.pendingEntryRichAdmission,
+                  pending.scope == scope,
+                  pending.restoreRequestGeneration == requestGeneration else {
+                return
+            }
+            self.entryConfirmationTask = nil
+            self.confirmEntryRichAdmissionIfPossible(scope: scope)
+        }
+    }
+
+    private func confirmEntryRichAdmissionIfPossible(
+        scope: IntatisThreadPresentationScope
+    ) {
+        guard let pendingEntryRichAdmission,
+              pendingEntryRichAdmission.scope == scope,
+              pendingEntryRichAdmission.restoreRequestGeneration != nil,
+              activeScope == scope,
+              followState == .followingBottom,
+              viewportAdmission == .suspended(
+                generation:
+                    pendingEntryRichAdmission.admissionGeneration) else {
+            return
+        }
+        let confirmsPostRestoreScrollGeometry =
+            pendingEntryRichAdmission.geometryObservationCountAtRestore
+                .map { geometryObservationCount > $0 } == true
+            && latestIsAtBottom
+            && latestContentHeight.map { $0.isFinite && $0 > 0 } == true
+        guard isBottomAnchorVisible
+                || confirmsPostRestoreScrollGeometry else {
+            return
+        }
+        invalidateEntryConfirmation()
+        self.pendingEntryRichAdmission = nil
+        viewportGeneration &+= 1
+        viewportAdmission = .idleDwell(generation: viewportGeneration)
+    }
+
+    private func synchronizeRichSettleWake(
+        _ check: IntatisThreadRichSettleModel.Check
+    ) {
+        switch check {
+        case .inactive:
+            return
+        case let .settled(token):
+            guard richSettle.epoch == nil,
+                  followState == .followingBottom,
+                  let scope = activeScope,
+                  let scrollExecutor else {
+                return
+            }
+            richSettleExecutionCount += 1
+            request(
+                scope: scope,
+                reason: .richHeightCorrection,
+                perform: scrollExecutor)
+            _ = token
+        case let .wait(deadline):
+            richSettleTaskToken &+= 1
+            let token = richSettleTaskToken
+            richSettleTask?.cancel()
+            richSettleTask = Task { @MainActor [weak self] in
+                guard let self else { return }
+                let now = DispatchTime.now().uptimeNanoseconds
+                if deadline > now {
+                    do {
+                        try await Task.sleep(
+                            nanoseconds: deadline - now)
+                    } catch {
+                        return
+                    }
+                } else {
+                    await Task.yield()
+                }
+                guard !Task.isCancelled,
+                      self.richSettleTaskToken == token else {
+                    return
+                }
+                self.richSettleTask = nil
+                let next = self.richSettle.check(
+                    nowNanoseconds: DispatchTime.now().uptimeNanoseconds)
+                self.synchronizeRichSettleWake(next)
+            }
+        }
+    }
+
+    private func closeRichSettleEpoch() {
+        richSettle.close()
+        if richSettleTask != nil {
+            richSettleTask?.cancel()
+        }
+        richSettleTask = nil
+        richSettleTaskToken &+= 1
+    }
+
+    private func applyPendingGeometryObservation() {
+        guard let observation = pendingGeometryObservation else { return }
+        pendingGeometryObservation = nil
+        observeGeometry(
+            observation.isAtBottom,
+            contentHeight: observation.contentHeight,
+            scope: observation.scope)
+    }
+
+    private func invalidateGeometryObservation() {
+        geometryObservationTask?.cancel()
+        geometryObservationTask = nil
+        pendingGeometryObservation = nil
+        geometryObservationTaskToken &+= 1
+    }
+
+    private func applyPendingBottomAnchorVisibility() {
+        guard let observation = pendingBottomAnchorVisibility else { return }
+        pendingBottomAnchorVisibility = nil
+        observeBottomAnchorVisibility(
+            observation.isVisible,
+            scope: observation.scope)
+    }
+
+    private func invalidateBottomAnchorVisibility() {
+        bottomAnchorVisibilityTask?.cancel()
+        bottomAnchorVisibilityTask = nil
+        pendingBottomAnchorVisibility = nil
+        bottomAnchorVisibilityTaskToken &+= 1
+    }
+
+    private func invalidateEntryConfirmation() {
+        entryConfirmationTask?.cancel()
+        entryConfirmationTask = nil
+        entryConfirmationTaskToken &+= 1
     }
 
     private func invalidatePending() {
+        invalidateEntryConfirmation()
+        let cancelledRequests = cadence.outstandingRequests
         if pendingTask != nil {
             pendingTask?.cancel()
             cancellationCount += 1
         }
         pendingTask = nil
+        pendingWakeDeadlineNanoseconds = nil
         pendingRequest = nil
+        cadence.reset()
+        pendingWakeToken &+= 1
         generation &+= 1
+        for request in cancelledRequests {
+            performanceDiagnostics.recordScrollRequest(
+                reason: request.reason.diagnosticReason,
+                outcome: .cancelled,
+                pendingCount: 0)
+        }
+    }
+}
+
+public struct IntatisJumpToLatestButton: View {
+    private let accessibilityIdentifier: String
+    private let action: () -> Void
+
+    public init(
+        accessibilityIdentifier: String,
+        action: @escaping () -> Void
+    ) {
+        self.accessibilityIdentifier = accessibilityIdentifier
+        self.action = action
+    }
+
+    public var body: some View {
+        Button(action: action) {
+            Label(
+                IntatisLocalization.string("Jump to latest"),
+                systemImage: "arrow.down.to.line")
+                .font(.caption.bold())
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+        .accessibilityIdentifier(accessibilityIdentifier)
+        .padding(12)
+    }
+}
+
+public enum IntatisThreadHistoryWindowPolicy {
+    public static let capacity = 16
+}
+
+enum IntatisThreadRichEntryPolicy {
+    static let immediateRowLimit = 4
+
+    static func defersUntilInitialRestore(richRowCount: Int) -> Bool {
+        richRowCount > immediateRowLimit
+    }
+}
+
+struct IntatisThreadHistorySelection: Equatable {
+    let scope: IntatisThreadPresentationScope
+    let requestedUpperBound: Int?
+
+    func upperBound(
+        for currentScope: IntatisThreadPresentationScope
+    ) -> Int? {
+        scope == currentScope ? requestedUpperBound : nil
+    }
+}
+
+public struct IntatisThreadHistoryWindow<Element> {
+    public let items: [Element]
+    public let lowerBound: Int
+    public let upperBound: Int
+    public let totalCount: Int
+    public let capacity: Int
+
+    public static func resolve(
+        allItems: [Element],
+        requestedUpperBound: Int?,
+        capacity: Int = IntatisThreadHistoryWindowPolicy.capacity
+    ) -> Self {
+        let boundedCapacity = max(capacity, 1)
+        let totalCount = allItems.count
+        let upperBound = min(
+            max(requestedUpperBound ?? totalCount, 0),
+            totalCount)
+        let lowerBound = max(upperBound - boundedCapacity, 0)
+
+        return Self(
+            items: Array(allItems[lowerBound..<upperBound]),
+            lowerBound: lowerBound,
+            upperBound: upperBound,
+            totalCount: totalCount,
+            capacity: boundedCapacity)
+    }
+
+    public var hasEarlier: Bool {
+        lowerBound > 0
+    }
+
+    public var hasLater: Bool {
+        upperBound < totalCount
+    }
+
+    public var isLatest: Bool {
+        !hasLater
+    }
+
+    public var earlierRequestedUpperBound: Int? {
+        hasEarlier ? lowerBound : nil
+    }
+
+    public var newerRequestedUpperBound: Int? {
+        guard hasLater else { return nil }
+        let nextUpperBound = min(totalCount, upperBound + capacity)
+        return nextUpperBound == totalCount ? nil : nextUpperBound
+    }
+}
+
+public struct IntatisThreadHistoryPager: View {
+    private let lowerBound: Int
+    private let upperBound: Int
+    private let totalCount: Int
+    private let hasEarlier: Bool
+    private let hasLater: Bool
+    private let accessibilityPrefix: String
+    private let onEarlier: () -> Void
+    private let onNewer: () -> Void
+    private let onLatest: () -> Void
+
+    public init(
+        lowerBound: Int,
+        upperBound: Int,
+        totalCount: Int,
+        hasEarlier: Bool,
+        hasLater: Bool,
+        accessibilityPrefix: String,
+        onEarlier: @escaping () -> Void,
+        onNewer: @escaping () -> Void,
+        onLatest: @escaping () -> Void
+    ) {
+        self.lowerBound = lowerBound
+        self.upperBound = upperBound
+        self.totalCount = totalCount
+        self.hasEarlier = hasEarlier
+        self.hasLater = hasLater
+        self.accessibilityPrefix = accessibilityPrefix
+        self.onEarlier = onEarlier
+        self.onNewer = onNewer
+        self.onLatest = onLatest
+    }
+
+    public var body: some View {
+        HStack(spacing: 8) {
+            if hasEarlier {
+                Button(action: onEarlier) {
+                    Label(
+                        IntatisLocalization.string("Earlier"),
+                        systemImage: "chevron.up")
+                }
+                .accessibilityIdentifier("\(accessibilityPrefix).earlier")
+            }
+
+            Text(rangeLabel)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+
+            Spacer(minLength: 8)
+
+            if hasLater {
+                Button(action: onNewer) {
+                    Label(
+                        IntatisLocalization.string("Newer"),
+                        systemImage: "chevron.down")
+                }
+                .accessibilityIdentifier("\(accessibilityPrefix).newer")
+
+                Button(action: onLatest) {
+                    Label(
+                        IntatisLocalization.string("Latest"),
+                        systemImage: "arrow.down.to.line")
+                }
+                .accessibilityIdentifier("\(accessibilityPrefix).latest")
+            }
+        }
+        .font(.caption.bold())
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+        .padding(.vertical, 4)
+        .frame(maxWidth: .infinity)
+    }
+
+    private var rangeLabel: String {
+        IntatisLocalization.format(
+            "Messages %lld–%lld of %lld",
+            Int64(totalCount == 0 ? 0 : lowerBound + 1),
+            Int64(upperBound),
+            Int64(totalCount))
     }
 }
 

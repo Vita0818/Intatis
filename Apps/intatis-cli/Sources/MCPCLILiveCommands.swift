@@ -5,6 +5,7 @@ import IntatisMCP
 import IntatisPermission
 import IntatisProtocol
 import IntatisProviders
+import IntatisSkills
 import IntatisTools
 
 #if canImport(Darwin)
@@ -565,12 +566,24 @@ func runExecCommand(
             resolver:
                 CLIExactSecretResolver(
                     config: config))
-        let provider =
+        let route =
             try await providers
-                .defaultAgentProvider()
-        let baseRegistry =
+                .agentRuntimeRoute(
+                    model: ModelID(
+                        rawValue: config.model))
+        let skillSnapshot =
+            try await SkillCatalogService.shared.snapshot(
+                configuration: .standard(
+                    workspaceRoot: URL(
+                        fileURLWithPath:
+                            live.workspaceLease.rootPath),
+                    access: .workspaceAndGlobal),
+                catalogBudget:
+                    route.modelContextPolicy
+                        .skillCatalogMetadataBudget)
+        let baseRegistry = skillSnapshot.augmenting(
             ToolRegistry.standard(
-                includesTerminal: true)
+                includesTerminal: true))
         let consent = arguments.flags
             .contains("yes")
             ? MCPCLIConsentConfirmation(
@@ -588,21 +601,25 @@ func runExecCommand(
             reasoningEffort:
                 config.reasoningEffort,
             includeUsage: config.includeUsage,
-            maxIterations: config.maxSteps)
+            maxIterations: config.maxSteps,
+            modelContextPolicy:
+                route.modelContextPolicy)
         let agent = Agent(
             name: live.agentID,
             workspaceRoot:
                 URL(fileURLWithPath:
                         live.workspaceLease.rootPath)
                     .standardizedFileURL,
-            model: ModelID(
-                rawValue: config.model),
+            model: route.model,
             profile: .reviewed)
         let loop = runtime.makeLoop(
             log: live.runtime.log,
-            provider: provider,
+            provider: route.provider,
             responder: TerminalResponder(),
             agent: agent,
+            context: ContextBuilder(
+                skillSnapshot: skillSnapshot,
+                runtimeEnvironment: .code),
             terminal: terminal,
             capabilityLease:
                 live.capabilityLease,

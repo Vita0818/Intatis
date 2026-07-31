@@ -468,7 +468,8 @@ public struct CodeProjection: Equatable, Sendable {
                     timestamp: envelope.ts))
             }
 
-        case .sessionSettingsUpdated, .sessionStorageMigrated, .modelHistoryItem,
+        case .sessionSettingsUpdated, .sessionStorageMigrated,
+             .modelHistoryItem, .modelHistoryCompacted,
              .toolExecutionPrepared, .toolExecutionSettled,
              .permissionRequest, .permissionReviewRequested, .permissionReviewSettled,
              .agentStatus,

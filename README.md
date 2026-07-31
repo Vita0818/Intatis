@@ -15,6 +15,8 @@ headless Agent Kernel。架构设计见 [`ARCHITECTURE.md`](ARCHITECTURE.md)，�
 - 单 workspace Code agent：读文件、列目录、搜索、写文件、apply patch、git status/diff、shell 工具。
 - 确定性权限闸：敏感路径 / workspace escape / sandbox shell / 危险 shell 命令硬拒绝，写入和大多数 shell 默认问用户。
 - Cowork thread：多 Agent registry、`@mention` 路由、受控 message bus、agent-to-agent 转发审计。
+- Cowork 自动权限审查控制面：独立保留 reviewer、FIFO/single-flight、
+  request-generation 隔离与 durable allow/deny；失败、超时和取消均 fail closed。
 - Artifact store：文件附件、图片产物、转写文本、视频任务产物的存储抽象。
 - iOS 真子集 target：只链接 Chat / Provider / Conversation / Artifact / Multimodal / SharedUI 子集。
 - CLI：`chat` / `code` / `cowork` REPL、slash commands、附件输入、离线 selftest。
@@ -25,7 +27,6 @@ headless Agent Kernel。架构设计见 [`ARCHITECTURE.md`](ARCHITECTURE.md)，�
 - Multimodal：图片生成和批量转写有 OpenAI-compatible provider；视频只有 submit/poll 抽象和测试 fake provider。
 - App Store 级 git backend：当前 git 仍是 `ProcessGitService` spawn `git`，App Store 沙盒内需要进程内 git backend。
 - Permission recovery：pending permission 可从 event log 恢复显示；旧 async tool continuation 暂不恢复，需重跑任务。
-- Model permission reviewer：类型和单元测试存在，但本轮未接入默认权限链路，不会自动批准工具。
 
 ### Planned
 
@@ -33,7 +34,6 @@ headless Agent Kernel。架构设计见 [`ARCHITECTURE.md`](ARCHITECTURE.md)，�
 - 完整视频 provider 配置与 GUI 入口。
 - 完整 session history / resume 管理界面。
 - 进程外 kernel transport（stdio / daemon）。
-- 自动权限审查链路和 reviewer 配置 UI。
 
 ---
 
@@ -63,7 +63,10 @@ headless Agent Kernel。架构设计见 [`ARCHITECTURE.md`](ARCHITECTURE.md)，�
 
 已包含：
 
-- 工具：`read_file` / `list_files` / `search_text` / `write_file` / `apply_patch`（unified diff applier）/ `run_shell` / `git_status` / `git_diff`，每个都过**路径围栏**（`..`、越界、symlink 逃逸一律拒绝）。
+- 工具：`read_file` / `list_files` / `search_text` / `write_file` /
+  `apply_patch`（unified diff applier）/ `exec_command` / `write_stdin` /
+  `git_status` / `git_diff`，每个都过**路径围栏**（`..`、越界、symlink
+  逃逸一律拒绝）。production registry 不暴露 raw `run_shell`。
 - OpenAI function-calling：流式 `tool_calls` 按 index 累积装配。
 - 确定性权限闸（A 层）：密钥 / `.env` / 越界 / `sudo` 等硬 `deny`；普通写 / patch / shell 默认回到用户确认；只有极窄的 confined read-only shell argv 会自动放行。
 - 单 Agent 工具循环：`流式 → tool_call → 权限 → 执行 → observation → 续`，带迭代上限。
@@ -82,8 +85,59 @@ headless Agent Kernel。架构设计见 [`ARCHITECTURE.md`](ARCHITECTURE.md)，�
 - **多 Agent 编排**（`Orchestrator`）：`@AgentName` 把消息定向给某个 Agent，多 Agent 输出合并进同一 thread（按 agent 名区分）。
 - **受控 Agent 间通信**：唯一通道是 `ask_agent` 工具 → per-agent `AgentMessenger` → `MessageBus` → `Mediator`。Agent **不能**直接读彼此目录。
 - **Mediator 转发规则**：`SecretScanner` 命中（密钥/token/private key）硬 `block`；超长原文 `block`（强制摘要）；可选 `ForwardingReviewer` 做"摘要 vs 大段源码"判断。每次转发都记 `agent_to_agent_message` + `permission_review`。
-- `ModelPermissionReviewer` 类型保留在代码中并有测试，但默认权限链路暂未接入自动 reviewer；本阶段不会让模型自动批准权限请求。
+- ask-class 工具由独立 `@permission-reviewer` 控制面自动返回 durable
+  allow/deny；它是 read-only、零工具/通信/委派的保留 agent，不占普通
+  scheduler 槽，也不能绕过确定性 hard deny。用户仍可显式切换人工模式。
 - **Cowork 界面**：左栏 agent 名册 + Add Agent，中栏合并 thread（含 `↔` agent-to-agent 卡），右栏 per-agent 详情；`@mention` composer。
+
+---
+
+## Skills（Code / Cowork）
+
+Code 与 Cowork 会在每次 send / AgentInvocation 开始时，从当前 agent 的工作区
+发现 `.agents/skills/<skill-name>/SKILL.md` 并冻结一个独立 snapshot。Developer
+ID 构建和 CLI 还可按 host policy 读取 `~/.agents/skills`、
+`$CODEX_HOME/skills`（默认 `~/.codex/skills`）及系统 roots；App Store 构建只读
+已授权工作区，iOS 不链接 Skills。
+
+`SKILL.md` 使用 Agent Skills 风格 frontmatter：
+
+```md
+---
+name: code-review
+description: Review a change for correctness, regressions, and missing tests.
+---
+
+Follow the repository instructions, inspect the diff, and report evidence.
+```
+
+用户可在当前输入中写 `$code-review` 显式加载完整正文；模型也可先根据有界
+catalog 选择 `activate_skill`，再按需用 `read_skill_resource` 读取该 snapshot
+中冻结的 UTF-8 resource。Skill 是上下文，不是权限：它不会增加文件、shell、
+网络、MCP、通信或委派能力，脚本仍只能通过本次请求真实提供且经过权限链的
+工具运行。Skill resource 没有通用 `read_file` 兜底。
+
+catalog metadata 预算使用当前 exact model 的 canonical primary context 的
+2% approximate tokens：`context_window` 优先，缺失时可由显式
+`limit.context` 补位；两者未知时回退 8,000 字符。冻结 snapshot 会记录
+count-only omission/truncation metrics，省略项在 catalog 中有明确 marker。
+Skill 也可在 `agents/openai.yaml` 声明严格的 MCP-only tool dependency；正文
+披露前必须由同一个 request-owned MCP snapshot（其 response 选择了该 Skill
+tool）承载 host-attested exact server 与 transport locator 配对断言。
+production assertion 只从当前 agent-visible tool view 派生，server 至少须
+贡献一个可见 tool；缺失或 endpoint 改变时 fail closed，不读取全局状态兜底。
+当前不会自动安装 server、执行 OAuth、写外部配置或刷新 runtime。
+
+稳定 Code conversation 与 Cowork `@main` 使用同一套 durable
+replacement-history compaction 管理长会话：exact model metadata 可证明时，
+在 provider-neutral 估算达到 90% 自动阈值或 95% 可用窗口边界时触发，将旧
+历史替换为动态有界的真实用户原文、必要的当前 context 与 continuation
+summary。checkpoint 先写入 EventLog，再替换 live request history。恢复器按
+最新有效 checkpoint 加后缀重建；当前 deterministic 证据只覆盖从同一
+EventLog 对象建立 fresh
+`AgentLoop` 的 replay，真正 process-kill/reopen 仍为 `UNKNOWN`。真实 tokenizer
+仍可能有漂移；Skill 仍只在当前 Turn / invocation 激活，不会变成跨 Turn 的
+sticky 权限或状态。
 
 ---
 
@@ -126,6 +180,7 @@ headless Agent Kernel。架构设计见 [`ARCHITECTURE.md`](ARCHITECTURE.md)，�
 | `Packages/IntatisArtifacts` | IntatisArtifacts | artifact store |
 | `Packages/IntatisConversation` | IntatisConversation | 事件日志、projection、**无工具的 `ChatLoop`**、`CodeProjection` |
 | `Packages/IntatisTools` | IntatisTools | 路径围栏 + 文件 / git / shell 工具（哑执行器）|
+| `Packages/IntatisSkills` | IntatisSkills | 有界 Skill discovery、immutable snapshot、developer catalog、显式激活与 frozen resource tools |
 | `Packages/IntatisPermission` | IntatisPermission | 确定性权限闸 + SecretScanner + profiles + 模型审查员（B 层）|
 | `Packages/IntatisAgentKernel` | IntatisAgentKernel | Agent + ContextBuilder + 工具循环 |
 | `Packages/IntatisCowork` | IntatisCowork | AgentRegistry + Mediator + MessageBus + Orchestrator + `ask_agent` |
@@ -136,9 +191,9 @@ headless Agent Kernel。架构设计见 [`ARCHITECTURE.md`](ARCHITECTURE.md)，�
 
 单一根 `Package.swift`；模块 == target；target 依赖强制 ARCHITECTURE.md §2.1 的无环依赖图。
 
-> **注意：** 这份代码是在没有本地 Swift 工具链的环境下编写的（沙盒里没有 Swift，且 SwiftUI
-> 只能在 Apple 平台编译）。代码按可编译的方式组织，并带完整 XCTest 测试，但请**先在你的 Mac 上
-> 跑 `swift build` / `swift test`**，并像对待任何"第一次编译"那样，预期需要修一些小问题。
+当前源码已在 Apple Swift/Xcode 工具链上运行完整 SwiftPM 测试，并构建
+Developer ID macOS、App Store macOS 与 iOS Simulator 产品图；精确命令、计数
+和仍为 `UNKNOWN` 的真实环境矩阵见 [`docs/TESTING.md`](docs/TESTING.md)。
 
 ---
 
@@ -147,7 +202,7 @@ headless Agent Kernel。架构设计见 [`ARCHITECTURE.md`](ARCHITECTURE.md)，�
 ### 库 / 逻辑层（不需要 Xcode）
 
 ```bash
-swift build       # 编译 11 个库
+swift build       # 编译 SwiftPM 产品图
 swift test        # 运行全部 XCTest 套件——无需联网
 ```
 
@@ -169,9 +224,11 @@ App target（mac 链全部 11 个库；iOS 只链 chat 子集 7 个），并接�
 - 首次启动点右上角 🔑 粘贴 OpenAI-compatible API key（存 Keychain）。默认端点
   `https://api.openai.com/v1`、模型 `gpt-4o-mini` / `dall-e-3` / `whisper-1`，在
   `Apps/IntatisMac/Sources/AppConfig.swift`（iOS 在 `IOSConfig.swift`）里改。
-- mac 默认用**沙盒（App Store）entitlements**：Chat 与 Code 的读/写/patch 可用，但 `run_shell`
-  与 `git`（spawn）在沙盒里跑不了。要完整 Code/Cowork（shell+git），按 `project.yml` 注释切到
-  **DeveloperID entitlements** 并设 `AppConfig.platformProfile = .macDeveloperID`。
+- **IntatisMacAppStore** 使用 App Store sandbox：Chat 与受限 Code 的读/写/patch
+  可用，但不会注册 managed terminal，spawn-based Git 也不可用。完整 Code/Cowork
+  请选择 **IntatisMac** Developer-ID scheme；其 `exec_command` / `write_stdin`
+  managed terminal 和 Git 仍受产品权限、workspace confinement 与系统 sandbox
+  约束。
 
 > 不想装 XcodeGen 也行：Xcode 里 File ▸ New ▸ Target ▸ App 建 macOS/iOS App target，把本仓库
 > 作为 local Swift package 依赖，按上面的库清单勾选 product 即可。
@@ -238,8 +295,9 @@ cowork ❯ @reviewer 重点看并发安全                   # 也可手动定�
 **code 写文件再读回**走一遍，复用的就是真正的 ChatLoop / AgentLoop / 渲染 / 审批代码。
 
 `intatis code` 跑的就是完整 Agent：模型调用 `read_file` / `search_text` / `write_file` /
-`apply_patch` / `run_shell` / `git_status` / `git_diff`，写入和命令在终端里 `[y/N]` 审批（只读
-自动放行）。
+`apply_patch` / `exec_command` / `write_stdin` / `git_status` / `git_diff`。CLI 的写入与
+managed terminal 启动/输入仍经过权限门，并在需要时由终端 `[y/N]` 审批（只读自动放行）；
+产品 registry 不暴露旧的 raw `run_shell`。
 
 **装成系统命令**（像 `curl` / `chmod` 那样从任何目录用 `intatis` 唤醒）：
 
@@ -280,8 +338,24 @@ INTATIS_BASE_URL=https://api.deepseek.com/v1 INTATIS_API_KEY=sk-... \
 INTATIS_API_KEY=sk-... INTATIS_MODEL=o4-mini INTATIS_REASONING=high swift run intatis chat
 ```
 
-**调单轮工具步数上限**：长任务（多次读写/委派）默认每轮最多 50 个工具往返，到顶才报
-`max_iterations`。嫌不够就调大：`INTATIS_MAX_STEPS=200`（chat / code / cowork 都生效）。
+OpenCode/JavaScript SDK 风格配置中的 `provider.npm`、model-level
+`provider.npm` 和原始 options 都会保留。Intatis 按 OpenCode 的 custom-provider
+规则选择 package adapter：model override 优先于 provider，二者都缺失时默认
+`@ai-sdk/openai-compatible`。这个 compatible adapter 才会在最终 Chat
+Completions HTTP 边界把 `reasoningEffort` 变成 `reasoning_effort`，同时原样保留
+OpenRouter 的 `provider.only` / `allow_fallbacks` / `require_parameters`；无需关闭
+strict routing 兜底。若显式选择 `@openrouter/ai-sdk-provider`，则使用它自己的
+nested `reasoning` 语义，不套 compatible 的 camel-to-snake 规则。未知 npm
+package 不会猜测或静默回退，而是在网络请求前给出配置错误。新式 compatible /
+OpenRouter adapter 还会遵循 pinned package 的完整请求形状：依赖上游默认单候选，
+不额外发送 `n`，也不会仅因某个工具声明可并行就自动发送
+`parallel_tool_calls`。若确实需要 provider-specific parallel 设置，应在模型
+options 中显式配置并交给对应 package adapter 解释。
+
+**调单轮工具步数上限**：Code 默认每轮最多 50 个工具往返，Cowork 默认 64 个，到顶才报
+`max_iterations`。`INTATIS_MAX_STEPS=200` 会显式覆盖 Code / Cowork 两种模式（也可以显式调低）。
+新 Cowork invocation 默认最多运行 600 秒；普通 Chat provider 请求仍为 120 秒，Code/Cowork
+Agent provider 请求为 180 秒。
 
 `swift run intatis config` 随时看当前解析到的端点 / 模型 / 推理强度。
 
@@ -293,7 +367,8 @@ INTATIS_API_KEY=sk-... INTATIS_MODEL=o4-mini INTATIS_REASONING=high swift run in
 
 ## 分发：两个构建，一个 capability 开关
 
-`run_shell` 是唯一被 App Store 沙盒卡死的操作（ARCHITECTURE.md §9.1）。因此：
+本地持久进程 / PTY managed terminal 不能进入 App Store sandbox 构建
+（ARCHITECTURE.md §9.1）。因此：
 
 | 构建 | `AppConfig.platformProfile` | Entitlements | Shell |
 |-------|------------------------------|--------------|:---:|
@@ -301,8 +376,10 @@ INTATIS_API_KEY=sk-... INTATIS_MODEL=o4-mini INTATIS_REASONING=high swift run in
 | Developer-ID（公证） | `.macDeveloperID` | `IntatisMac.DeveloperID.entitlements` | ✓ |
 
 v0.1（Chat）可顺利上架 App Store。v0.2 的 git 工具目前用 spawn `git`（开发用）；要在
-App Store 沙盒内运行，需把 `GitService` 换成进程内 libgit2 后端（接缝已留好）。`run_shell`
-在 `.macAppStore` profile 下被权限闸直接 `deny`。
+App Store 沙盒内运行，需把 `GitService` 换成进程内 libgit2 后端（接缝已留好）。
+`.macAppStore` profile 不注册 `exec_command` / `write_stdin`；Developer-ID 与 CLI
+使用 runtime-owned managed terminal，并继续经过 CapabilityLease、权限门、durable tool
+ticket、workspace confinement 与平台 sandbox。
 
 ---
 
@@ -334,7 +411,10 @@ v0.2：
 v0.3：
 
 - **Protocol（v0.3）** —— 5 个 Cowork 事件 round-trip；`agent_to_agent_message` wire type；`profile.set` 命令。
-- **Permission（reviewer 类型）** —— 解析 allow / deny（含前后包裹文本）/ 不可解析回退 ask；engine 对 hard `deny` 的测试覆盖存在。默认产品链路暂未接入自动 reviewer。
+- **Permission（reviewer 类型）** —— hard deny 终局；普通 ask-class 调用可交给 Cowork
+  默认启用的独立 `@permission-reviewer` 控制面，只接受有界结构化 allow / deny。
+  timeout、不可解析输出、provider/persistence failure 或取消都对当前调用 durable
+  fail closed；不会静默回退为 GUI 人工审批。
 - **Cowork** —— Mediator 正常转发 / 密钥 block / 超长 block / reviewer block；MessageBus 转发记两条日志、block 返回 nil 并记 `deny`；Orchestrator 端到端 agent-to-agent 经双向 mediation 并记录；含密钥的问题在到达对端前被拦截。
 
 v0.4：

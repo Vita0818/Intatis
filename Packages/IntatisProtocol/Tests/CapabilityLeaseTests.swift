@@ -37,6 +37,7 @@ final class CapabilityLeaseTests: XCTestCase {
             return XCTFail("coordinator lease should grant delegation")
         }
         XCTAssertGreaterThan(budget.maxTasks, 0)
+        XCTAssertEqual(budget.maxDepth, 1)
     }
 
     func testReadWriteWorkerReceivesManagedTerminalCapability() {

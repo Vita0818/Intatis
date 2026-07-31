@@ -24,6 +24,7 @@ enum CLIInferenceRouteIdentity {
             "intatis-cli-route-config-v2",
             route.id,
             route.wire.rawValue,
+            route.requestAdapter.rawValue,
             route.baseURL.absoluteString,
             route.chatEndpoint?.absoluteString ?? "",
             route.credentialRef.source.rawValue,
@@ -240,6 +241,8 @@ struct CLIInferenceProfiles: Sendable {
             InferenceConnectionDraft(
                 inferenceConnectionID: CLIInferenceRouteIdentity.connectionID(route: route),
                 wire: route.wire,
+                requestAdapter:
+                    route.requestAdapter,
                 baseURL: route.baseURL,
                 chatEndpoint: route.chatEndpoint,
                 credentialRef: route.credentialRef,
@@ -289,6 +292,12 @@ struct CLIInferenceProfiles: Sendable {
             variantID: durableVariant,
             modelBaseRequestOptions: model.requestOptions,
             variantRequestOptions: variant?.requestOptions ?? [:],
+            requestAdapterOverride:
+                model.requestAdapterOverride,
+            modelContextPolicy:
+                AgentModelContextPolicy(
+                    configurationMetadata:
+                        model.configurationMetadata),
             declaredCapabilities:
                 model.declaredCapabilities,
             safeRouteLabel: routeLabel)
@@ -297,6 +306,11 @@ struct CLIInferenceProfiles: Sendable {
     private static func reasoningEffort(
         in options: [String: JSONValue]
     ) -> ReasoningEffort? {
+        if case .string(let value) =
+            options["reasoningEffort"] {
+            return ReasoningEffort(
+                rawValue: value.lowercased())
+        }
         if case .string(let value) = options["reasoning_effort"] {
             return ReasoningEffort(rawValue: value.lowercased())
         }

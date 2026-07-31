@@ -276,6 +276,730 @@ final class ModelHistoryProjectionTests: XCTestCase {
         })
     }
 
+    func testLatestCheckpointReplacesOlderHistoryAndReplaysOnlySuffix()
+        throws
+    {
+        let firstID = SubmissionID(rawValue: "sub_checkpoint_first")
+        let suffixID = SubmissionID(rawValue: "sub_checkpoint_suffix")
+        let currentID = SubmissionID(rawValue: "sub_checkpoint_current")
+        let firstTask = rootTask(
+            "task_checkpoint_first",
+            firstID,
+            "first user")
+        let suffixTask = rootTask(
+            "task_checkpoint_suffix",
+            suffixID,
+            "suffix user")
+        let currentTask = rootTask(
+            "task_checkpoint_current",
+            currentID,
+            "current user")
+        let suffixTurn = TurnID(rawValue: "turn_checkpoint_suffix")
+        let compacted = checkpoint(
+            message: "state after first",
+            replacementHistory: [
+                retainedUser(
+                    "retained-first",
+                    submissionID: firstID,
+                    content: firstTask.objective),
+                summary("summary-first", "state after first"),
+            ])
+        let events = [
+            envelope(1, .userMessage(UserMessagePayload(
+                text: firstTask.objective,
+                to: main,
+                submissionID: firstID))),
+            envelope(2, .taskCreated(TaskCreatedPayload(
+                contract: firstTask))),
+            envelope(3, .modelHistoryCompacted(compacted)),
+            envelope(4, .userMessage(UserMessagePayload(
+                text: suffixTask.objective,
+                to: main,
+                submissionID: suffixID))),
+            envelope(5, .taskCreated(TaskCreatedPayload(
+                contract: suffixTask))),
+            envelope(6, .modelHistoryItem(.message(
+                itemID: "suffix-user",
+                turnID: suffixTurn,
+                agent: main,
+                taskID: suffixTask.id,
+                submissionID: suffixID,
+                taskAttempt: 1,
+                role: .user,
+                content: suffixTask.objective))),
+            envelope(7, .modelHistoryItem(.message(
+                itemID: "suffix-assistant",
+                turnID: suffixTurn,
+                agent: main,
+                taskID: suffixTask.id,
+                submissionID: suffixID,
+                taskAttempt: 1,
+                role: .assistant,
+                content: "suffix answer"))),
+            envelope(8, .userMessage(UserMessagePayload(
+                text: currentTask.objective,
+                to: main,
+                submissionID: currentID))),
+            envelope(9, .taskCreated(TaskCreatedPayload(
+                contract: currentTask))),
+        ]
+
+        let projection = try AgentModelHistoryProjector().projectState(
+            agentID: main,
+            currentTask: currentTask,
+            events: events)
+
+        XCTAssertEqual(projection.messages, [
+            .user(firstTask.objective),
+            .user("state after first"),
+            .user(suffixTask.objective),
+            .assistant("suffix answer"),
+        ])
+        XCTAssertEqual(
+            projection.realUserMessages.map(\.submissionID),
+            [firstID, suffixID])
+        XCTAssertEqual(projection.baseCheckpoint?.sequence, 3)
+        XCTAssertEqual(projection.latestCheckpoint?.sequence, 3)
+        XCTAssertEqual(projection.latestAgentHistorySequence, 7)
+    }
+
+    func testMidTurnCheckpointSuffixMayContinueWithoutAnotherUserItem()
+        throws
+    {
+        let priorID = SubmissionID(rawValue: "sub_midturn_prior")
+        let currentID = SubmissionID(rawValue: "sub_midturn_current")
+        let priorTask = rootTask(
+            "task_midturn_prior",
+            priorID,
+            "prior user")
+        let currentTask = rootTask(
+            "task_midturn_current",
+            currentID,
+            "current user")
+        let turnID = TurnID(rawValue: "turn_midturn")
+        let compacted = checkpoint(
+            message: "state through the tool result",
+            replacementHistory: [
+                retainedUser(
+                    "midturn-retained-user",
+                    submissionID: priorID,
+                    content: priorTask.objective),
+                summary(
+                    "midturn-summary",
+                    "state through the tool result"),
+            ])
+        let events = [
+            envelope(1, .userMessage(UserMessagePayload(
+                text: priorTask.objective,
+                to: main,
+                submissionID: priorID))),
+            envelope(2, .taskCreated(TaskCreatedPayload(
+                contract: priorTask))),
+            envelope(3, .modelHistoryItem(.message(
+                itemID: "midturn-original-user",
+                turnID: turnID,
+                agent: main,
+                taskID: priorTask.id,
+                submissionID: priorID,
+                taskAttempt: 1,
+                role: .user,
+                content: priorTask.objective))),
+            envelope(4, .modelHistoryCompacted(compacted)),
+            // The checkpoint already represents the user and earlier work.
+            // A same-turn continuation must not fabricate another user item.
+            envelope(5, .modelHistoryItem(.message(
+                itemID: "midturn-continuation",
+                turnID: turnID,
+                agent: main,
+                taskID: priorTask.id,
+                submissionID: priorID,
+                taskAttempt: 1,
+                role: .assistant,
+                content: "continued after compaction"))),
+            envelope(6, .userMessage(UserMessagePayload(
+                text: currentTask.objective,
+                to: main,
+                submissionID: currentID))),
+            envelope(7, .taskCreated(TaskCreatedPayload(
+                contract: currentTask))),
+        ]
+
+        let projection = try AgentModelHistoryProjector().projectState(
+            agentID: main,
+            currentTask: currentTask,
+            events: events)
+
+        XCTAssertEqual(projection.messages, [
+            .user(priorTask.objective),
+            .user("state through the tool result"),
+            .assistant("continued after compaction"),
+        ])
+        XCTAssertEqual(projection.realUserMessages.count, 1)
+        XCTAssertEqual(
+            projection.realUserMessages.first?.submissionID,
+            priorID)
+    }
+
+    func testTwoWindowCheckpointLineageSelectsNewestWindow() throws {
+        let firstID = SubmissionID(rawValue: "sub_window_one")
+        let secondID = SubmissionID(rawValue: "sub_window_two")
+        let currentID = SubmissionID(rawValue: "sub_window_current")
+        let firstTask = rootTask("task_window_one", firstID, "U1")
+        let secondTask = rootTask("task_window_two", secondID, "U2")
+        let currentTask = rootTask(
+            "task_window_current",
+            currentID,
+            "U3")
+        let first = checkpoint(
+            message: "window one",
+            replacementHistory: [
+                retainedUser(
+                    "window-one-user",
+                    submissionID: firstID,
+                    content: firstTask.objective),
+                summary("window-one-summary", "window one"),
+            ])
+        let second = checkpoint(
+            message: "window two",
+            replacementHistory: [
+                retainedUser(
+                    "window-two-first-user",
+                    submissionID: firstID,
+                    content: firstTask.objective),
+                retainedUser(
+                    "window-two-second-user",
+                    submissionID: secondID,
+                    content: secondTask.objective),
+                summary("window-two-summary", "window two"),
+            ],
+            windowNumber: 2,
+            previousWindowID: firstWindowID,
+            windowID: secondWindowID)
+        let events = [
+            envelope(1, .userMessage(UserMessagePayload(
+                text: firstTask.objective,
+                to: main,
+                submissionID: firstID))),
+            envelope(2, .taskCreated(TaskCreatedPayload(
+                contract: firstTask))),
+            envelope(3, .modelHistoryCompacted(first)),
+            envelope(4, .userMessage(UserMessagePayload(
+                text: secondTask.objective,
+                to: main,
+                submissionID: secondID))),
+            envelope(5, .taskCreated(TaskCreatedPayload(
+                contract: secondTask))),
+            envelope(6, .modelHistoryCompacted(second)),
+            envelope(7, .userMessage(UserMessagePayload(
+                text: currentTask.objective,
+                to: main,
+                submissionID: currentID))),
+            envelope(8, .taskCreated(TaskCreatedPayload(
+                contract: currentTask))),
+        ]
+
+        let projection = try AgentModelHistoryProjector().projectState(
+            agentID: main,
+            currentTask: currentTask,
+            events: events)
+
+        XCTAssertEqual(projection.messages, [
+            .user(firstTask.objective),
+            .user(secondTask.objective),
+            .user("window two"),
+        ])
+        XCTAssertEqual(projection.baseCheckpoint?.sequence, 6)
+        XCTAssertEqual(projection.latestCheckpoint?.sequence, 6)
+        XCTAssertEqual(
+            projection.latestCheckpoint?.payload.windowNumber,
+            2)
+    }
+
+    func testNonContiguousCheckpointLineageFailsClosed() throws {
+        let firstID = SubmissionID(rawValue: "sub_bad_lineage_first")
+        let secondID = SubmissionID(rawValue: "sub_bad_lineage_second")
+        let currentID = SubmissionID(rawValue: "sub_bad_lineage_current")
+        let firstTask = rootTask(
+            "task_bad_lineage_first",
+            firstID,
+            "U1")
+        let secondTask = rootTask(
+            "task_bad_lineage_second",
+            secondID,
+            "U2")
+        let currentTask = rootTask(
+            "task_bad_lineage_current",
+            currentID,
+            "U3")
+        let first = checkpoint(
+            message: "window one",
+            replacementHistory: [
+                retainedUser(
+                    "bad-lineage-window-one-user",
+                    submissionID: firstID,
+                    content: firstTask.objective),
+                summary(
+                    "bad-lineage-window-one-summary",
+                    "window one"),
+            ])
+        let invalidSecond = checkpoint(
+            message: "window two",
+            replacementHistory: [
+                retainedUser(
+                    "bad-lineage-window-two-user",
+                    submissionID: secondID,
+                    content: secondTask.objective),
+                summary(
+                    "bad-lineage-window-two-summary",
+                    "window two"),
+            ],
+            windowNumber: 2,
+            // A second window must point to the first checkpoint's window,
+            // not back to the initial window.
+            previousWindowID: initialWindowID,
+            windowID: secondWindowID)
+        let events = [
+            envelope(1, .userMessage(UserMessagePayload(
+                text: firstTask.objective,
+                to: main,
+                submissionID: firstID))),
+            envelope(2, .taskCreated(TaskCreatedPayload(
+                contract: firstTask))),
+            envelope(3, .modelHistoryCompacted(first)),
+            envelope(4, .userMessage(UserMessagePayload(
+                text: secondTask.objective,
+                to: main,
+                submissionID: secondID))),
+            envelope(5, .taskCreated(TaskCreatedPayload(
+                contract: secondTask))),
+            envelope(6, .modelHistoryCompacted(invalidSecond)),
+            envelope(7, .userMessage(UserMessagePayload(
+                text: currentTask.objective,
+                to: main,
+                submissionID: currentID))),
+            envelope(8, .taskCreated(TaskCreatedPayload(
+                contract: currentTask))),
+        ]
+
+        XCTAssertThrowsError(
+            try AgentModelHistoryProjector().projectState(
+                agentID: main,
+                currentTask: currentTask,
+                events: events)
+        ) { error in
+            XCTAssertEqual(
+                error as? AgentModelHistoryProjectionError,
+                .invalidCheckpoint(
+                    sequence: 6,
+                    reason: "window lineage is not contiguous"))
+        }
+    }
+
+    func testContextualSkillReplaysButIsNotClassifiedAsRealUser()
+        throws
+    {
+        let priorID = SubmissionID(rawValue: "sub_contextual_skill")
+        let currentID = SubmissionID(rawValue: "sub_contextual_current")
+        let priorTask = rootTask(
+            "task_contextual_skill",
+            priorID,
+            "use the selected skill")
+        let currentTask = rootTask(
+            "task_contextual_current",
+            currentID,
+            "continue")
+        let skillBody =
+            "<skill><name>example</name><instructions>Follow it.</instructions></skill>"
+        let compacted = checkpoint(
+            message: "skill-guided state",
+            replacementHistory: [
+                ModelHistoryReplacementItem(
+                    itemID: "contextual-skill",
+                    kind: .message,
+                    role: .user,
+                    messageClassification: .contextual,
+                    content: skillBody),
+                retainedUser(
+                    "contextual-real-user",
+                    submissionID: priorID,
+                    content: priorTask.objective),
+                summary(
+                    "contextual-summary",
+                    "skill-guided state"),
+            ])
+        let events = [
+            envelope(1, .userMessage(UserMessagePayload(
+                text: priorTask.objective,
+                to: main,
+                submissionID: priorID))),
+            envelope(2, .taskCreated(TaskCreatedPayload(
+                contract: priorTask))),
+            envelope(3, .modelHistoryCompacted(compacted)),
+            envelope(4, .userMessage(UserMessagePayload(
+                text: currentTask.objective,
+                to: main,
+                submissionID: currentID))),
+            envelope(5, .taskCreated(TaskCreatedPayload(
+                contract: currentTask))),
+        ]
+
+        let projection = try AgentModelHistoryProjector().projectState(
+            agentID: main,
+            currentTask: currentTask,
+            events: events)
+
+        XCTAssertEqual(projection.messages, [
+            .user(skillBody),
+            .user(priorTask.objective),
+            .user("skill-guided state"),
+        ])
+        XCTAssertEqual(projection.realUserMessages.count, 1)
+        XCTAssertEqual(
+            projection.realUserMessages.first?.submissionID,
+            priorID)
+        XCTAssertEqual(
+            projection.realUserMessages.first?.content,
+            priorTask.objective)
+        XCTAssertFalse(
+            projection.realUserMessages.contains {
+                $0.content == skillBody
+            })
+    }
+
+    func testCheckpointAfterQueuedCurrentAcceptanceStillBecomesBase()
+        throws
+    {
+        let priorID = SubmissionID(rawValue: "sub_queued_prior")
+        let currentID = SubmissionID(rawValue: "sub_queued_current")
+        let priorTask = rootTask(
+            "task_queued_prior",
+            priorID,
+            "prior")
+        let currentTask = rootTask(
+            "task_queued_current",
+            currentID,
+            "already queued")
+        let compacted = checkpoint(
+            message: "prior compacted after U2 was queued",
+            replacementHistory: [
+                retainedUser(
+                    "queued-prior-user",
+                    submissionID: priorID,
+                    content: priorTask.objective),
+                summary(
+                    "queued-prior-summary",
+                    "prior compacted after U2 was queued"),
+            ])
+        let events = [
+            envelope(1, .userMessage(UserMessagePayload(
+                text: priorTask.objective,
+                to: main,
+                submissionID: priorID))),
+            envelope(2, .taskCreated(TaskCreatedPayload(
+                contract: priorTask))),
+            envelope(3, .userMessage(UserMessagePayload(
+                text: currentTask.objective,
+                to: main,
+                submissionID: currentID))),
+            envelope(4, .taskQueued(TaskQueuedPayload(
+                contract: currentTask,
+                rootTaskID: currentTask.id,
+                assignee: main,
+                hopCount: 0,
+                visitedAgents: [main],
+                attempt: 1))),
+            envelope(5, .modelHistoryCompacted(compacted)),
+        ]
+
+        let projection = try AgentModelHistoryProjector().projectState(
+            agentID: main,
+            currentTask: currentTask,
+            events: events)
+
+        XCTAssertEqual(projection.messages, [
+            .user(priorTask.objective),
+            .user("prior compacted after U2 was queued"),
+        ])
+        XCTAssertEqual(projection.baseCheckpoint?.sequence, 5)
+        XCTAssertEqual(projection.latestCheckpoint?.sequence, 5)
+    }
+
+    func testRetrySupersedesNewestCheckpointButKeepsLatestCursor()
+        throws
+    {
+        let oldestID = SubmissionID(rawValue: "sub_retry_oldest")
+        let retriedID = SubmissionID(rawValue: "sub_retry_covered")
+        let currentID = SubmissionID(rawValue: "sub_retry_current")
+        let oldestTask = rootTask(
+            "task_retry_oldest",
+            oldestID,
+            "oldest U")
+        let retriedTask = rootTask(
+            "task_retry_covered",
+            retriedID,
+            "retried U")
+        let currentTask = rootTask(
+            "task_retry_current",
+            currentID,
+            "current U")
+        let first = checkpoint(
+            message: "oldest summary",
+            replacementHistory: [
+                retainedUser(
+                    "retry-oldest-retained",
+                    submissionID: oldestID,
+                    content: oldestTask.objective),
+                summary(
+                    "retry-oldest-summary",
+                    "oldest summary"),
+            ])
+        let second = checkpoint(
+            message: "summary containing failed attempt",
+            replacementHistory: [
+                retainedUser(
+                    "retry-second-oldest",
+                    submissionID: oldestID,
+                    content: oldestTask.objective),
+                retainedUser(
+                    "retry-second-covered",
+                    submissionID: retriedID,
+                    content: retriedTask.objective),
+                summary(
+                    "retry-second-summary",
+                    "summary containing failed attempt"),
+            ],
+            windowNumber: 2,
+            previousWindowID: firstWindowID,
+            windowID: secondWindowID)
+        let firstAttemptTurn = TurnID(
+            rawValue: "turn_retry_first_attempt")
+        let secondAttemptTurn = TurnID(
+            rawValue: "turn_retry_second_attempt")
+        let events = [
+            envelope(1, .userMessage(UserMessagePayload(
+                text: oldestTask.objective,
+                to: main,
+                submissionID: oldestID))),
+            envelope(2, .taskCreated(TaskCreatedPayload(
+                contract: oldestTask))),
+            envelope(3, .modelHistoryCompacted(first)),
+            envelope(4, .userMessage(UserMessagePayload(
+                text: retriedTask.objective,
+                to: main,
+                submissionID: retriedID))),
+            envelope(5, .taskCreated(TaskCreatedPayload(
+                contract: retriedTask))),
+            envelope(6, .modelHistoryItem(.message(
+                itemID: "retry-first-user",
+                turnID: firstAttemptTurn,
+                agent: main,
+                taskID: retriedTask.id,
+                submissionID: retriedID,
+                taskAttempt: 1,
+                role: .user,
+                content: retriedTask.objective))),
+            envelope(7, .modelHistoryItem(.message(
+                itemID: "retry-first-answer",
+                turnID: firstAttemptTurn,
+                agent: main,
+                taskID: retriedTask.id,
+                submissionID: retriedID,
+                taskAttempt: 1,
+                role: .assistant,
+                content: "failed attempt answer"))),
+            envelope(8, .modelHistoryCompacted(second)),
+            envelope(9, .modelHistoryItem(.message(
+                itemID: "retry-second-user",
+                turnID: secondAttemptTurn,
+                agent: main,
+                taskID: retriedTask.id,
+                submissionID: retriedID,
+                taskAttempt: 2,
+                role: .user,
+                content: retriedTask.objective))),
+            envelope(10, .modelHistoryItem(.message(
+                itemID: "retry-second-answer",
+                turnID: secondAttemptTurn,
+                agent: main,
+                taskID: retriedTask.id,
+                submissionID: retriedID,
+                taskAttempt: 2,
+                role: .assistant,
+                content: "fresh retry answer"))),
+            envelope(11, .userMessage(UserMessagePayload(
+                text: currentTask.objective,
+                to: main,
+                submissionID: currentID))),
+            envelope(12, .taskCreated(TaskCreatedPayload(
+                contract: currentTask))),
+        ]
+
+        let projection = try AgentModelHistoryProjector().projectState(
+            agentID: main,
+            currentTask: currentTask,
+            events: events)
+
+        XCTAssertEqual(projection.baseCheckpoint?.sequence, 3)
+        XCTAssertEqual(projection.latestCheckpoint?.sequence, 8)
+        XCTAssertEqual(
+            projection.baseCheckpoint?.payload.windowNumber,
+            1)
+        XCTAssertEqual(
+            projection.latestCheckpoint?.payload.windowNumber,
+            2)
+        XCTAssertEqual(projection.messages, [
+            .user(oldestTask.objective),
+            .user("oldest summary"),
+            .user(retriedTask.objective),
+            .assistant("fresh retry answer"),
+        ])
+        XCTAssertFalse(
+            projection.messages.contains {
+                $0.content == "summary containing failed attempt"
+                    || $0.content == "failed attempt answer"
+            })
+        XCTAssertEqual(projection.latestAgentHistorySequence, 10)
+    }
+
+    func testUTF8TruncatedRetainedUserSurvivesEnvelopeRoundTrip()
+        throws
+    {
+        let priorID = SubmissionID(rawValue: "sub_utf8_prior")
+        let currentID = SubmissionID(rawValue: "sub_utf8_current")
+        let source = "不会保留的前缀🙂中段🧠最终片段漢字🚀"
+        let suffix = "最终片段漢字🚀"
+        let marker =
+            AgentModelHistoryCompactor.retainedRealUserTruncationMarker
+        let retained = marker + suffix
+        let priorTask = rootTask(
+            "task_utf8_prior",
+            priorID,
+            source)
+        let currentTask = rootTask(
+            "task_utf8_current",
+            currentID,
+            "继续")
+        let compacted = checkpoint(
+            message: "UTF-8 summary 🧾",
+            replacementHistory: [
+                retainedUser(
+                    "utf8-retained-user",
+                    submissionID: priorID,
+                    content: retained,
+                    contentTruncated: true),
+                summary(
+                    "utf8-summary",
+                    "UTF-8 summary 🧾"),
+            ])
+        let events = [
+            envelope(1, .userMessage(UserMessagePayload(
+                text: source,
+                to: main,
+                submissionID: priorID))),
+            envelope(2, .taskCreated(TaskCreatedPayload(
+                contract: priorTask))),
+            envelope(3, .modelHistoryCompacted(compacted)),
+            envelope(4, .userMessage(UserMessagePayload(
+                text: currentTask.objective,
+                to: main,
+                submissionID: currentID))),
+            envelope(5, .taskCreated(TaskCreatedPayload(
+                contract: currentTask))),
+        ]
+        let encoded = try JSONEncoder().encode(events)
+        let decoded = try JSONDecoder().decode(
+            [Envelope].self,
+            from: encoded)
+
+        let projection = try AgentModelHistoryProjector().projectState(
+            agentID: main,
+            currentTask: currentTask,
+            events: decoded)
+
+        XCTAssertEqual(projection.messages.first, .user(retained))
+        XCTAssertEqual(projection.realUserMessages.count, 1)
+        XCTAssertEqual(
+            projection.realUserMessages.first?.content,
+            retained)
+        XCTAssertEqual(
+            projection.realUserMessages.first?.contentTruncated,
+            true)
+        XCTAssertTrue(source.hasSuffix(suffix))
+    }
+
+    func testCheckpointShadowsInvalidRawHistoryBeforeItsBoundary()
+        throws
+    {
+        let priorID = SubmissionID(rawValue: "sub_shadowed_invalid")
+        let currentID = SubmissionID(rawValue: "sub_shadowed_current")
+        let priorTask = rootTask(
+            "task_shadowed_invalid",
+            priorID,
+            "canonical user")
+        let currentTask = rootTask(
+            "task_shadowed_current",
+            currentID,
+            "current")
+        let invalidTurn = TurnID(rawValue: "turn_shadowed_invalid")
+        let compacted = checkpoint(
+            message: "validated replacement",
+            replacementHistory: [
+                retainedUser(
+                    "shadowed-retained-user",
+                    submissionID: priorID,
+                    content: priorTask.objective),
+                summary(
+                    "shadowed-summary",
+                    "validated replacement"),
+            ])
+        let invalidRaw = [
+            envelope(1, .userMessage(UserMessagePayload(
+                text: priorTask.objective,
+                to: main,
+                submissionID: priorID))),
+            envelope(2, .taskCreated(TaskCreatedPayload(
+                contract: priorTask))),
+            // This would fail an uncheckpointed reconstruction because it
+            // does not match the accepted durable submission.
+            envelope(3, .modelHistoryItem(.message(
+                itemID: "shadowed-invalid-user",
+                turnID: invalidTurn,
+                agent: main,
+                taskID: priorTask.id,
+                submissionID: priorID,
+                taskAttempt: 1,
+                role: .user,
+                content: "not the accepted user text"))),
+        ]
+        let currentEvents = [
+            envelope(5, .userMessage(UserMessagePayload(
+                text: currentTask.objective,
+                to: main,
+                submissionID: currentID))),
+            envelope(6, .taskCreated(TaskCreatedPayload(
+                contract: currentTask))),
+        ]
+        XCTAssertThrowsError(
+            try AgentModelHistoryProjector().project(
+                agentID: main,
+                currentTask: currentTask,
+                events: invalidRaw + currentEvents))
+
+        let projection = try AgentModelHistoryProjector().projectState(
+            agentID: main,
+            currentTask: currentTask,
+            events:
+                invalidRaw
+                + [envelope(4, .modelHistoryCompacted(compacted))]
+                + currentEvents)
+
+        XCTAssertEqual(projection.messages, [
+            .user(priorTask.objective),
+            .user("validated replacement"),
+        ])
+        XCTAssertEqual(projection.baseCheckpoint?.sequence, 4)
+    }
+
     func testConflictingReuseOfItemIDFailsClosed() throws {
         let priorID = SubmissionID(rawValue: "sub_conflict")
         let currentID = SubmissionID(rawValue: "sub_conflict_current")
@@ -404,6 +1128,60 @@ final class ModelHistoryProjectionTests: XCTestCase {
                 role: .assistant,
                 content: answer))),
         ]
+    }
+
+    private let initialWindowID =
+        "018f47a0-7b1c-7000-8000-000000000001"
+    private let firstWindowID =
+        "018f47a0-7b1c-7000-8000-000000000002"
+    private let secondWindowID =
+        "018f47a0-7b1c-7000-8000-000000000003"
+
+    private func checkpoint(
+        message: String,
+        replacementHistory: [ModelHistoryReplacementItem],
+        windowNumber: UInt64 = 1,
+        previousWindowID: String? = nil,
+        windowID: String? = nil
+    ) -> ModelHistoryCompactedPayload {
+        ModelHistoryCompactedPayload(
+            agent: main,
+            message: message,
+            replacementHistory: replacementHistory,
+            windowNumber: windowNumber,
+            firstWindowID: initialWindowID,
+            previousWindowID:
+                previousWindowID ?? initialWindowID,
+            windowID: windowID ?? firstWindowID)
+    }
+
+    private func retainedUser(
+        _ itemID: String,
+        submissionID: SubmissionID,
+        content: String,
+        contentTruncated: Bool = false
+    ) -> ModelHistoryReplacementItem {
+        ModelHistoryReplacementItem(
+            itemID: itemID,
+            sourceSubmissionID: submissionID,
+            kind: .message,
+            role: .user,
+            messageClassification: .realUser,
+            content: content,
+            contentTruncated:
+                contentTruncated ? true : nil)
+    }
+
+    private func summary(
+        _ itemID: String,
+        _ content: String
+    ) -> ModelHistoryReplacementItem {
+        ModelHistoryReplacementItem(
+            itemID: itemID,
+            kind: .message,
+            role: .user,
+            messageClassification: .compactionSummary,
+            content: content)
     }
 
     private func rootTask(

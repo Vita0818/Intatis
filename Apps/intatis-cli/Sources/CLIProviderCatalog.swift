@@ -15,12 +15,29 @@ struct CLIProviderModel: Equatable, Sendable {
     let id: String
     let displayName: String
     let requestOptions: [String: JSONValue]
+    /// Complete raw model object. Non-wire metadata such as context-window
+    /// limits is parsed from here and never copied into request options.
+    let configurationMetadata: [String: JSONValue]
     let variants: [CLIProviderVariant]
     let declaredCapabilities: [Capability]
+
+    var requestAdapterOverride:
+        ProviderRequestAdapter?
+    {
+        guard case .object(let provider)? =
+                configurationMetadata["provider"],
+              case .string(let npm)? =
+                provider["npm"] else {
+            return nil
+        }
+        return ProviderRequestAdapter
+            .configuredModelOverride(npm)
+    }
 
     init(id: String,
          displayName: String,
          requestOptions: [String: JSONValue] = [:],
+         configurationMetadata: [String: JSONValue] = [:],
          variants: [CLIProviderVariant] = [],
          declaredCapabilities: [Capability] = [
             .chat,
@@ -29,6 +46,7 @@ struct CLIProviderModel: Equatable, Sendable {
         self.id = id
         self.displayName = displayName
         self.requestOptions = requestOptions
+        self.configurationMetadata = configurationMetadata
         self.variants = variants
         self.declaredCapabilities =
             declaredCapabilities
@@ -44,6 +62,7 @@ struct CLIProviderRoute: Equatable, Sendable {
     var baseURL: URL
     var chatEndpoint: URL?
     let wire: WireFormat
+    let requestAdapter: ProviderRequestAdapter
     var credentialRef: KeychainRef
     var inlineSecret: String?
     var models: [CLIProviderModel]
@@ -60,7 +79,10 @@ struct CLIProviderRoute: Equatable, Sendable {
         let variants = CLIInferenceProfiles.reasoningLevels.map { effort in
             CLIProviderVariant(
                 id: "reasoning-\(effort.rawValue)",
-                requestOptions: ["reasoning_effort": .string(effort.rawValue)])
+                requestOptions: [
+                    "reasoningEffort":
+                        .string(effort.rawValue),
+                ])
         }
         return CLIProviderRoute(
             id: routeID,
@@ -68,6 +90,7 @@ struct CLIProviderRoute: Equatable, Sendable {
             baseURL: baseURL,
             chatEndpoint: nil,
             wire: wire,
+            requestAdapter: .openAICompatible,
             credentialRef: CLIInferenceRouteIdentity.inlineCredentialRef(
                 routeID: routeID,
                 baseURL: baseURL,
@@ -180,6 +203,9 @@ struct CLIModernProviderConfig: Sendable {
                 baseURL: baseURL,
                 chatEndpoint: chatEndpoint,
                 wire: .openai,
+                requestAdapter:
+                    .configuredProvider(
+                        provider.string("npm")),
                 credentialRef: credentialRef,
                 inlineSecret: nil,
                 models: models))
@@ -309,6 +335,7 @@ struct CLIModernProviderConfig: Sendable {
                     id: modelID,
                     displayName: name,
                     requestOptions: modelOptions,
+                    configurationMetadata: object,
                     variants: variants,
                     declaredCapabilities:
                         ModelCapabilityMetadata
@@ -357,6 +384,11 @@ struct CLIModernProviderConfig: Sendable {
     private static func reasoningEffort(
         in options: [String: JSONValue]
     ) -> ReasoningEffort? {
+        if case .string(let value) =
+            options["reasoningEffort"] {
+            return ReasoningEffort(
+                rawValue: value.lowercased())
+        }
         if case .string(let value) = options["reasoning_effort"] {
             return ReasoningEffort(rawValue: value.lowercased())
         }

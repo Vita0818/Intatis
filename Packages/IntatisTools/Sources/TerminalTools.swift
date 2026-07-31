@@ -11,7 +11,7 @@ import Musl
 
 // MARK: - Managed terminal process sessions
 
-private final class BoundedOutputDrain: @unchecked Sendable {
+final class BoundedOutputDrain: @unchecked Sendable {
     struct Snapshot {
         let data: Data
         let nextOffset: UInt64
@@ -1175,7 +1175,7 @@ private func writeAllNonBlocking(_ data: Data, to descriptor: Int32) throws {
     }
 }
 
-private func configureNonBlockingTerminalDescriptor(
+func configureNonBlockingTerminalDescriptor(
     _ descriptor: Int32
 ) throws {
     let currentFlags = systemFcntl(descriptor, F_GETFL, 0)
@@ -1228,7 +1228,7 @@ private func killAndReapManagedProcess(_ pid: Int32) {
     _ = waitAndReap(pid: pid)
 }
 
-private func systemPipe(_ descriptors: inout [Int32]) -> Int32 {
+func systemPipe(_ descriptors: inout [Int32]) -> Int32 {
     descriptors.withUnsafeMutableBufferPointer {
         #if canImport(Darwin)
         Darwin.pipe($0.baseAddress!)
@@ -1242,9 +1242,9 @@ private func systemPipe(_ descriptors: inout [Int32]) -> Int32 {
     }
 }
 
-private func systemFcntl(_ descriptor: Int32,
-                         _ command: Int32,
-                         _ value: Int32) -> Int32 {
+func systemFcntl(_ descriptor: Int32,
+                 _ command: Int32,
+                 _ value: Int32) -> Int32 {
     #if canImport(Darwin)
     Darwin.fcntl(descriptor, command, value)
     #elseif canImport(Glibc)
@@ -1270,9 +1270,9 @@ private func systemWrite(_ descriptor: Int32,
     #endif
 }
 
-private func systemRead(_ descriptor: Int32,
-                        _ buffer: UnsafeMutableRawPointer,
-                        _ count: Int) -> Int {
+func systemRead(_ descriptor: Int32,
+                _ buffer: UnsafeMutableRawPointer,
+                _ count: Int) -> Int {
     #if canImport(Darwin)
     Darwin.read(descriptor, buffer, count)
     #elseif canImport(Glibc)
@@ -1284,7 +1284,7 @@ private func systemRead(_ descriptor: Int32,
     #endif
 }
 
-private func systemClose(_ descriptor: Int32) {
+func systemClose(_ descriptor: Int32) {
     #if canImport(Darwin)
     _ = Darwin.close(descriptor)
     #elseif canImport(Glibc)
@@ -1294,7 +1294,7 @@ private func systemClose(_ descriptor: Int32) {
     #endif
 }
 
-private func systemErrno() -> Int32 {
+func systemErrno() -> Int32 {
     #if canImport(Darwin)
     Darwin.errno
     #elseif canImport(Glibc)

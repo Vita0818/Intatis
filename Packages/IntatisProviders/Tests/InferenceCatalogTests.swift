@@ -30,6 +30,50 @@ final class InferenceCatalogTests: XCTestCase {
         XCTAssertEqual(merged["service_tier"], .string("priority"))
     }
 
+    func testDeepMergeMatchesOpenCodePlainObjectOverlay() throws {
+        let merged = try InferenceRequestOptionMerge.deepMerge([
+            [
+                "provider": .object([
+                    "only": .array([
+                        .string("one"),
+                        .string("two"),
+                    ]),
+                    "allow_fallbacks": .bool(true),
+                    "max_price": .object([
+                        "prompt": .number(1),
+                        "completion": .number(1),
+                    ]),
+                ]),
+            ],
+            [
+                "provider": .object([
+                    "only": .array([
+                        .string("three"),
+                    ]),
+                    "require_parameters":
+                        .bool(true),
+                    "max_price": .object([
+                        "completion": .number(2),
+                    ]),
+                ]),
+            ],
+        ])
+
+        XCTAssertEqual(
+            merged["provider"],
+            .object([
+                "only": .array([
+                    .string("three"),
+                ]),
+                "allow_fallbacks": .bool(true),
+                "require_parameters": .bool(true),
+                "max_price": .object([
+                    "prompt": .number(1),
+                    "completion": .number(2),
+                ]),
+            ]))
+    }
+
     func testSecretLikeOptionValidationIsRecursiveAndDoesNotEchoMaterial() {
         let rawSecret = "ghp_abcdefghijklmnopqrstuvwxyz123456"
         XCTAssertThrowsError(try InferenceRequestOptionValidation.validateNonSecret([
@@ -149,6 +193,70 @@ final class InferenceCatalogTests: XCTestCase {
         XCTAssertEqual(first.profiles.count, 1)
         XCTAssertEqual(first.currentConnectionRefs.first?.inferenceConnectionRevision.rawValue, "1")
         XCTAssertEqual(first.currentProfileRefs.first?.inferenceProfileRevision.rawValue, "1")
+    }
+
+    func testRequestAdapterChangeCreatesNewConnectionAndProfileRevisions()
+        throws {
+        let legacy = try InferenceCatalogReconciler
+            .reconcile(
+                draft: makeCatalogDraft(
+                    requestAdapter:
+                        .legacyOpenAIWire))
+        let compatible = try InferenceCatalogReconciler
+            .reconcile(
+                existing: legacy,
+                draft: makeCatalogDraft(
+                    requestAdapter:
+                        .openAICompatible))
+
+        XCTAssertEqual(compatible.connections.count, 2)
+        XCTAssertEqual(compatible.profiles.count, 2)
+        let current = try InferenceCatalogSnapshot(
+            catalog: compatible).resolve(
+                XCTUnwrap(
+                    compatible.currentProfileRefs.first))
+        XCTAssertEqual(
+            current.connection.requestAdapter,
+            .openAICompatible)
+        XCTAssertEqual(
+            current.profile.requestAdapter,
+            .openAICompatible)
+    }
+
+    func testSchemaOneConnectionStillEncodesRequiredEmptyOptions()
+        throws {
+        let catalog =
+            try InferenceCatalogReconciler.reconcile(
+                draft: InferenceCatalogDraft(
+                    connections: [
+                        InferenceConnectionDraft(
+                            inferenceConnectionID:
+                                connectionID,
+                            wire: .openai,
+                            requestAdapter:
+                                .openAICompatible,
+                            baseURL: URL(
+                                string:
+                                    "https://example.test/v1")!,
+                            credentialRef:
+                                .environment(
+                                    "TEST_API_KEY"),
+                            defaultRequestOptions:
+                                [:]),
+                    ],
+                    profiles: [
+                        makeProfileDraft(),
+                    ]))
+        let data = try JSONEncoder().encode(catalog)
+        let root = try XCTUnwrap(
+            JSONSerialization.jsonObject(
+                with: data) as? [String: Any])
+        let connections = try XCTUnwrap(
+            root["connections"]
+                as? [[String: Any]])
+        XCTAssertNotNil(
+            try XCTUnwrap(connections.first)[
+                "defaultRequestOptions"])
     }
 
     func testProfileSemanticChangeAppendsRevisionAndRetainsOldRevision() throws {
@@ -371,21 +479,33 @@ final class InferenceCatalogTests: XCTestCase {
     private func makeCatalogDraft(
         baseURL: URL = URL(string: "https://example.test/v1")!,
         credentialRef: KeychainRef = .environment("TEST_API_KEY"),
-        profileOptions: [String: JSONValue] = [:]
+        profileOptions: [String: JSONValue] = [:],
+        requestAdapter:
+            ProviderRequestAdapter =
+                .legacyOpenAIWire
     ) -> InferenceCatalogDraft {
         InferenceCatalogDraft(
-            connections: [makeConnectionDraft(baseURL: baseURL, credentialRef: credentialRef)],
+            connections: [makeConnectionDraft(
+                baseURL: baseURL,
+                credentialRef: credentialRef,
+                requestAdapter:
+                    requestAdapter)],
             profiles: [makeProfileDraft(profileOptions: profileOptions)])
     }
 
     private func makeConnectionDraft(
         baseURL: URL = URL(string: "https://example.test/v1")!,
         chatEndpoint: URL? = nil,
-        credentialRef: KeychainRef = .environment("TEST_API_KEY")
+        credentialRef: KeychainRef = .environment("TEST_API_KEY"),
+        requestAdapter:
+            ProviderRequestAdapter =
+                .legacyOpenAIWire
     ) -> InferenceConnectionDraft {
         InferenceConnectionDraft(
             inferenceConnectionID: connectionID,
             wire: .openai,
+            requestAdapter:
+                requestAdapter,
             baseURL: baseURL,
             chatEndpoint: chatEndpoint,
             credentialRef: credentialRef,

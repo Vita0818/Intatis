@@ -23,6 +23,7 @@ let package = Package(
         .library(name: "IntatisArtifacts", targets: ["IntatisArtifacts"]),
         .library(name: "IntatisConversation", targets: ["IntatisConversation"]),
         .library(name: "IntatisTools", targets: ["IntatisTools"]),
+        .library(name: "IntatisSkills", targets: ["IntatisSkills"]),
         .library(name: "IntatisPermission", targets: ["IntatisPermission"]),
         .library(name: "IntatisMCP", targets: ["IntatisMCP"]),
         .library(name: "IntatisMCPStdio", targets: ["IntatisMCPStdio"]),
@@ -106,6 +107,14 @@ let package = Package(
             path: "Packages/IntatisTools/Sources"
         ),
         .target(
+            name: "IntatisSkills",
+            dependencies: [
+                "IntatisCore", "IntatisProtocol", "IntatisTools",
+                "IntatisPermission",
+            ],
+            path: "Packages/IntatisSkills/Sources"
+        ),
+        .target(
             name: "IntatisPermission",
             // Providers added in v0.3 for the model-backed reviewer (layer B).
             dependencies: ["IntatisCore", "IntatisProtocol", "IntatisProviders"],
@@ -174,7 +183,7 @@ let package = Package(
             dependencies: [
                 "IntatisCore", "IntatisProtocol", "IntatisProviders",
                 "IntatisTools", "IntatisPermission", "IntatisConversation",
-                "IntatisArtifacts", "IntatisMCP",
+                "IntatisArtifacts", "IntatisMCP", "IntatisSkills",
                 .product(
                     name: "Crypto",
                     package: "swift-crypto",
@@ -189,6 +198,7 @@ let package = Package(
             dependencies: [
                 "IntatisCore", "IntatisProtocol", "IntatisProviders", "IntatisTools",
                 "IntatisPermission", "IntatisConversation", "IntatisAgentKernel",
+                "IntatisSkills",
             ],
             path: "Packages/IntatisCowork/Sources"
         ),
@@ -222,7 +232,7 @@ let package = Package(
             dependencies: [
                 "IntatisCore", "IntatisProtocol", "IntatisProviders", "IntatisConversation",
                 "IntatisTools", "IntatisPermission", "IntatisAgentKernel", "IntatisCowork",
-                "IntatisMCP", "IntatisMCPStdio",
+                "IntatisMCP", "IntatisMCPStdio", "IntatisSkills",
                 .product(
                     name: "Crypto",
                     package: "swift-crypto",
@@ -278,6 +288,13 @@ let package = Package(
             path: "Packages/IntatisTools/Tests"
         ),
         .testTarget(
+            name: "IntatisSkillsTests",
+            dependencies: [
+                "IntatisSkills", "IntatisCore", "IntatisProtocol", "IntatisTools",
+            ],
+            path: "Packages/IntatisSkills/Tests"
+        ),
+        .testTarget(
             name: "IntatisPermissionTests",
             dependencies: ["IntatisPermission", "IntatisCore", "IntatisProtocol", "IntatisProviders"],
             path: "Packages/IntatisPermission/Tests"
@@ -313,7 +330,7 @@ let package = Package(
             dependencies: [
                 "IntatisAgentKernel", "IntatisCore", "IntatisProtocol", "IntatisProviders",
                 "IntatisTools", "IntatisPermission", "IntatisConversation",
-                "IntatisArtifacts", "IntatisMCP",
+                "IntatisArtifacts", "IntatisMCP", "IntatisSkills",
                 .product(
                     name: "Crypto",
                     package: "swift-crypto",
@@ -327,6 +344,7 @@ let package = Package(
             dependencies: [
                 "IntatisCowork", "IntatisCore", "IntatisProtocol", "IntatisProviders",
                 "IntatisTools", "IntatisPermission", "IntatisConversation", "IntatisAgentKernel",
+                "IntatisSkills",
             ],
             path: "Packages/IntatisCowork/Tests"
         ),

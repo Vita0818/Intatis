@@ -37,13 +37,15 @@ permanent adjacent ledger at
 `Vendor/SwiftStreamingMarkdown/INTATIS_PATCH_LEDGER.md` records
 dependency/resource thinning, ownership-transfer and Swift 6 concurrency
 hardening, disabled optional features, a native code-copy control, zero native
-paragraph-view retention, the later audited single-dollar inline-math patch,
+paragraph-view retention, the later audited code-aware LaTeX patch,
 and focused test changes. The initial import removed HighlightSwift, iosMath,
 Shimmer, SnapshotTesting, upstream branded color/media assets, the unsafe
 regex-based math path, syntax-highlighting implementations, and obsolete
 optional-feature tests/snapshots. The current derivative does not restore that
-old math implementation: it adds a code-aware, bounded single-dollar path and
-an exact iosMath 2.5.0 dependency while block math remains disabled.
+old math implementation: it adds a request-local, code-aware path for common
+inline and display delimiters plus an exact iosMath 2.5.0 dependency, without
+Intatis-specific formula-count, per-formula byte, or fixed attachment-size
+caps.
 HighlightSwift, Shimmer, SnapshotTesting, branded assets, images, citations,
 animation, and syntax highlighting remain removed or disabled. The
 derivative's directly retained resource is the localization catalog; iosMath
@@ -52,14 +54,20 @@ license/readme data. The derivative manifest contains only the library and
 test targets; scratch validation probes and executable targets are absent
 from the vendored tree.
 
+The current macOS derivative also removes competing intrinsic paragraph
+width, returns the exact SwiftUI proposal width with a measured height, and
+bounds paragraph measurement memoization to the latest exact width. This is a
+local derivative patch; it does not change the upstream basis, license,
+parser dependency, or iosMath dependency.
+
 ## iosMath integration
 
 - Upstream: <https://github.com/kostub/iosMath>
 - Version/tag: `2.5.0`
 - Commit: `838cddc01fdd67efd530f8bb67959ad2715f9b06`
 - Local reuse mode: `dependency` (exact, conditioned on iOS and macOS)
-- Product role: native TeX parsing and layout for code-aware single-dollar
-  inline math
+- Product role: native TeX parsing and layout for code-aware inline and
+  display math
 - Package dependencies: none
 - Engine license: MIT
 
@@ -69,9 +77,9 @@ the shipped GUST notice, attributions, resource inventory, and distribution
 approval.
 The font resources are not part of Microsoft's source or license.
 The derivative hosts accepted formulas as live TextKit 2
-`MTMathUILabel` attachment views with a 1024×256-point preflight bound,
-semantic appearance, Dynamic Type-aware configuration, and exact literal
-fallback. It does not generate or retain formula raster previews.
+`MTMathUILabel` attachment views using intrinsic layout, semantic appearance,
+Dynamic Type-aware configuration, and exact literal fallback. It does not
+generate or retain formula raster previews.
 
 ### MIT License
 

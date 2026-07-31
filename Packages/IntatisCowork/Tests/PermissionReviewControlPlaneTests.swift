@@ -486,10 +486,17 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
     private let main = AgentID(rawValue: "main")
     private let reviewerID = Orchestrator.automaticPermissionReviewerID
 
-    func testDefaultReviewerCompletionAllowanceLeavesRoomForStructuredVerdict() {
+    func testDefaultReviewerBudgetLeavesRoomForStructuredVerdict() {
+        let policy = PermissionReviewControlPlanePolicy()
+        XCTAssertEqual(policy.timeoutSeconds, 120)
         XCTAssertEqual(
-            PermissionReviewControlPlanePolicy().reservedCompletionTokens,
-            1_024)
+            policy.reservedCompletionTokens,
+            4_096)
+        XCTAssertEqual(
+            PermissionReviewControlPlanePolicy(
+                reservedCompletionTokens: 20_000
+            ).reservedCompletionTokens,
+            16_384)
     }
 
     func testCorruptDurableReviewHistoryDeniesBeforeProviderDispatch() async throws {

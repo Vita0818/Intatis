@@ -82,6 +82,8 @@ targets:
       - package: Intatis
         product: IntatisAgentKernel
       - package: Intatis
+        product: IntatisSkills
+      - package: Intatis
         product: IntatisCowork
       - package: Intatis
         product: IntatisMCP
@@ -132,6 +134,8 @@ targets:
         product: IntatisPermission
       - package: Intatis
         product: IntatisAgentKernel
+      - package: Intatis
+        product: IntatisSkills
       - package: Intatis
         product: IntatisCowork
       - package: Intatis

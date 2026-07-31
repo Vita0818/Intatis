@@ -30,6 +30,10 @@ public struct MCPConnectionReuseIdentity:
     public let environmentReference: MCPEnvironmentReference
     public let launchArtifactFingerprint: String?
     public let runtimeIdentityFingerprint: String
+    /// Opaque transport-locator assertion input for Skill dependency
+    /// preflight. The raw endpoint/executable never enters the provider-visible
+    /// availability snapshot.
+    public let skillDependencyLocatorFingerprint: String?
 
     public init(
         server: MCPServerReference,
@@ -39,7 +43,9 @@ public struct MCPConnectionReuseIdentity:
         oauthAccountReference: MCPAccountReference?,
         environmentReference: MCPEnvironmentReference,
         launchArtifactFingerprint: String?,
-        runtimeIdentityFingerprint: String
+        runtimeIdentityFingerprint: String,
+        skillDependencyLocatorFingerprint:
+            String? = nil
     ) {
         self.server = server
         self.transport = transport
@@ -50,6 +56,8 @@ public struct MCPConnectionReuseIdentity:
         self.environmentReference = environmentReference
         self.launchArtifactFingerprint = launchArtifactFingerprint
         self.runtimeIdentityFingerprint = runtimeIdentityFingerprint
+        self.skillDependencyLocatorFingerprint =
+            skillDependencyLocatorFingerprint
     }
 
     public var poolKey: MCPAuthorityPoolKey {

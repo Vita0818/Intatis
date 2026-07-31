@@ -109,7 +109,8 @@ private final class PhaseLSessionLifecycleFixtureModel: ObservableObject {
     let runtimeB: PhaseLFixtureRuntime
     let root: URL
 
-    init(root: URL, manager: AppSessionRuntimeManager = .shared) {
+    init(root: URL, manager: AppSessionRuntimeManager? = nil) {
+        let manager = manager ?? AppSessionRuntimeManager.shared
         self.root = root
         try? FileManager.default.createDirectory(
             at: root,

@@ -4,6 +4,7 @@ import IntatisCore
 import IntatisPermission
 import IntatisProtocol
 import IntatisProviders
+import IntatisSkills
 import IntatisTools
 
 /// Optional durable scope for one AgentLoop turn. Cowork hosts can supply a
@@ -33,6 +34,9 @@ public struct AgentExecutionScope: Equatable, Sendable {
 /// Cowork agent. UI/ViewModels own presentation; this type owns the common
 /// request/tool/permission configuration that must not drift between modes.
 public struct AgentRuntime: Sendable {
+    public static let defaultCodeMaxIterations = 50
+    public static let defaultCoworkMaxIterations = 64
+
     public let environment: RuntimeEnvironmentManifest
     public let registry: ToolRegistry
     public let engine: PermissionEngine
@@ -40,6 +44,10 @@ public struct AgentRuntime: Sendable {
     public let reasoningEffort: ReasoningEffort?
     public let includeUsage: Bool
     public let maxIterations: Int
+    /// Exact model metadata frozen with this runtime. `.unspecified` keeps
+    /// automatic history compaction disabled; callers must never infer a
+    /// context window from a model identifier.
+    public let modelContextPolicy: AgentModelContextPolicy
 
     public init(environment: RuntimeEnvironmentManifest,
                 registry: ToolRegistry,
@@ -47,7 +55,8 @@ public struct AgentRuntime: Sendable {
                 allowsShell: Bool,
                 reasoningEffort: ReasoningEffort? = nil,
                 includeUsage: Bool = false,
-                maxIterations: Int = 50) {
+                maxIterations: Int = AgentRuntime.defaultCodeMaxIterations,
+                modelContextPolicy: AgentModelContextPolicy = .unspecified) {
         self.environment = environment
         self.registry = registry
         self.engine = engine
@@ -55,20 +64,23 @@ public struct AgentRuntime: Sendable {
         self.reasoningEffort = reasoningEffort
         self.includeUsage = includeUsage
         self.maxIterations = max(1, maxIterations)
+        self.modelContextPolicy = modelContextPolicy
     }
 
     public static func code(registry: ToolRegistry = .standard(),
                             allowsShell: Bool,
                             reasoningEffort: ReasoningEffort? = nil,
                             includeUsage: Bool = false,
-                            maxIterations: Int = 50) -> AgentRuntime {
+                            maxIterations: Int = AgentRuntime.defaultCodeMaxIterations,
+                            modelContextPolicy: AgentModelContextPolicy = .unspecified) -> AgentRuntime {
         AgentRuntime(
             environment: .code,
             registry: registry,
             allowsShell: allowsShell,
             reasoningEffort: reasoningEffort,
             includeUsage: includeUsage,
-            maxIterations: maxIterations)
+            maxIterations: maxIterations,
+            modelContextPolicy: modelContextPolicy)
     }
 
     public static func cowork(registry: ToolRegistry,
@@ -76,7 +88,8 @@ public struct AgentRuntime: Sendable {
                               allowsShell: Bool,
                               reasoningEffort: ReasoningEffort? = nil,
                               includeUsage: Bool = false,
-                              maxIterations: Int = 50) -> AgentRuntime {
+                              maxIterations: Int = AgentRuntime.defaultCoworkMaxIterations,
+                              modelContextPolicy: AgentModelContextPolicy = .unspecified) -> AgentRuntime {
         AgentRuntime(
             environment: .cowork,
             registry: registry,
@@ -84,7 +97,8 @@ public struct AgentRuntime: Sendable {
             allowsShell: allowsShell,
             reasoningEffort: reasoningEffort,
             includeUsage: includeUsage,
-            maxIterations: maxIterations)
+            maxIterations: maxIterations,
+            modelContextPolicy: modelContextPolicy)
     }
 
     public func makeLoop(log: EventLog,
@@ -116,6 +130,7 @@ public struct AgentRuntime: Sendable {
             systemPrompt: supplied.systemPrompt,
             taskContract: supplied.taskContract,
             contextBundle: supplied.contextBundle,
+            skillSnapshot: supplied.skillSnapshot,
             runtimeEnvironment: environment,
             conversationHistoryPolicy: supplied.conversationHistoryPolicy)
         return AgentLoop(
@@ -138,6 +153,7 @@ public struct AgentRuntime: Sendable {
             sessionNaming: sessionNaming,
             reasoningEffort: reasoningEffort,
             includeUsage: includeUsage,
+            modelContextPolicy: modelContextPolicy,
             maxIterations: maxIterations,
             capabilityLease: capabilityLease,
             workspaceLease: workspaceLease,

@@ -123,6 +123,11 @@ public struct Envelope: Codable, Equatable, Sendable {
             return .messageCompleted(try c.decode(MessageCompletedPayload.self, forKey: .payload))
         case .modelHistoryItem:
             return .modelHistoryItem(try c.decode(ModelHistoryItemPayload.self, forKey: .payload))
+        case .modelHistoryCompacted:
+            return .modelHistoryCompacted(
+                try c.decode(
+                    ModelHistoryCompactedPayload.self,
+                    forKey: .payload))
         case .error:
             return .error(try c.decode(ErrorPayload.self, forKey: .payload))
         case .toolCall:
@@ -363,6 +368,8 @@ public struct Envelope: Codable, Equatable, Sendable {
         case .messageDelta(let p):       try c.encode(p, forKey: .payload)
         case .messageCompleted(let p):   try c.encode(p, forKey: .payload)
         case .modelHistoryItem(let p):   try c.encode(p, forKey: .payload)
+        case .modelHistoryCompacted(let p):
+            try c.encode(p, forKey: .payload)
         case .error(let p):              try c.encode(p, forKey: .payload)
         case .toolCall(let p):           try c.encode(p, forKey: .payload)
         case .toolResult(let p):         try c.encode(p, forKey: .payload)

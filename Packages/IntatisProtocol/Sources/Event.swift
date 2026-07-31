@@ -572,6 +572,7 @@ public enum Event: Equatable, Sendable {
     case messageDelta(MessageDeltaPayload)
     case messageCompleted(MessageCompletedPayload)
     case modelHistoryItem(ModelHistoryItemPayload)
+    case modelHistoryCompacted(ModelHistoryCompactedPayload)
     case error(ErrorPayload)
     // v0.2
     case toolCall(ToolCallPayload)
@@ -702,6 +703,7 @@ public enum Event: Equatable, Sendable {
         case messageDelta = "message_delta"
         case messageCompleted = "message_completed"
         case modelHistoryItem = "model_history_item"
+        case modelHistoryCompacted = "model_history_compacted"
         case error = "error"
         case toolCall = "tool_call"
         case toolResult = "tool_result"
@@ -823,6 +825,7 @@ public enum Event: Equatable, Sendable {
         case .messageDelta:       return .messageDelta
         case .messageCompleted:   return .messageCompleted
         case .modelHistoryItem:   return .modelHistoryItem
+        case .modelHistoryCompacted: return .modelHistoryCompacted
         case .error:              return .error
         case .toolCall:           return .toolCall
         case .toolResult:         return .toolResult

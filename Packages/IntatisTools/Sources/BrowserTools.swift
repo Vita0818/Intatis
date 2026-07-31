@@ -1,5 +1,6 @@
 import Foundation
 import IntatisCore
+import IntatisProtocol
 
 #if canImport(FoundationNetworking)
 import FoundationNetworking
@@ -56,8 +57,29 @@ private enum BrowserToolConfig {
         try PathConfinement.resolve(".intatis/browser/history.jsonl", within: workspace)
     }
 
-    static func prepare(profile: String, workspace: URL) throws -> BrowserPaths {
+    static func executionTouchedPaths(profile: String) -> [String] {
+        [
+            ".intatis/browser/profiles/\(profile)",
+            ".intatis/browser/downloads/\(profile)",
+            ".intatis/browser/state/\(profile).json",
+            ".intatis/browser/history.jsonl",
+        ]
+    }
+
+    static func prepare(profile: String,
+                        workspace: URL,
+                        workspaceLease: WorkspaceLease) throws -> BrowserPaths {
         let paths = try paths(profile: profile, workspace: workspace)
+        _ = try validateBrowserWorkspaceAccess(
+            readablePaths: [],
+            writablePaths: [
+                paths.profileDir.path,
+                paths.downloadsDir.path,
+                paths.stateFile.path,
+                paths.historyFile.path,
+            ],
+            cwd: workspace,
+            workspaceLease: workspaceLease)
         try FileManager.default.createDirectory(at: paths.profileDir, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: paths.downloadsDir, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: paths.stateFile.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -85,6 +107,17 @@ private enum BrowserToolConfig {
             throw IntatisError.config("URL must be http(s) with a host")
         }
         return url
+    }
+
+    static func validatedHTTPURLString(_ raw: String) throws -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        _ = try validatedHTTPURL(trimmed)
+        return trimmed
+    }
+
+    static func httpURLStringIfValid(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        return try? validatedHTTPURLString(raw)
     }
 }
 
@@ -215,8 +248,23 @@ private struct BrowserDiagnosticsResult: Decodable {
     let browserApps: [String: Bool]?
 }
 
-private func browserShellQuote(_ text: String) -> String {
-    "'\(text.replacingOccurrences(of: "'", with: "'\\''"))'"
+private func browserBackendInvocation(
+    javaScript: String,
+    encodedArguments: String,
+    arguments: [String: Any]
+) -> BrowserBackendInvocation {
+    let readable = ["filePath"].compactMap { arguments[$0] as? String }
+    let writable = [
+        "profileDir",
+        "downloadsDir",
+        "stateFile",
+        "outputPath",
+    ].compactMap { arguments[$0] as? String }
+    return BrowserBackendInvocation(
+        javaScript: javaScript,
+        encodedArguments: encodedArguments,
+        readableWorkspacePaths: Array(Set(readable)).sorted(),
+        writableWorkspacePaths: Array(Set(writable)).sorted())
 }
 
 private func browserJSONLine(from stdout: String) throws -> String {
@@ -479,7 +527,7 @@ private func browserHistorySummaries(at historyURL: URL) -> [String: BrowserProf
         summary.count += 1
         summary.latestTimestamp = entry.ts
         summary.latestAction = entry.action
-        summary.latestURL = entry.url
+        summary.latestURL = BrowserToolConfig.httpURLStringIfValid(entry.url)
         summary.latestTitle = entry.title
         summaries[profile] = summary
     }
@@ -557,7 +605,9 @@ private func browserProfileMetadata(profile: String,
     let downloadsURL = try BrowserToolConfig.downloadsURL(profile: profile, workspace: workspace)
     let stateURL = try BrowserToolConfig.stateURL(profile: profile, workspace: workspace)
     let state = browserStateDictionary(at: stateURL)
-    let navigationStack = state["navigationStack"] as? [Any]
+    let navigationStack = (state["navigationStack"] as? [Any])?.compactMap {
+        BrowserToolConfig.httpURLStringIfValid($0 as? String)
+    }
     let navigationIndex = state["navigationIndex"] as? Int
         ?? (state["navigationIndex"] as? NSNumber)?.intValue
         ?? ((state["navigationIndex"] as? String).flatMap(Int.init))
@@ -570,7 +620,7 @@ private func browserProfileMetadata(profile: String,
         downloadDirectory: browserDirectoryMetadata(at: downloadsURL, includeRecursiveSize: true),
         runtime: browserProfileRuntimeMetadata(at: profileURL),
         stateExists: FileManager.default.fileExists(atPath: stateURL.path),
-        currentURL: state["url"] as? String,
+        currentURL: BrowserToolConfig.httpURLStringIfValid(state["url"] as? String),
         currentTitle: state["title"] as? String,
         updatedAt: state["updatedAt"] as? String,
         screenshotPath: state["screenshotPath"] as? String,
@@ -795,8 +845,7 @@ private func browserHistoryStackFromMetadata(paths: BrowserPaths) -> [String] {
     for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
         guard let entry = try? decoder.decode(BrowserHistoryEntry.self, from: Data(line.utf8)),
               entry.profile == paths.profile,
-              let url = entry.url?.trimmingCharacters(in: .whitespacesAndNewlines),
-              url.isEmpty == false else {
+              let url = BrowserToolConfig.httpURLStringIfValid(entry.url) else {
             continue
         }
         if stack.last != url {
@@ -808,10 +857,11 @@ private func browserHistoryStackFromMetadata(paths: BrowserPaths) -> [String] {
 
 private func browserNavigationSnapshot(paths: BrowserPaths) -> (stack: [String], index: Int, currentURL: String?) {
     let previousState = browserStateDictionary(at: paths.stateFile)
-    let currentURL = (previousState["url"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let currentURL = BrowserToolConfig.httpURLStringIfValid(previousState["url"] as? String)
     let rawStack = previousState["navigationStack"] as? [Any]
-    var stack = rawStack?.compactMap { ($0 as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) }
-        .filter { $0.isEmpty == false } ?? []
+    var stack = rawStack?.compactMap {
+        BrowserToolConfig.httpURLStringIfValid($0 as? String)
+    } ?? []
     if stack.isEmpty {
         stack = browserHistoryStackFromMetadata(paths: paths)
     }
@@ -850,7 +900,7 @@ private func browserHistoryNavigationURL(direction: BrowserHistoryDirection, pat
     guard snapshot.stack.indices.contains(targetIndex) else {
         throw IntatisError.config(direction.missingEntryMessage)
     }
-    return snapshot.stack[targetIndex]
+    return try BrowserToolConfig.validatedHTTPURLString(snapshot.stack[targetIndex])
 }
 
 private func updateBrowserStateAndHistory(_ result: BrowserActionResult, paths: BrowserPaths) throws {
@@ -859,7 +909,10 @@ private func updateBrowserStateAndHistory(_ result: BrowserActionResult, paths: 
 
     let timestamp = ISO8601DateFormatter().string(from: Date())
     let snapshot = browserNavigationSnapshot(paths: paths)
-    let resultURL = (result.url ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    let rawResultURL = (result.url ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    let resultURL = rawResultURL.isEmpty
+        ? ""
+        : try BrowserToolConfig.validatedHTTPURLString(rawResultURL)
     var navigationStack = snapshot.stack
     var navigationIndex = snapshot.index
     if resultURL.isEmpty == false {
@@ -1008,13 +1061,12 @@ private func browserProfileDeleteOutput(profile: String,
     return lines.joined(separator: "\n")
 }
 
-private func playwrightCommand(arguments: [String: Any]) throws -> String {
+private func playwrightCommand(
+    arguments: [String: Any]
+) throws -> BrowserBackendInvocation {
     let data = try JSONSerialization.data(withJSONObject: arguments, options: [])
     let payload = data.base64EncodedString()
-    return """
-    set -e
-    command -v node >/dev/null 2>&1 || { echo "node is not installed; install Node.js and Playwright to use Intatis browser tools" >&2; exit 127; }
-    INTATIS_BROWSER_ARGS=\(browserShellQuote(payload)) node <<'INTATIS_BROWSER_NODE'
+    let javaScript = """
     const fs = require('fs');
     const path = require('path');
     const childProcess = require('child_process');
@@ -1190,14 +1242,28 @@ private func playwrightCommand(arguments: [String: Any]) throws -> String {
     let playwrightInfo = loadPlaywright();
     ({ chromium } = playwrightInfo.mod);
 
+    function validatedNavigationURL(value) {
+      if (typeof value !== 'string' || !value.trim()) return undefined;
+      try {
+        const parsed = new URL(value.trim());
+        if (!['http:', 'https:'].includes(parsed.protocol) || !parsed.hostname) {
+          throw new Error('unsupported browser URL');
+        }
+        return parsed.toString();
+      } catch (_) {
+        throw new Error('browser URL must be http(s) with a host');
+      }
+    }
+
     function readStateURL() {
+      let state;
       try {
         if (!args.stateFile || !fs.existsSync(args.stateFile)) return undefined;
-        const state = JSON.parse(fs.readFileSync(args.stateFile, 'utf8'));
-        return typeof state.url === 'string' && state.url.length ? state.url : undefined;
+        state = JSON.parse(fs.readFileSync(args.stateFile, 'utf8'));
       } catch (_) {
         return undefined;
       }
+      return validatedNavigationURL(state && state.url);
     }
 
     function launchOptions() {
@@ -1205,7 +1271,11 @@ private func playwrightCommand(arguments: [String: Any]) throws -> String {
         headless: args.headless !== false,
         acceptDownloads: true,
         downloadsPath: args.downloadsDir,
-        viewport: { width: 1280, height: 900 }
+        viewport: { width: 1280, height: 900 },
+        args: [
+          '--disable-breakpad',
+          '--disable-crashpad-for-testing'
+        ]
       };
       if (args.channel && args.channel !== 'chromium') options.channel = args.channel;
       return options;
@@ -1337,7 +1407,7 @@ private func playwrightCommand(arguments: [String: Any]) throws -> String {
 
     async function openPage(context) {
       const page = context.pages()[0] || await context.newPage();
-      const targetURL = args.url || readStateURL();
+      const targetURL = args.url ? validatedNavigationURL(args.url) : readStateURL();
       if (!targetURL) throw new Error('no current browser URL; call browser_navigate or browser_search first');
       await page.goto(targetURL, { waitUntil: 'domcontentloaded', timeout: 45000 });
       return page;
@@ -1661,17 +1731,19 @@ private func playwrightCommand(arguments: [String: Any]) throws -> String {
       console.error(error && error.stack ? error.stack : String(error));
       process.exit(1);
     });
-    INTATIS_BROWSER_NODE
     """
+    return browserBackendInvocation(
+        javaScript: javaScript,
+        encodedArguments: payload,
+        arguments: arguments)
 }
 
-private func cdpCommand(arguments: [String: Any]) throws -> String {
+private func cdpCommand(
+    arguments: [String: Any]
+) throws -> BrowserBackendInvocation {
     let data = try JSONSerialization.data(withJSONObject: arguments, options: [])
     let payload = data.base64EncodedString()
-    return """
-    set -e
-    command -v node >/dev/null 2>&1 || { echo "node is not installed; install Node.js to use Intatis browser tools" >&2; exit 127; }
-    INTATIS_BROWSER_ARGS=\(browserShellQuote(payload)) node <<'INTATIS_CDP_NODE'
+    let javaScript = """
     const fs = require('fs');
     const path = require('path');
     const childProcess = require('child_process');
@@ -1769,14 +1841,28 @@ private func cdpCommand(arguments: [String: Any]) throws -> String {
       return '';
     }
 
+    function validatedNavigationURL(value) {
+      if (typeof value !== 'string' || !value.trim()) return undefined;
+      try {
+        const parsed = new URL(value.trim());
+        if (!['http:', 'https:'].includes(parsed.protocol) || !parsed.hostname) {
+          throw new Error('unsupported browser URL');
+        }
+        return parsed.toString();
+      } catch (_) {
+        throw new Error('browser URL must be http(s) with a host');
+      }
+    }
+
     function readStateURL() {
+      let state;
       try {
         if (!args.stateFile || !fs.existsSync(args.stateFile)) return undefined;
-        const state = JSON.parse(fs.readFileSync(args.stateFile, 'utf8'));
-        return typeof state.url === 'string' && state.url.length ? state.url : undefined;
+        state = JSON.parse(fs.readFileSync(args.stateFile, 'utf8'));
       } catch (_) {
         return undefined;
       }
+      return validatedNavigationURL(state && state.url);
     }
 
     function searchURL() {
@@ -1789,7 +1875,7 @@ private func cdpCommand(arguments: [String: Any]) throws -> String {
 
     function targetURL() {
       if (args.action === 'search') return searchURL();
-      return args.url || readStateURL();
+      return args.url ? validatedNavigationURL(args.url) : readStateURL();
     }
 
     function wait(ms) {
@@ -1810,29 +1896,120 @@ private func cdpCommand(arguments: [String: Any]) throws -> String {
       });
     }
 
-    async function waitForDevToolsActivePort(profileDir, timeoutMillis) {
+    function generationMismatch(message) {
+      const error = new Error(message);
+      error.generationMismatch = true;
+      return error;
+    }
+
+    function prepareDevToolsActivePort(profileDir) {
       const activePortFile = path.join(profileDir, 'DevToolsActivePort');
+      try {
+        fs.unlinkSync(activePortFile);
+      } catch (error) {
+        if (!error || error.code !== 'ENOENT') {
+          throw generationMismatch('could not remove the previous DevToolsActivePort safely');
+        }
+      }
+      return {
+        activePortFile,
+        notBeforeMillis: Date.now()
+      };
+    }
+
+    async function waitForDevToolsActivePort(generation, timeoutMillis, browserProcess, spawnError) {
       const started = Date.now();
       while (Date.now() - started < timeoutMillis) {
+        const launchError = spawnError();
+        if (launchError) {
+          throw new Error(`browser process failed to launch before exposing a DevTools port: ${launchError.message || launchError}`);
+        }
+        if (browserProcess.exitCode !== null || browserProcess.signalCode !== null) {
+          const outcome = browserProcess.exitCode !== null
+            ? `exit ${browserProcess.exitCode}`
+            : `signal ${browserProcess.signalCode}`;
+          throw new Error(`browser exited before exposing a DevTools port (${outcome})`);
+        }
         try {
-          const lines = fs.readFileSync(activePortFile, 'utf8').trim().split(/\\r?\\n/);
-          const port = Number(lines[0]);
-          if (Number.isFinite(port) && port > 0) return port;
-        } catch (_) {}
+          const stat = fs.lstatSync(generation.activePortFile);
+          const newestTimestamp = Math.max(stat.birthtimeMs || 0, stat.ctimeMs || 0, stat.mtimeMs || 0);
+          const currentUID = typeof process.getuid === 'function' ? process.getuid() : undefined;
+          if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1
+              || (currentUID !== undefined && stat.uid !== currentUID)
+              || stat.size <= 0 || stat.size > 1024
+              || newestTimestamp + 1000 < generation.notBeforeMillis) {
+            throw generationMismatch('DevToolsActivePort does not belong to the current browser launch');
+          }
+          const lines = fs.readFileSync(generation.activePortFile, 'utf8').trim().split(/\\r?\\n/);
+          if (lines.length >= 2) {
+            const port = Number(lines[0]);
+            const browserPath = String(lines[1] || '').trim();
+            if (!Number.isInteger(port) || port < 1 || port > 65535
+                || !/^\\/devtools\\/browser\\/[A-Za-z0-9._-]+$/.test(browserPath)) {
+              throw generationMismatch('DevToolsActivePort has an invalid current-launch endpoint');
+            }
+            const candidate = { port, browserPath };
+            try {
+              await validateDevToolsEndpoint(candidate);
+              return candidate;
+            } catch (error) {
+              if (error && error.generationMismatch) throw error;
+            }
+          }
+        } catch (error) {
+          if (error && error.generationMismatch) throw error;
+          if (error && error.code && error.code !== 'ENOENT') {
+            throw generationMismatch('DevToolsActivePort could not be validated for the current launch');
+          }
+        }
         await wait(100);
       }
       throw new Error('browser did not expose a DevTools port');
     }
 
     async function fetchJSON(url, options = {}) {
-      const response = await fetch(url, options);
+      const requestOptions = Object.assign({}, options);
+      if (!requestOptions.signal && typeof AbortSignal !== 'undefined'
+          && typeof AbortSignal.timeout === 'function') {
+        requestOptions.signal = AbortSignal.timeout(5000);
+      }
+      const response = await fetch(url, requestOptions);
       if (!response.ok) throw new Error(`CDP HTTP ${response.status} for ${url}`);
       return await response.json();
     }
 
+    function validatedLoopbackWebSocketURL(raw, port, expectedPath) {
+      let parsed;
+      try {
+        parsed = new URL(String(raw || ''));
+      } catch (_) {
+        throw generationMismatch('CDP returned an invalid WebSocket endpoint');
+      }
+      const hostname = parsed.hostname.toLowerCase().replace(/^\\[|\\]$/g, '');
+      const isLoopback = hostname === '127.0.0.1' || hostname === 'localhost' || hostname === '::1';
+      if (parsed.protocol !== 'ws:' || !isLoopback || Number(parsed.port) !== port
+          || (expectedPath && parsed.pathname !== expectedPath)) {
+        throw generationMismatch('CDP WebSocket endpoint does not match the current loopback launch');
+      }
+      return parsed.toString();
+    }
+
+    async function validateDevToolsEndpoint(candidate) {
+      const version = await fetchJSON(`http://127.0.0.1:${candidate.port}/json/version`);
+      validatedLoopbackWebSocketURL(
+        version && version.webSocketDebuggerUrl,
+        candidate.port,
+        candidate.browserPath
+      );
+    }
+
     async function listPageTargets(port) {
       const targets = await fetchJSON(`http://127.0.0.1:${port}/json/list`);
-      return targets.filter((item) => item.type === 'page' && item.webSocketDebuggerUrl);
+      return targets
+        .filter((item) => item.type === 'page' && item.webSocketDebuggerUrl)
+        .map((item) => Object.assign({}, item, {
+          webSocketDebuggerUrl: validatedLoopbackWebSocketURL(item.webSocketDebuggerUrl, port)
+        }));
     }
 
     async function pageTarget(port) {
@@ -1846,7 +2023,9 @@ private func cdpCommand(arguments: [String: Any]) throws -> String {
         }
       }
       if (!target || !target.webSocketDebuggerUrl) throw new Error('CDP page target is unavailable');
-      return target;
+      return Object.assign({}, target, {
+        webSocketDebuggerUrl: validatedLoopbackWebSocketURL(target.webSocketDebuggerUrl, port)
+      });
     }
 
     class CDPClient {
@@ -2666,14 +2845,17 @@ private func cdpCommand(arguments: [String: Any]) throws -> String {
       args.executablePath = executable;
       fs.mkdirSync(args.profileDir, { recursive: true });
       fs.mkdirSync(args.downloadsDir, { recursive: true });
-      try { fs.unlinkSync(path.join(args.profileDir, 'DevToolsActivePort')); } catch (_) {}
+      const devToolsGeneration = prepareDevToolsActivePort(args.profileDir);
 
       const launchArgs = [
         `--user-data-dir=${args.profileDir}`,
         '--remote-debugging-port=0',
+        '--remote-debugging-address=127.0.0.1',
         '--remote-allow-origins=*',
         '--no-first-run',
         '--no-default-browser-check',
+        '--disable-breakpad',
+        '--disable-crashpad-for-testing',
         '--use-mock-keychain',
         `--window-size=1280,900`,
         'about:blank'
@@ -2683,20 +2865,32 @@ private func cdpCommand(arguments: [String: Any]) throws -> String {
       }
 
       let stderr = '';
+      let browserSpawnError = null;
       const browser = childProcess.spawn(executable, launchArgs, { stdio: ['ignore', 'ignore', 'pipe'] });
+      const clients = [];
+      let client = null;
       activeBrowser = browser;
-      browser.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
-
-      const port = await waitForDevToolsActivePort(args.profileDir, 15000).catch((error) => {
-        if (stderr.trim()) throw new Error(`${error.message}: ${stderr.trim().slice(0, 4000)}`);
-        throw error;
+      browser.once('error', (error) => { browserSpawnError = error; });
+      browser.stderr.on('data', (chunk) => {
+        if (stderr.length < 4000) stderr += chunk.toString().slice(0, 4000 - stderr.length);
       });
-      const target = await pageTarget(port);
-      let client = new CDPClient(target.webSocketDebuggerUrl);
-      const clients = [client];
-      let currentTargetID = target.id;
-      await client.connect();
+
       try {
+        const devToolsEndpoint = await waitForDevToolsActivePort(
+          devToolsGeneration,
+          15000,
+          browser,
+          () => browserSpawnError
+        ).catch((error) => {
+          if (stderr.trim()) throw new Error(`${error.message}: ${stderr.trim()}`);
+          throw error;
+        });
+        const port = devToolsEndpoint.port;
+        const target = await pageTarget(port);
+        client = new CDPClient(target.webSocketDebuggerUrl);
+        clients.push(client);
+        let currentTargetID = target.id;
+        await client.connect();
         await enablePageClient(client);
 
         const url = targetURL();
@@ -2827,7 +3021,9 @@ private func cdpCommand(arguments: [String: Any]) throws -> String {
         summary.pageCount = Math.max(pageCount, targetsAfter.length || 0);
         console.log(JSON.stringify(summary));
       } finally {
-        try { await client.send('Browser.close', {}, 1500); } catch (_) {}
+        if (client) {
+          try { await client.send('Browser.close', {}, 1500); } catch (_) {}
+        }
         for (const item of clients) item.close();
         if (!(await waitForProcessExit(browser, 1500))) {
           try { browser.kill('SIGTERM'); } catch (_) {}
@@ -2836,6 +3032,7 @@ private func cdpCommand(arguments: [String: Any]) throws -> String {
             await waitForProcessExit(browser, 1000);
           }
         }
+        activeBrowser = null;
       }
     }
 
@@ -2845,17 +3042,38 @@ private func cdpCommand(arguments: [String: Any]) throws -> String {
       })
       .catch((error) => {
         clearTimeout(commandWatchdog);
-        console.error(error && error.stack ? error.stack : String(error));
-        process.exit(1);
-      });
-    INTATIS_CDP_NODE
+      console.error(error && error.stack ? error.stack : String(error));
+      process.exit(1);
+    });
     """
+    return browserBackendInvocation(
+        javaScript: javaScript,
+        encodedArguments: payload,
+        arguments: arguments)
 }
 
 private func browserBackendMissing(_ result: ShellResult) -> Bool {
     let message = result.stderr.isEmpty ? result.stdout : result.stderr
     return message.contains("playwright is not installed or not resolvable by Node")
         || message.contains("Cannot find module 'playwright'")
+}
+
+private func validateBrowserNavigationInput(arguments: [String: Any],
+                                            paths: BrowserPaths) throws {
+    if let explicitURL = arguments["url"] as? String,
+       explicitURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
+        _ = try BrowserToolConfig.validatedHTTPURLString(explicitURL)
+        return
+    }
+    guard (arguments["action"] as? String) != "search" else {
+        return
+    }
+    let state = browserStateDictionary(at: paths.stateFile)
+    guard let persistedURL = state["url"] as? String,
+          persistedURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else {
+        return
+    }
+    _ = try BrowserToolConfig.validatedHTTPURLString(persistedURL)
 }
 
 private func runPlaywright(arguments: [String: Any],
@@ -2880,11 +3098,16 @@ private func runPlaywrightUnlocked(arguments: [String: Any],
                                    maxCharacters: Int,
                                    redactions: [String] = [],
                                    changedFiles: [String]? = nil) async throws -> ToolObservation {
+    try validateBrowserNavigationInput(arguments: arguments, paths: paths)
     let command = try playwrightCommand(arguments: arguments)
-    var shellResult = try await context.networkStructuredShell.run(command, cwd: context.workspaceRoot)
+    var shellResult = try await context.browserBackend.run(
+        command,
+        cwd: context.workspaceRoot)
     if shellResult.exitCode != 0 && browserBackendMissing(shellResult) {
         let fallbackCommand = try cdpCommand(arguments: arguments)
-        shellResult = try await context.networkStructuredShell.run(fallbackCommand, cwd: context.workspaceRoot)
+        shellResult = try await context.browserBackend.run(
+            fallbackCommand,
+            cwd: context.workspaceRoot)
     }
     guard shellResult.exitCode == 0 else {
         var message = shellResult.stderr.isEmpty ? shellResult.stdout : shellResult.stderr
@@ -3100,7 +3323,10 @@ public struct BrowserDiagnosticsTool: Tool {
 
     public func touchedPaths(_ args: ToolArgs) -> [String] {
         let profile = (try? BrowserToolConfig.normalizedProfile((try? args.decode(Args.self))?.profile)) ?? BrowserToolConfig.defaultProfile
-        return [".intatis/browser/profiles/\(profile)", ".intatis/browser/history.jsonl"]
+        return [
+            ".intatis/browser/profiles/\(profile)",
+            ".intatis/browser/history.jsonl",
+        ]
     }
 
     public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {
@@ -3120,7 +3346,9 @@ public struct BrowserDiagnosticsTool: Tool {
             "historyFile": historyURL.path,
         ]
         let command = try playwrightCommand(arguments: payload)
-        let shellResult = try await context.structuredShell.run(command, cwd: context.workspaceRoot)
+        let shellResult = try await context.structuredShell.run(
+            command.injectedShellCommand,
+            cwd: context.workspaceRoot)
         guard shellResult.exitCode == 0 else {
             var message = shellResult.stderr.isEmpty ? shellResult.stdout : shellResult.stderr
             if message.count > 10_000 { message = String(message.prefix(10_000)) + "\n[truncated]" }
@@ -3333,7 +3561,7 @@ public struct BrowserNavigateTool: Tool {
 
     public func touchedPaths(_ args: ToolArgs) -> [String] {
         let profile = (try? BrowserToolConfig.normalizedProfile((try? args.decode(Args.self))?.profile)) ?? BrowserToolConfig.defaultProfile
-        return [".intatis/browser/profiles/\(profile)", ".intatis/browser/history.jsonl"]
+        return BrowserToolConfig.executionTouchedPaths(profile: profile)
     }
 
     public func risksNetwork(_ args: ToolArgs) -> Bool { true }
@@ -3342,7 +3570,10 @@ public struct BrowserNavigateTool: Tool {
         let a = try args.decode(Args.self)
         _ = try BrowserToolConfig.validatedHTTPURL(a.url)
         let profile = try BrowserToolConfig.normalizedProfile(a.profile)
-        let paths = try BrowserToolConfig.prepare(profile: profile, workspace: context.workspaceRoot)
+        let paths = try BrowserToolConfig.prepare(
+            profile: profile,
+            workspace: context.workspaceRoot,
+            workspaceLease: context.workspaceLease)
         let limit = maxCharacters(a.maxCharacters)
         let payload: [String: Any] = [
             "action": "navigate",
@@ -3387,7 +3618,7 @@ public struct BrowserSnapshotTool: Tool {
 
     public func touchedPaths(_ args: ToolArgs) -> [String] {
         let profile = (try? BrowserToolConfig.normalizedProfile((try? args.decode(Args.self))?.profile)) ?? BrowserToolConfig.defaultProfile
-        return [".intatis/browser/profiles/\(profile)", ".intatis/browser/history.jsonl"]
+        return BrowserToolConfig.executionTouchedPaths(profile: profile)
     }
 
     public func risksNetwork(_ args: ToolArgs) -> Bool { true }
@@ -3395,7 +3626,10 @@ public struct BrowserSnapshotTool: Tool {
     public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {
         let a = try args.decode(Args.self)
         let profile = try BrowserToolConfig.normalizedProfile(a.profile)
-        let paths = try BrowserToolConfig.prepare(profile: profile, workspace: context.workspaceRoot)
+        let paths = try BrowserToolConfig.prepare(
+            profile: profile,
+            workspace: context.workspaceRoot,
+            workspaceLease: context.workspaceLease)
         let limit = maxCharacters(a.maxCharacters)
         let payload: [String: Any] = [
             "action": "snapshot",
@@ -3439,11 +3673,7 @@ public struct BrowserHandoffTool: Tool {
 
     public func touchedPaths(_ args: ToolArgs) -> [String] {
         let profile = (try? BrowserToolConfig.normalizedProfile((try? args.decode(Args.self))?.profile)) ?? BrowserToolConfig.defaultProfile
-        return [
-            ".intatis/browser/profiles/\(profile)",
-            ".intatis/browser/state/\(profile).json",
-            ".intatis/browser/history.jsonl",
-        ]
+        return BrowserToolConfig.executionTouchedPaths(profile: profile)
     }
 
     public func risksNetwork(_ args: ToolArgs) -> Bool { true }
@@ -3451,7 +3681,10 @@ public struct BrowserHandoffTool: Tool {
     public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {
         let a = try args.decode(Args.self)
         let profile = try BrowserToolConfig.normalizedProfile(a.profile)
-        let paths = try BrowserToolConfig.prepare(profile: profile, workspace: context.workspaceRoot)
+        let paths = try BrowserToolConfig.prepare(
+            profile: profile,
+            workspace: context.workspaceRoot,
+            workspaceLease: context.workspaceLease)
         let limit = maxCharacters(a.maxCharacters)
         let handoffSeconds = min(max(a.handoffSeconds ?? 60, 1), 600)
         var payload: [String: Any] = [
@@ -3503,7 +3736,7 @@ public struct BrowserReloadTool: Tool {
 
     public func touchedPaths(_ args: ToolArgs) -> [String] {
         let profile = (try? BrowserToolConfig.normalizedProfile((try? args.decode(Args.self))?.profile)) ?? BrowserToolConfig.defaultProfile
-        return [".intatis/browser/profiles/\(profile)", ".intatis/browser/history.jsonl"]
+        return BrowserToolConfig.executionTouchedPaths(profile: profile)
     }
 
     public func risksNetwork(_ args: ToolArgs) -> Bool { true }
@@ -3511,7 +3744,10 @@ public struct BrowserReloadTool: Tool {
     public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {
         let a = try args.decode(Args.self)
         let profile = try BrowserToolConfig.normalizedProfile(a.profile)
-        let paths = try BrowserToolConfig.prepare(profile: profile, workspace: context.workspaceRoot)
+        let paths = try BrowserToolConfig.prepare(
+            profile: profile,
+            workspace: context.workspaceRoot,
+            workspaceLease: context.workspaceLease)
         let limit = maxCharacters(a.maxCharacters)
         let payload: [String: Any] = [
             "action": "reload",
@@ -3540,11 +3776,7 @@ private struct BrowserHistoryNavigationArgs: Decodable {
 private func browserHistoryNavigationTouchedPaths(_ args: ToolArgs) -> [String] {
     let profile = (try? BrowserToolConfig.normalizedProfile((try? args.decode(BrowserHistoryNavigationArgs.self))?.profile))
         ?? BrowserToolConfig.defaultProfile
-    return [
-        ".intatis/browser/profiles/\(profile)",
-        ".intatis/browser/state/\(profile).json",
-        ".intatis/browser/history.jsonl",
-    ]
+    return BrowserToolConfig.executionTouchedPaths(profile: profile)
 }
 
 private func executeBrowserHistoryNavigation(_ args: ToolArgs,
@@ -3552,7 +3784,10 @@ private func executeBrowserHistoryNavigation(_ args: ToolArgs,
                                              direction: BrowserHistoryDirection) async throws -> ToolObservation {
     let a = try args.decode(BrowserHistoryNavigationArgs.self)
     let profile = try BrowserToolConfig.normalizedProfile(a.profile)
-    let paths = try BrowserToolConfig.prepare(profile: profile, workspace: context.workspaceRoot)
+    let paths = try BrowserToolConfig.prepare(
+        profile: profile,
+        workspace: context.workspaceRoot,
+        workspaceLease: context.workspaceLease)
     return try await withBrowserProfileCommandLock(paths: paths) {
         let targetURL = try browserHistoryNavigationURL(direction: direction, paths: paths)
         let limit = maxCharacters(a.maxCharacters)
@@ -3670,7 +3905,7 @@ public struct BrowserClickTool: Tool {
 
     public func touchedPaths(_ args: ToolArgs) -> [String] {
         let profile = (try? BrowserToolConfig.normalizedProfile((try? args.decode(Args.self))?.profile)) ?? BrowserToolConfig.defaultProfile
-        return [".intatis/browser/profiles/\(profile)", ".intatis/browser/history.jsonl"]
+        return BrowserToolConfig.executionTouchedPaths(profile: profile)
     }
 
     public func risksNetwork(_ args: ToolArgs) -> Bool { true }
@@ -3681,7 +3916,10 @@ public struct BrowserClickTool: Tool {
             throw IntatisError.decoding("browser_click requires selector, text, or role+name")
         }
         let profile = try BrowserToolConfig.normalizedProfile(a.profile)
-        let paths = try BrowserToolConfig.prepare(profile: profile, workspace: context.workspaceRoot)
+        let paths = try BrowserToolConfig.prepare(
+            profile: profile,
+            workspace: context.workspaceRoot,
+            workspaceLease: context.workspaceLease)
         let limit = maxCharacters(a.maxCharacters)
         var payload: [String: Any] = [
             "action": "click",
@@ -3747,7 +3985,7 @@ public struct BrowserTypeTool: Tool {
 
     public func touchedPaths(_ args: ToolArgs) -> [String] {
         let profile = (try? BrowserToolConfig.normalizedProfile((try? args.decode(Args.self))?.profile)) ?? BrowserToolConfig.defaultProfile
-        return [".intatis/browser/profiles/\(profile)", ".intatis/browser/history.jsonl"]
+        return BrowserToolConfig.executionTouchedPaths(profile: profile)
     }
 
     public func risksNetwork(_ args: ToolArgs) -> Bool { true }
@@ -3761,7 +3999,10 @@ public struct BrowserTypeTool: Tool {
             throw IntatisError.config("browser_type refuses likely sensitive credential entry target (\(reason)); use browser_handoff for login, password, 2FA, token, or API key entry")
         }
         let profile = try BrowserToolConfig.normalizedProfile(a.profile)
-        let paths = try BrowserToolConfig.prepare(profile: profile, workspace: context.workspaceRoot)
+        let paths = try BrowserToolConfig.prepare(
+            profile: profile,
+            workspace: context.workspaceRoot,
+            workspaceLease: context.workspaceLease)
         let limit = maxCharacters(a.maxCharacters)
         var payload: [String: Any] = [
             "action": "type",
@@ -3827,7 +4068,7 @@ public struct BrowserSubmitTool: Tool {
 
     public func touchedPaths(_ args: ToolArgs) -> [String] {
         let profile = (try? BrowserToolConfig.normalizedProfile((try? args.decode(Args.self))?.profile)) ?? BrowserToolConfig.defaultProfile
-        return [".intatis/browser/profiles/\(profile)", ".intatis/browser/history.jsonl"]
+        return BrowserToolConfig.executionTouchedPaths(profile: profile)
     }
 
     public func risksNetwork(_ args: ToolArgs) -> Bool { true }
@@ -3835,7 +4076,10 @@ public struct BrowserSubmitTool: Tool {
     public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {
         let a = try args.decode(Args.self)
         let profile = try BrowserToolConfig.normalizedProfile(a.profile)
-        let paths = try BrowserToolConfig.prepare(profile: profile, workspace: context.workspaceRoot)
+        let paths = try BrowserToolConfig.prepare(
+            profile: profile,
+            workspace: context.workspaceRoot,
+            workspaceLease: context.workspaceLease)
         let limit = maxCharacters(a.maxCharacters)
         var payload: [String: Any] = [
             "action": "submit",
@@ -3904,7 +4148,7 @@ public struct BrowserSelectOptionTool: Tool {
 
     public func touchedPaths(_ args: ToolArgs) -> [String] {
         let profile = (try? BrowserToolConfig.normalizedProfile((try? args.decode(Args.self))?.profile)) ?? BrowserToolConfig.defaultProfile
-        return [".intatis/browser/profiles/\(profile)", ".intatis/browser/history.jsonl"]
+        return BrowserToolConfig.executionTouchedPaths(profile: profile)
     }
 
     public func risksNetwork(_ args: ToolArgs) -> Bool { true }
@@ -3923,7 +4167,10 @@ public struct BrowserSelectOptionTool: Tool {
             throw IntatisError.decoding("browser_select_option requires optionValue, optionLabel, or optionIndex")
         }
         let profile = try BrowserToolConfig.normalizedProfile(a.profile)
-        let paths = try BrowserToolConfig.prepare(profile: profile, workspace: context.workspaceRoot)
+        let paths = try BrowserToolConfig.prepare(
+            profile: profile,
+            workspace: context.workspaceRoot,
+            workspaceLease: context.workspaceLease)
         let limit = maxCharacters(a.maxCharacters)
         var payload: [String: Any] = [
             "action": "select",
@@ -3990,7 +4237,7 @@ public struct BrowserPressKeyTool: Tool {
 
     public func touchedPaths(_ args: ToolArgs) -> [String] {
         let profile = (try? BrowserToolConfig.normalizedProfile((try? args.decode(Args.self))?.profile)) ?? BrowserToolConfig.defaultProfile
-        return [".intatis/browser/profiles/\(profile)", ".intatis/browser/history.jsonl"]
+        return BrowserToolConfig.executionTouchedPaths(profile: profile)
     }
 
     public func risksNetwork(_ args: ToolArgs) -> Bool { true }
@@ -3999,7 +4246,10 @@ public struct BrowserPressKeyTool: Tool {
         let a = try args.decode(Args.self)
         let key = try normalizedBrowserKey(a.key)
         let profile = try BrowserToolConfig.normalizedProfile(a.profile)
-        let paths = try BrowserToolConfig.prepare(profile: profile, workspace: context.workspaceRoot)
+        let paths = try BrowserToolConfig.prepare(
+            profile: profile,
+            workspace: context.workspaceRoot,
+            workspaceLease: context.workspaceLease)
         let limit = maxCharacters(a.maxCharacters)
         var payload: [String: Any] = [
             "action": "press",
@@ -4070,7 +4320,7 @@ public struct BrowserScrollTool: Tool {
 
     public func touchedPaths(_ args: ToolArgs) -> [String] {
         let profile = (try? BrowserToolConfig.normalizedProfile((try? args.decode(Args.self))?.profile)) ?? BrowserToolConfig.defaultProfile
-        return [".intatis/browser/profiles/\(profile)", ".intatis/browser/history.jsonl"]
+        return BrowserToolConfig.executionTouchedPaths(profile: profile)
     }
 
     public func risksNetwork(_ args: ToolArgs) -> Bool { true }
@@ -4079,7 +4329,10 @@ public struct BrowserScrollTool: Tool {
         let a = try args.decode(Args.self)
         let delta = try browserScrollDelta(direction: a.direction, amount: a.amount, deltaX: a.deltaX, deltaY: a.deltaY)
         let profile = try BrowserToolConfig.normalizedProfile(a.profile)
-        let paths = try BrowserToolConfig.prepare(profile: profile, workspace: context.workspaceRoot)
+        let paths = try BrowserToolConfig.prepare(
+            profile: profile,
+            workspace: context.workspaceRoot,
+            workspaceLease: context.workspaceLease)
         let limit = maxCharacters(a.maxCharacters)
         var payload: [String: Any] = [
             "action": "scroll",
@@ -4147,7 +4400,7 @@ public struct BrowserWaitTool: Tool {
 
     public func touchedPaths(_ args: ToolArgs) -> [String] {
         let profile = (try? BrowserToolConfig.normalizedProfile((try? args.decode(Args.self))?.profile)) ?? BrowserToolConfig.defaultProfile
-        return [".intatis/browser/profiles/\(profile)", ".intatis/browser/history.jsonl"]
+        return BrowserToolConfig.executionTouchedPaths(profile: profile)
     }
 
     public func risksNetwork(_ args: ToolArgs) -> Bool { true }
@@ -4155,7 +4408,10 @@ public struct BrowserWaitTool: Tool {
     public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {
         let a = try args.decode(Args.self)
         let profile = try BrowserToolConfig.normalizedProfile(a.profile)
-        let paths = try BrowserToolConfig.prepare(profile: profile, workspace: context.workspaceRoot)
+        let paths = try BrowserToolConfig.prepare(
+            profile: profile,
+            workspace: context.workspaceRoot,
+            workspaceLease: context.workspaceLease)
         let limit = maxCharacters(a.maxCharacters)
         var payload: [String: Any] = [
             "action": "wait",
@@ -4214,7 +4470,7 @@ public struct BrowserScreenshotTool: Tool {
     public func touchedPaths(_ args: ToolArgs) -> [String] {
         let decoded = try? args.decode(Args.self)
         let profile = (try? BrowserToolConfig.normalizedProfile(decoded?.profile)) ?? BrowserToolConfig.defaultProfile
-        var paths = [".intatis/browser/profiles/\(profile)", ".intatis/browser/history.jsonl"]
+        var paths = BrowserToolConfig.executionTouchedPaths(profile: profile)
         if let outputPath = decoded?.outputPath {
             paths.append(outputPath)
         }
@@ -4232,9 +4488,17 @@ public struct BrowserScreenshotTool: Tool {
         guard outputURL.pathExtension.lowercased() == "png" else {
             throw IntatisError.decoding("browser_screenshot outputPath must end with .png")
         }
+        _ = try validateBrowserWorkspaceAccess(
+            readablePaths: [],
+            writablePaths: [outputURL.path],
+            cwd: context.workspaceRoot,
+            workspaceLease: context.workspaceLease)
         let relativeOutputPath = PathConfinement.relativePath(of: outputURL, root: context.workspaceRoot)
         let profile = try BrowserToolConfig.normalizedProfile(a.profile)
-        let paths = try BrowserToolConfig.prepare(profile: profile, workspace: context.workspaceRoot)
+        let paths = try BrowserToolConfig.prepare(
+            profile: profile,
+            workspace: context.workspaceRoot,
+            workspaceLease: context.workspaceLease)
         let limit = maxCharacters(a.maxCharacters)
         var payload: [String: Any] = [
             "action": "screenshot",
@@ -4303,7 +4567,7 @@ public struct BrowserUploadFileTool: Tool {
     public func touchedPaths(_ args: ToolArgs) -> [String] {
         let decoded = try? args.decode(Args.self)
         let profile = (try? BrowserToolConfig.normalizedProfile(decoded?.profile)) ?? BrowserToolConfig.defaultProfile
-        var paths = [".intatis/browser/profiles/\(profile)", ".intatis/browser/history.jsonl"]
+        var paths = BrowserToolConfig.executionTouchedPaths(profile: profile)
         if let filePath = decoded?.filePath {
             paths.append(filePath)
         }
@@ -4318,13 +4582,21 @@ public struct BrowserUploadFileTool: Tool {
             throw IntatisError.decoding("browser_upload_file requires selector, text, or role+name")
         }
         let fileURL = try PathConfinement.resolve(a.filePath, within: context.workspaceRoot)
+        _ = try validateBrowserWorkspaceAccess(
+            readablePaths: [fileURL.path],
+            writablePaths: [],
+            cwd: context.workspaceRoot,
+            workspaceLease: context.workspaceLease)
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: fileURL.path, isDirectory: &isDirectory), !isDirectory.boolValue else {
             throw IntatisError.notFound("upload file not found: \(a.filePath)")
         }
         let relativeFilePath = PathConfinement.relativePath(of: fileURL, root: context.workspaceRoot)
         let profile = try BrowserToolConfig.normalizedProfile(a.profile)
-        let paths = try BrowserToolConfig.prepare(profile: profile, workspace: context.workspaceRoot)
+        let paths = try BrowserToolConfig.prepare(
+            profile: profile,
+            workspace: context.workspaceRoot,
+            workspaceLease: context.workspaceLease)
         let limit = maxCharacters(a.maxCharacters)
         var payload: [String: Any] = [
             "action": "upload",
@@ -4390,11 +4662,7 @@ public struct BrowserDownloadTool: Tool {
 
     public func touchedPaths(_ args: ToolArgs) -> [String] {
         let profile = (try? BrowserToolConfig.normalizedProfile((try? args.decode(Args.self))?.profile)) ?? BrowserToolConfig.defaultProfile
-        return [
-            ".intatis/browser/profiles/\(profile)",
-            ".intatis/browser/downloads/\(profile)",
-            ".intatis/browser/history.jsonl",
-        ]
+        return BrowserToolConfig.executionTouchedPaths(profile: profile)
     }
 
     public func risksNetwork(_ args: ToolArgs) -> Bool { true }
@@ -4405,7 +4673,10 @@ public struct BrowserDownloadTool: Tool {
             throw IntatisError.decoding("browser_download requires selector, text, or role+name")
         }
         let profile = try BrowserToolConfig.normalizedProfile(a.profile)
-        let paths = try BrowserToolConfig.prepare(profile: profile, workspace: context.workspaceRoot)
+        let paths = try BrowserToolConfig.prepare(
+            profile: profile,
+            workspace: context.workspaceRoot,
+            workspaceLease: context.workspaceLease)
         let limit = maxCharacters(a.maxCharacters)
         var payload: [String: Any] = [
             "action": "download",
@@ -4494,7 +4765,7 @@ public struct BrowserSearchTool: Tool {
 
     public func touchedPaths(_ args: ToolArgs) -> [String] {
         let profile = (try? BrowserToolConfig.normalizedProfile((try? args.decode(Args.self))?.profile)) ?? BrowserToolConfig.defaultProfile
-        return [".intatis/browser/profiles/\(profile)", ".intatis/browser/history.jsonl"]
+        return BrowserToolConfig.executionTouchedPaths(profile: profile)
     }
 
     public func risksNetwork(_ args: ToolArgs) -> Bool { true }
@@ -4502,7 +4773,10 @@ public struct BrowserSearchTool: Tool {
     public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {
         let a = try args.decode(Args.self)
         let profile = try BrowserToolConfig.normalizedProfile(a.profile)
-        let paths = try BrowserToolConfig.prepare(profile: profile, workspace: context.workspaceRoot)
+        let paths = try BrowserToolConfig.prepare(
+            profile: profile,
+            workspace: context.workspaceRoot,
+            workspaceLease: context.workspaceLease)
         let limit = maxCharacters(a.maxCharacters)
         let engine = (a.engine ?? "duckduckgo").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         var payload: [String: Any] = [

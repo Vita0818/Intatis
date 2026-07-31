@@ -472,12 +472,22 @@ final class IntatisToolsTests: XCTestCase {
         XCTAssertTrue(production.shell is ProcessShellRunner)
         XCTAssertTrue(production.structuredShell is StructuredProcessShellRunner)
         XCTAssertTrue(production.networkStructuredShell is StructuredProcessShellRunner)
+        XCTAssertTrue(production.browserBackend is BrowserBackendProcessRunner)
 
         let fake = FakeShell(result: ShellResult(stdout: "ok", stderr: "", exitCode: 0))
         let injected = ToolContext(workspaceRoot: ws, shell: fake)
         XCTAssertTrue(injected.shell is FakeShell)
         XCTAssertTrue(injected.structuredShell is FakeShell)
         XCTAssertTrue(injected.networkStructuredShell is FakeShell)
+        XCTAssertTrue(injected.browserBackend is InjectedShellBrowserBackendRunner)
+
+        let customStructured = ToolContext(
+            workspaceRoot: ws,
+            structuredShell: fake,
+            networkStructuredShell: fake)
+        XCTAssertTrue(customStructured.structuredShell is FakeShell)
+        XCTAssertTrue(customStructured.networkStructuredShell is FakeShell)
+        XCTAssertTrue(customStructured.browserBackend is BrowserBackendProcessRunner)
     }
 
     func testStructuredProcessShellRunnerStillSupportsToolBackendCommands() async throws {
@@ -555,6 +565,118 @@ final class IntatisToolsTests: XCTestCase {
         let write = try await runner.run("printf changed > allowed/new.txt", cwd: ws)
         XCTAssertNotEqual(write.exitCode, 0)
         XCTAssertFalse(FileManager.default.fileExists(atPath: allowedDir.appendingPathComponent("new.txt").path))
+    }
+
+    func testBrowserBackendProcessRunnerUsesSanitizedEnvironment() async throws {
+        let ws = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        setenv("INTATIS_BROWSER_HOST_SECRET_MARKER", "host-secret-marker", 1)
+        defer { unsetenv("INTATIS_BROWSER_HOST_SECRET_MARKER") }
+
+        let invocation = BrowserBackendInvocation(
+            javaScript: #"process.stdout.write(`${process.env.INTATIS_BROWSER_HOST_SECRET_MARKER || ""}|${process.env.INTATIS_BROWSER_PROCESS_BOUNDARY || ""}`);"#,
+            encodedArguments: Data("{}".utf8).base64EncodedString(),
+            readableWorkspacePaths: [],
+            writableWorkspacePaths: [])
+        let result = try await BrowserBackendProcessRunner(timeoutSeconds: 5).run(
+            invocation,
+            cwd: ws)
+
+        XCTAssertEqual(result.exitCode, 0, result.stderr)
+        XCTAssertEqual(result.stdout, "|1")
+    }
+
+    func testBrowserBackendProcessRunnerRejectsWorkspaceRootReplacement() async throws {
+        let ws = try tempWorkspace()
+        let reviewed = ws.deletingLastPathComponent()
+            .appendingPathComponent("\(ws.lastPathComponent)-browser-reviewed")
+        defer {
+            try? FileManager.default.removeItem(at: ws)
+            try? FileManager.default.removeItem(at: reviewed)
+        }
+        let lease = WorkspaceLease(rootPath: ws.path, access: .readWrite, deniedPatterns: [])
+        let runner = BrowserBackendProcessRunner(timeoutSeconds: 5, workspaceLease: lease)
+        let invocation = BrowserBackendInvocation(
+            javaScript: #"process.stdout.write("should-not-run");"#,
+            encodedArguments: Data("{}".utf8).base64EncodedString(),
+            readableWorkspacePaths: [],
+            writableWorkspacePaths: [])
+        try FileManager.default.moveItem(at: ws, to: reviewed)
+        try FileManager.default.createDirectory(at: ws, withIntermediateDirectories: true)
+
+        do {
+            _ = try await runner.run(invocation, cwd: ws)
+            XCTFail("replacement directory unexpectedly retained reviewed browser authority")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("root identity changed"), "\(error)")
+        }
+    }
+
+    func testBrowserBackendProcessRunnerBoundsFloodedOutput() async throws {
+        let ws = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let outputLimit = 64 * 1_024
+        let invocation = BrowserBackendInvocation(
+            javaScript: """
+            const chunk = "x".repeat(16 * 1024);
+            for (let index = 0; index < 128; index += 1) {
+              process.stdout.write(chunk);
+              process.stderr.write(chunk);
+            }
+            process.stdout.write("\\n{\\"finished\\":true}\\n");
+            process.stderr.write("\\nfinished-stderr\\n");
+            """,
+            encodedArguments: Data("{}".utf8).base64EncodedString(),
+            readableWorkspacePaths: [],
+            writableWorkspacePaths: [])
+
+        let result = try await BrowserBackendProcessRunner(
+            timeoutSeconds: 10,
+            maximumOutputBytes: outputLimit
+        ).run(invocation, cwd: ws)
+
+        XCTAssertEqual(result.exitCode, 0, result.stderr)
+        XCTAssertLessThan(result.stdout.utf8.count, outputLimit + 256)
+        XCTAssertLessThan(result.stderr.utf8.count, outputLimit + 256)
+        XCTAssertTrue(result.stdout.contains("output bytes omitted"))
+        XCTAssertTrue(result.stderr.contains("output bytes omitted"))
+        XCTAssertTrue(result.stdout.contains(#"{"finished":true}"#))
+        XCTAssertTrue(result.stderr.contains("finished-stderr"))
+    }
+
+    func testBrowserBackendProcessRunnerRejectsDeniedDeclaredPathBeforeSpawn() async throws {
+        let ws = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        try Data("blocked-marker".utf8)
+            .write(to: ws.appendingPathComponent("denied.txt"))
+        let executionMarker = ws.appendingPathComponent("browser-executed.txt")
+        let script = """
+        const fs = require("fs");
+        fs.writeFileSync(\(String(reflecting: executionMarker.path)), "executed");
+        """
+        let lease = WorkspaceLease(
+            rootPath: ws.path,
+            access: .readWrite,
+            deniedPatterns: ["denied.txt"])
+        let invocation = BrowserBackendInvocation(
+            javaScript: script,
+            encodedArguments: Data("{}".utf8).base64EncodedString(),
+            readableWorkspacePaths: [ws.appendingPathComponent("denied.txt").path],
+            writableWorkspacePaths: [])
+
+        do {
+            _ = try await BrowserBackendProcessRunner(
+                timeoutSeconds: 5,
+                workspaceLease: lease
+            ).run(invocation, cwd: ws)
+            XCTFail("denied declared path unexpectedly reached the browser process")
+        } catch {
+            XCTAssertTrue(
+                String(describing: error).contains("denied by the workspace lease"),
+                "\(error)")
+        }
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: executionMarker.path))
     }
 
     func testManagedProcessRejectsWorkspaceRootReplacementAfterLeaseReview() async throws {
@@ -1676,6 +1798,61 @@ final class IntatisToolsTests: XCTestCase {
         XCTAssertTrue(obs.text.contains("Persistent browser profile: .intatis/browser/profiles/smoke"))
     }
 
+    func testRealCDPBrowserIgnoresStaleDevToolsActivePortWhenEnabled() async throws {
+        guard ProcessInfo.processInfo.environment["INTATIS_REAL_BROWSER_SMOKE"] == "1" else {
+            throw XCTSkip("set INTATIS_REAL_BROWSER_SMOKE=1 to run the stale DevToolsActivePort smoke")
+        }
+
+        #if canImport(Darwin)
+        let ws = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let diagnostics = try await BrowserDiagnosticsTool().execute(
+            ToolArgs(raw: #"{"profile":"stale-port-smoke","channel":"msedge"}"#),
+            in: ToolContext(workspaceRoot: ws))
+        if diagnostics.text.contains("playwright available: yes") {
+            throw XCTSkip("stale DevToolsActivePort smoke requires the CDP fallback")
+        }
+
+        let site = ws.appendingPathComponent("stale-port-site", isDirectory: true)
+        try FileManager.default.createDirectory(at: site, withIntermediateDirectories: true)
+        try Data("""
+        <!doctype html>
+        <title>Stale Port Smoke</title>
+        <body>fresh CDP browser marker</body>
+        """.utf8).write(to: site.appendingPathComponent("index.html"))
+        let port = try freeLoopbackPort()
+        let server = try startStaticHTTPServer(directory: site, port: port)
+        defer {
+            if server.isRunning {
+                server.terminate()
+            }
+        }
+        try await waitForHTTPServer(port: port, path: "/index.html")
+
+        let profileDirectory = ws
+            .appendingPathComponent(".intatis/browser/profiles/stale-port-smoke", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: profileDirectory,
+            withIntermediateDirectories: true)
+        let activePortFile = profileDirectory.appendingPathComponent("DevToolsActivePort")
+        try Data("1\n/devtools/browser/forged-stale-endpoint\n".utf8)
+            .write(to: activePortFile)
+
+        let observation = try await BrowserNavigateTool().execute(
+            ToolArgs(raw: #"{"url":"http://127.0.0.1:\#(port)/index.html","profile":"stale-port-smoke","channel":"msedge","headless":true,"waitMillis":250,"maxCharacters":2000}"#),
+            in: ToolContext(workspaceRoot: ws))
+
+        XCTAssertTrue(observation.text.contains("backend: cdp"), observation.text)
+        XCTAssertTrue(observation.text.contains("fresh CDP browser marker"), observation.text)
+        if FileManager.default.fileExists(atPath: activePortFile.path) {
+            let current = try String(contentsOf: activePortFile, encoding: .utf8)
+            XCTAssertNotEqual(current.split(whereSeparator: \.isNewline).first, "1")
+        }
+        #else
+        throw XCTSkip("real CDP browser smoke requires Darwin")
+        #endif
+    }
+
     func testRealBrowserSearchWhenEnabled() async throws {
         guard ProcessInfo.processInfo.environment["INTATIS_REAL_BROWSER_SMOKE"] == "1" else {
             throw XCTSkip("set INTATIS_REAL_BROWSER_SMOKE=1 to run the real browser search smoke")
@@ -2045,7 +2222,18 @@ final class IntatisToolsTests: XCTestCase {
         </script>
         </body>
         """
-        let pageURL = "data:text/html;base64,\(Data(formHTML.utf8).base64EncodedString())"
+        let site = ws.appendingPathComponent("upload-download-site", isDirectory: true)
+        try FileManager.default.createDirectory(at: site, withIntermediateDirectories: true)
+        try Data(formHTML.utf8).write(to: site.appendingPathComponent("index.html"))
+        let port = try freeLoopbackPort()
+        let server = try startStaticHTTPServer(directory: site, port: port)
+        defer {
+            if server.isRunning {
+                server.terminate()
+            }
+        }
+        try await waitForHTTPServer(port: port, path: "/index.html")
+        let pageURL = "http://127.0.0.1:\(port)/index.html"
         let stateURL = ws.appendingPathComponent(".intatis/browser/state/io-smoke.json")
         try FileManager.default.createDirectory(at: stateURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         let statePayload: [String: String] = [
@@ -2129,7 +2317,18 @@ final class IntatisToolsTests: XCTestCase {
         </script>
         </body>
         """
-        let pageURL = "data:text/html;base64,\(Data(formHTML.utf8).base64EncodedString())"
+        let site = ws.appendingPathComponent("select-press-site", isDirectory: true)
+        try FileManager.default.createDirectory(at: site, withIntermediateDirectories: true)
+        try Data(formHTML.utf8).write(to: site.appendingPathComponent("index.html"))
+        let port = try freeLoopbackPort()
+        let server = try startStaticHTTPServer(directory: site, port: port)
+        defer {
+            if server.isRunning {
+                server.terminate()
+            }
+        }
+        try await waitForHTTPServer(port: port, path: "/index.html")
+        let pageURL = "http://127.0.0.1:\(port)/index.html"
         let stateURL = ws.appendingPathComponent(".intatis/browser/state/form-smoke.json")
         try FileManager.default.createDirectory(at: stateURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         let statePayload: [String: String] = [
@@ -2812,6 +3011,164 @@ final class IntatisToolsTests: XCTestCase {
         XCTAssertEqual(stack, ["https://example.com/one", "https://example.com/two"])
     }
 
+    func testBrowserSnapshotRejectsForgedStateURLBeforeBackendAndAllowsHTTPURLs() async throws {
+        let ws = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let stateURL = ws.appendingPathComponent(".intatis/browser/state/work.json")
+        try FileManager.default.createDirectory(
+            at: stateURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true)
+        func writeStateURL(_ value: String) throws {
+            let data = try JSONSerialization.data(withJSONObject: ["url": value])
+            try data.write(to: stateURL, options: .atomic)
+        }
+
+        let recorder = CommandRecorder()
+        let backend = RecordingShell(
+            recorder: recorder,
+            result: ShellResult(
+                stdout: #"{"action":"snapshot","profile":"work","backend":"fake","url":"https://example.com/snapshot","title":"Snapshot","text":"safe persisted URL marker","links":[]}"#,
+                stderr: "",
+                exitCode: 0))
+        let context = ToolContext(
+            workspaceRoot: ws,
+            shell: backend,
+            browserBackendShell: backend,
+            git: FakeGit(statusText: "", diffText: ""))
+
+        try writeStateURL("file:///etc/passwd")
+        do {
+            _ = try await BrowserSnapshotTool().execute(
+                ToolArgs(raw: #"{"profile":"work","waitMillis":0}"#),
+                in: context)
+            XCTFail("forged file URL unexpectedly reached the browser backend")
+        } catch {
+            let message = String(describing: error)
+            XCTAssertTrue(
+                message.contains("URL must be http(s) with a host"),
+                message)
+        }
+        let commandsAfterForgedState = await recorder.all()
+        XCTAssertTrue(commandsAfterForgedState.isEmpty)
+
+        for allowedURL in [
+            "http://example.com/from-state",
+            "https://example.com/from-state",
+        ] {
+            try writeStateURL(allowedURL)
+            let observation = try await BrowserSnapshotTool().execute(
+                ToolArgs(raw: #"{"profile":"work","waitMillis":0}"#),
+                in: context)
+            XCTAssertTrue(
+                observation.text.contains("safe persisted URL marker"),
+                observation.text)
+        }
+        let commandsAfterAllowedStates = await recorder.all()
+        XCTAssertEqual(commandsAfterAllowedStates.count, 2)
+    }
+
+    func testBrowserHistoryNavigationRejectsForgedTargetsBeforeBackendAndAllowsHTTPURLs() async throws {
+        let ws = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let stateURL = ws.appendingPathComponent(".intatis/browser/state/work.json")
+        try FileManager.default.createDirectory(
+            at: stateURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true)
+        func writeNavigationState(stack: [String], index: Int) throws {
+            let data = try JSONSerialization.data(withJSONObject: [
+                "url": stack[index],
+                "navigationStack": stack,
+                "navigationIndex": index,
+            ])
+            try data.write(to: stateURL, options: .atomic)
+        }
+
+        let recorder = CommandRecorder()
+        let backBackend = RecordingShell(
+            recorder: recorder,
+            result: ShellResult(
+                stdout: #"{"action":"back","profile":"work","backend":"fake","url":"http://example.com/one","title":"One","text":"safe back marker","links":[]}"#,
+                stderr: "",
+                exitCode: 0))
+        let forwardBackend = RecordingShell(
+            recorder: recorder,
+            result: ShellResult(
+                stdout: #"{"action":"forward","profile":"work","backend":"fake","url":"https://example.com/two","title":"Two","text":"safe forward marker","links":[]}"#,
+                stderr: "",
+                exitCode: 0))
+        let backContext = ToolContext(
+            workspaceRoot: ws,
+            shell: backBackend,
+            browserBackendShell: backBackend,
+            git: FakeGit(statusText: "", diffText: ""))
+        let forwardContext = ToolContext(
+            workspaceRoot: ws,
+            shell: forwardBackend,
+            browserBackendShell: forwardBackend,
+            git: FakeGit(statusText: "", diffText: ""))
+
+        try writeNavigationState(
+            stack: ["file:///etc/passwd", "https://example.com/current"],
+            index: 1)
+        do {
+            _ = try await BrowserBackTool().execute(
+                ToolArgs(raw: #"{"profile":"work","waitMillis":0}"#),
+                in: backContext)
+            XCTFail("forged back target unexpectedly reached the browser backend")
+        } catch {
+            let message = String(describing: error)
+            XCTAssertTrue(
+                message.contains("URL must be http(s) with a host")
+                    || message.contains("no previous browser history entry"),
+                message)
+        }
+        let commandsAfterForgedBack = await recorder.all()
+        XCTAssertTrue(commandsAfterForgedBack.isEmpty)
+
+        try writeNavigationState(
+            stack: ["https://example.com/current", "file:///etc/passwd"],
+            index: 0)
+        do {
+            _ = try await BrowserForwardTool().execute(
+                ToolArgs(raw: #"{"profile":"work","waitMillis":0}"#),
+                in: forwardContext)
+            XCTFail("forged forward target unexpectedly reached the browser backend")
+        } catch {
+            let message = String(describing: error)
+            XCTAssertTrue(
+                message.contains("URL must be http(s) with a host")
+                    || message.contains("no next browser history entry"),
+                message)
+        }
+        let commandsAfterForgedForward = await recorder.all()
+        XCTAssertTrue(commandsAfterForgedForward.isEmpty)
+
+        let safeStack = [
+            "http://example.com/one",
+            "https://example.com/two",
+        ]
+        try writeNavigationState(stack: safeStack, index: 1)
+        let back = try await BrowserBackTool().execute(
+            ToolArgs(raw: #"{"profile":"work","waitMillis":0}"#),
+            in: backContext)
+        XCTAssertTrue(back.text.contains("safe back marker"), back.text)
+
+        try writeNavigationState(stack: safeStack, index: 0)
+        let forward = try await BrowserForwardTool().execute(
+            ToolArgs(raw: #"{"profile":"work","waitMillis":0}"#),
+            in: forwardContext)
+        XCTAssertTrue(forward.text.contains("safe forward marker"), forward.text)
+
+        let commands = await recorder.all()
+        XCTAssertEqual(commands.count, 2)
+        let backPayload = try browserPayload(from: commands[0])
+        let forwardPayload = try browserPayload(from: commands[1])
+        XCTAssertEqual(backPayload["action"] as? String, "back")
+        XCTAssertEqual(backPayload["url"] as? String, safeStack[0])
+        XCTAssertEqual(forwardPayload["action"] as? String, "forward")
+        XCTAssertEqual(forwardPayload["url"] as? String, safeStack[1])
+    }
+
     func testBrowserDiagnosticsReportsBackendAvailability() async throws {
         let ws = try tempWorkspace()
         defer { try? FileManager.default.removeItem(at: ws) }
@@ -2833,19 +3190,23 @@ final class IntatisToolsTests: XCTestCase {
         XCTAssertTrue(obs.text.contains("/opt/homebrew/lib/node_modules/playwright"))
     }
 
-    func testBrowserNetworkActionsUseDedicatedNetworkStructuredRunner() async throws {
+    func testBrowserActionsUseDedicatedBrowserBackendRunner() async throws {
         let ws = try tempWorkspace()
         defer { try? FileManager.default.removeItem(at: ws) }
-        let offline = FakeShell(result: ShellResult(stdout: "", stderr: "offline runner used", exitCode: 91))
-        let online = FakeShell(result: ShellResult(
+        let wrongRunner = FakeShell(result: ShellResult(
+            stdout: "",
+            stderr: "generic structured runner used",
+            exitCode: 91))
+        let browserRunner = FakeShell(result: ShellResult(
             stdout: #"{"action":"navigate","profile":"work","backend":"fake","url":"https://example.com","title":"Example","text":"network runner marker","links":[]}"#,
             stderr: "",
             exitCode: 0))
         let ctx = ToolContext(
             workspaceRoot: ws,
-            shell: offline,
-            structuredShell: offline,
-            networkStructuredShell: online,
+            shell: wrongRunner,
+            structuredShell: wrongRunner,
+            networkStructuredShell: wrongRunner,
+            browserBackendShell: browserRunner,
             git: FakeGit(statusText: "", diffText: ""))
 
         let observation = try await BrowserNavigateTool().execute(
@@ -2853,7 +3214,214 @@ final class IntatisToolsTests: XCTestCase {
             in: ctx)
 
         XCTAssertTrue(observation.text.contains("network runner marker"), observation.text)
-        XCTAssertFalse(observation.text.contains("offline runner used"), observation.text)
+        XCTAssertFalse(observation.text.contains("generic structured runner used"), observation.text)
+    }
+
+    func testCDPNewPageFallbackValidatesReturnedWebSocketEndpointBeforeConnect() async throws {
+        guard let nodePath = [
+            "/opt/homebrew/bin/node",
+            "/usr/local/bin/node",
+            "/usr/bin/node",
+        ].first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
+            throw XCTSkip("Node.js is required for the CDP page-target contract test")
+        }
+
+        let ws = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let recorder = CommandRecorder()
+        let missingBackend = RecordingShell(
+            recorder: recorder,
+            result: ShellResult(
+                stdout: "",
+                stderr: "playwright is not installed or not resolvable by Node",
+                exitCode: 1))
+        let context = ToolContext(
+            workspaceRoot: ws,
+            shell: missingBackend,
+            browserBackendShell: missingBackend,
+            git: FakeGit(statusText: "", diffText: ""))
+
+        do {
+            _ = try await BrowserNavigateTool().execute(
+                ToolArgs(raw: #"{"url":"https://example.com","profile":"new-page-contract","waitMillis":0}"#),
+                in: context)
+            XCTFail("double missing backend unexpectedly completed")
+        } catch {
+            XCTAssertTrue(
+                String(describing: error).contains("browser backend failed"),
+                "\(error)")
+        }
+
+        let commands = await recorder.all()
+        XCTAssertEqual(commands.count, 2)
+        guard commands.count == 2 else { return }
+        let cdpCommand = commands[1]
+        guard let functionStart = cdpCommand.range(
+            of: "async function pageTarget(port) {"),
+              let functionEnd = cdpCommand.range(
+                of: "class CDPClient",
+                range: functionStart.upperBound..<cdpCommand.endIndex) else {
+            return XCTFail("could not extract the CDP pageTarget implementation")
+        }
+        let pageTargetSource = String(
+            cdpCommand[functionStart.lowerBound..<functionEnd.lowerBound])
+        XCTAssertTrue(pageTargetSource.contains("/json/new?about:blank"))
+
+        let forgedEndpoint =
+            "ws://198.51.100.77:43123/devtools/page/forged-external-target"
+        let harness = """
+        const validationCalls = [];
+        async function listPageTargets(_) { return []; }
+        async function fetchJSON(_, __) {
+          return {
+            id: "forged-target",
+            type: "page",
+            webSocketDebuggerUrl: \(String(reflecting: forgedEndpoint))
+          };
+        }
+        function validatedLoopbackWebSocketURL(raw, port, expectedPath) {
+          validationCalls.push({ raw, port, expectedPath: expectedPath || null });
+          throw new Error("forged non-loopback WebSocket endpoint rejected");
+        }
+        \(pageTargetSource)
+        (async () => {
+          let accepted = false;
+          let error = "";
+          try {
+            await pageTarget(43123);
+            accepted = true;
+          } catch (caught) {
+            error = String(caught && caught.message ? caught.message : caught);
+          }
+          process.stdout.write(JSON.stringify({ accepted, error, validationCalls }));
+        })().catch((error) => {
+          process.stderr.write(String(error && error.stack ? error.stack : error));
+          process.exit(1);
+        });
+        """
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: nodePath)
+        process.arguments = ["-e", harness]
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.standardOutput = stdout
+        process.standardError = stderr
+        try process.run()
+        process.waitUntilExit()
+        let stdoutData = stdout.fileHandleForReading.readDataToEndOfFile()
+        let stderrText = String(
+            decoding: stderr.fileHandleForReading.readDataToEndOfFile(),
+            as: UTF8.self)
+        XCTAssertEqual(process.terminationStatus, 0, stderrText)
+        let result = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: stdoutData) as? [String: Any])
+        XCTAssertEqual(result["accepted"] as? Bool, false)
+        XCTAssertTrue(
+            (result["error"] as? String)?
+                .contains("forged non-loopback WebSocket endpoint rejected") == true,
+            "\(result)")
+        let validationCalls = try XCTUnwrap(
+            result["validationCalls"] as? [[String: Any]])
+        XCTAssertEqual(validationCalls.count, 1)
+        XCTAssertEqual(validationCalls.first?["raw"] as? String, forgedEndpoint)
+        XCTAssertEqual(validationCalls.first?["port"] as? Int, 43_123)
+    }
+
+    func testBrowserExecutionDeclaresAllManagedPaths() throws {
+        let paths = BrowserNavigateTool().touchedPaths(
+            ToolArgs(raw: #"{"url":"https://example.com","profile":"work"}"#))
+        XCTAssertEqual(Set(paths), Set([
+            ".intatis/browser/profiles/work",
+            ".intatis/browser/downloads/work",
+            ".intatis/browser/state/work.json",
+            ".intatis/browser/history.jsonl",
+        ]))
+    }
+
+    func testBrowserExecutionRejectsReadOnlyLeaseBeforeCreatingState() async throws {
+        let ws = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let lease = WorkspaceLease(
+            rootPath: ws.path,
+            access: .readOnly,
+            deniedPatterns: [])
+        let backend = FakeShell(result: ShellResult(
+            stdout: #"{"action":"navigate","profile":"work","url":"https://example.com"}"#,
+            stderr: "",
+            exitCode: 0))
+        let context = ToolContext(
+            workspaceRoot: ws,
+            workspaceLease: lease,
+            shell: backend,
+            browserBackendShell: backend)
+
+        do {
+            _ = try await BrowserNavigateTool().execute(
+                ToolArgs(raw: #"{"url":"https://example.com","profile":"work","waitMillis":0}"#),
+                in: context)
+            XCTFail("read-only lease unexpectedly allowed browser state writes")
+        } catch {
+            XCTAssertTrue(
+                String(describing: error).contains("read-write workspace lease"),
+                "\(error)")
+        }
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: ws.appendingPathComponent(".intatis").path))
+    }
+
+    func testBrowserExecutionRejectsNarrowOrDeniedManagedPathsBeforeCreatingState() async throws {
+        let ws = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let backend = FakeShell(result: ShellResult(
+            stdout: #"{"action":"navigate","profile":"work","url":"https://example.com"}"#,
+            stderr: "",
+            exitCode: 0))
+        let narrowLease = WorkspaceLease(
+            rootPath: ws.path,
+            access: .readWrite,
+            allowedPathRules: [
+                PathRule(pattern: ".intatis/browser/profiles/**"),
+            ],
+            deniedPatterns: [])
+        let narrowContext = ToolContext(
+            workspaceRoot: ws,
+            workspaceLease: narrowLease,
+            shell: backend,
+            browserBackendShell: backend)
+        do {
+            _ = try await BrowserNavigateTool().execute(
+                ToolArgs(raw: #"{"url":"https://example.com","profile":"work","waitMillis":0}"#),
+                in: narrowContext)
+            XCTFail("narrow lease unexpectedly allowed all browser state paths")
+        } catch {
+            XCTAssertTrue(
+                String(describing: error).contains("outside the workspace lease allow-list"),
+                "\(error)")
+        }
+
+        let deniedLease = WorkspaceLease(
+            rootPath: ws.path,
+            access: .readWrite,
+            deniedPatterns: ["state"])
+        let deniedContext = ToolContext(
+            workspaceRoot: ws,
+            workspaceLease: deniedLease,
+            shell: backend,
+            browserBackendShell: backend)
+        do {
+            _ = try await BrowserNavigateTool().execute(
+                ToolArgs(raw: #"{"url":"https://example.com","profile":"work","waitMillis":0}"#),
+                in: deniedContext)
+            XCTFail("denied state path unexpectedly reached the browser backend")
+        } catch {
+            XCTAssertTrue(
+                String(describing: error).contains("denied by the workspace lease"),
+                "\(error)")
+        }
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: ws.appendingPathComponent(".intatis").path))
     }
 
     #if canImport(Darwin)

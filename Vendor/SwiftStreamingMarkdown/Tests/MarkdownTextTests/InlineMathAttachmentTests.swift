@@ -80,7 +80,7 @@ final class InlineMathAttachmentTests: XCTestCase {
   }
 
   @MainActor
-  func testValidFormulaPreflightsFiniteBoundedLiveTextKitView() throws {
+  func testValidFormulaPreflightsFiniteLiveTextKitView() throws {
     let rendered = InlineMathAttachment.attributedString(
       source: #"E=mc^2"#,
       originalLiteral: #"$E=mc^2$"#,
@@ -98,14 +98,6 @@ final class InlineMathAttachmentTests: XCTestCase {
     XCTAssertTrue(attachment.bounds.height.isFinite)
     XCTAssertGreaterThan(attachment.bounds.width, 0)
     XCTAssertGreaterThan(attachment.bounds.height, 0)
-    XCTAssertLessThanOrEqual(
-      attachment.bounds.width,
-      InlineMathAttachment.maximumRenderedWidth
-    )
-    XCTAssertLessThanOrEqual(
-      attachment.bounds.height,
-      InlineMathAttachment.maximumRenderedHeight
-    )
 
     let paragraph = ParagraphNSView()
     paragraph.setParagraphContents(rendered, animatedByWord: false)
@@ -118,6 +110,26 @@ final class InlineMathAttachmentTests: XCTestCase {
     XCTAssertEqual(label.frame.size, attachment.bounds.size)
     XCTAssertNil(label.error)
     XCTAssertNotNil(label.displayList)
+  }
+
+  @MainActor
+  func testDisplayPresentationUsesIosMathDisplayMode() throws {
+    let literal = #"\[\sum_{i=1}^{n} i\]"#
+    let rendered = InlineMathAttachment.attributedString(
+      source: #"\sum_{i=1}^{n} i"#,
+      originalLiteral: literal,
+      presentation: .display,
+      attributes: attributes()
+    )
+    let attachment = try XCTUnwrap(
+      rendered.attribute(.attachment, at: 0, effectiveRange: nil)
+        as? InlineMathAttachment
+    )
+
+    XCTAssertEqual(attachment.mathData.presentation, .display)
+    XCTAssertEqual(rendered.plainTextRestoringInlineMath, literal)
+    XCTAssertTrue(attachment.preflightLayout())
+    XCTAssertEqual(attachment.makeLiveLabel().mode, .display)
   }
 
   @MainActor
@@ -255,35 +267,30 @@ final class InlineMathAttachmentTests: XCTestCase {
   }
 
   @MainActor
-  func testThirtyTwoFormulaLivePreflightPerformanceProbe() {
-    measure(metrics: [XCTClockMetric()]) {
-      for index in 1...MathRenderConfig.maximumFormulaCount {
-        let source = "x_{\(index)}"
-        let rendered = InlineMathAttachment.attributedString(
-          source: source,
-          originalLiteral: "$\(source)$",
-          attributes: attributes()
-        )
-        guard let attachment = rendered.attribute(
-          .attachment,
-          at: 0,
-          effectiveRange: nil
-        ) as? InlineMathAttachment else {
-          XCTFail("Expected formula \(index) to produce an attachment")
-          return
-        }
-        XCTAssertTrue(attachment.preflightLayout())
-        XCTAssertNil(attachment.image)
+  func testMoreThanThirtyTwoFormulaAttachmentsPreflight() {
+    for index in 1...40 {
+      let source = "x_{\(index)}"
+      let rendered = InlineMathAttachment.attributedString(
+        source: source,
+        originalLiteral: "$\(source)$",
+        attributes: attributes()
+      )
+      guard let attachment = rendered.attribute(
+        .attachment,
+        at: 0,
+        effectiveRange: nil
+      ) as? InlineMathAttachment else {
+        XCTFail("Expected formula \(index) to produce an attachment")
+        return
       }
+      XCTAssertTrue(attachment.preflightLayout())
+      XCTAssertNil(attachment.image)
     }
   }
 
   @MainActor
-  func testMaximumAdmissionFormulaFailsClosedPerformanceProbe() throws {
-    let source = String(
-      repeating: "x",
-      count: MathRenderConfig.maximumFormulaUTF8Bytes
-    )
+  func testWideFormulaIsNotRejectedByLegacyAttachmentBound() throws {
+    let source = String(repeating: "x", count: 300)
     let literal = "$\(source)$"
     let rendered = InlineMathAttachment.attributedString(
       source: source,
@@ -295,10 +302,9 @@ final class InlineMathAttachmentTests: XCTestCase {
         as? InlineMathAttachment
     )
 
-    measure(metrics: [XCTClockMetric()]) {
-      XCTAssertFalse(attachment.preflightLayout())
-    }
-    XCTAssertEqual(
+    XCTAssertTrue(attachment.preflightLayout())
+    XCTAssertGreaterThan(attachment.bounds.width, 1_024)
+    XCTAssertNotEqual(
       materializeInlineMathAttachments(in: rendered).string,
       literal
     )

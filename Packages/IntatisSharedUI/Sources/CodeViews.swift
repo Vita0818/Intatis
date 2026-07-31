@@ -45,6 +45,7 @@ public struct CodeShell: View {
     private let onResolve: (PermissionResponseAction) -> Void
     @Binding private var showsInspector: Bool
     @StateObject private var scrollCoordinator = IntatisThreadScrollCoordinator()
+    @State private var historySelection: IntatisThreadHistorySelection?
 
     public init(items: [CodeItem],
                 presentationScope: IntatisThreadPresentationScope,
@@ -167,17 +168,36 @@ public struct CodeShell: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .padding(.horizontal, layout.horizontalPadding)
         } else {
+            let historyWindow = threadHistoryWindow
+            let pageScope = threadPresentationScope
             ScrollViewReader { proxy in
                 ScrollView {
-                    IntatisAdaptiveThreadStack(
-                        visibleRowCount: displayedItems.count + (showsThinkingIndicator ? 1 : 0),
-                        alignment: .leading,
-                        spacing: 12) {
-                        ForEach(displayedItems) { item in
+                    VStack(alignment: .leading, spacing: 12) {
+                        if historyWindow.hasEarlier || historyWindow.hasLater {
+                            IntatisThreadHistoryPager(
+                                lowerBound: historyWindow.lowerBound,
+                                upperBound: historyWindow.upperBound,
+                                totalCount: historyWindow.totalCount,
+                                hasEarlier: historyWindow.hasEarlier,
+                                hasLater: historyWindow.hasLater,
+                                accessibilityPrefix: "code.history",
+                                onEarlier: {
+                                    selectHistoryWindow(
+                                        historyWindow.earlierRequestedUpperBound)
+                                },
+                                onNewer: {
+                                    selectHistoryWindow(
+                                        historyWindow.newerRequestedUpperBound)
+                                },
+                                onLatest: {
+                                    selectHistoryWindow(nil)
+                                })
+                        }
+                        ForEach(historyWindow.items) { item in
                             CodeItemRow(item: item, style: threadStyle, layout: layout)
                                 .id(item.id)
                         }
-                        if showsThinkingIndicator {
+                        if showsVisibleThinkingIndicator {
                             IntatisThreadThinkingRow(
                                 layout: layout,
                                 style: threadStyle,
@@ -187,36 +207,79 @@ public struct CodeShell: View {
                         Color.clear
                             .frame(height: 1)
                             .padding(.bottom, 16)
-                            .id(IntatisThreadBottomAnchorID(scope: presentationScope))
+                            .id(IntatisThreadBottomAnchorID(scope: pageScope))
+                            .intatisThreadBottomAnchorFrameProbe()
                     }
+                    .environment(
+                        \.intatisMessageViewportAdmission,
+                        scrollCoordinator.effectiveViewportAdmission(
+                            for: pageScope,
+                            defersUntilInitialRestore:
+                                defersRichUntilInitialRestore))
+                    .environment(
+                        \.intatisThreadScrollCoordinator,
+                        scrollCoordinator)
+                    .environment(
+                        \.intatisThreadRichSettleSource,
+                        scrollCoordinator.effectiveRichSettleSource(
+                            for: pageScope))
                     .frame(width: layout.contentWidth)
                     .frame(maxWidth: .infinity)
                     .padding(.horizontal, layout.horizontalPadding)
                     .padding(.top, 16)
                 }
                 .scrollContentBackground(.hidden)
+                .intatisThreadViewportFrameProbe()
+                .onPreferenceChange(
+                    IntatisThreadViewportFramesPreferenceKey.self
+                ) { frames in
+                    guard let isVisible =
+                            IntatisThreadViewportFrames
+                                .isBottomAnchorVisible(frames) else {
+                        return
+                    }
+                    scrollCoordinator.enqueueBottomAnchorVisibility(
+                        isVisible,
+                        scope: pageScope)
+                }
+                .overlay(alignment: .bottomTrailing) {
+                    if historyWindow.hasLater
+                        || scrollCoordinator.followState == .detachedByUser {
+                        IntatisJumpToLatestButton(
+                            accessibilityIdentifier: "code.jump-to-latest"
+                        ) {
+                            if historyWindow.hasLater {
+                                selectHistoryWindow(nil)
+                            } else {
+                                scrollCoordinator.jumpToLatest(
+                                    scope: pageScope,
+                                    perform: scrollPerformer(proxy))
+                            }
+                        }
+                    }
+                }
                 .onAppear {
-                    scrollCoordinator.activate(scope: presentationScope)
+                    scrollCoordinator.activate(
+                        scope: pageScope,
+                        defersRichUntilInitialRestore:
+                            defersRichUntilInitialRestore)
                     requestScroll(
                         proxy,
-                        reason: .initialRestore)
+                        reason: .initialRestore,
+                        scope: pageScope)
                 }
                 .onChange(of: itemScrollSignature) { _, _ in
-                    scrollCoordinator.beginLayoutEpoch(
-                        scope: presentationScope)
+                    guard historyWindow.isLatest else { return }
                     requestScroll(
                         proxy,
-                        reason: scrollReason)
+                        reason: scrollReason,
+                        scope: pageScope)
                 }
                 .onChange(of: layout.contentWidth) { _, _ in
-                    scrollCoordinator.beginLayoutEpoch(
-                        scope: presentationScope)
-                }
-                .onChange(of: presentationScope) { _, newScope in
-                    scrollCoordinator.activate(scope: newScope)
-                    requestScroll(
-                        proxy,
-                        reason: .initialRestore)
+                    scrollCoordinator.openWidthSettleEpoch(
+                        scope: pageScope,
+                        width: layout.contentWidth,
+                        perform: scrollPerformer(proxy))
                 }
                 .onScrollGeometryChange(
                     for: IntatisThreadScrollGeometry.self
@@ -226,36 +289,29 @@ public struct CodeShell: View {
                         containerHeight: geometry.containerSize.height,
                         bottomInset: geometry.contentInsets.bottom,
                         contentHeight: geometry.contentSize.height)
-                } action: { previous, current in
-                    scrollCoordinator.updateBottomProximity(
+                } action: { _, current in
+                    scrollCoordinator.enqueueGeometryObservation(
                         current.isAtBottom,
                         contentHeight: current.contentHeight,
-                        scope: presentationScope)
-                    if !current.isAtBottom,
-                       current.hasMaterialHeightChange(from: previous) {
-                        requestScroll(
-                            proxy,
-                            reason: .richHeightCorrection,
-                            contentHeight: current.contentHeight)
-                    }
+                        scope: pageScope)
                 }
                 .onScrollPhaseChange { _, newPhase in
                     switch newPhase {
                     case .tracking, .interacting, .decelerating:
                         scrollCoordinator.userInteractionDidBegin(
-                            scope: presentationScope)
+                            scope: pageScope)
                     case .idle:
                         scrollCoordinator.userInteractionDidEnd(
-                            scope: presentationScope)
+                            scope: pageScope)
                     case .animating:
                         break
                     }
                 }
                 .onDisappear {
-                    scrollCoordinator.deactivate(scope: presentationScope)
+                    scrollCoordinator.deactivate(scope: pageScope)
                 }
             }
-            .id(presentationScope)
+            .id(pageScope)
         }
     }
 
@@ -266,48 +322,76 @@ public struct CodeShell: View {
             permissionBlocksResponse: permissionBlocksComposer)
     }
 
+    private var defersRichUntilInitialRestore: Bool {
+        IntatisThreadRichEntryPolicy.defersUntilInitialRestore(
+            richRowCount: threadHistoryWindow.items.count)
+    }
+
+    private var threadHistoryWindow: IntatisThreadHistoryWindow<CodeItem> {
+        .resolve(
+            allItems: displayedItems,
+            requestedUpperBound: requestedHistoryWindowUpperBound)
+    }
+
+    private var requestedHistoryWindowUpperBound: Int? {
+        historySelection?.upperBound(for: presentationScope)
+    }
+
+    private var threadPresentationScope: IntatisThreadPresentationScope {
+        presentationScope.historyWindowScope(
+            requestedUpperBound: requestedHistoryWindowUpperBound)
+    }
+
+    private func selectHistoryWindow(_ requestedUpperBound: Int?) {
+        historySelection = IntatisThreadHistorySelection(
+            scope: presentationScope,
+            requestedUpperBound: requestedUpperBound)
+    }
+
+    private var showsVisibleThinkingIndicator: Bool {
+        threadHistoryWindow.isLatest && showsThinkingIndicator
+    }
+
     private var itemScrollSignature: IntatisThreadScrollSignature {
-        let last = displayedItems.last
+        let historyWindow = threadHistoryWindow
+        let last = historyWindow.items.last
         return IntatisThreadScrollSignature(
-            visibleItemCount: displayedItems.count,
+            visibleItemCount: historyWindow.items.count,
             lastItemID: last?.id,
             lastBodyUTF8Count: last?.body.utf8.count ?? 0,
             lastItemComplete: last?.complete ?? false,
-            isWorking: isWorking,
-            showsThinkingIndicator: showsThinkingIndicator)
+            isWorking: historyWindow.isLatest && isWorking,
+            showsThinkingIndicator: showsVisibleThinkingIndicator)
     }
 
     private var scrollReason: IntatisThreadScrollReason {
-        guard let last = displayedItems.last else { return .liveUpdate }
-        return last.complete && !isWorking ? .completion : .liveUpdate
+        let historyWindow = threadHistoryWindow
+        guard let last = historyWindow.items.last else {
+            return .liveUpdate
+        }
+        let visibleIsWorking = historyWindow.isLatest && isWorking
+        return last.complete && !visibleIsWorking
+            ? .completion
+            : .liveUpdate
     }
 
     private func requestScroll(
         _ proxy: ScrollViewProxy,
         reason: IntatisThreadScrollReason,
-        contentHeight: CGFloat? = nil
+        scope: IntatisThreadPresentationScope
     ) {
-        let perform: @MainActor (IntatisThreadScrollRequest) -> Void = { request in
+        scrollCoordinator.request(
+            scope: scope,
+            reason: reason,
+            perform: scrollPerformer(proxy))
+    }
+
+    private func scrollPerformer(
+        _ proxy: ScrollViewProxy
+    ) -> @MainActor (IntatisThreadScrollRequest) -> Void {
+        { request in
             let anchorID = IntatisThreadBottomAnchorID(scope: request.scope)
-            if request.animated {
-                withAnimation(.easeOut(duration: 0.18)) {
-                    proxy.scrollTo(anchorID, anchor: .bottom)
-                }
-            } else {
-                proxy.scrollTo(anchorID, anchor: .bottom)
-            }
-        }
-        if reason == .richHeightCorrection,
-           let contentHeight {
-            scrollCoordinator.requestRichHeightCorrection(
-                scope: presentationScope,
-                contentHeight: contentHeight,
-                perform: perform)
-        } else {
-            scrollCoordinator.request(
-                scope: presentationScope,
-                reason: reason,
-                perform: perform)
+            proxy.scrollTo(anchorID, anchor: .bottom)
         }
     }
 
@@ -353,7 +437,10 @@ public struct CodeShell: View {
                         stats: latestTurnStats,
                         style: threadStyle)
                 },
-                onSend: onSend)
+                onSend: {
+                    selectHistoryWindow(nil)
+                    onSend()
+                })
         }
         .frame(maxWidth: layout.contentMaxWidth)
         .padding(.horizontal, layout.horizontalPadding)

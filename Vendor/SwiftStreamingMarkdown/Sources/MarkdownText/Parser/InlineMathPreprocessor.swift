@@ -2,13 +2,13 @@
 //  Copyright (c) Microsoft Corporation. All rights reserved.
 //  Licensed under the MIT License. See LICENSE in the project root for license information.
 //
-//  Intatis derivative modification: code-aware inline-math preprocessing.
+//  Intatis derivative modification: code-aware LaTeX preprocessing.
 //
 
 import Foundation
 import Markdown
 
-/// Code-aware, request-local preprocessing for conservative inline math.
+/// Code-aware, request-local preprocessing for inline and display math.
 ///
 /// The first raw `Document` remains the authority for identifying code and
 /// literal-only syntax. Only accepted candidates outside code, link/image,
@@ -24,6 +24,7 @@ enum InlineMathPreprocessor {
     let range: Range<String.Index>
     let source: String
     let originalLiteral: String
+    let presentation: MathPresentation
   }
 
   private struct PositionedCharacter {
@@ -35,23 +36,24 @@ enum InlineMathPreprocessor {
   }
 
   /// A cheap check used to keep ordinary no-math messages on the one-parse path.
-  static func mightContainSingleDollarDelimiter(_ source: String) -> Bool {
-    guard source.utf8.contains(0x24) else { return false }
+  static func mightContainMathDelimiter(_ source: String) -> Bool {
     let bytes = Array(source.utf8)
+    var precedingBackslashes = 0
 
-    for index in bytes.indices where bytes[index] == 0x24 {
-      let previousIsDollar = index > bytes.startIndex && bytes[index - 1] == 0x24
-      let nextIsDollar = index + 1 < bytes.endIndex && bytes[index + 1] == 0x24
-      guard !previousIsDollar, !nextIsDollar else { continue }
-
-      var backslashCount = 0
-      var cursor = index
-      while cursor > bytes.startIndex, bytes[cursor - 1] == 0x5C {
-        backslashCount += 1
-        cursor -= 1
-      }
-      if backslashCount.isMultiple(of: 2) {
-        return true
+    for index in bytes.indices {
+      let byte = bytes[index]
+      if byte == 0x5C {
+        if precedingBackslashes.isMultiple(of: 2),
+           index + 1 < bytes.endIndex,
+           bytes[index + 1] == 0x28 || bytes[index + 1] == 0x5B {
+          return true
+        }
+        precedingBackslashes += 1
+      } else {
+        if byte == 0x24, precedingBackslashes.isMultiple(of: 2) {
+          return true
+        }
+        precedingBackslashes = 0
       }
     }
     return false
@@ -62,8 +64,8 @@ enum InlineMathPreprocessor {
     document: Document,
     config: MathRenderConfig
   ) -> Output? {
-    guard config.isSingleDollarInlineEnabled,
-          mightContainSingleDollarDelimiter(source),
+    guard config.isEnabled,
+          mightContainMathDelimiter(source),
           let protectedRanges = protectedLiteralRanges(
             in: document,
             source: source
@@ -89,8 +91,8 @@ enum InlineMathPreprocessor {
       with: ""
     )
   ) -> Output? {
-    guard config.isSingleDollarInlineEnabled,
-          mightContainSingleDollarDelimiter(source),
+    guard config.isEnabled,
+          mightContainMathDelimiter(source),
           let protectedRanges = normalizedProtectedRanges(
             protectedUTF8Ranges,
             source: source
@@ -106,17 +108,11 @@ enum InlineMathPreprocessor {
     let candidates = scanCandidates(in: source, characters: characters)
     guard !candidates.isEmpty else { return nil }
 
-    let literalOnly =
-      candidates.count > config.maxFormulaCount
-      || candidates.contains {
-        $0.source.utf8.count > config.maxFormulaUTF8Bytes
-      }
-
     let entries = candidates.map {
       InlineMathCatalog.Entry(
         source: $0.source,
         originalLiteral: $0.originalLiteral,
-        rendering: literalOnly ? .literalOnly : .attachment
+        presentation: $0.presentation
       )
     }
     let catalog = InlineMathCatalog(namespace: namespace, entries: entries)
@@ -211,29 +207,125 @@ enum InlineMathPreprocessor {
     return result
   }
 
+  private enum Delimiter {
+    case singleDollar
+    case doubleDollar
+    case parenthesis
+    case bracket
+
+    var length: Int {
+      self == .singleDollar ? 1 : 2
+    }
+
+    var presentation: MathPresentation {
+      switch self {
+      case .singleDollar, .parenthesis:
+        return .inline
+      case .doubleDollar, .bracket:
+        return .display
+      }
+    }
+
+    var allowsNewlines: Bool {
+      presentation == .display
+    }
+  }
+
+  private struct OpenDelimiter {
+    let delimiter: Delimiter
+    let characterIndex: Int
+  }
+
   private static func scanCandidates(
     in source: String,
     characters: [PositionedCharacter]
   ) -> [Candidate] {
     var candidates: [Candidate] = []
-    var openerIndex: Int?
+    var opener: OpenDelimiter?
+    var index = characters.startIndex
 
-    for index in characters.indices {
+    while index < characters.endIndex {
       let positioned = characters[index]
       if positioned.isProtected {
-        openerIndex = nil
+        opener = nil
+        index += 1
         continue
       }
 
-      if positioned.character.isNewline {
-        openerIndex = nil
+      if let open = opener {
+        if positioned.character.isNewline,
+           !open.delimiter.allowsNewlines {
+          opener = nil
+          index += 1
+          continue
+        }
+
+        if isClosingDelimiter(
+          open.delimiter,
+          at: index,
+          characters: characters
+        ) {
+          let openerEnd = characters[
+            open.characterIndex + open.delimiter.length - 1
+          ].endIndex
+          let closerEnd = characters[
+            index + open.delimiter.length - 1
+          ].endIndex
+          let literalRange =
+            characters[open.characterIndex].index..<closerEnd
+          let rawFormula = String(source[openerEnd..<positioned.index])
+          let formula = rawFormula.trimmingCharacters(
+            in: .whitespacesAndNewlines
+          )
+          if !formula.isEmpty {
+            candidates.append(
+              Candidate(
+                range: literalRange,
+                source: formula,
+                originalLiteral: String(source[literalRange]),
+                presentation: open.delimiter.presentation
+              )
+            )
+          }
+          opener = nil
+          index += open.delimiter.length
+          continue
+        }
+
+        index += 1
         continue
       }
 
-      guard positioned.character == "$" else { continue }
-      let escaped = isEscapedDelimiter(at: index, characters: characters)
-      if escaped {
-        continue
+      if let delimiter = openingDelimiter(
+        at: index,
+        characters: characters
+      ) {
+        opener = OpenDelimiter(
+          delimiter: delimiter,
+          characterIndex: index
+        )
+        index += delimiter.length
+      } else {
+        index += 1
+      }
+    }
+
+    return candidates
+  }
+
+  private static func openingDelimiter(
+    at index: Int,
+    characters: [PositionedCharacter]
+  ) -> Delimiter? {
+    let positioned = characters[index]
+    guard !positioned.isProtected else { return nil }
+
+    if positioned.character == "$" {
+      guard !isEscapedDelimiter(at: index, characters: characters) else {
+        return nil
+      }
+      if isDoubleDollarDelimiter(at: index, characters: characters) {
+        return .doubleDollar
       }
 
       let previous = index > characters.startIndex
@@ -242,35 +334,104 @@ enum InlineMathPreprocessor {
       let next = index + 1 < characters.endIndex
         ? characters[index + 1].character
         : nil
-      let isSingleDelimiter = previous != "$" && next != "$"
-      guard isSingleDelimiter else {
-        openerIndex = nil
-        continue
+      guard previous != "$",
+            next != "$",
+            isValidOpener(next: next) else {
+        return nil
       }
-
-      if let openIndex = openerIndex {
-        if isValidCloser(previous: previous, next: next) {
-          let open = characters[openIndex]
-          let contentRange = open.endIndex..<positioned.index
-          let literalRange = open.index..<positioned.endIndex
-          let formulaSource = String(source[contentRange])
-          candidates.append(
-            Candidate(
-              range: literalRange,
-              source: formulaSource,
-              originalLiteral: String(source[literalRange])
-            )
-          )
-          openerIndex = nil
-        } else {
-          openerIndex = isValidOpener(next: next) ? index : nil
-        }
-      } else if isValidOpener(next: next) {
-        openerIndex = index
-      }
+      return .singleDollar
     }
 
-    return candidates
+    guard positioned.character == "\\",
+          !isEscapedDelimiter(at: index, characters: characters),
+          index + 1 < characters.endIndex,
+          !characters[index + 1].isProtected else {
+      return nil
+    }
+    switch characters[index + 1].character {
+    case "(":
+      return .parenthesis
+    case "[":
+      return .bracket
+    default:
+      return nil
+    }
+  }
+
+  private static func isClosingDelimiter(
+    _ delimiter: Delimiter,
+    at index: Int,
+    characters: [PositionedCharacter]
+  ) -> Bool {
+    switch delimiter {
+    case .singleDollar:
+      guard characters[index].character == "$",
+            !isEscapedDelimiter(at: index, characters: characters)
+      else {
+        return false
+      }
+      let previous = index > characters.startIndex
+        ? characters[index - 1].character
+        : nil
+      let next = index + 1 < characters.endIndex
+        ? characters[index + 1].character
+        : nil
+      return previous != "$"
+        && next != "$"
+        && isValidCloser(previous: previous, next: next)
+
+    case .doubleDollar:
+      return isDoubleDollarDelimiter(at: index, characters: characters)
+
+    case .parenthesis:
+      return isBackslashDelimiter(
+        ")",
+        at: index,
+        characters: characters
+      )
+
+    case .bracket:
+      return isBackslashDelimiter(
+        "]",
+        at: index,
+        characters: characters
+      )
+    }
+  }
+
+  private static func isDoubleDollarDelimiter(
+    at index: Int,
+    characters: [PositionedCharacter]
+  ) -> Bool {
+    guard index + 1 < characters.endIndex,
+          characters[index].character == "$",
+          characters[index + 1].character == "$",
+          !characters[index].isProtected,
+          !characters[index + 1].isProtected,
+          !isEscapedDelimiter(at: index, characters: characters)
+    else {
+      return false
+    }
+    let previous = index > characters.startIndex
+      ? characters[index - 1].character
+      : nil
+    let next = index + 2 < characters.endIndex
+      ? characters[index + 2].character
+      : nil
+    return previous != "$" && next != "$"
+  }
+
+  private static func isBackslashDelimiter(
+    _ terminal: Character,
+    at index: Int,
+    characters: [PositionedCharacter]
+  ) -> Bool {
+    index + 1 < characters.endIndex
+      && characters[index].character == "\\"
+      && characters[index + 1].character == terminal
+      && !characters[index].isProtected
+      && !characters[index + 1].isProtected
+      && !isEscapedDelimiter(at: index, characters: characters)
   }
 
   private static func isEscapedDelimiter(

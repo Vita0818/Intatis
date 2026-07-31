@@ -81,6 +81,12 @@ public struct ProviderEndpoint: Codable, Equatable, Sendable {
     public var responsesEndpoint: URL?
     public var apiKeyRef: KeychainRef
     public var wire: WireFormat
+    /// Provider SDK option semantics selected by OpenCode-compatible `npm`
+    /// configuration. This is separate from the HTTP wire dialect.
+    public var requestAdapter: ProviderRequestAdapter
+    /// Optional model-level `provider.npm` overrides. OpenCode resolves these
+    /// before the provider-level package.
+    public var modelRequestAdapters: [String: ProviderRequestAdapter]
     /// Arbitrary model-scoped request body options from the user's provider
     /// configuration. Wire adapters merge the selected model's object into the
     /// outgoing request without enumerating provider-specific keys.
@@ -93,6 +99,8 @@ public struct ProviderEndpoint: Codable, Equatable, Sendable {
     public init(id: String, baseURL: URL, chatEndpoint: URL? = nil,
                 responsesEndpoint: URL? = nil,
                 apiKeyRef: KeychainRef, wire: WireFormat,
+                requestAdapter: ProviderRequestAdapter = .legacyOpenAIWire,
+                modelRequestAdapters: [String: ProviderRequestAdapter] = [:],
                 modelRequestOptions: [String: [String: JSONValue]] = [:],
                 modelCapabilities: [String: [Capability]] = [:]) {
         self.id = id
@@ -101,6 +109,8 @@ public struct ProviderEndpoint: Codable, Equatable, Sendable {
         self.responsesEndpoint = responsesEndpoint
         self.apiKeyRef = apiKeyRef
         self.wire = wire
+        self.requestAdapter = requestAdapter
+        self.modelRequestAdapters = modelRequestAdapters
         self.modelRequestOptions = modelRequestOptions
         self.modelCapabilities = modelCapabilities
     }
@@ -112,6 +122,8 @@ public struct ProviderEndpoint: Codable, Equatable, Sendable {
         case responsesEndpoint
         case apiKeyRef
         case wire
+        case requestAdapter
+        case modelRequestAdapters
         case modelRequestOptions
         case modelCapabilities
     }
@@ -126,6 +138,12 @@ public struct ProviderEndpoint: Codable, Equatable, Sendable {
             forKey: .responsesEndpoint)
         self.apiKeyRef = try container.decode(KeychainRef.self, forKey: .apiKeyRef)
         self.wire = try container.decode(WireFormat.self, forKey: .wire)
+        self.requestAdapter = try container.decodeIfPresent(
+            ProviderRequestAdapter.self,
+            forKey: .requestAdapter) ?? .legacyOpenAIWire
+        self.modelRequestAdapters = try container.decodeIfPresent(
+            [String: ProviderRequestAdapter].self,
+            forKey: .modelRequestAdapters) ?? [:]
         self.modelRequestOptions = try container.decodeIfPresent(
             [String: [String: JSONValue]].self,
             forKey: .modelRequestOptions) ?? [:]
@@ -144,6 +162,16 @@ public struct ProviderEndpoint: Codable, Equatable, Sendable {
             forKey: .responsesEndpoint)
         try container.encode(apiKeyRef, forKey: .apiKeyRef)
         try container.encode(wire, forKey: .wire)
+        if requestAdapter != .legacyOpenAIWire {
+            try container.encode(
+                requestAdapter,
+                forKey: .requestAdapter)
+        }
+        if !modelRequestAdapters.isEmpty {
+            try container.encode(
+                modelRequestAdapters,
+                forKey: .modelRequestAdapters)
+        }
         if !modelRequestOptions.isEmpty {
             try container.encode(modelRequestOptions, forKey: .modelRequestOptions)
         }
@@ -164,6 +192,12 @@ public struct ProviderEndpoint: Codable, Equatable, Sendable {
 
     public func requestOptions(for model: ModelID) -> [String: JSONValue] {
         modelRequestOptions[model.rawValue] ?? [:]
+    }
+
+    public func requestAdapter(
+        for model: ModelID
+    ) -> ProviderRequestAdapter {
+        modelRequestAdapters[model.rawValue] ?? requestAdapter
     }
 
     public func capabilities(

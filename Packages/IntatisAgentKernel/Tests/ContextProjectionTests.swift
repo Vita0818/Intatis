@@ -6,6 +6,7 @@ import IntatisProviders
 import IntatisTools
 import IntatisPermission
 import IntatisConversation
+import IntatisSkills
 @testable import IntatisAgentKernel
 
 private final class ContextCapturingProvider: ToolCallingProvider, @unchecked Sendable {
@@ -72,6 +73,48 @@ final class ContextProjectionTests: XCTestCase {
                 "Complete only the assigned task.",
                 "Do not share raw workspace details with sibling agents.",
             ])
+    }
+
+    func testSkillCatalogBudgetUsesOnlyCanonicalPrimaryContextMetadata() {
+        let exact = AgentModelContextPolicy(
+            contextWindowTokens: 200_000,
+            maxContextWindowTokens: 400_000,
+            effectiveContextWindowPercent: 50)
+        XCTAssertEqual(
+            exact.skillCatalogMetadataBudget,
+            .approximateTokens(4_000))
+
+        let largerExact = AgentModelContextPolicy(
+            contextWindowTokens: 400_000)
+        XCTAssertEqual(
+            largerExact.skillCatalogMetadataBudget,
+            .approximateTokens(8_000))
+
+        let openCodePrimary = AgentModelContextPolicy(
+            configurationMetadata: [
+                "limit": .object([
+                    "context": .number(300_000),
+                ]),
+            ])
+        XCTAssertEqual(
+            openCodePrimary.skillCatalogMetadataBudget,
+            .approximateTokens(6_000))
+
+        let maxOnly = AgentModelContextPolicy(
+            maxContextWindowTokens: 400_000)
+        XCTAssertEqual(
+            maxOnly.skillCatalogMetadataBudget,
+            .characters(8_000))
+
+        let autoOnly = AgentModelContextPolicy(
+            autoCompactTokenLimit: 100_000)
+        XCTAssertEqual(
+            autoOnly.skillCatalogMetadataBudget,
+            .characters(8_000))
+        XCTAssertEqual(
+            AgentModelContextPolicy.unspecified
+                .skillCatalogMetadataBudget,
+            .characters(8_000))
     }
 
     func testCoworkSystemPromptDoesNotEmbedDynamicIdentityOrWorkspaceData() {
@@ -515,6 +558,159 @@ final class ContextProjectionTests: XCTestCase {
         XCTAssertTrue(systemPrompt.contains("strict JSON object"))
         XCTAssertTrue(systemPrompt.contains("only after receiving its ToolResult"))
         XCTAssertTrue(systemPrompt.contains("Code-specific instructions."))
+    }
+
+    func testRuntimeProjectsSkillCatalogAsDeveloperAndExplicitBodyAsUser() async throws {
+        let workspace = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "intatis-skill-context-\(UUID().uuidString)",
+                isDirectory: true)
+        let skillDirectory = workspace
+            .appendingPathComponent(".agents/skills/demo", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: skillDirectory,
+            withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let instructions = """
+        ---
+        name: demo
+        description: Demonstrate the exact Skill projection roles.
+        ---
+        BODY_ONLY_MARKER
+        """
+        try instructions.write(
+            to: skillDirectory.appendingPathComponent("SKILL.md"),
+            atomically: true,
+            encoding: .utf8)
+
+        let snapshot = try await SkillCatalogService.shared.snapshot(
+            configuration: SkillDiscoveryConfiguration(
+                workspaceRoot: workspace,
+                access: .workspaceOnly))
+        let registry = snapshot.augmenting(ToolRegistry([]))
+        let log = try EventLog(
+            session: SessionID(rawValue: "skill_context"),
+            fileURL: workspace.appendingPathComponent("events.jsonl"))
+        let provider = ContextCapturingProvider()
+        let runtime = AgentRuntime.code(
+            registry: registry,
+            allowsShell: false)
+        let loop = runtime.makeLoop(
+            log: log,
+            provider: provider,
+            responder: FixedResponder(.allow),
+            agent: Agent(
+                name: AgentID(rawValue: "skill-agent"),
+                workspaceRoot: workspace,
+                model: ModelID(rawValue: "m"),
+                profile: .reviewed),
+            context: ContextBuilder(
+                systemPrompt: "system",
+                skillSnapshot: snapshot),
+            workspaceLease: WorkspaceLease(
+                rootPath: workspace.path,
+                access: .readWrite))
+
+        try await loop.send("Use $demo for this turn.")
+
+        let request = try XCTUnwrap(provider.requests.first)
+        XCTAssertEqual(request.messages.first?.role, .system)
+        XCTAssertEqual(request.messages.dropFirst().first?.role, .developer)
+        XCTAssertEqual(request.messages.last?.role, .user)
+        let system = try XCTUnwrap(request.messages.first?.content)
+        let catalog = try XCTUnwrap(
+            request.messages.first(where: { $0.role == .developer })?
+                .content)
+        let activationIndex = try XCTUnwrap(
+            request.messages.firstIndex(where: {
+                $0.role == .user
+                    && $0.content?.contains(
+                        "<<<INTATIS_ACTIVATED_SKILLS") == true
+            }))
+        let currentUserIndex = request.messages.index(
+            before: request.messages.endIndex)
+        XCTAssertLessThan(activationIndex, currentUserIndex)
+        let activation = try XCTUnwrap(
+            request.messages[activationIndex].content)
+        XCTAssertTrue(system.contains("INTATIS_SKILL_CATALOG"))
+        XCTAssertTrue(catalog.contains("demo"))
+        XCTAssertFalse(catalog.contains("BODY_ONLY_MARKER"))
+        XCTAssertTrue(activation.contains("BODY_ONLY_MARKER"))
+        XCTAssertTrue(activation.contains("---"))
+        XCTAssertEqual(
+            request.messages[currentUserIndex].content,
+            "Use $demo for this turn.")
+        XCTAssertEqual(
+            Set(request.tools.map(\.name)),
+            ["activate_skill", "read_skill_resource"])
+    }
+
+    func testSkillSystemPolicyIsStableAndRejectedSelectionRemainsUserContext()
+        async throws
+    {
+        let workspace = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "intatis-skill-rejection-\(UUID().uuidString)",
+                isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        for name in ["alpha", "beta"] {
+            let directory = workspace.appendingPathComponent(
+                ".agents/skills/\(name)",
+                isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true)
+            try """
+            ---
+            name: \(name)
+            description: \(name) workflow.
+            ---
+            \(name) body
+            """.write(
+                to: directory.appendingPathComponent("SKILL.md"),
+                atomically: true,
+                encoding: .utf8)
+        }
+        var limits = SkillDiscoveryLimits.standard
+        limits.maxExplicitSkills = 1
+        let snapshot = try await SkillCatalogService.shared.snapshot(
+            configuration: SkillDiscoveryConfiguration(
+                workspaceRoot: workspace,
+                access: .workspaceOnly,
+                limits: limits))
+
+        let withoutSkills = ContextBuilder(systemPrompt: "stable")
+            .initialMessages(history: [], userText: "ordinary")
+        let withEmptySnapshot = ContextBuilder(
+            systemPrompt: "stable",
+            skillSnapshot: .empty)
+            .initialMessages(history: [], userText: "ordinary")
+        XCTAssertEqual(
+            withoutSkills.first?.content,
+            withEmptySnapshot.first?.content)
+        XCTAssertTrue(
+            withoutSkills.first?.content?.contains(
+                "status=\"rejected\"") == true)
+
+        let messages = ContextBuilder(
+            systemPrompt: "stable",
+            skillSnapshot: snapshot)
+            .initialMessages(
+                history: [],
+                userText: "Use $alpha and $beta.")
+        let rejected = try XCTUnwrap(messages.first(where: {
+            $0.role == .user
+                && $0.content?.contains(
+                    "ACTIVATION_REJECTED") == true
+        }))
+        XCTAssertTrue(
+            rejected.content?.contains(
+                "status=\"rejected\"") == true)
+        XCTAssertFalse(
+            rejected.content?.contains("alpha body") == true)
+        XCTAssertFalse(
+            rejected.content?.contains("beta body") == true)
+        XCTAssertEqual(messages.last?.content, "Use $alpha and $beta.")
     }
 
     func testWorkerPromptDoesNotReplayOriginalSpawnInstructionAsFreshUserMessage() async throws {

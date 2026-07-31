@@ -55,7 +55,9 @@ external-runtime 以独立 helper/process/service 运行上游实现
 1. 固定上游仓库 URL、tag/commit 和具体文件路径；不得直接跟随浮动 `main`/`dev` 作为可重复构建依据。
 2. 读取根许可证、目标文件头、NOTICE、依赖清单和相关资产许可证。
 3. 选择 `derived` / `vendored` / `dependency` / `external-runtime` 之一，并说明为何适合 Apple 平台。
-4. 评估 SwiftPM/Xcode target、macOS 签名、App Store、iOS 子集、binary size、更新和供应链影响。
+4. 评估 SwiftPM/Xcode target、macOS Developer ID 签名/公证/直接分发、
+   iOS 子集、binary size、更新和供应链影响；不得仅为已取消的 Mac App Store
+   产品面引入替代依赖或裁剪能力。
 5. 说明外部实现如何接入现有 Permission/EventLog/Lease/PathConfinement 边界。
 6. 在 `NOTICE.md` 增加当前实际采用项；需要分发完整第三方声明时新增 `ThirdPartyNotices/<project>.md`。
 7. 对直接复制或翻译的文件，在文件头或相邻来源清单中记录上游 URL、commit、原许可证、本地修改摘要；不得把许可证全文散落复制到每个源码文件。
@@ -69,6 +71,36 @@ external-runtime 以独立 helper/process/service 运行上游实现
 - 当前状态：`research-only`，截至本政策生效时尚未把 OpenCode 源码、公开 prompt 或 UI 资产加入 Intatis。
 - 后续允许选择性复用其具体实现，但每批必须固定 commit、核对目标文件与传递依赖，并按本政策记录 provenance。
 - Intatis 不使用 OpenCode 名称、Logo、图标或 UI 品牌；若复用 TypeScript 实现，优先选择可验证的逻辑/测试进行 Swift 派生实现，或作为 macOS-only 隔离 runtime 评估。
+
+## OpenCode provider adapter 与 AI SDK wire 参考记录
+
+- OpenCode 上游：`https://github.com/anomalyco/opencode`；本机实际版本
+  `1.18.8`，固定 release commit
+  `3c81a5d1ddceab377d9ad71c14899e6935333fdd`（调研日期
+  2026-07-28，MIT）。同时核对当日 dev commit
+  `017a5977d2107092007623e507fc5c6eb337d3b2`，相关 provider/request/transform
+  文件与 release 内容一致。
+- 阅读范围为
+  `packages/opencode/src/provider/provider.ts`、
+  `provider/transform.ts`、`session/llm/request.ts`、`session/llm.ts` 与
+  `test/provider/cf-ai-gateway-e2e.test.ts`。确认 custom provider 的 package
+  selection、defaults → model → agent → variant deep merge、namespaced
+  provider options 和最终 SDK dispatch；“配置保真”不等于 raw options 直接
+  拼入 HTTP body。
+- 对应 wire 行为固定核对
+  `@ai-sdk/openai-compatible@2.0.41`，Vercel AI commit
+  `99327b1d7b3d172ed0aae7230ae153f2d32b0ebb`（Apache-2.0），以及
+  `@openrouter/ai-sdk-provider@2.9.0`，OpenRouter provider commit
+  `5cef3c562b12c89c7ddbf1c88565e1219af6a302`（Apache-2.0）。另参考 Remeda
+  `mergeDeep` 的公开 plain-object recursion/array-scalar replacement 行为；
+  本地没有引入 Remeda runtime。
+- 本轮复用形式是 `reference`：Intatis 以 Swift 独立实现 raw npm identity、
+  reviewed adapter selection/lowering、deep merge、durable revision 与
+  fail-closed 边界；没有复制、逐行翻译、vendor、链接或分发 OpenCode、
+  Vercel AI SDK、OpenRouter SDK、Remeda 的源码、测试、prompt、文案、名称、
+  Logo 或 UI 资产。因此没有新增第三方依赖/分发物，`NOTICE.md` 无需修改。
+  将来若直接采用其源码、fixture 或 runtime，必须按固定目标文件重新分类为
+  `derived` / `vendored` / `dependency` 并补齐许可证与 NOTICE。
 
 ## Codex CLI managed terminal 参考记录
 
@@ -85,6 +117,128 @@ external-runtime 以独立 helper/process/service 运行上游实现
 - 核对结果：根许可证为 Apache-2.0，仓库包含 NOTICE；本轮重点阅读 `codex-rs/core/src/state/session.rs`、`context_manager/history.rs`、`context_manager/normalize.rs`、`codex-rs/core/src/session/turn.rs`、`session/rollout_reconstruction.rs`、`codex-rs/protocol/src/models.rs`、`protocol.rs`、`codex-rs/rollout/src/policy.rs` 以及对应 context/history/compaction tests。
 - 本轮复用形式是 `reference`：参考同一 thread 持有有序 model items、completed item 单次入历史、function call/output 按 call ID 配对、请求前对 missing/orphan pair 做 prompt-only 归一化、resume 从 rollout 重建，以及 compaction 保存完整 `replacement_history` 的行为。
 - Intatis 的 `ModelHistoryItemPayload`、EventLog wire event、Swift projector、legacy bridge、AgentLoop 接线和测试均为独立实现；没有复制、逐行翻译、vendor 或链接 Codex Rust 源码、prompt、测试、文案、名称、Logo 或 UI 资产。因此本轮没有新增第三方分发物，也没有修改 `NOTICE.md`。后续若直接采用上游任何文件或表达，必须重新按目标 commit 核对来源与 Apache-2.0 NOTICE，并把复用类型改为 `derived` / `vendored` / `dependency`。
+
+## Codex CLI Skill 生命周期与 replacement-history compaction 参考记录
+
+- 上游：`https://github.com/openai/codex`
+- 固定 commit：`bd2de422aa287b97b06ca6425a10935bcf1b3731`（调研日期
+  2026-07-28）；根许可证为 Apache-2.0，仓库包含 NOTICE。
+- Skill 生命周期重点核对
+  `codex-rs/core-skills/src/{render,injection,skill_instructions,service}.rs`、
+  `codex-rs/skills/src/model.rs`、
+  `codex-rs/app-server/src/skills_watcher.rs`、
+  `codex-rs/core/src/session/{turn,context_window}.rs` 和
+  `codex-rs/core/src/mcp_skill_dependencies.rs`。确认 Codex 没有 Session 级
+  activated ledger/TTL：当前 Turn 解析并注入 Skill，物理正文进入普通历史，
+  后续由通用 compaction 管理；watcher 只使下一 Turn 的 metadata cache 失效。
+- catalog/MCP 对照还核对了 Core renderer 与
+  `codex-rs/ext/skills/src/{dynamic_skill_selector,shadow_selection_experiment}.rs`。
+  Core 路径以 exact raw primary `context_window` 的 2% 作为 metadata token
+  budget，缺失时回退 8,000 characters；ext/skills 的 resolved/max-window +
+  4k cap 是另一条路径，不能混写成 CLI Core 合同。MCP dependency 正式范围是
+  `agents/openai.yaml` 中的 MCP tools，并包含用户确认、配置/OAuth 与 runtime
+  refresh 流程；Intatis 只独立实现了更窄的 metadata + request-owned
+  fail-closed preflight，没有复制或声称实现该外部变更流程。
+- Intatis 的 OpenCode-compatible profile parser 会在 `context_window` 缺失时
+  把显式 `limit.context` 归一到 canonical primary `contextWindowTokens`；
+  catalog 对该 canonical primary 应用同一 2% 公式，但仍拒绝
+  `max_context_window`、compaction threshold 或 model slug 猜测。这是本地
+  compatibility adapter，应与上游 Core 原始字段事实分开记录。
+- compaction 重点核对 `codex-rs/core/src/compact.rs`、
+  `session/rollout_reconstruction.rs`、`state/auto_compact_window.rs`、
+  `codex-rs/protocol/src/{openai_models,protocol,compacted_item}.rs` 及
+  `core/tests/suite/{compact,compact_remote}.rs`。参考事实包括 90% auto /
+  95% usable window、pre/mid-turn 触发、最多 20k token 真实用户消息 +
+  continuation summary、完整 replacement history、UUIDv7 window chain 与
+  latest-checkpoint-plus-suffix 恢复；同时记录 remote persistence 测试 ignored
+  与 network-dependent 测试 skip，未把它们写成上游已完整证明。
+- 本轮复用形式为 `reference`。Intatis 的 Swift protocol/EventLog event、
+  compactor、projector、token estimator、profile policy、catalog budget/
+  metrics、`agents/openai.yaml` parser、MCP locator fingerprint、
+  request-owned host availability assertion、AgentLoop 接线与测试均为独立实现；没有
+  复制或逐行翻译 Rust 源码，没有复制 compact/Skill prompt、snapshot、
+  fixture、产品文案、名称、Logo 或 UI 资产，也没有 vendor、链接或分发 Codex
+  crate。Intatis 还保留了比上游更强的 EventLog-first
+  commit-before-live-swap 与 per-agent CAS。
+- 因此没有新增第三方分发物或依赖，`NOTICE.md` 无需修改。若以后直接采用
+  Codex prompt、源码表达、测试 fixture 或 remote compact wire 实现，必须按
+  目标文件和固定 commit 重新分类为 `derived` / `vendored` / `dependency`，
+  复核 Apache-2.0 NOTICE 并更新 provenance 与 `NOTICE.md`。
+
+## Codex CLI Skills 参考记录
+
+- 上游：`https://github.com/openai/codex`
+- 固定 commit：`fbe65995bbcd4da249cfdafe0300ac3cb2cb3b3c`（调研日期
+  2026-07-27）
+- 核对结果：根许可证为 Apache-2.0，仓库包含 NOTICE；本轮阅读
+  `codex-rs/core-skills/src/render.rs`、`injection.rs`、
+  `skill_instructions.rs`，并定位 `codex-rs/core/src/session/mod.rs` /
+  `session/turn.rs` 的 developer catalog 与 user contextual injection
+  接线。参考事实包括标准 root 类别、canonical 去重、hidden/depth/directory/
+  entry bounds、64/1024 metadata limits、8k/2% catalog budget、system→admin→
+  repo→user budget order、无歧义 `$name`、完整 `SKILL.md` 激活和 child
+  独立加载。
+- 本轮复用形式是 `reference`。`IntatisSkills` 的 Swift loader、snapshot、
+  catalog 文案、dynamic tools、permission/durable execution 接线与测试均为
+  独立实现；没有复制、逐行翻译、vendor 或链接 Codex Rust 源码、公开 prompt、
+  测试、文案、名称、Logo 或 UI 资产。Intatis 还增加了自己的
+  WorkspaceLease、SecretScanner、48 KiB durable output、iOS linkage 与
+  stricter no-symlink 边界。历史 App Store 分支不是当前复用准入条件。
+- 因此本轮没有新增第三方分发物或依赖，`NOTICE.md` 无需修改。若以后复制
+  Codex prompt/源码、支持其 plugin runtime 或改变当前严格 symlink 策略，必须
+  按具体文件和 commit 重新登记 `derived` / `vendored` / `dependency`、
+  Apache-2.0 NOTICE 与本地修改。
+
+## OpenAI Codex `skill-creator` 实际采用记录
+
+- 采用日期：2026-07-28。上游为 `https://github.com/openai/codex` 的
+  `rust-v0.145.0`，固定 commit
+  `25af12f7e61572b0bc18ddb1008be543b91519b0`；根许可证为
+  Apache-2.0，仓库包含 NOTICE。该固定 release 与本机已安装的 Codex CLI
+  0.145.0 对应。
+- 实际采用路径为 `.agents/skills/intatis-skill-creator/`，复用类型从上面的
+  早期纯调研批次明确变为 `vendored` + `derived`。本批采用
+  `SKILL.md`、三个 Python helper 和 `references/openai_yaml.md` 的公开结构与
+  表达，并把设计指导重组为本地 `references/design-guide.md`。
+- 本地派生改名是有意的：DeveloperID/CLI 同时发现
+  `$CODEX_HOME/skills/.system`，若再放置同名 `skill-creator`，显式
+  `$skill-creator` 会因跨 root 歧义 fail closed。派生版本还改为
+  `.agents/skills` 默认路径、Python 标准库实现、48 KiB 资源边界、
+  WorkspaceLease/普通权限链语义，并移除会触发 Intatis SecretScanner 的
+  credential-shaped 示例。
+- 没有复制上游 `agents/openai.yaml`、icon/image/品牌资产、其他系统 Skill
+  或 Codex runtime。生成 `agents/openai.yaml` 只是 opt-in
+  cross-harness metadata；Intatis 只消费其中严格的 MCP dependency 子集，
+  interface/policy 字段不授予能力。
+- 完整文件级 provenance、上游 Git blob、修改摘要、执行边界和升级流程在
+  `ThirdPartyNotices/OpenAICodexSkillCreator.md`；复用现有完整许可证
+  `ThirdPartyNotices/Licenses/Codex-61a44880-Apache-2.0.txt`，并已同步更新
+  `NOTICE.md`。以后升级必须重新固定 commit、核对目标 blob、许可证/NOTICE、
+  本地修改和验证结果。
+
+## Gemini CLI / Pi Skills 对照记录
+
+- Gemini CLI 上游：`https://github.com/google-gemini/gemini-cli`；固定
+  commit：`3818efbbfbf8ef029ef53a6ab1093db39971ce83`（调研日期
+  2026-07-27）。根许可证与目标文件头均为 Apache-2.0。本轮阅读
+  `packages/core/src/skills/skillLoader.ts`、`skillManager.ts`、
+  `packages/core/src/tools/activate-skill.ts` 和
+  `tools/definitions/coreTools.ts`。其实现把 metadata discovery、带优先级的
+  manager、专用 `activate_skill`、完整正文和资源目录分层，并让非 built-in
+  Skill 激活经过确认；激活后会把 Skill 目录加入 workspace context。
+- Pi 上游：`https://github.com/earendil-works/pi`；固定 commit：
+  `99e34013d13a71c2aef1958fd5ab44fa9bfc75dd`（调研日期 2026-07-27）。
+  根许可证为 MIT。本轮阅读
+  `packages/coding-agent/src/core/skills.ts`、`system-prompt.ts` 和
+  `resource-loader.ts`。其实现校验 Agent Skills metadata、发现多类 root、
+  把 catalog 放入 system prompt，并要求模型用通用 `read` 工具读取
+  `SKILL.md` 与相对资源。
+- 两条对照均为 `reference`。Intatis 采用“专用激活 + 渐进披露”的结构判断，
+  但没有复制两者的源码、prompt、测试或文案；同时明确不采用 Gemini 激活后
+  扩大 workspace context、Pi 依赖 generic read/path 的读取方式。
+  `IntatisSkills` 只暴露 snapshot-bound `activate_skill` /
+  `read_skill_resource`，不把 Skill 目录变成新权限根，也不以 `read_file`
+  兜底。没有新增第三方分发物或依赖，因此 `NOTICE.md` 无需修改。
 
 ## 官方 Swift MCP SDK 当前准入结论
 

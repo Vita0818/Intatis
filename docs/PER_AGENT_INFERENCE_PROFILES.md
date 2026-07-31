@@ -114,7 +114,7 @@ Catalog 编译阶段采用浅覆盖，顺序固定为：
 
 当前 bound Cowork agent 的 reasoning/options 由 profile 所有；session-wide `reasoningEffort` 只用于没有 binding 的兼容路径。Cowork durable catalog **不是**开放 JSON 通道：只有显式 schema 中的有界字段可进入 revision，包括数值型 sampling/token/logprob 参数、`logprobs` / `parallel_tool_calls` 布尔值、安全 token 字符串 `reasoning_effort` / `verbosity` / `service_tier`，以及受限的 `reasoning`、`thinking`、`output_config` 和 provider routing 子结构。未知 key、错误 JSON shape、过深/过大容器、runtime structural fields、secret/auth/header/query/URL/endpoint transport material、`stream_options` 与 `n` / `best_of` / `num_return_sequences` / `candidate_count` 等多候选控制都在 catalog admission 时 fail closed；新增 durable option 必须先显式扩展 schema 与测试。
 
-这与 Chat/Code 的兼容配置路径不同：`ProviderEndpoint.modelRequestOptions` 仍保留并浅合并任意 model/variant JSON，不按厂商枚举丢弃未知字段；但 OpenAI-compatible request builder 最终拥有 `model`、`messages`、`tools`、`stream` 等结构。对所有 Chat/Agent 请求，builder 都会无条件移除配置提供的 `stream_options`、`n`、`best_of`、`num_return_sequences`、`candidate_count`，并固定 `n = 1`；只有 host 的 `includeUsage` 可以重新加入受控 `stream_options.include_usage`。当 host 另给 output-token ceiling 时，还会按忽略大小写及 `_` / `-` / `.` 分隔差异的 normalized key 清除全部竞争 token aliases，再写入 host-owned `max_tokens`。因此即使兼容 Chat/Code 配置是开放 JSON，配置也不能改变单候选、usage 或 host ceiling 请求形状；Cowork profile 更早在 durable schema admission 就会拒绝这些字段。
+这与 Chat/Code 的兼容配置路径不同：`ProviderEndpoint.modelRequestOptions` 仍保留任意 model/variant JSON，不按厂商枚举丢弃未知字段；多层 options 使用 OpenCode/Remeda `mergeDeep` 语义，只有共享 plain object 递归，array/scalar/null 由后层替换。`provider.npm` 与 model `provider.npm` 分别冻结 provider adapter 和 model override；最终 request builder 只让 exact adapter 解释已知选项，禁止全局 reasoning alias 规范化或未知 package fallback。`@ai-sdk/openai-compatible` 与 `@openrouter/ai-sdk-provider` 的 reasoning wire shape 不同，历史缺 adapter 值继续走 legacy 行为。Builder 最终拥有 `model`、`messages`、`tools`、`stream` 等结构；对所有 Chat/Agent 请求都会无条件移除配置提供的 `stream_options`、`n`、`best_of`、`num_return_sequences`、`candidate_count`。新式 `@ai-sdk/openai-compatible` / `@openrouter/ai-sdk-provider` adapter 按 pinned OpenCode package 语义省略 `n`，依赖 API 的默认单候选行为，也不会因为 Intatis tool metadata 声明 parallel-safe 就自动合成 `parallel_tool_calls`；只有 legacy Intatis wire 继续显式写入 `n = 1` 和 call-level parallel 开关。显式配置并经 adapter lowering 的 `parallel_tool_calls` 仍可保留。只有 host 的 `includeUsage` 可以重新加入受控 `stream_options.include_usage`。当 host 另给 output-token ceiling 时，还会按忽略大小写及 `_` / `-` / `.` 分隔差异的 normalized key 清除全部竞争 token aliases，再写入 host-owned `max_tokens`。因此即使兼容 Chat/Code 配置是开放 JSON，配置也不能通过候选数量字段改变单候选、usage 或 host ceiling 请求形状；Cowork profile 更早在 durable schema admission 就会拒绝候选数量字段。
 
 ## 6. Agent 生命周期语义
 
@@ -132,6 +132,12 @@ Catalog 编译阶段采用浅覆盖，顺序固定为：
 
 - 未传 `inference_profile_id`：精确继承调用者 binding，包括 revision、connection、variant 和 definition digest。
 - 显式传入：只能使用 runtime 的 host-approved profile map，且在 admission 前完成 exact resolve。
+- coordinator 可先调用 `list_inference_profiles` 查看 host-approved
+  profile ID、安全 label、model 与 variant。`spawn_agent` / list tool 的
+  model-facing descriptor 明确把“省略并继承 exact caller profile”列为默认
+  推荐；只有某个安全 label/model/variant 明确适配被委派工作时才选择不同
+  profile。当前没有硬编码按任务类型推荐特定厂商/model 的 policy tags，不能
+  把模型自己的 label 判断写成 host-guaranteed recommendation。
 - raw model 与 profile 不能同时提交；worker 不能通过 raw model 字段绕过 host-approved profile。
 - 新 agent 的完整 binding 随 durable spawn/attach 事件落盘后才进入可运行 roster。
 
@@ -240,7 +246,7 @@ Endpoint/trust-domain 变化本质上是数据出口变化。当前第一阶段�
 
 - protocol round-trip 与 legacy optional-field decode；
 - Chat/Code `ProviderEndpoint` arbitrary JSON options 保真；Cowork durable schema 只接受显式 allowlisted 字段，并对 unknown key、错误 shape、secret/auth/header/query/URL/endpoint、structural/stream/multi-candidate fields fail closed；
-- 所有 OpenAI-compatible Chat/Agent request 都移除配置 `stream_options` 与多候选参数并强制 `n = 1`；host `includeUsage` 才能重建受控 usage shape，host token ceiling 另清除竞争 aliases；
+- 所有 OpenAI-compatible Chat/Agent request 都移除配置 `stream_options` 与多候选参数；新式 package adapter 省略 `n` 并依赖默认单候选，legacy wire 才显式写入 `n = 1`。新式 adapter 也不得从 parallel-safe tool metadata 自动合成 `parallel_tool_calls`；host `includeUsage` 才能重建受控 usage shape，host token ceiling 另清除竞争 aliases；
 - 语义相同复用 revision、语义变化追加 revision、旧 revision 保留；
 - store owner-only 权限、corruption/schema/permission failure 不覆盖原文件；
 - exact resolution 不回退 current，且 profile/connection revision、model/variant、safe route/trust/egress/digest 任一 mismatch 都在 secret/network 前失败；

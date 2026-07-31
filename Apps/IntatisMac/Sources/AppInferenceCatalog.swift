@@ -52,6 +52,8 @@ enum AppInferenceCatalogCompiler {
             connections.append(InferenceConnectionDraft(
                 inferenceConnectionID: connectionID,
                 wire: .openai,
+                requestAdapter:
+                    provider.requestAdapter,
                 baseURL: baseURL,
                 chatEndpoint: chatEndpoint,
                 credentialRef: AppConfig.apiKeyRef(for: provider),
@@ -76,6 +78,12 @@ enum AppInferenceCatalogCompiler {
                     modelBaseRequestOptions: model.requestOptions,
                     variantRequestOptions: [:],
                     profileRequestOptions: [:],
+                    requestAdapterOverride:
+                        model.requestAdapterOverride,
+                    modelContextPolicy:
+                        AgentModelContextPolicy(
+                            configurationMetadata:
+                                model.configurationMetadata),
                     declaredCapabilities:
                         model.declaredCapabilities,
                     safeRouteLabel: routeLabel))
@@ -102,6 +110,12 @@ enum AppInferenceCatalogCompiler {
                         modelBaseRequestOptions: model.requestOptions,
                         variantRequestOptions: variant.requestOptions,
                         profileRequestOptions: [:],
+                        requestAdapterOverride:
+                            model.requestAdapterOverride,
+                        modelContextPolicy:
+                            AgentModelContextPolicy(
+                                configurationMetadata:
+                                    model.configurationMetadata),
                         declaredCapabilities:
                             model.declaredCapabilities,
                         safeRouteLabel: routeLabel))

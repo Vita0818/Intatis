@@ -16,6 +16,10 @@ public enum IntatisMessageRenderingPolicy: Sendable {
 final class IntatisMessageProjectionLifecycleGate: ObservableObject {
     private var isVisible = false
     private var lastAppliedInput: IntatisMessageProjectionInput?
+    private var viewportDwellTask: Task<Void, Never>?
+    private(set) var pendingViewportDwellGeneration: UInt64?
+    private(set) var completedViewportDwellGeneration: UInt64?
+    private(set) var richAdmissionCount = 0
 
     func activate(
         _ input: IntatisMessageProjectionInput,
@@ -46,6 +50,8 @@ final class IntatisMessageProjectionLifecycleGate: ObservableObject {
     ) {
         isVisible = false
         lastAppliedInput = nil
+        cancelViewportDwell()
+        completedViewportDwellGeneration = nil
         richState.deactivate()
         rawState.deactivate()
     }
@@ -60,11 +66,83 @@ final class IntatisMessageProjectionLifecycleGate: ObservableObject {
         // caused by publication is already a no-op when its Just emits.
         lastAppliedInput = input
         rawState.submit(input.rawRevision)
-        if input.usesRichRenderer {
-            richState.submit(request: input.richRequest)
-        } else {
+        guard input.usesRichRenderer else {
+            cancelViewportDwell()
             richState.deactivate()
+            return
         }
+
+        switch input.viewportAdmission {
+        case .immediate:
+            cancelViewportDwell()
+            richAdmissionCount += 1
+            richState.submit(request: input.richRequest)
+        case .suspended:
+            cancelViewportDwell()
+            richState.suspend(keepingExact: input.richRequest)
+        case let .idleDwell(generation):
+            if completedViewportDwellGeneration == generation {
+                cancelViewportDwell()
+                richAdmissionCount += 1
+                richState.submit(request: input.richRequest)
+                return
+            }
+            richState.suspend(keepingExact: input.richRequest)
+            scheduleViewportDwell(
+                generation: generation,
+                richState: richState)
+        }
+    }
+
+    private func scheduleViewportDwell(
+        generation: UInt64,
+        richState: IntatisMicrosoftMarkdownRenderState
+    ) {
+        guard pendingViewportDwellGeneration != generation
+                || viewportDwellTask == nil else {
+            return
+        }
+        cancelViewportDwell()
+        pendingViewportDwellGeneration = generation
+        viewportDwellTask = Task { @MainActor [weak self, weak richState] in
+            do {
+                try await Task.sleep(
+                    for: IntatisMarkdownRendererLimits.viewportIdleDwell)
+            } catch {
+                return
+            }
+            guard let self, let richState else { return }
+            self.viewportDwellDidElapse(
+                generation: generation,
+                richState: richState)
+        }
+    }
+
+    /// Kept internal so deterministic tests can drive the exact-revision gate
+    /// without relying on wall-clock sleeps.
+    func viewportDwellDidElapse(
+        generation: UInt64,
+        richState: IntatisMicrosoftMarkdownRenderState
+    ) {
+        guard isVisible,
+              pendingViewportDwellGeneration == generation,
+              let input = lastAppliedInput,
+              input.viewportAdmission
+                == .idleDwell(generation: generation) else {
+            return
+        }
+        viewportDwellTask?.cancel()
+        viewportDwellTask = nil
+        pendingViewportDwellGeneration = nil
+        completedViewportDwellGeneration = generation
+        richAdmissionCount += 1
+        richState.submit(request: input.richRequest)
+    }
+
+    private func cancelViewportDwell() {
+        viewportDwellTask?.cancel()
+        viewportDwellTask = nil
+        pendingViewportDwellGeneration = nil
     }
 }
 
@@ -72,6 +150,19 @@ struct IntatisMessageProjectionInput: Equatable {
     let rawRevision: IntatisRawTextProjectionRevision
     let richRequest: IntatisMarkdownRenderRequest
     let usesRichRenderer: Bool
+    let viewportAdmission: IntatisMessageViewportAdmission
+
+    init(
+        rawRevision: IntatisRawTextProjectionRevision,
+        richRequest: IntatisMarkdownRenderRequest,
+        usesRichRenderer: Bool,
+        viewportAdmission: IntatisMessageViewportAdmission = .immediate
+    ) {
+        self.rawRevision = rawRevision
+        self.richRequest = richRequest
+        self.usesRichRenderer = usesRichRenderer
+        self.viewportAdmission = viewportAdmission
+    }
 }
 
 /// Renderer-neutral product facade shared by Chat, Code, Cowork, and iOS.
@@ -85,6 +176,12 @@ public struct IntatisMessageContentView: View {
 
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.intatisMessageViewportAdmission)
+    private var viewportAdmission
+    @Environment(\.intatisThreadScrollCoordinator)
+    private var threadScrollCoordinator
+    @Environment(\.intatisThreadRichSettleSource)
+    private var threadRichSettleSource
     @StateObject private var lifecycleGate = IntatisMessageProjectionLifecycleGate()
     @StateObject private var richState = IntatisMicrosoftMarkdownRenderState()
     @StateObject private var rawState: IntatisRawTextProjectionState
@@ -135,6 +232,12 @@ public struct IntatisMessageContentView: View {
         }
         .fixedSize(horizontal: false, vertical: true)
         .frame(maxWidth: .infinity, alignment: .leading)
+        .onChange(of: finalRichSettleToken) { _, token in
+            notifyRichDocumentCommit(token: token)
+        }
+        .onChange(of: threadRichSettleSource) { _, _ in
+            notifyRichDocumentCommit(token: finalRichSettleToken)
+        }
         .onReceive(Just(projectionInput)) { input in
             lifecycleGate.receive(
                 input,
@@ -149,6 +252,7 @@ public struct IntatisMessageContentView: View {
                 projectionInput,
                 rawState: rawState,
                 richState: richState)
+            notifyRichDocumentCommit(token: finalRichSettleToken)
         }
         .onDisappear {
             lifecycleGate.deactivate(
@@ -202,7 +306,38 @@ public struct IntatisMessageContentView: View {
         IntatisMessageProjectionInput(
             rawRevision: rawProjectionRevision,
             richRequest: richRequest,
-            usesRichRenderer: renderPlan.usesRichRenderer)
+            usesRichRenderer: renderPlan.usesRichRenderer,
+            viewportAdmission: viewportAdmission)
+    }
+
+    private var finalRichSettleToken: IntatisThreadRichSettleToken? {
+        guard let published = richState.publishedDocument else {
+            return nil
+        }
+        let revision = published.revision
+        guard revision.isComplete,
+              published.request == richRequest else {
+            return nil
+        }
+        return .finalDocument(
+            messageID: revision.messageID,
+            contentUTF8Count: revision.rawText.utf8.count,
+            contentHash: revision.rawText.hashValue,
+            appearance: revision.appearance.rawValue,
+            typography: revision.typography.rawValue,
+            configurationRevision: revision.configurationRevision)
+    }
+
+    private func notifyRichDocumentCommit(
+        token: IntatisThreadRichSettleToken?
+    ) {
+        guard let token,
+              let threadRichSettleSource else {
+            return
+        }
+        threadScrollCoordinator?.richDocumentDidCommit(
+            token: token,
+            source: threadRichSettleSource)
     }
 }
 #endif

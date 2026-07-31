@@ -24,7 +24,11 @@ private final class FakeVideo: VideoGenerationProvider, @unchecked Sendable {
     init(_ polls: [VideoJobStatus]) { self.polls = polls }
     func submit(_ request: VideoRequest) async throws -> String { "job1" }
     func poll(_ jobID: String) async throws -> VideoJobStatus {
-        lock.lock(); let s = polls[min(i, polls.count - 1)]; i += 1; lock.unlock(); return s
+        lock.withLock {
+            let status = polls[min(i, polls.count - 1)]
+            i += 1
+            return status
+        }
     }
 }
 

@@ -445,6 +445,15 @@ extension OpenAIWireProvider: ToolCallingProvider {
                                 return true
 
                             case "response.failed":
+                                if let contextWindow =
+                                    ProviderErrorFormatting
+                                        .contextWindowExceeded(
+                                            from: .object(event),
+                                            operation:
+                                                "Responses request")
+                                {
+                                    throw contextWindow
+                                }
                                 let message =
                                     Self.responsesFailureMessage(event)
                                 throw IntatisError.provider(
@@ -529,23 +538,29 @@ extension OpenAIWireProvider: ToolCallingProvider {
     private func buildChatCompletionsAgentRequest(
         _ request: AgentRequest
     ) throws -> URLRequest {
-        var root = Self.configuredRequestBody(endpoint: endpoint, model: request.model)
+        let requestAdapter =
+            endpoint.requestAdapter(for: request.model)
+        var root = try Self.configuredRequestBody(
+            endpoint: endpoint,
+            model: request.model)
         root["model"] = .string(request.model.rawValue)
         root["messages"] = .array(request.messages.map(Self.messageJSON))
         root["stream"] = .bool(true)
-        root["n"] = .number(1)
         if !request.tools.isEmpty {
             root["tools"] = .array(request.tools.map(Self.toolJSON))
         }
-        if let parallelToolCalls = request.parallelToolCalls {
-            root["parallel_tool_calls"] = .bool(parallelToolCalls)
-        }
+        try Self.applyChatCompletionsInvocationControls(
+            to: &root,
+            requestAdapter: requestAdapter,
+            parallelToolCalls:
+                request.parallelToolCalls)
         if let t = request.temperature {
             root["temperature"] = .number(t)
         }
-        if let r = request.reasoningEffort {
-            root["reasoning_effort"] = .string(r.rawValue)
-        }
+        Self.applyChatCompletionsReasoningOptions(
+            to: &root,
+            runtimeEffort: request.reasoningEffort,
+            requestAdapter: requestAdapter)
         if let maxOutputTokens = request.maxOutputTokens {
             // The invocation ceiling is host-owned. A durable inference profile
             // may carry a provider-native limit when no host ceiling is set,
@@ -574,7 +589,7 @@ extension OpenAIWireProvider: ToolCallingProvider {
     private func buildResponsesAgentRequest(
         _ request: AgentRequest
     ) throws -> URLRequest {
-        var root = Self.configuredRequestBody(
+        var root = try Self.configuredRequestBody(
             endpoint: endpoint,
             model: request.model)
         let instructions = request.messages
@@ -611,12 +626,9 @@ extension OpenAIWireProvider: ToolCallingProvider {
         if let temperature = request.temperature {
             root["temperature"] = .number(temperature)
         }
-        if let effort = request.reasoningEffort {
-            root["reasoning"] = .object([
-                "effort": .string(effort.rawValue),
-            ])
-            root.removeValue(forKey: "reasoning_effort")
-        }
+        Self.applyResponsesReasoningOptions(
+            to: &root,
+            runtimeEffort: request.reasoningEffort)
         if let maxOutputTokens = request.maxOutputTokens {
             for key in Array(root.keys)
             where Self.isOutputTokenCeilingKey(key) {
@@ -936,6 +948,9 @@ extension OpenAIWireProvider: ToolCallingProvider {
     }
 
     static func messageJSON(_ m: AgentMessage) -> JSONValue {
+        // Preserve the request's exact role on every wire. An endpoint that
+        // cannot accept `developer` must fail explicitly; silently projecting
+        // it to system/user would change the Skill trust contract.
         var obj: [String: JSONValue] = ["role": .string(m.role.rawValue)]
         if !m.images.isEmpty {
             var parts: [JSONValue] = []

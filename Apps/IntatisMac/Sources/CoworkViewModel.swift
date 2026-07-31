@@ -10,6 +10,7 @@ import IntatisPermission
 import IntatisConversation
 import IntatisAgentKernel
 import IntatisCowork
+import IntatisSkills
 import IntatisMCP
 import IntatisTools
 import IntatisSharedUI
@@ -330,6 +331,12 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
     private var orchestrator: Orchestrator?
     private var goalRuntime: GoalRuntimeController?
     private var subscription: Task<Void, Never>?
+    private var projectionPump:
+        SessionProjectionPump<
+            CoworkSessionProjectionState,
+            ContinuousClock>?
+    private var projectionCommitFence:
+        SessionProjectionCommitFence?
     private var shutdownTask: Task<Void, Never>? {
         didSet { refreshRuntimeBusy() }
     }
@@ -480,60 +487,81 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
 
     func start() {
         guard !didStop, orchestrator == nil, shutdownTask == nil else { return }
+        let projectionIdentity =
+            SessionProjectionIdentity(
+                sessionID: sessionID)
+        let projectionPump =
+            SessionProjectionPump<
+                CoworkSessionProjectionState,
+                ContinuousClock>(
+                    identity: projectionIdentity,
+                    clock: ContinuousClock())
+        projectionCommitFence =
+            SessionProjectionCommitFence(
+                identity:
+                    projectionIdentity)
+        self.projectionPump =
+            projectionPump
         setPermissionReviewerStatus(.enabling)
         let registryBox = registryBox
         let makeMCPSnapshots = mcpSnapshots
         let mcpLog = log
+        let toolSnapshotProvider:
+            Orchestrator.ToolSnapshotProvider?
+        if let makeSource = makeMCPSnapshots {
+            toolSnapshotProvider = {
+                agent,
+                capabilityLease,
+                workspaceLease,
+                baseRegistry,
+                isResume,
+                providerCapabilities,
+                outputBudget in
+                let state =
+                    try await MCPDurableSessionState
+                        .load(from: mcpLog)
+                guard !state.attachments.isEmpty else {
+                    return nil
+                }
+                guard let workspaceLease else {
+                    throw IntatisError.config(
+                        "MCP dispatch requires an exact workspace lease")
+                }
+                let source =
+                    try await makeSource()
+                return try await source.snapshot(
+                    for: MCPAgentDispatchInput(
+                        agentID: agent.name,
+                        capabilityLease:
+                            capabilityLease,
+                        workspaceLease:
+                            workspaceLease,
+                        baseRegistry:
+                            baseRegistry,
+                        activationReason:
+                            isResume
+                                ? .resume
+                                : .send),
+                    providerCapabilities:
+                        providerCapabilities,
+                    turnResultBudget:
+                        outputBudget)
+            }
+        } else {
+            toolSnapshotProvider = nil
+        }
         do {
             let runtime = try Orchestrator.runtime(
                 log: log,
                 allowsShell: PlatformProfile.current.allowsShell,
                 responder: CoworkUnavailableAutomaticPermissionResponder(),
                 executionPolicy: CoworkExecutionPolicy(tokenBudget: projectSettings.tokenBudget),
+                skillRootAccess: AppConfig.skillRootAccess,
                 availableInferenceProfiles: inferenceProfileOptions.map(\.binding),
                 requiresInferenceBindings: true,
                 imageGeneratorFor: { _ in await registryBox.imageToolService() },
                 toolSnapshotProvider:
-                    makeMCPSnapshots.map { makeSource in
-                        {
-                            agent,
-                            capabilityLease,
-                            workspaceLease,
-                            baseRegistry,
-                            isResume,
-                            providerCapabilities,
-                            outputBudget in
-                            let state =
-                                try await MCPDurableSessionState
-                                    .load(from: mcpLog)
-                            guard !state.attachments.isEmpty else {
-                                return nil
-                            }
-                            guard let workspaceLease else {
-                                throw IntatisError.config(
-                                    "MCP dispatch requires an exact workspace lease")
-                            }
-                            let source =
-                                try await makeSource()
-                            return try await source.snapshot(
-                                for: MCPAgentDispatchInput(
-                                    agentID: agent.name,
-                                    capabilityLease:
-                                        capabilityLease,
-                                    workspaceLease:
-                                        workspaceLease,
-                                    baseRegistry:
-                                        baseRegistry,
-                                    activationReason:
-                                        isResume
-                                            ? .resume
-                                            : .send),
-                                providerCapabilities:
-                                    providerCapabilities,
-                                turnResultBudget:
-                                    outputBudget)
-                        }
-                    },
+                    toolSnapshotProvider,
                 sessionNaming: sessionNaming,
                 resolvedInferenceFor: { agent in
                     try await registryBox.resolvedInference(for: agent)
@@ -560,83 +588,219 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         }
         subscription = Task { @MainActor [weak self] in
             guard let self else { return }
-            let replayed = await self.log.replay()
-            var codeProjection = CodeProjection.build(from: replayed)
-            var coworkProjection = CoworkProjection.build(from: replayed)
-            var permissions = PermissionProjection.build(from: replayed, markNeedsRerun: true)
-            var turnStats = TurnStatsProjection.build(from: replayed)
-            self.restoreWorkspaceAccess(for: coworkProjection)
-            await self.orchestrator?.restore(from: coworkProjection)
-            await self.refreshInferenceResolutionState()
+            do {
+                let replayed = await self.log.replay()
+                let preRestore =
+                    try await projectionPump
+                        .loadInitialReplay(
+                            replayed)
+                let replayedCowork =
+                    preRestore.cowork
+                        ?? CoworkProjection()
+                self.restoreWorkspaceAccess(
+                    for: replayedCowork)
+                await self.orchestrator?.restore(
+                    from: replayedCowork)
+                await self.refreshInferenceResolutionState()
 
-            // Restore may durably reconcile stale control-plane state. Rebuild
-            // every projection from that authoritative tail before starting
-            // bootstrap, then register the stream first so bootstrap admission
-            // events cannot remain invisible while another startup step waits.
-            let restored = await self.log.replay()
-            codeProjection = CodeProjection.build(from: restored)
-            coworkProjection = CoworkProjection.build(from: restored)
-            permissions = PermissionProjection.build(from: restored, markNeedsRerun: true)
-            turnStats = TurnStatsProjection.build(from: restored)
-            self.canonicalItems = codeProjection.items
-            self.restoreSubmittedIntentState(
-                from: coworkProjection,
-                marksUnfinishedAsInterrupted: true)
-            await self.restoreSubmittedIntentOutbox()
-            self.refreshPresentedItems()
-            self.pendingPermission = self.presentedPermission(projected: permissions.latest)
-            self.permissionNotice = permissions.latestResolved
-            self.latestTurnStats = turnStats.latest
-            self.applyCoworkProjection(coworkProjection)
-            let stream = await self.log.stream(from: (restored.last?.seq ?? -1) + 1)
-
-            if self.launchMode == .fresh {
-                // Choosing the primary workspace is the explicit authorization
-                // for the fixed @main bootstrap. Do not ask a model to approve
-                // that same user choice a second time.
-                await self.bootstrapMainAgentIfNeeded(
-                    existingProjection: coworkProjection,
-                    allowsInitialSessionBootstrap: true)
-                if let orchestrator = self.orchestrator {
-                    await self.synchronizePermissionReviewerHealth(using: orchestrator)
+                // Restore may durably reconcile stale control-plane state.
+                // Build every projection on the non-MainActor pump from that
+                // authoritative tail, then register the stream before
+                // bootstrap can append additional admission events.
+                let restored =
+                    await self.log.replay()
+                let initial =
+                    try await projectionPump
+                        .synchronize(
+                            with: restored,
+                            markRestoredPermissionsNeedsRerun:
+                                true)
+                if let restoredProjection =
+                        initial.cowork {
+                    self.restoreSubmittedIntentState(
+                        from: restoredProjection,
+                        marksUnfinishedAsInterrupted:
+                            true)
                 }
-            } else {
-                // Restore @main from canonical settings and the session-owned
-                // bookmark before starting the reviewer. A missing @main
-                // cannot be repaired through ordinary model-reviewed attach,
-                // because the reviewer itself derives its exact binding from
-                // @main.
-                await self.bootstrapMainAgentIfNeeded(
-                    existingProjection: coworkProjection,
-                    allowsInitialSessionBootstrap: false)
-                // Data-plane/Goal recovery is independent from permission
-                // reviewer readiness. Until the reviewer is live, the
-                // fail-closed responder above denies only ask-class tools.
+                await self.restoreSubmittedIntentOutbox()
+                self.commitProjectionSnapshot(initial)
+                let stream = await self.log.stream(
+                    from:
+                        (restored.last?.seq ?? -1)
+                            + 1)
+                let publications =
+                    try await projectionPump
+                        .publications(
+                            consuming: stream)
+                let initialCoworkProjection =
+                    initial.cowork
+                        ?? replayedCowork
+
+                if self.launchMode == .fresh {
+                    // Choosing the primary workspace is the explicit
+                    // authorization for the fixed @main bootstrap. Do not ask
+                    // a model to approve that same user choice a second time.
+                    await self.bootstrapMainAgentIfNeeded(
+                        existingProjection:
+                            initialCoworkProjection,
+                        allowsInitialSessionBootstrap:
+                            true)
+                    if let orchestrator =
+                            self.orchestrator {
+                        await self
+                            .synchronizePermissionReviewerHealth(
+                                using: orchestrator)
+                    }
+                } else {
+                    // Restore @main from canonical settings and the
+                    // session-owned bookmark before starting the reviewer.
+                    await self.bootstrapMainAgentIfNeeded(
+                        existingProjection:
+                            initialCoworkProjection,
+                        allowsInitialSessionBootstrap:
+                            false)
+                    // Data-plane/Goal recovery is independent from permission
+                    // reviewer readiness. Until the reviewer is live, the
+                    // fail-closed responder above denies only ask-class tools.
+                    await self.resumeRuntimeIfReady()
+                    await self.ensureAutomaticPermissionReview(
+                        existingProjection:
+                            self.latestCoworkProjection)
+                }
+                // Fresh-session registration may already include a healthy
+                // reviewer, but data-plane readiness does not depend on it.
                 await self.resumeRuntimeIfReady()
-                await self.ensureAutomaticPermissionReview(
-                    existingProjection: self.latestCoworkProjection)
-            }
-            // Fresh-session registration may already include a healthy
-            // reviewer, but data-plane readiness does not depend on it.
-            await self.resumeRuntimeIfReady()
-            for await envelope in stream {
-                codeProjection.apply(envelope)
-                coworkProjection.apply(envelope)
-                permissions.apply(envelope)
-                turnStats.apply(envelope)
-                if case .permissionResolved(let payload) = envelope.event,
-                   let requestID = payload.requestId {
-                    self.suppressedPermissionRequestIDs.remove(requestID)
+                for await output in publications {
+                    guard !Task.isCancelled else {
+                        break
+                    }
+                    switch output {
+                    case .snapshot(let snapshot):
+                        self.commitProjectionSnapshot(
+                            snapshot)
+                    case .failed(let failure):
+                        guard self.projectionCommitFence?
+                                .identity
+                                == projectionIdentity else {
+                            continue
+                        }
+                        self.projectionError =
+                            failure.localizedDescription
+                    }
                 }
-                self.canonicalItems = codeProjection.items
-                self.observeSubmittedIntentEvent(envelope)
-                self.refreshPresentedItems()
-                self.pendingPermission = self.presentedPermission(projected: permissions.latest)
-                self.permissionNotice = permissions.latestResolved
-                self.latestTurnStats = turnStats.latest
-                self.applyCoworkProjection(coworkProjection)
+            } catch {
+                guard self.projectionCommitFence?
+                        .identity
+                        == projectionIdentity,
+                      !Task.isCancelled else {
+                    return
+                }
+                self.projectionError =
+                    error.localizedDescription
             }
         }
+    }
+
+    private func commitProjectionSnapshot(
+        _ snapshot:
+            CoworkSessionProjectionSnapshot
+    ) {
+        let commitStart =
+            DispatchTime.now().uptimeNanoseconds
+        var published = false
+        defer {
+            let commitEnd =
+                DispatchTime.now()
+                    .uptimeNanoseconds
+            snapshot.projectionBatch?.finish(
+                commitDurationNanoseconds:
+                    commitEnd >= commitStart
+                    ? commitEnd - commitStart
+                    : 0,
+                published: published)
+        }
+        let isInitialCommit =
+            projectionCommitFence?
+                .throughSeq == Int.min
+        guard projectionCommitFence?
+                .accept(
+                    identity:
+                        snapshot.identity,
+                    throughSeq:
+                        snapshot.throughSeq)
+                == true else {
+            return
+        }
+        published = true
+
+        if let barrier =
+                snapshot.barrierEnvelope {
+            observeProjectionBarrier(barrier)
+        }
+        if let nextItems = snapshot.items,
+           nextItems != canonicalItems {
+            canonicalItems = nextItems
+            refreshPresentedItems()
+        } else if snapshot.items != nil,
+                  isInitialCommit {
+            // The canonical thread can be empty while the owner-only outbox
+            // still contains a locally preserved submission.
+            refreshPresentedItems()
+        }
+        if let permission =
+                snapshot.permission {
+            let nextPending =
+                presentedPermission(
+                    projected:
+                        permission.latest)
+            if nextPending != pendingPermission {
+                pendingPermission = nextPending
+            }
+            let nextNotice =
+                permission.latestResolved
+            if nextNotice != permissionNotice {
+                permissionNotice = nextNotice
+            }
+        }
+        if let turnStats = snapshot.turnStats,
+           turnStats.latest
+                != latestTurnStats {
+            latestTurnStats =
+                turnStats.latest
+        }
+        if let coworkProjection =
+                snapshot.cowork,
+           coworkProjection
+                != latestCoworkProjection {
+            applyCoworkProjection(
+                coworkProjection)
+        }
+    }
+
+    /// Reattaching a process-owned Cowork session to a window performs one
+    /// idempotent latest-snapshot flush. The normal subscription remains live
+    /// while the session is off-screen; this only closes the bounded trailing
+    /// publication race and cannot overwrite a newer generation/sequence.
+    func flushProjectionForPresentation() async {
+        guard !didStop,
+              let projectionPump,
+              let snapshot =
+                await projectionPump.flushNow() else {
+            return
+        }
+        commitProjectionSnapshot(snapshot)
+    }
+
+    private func observeProjectionBarrier(
+        _ envelope: Envelope
+    ) {
+        if case .permissionResolved(let payload) =
+                envelope.event,
+           let requestID = payload.requestId {
+            suppressedPermissionRequestIDs
+                .remove(requestID)
+        }
+        observeSubmittedIntentEvent(envelope)
     }
 
     func mcpProjectAgents()
@@ -751,15 +915,26 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                     descriptor
                         .capabilityLeaseID,
                 taskID: descriptor.taskID)
+        let workspaceRoot =
+            URL(fileURLWithPath:
+                    workspaceLease.rootPath)
+                .standardizedFileURL
+        let allowsShell =
+            PlatformProfile.current.allowsShell
+        let skillSnapshot =
+            try await SkillCatalogService.shared.snapshot(
+                configuration: .standard(
+                    workspaceRoot: workspaceRoot,
+                    access: AppConfig.skillRootAccess))
         return MCPAgentDispatchInput(
             agentID: descriptor.agentID,
             capabilityLease:
                 capabilityLease,
             workspaceLease: workspaceLease,
-            baseRegistry: ToolRegistry.standard(
-                includesTerminal:
-                    PlatformProfile.current
-                        .allowsShell),
+            baseRegistry: skillSnapshot.augmenting(
+                ToolRegistry.standard(
+                    includesTerminal:
+                        allowsShell)),
             activationReason: reason)
     }
 
@@ -770,6 +945,13 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         }
         guard !didStop else { return }
         didStop = true
+        if let projectionPump,
+           let finalSnapshot =
+                await projectionPump.finishAndFlush()
+        {
+            commitProjectionSnapshot(
+                finalSnapshot)
+        }
         let runningSubscription = subscription
         runningSubscription?.cancel()
         subscription = nil
@@ -820,6 +1002,8 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         }
         for lease in workspaceAccessLeases.values { lease.release() }
         workspaceAccessLeases.removeAll()
+        projectionPump = nil
+        projectionCommitFence = nil
         shutdownTask = nil
     }
 
@@ -918,33 +1102,57 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                     submissionFailure: failure)
             }
         presented.append(contentsOf: outboxItems)
-        items = presented
+        if presented != items {
+            items = presented
+        }
     }
 
     private func applyCoworkProjection(_ projection: CoworkProjection) {
         latestCoworkProjection = projection
         if let canonical = projection.sessionSettings?.cowork,
-           canonical.sessionID == sessionID {
+           canonical.sessionID == sessionID,
+           canonical != projectSettings {
             projectSettings = canonical
         }
-        goal = Self.goalPresentation(
+        let nextGoal = Self.goalPresentation(
             from: projection,
             controlsEnabled: isGoalRuntimeReady)
-        workTasks = Self.workTaskPresentation(from: projection)
-        if let currentGoalID = projection.currentGoalID,
-           projection.goals[currentGoalID]?.status == .active {
+        if nextGoal != goal {
+            goal = nextGoal
+        }
+        let nextWorkTasks =
+            Self.workTaskPresentation(
+                from: projection)
+        if nextWorkTasks != workTasks {
+            workTasks = nextWorkTasks
+        }
+        let nextIsGoalContinuing: Bool
+        if let currentGoalID =
+                projection.currentGoalID,
+           projection.goals[currentGoalID]?
+                .status == .active {
             // A single continuation task may advance through several durable
             // runs. Between run N settling and run N+1 being created, the
             // projection briefly contains no non-terminal run even though the
             // Goal still owns the data plane. Keep later submitted intents in
             // FIFO order until the Goal leaves `.active` explicitly.
-            isGoalContinuing = true
+            nextIsGoalContinuing = true
         } else {
-            isGoalContinuing = false
+            nextIsGoalContinuing = false
         }
-        agents = agentPresentation(from: projection)
+        if nextIsGoalContinuing
+            != isGoalContinuing {
+            isGoalContinuing =
+                nextIsGoalContinuing
+        }
+        let nextAgents =
+            agentPresentation(
+                from: projection)
+        if nextAgents != agents {
+            agents = nextAgents
+        }
 
-        summary = CoworkStatusSummary(
+        let nextSummary = CoworkStatusSummary(
             activeCount: projection.activeTasks.count,
             runningCount: projection.runningTasks.count,
             completedCount: projection.completedTasks.count,
@@ -960,12 +1168,27 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             runningTasks: projection.runningTasks.map(taskLine),
             failedTasks: projection.failedTasks.map(taskLine),
             recentCompletedTasks: projection.completedTasks.map(taskLine))
-        project = Self.makeProjectInfo(
+        if nextSummary != summary {
+            summary = nextSummary
+        }
+        let nextProject = Self.makeProjectInfo(
             sessionID: sessionID,
             settings: projectSettings,
             projection: projection)
+        if nextProject != project {
+            project = nextProject
+        }
         let retryable = projection.failedTasks + projection.cancelledTasks
-        retryableTasks = Dictionary(uniqueKeysWithValues: retryable.map { ($0.id.rawValue, $0) })
+        let nextRetryableTasks =
+            Dictionary(
+                uniqueKeysWithValues:
+                    retryable.map {
+                        ($0.id.rawValue, $0)
+                    })
+        if nextRetryableTasks != retryableTasks {
+            retryableTasks =
+                nextRetryableTasks
+        }
         scheduleSubmissionDrain()
     }
 
@@ -1439,10 +1662,37 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         }
         // Goal startup may append a recovery checkpoint, audit, and the final
         // Phase-L pause before the already-created stream loop receives those
-        // events. Fold the durable tail immediately so the UI never exposes a
-        // stale active/Pause state after cold recovery.
-        let postRecoveryProjection = CoworkProjection.build(from: await log.replay())
-        applyCoworkProjection(postRecoveryProjection)
+        // events. Synchronize the same projection actor with the durable tail
+        // so the UI never exposes a stale active/Pause state after cold
+        // recovery and no second projection truth is introduced.
+        let postRecoveryReplay =
+            await log.replay()
+        if let projectionPump {
+            do {
+                let previouslyCommitted =
+                    projectionCommitFence?
+                        .throughSeq
+                        ?? Int.min
+                let snapshot =
+                    try await projectionPump
+                        .synchronize(
+                            with:
+                                postRecoveryReplay)
+                for envelope in
+                    postRecoveryReplay
+                    where envelope.seq
+                        > previouslyCommitted {
+                    observeProjectionBarrier(
+                        envelope)
+                }
+                commitProjectionSnapshot(
+                    snapshot)
+            } catch {
+                projectionError =
+                    error.localizedDescription
+                return
+            }
+        }
         let resumedPendingTasks = await orchestrator.startNewTasksKeepingRestoredTasksPaused()
         guard resumedPendingTasks,
               !Task.isCancelled,

@@ -1876,6 +1876,12 @@ struct IntatisMCPSettingsView: View {
         panel.allowedContentTypes = [.json]
         panel.nameFieldStringValue = "mcp.json"
         panel.canCreateDirectories = true
+        IntatisMacProcessDiagnostics.shared
+            .setKnownModalPresented(true)
+        defer {
+            IntatisMacProcessDiagnostics.shared
+                .setKnownModalPresented(false)
+        }
         guard panel.runModal() == .OK,
               let url = panel.url else { return }
         Task { await env.mcp.exportCatalog(to: url) }

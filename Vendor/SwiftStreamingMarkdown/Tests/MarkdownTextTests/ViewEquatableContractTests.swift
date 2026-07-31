@@ -57,4 +57,42 @@ final class ViewEquatableContractTests: XCTestCase {
     XCTAssertNotEqual(lhs, ParagraphView(contents: differentAttributes, lineSpacing: 5))
     XCTAssertNotEqual(lhs, ParagraphView(contents: secondContents, lineSpacing: 6))
   }
+
+  #if canImport(AppKit)
+  @MainActor
+  func testParagraphMeasurementCacheRetainsOnlyLatestWindowWidth() {
+    var cache = ParagraphMeasurementCache()
+
+    for step in 0..<10_000 {
+      cache.store(
+        height: CGFloat(step + 1),
+        forWidthKey: CGFloat(step) / 10
+      )
+      XCTAssertEqual(cache.entryCount, 1)
+    }
+
+    XCTAssertNil(cache.height(forWidthKey: 0))
+    XCTAssertEqual(cache.height(forWidthKey: 999.9), 10_000)
+
+    // Adjacent live-resize proposals must not alias. Rounding the narrower
+    // value up can cross a TextKit line-wrap boundary and under-report height.
+    cache.store(height: 128, forWidthKey: 216.95)
+    XCTAssertEqual(cache.height(forWidthKey: 216.95), 128)
+    XCTAssertNil(cache.height(forWidthKey: 217.0))
+
+    cache.reset()
+    XCTAssertEqual(cache.entryCount, 0)
+  }
+
+  @MainActor
+  func testParagraphLayoutClaimsProposalWidthAndMeasuredHeight() {
+    XCTAssertEqual(
+      ParagraphView.layoutSize(
+        proposalWidth: 731.25,
+        measuredHeight: 84
+      ),
+      CGSize(width: 731.25, height: 84)
+    )
+  }
+  #endif
 }

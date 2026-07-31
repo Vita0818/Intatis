@@ -56,33 +56,87 @@ struct ParagraphView: NSViewRepresentable {
     }
 
     if contents != context.coordinator.lastContents || lineSpacing != context.coordinator.lastLineSpacing {
-      context.coordinator.sizeCache.removeAll()
+      context.coordinator.measurementCache.reset()
       context.coordinator.lastContents = contents
       context.coordinator.lastLineSpacing = lineSpacing
     }
 
-    let cacheKey = (width * 10).rounded() / 10
+    let widthKey = width
 
-    if let cachedSize = context.coordinator.sizeCache[cacheKey] {
-      return cachedSize
+    if let cachedHeight = context.coordinator.measurementCache.height(
+      forWidthKey: widthKey
+    ) {
+      return Self.layoutSize(
+        proposalWidth: width,
+        measuredHeight: cachedHeight
+      )
     }
 
-    let calculatedSize = nsView.measureSize(fittingWidth: width)
+    let measuredSize = nsView.measureSize(fittingWidth: widthKey)
+    let measuredHeight = measuredSize.height.rounded(.up)
 
-    context.coordinator.sizeCache[cacheKey] = calculatedSize
-    return calculatedSize
+    context.coordinator.measurementCache.store(
+      height: measuredHeight,
+      forWidthKey: widthKey
+    )
+    return Self.layoutSize(
+      proposalWidth: width,
+      measuredHeight: measuredHeight
+    )
   }
 
   class Coordinator {
-    var sizeCache: [CGFloat: CGSize] = [:]
+    var measurementCache = ParagraphMeasurementCache()
     var lastContents: NSMutableAttributedString?
     var lastLineSpacing: CGFloat?
   }
+
+  /// A paragraph is a wrapping, horizontally flexible leaf. Returning the
+  /// measured glyph width lets AppKit's intrinsic width and SwiftUI's proposed
+  /// width negotiate against each other during a window resize. Claiming the
+  /// finite proposal while reporting only the measured height gives that
+  /// negotiation a single owner and prevents a width -> intrinsic-size ->
+  /// width feedback loop.
+  static func layoutSize(
+    proposalWidth: CGFloat,
+    measuredHeight: CGFloat
+  ) -> CGSize {
+    CGSize(width: proposalWidth, height: measuredHeight)
+  }
+
 }
 
 extension ParagraphView: @MainActor Equatable {
   static func == (lhs: ParagraphView, rhs: ParagraphView) -> Bool {
     lhs.contents.isEqual(to: rhs.contents) && lhs.lineSpacing == rhs.lineSpacing
+  }
+}
+
+/// Per-representable, one-entry measurement memo. Window zoom and live resize
+/// can issue hundreds of distinct proposals. Retaining every historical width
+/// is both unnecessary and unbounded; only the most recent proposal can be
+/// reused by the next SwiftUI layout pass.
+struct ParagraphMeasurementCache {
+  private(set) var widthKey: CGFloat?
+  private(set) var measuredHeight: CGFloat?
+
+  var entryCount: Int {
+    widthKey == nil || measuredHeight == nil ? 0 : 1
+  }
+
+  func height(forWidthKey candidate: CGFloat) -> CGFloat? {
+    guard widthKey == candidate else { return nil }
+    return measuredHeight
+  }
+
+  mutating func store(height: CGFloat, forWidthKey widthKey: CGFloat) {
+    self.widthKey = widthKey
+    measuredHeight = height
+  }
+
+  mutating func reset() {
+    widthKey = nil
+    measuredHeight = nil
   }
 }
 
