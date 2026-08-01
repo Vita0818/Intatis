@@ -11,6 +11,28 @@ private struct CannedChat: ChatProvider {
     }
 }
 
+private final class CapturingCannedChat: ChatProvider, @unchecked Sendable {
+    private let lock = NSLock()
+    private var captured: [ChatRequest] = []
+
+    var requests: [ChatRequest] {
+        lock.lock()
+        defer { lock.unlock() }
+        return captured
+    }
+
+    func stream(_ request: ChatRequest) -> AsyncThrowingStream<ChatChunk, Error> {
+        lock.lock()
+        captured.append(request)
+        lock.unlock()
+        return AsyncThrowingStream { continuation in
+            continuation.yield(.delta(#"{"decision":"allow","risk":"low","reason":"ok"}"#))
+            continuation.yield(.done)
+            continuation.finish()
+        }
+    }
+}
+
 private func reviewCtx(profile: PermissionProfile = .reviewed) -> PermissionContext {
     PermissionContext(workspaceRoot: URL(fileURLWithPath: "/ws"), profile: profile,
                       allowsShell: true, userGoal: "edit a file", agent: AgentID(rawValue: "Coder"))
@@ -22,6 +44,22 @@ private func writeCall() -> ToolCallContext {
 }
 
 final class IntatisPermissionReviewerTests: XCTestCase {
+
+    func testReviewerDoesNotInventSamplingParameters() async throws {
+        let provider = CapturingCannedChat()
+        let reviewer = ModelPermissionReviewer(
+            provider: provider,
+            model: ModelID(rawValue: "rev"))
+
+        _ = await reviewer.review(
+            writeCall(),
+            reviewCtx(),
+            gateReason: "write",
+            risk: .low)
+
+        let request = try XCTUnwrap(provider.requests.first)
+        XCTAssertNil(request.temperature)
+    }
 
     func testReviewerParsesAllow() async {
         let r = ModelPermissionReviewer(

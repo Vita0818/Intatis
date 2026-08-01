@@ -3,6 +3,7 @@ import Foundation
 import SwiftUI
 import IntatisCore
 import IntatisConversation
+import IntatisProtocol
 #if canImport(AppKit)
 import AppKit
 #elseif canImport(UIKit)
@@ -44,6 +45,20 @@ public struct IntatisThreadStyle {
             stroke: stroke,
             cardStroke: stroke,
             error: .red)
+    }
+}
+
+/// User bubbles are already identified by their trailing alignment and
+/// Material surface, so repeating a sender label adds noise without adding
+/// information. Other message roles keep their structured identity header.
+public enum IntatisMessageHeaderPolicy {
+    public static func showsIdentity(for role: MessageRole) -> Bool {
+        switch role {
+        case .user:
+            return false
+        case .assistant, .agent, .system:
+            return true
+        }
     }
 }
 
@@ -1526,6 +1541,21 @@ private struct IntatisContentSurfaceModifier: ViewModifier {
     }
 }
 
+private struct IntatisSubtleContentSurfaceModifier: ViewModifier {
+    let cornerRadius: CGFloat
+
+    func body(content: Content) -> some View {
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        content
+            .background(.regularMaterial, in: shape)
+            .overlay {
+                shape.stroke(
+                    intatisPlatformSeparator.opacity(0.55),
+                    lineWidth: 0.5)
+            }
+    }
+}
+
 private struct IntatisLiquidGlassModifier: ViewModifier {
     let cornerRadius: CGFloat
     let isInteractive: Bool
@@ -1586,6 +1616,13 @@ public extension View {
     /// Standard Material for content-layer cards and read-only information.
     func intatisContentSurface(cornerRadius: CGFloat = 16) -> some View {
         modifier(IntatisContentSurfaceModifier(cornerRadius: cornerRadius))
+    }
+
+    /// A quieter Material surface for transient, compact status and review UI.
+    /// It preserves a system-resolved boundary without competing with the
+    /// conversation content or using a semantic color as a full-card outline.
+    func intatisSubtleContentSurface(cornerRadius: CGFloat = 12) -> some View {
+        modifier(IntatisSubtleContentSurfaceModifier(cornerRadius: cornerRadius))
     }
 
     /// Native Liquid Glass on current systems, with semantic Material fallback.
@@ -2556,26 +2593,36 @@ enum IntatisThreadActivity {
     }
 }
 
-struct IntatisThreadHeaderAction {
+public struct IntatisThreadHeaderAction {
     let title: String
     let systemImage: String
     let isDisabled: Bool
+    let isIconOnly: Bool
+    let help: String
+    let accessibilityIdentifier: String
     let action: () -> Void
 
-    init(title: String,
-         systemImage: String,
-         isDisabled: Bool = false,
-         action: @escaping () -> Void) {
+    public init(title: String,
+                systemImage: String,
+                isDisabled: Bool = false,
+                isIconOnly: Bool = false,
+                help: String? = nil,
+                accessibilityIdentifier: String? = nil,
+                action: @escaping () -> Void) {
         self.title = title
         self.systemImage = systemImage
         self.isDisabled = isDisabled
+        self.isIconOnly = isIconOnly
+        self.help = help ?? title
+        self.accessibilityIdentifier = accessibilityIdentifier
+            ?? "thread.header.action.\(systemImage)"
         self.action = action
     }
 }
 
 struct IntatisWorkspaceThreadHeader: View {
     let title: String
-    let subtitle: String
+    let subtitle: String?
     let style: IntatisThreadStyle
     let actions: [IntatisThreadHeaderAction]
 
@@ -2598,10 +2645,12 @@ struct IntatisWorkspaceThreadHeader: View {
             Text(title)
                 .font(.system(size: 30, weight: .semibold, design: .serif))
                 .foregroundStyle(style.primaryText)
-            Text(subtitle)
-                .font(.system(size: 13, weight: .medium))
-                .foregroundStyle(style.secondaryText)
-                .lineLimit(2)
+            if let subtitle, !subtitle.isEmpty {
+                Text(subtitle)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(style.secondaryText)
+                    .lineLimit(2)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -2612,14 +2661,29 @@ struct IntatisWorkspaceThreadHeader: View {
                 HStack(spacing: 8) {
                     ForEach(Array(actions.enumerated()), id: \.offset) { _, action in
                         Button(action: action.action) {
-                            Label(action.title, systemImage: action.systemImage)
-                                .font(.system(size: 13, weight: .semibold))
+                            actionLabel(action)
                         }
                         .intatisGlassButton()
                         .disabled(action.isDisabled)
+                        .help(action.help)
+                        .accessibilityIdentifier(action.accessibilityIdentifier)
                     }
                 }
             }
+        }
+    }
+
+    @ViewBuilder private func actionLabel(
+        _ action: IntatisThreadHeaderAction
+    ) -> some View {
+        if action.isIconOnly {
+            Image(systemName: action.systemImage)
+                .font(.system(size: 13, weight: .semibold))
+                .frame(width: 16, height: 16)
+                .accessibilityLabel(action.title)
+        } else {
+            Label(action.title, systemImage: action.systemImage)
+                .font(.system(size: 13, weight: .semibold))
         }
     }
 }

@@ -1707,7 +1707,8 @@ final class AutomaticPermissionReviewTests: XCTestCase {
         let reviewRequest = try XCTUnwrap(reviewerProvider.requests.first)
         XCTAssertEqual(reviewRequest.model, ModelID(rawValue: "reviewer-model"))
         XCTAssertTrue(reviewRequest.tools.isEmpty)
-        XCTAssertEqual(reviewRequest.maxOutputTokens, 4_096)
+        XCTAssertNil(reviewRequest.temperature)
+        XCTAssertNil(reviewRequest.maxOutputTokens)
         let prompt = reviewRequest.messages.compactMap(\.content).joined(separator: "\n")
         XCTAssertTrue(prompt.contains("Active agent roster:"))
         XCTAssertTrue(prompt.contains("@main"))
@@ -1823,7 +1824,7 @@ final class AutomaticPermissionReviewTests: XCTestCase {
             policy: PermissionReviewControlPlanePolicy(
                 timeoutSeconds: 0.03,
                 tokenBudget: 50_000,
-                reservedCompletionTokens: 64,
+                estimatedCompletionTokens: 64,
                 maxRecentEvents: 12))
         XCTAssertEqual(enabled, .enabled(reviewer))
 

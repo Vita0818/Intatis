@@ -777,7 +777,7 @@ final class IntatisProvidersTests: XCTestCase {
         }
     }
 
-    func testHealthCheckReportsOKForCompletedChatStream() async {
+    func testHealthCheckReportsOKForCompletedChatStream() async throws {
         let sse = """
         data: {"choices":[{"delta":{"content":"OK"}}]}
 
@@ -789,7 +789,8 @@ final class IntatisProvidersTests: XCTestCase {
         let config = ProviderConfig(
             endpoints: [openAIEndpoint],
             models: ResolvedModels(chat: ModelRef(endpoint: "e", model: ModelID(rawValue: "gpt-health"))))
-        let registry = ProviderRegistry(config: config, resolver: StaticSecret(key: "k"), http: FakeHTTP(chunks: [Data(sse.utf8)]))
+        let http = CapturingHTTP(chunks: [Data(sse.utf8)])
+        let registry = ProviderRegistry(config: config, resolver: StaticSecret(key: "k"), http: http)
 
         let report = await registry.healthCheck()
 
@@ -801,6 +802,10 @@ final class IntatisProvidersTests: XCTestCase {
         XCTAssertEqual(report.totalTokens, 3)
         XCTAssertEqual(report.responsePreview, "OK")
         XCTAssertNil(report.code)
+        let body = try XCTUnwrap(http.lastBody)
+        let root = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: body) as? [String: Any])
+        XCTAssertNil(root["temperature"])
     }
 
     func testHealthCheckReportsPartialStreamWhenDoneMarkerMissing() async {
@@ -919,6 +924,55 @@ final class IntatisProvidersTests: XCTestCase {
         let root = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
         let streamOptions = try XCTUnwrap(root["stream_options"] as? [String: Any])
         XCTAssertEqual(streamOptions["include_usage"] as? Bool, true)
+    }
+
+    func testStrictRoutingHealthCheckPreservesOptionsWithoutInventingUnsupportedParameters()
+        async throws
+    {
+        let model = "openai/gpt-strict"
+        let endpoint = ProviderEndpoint(
+            id: "strict",
+            baseURL: URL(string: "https://openrouter.example.test/api/v1")!,
+            apiKeyRef: KeychainRef(service: "s", account: "a"),
+            wire: .openai,
+            modelRequestOptions: [
+                model: [
+                    "provider": .object([
+                        "require_parameters": .bool(true),
+                    ]),
+                ],
+            ])
+        let sse = """
+        data: {"choices":[{"delta":{"content":"OK"}}]}
+
+        data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+
+        """
+        let http = CapturingHTTP(chunks: [Data(sse.utf8)])
+        let modelRef = ModelRef(
+            endpoint: "strict",
+            model: ModelID(rawValue: model))
+        let registry = ProviderRegistry(
+            config: ProviderConfig(
+                endpoints: [endpoint],
+                models: ResolvedModels(
+                    chat: modelRef,
+                    agent: modelRef)),
+            resolver: StaticSecret(key: "k"),
+            http: http)
+
+        let report = await registry.healthCheck(role: .agent)
+
+        XCTAssertEqual(report.status, .ok)
+        let data = try XCTUnwrap(http.lastBody)
+        let root = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let routing = try XCTUnwrap(root["provider"] as? [String: Any])
+        XCTAssertEqual(routing["require_parameters"] as? Bool, true)
+        XCTAssertNil(root["temperature"])
+        XCTAssertNil(root["max_tokens"])
+        XCTAssertNil(root["max_completion_tokens"])
+        XCTAssertNil(root["max_output_tokens"])
     }
 
     func testConfiguredModelOptionsPassThroughChatBodyWithoutOverridingRuntimeStructure() throws {

@@ -379,6 +379,20 @@ private final class ReviewPartialUsageFailureProvider: ToolCallingProvider, @unc
     }
 }
 
+private struct ReviewDiagnosticFailureProvider: ToolCallingProvider {
+    struct Failure: LocalizedError {
+        var errorDescription: String? {
+            "OpenRouter rejected https://provider.example/v1/chat?api_key=secret-value because no route supports temperature"
+        }
+    }
+
+    func stream(_ request: AgentRequest) -> AsyncThrowingStream<AgentChunk, Error> {
+        AsyncThrowingStream { continuation in
+            continuation.finish(throwing: Failure())
+        }
+    }
+}
+
 private actor ReviewFailingAppender {
     enum FailurePoint {
         case requested
@@ -486,17 +500,16 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
     private let main = AgentID(rawValue: "main")
     private let reviewerID = Orchestrator.automaticPermissionReviewerID
 
-    func testDefaultReviewerBudgetLeavesRoomForStructuredVerdict() {
+    func testDefaultReviewerPolicyDoesNotInventProviderOutputLimits() {
         let policy = PermissionReviewControlPlanePolicy()
         XCTAssertEqual(policy.timeoutSeconds, 120)
-        XCTAssertEqual(
-            policy.reservedCompletionTokens,
-            4_096)
-        XCTAssertEqual(
-            PermissionReviewControlPlanePolicy(
-                reservedCompletionTokens: 20_000
-            ).reservedCompletionTokens,
-            16_384)
+        XCTAssertNil(policy.estimatedCompletionTokens)
+        XCTAssertNil(policy.maxOutputCharacters)
+        let explicit = PermissionReviewControlPlanePolicy(
+            estimatedCompletionTokens: 20_000,
+            maxOutputCharacters: 50_000)
+        XCTAssertEqual(explicit.estimatedCompletionTokens, 20_000)
+        XCTAssertEqual(explicit.maxOutputCharacters, 50_000)
     }
 
     func testCorruptDurableReviewHistoryDeniesBeforeProviderDispatch() async throws {
@@ -517,15 +530,12 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
         XCTAssertEqual(provider.callCount, 0)
     }
 
-    func testTruncatedReviewerVerdictIsDiagnosedAndDenied() async throws {
+    func testUsageCountAloneDoesNotInventReviewerOutputLimit() async throws {
         let (log, workspace) = try makeLogAndWorkspace()
         defer { try? FileManager.default.removeItem(at: workspace) }
         let provider = ReviewControlPlaneProvider(chunks: [
             .textDelta(#"{"decision":"allow","reason":"unfinished"#),
             .usage(Usage(promptTokens: 100, completionTokens: 64, totalTokens: 164)),
-            // Some OpenAI-compatible providers report `stop` even when usage
-            // reaches the exact requested ceiling, so usage must also diagnose
-            // the truncation seen in production logs.
             .done(finishReason: "stop"),
         ])
         let responder = makeResponder(log: log, workspace: workspace, provider: provider)
@@ -537,13 +547,13 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
         XCTAssertEqual(resolution.source, .automaticReviewerFailure)
         XCTAssertEqual(resolution.reviewStatus, .failed)
         XCTAssertEqual(resolution.failureKind, .malformedVerdict)
-        XCTAssertTrue(resolution.reason?.contains("completion-token limit") == true)
+        XCTAssertTrue(resolution.reason?.contains("malformed verdict JSON") == true)
         let settled = await log.replay().compactMap { envelope -> PermissionReviewSettledPayload? in
             if case .permissionReviewSettled(let payload) = envelope.event { return payload }
             return nil
         }
         XCTAssertEqual(settled.last?.status, .failed)
-        XCTAssertTrue(settled.last?.reason.contains("completion-token limit") == true)
+        XCTAssertTrue(settled.last?.reason.contains("malformed verdict JSON") == true)
         XCTAssertFalse(settled.last?.reason.contains("tool call") == true)
     }
 
@@ -814,7 +824,8 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
         let providerRequest = try XCTUnwrap(provider.requests.first)
         XCTAssertTrue(providerRequest.tools.isEmpty)
         XCTAssertTrue(providerRequest.includeUsage)
-        XCTAssertEqual(providerRequest.maxOutputTokens, 64)
+        XCTAssertNil(providerRequest.temperature)
+        XCTAssertNil(providerRequest.maxOutputTokens)
         let prompt = providerRequest.messages.compactMap(\.content).joined(separator: "\n")
         XCTAssertTrue(prompt.contains("task_id: task_review_context"))
         XCTAssertTrue(prompt.contains("root_task_id: task_root"))
@@ -1155,7 +1166,7 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
             policy: PermissionReviewControlPlanePolicy(
                 timeoutSeconds: 0.04,
                 tokenBudget: 50_000,
-                reservedCompletionTokens: 64,
+                estimatedCompletionTokens: 64,
                 maxRecentEvents: 12))
         async let first = responder.requestApproval(permissionRequest(id: "req_deadline_1"))
         for _ in 0..<100 where provider.callCount == 0 {
@@ -1186,7 +1197,7 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
             policy: PermissionReviewControlPlanePolicy(
                 timeoutSeconds: 1,
                 tokenBudget: 50_000,
-                reservedCompletionTokens: 64,
+                estimatedCompletionTokens: 64,
                 maxRecentEvents: 12,
                 maxPendingReviews: 1))
         let first = Task {
@@ -1339,7 +1350,7 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
             policy: PermissionReviewControlPlanePolicy(
                 timeoutSeconds: 0.03,
                 tokenBudget: 50_000,
-                reservedCompletionTokens: 64,
+                estimatedCompletionTokens: 64,
                 maxRecentEvents: 12))
         let start = Date()
 
@@ -1440,7 +1451,7 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
             policy: PermissionReviewControlPlanePolicy(
                 timeoutSeconds: 0.03,
                 tokenBudget: 50_000,
-                reservedCompletionTokens: 64,
+                estimatedCompletionTokens: 64,
                 maxRecentEvents: 12))
 
         let firstDecision = await firstResponder.requestApproval(
@@ -1613,7 +1624,7 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
             policy: PermissionReviewControlPlanePolicy(
                 timeoutSeconds: 1,
                 tokenBudget: 1,
-                reservedCompletionTokens: 1,
+                estimatedCompletionTokens: 1,
                 maxRecentEvents: 4))
 
         let decision = await responder.requestApproval(permissionRequest(id: "req_budget"))
@@ -1646,7 +1657,7 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
             policy: PermissionReviewControlPlanePolicy(
                 timeoutSeconds: 1,
                 tokenBudget: 100_000,
-                reservedCompletionTokens: 64,
+                estimatedCompletionTokens: 64,
                 maxRecentEvents: 4))
 
         let first = await responder.requestResolution(permissionRequest(id: "req_partial_usage_failure"))
@@ -1671,6 +1682,33 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
         XCTAssertEqual(settlements.first?.cumulativeTokens, 99_900)
         XCTAssertEqual(settlements.last?.status, .failed)
         XCTAssertEqual(settlements.last?.cumulativeTokens, 199_800)
+    }
+
+    func testProviderFailurePersistsUsefulSanitizedDiagnostic() async throws {
+        let (log, workspace) = try makeLogAndWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let responder = makeResponder(
+            log: log,
+            workspace: workspace,
+            provider: ReviewDiagnosticFailureProvider())
+
+        let resolution = await responder.requestResolution(
+            permissionRequest(id: "req_provider_diagnostic"))
+
+        XCTAssertEqual(resolution.failureKind, .providerFailure)
+        XCTAssertTrue(resolution.reason?.contains("no route supports temperature") == true)
+        XCTAssertTrue(resolution.reason?.contains("[REDACTED_URL]") == true)
+        XCTAssertFalse(resolution.reason?.contains("secret-value") == true)
+        let settlements = await log.replay().compactMap {
+            envelope -> PermissionReviewSettledPayload? in
+            if case .permissionReviewSettled(let payload) = envelope.event {
+                return payload
+            }
+            return nil
+        }
+        let settled = try XCTUnwrap(settlements.last)
+        XCTAssertTrue(settled.reason.contains("no route supports temperature"))
+        XCTAssertFalse(settled.reason.contains("secret-value"))
     }
 
     func testOrphanedDurableReviewIsDeniedBeforeNewAutomaticReviewRuns() async throws {
@@ -1732,7 +1770,7 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
             policy: PermissionReviewControlPlanePolicy(
                 timeoutSeconds: 1,
                 tokenBudget: 200_000,
-                reservedCompletionTokens: 64,
+                estimatedCompletionTokens: 64,
                 maxRecentEvents: 4))
         let firstDecision = await firstResponder.requestApproval(permissionRequest(id: "req_budget_seed"))
         XCTAssertEqual(firstDecision, .allow)
@@ -1746,7 +1784,7 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
             policy: PermissionReviewControlPlanePolicy(
                 timeoutSeconds: 1,
                 tokenBudget: 99_500,
-                reservedCompletionTokens: 64,
+                estimatedCompletionTokens: 64,
                 maxRecentEvents: 4))
 
         let decision = await secondResponder.requestApproval(permissionRequest(id: "req_budget_restored"))
@@ -1768,7 +1806,7 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
                                policy: PermissionReviewControlPlanePolicy = PermissionReviewControlPlanePolicy(
                                 timeoutSeconds: 1,
                                 tokenBudget: 100_000,
-                                reservedCompletionTokens: 64,
+                                estimatedCompletionTokens: 64,
                                 maxRecentEvents: 12),
                                eventAppender: PermissionReviewEventAppender? = nil) -> AgentPermissionResponder {
         makeResponder(
@@ -1788,7 +1826,7 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
         policy: PermissionReviewControlPlanePolicy = PermissionReviewControlPlanePolicy(
             timeoutSeconds: 1,
             tokenBudget: 100_000,
-            reservedCompletionTokens: 64,
+            estimatedCompletionTokens: 64,
             maxRecentEvents: 12),
         eventAppender: PermissionReviewEventAppender? = nil
     ) -> AgentPermissionResponder {

@@ -28,7 +28,7 @@ public struct ModelPermissionReviewer: PermissionReviewer {
         ]
         do {
             var full = ""
-            for try await chunk in provider.stream(ChatRequest(model: model, messages: messages, temperature: 0)) {
+            for try await chunk in provider.stream(ChatRequest(model: model, messages: messages)) {
                 if case .delta(let d) = chunk { full += d }
             }
             return Self.parse(full, fallbackRisk: risk)

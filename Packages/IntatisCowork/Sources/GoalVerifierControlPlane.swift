@@ -3,18 +3,24 @@ import IntatisCore
 import IntatisProtocol
 import IntatisProviders
 
-/// Bounded execution policy for the independent Goal verifier.
+/// Execution policy for the independent Goal verifier. Provider/model output
+/// controls are omitted by default and are only sent when the host explicitly
+/// configures them.
 public struct GoalVerifierPolicy: Equatable, Sendable {
     public var timeoutSeconds: Double
-    public var maxOutputCharacters: Int
-    public var maxOutputTokens: Int
+    public var maxOutputCharacters: Int?
+    public var maxOutputTokens: Int?
 
     public init(timeoutSeconds: Double = 45,
-                maxOutputCharacters: Int = 24_000,
-                maxOutputTokens: Int = 4_096) {
+                maxOutputCharacters: Int? = nil,
+                maxOutputTokens: Int? = nil) {
         self.timeoutSeconds = min(300, max(0.01, timeoutSeconds))
-        self.maxOutputCharacters = min(100_000, max(1_024, maxOutputCharacters))
-        self.maxOutputTokens = min(16_384, max(256, maxOutputTokens))
+        self.maxOutputCharacters = maxOutputCharacters.flatMap {
+            $0 > 0 ? $0 : nil
+        }
+        self.maxOutputTokens = maxOutputTokens.flatMap {
+            $0 > 0 ? $0 : nil
+        }
     }
 }
 
@@ -210,7 +216,6 @@ public actor GoalVerifierControlPlane {
                 .user(userMessage),
             ],
             tools: [],
-            temperature: 0,
             includeUsage: true,
             maxOutputTokens: policy.maxOutputTokens)
 
@@ -302,12 +307,12 @@ public actor GoalVerifierControlPlane {
                 kind: .usageLimit,
                 reason: "Goal verifier provider account usage limit was reached.")
         case .outputLimit(let output):
-            healthState = .degraded("Goal verifier exceeded its bounded output size.")
+            healthState = .degraded("Goal verifier exceeded its explicitly configured host output size.")
             return failure(
                 input,
                 usage: output.usage,
                 kind: .outputLimit,
-                reason: "Goal verifier exceeded its bounded output size.")
+                reason: "Goal verifier exceeded its explicitly configured host output size.")
         case .timedOut:
             healthState = .degraded(
                 "Goal verifier timed out; the provider did not prove termination.")
@@ -611,7 +616,7 @@ public actor GoalVerifierControlPlane {
     private static func runProvider(provider: ToolCallingProvider,
                                     request: AgentRequest,
                                     timeoutSeconds: Double,
-                                    maxOutputCharacters: Int,
+                                    maxOutputCharacters: Int?,
                                     activity: GoalVerifierProviderActivity) async -> ProviderResult {
         let race = GoalVerifierProviderRace()
         let providerTask = Task {
@@ -628,7 +633,8 @@ public actor GoalVerifierControlPlane {
                     try Task.checkCancellation()
                     switch chunk {
                     case .textDelta(let delta):
-                        guard output.text.count + delta.count <= maxOutputCharacters else {
+                        if let maxOutputCharacters,
+                           output.text.count + delta.count > maxOutputCharacters {
                             throw GoalVerifierOutputLimitExceeded()
                         }
                         output.text += delta

@@ -1,6 +1,6 @@
 # CURRENT_UI_COLOR_SYSTEM — 系统原生表面与 Liquid Glass 规范
 
-最近核对日期：2026-07-23
+最近核对日期：2026-08-01
 
 > **文档状态：当前实施规范。**
 >
@@ -54,13 +54,13 @@
 - 正常 agent 回复继承系统 canvas；用户消息、失败回复、Plan、Workspace、Recent Failures、权限提示和 artifact 属于结构化内容层，使用系统 Material。
 - Code 与 Cowork 共用名称右侧的低噪声消息时间；时间不参与 agent 状态、权限或任务完成语义。
 - header / workspace 操作与主要 CTA 属于功能层，使用原生 glass button。
-- inspector 使用 SwiftUI 原生 `.inspector`，不创建固定灰色或纯黑 / 纯白面板。
+- inspector 是内容区内的系统风格 trailing status rail，使用稳定 outer width 决定显隐并继承系统 `.bar` / separator；不创建固定灰色或纯黑 / 纯白面板，也不向 window toolbar 动态增删 item。
 
 ### 3.4 Cowork
 
 - 正常 agent 回复与 Code 共用无外框正文渲染；tool、error、permission、task 与 agent-to-agent 等结构化记录仍保留语义容器。
 - Goal、Tasks、Git Status、项目数据等属于内容层，不套 Liquid Glass。
-- Goal 与 Tasks 只在可见的宽屏 inspector 中呈现；窄窗口或用户隐藏 inspector 时，不在 thread 顶部复制 compact dock，也不保留对应占位高度。
+- Goal 与 Tasks 只在可见的宽屏 trailing status rail 中呈现；窄窗口或用户隐藏时，不在 thread 顶部复制 compact dock，也不保留对应占位高度。
 - Goal 操作、agent 操作、task action、项目设置按钮和紧凑 agent pill 属于功能层，可使用 Liquid Glass 并以 `GlassEffectContainer` 组织相邻效果。
 - 红、橙、绿继续只承担错误、等待 / 阻塞、成功等语义状态，并同时保留文字或图标。
 
@@ -157,3 +157,11 @@ rg -n 'glassEffect|GlassEffectContainer|buttonStyle\(\.glass|regularMaterial|win
 - 第二排附件/图像 action/stop/Send 的 icon label 统一为 32×32，经原生 `.glass` / `.glassProminent` 或 bordered fallback 后得到 40×40 外观；输入容器单行最小高度为 40、间距为 8、圆角为 20。外层使用 bottom alignment，多行输入时按钮保持贴底。
 - 原生控件 fitting-size probe 确认 Recent `+` 为 30×30，plain native `Menu` 加共享 interactive glass label 后为 40pt 高；第二排 glass/glassProminent/bordered 按钮与单行输入均为 40pt。Swift parse、SharedUI build、`IntatisSharedUITests` 50/50、`PerAgentInferenceProfileTests` 20/20、XcodeGen、macOS Debug 与 iOS generic Simulator Debug build 均通过。
 - 遵守 renderer NO-GO，本轮未启动 App 或 fixture；实际像素、sidebar 交互、Light/Dark、Reduce Transparency 和真实窄宽布局仍为 `UNKNOWN`。
+
+## 13. 2026-07-31 权限审查与消息标识收口
+
+- 待处理权限使用紧凑、左对齐的低对比 Material 卡片，不再用风险色描整张卡。风险色只用于小图标与 risk chip；tool、reason 与当前状态保持可扫读，结构化 scope 和 patch diff 默认收进 `Details`，避免长参数抢占对话主视觉。
+- `Details` 只展示 host 生成的结构化 action preview / intent / resource / touched path；raw JSON arguments 不进入通用详情列表。patch diff 仍可在用户主动展开后查看和选择，权限 action、RequestID/FIFO 与审批语义不变。
+- automatic reviewer 状态只显示进度，不暴露 Approve / Decline / Cancel；人工模式继续区分 `Approve Call`、`Decline Call` 与 `Cancel Turn`。resolved notice 收窄为同一低对比表面的紧凑状态行。
+- Chat、Code、Cowork 和共享 iOS Chat 的用户气泡继续靠右并保留既有 Material/宽度合同，但不再重复显示 `You`；assistant、agent、system 的 structured identity header 与 agent timestamp 保留。macOS sidebar 品牌块只显示 `Intatis`。active Chat/Code/Cowork session header 和 sidebar Recent row 都只显示 session name，不在其下显示灰色 model/provider/host、workspace/state、agent/running、event/date/path/runtime metadata；空态首页与 Settings 的说明性 subtitle 不属于 session metadata，继续保留。
+- Computer Use 使用独立 bundle 的离线 Phase C fixture 验证了 Light/Dark、默认折叠、详情展开、automatic non-actionable 与 approved notice；另以本轮构建打开真实历史 Chat，只读确认侧栏品牌副标题、active session subtitle、Recent session detail 和用户气泡 `You` 均消失，并在 Cowork history 再核对单行 session row；未发送 provider 请求。当前截图与逐项对比记录见根目录 `design-qa.md`。

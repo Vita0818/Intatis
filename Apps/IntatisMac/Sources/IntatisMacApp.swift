@@ -851,6 +851,7 @@ struct CodeSessionView: View {
     @Binding var showsInspector: Bool
     @State private var showMCPProjectSettings =
         false
+    @State private var showMCPContent = false
     @Environment(\.colorScheme) private var scheme
 
     var body: some View {
@@ -885,28 +886,31 @@ struct CodeSessionView: View {
                             vm.cancelPendingMCPExternalContexts()
                         })
                   }),
+                  headerActions: [
+                    IntatisThreadHeaderAction(
+                        title: "MCP Content",
+                        systemImage: "shippingbox.and.arrow.backward",
+                        isIconOnly: true,
+                        help: "Browse granted MCP resources, prompts, tasks, and calls",
+                        accessibilityIdentifier: "code.mcp.content") {
+                            showMCPContent = true
+                        },
+                    IntatisThreadHeaderAction(
+                        title: "MCP Settings",
+                        systemImage: "network.badge.shield.half.filled",
+                        isIconOnly: true,
+                        help: "Attach servers and manage exact Agent MCP grants",
+                        accessibilityIdentifier: "code.mcp.settings") {
+                            showMCPProjectSettings = true
+                        },
+                  ],
                   showsInspector: $showsInspector,
                   input: $vm.input,
                   onSend: { vm.send() },
                   onCancelCurrent: { vm.cancelCurrentTurn() },
                   onResolve: { vm.resolvePermission($0) })
-            .toolbar {
-                ToolbarItem {
-                    MCPConversationCenterButton(
-                        host: mcpContentHost)
-                }
-                ToolbarItem {
-                    Button {
-                        showMCPProjectSettings = true
-                    } label: {
-                        Label(
-                            "MCP Project Settings",
-                            systemImage:
-                                "network.badge.shield.half.filled")
-                    }
-                    .help(
-                        "Attach servers and manage exact Agent MCP grants")
-                }
+            .sheet(isPresented: $showMCPContent) {
+                MCPConversationCenterSheet(host: mcpContentHost)
             }
             .sheet(
                 isPresented:
@@ -948,6 +952,7 @@ struct CoworkSessionView: View {
     @State private var goalTokenBudgetDraft = ""
     @State private var goalEditorSubmissionError: String?
     @State private var showAttachmentImporter = false
+    @State private var showMCPContent = false
     @Environment(\.colorScheme) private var scheme
 
     private var hasMainAgent: Bool {
@@ -1039,6 +1044,16 @@ struct CoworkSessionView: View {
                         .frame(
                             minHeight: IntatisComposerControlMetrics.controlHeight,
                             alignment: .center)),
+                        headerActions: [
+                            IntatisThreadHeaderAction(
+                                title: "MCP Content",
+                                systemImage: "shippingbox.and.arrow.backward",
+                                isIconOnly: true,
+                                help: "Browse granted MCP resources, prompts, tasks, and calls",
+                                accessibilityIdentifier: "cowork.mcp.content") {
+                                    showMCPContent = true
+                                },
+                        ],
                         showsInspector: $showsInspector,
                         input: $vm.input,
                         onSend: { vm.send() },
@@ -1065,6 +1080,9 @@ struct CoworkSessionView: View {
         }
         .sheet(isPresented: $showProjectSettings) { projectSettingsSheet }
         .sheet(isPresented: $showGoalEditor) { goalEditorSheet }
+        .sheet(isPresented: $showMCPContent) {
+            MCPConversationCenterSheet(host: mcpContentHost)
+        }
         .fileImporter(
             isPresented: $showAttachmentImporter,
             allowedContentTypes: [.data, .content],
@@ -1081,12 +1099,6 @@ struct CoworkSessionView: View {
             guard !urls.isEmpty else { return false }
             vm.importDraftAttachments(urls)
             return true
-        }
-        .toolbar {
-            ToolbarItem {
-                MCPConversationCenterButton(
-                    host: mcpContentHost)
-            }
         }
         .alert("Clear this Goal?", isPresented: $showGoalClearConfirmation) {
             Button("Clear", role: .destructive) { vm.clearGoal() }

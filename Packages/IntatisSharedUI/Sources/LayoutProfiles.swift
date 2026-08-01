@@ -40,6 +40,78 @@ public struct IntatisSplitColumnLayout: Equatable {
         detailIdeal: 300)
 }
 
+/// Resolves a workspace thread and its status rail from one stable, outer
+/// width proposal. The status rail never measures its already-compressed
+/// thread column to decide whether it should exist; doing so creates a
+/// presentation feedback loop around the activation threshold.
+public struct IntatisWorkspaceInspectorLayout: Equatable {
+    public let isVisible: Bool
+    public let threadWidth: CGFloat
+    public let inspectorWidth: CGFloat
+
+    public init(
+        isVisible: Bool,
+        threadWidth: CGFloat,
+        inspectorWidth: CGFloat
+    ) {
+        self.isVisible = isVisible
+        self.threadWidth = threadWidth
+        self.inspectorWidth = inspectorWidth
+    }
+}
+
+public enum IntatisWorkspaceInspectorLayoutPolicy {
+    public static func resolve(
+        availableWidth rawAvailableWidth: CGFloat,
+        isRequested: Bool,
+        activationWidth: CGFloat,
+        minimumThreadWidth: CGFloat,
+        minimumInspectorWidth: CGFloat,
+        idealInspectorWidth: CGFloat,
+        maximumInspectorWidth: CGFloat,
+        dividerWidth: CGFloat = 1
+    ) -> IntatisWorkspaceInspectorLayout {
+        let availableWidth = rawAvailableWidth.isFinite
+            ? max(rawAvailableWidth, 1)
+            : 1
+        let normalizedDividerWidth = dividerWidth.isFinite
+            ? max(dividerWidth, 0)
+            : 0
+
+        guard isRequested,
+              availableWidth >= activationWidth,
+              availableWidth
+                >= minimumThreadWidth
+                    + minimumInspectorWidth
+                    + normalizedDividerWidth
+        else {
+            return IntatisWorkspaceInspectorLayout(
+                isVisible: false,
+                threadWidth: availableWidth,
+                inspectorWidth: 0)
+        }
+
+        let inspectorCeiling = max(
+            minimumInspectorWidth,
+            min(
+                maximumInspectorWidth,
+                availableWidth
+                    - minimumThreadWidth
+                    - normalizedDividerWidth))
+        let inspectorWidth = min(
+            max(idealInspectorWidth, minimumInspectorWidth),
+            inspectorCeiling)
+        return IntatisWorkspaceInspectorLayout(
+            isVisible: true,
+            threadWidth: max(
+                availableWidth
+                    - inspectorWidth
+                    - normalizedDividerWidth,
+                1),
+            inspectorWidth: inspectorWidth)
+    }
+}
+
 public struct ThreeColumnShellLayout: Equatable {
     public enum Presentation: Equatable {
         case split

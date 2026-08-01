@@ -98,10 +98,22 @@ struct PhaseCPermissionFixtureView: View {
         PermissionRequestPayload(
             requestId: RequestID(rawValue: id),
             agent: AgentID(rawValue: "main"),
-            tool: "write_file",
-            args: #"{"path":"notes.txt","content":"phase-c fixture"}"#,
+            tool: "apply_patch",
+            args: #"{"diff":"*** Begin Patch\n*** Update File: Sources/ComposerView.swift\n@@\n-            Text(\"You\")\n+            EmptyView()\n*** End Patch"}"#,
             risk: .medium,
-            reason: "Write notes.txt in the authorized workspace",
+            reason: "Update the message header in the authorized workspace",
+            context: PermissionRequestContext(
+                touchedPaths: ["Sources/ComposerView.swift"],
+                sideEffect: .write,
+                intent: PermissionIntent(
+                    action: "filesystem.patch",
+                    resources: [PermissionResource(
+                        kind: .workspacePath,
+                        value: "Sources/ComposerView.swift",
+                        access: .readWrite)],
+                    dataEffects: [.mutate],
+                    risks: [.workspaceMutation],
+                    replayPolicy: .requiresManualReconciliation)),
             approvalMode: approvalMode)
     }
 

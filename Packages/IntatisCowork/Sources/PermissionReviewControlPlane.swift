@@ -15,22 +15,31 @@ public struct PermissionReviewControlPlanePolicy: Equatable, Sendable {
     /// Optional soft warning threshold for cumulative reviewer usage. It never
     /// disables automatic review. Failures and invalid output fail closed.
     public var tokenBudget: Int?
-    public var reservedCompletionTokens: Int
+    /// Optional host estimate used only for soft usage accounting when a
+    /// provider call fails before reporting usage. It is never sent upstream
+    /// as an output-token ceiling.
+    public var estimatedCompletionTokens: Int?
     public var maxRecentEvents: Int
-    public var maxOutputCharacters: Int
+    /// Optional explicit host memory bound. The default leaves response size
+    /// to the selected provider/model instead of inventing a local ceiling.
+    public var maxOutputCharacters: Int?
     public var maxPendingReviews: Int
 
     public init(timeoutSeconds: Double = 120,
                 tokenBudget: Int? = nil,
-                reservedCompletionTokens: Int = 4_096,
+                estimatedCompletionTokens: Int? = nil,
                 maxRecentEvents: Int = 36,
-                maxOutputCharacters: Int = 8_000,
+                maxOutputCharacters: Int? = nil,
                 maxPendingReviews: Int = 64) {
         self.timeoutSeconds = min(300, max(0.01, timeoutSeconds))
         self.tokenBudget = tokenBudget.map { max(1, $0) }
-        self.reservedCompletionTokens = min(16_384, max(1, reservedCompletionTokens))
+        self.estimatedCompletionTokens = estimatedCompletionTokens.flatMap {
+            $0 > 0 ? $0 : nil
+        }
         self.maxRecentEvents = min(200, max(1, maxRecentEvents))
-        self.maxOutputCharacters = min(32_000, max(256, maxOutputCharacters))
+        self.maxOutputCharacters = maxOutputCharacters.flatMap {
+            $0 > 0 ? $0 : nil
+        }
         self.maxPendingReviews = min(1_024, max(1, maxPendingReviews))
     }
 }
@@ -109,6 +118,7 @@ public actor PermissionReviewControlPlane {
         var usage: Usage?
         var finishReason: String?
         var exceededOutputCharacterLimit: Bool
+        var failureDiagnostic: String?
     }
 
     fileprivate enum ProviderResult {
@@ -708,10 +718,13 @@ public actor PermissionReviewControlPlane {
                 maxRecentEvents: policy.maxRecentEvents)),
         ]
         let estimatedPromptTokens = Self.estimatedTokens(in: messages)
+        let estimatedDispatchTokens = Self.saturatingSum(
+            estimatedPromptTokens,
+            policy.estimatedCompletionTokens ?? 0)
         if let limit = policy.tokenBudget,
            Self.budgetWouldExceed(
             consumed: consumedTokens,
-            required: estimatedPromptTokens + policy.reservedCompletionTokens,
+            required: estimatedDispatchTokens,
             limit: limit) {
             healthState = .degraded(
                 "Automatic reviewer crossed its soft token budget warning threshold; review remains active and usage continues to be recorded.")
@@ -721,9 +734,7 @@ public actor PermissionReviewControlPlane {
             model: reviewerAgent.model,
             messages: messages,
             tools: [],
-            temperature: 0,
-            includeUsage: true,
-            maxOutputTokens: policy.reservedCompletionTokens)
+            includeUsage: true)
         let remainingSeconds = task.deadline.timeIntervalSinceNow
         guard remainingSeconds > 0 else {
             healthState = .degraded(
@@ -781,7 +792,9 @@ public actor PermissionReviewControlPlane {
                 estimatedPromptTokens: estimatedPromptTokens)
             let failureReason: String
             if output.exceededOutputCharacterLimit {
-                failureReason = "permission reviewer exceeded its bounded output character limit; automatic mode denied the request"
+                failureReason = "permission reviewer exceeded the explicitly configured host output character limit; automatic mode denied the request"
+            } else if let diagnostic = output.failureDiagnostic {
+                failureReason = "permission reviewer provider failed: \(diagnostic); automatic mode denied the request"
             } else {
                 failureReason = "permission reviewer failed; automatic mode denied the request"
             }
@@ -823,9 +836,7 @@ public actor PermissionReviewControlPlane {
                     expectedProviderGeneration: providerGeneration)
             }
             guard let parsed = Self.parse(output.text, fallbackRisk: task.gate.risk) else {
-                let reason = Self.invalidVerdictReason(
-                    output,
-                    completionTokenLimit: policy.reservedCompletionTokens)
+                let reason = Self.invalidVerdictReason(output)
                 healthState = .degraded(reason)
                 return await persistTerminal(
                     task: task,
@@ -1032,7 +1043,7 @@ public actor PermissionReviewControlPlane {
         _ request: AgentRequest,
         generation: PermissionReviewProviderGenerationID,
         timeoutSeconds: Double,
-        maxOutputCharacters: Int
+        maxOutputCharacters: Int?
     ) async -> ProviderResult {
         guard var job = jobs[generation.reviewTaskID], job.state == .running else {
             return .cancelled
@@ -1052,7 +1063,8 @@ public actor PermissionReviewControlPlane {
                 sawToolCall: false,
                 usage: nil,
                 finishReason: nil,
-                exceededOutputCharacterLimit: false)
+                exceededOutputCharacterLimit: false,
+                failureDiagnostic: nil)
             let result: ProviderResult
             do {
                 try Task.checkCancellation()
@@ -1063,7 +1075,8 @@ public actor PermissionReviewControlPlane {
                     try Task.checkCancellation()
                     switch chunk {
                     case .textDelta(let delta):
-                        guard output.text.count + delta.count <= maxOutputCharacters else {
+                        if let maxOutputCharacters,
+                           output.text.count + delta.count > maxOutputCharacters {
                             exceededOutputLimit = true
                             break stream
                         }
@@ -1081,6 +1094,8 @@ public actor PermissionReviewControlPlane {
             } catch is CancellationError {
                 result = .cancelled
             } catch {
+                output.failureDiagnostic =
+                    RuntimeErrorPresentation.message(for: error)
                 result = .failed(output)
             }
             race.resolve(generation: generation, result: result)
@@ -1468,17 +1483,15 @@ public actor PermissionReviewControlPlane {
         var profile: String
     }
 
-    private static func invalidVerdictReason(_ output: ProviderOutput,
-                                             completionTokenLimit: Int) -> String {
+    private static func invalidVerdictReason(_ output: ProviderOutput) -> String {
         let finishReason = output.finishReason?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased() ?? ""
         let providerReportedLengthStop = finishReason.contains("length")
             || finishReason.contains("max_token")
             || finishReason.contains("token_limit")
-        let usageReachedLimit = (output.usage?.completionTokens ?? 0) >= completionTokenLimit
-        if providerReportedLengthStop || usageReachedLimit {
-            return "permission reviewer output reached its completion-token limit before a valid verdict; automatic mode denied the request"
+        if providerReportedLengthStop {
+            return "permission reviewer provider stopped at its output-token limit before a valid verdict; automatic mode denied the request"
         }
         if output.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return "permission reviewer returned an empty verdict; automatic mode denied the request"
@@ -1552,14 +1565,15 @@ public actor PermissionReviewControlPlane {
     }
 
     private func chargeEstimatedDispatchUsage(estimatedPromptTokens: Int) -> PermissionReviewUsage {
-        let (estimatedTotal, totalOverflow) = estimatedPromptTokens.addingReportingOverflow(
-            policy.reservedCompletionTokens)
-        let total = totalOverflow ? Int.max : estimatedTotal
+        let estimatedCompletion = policy.estimatedCompletionTokens ?? 0
+        let total = Self.saturatingSum(
+            estimatedPromptTokens,
+            estimatedCompletion)
         let (updatedConsumed, consumedOverflow) = consumedTokens.addingReportingOverflow(total)
         consumedTokens = consumedOverflow ? Int.max : updatedConsumed
         return PermissionReviewUsage(
             promptTokens: estimatedPromptTokens,
-            completionTokens: policy.reservedCompletionTokens,
+            completionTokens: policy.estimatedCompletionTokens,
             totalTokens: total,
             estimated: true)
     }
@@ -1817,6 +1831,11 @@ public actor PermissionReviewControlPlane {
     private static func budgetWouldExceed(consumed: Int, required: Int, limit: Int) -> Bool {
         guard consumed <= limit else { return true }
         return required > limit - consumed
+    }
+
+    private static func saturatingSum(_ lhs: Int, _ rhs: Int) -> Int {
+        let (sum, overflow) = lhs.addingReportingOverflow(rhs)
+        return overflow ? Int.max : sum
     }
 
     private static func capabilityLeaseSummary(_ lease: CapabilityLease?) -> String {

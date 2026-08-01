@@ -192,19 +192,24 @@ struct MessageRow: View {
 
     private var messageBody: some View {
         VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 6) {
-                Text(roleLabel)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                if (message.role == .assistant || message.role == .agent),
-                   let timestamp = message.timestamp {
-                    Text(IntatisMessageTimestampPresentation.string(for: timestamp))
-                        .font(.caption2)
-                        .monospacedDigit()
-                        .foregroundStyle(.tertiary)
-                }
-                ForEach(message.tags, id: \.self) { tag in
-                    tagBadge(tag)
+            if IntatisMessageHeaderPolicy.showsIdentity(for: message.role)
+                || !message.tags.isEmpty {
+                HStack(spacing: 6) {
+                    if let roleLabel {
+                        Text(roleLabel)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    if (message.role == .assistant || message.role == .agent),
+                       let timestamp = message.timestamp {
+                        Text(IntatisMessageTimestampPresentation.string(for: timestamp))
+                            .font(.caption2)
+                            .monospacedDigit()
+                            .foregroundStyle(.tertiary)
+                    }
+                    ForEach(message.tags, id: \.self) { tag in
+                        tagBadge(tag)
+                    }
                 }
             }
             if message.role == .assistant || message.role == .agent {
@@ -229,9 +234,9 @@ struct MessageRow: View {
         (message.text.isEmpty && !message.isComplete) ? "…" : message.text
     }
 
-    private var roleLabel: String {
+    private var roleLabel: String? {
         switch message.role {
-        case .user:      return IntatisLocalization.string("You")
+        case .user:      return nil
         case .assistant: return IntatisLocalization.string("Assistant")
         case .agent:
             return message.agent?.rawValue ?? IntatisLocalization.string("Agent")

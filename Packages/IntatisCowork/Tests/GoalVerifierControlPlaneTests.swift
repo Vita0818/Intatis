@@ -81,6 +81,8 @@ final class GoalVerifierControlPlaneTests: XCTestCase {
         let request = try XCTUnwrap(provider.requests.first)
         XCTAssertEqual(request.model, ModelID(rawValue: "selected-model"))
         XCTAssertTrue(request.tools.isEmpty)
+        XCTAssertNil(request.temperature)
+        XCTAssertNil(request.maxOutputTokens)
         XCTAssertEqual(request.messages.map(\.role), [.system, .user])
         XCTAssertTrue(request.messages[0].content?.contains("independent GoalVerifier") == true)
         XCTAssertTrue(request.messages[1].content?.contains("GOAL_SNAPSHOT") == true)
@@ -244,6 +246,30 @@ final class GoalVerifierControlPlaneTests: XCTestCase {
 
         XCTAssertEqual(result.audit.verdict, .continue)
         XCTAssertEqual(result.failureKind, .outputLimit)
+    }
+
+    func testExplicitOutputPolicyIsForwardedWithoutAnArbitraryClamp() async throws {
+        let fixture = makeFixture(taskStatus: .completed, includeEvidence: true)
+        let provider = GoalVerifierTestProvider(chunks: [
+            .textDelta(completeResponse(reference: "test://swift/goal-verifier")),
+            .done(finishReason: "stop"),
+        ])
+        let verifier = GoalVerifierControlPlane(
+            provider: provider,
+            model: ModelID(rawValue: "m"),
+            policy: GoalVerifierPolicy(
+                maxOutputCharacters: 200_000,
+                maxOutputTokens: 20_000))
+
+        _ = await verifier.verify(fixture.input)
+
+        let request = try XCTUnwrap(provider.requests.first)
+        XCTAssertNil(request.temperature)
+        XCTAssertEqual(request.maxOutputTokens, 20_000)
+        XCTAssertEqual(
+            GoalVerifierPolicy(maxOutputCharacters: 200_000)
+                .maxOutputCharacters,
+            200_000)
     }
 
     func testProviderHardUsageLimitIsDistinctFromOutputLimit() async {

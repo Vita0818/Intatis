@@ -113,18 +113,10 @@ private struct IntatisChatSessionScreen: View {
     }
 
     private func header(layout: IntatisMacScreenLayout) -> some View {
-        IntatisPageHeader(title: sessionTitle, subtitle: subtitle)
+        IntatisPageHeader(title: sessionTitle, subtitle: nil)
         .padding(.horizontal, layout.horizontalPadding)
         .padding(.top, 24)
         .padding(.bottom, 10)
-    }
-
-    private var subtitle: String {
-        let catalog = env.providerCatalog
-        let provider = catalog.selectedProvider
-        let model = catalog.selectedModel
-        let host = provider.flatMap { URL(string: $0.baseURL)?.host } ?? provider?.baseURL ?? AppConfig.defaultBaseURL
-        return "\(model?.title ?? AppConfig.defaultDisplayName(for: AppConfig.defaultModel)) · \(provider?.title ?? "OpenAI") · \(host)"
     }
 
     @ViewBuilder private func errorText(layout: IntatisMacScreenLayout) -> some View {
@@ -447,9 +439,9 @@ struct IntatisMessageBubble: View {
             && message.recoveryAdvice == nil
     }
 
-    private var roleLabel: String {
+    private var roleLabel: String? {
         switch message.role {
-        case .user:      return IntatisLocalization.string("You")
+        case .user:      return nil
         case .assistant: return "Intatis"
         case .agent:     return message.agent?.rawValue ?? "Intatis"
         case .system:    return IntatisLocalization.string("System")
@@ -486,20 +478,25 @@ struct IntatisMessageBubble: View {
 
     private var bubbleBody: some View {
         VStack(alignment: .leading, spacing: 5) {
-            HStack(spacing: 6) {
-                Text(roleLabel)
-                    .font(IntatisType.caption(10, .semibold))
-                    .tracking(0.6)
-                    .foregroundStyle(isUser ? IntatisTheme.accent(scheme) : IntatisTheme.tertiaryText(scheme))
-                if (message.role == .assistant || message.role == .agent),
-                   let timestamp = message.timestamp {
-                    Text(IntatisMessageTimestampPresentation.string(for: timestamp))
-                        .font(IntatisType.caption(10))
-                        .monospacedDigit()
-                        .foregroundStyle(IntatisTheme.tertiaryText(scheme))
-                }
-                ForEach(message.tags, id: \.self) { tag in
-                    goalTag(tag)
+            if IntatisMessageHeaderPolicy.showsIdentity(for: message.role)
+                || !message.tags.isEmpty {
+                HStack(spacing: 6) {
+                    if let roleLabel {
+                        Text(roleLabel)
+                            .font(IntatisType.caption(10, .semibold))
+                            .tracking(0.6)
+                            .foregroundStyle(IntatisTheme.tertiaryText(scheme))
+                    }
+                    if (message.role == .assistant || message.role == .agent),
+                       let timestamp = message.timestamp {
+                        Text(IntatisMessageTimestampPresentation.string(for: timestamp))
+                            .font(IntatisType.caption(10))
+                            .monospacedDigit()
+                            .foregroundStyle(IntatisTheme.tertiaryText(scheme))
+                    }
+                    ForEach(message.tags, id: \.self) { tag in
+                        goalTag(tag)
+                    }
                 }
             }
             if message.role == .assistant || message.role == .agent {

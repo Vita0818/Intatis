@@ -301,7 +301,7 @@ struct IntatisMacRootView: View {
         IntatisSessionHistoryItem(
             id: session.id,
             title: session.displayName ?? session.id.rawValue,
-            detail: sessionDetail(session),
+            detail: "",
             systemImage: icon,
             isSelected: selected,
             isDeleteDisabled: isDeleteDisabled(session))
@@ -312,35 +312,6 @@ struct IntatisMacRootView: View {
         let key = AppSessionRuntimeKey(kind: session.kind, sessionID: session.id)
         return runtimeStatuses[key]?.blocksDeletion == true
             || runtimeManager.isBusy(kind: session.kind, sessionID: session.id)
-    }
-
-    private func sessionDetail(_ session: AppSessionSummary) -> String {
-        let timestamp = session.updatedAt == .distantPast
-            ? IntatisLocalization.string("Unknown date")
-            : session.updatedAt.formatted(date: .abbreviated, time: .shortened)
-        let count = session.eventCount == 1
-            ? IntatisLocalization.string("1 event")
-            : IntatisLocalization.format("%lld events", Int64(session.eventCount))
-        let workspace: String
-        switch selection {
-        case .code:
-            workspace = WorkspaceAccess.workspacePath(for: session.id).map { " · \($0)" } ?? ""
-        case .cowork:
-            workspace = CoworkProjectSettingsStore.primaryWorkspacePath(sessionID: session.id).map { " · \($0)" } ?? ""
-        case .chat:
-            workspace = ""
-        }
-        let key = AppSessionRuntimeKey(kind: session.kind, sessionID: session.id)
-        let runtimeLabel: String?
-        if runtimeManager.state != .running, runtimeStatuses[key] != nil {
-            runtimeLabel = "Stopping"
-        } else {
-            runtimeLabel = runtimeStatuses[key]?.label
-        }
-        let runtimeState = runtimeLabel.map {
-                " · \(IntatisLocalization.string($0))"
-            } ?? ""
-        return "\(count) · \(timestamp)\(workspace)\(runtimeState)"
     }
 
     private func refreshAllSessions() {
@@ -828,16 +799,10 @@ struct IntatisSidebar: View {
     }
 
     private var titleBlock: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text("Intatis")
-                .font(IntatisType.brand(28))
-                .foregroundStyle(IntatisTheme.deepText(scheme))
-            Text(IntatisLocalization.string("Local AI workbench"))
-                .font(IntatisType.caption(12, .semibold))
-                .foregroundStyle(IntatisTheme.softText(scheme))
-                .lineLimit(1)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        Text("Intatis")
+            .font(IntatisType.brand(28))
+            .foregroundStyle(IntatisTheme.deepText(scheme))
+            .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var modeNavigation: some View {

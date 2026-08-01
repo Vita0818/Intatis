@@ -6,6 +6,7 @@ import IntatisProviders
 import IntatisPermission
 import IntatisConversation
 import IntatisAgentKernel
+import IntatisTools
 @testable import IntatisCowork
 
 private actor ReliabilityConcurrencyProbe {

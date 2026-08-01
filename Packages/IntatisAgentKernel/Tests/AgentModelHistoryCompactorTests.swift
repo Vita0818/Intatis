@@ -571,8 +571,7 @@ final class AgentModelHistoryCompactorTests: XCTestCase {
         XCTAssertNotNil(request.maxOutputTokens)
         XCTAssertLessThanOrEqual(
             request.maxOutputTokens ?? .max,
-            AgentModelHistoryCompactor
-                .defaultMaximumSummaryOutputTokens)
+            usableLimit)
         XCTAssertLessThan(
             result.replacementHistory
                 .first(where: {
@@ -585,7 +584,7 @@ final class AgentModelHistoryCompactorTests: XCTestCase {
                 .utf8.count)
     }
 
-    func testProviderIgnoringSummaryCeilingFailsEvenWhenReplacementWindowIsLarge()
+    func testProviderIgnoringDerivedReplacementWindowCeilingFailsClosed()
         async throws
     {
         let provider = CompactorScriptedProvider([.chunks([
@@ -599,7 +598,7 @@ final class AgentModelHistoryCompactorTests: XCTestCase {
             _ = try await makeCompactor(provider).compact(
                 history: [.user("history")],
                 realUserMessages: [],
-                maximumReplacementInputTokens: 100_000)
+                maximumReplacementInputTokens: 100)
             XCTFail("an oversized provider response must fail closed")
         } catch let error as AgentModelHistoryCompactionError {
             guard case .summaryOutputLimitExceeded(
@@ -608,11 +607,23 @@ final class AgentModelHistoryCompactorTests: XCTestCase {
                 return XCTFail("unexpected error: \(error)")
             }
             XCTAssertGreaterThan(estimated, limit)
-            XCTAssertEqual(
-                limit,
-                AgentModelHistoryCompactor
-                    .defaultMaximumSummaryOutputTokens)
+            XCTAssertLessThan(limit, 100)
         }
+    }
+
+    func testUnconstrainedCompactionDoesNotInventProviderOutputCeiling()
+        async throws
+    {
+        let provider = CompactorScriptedProvider([.chunks([
+            .textDelta("unconstrained summary"),
+            .done(finishReason: "stop"),
+        ])])
+
+        _ = try await makeCompactor(provider).compact(
+            history: [.user("history")],
+            realUserMessages: [])
+
+        XCTAssertNil(try XCTUnwrap(provider.requests.first).maxOutputTokens)
     }
 
     func testReportedUsageSettlesSharedTokenBudgetAndSetsOutputCeiling()

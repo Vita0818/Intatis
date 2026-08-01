@@ -166,7 +166,6 @@ enum ProviderHealthChecker {
         let request = ChatRequest(
             model: model,
             messages: [ChatMessage(role: .user, content: options.prompt)],
-            temperature: 0,
             includeUsage: true)
 
         do {
@@ -220,7 +219,6 @@ enum ProviderHealthChecker {
             model: model,
             messages: [.user(options.prompt)],
             tools: [],
-            temperature: 0,
             includeUsage: true)
 
         do {

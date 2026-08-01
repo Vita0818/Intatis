@@ -91,7 +91,6 @@ public struct AgentModelHistoryCompactionResult: Equatable, Sendable {
 /// typed checkpoint has committed successfully.
 public struct AgentModelHistoryCompactor: Sendable {
     public static let retainedRealUserTokenBudget = 20_000
-    static let defaultMaximumSummaryOutputTokens = 4_096
     static let retainedRealUserTruncationMarker =
         "[Earlier part of this user message omitted]\n"
 
@@ -172,15 +171,15 @@ public struct AgentModelHistoryCompactor: Sendable {
             reservation?.maxOutputTokens,
             summaryOutputLimit,
         ].compactMap { $0 }.min()
-        let effectiveSummaryOutputLimit =
-            request.maxOutputTokens ?? summaryOutputLimit
-        // The provider-facing max_output_tokens field is only a request. Keep
-        // a host-enforced byte bound as well so one non-conforming, very large
-        // delta is rejected before it is appended to the in-memory summary.
-        // AgentTokenEstimator uses ceil(UTF8 bytes / 4), and this effective
-        // limit is never greater than the 4,096-token compaction ceiling.
-        let maximumSummaryUTF8Bytes =
-            effectiveSummaryOutputLimit * 4
+        let effectiveSummaryOutputLimit = request.maxOutputTokens
+        // A real replacement-window or explicit Goal token budget is a
+        // correctness constraint, so mirror that provider request on the host
+        // in case a provider ignores it. With neither constraint, do not
+        // invent a summary-output ceiling.
+        let maximumSummaryUTF8Bytes = effectiveSummaryOutputLimit.map {
+            let (bytes, overflow) = $0.multipliedReportingOverflow(by: 4)
+            return overflow ? Int.max : bytes
+        }
 
         var summary = ""
         var summaryUTF8Bytes = 0
@@ -195,29 +194,34 @@ public struct AgentModelHistoryCompactor: Sendable {
                 switch chunk {
                 case .textDelta(let text):
                     let incomingBytes = text.utf8.count
-                    guard incomingBytes
-                        <= maximumSummaryUTF8Bytes
-                            - summaryUTF8Bytes else {
+                    if let maximumSummaryUTF8Bytes,
+                       incomingBytes
+                        > maximumSummaryUTF8Bytes
+                            - summaryUTF8Bytes {
                         throw AgentModelHistoryCompactionError
                             .summaryOutputLimitExceeded(
                                 estimated:
-                                    effectiveSummaryOutputLimit + 1,
+                                    effectiveSummaryOutputLimit == Int.max
+                                        ? Int.max
+                                        : (effectiveSummaryOutputLimit ?? 0) + 1,
                                 limit:
-                                    effectiveSummaryOutputLimit)
+                                    effectiveSummaryOutputLimit ?? 0)
                     }
                     summary += text
                     summaryUTF8Bytes += incomingBytes
-                    let estimatedSummaryTokens =
-                        AgentTokenEstimator.approximateTokens(
-                            in: summary)
-                    guard estimatedSummaryTokens
-                        <= effectiveSummaryOutputLimit else {
-                        throw AgentModelHistoryCompactionError
-                            .summaryOutputLimitExceeded(
-                                estimated:
-                                    estimatedSummaryTokens,
-                                limit:
-                                    effectiveSummaryOutputLimit)
+                    if let effectiveSummaryOutputLimit {
+                        let estimatedSummaryTokens =
+                            AgentTokenEstimator.approximateTokens(
+                                in: summary)
+                        guard estimatedSummaryTokens
+                            <= effectiveSummaryOutputLimit else {
+                            throw AgentModelHistoryCompactionError
+                                .summaryOutputLimitExceeded(
+                                    estimated:
+                                        estimatedSummaryTokens,
+                                    limit:
+                                        effectiveSummaryOutputLimit)
+                        }
                     }
                 case .toolCalls(let calls):
                     if !calls.isEmpty {
@@ -329,9 +333,9 @@ public struct AgentModelHistoryCompactor: Sendable {
 
     private static func summaryOutputTokenLimit(
         maximumReplacementInputTokens: Int?
-    ) throws -> Int {
+    ) throws -> Int? {
         guard let maximumReplacementInputTokens else {
-            return defaultMaximumSummaryOutputTokens
+            return nil
         }
         let fixedSummaryTokens = AgentTokenEstimator
             .approximateInputTokens(messages: [
@@ -344,7 +348,7 @@ public struct AgentModelHistoryCompactor: Sendable {
                 .replacementBudgetUnavailable(
                     limit: maximumReplacementInputTokens)
         }
-        return min(defaultMaximumSummaryOutputTokens, available)
+        return available
     }
 
     private static func retainedRealUsersFittingReplacement(
