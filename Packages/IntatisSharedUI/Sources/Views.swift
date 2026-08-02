@@ -7,7 +7,9 @@ import IntatisConversation
 
 /// Shared chat shell. The caller chooses split or single-thread presentation via
 /// `ThreeColumnShellLayout`, so macOS/iPad-style panes and compact iOS chat use
-/// the same thread/composer implementation with different parameters.
+/// the same thread/composer implementation with different parameters. A
+/// thread-only caller owns the surrounding navigation container so its native
+/// toolbar and sheets participate in the same navigation stack.
 public struct ThreeColumnShell: View {
     @ObservedObject private var model: ChatViewModel
     private let layout: ThreeColumnShellLayout
@@ -40,10 +42,7 @@ public struct ThreeColumnShell: View {
                                                         ideal: layout.columns.detailIdeal)
                 }
             case .threadOnly:
-                NavigationStack {
-                    ThreadView(model: model)
-                        .navigationTitle("Chat")
-                }
+                ThreadView(model: model)
             }
         }
         .task { model.start() }
@@ -131,7 +130,9 @@ struct ThreadView: View {
                     .padding(.horizontal)
                     .padding(.vertical, 4)
             }
+            #if !os(iOS)
             Divider()
+            #endif
             ComposerView(model: model)
         }
     }
@@ -219,6 +220,9 @@ struct MessageRow: View {
                     isComplete: message.isComplete,
                     policy: .richText,
                     style: style)
+                if !message.citations.isEmpty {
+                    IntatisMessageCitationsView(citations: message.citations)
+                }
             } else {
                 Text(displayText)
                     .textSelection(.enabled)
@@ -256,6 +260,65 @@ struct MessageRow: View {
     }
 }
 
+public struct IntatisMessageCitationsView: View {
+    private struct LinkValue: Identifiable {
+        let id: String
+        let title: String
+        let url: URL
+
+        init?(_ citation: MessageCitation) {
+            guard citation.url.count <= 4_096,
+                  let url = URL(string: citation.url),
+                  let scheme = url.scheme?.lowercased(),
+                  scheme == "http" || scheme == "https",
+                  let host = url.host,
+                  !host.isEmpty,
+                  url.user == nil,
+                  url.password == nil else {
+                return nil
+            }
+            self.id = url.absoluteString
+            self.title = citation.title.isEmpty ? host : citation.title
+            self.url = url
+        }
+    }
+
+    private let citations: [MessageCitation]
+
+    public init(citations: [MessageCitation]) {
+        self.citations = citations
+    }
+
+    private var links: [LinkValue] {
+        citations.compactMap(LinkValue.init)
+    }
+
+    @ViewBuilder public var body: some View {
+        if !links.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(IntatisLocalization.string("Sources"))
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(links) { link in
+                            Link(destination: link.url) {
+                                Label(link.title, systemImage: "link")
+                                    .font(.caption)
+                                    .lineLimit(1)
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .accessibilityHint(link.url.host ?? link.id)
+                        }
+                    }
+                }
+            }
+            .padding(.top, 6)
+        }
+    }
+}
+
 struct ComposerView: View {
     @ObservedObject var model: ChatViewModel
     @Environment(\.colorScheme) private var scheme
@@ -272,12 +335,8 @@ struct ComposerView: View {
             canSend: canSend,
             isInputDisabled: model.isBusy,
             style: .standard(scheme),
-            secondaryAction: IntatisThreadComposerSecondaryAction(
-                systemImage: "photo",
-                help: IntatisLocalization.string("Generate image from prompt"),
-                isBusy: model.isGeneratingArtifact,
-                isDisabled: !canSend,
-                action: { model.generateImage() }),
+            secondaryAction: secondaryAction,
+            inputLeadingAccessory: inputLeadingAccessory,
             stopAction: model.isBusy
                 ? IntatisThreadComposerSecondaryAction(
                     systemImage: "stop.fill",
@@ -286,6 +345,46 @@ struct ComposerView: View {
                 : nil,
             onSend: { model.send() })
         .padding(10)
+    }
+
+    private var secondaryAction: IntatisThreadComposerSecondaryAction? {
+        #if os(iOS)
+        return nil
+        #else
+        return IntatisThreadComposerSecondaryAction(
+            systemImage: "photo",
+            help: IntatisLocalization.string("Generate image from prompt"),
+            isBusy: model.isGeneratingArtifact,
+            isDisabled: !canSend,
+            action: { model.generateImage() })
+        #endif
+    }
+
+    private var inputLeadingAccessory: AnyView? {
+        #if os(iOS)
+        let label = IntatisLocalization.string("Attachments and chat tools")
+        return AnyView(
+            Menu {
+                Button {
+                    model.generateImage()
+                } label: {
+                    Label(
+                        IntatisLocalization.string("Generate image from prompt"),
+                        systemImage: "photo.badge.plus")
+                }
+                .disabled(!canSend)
+            } label: {
+                Label(label, systemImage: "paperclip")
+                    .intatisComposerIconLabel()
+            }
+            .intatisCompactIconButton()
+            .help(label)
+            .accessibilityLabel(label)
+            .accessibilityIdentifier("thread.composer.actions")
+            .disabled(model.isBusy))
+        #else
+        return nil
+        #endif
     }
 }
 

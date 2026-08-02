@@ -1,5 +1,6 @@
 import Foundation
 import IntatisCore
+import IntatisProtocol
 
 #if canImport(FoundationNetworking)
 import FoundationNetworking
@@ -37,6 +38,20 @@ public struct ChatMessage: Codable, Equatable, Sendable {
 /// and endpoints that don't support it are unaffected.
 public enum ReasoningEffort: String, Codable, Sendable {
     case minimal, low, medium, high
+}
+
+/// Hosted web-search options for a chat request. This is provider-side search,
+/// not an Intatis local tool, so the iOS Chat subset keeps its no-tools boundary.
+public struct ChatWebSearchConfiguration: Equatable, Sendable {
+    public enum ContextSize: String, Equatable, Sendable {
+        case low, medium, high
+    }
+
+    public var contextSize: ContextSize
+
+    public init(contextSize: ContextSize = .medium) {
+        self.contextSize = contextSize
+    }
 }
 
 /// Token usage reported by the endpoint (when available).
@@ -114,20 +129,25 @@ public struct ChatRequest: Equatable, Sendable {
     /// Ask the endpoint to report token usage (OpenAI `stream_options.include_usage`).
     public var includeUsage: Bool
     public var stream: Bool
+    /// When present, the adapter uses the Responses API with hosted web search.
+    public var webSearch: ChatWebSearchConfiguration?
     public init(model: ModelID, messages: [ChatMessage], temperature: Double? = nil,
-                reasoningEffort: ReasoningEffort? = nil, includeUsage: Bool = false, stream: Bool = true) {
+                reasoningEffort: ReasoningEffort? = nil, includeUsage: Bool = false,
+                stream: Bool = true, webSearch: ChatWebSearchConfiguration? = nil) {
         self.model = model
         self.messages = messages
         self.temperature = temperature
         self.reasoningEffort = reasoningEffort
         self.includeUsage = includeUsage
         self.stream = stream
+        self.webSearch = webSearch
     }
 }
 
 /// One piece of a streaming chat response.
 public enum ChatChunk: Equatable, Sendable {
     case delta(String)
+    case citation(MessageCitation)
     case usage(Usage)
     case done
 }

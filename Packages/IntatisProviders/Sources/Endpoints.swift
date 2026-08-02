@@ -268,6 +268,9 @@ public struct ModelRef: Codable, Equatable, Sendable {
 /// Default model per role. v0.1 only requires `chat`; the rest are forward slots.
 public struct ResolvedModels: Codable, Equatable, Sendable {
     public var chat: ModelRef
+    /// Optional provider-hosted search route for Chat. When absent, searched
+    /// turns use the ordinary `chat` route.
+    public var webSearch: ModelRef?
     public var agent: ModelRef?
     public var reviewer: ModelRef?
     public var vision: ModelRef?
@@ -275,6 +278,7 @@ public struct ResolvedModels: Codable, Equatable, Sendable {
     public var imageGen: ModelRef?
     public var videoGen: ModelRef?
     public init(chat: ModelRef,
+                webSearch: ModelRef? = nil,
                 agent: ModelRef? = nil,
                 reviewer: ModelRef? = nil,
                 vision: ModelRef? = nil,
@@ -282,6 +286,7 @@ public struct ResolvedModels: Codable, Equatable, Sendable {
                 imageGen: ModelRef? = nil,
                 videoGen: ModelRef? = nil) {
         self.chat = chat
+        self.webSearch = webSearch
         self.agent = agent
         self.reviewer = reviewer
         self.vision = vision

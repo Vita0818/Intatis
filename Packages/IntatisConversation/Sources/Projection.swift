@@ -14,6 +14,7 @@ public struct ChatMessageView: Identifiable, Equatable, Sendable {
     public var tags: [String]
     public var goal: String?
     public var recoveryAdvice: RuntimeRecoveryAdvice?
+    public var citations: [MessageCitation]
 
     public init(id: MessageID,
                 role: MessageRole,
@@ -23,7 +24,8 @@ public struct ChatMessageView: Identifiable, Equatable, Sendable {
                 timestamp: Date? = nil,
                 tags: [String] = [],
                 goal: String? = nil,
-                recoveryAdvice: RuntimeRecoveryAdvice? = nil) {
+                recoveryAdvice: RuntimeRecoveryAdvice? = nil,
+                citations: [MessageCitation] = []) {
         self.id = id
         self.role = role
         self.agent = agent
@@ -33,6 +35,7 @@ public struct ChatMessageView: Identifiable, Equatable, Sendable {
         self.tags = tags
         self.goal = goal
         self.recoveryAdvice = recoveryAdvice
+        self.citations = citations
     }
 }
 
@@ -82,13 +85,15 @@ public struct ConversationProjection: Equatable, Sendable {
             if let i = messages.firstIndex(where: { $0.id == p.messageId }) {
                 messages[i].text = p.text
                 messages[i].isComplete = true
+                messages[i].citations = p.citations ?? []
                 if messages[i].timestamp == nil {
                     messages[i].timestamp = timestamp
                 }
             } else {
                 messages.append(ChatMessageView(id: p.messageId, role: p.role, agent: p.agent,
                                                 text: p.text, isComplete: true,
-                                                timestamp: timestamp))
+                                                timestamp: timestamp,
+                                                citations: p.citations ?? []))
             }
 
         case .error(let p):

@@ -79,22 +79,39 @@ public struct MessageDeltaPayload: Codable, Equatable, Sendable {
     }
 }
 
+/// A provider-supplied source for an assistant message. URLs remain strings in
+/// the durable event schema; the UI validates them again before creating a
+/// tappable link.
+public struct MessageCitation: Codable, Equatable, Hashable, Sendable {
+    public var url: String
+    public var title: String
+
+    public init(url: String, title: String) {
+        self.url = url
+        self.title = title
+    }
+}
+
 public struct MessageCompletedPayload: Codable, Equatable, Sendable {
     public var messageId: MessageID
     public var role: MessageRole
     public var agent: AgentID?
     public var text: String
     public var submissionID: SubmissionID?
+    /// Additive web citations. Legacy events decode this field as nil.
+    public var citations: [MessageCitation]?
     public init(messageId: MessageID,
                 role: MessageRole,
                 agent: AgentID? = nil,
                 text: String,
-                submissionID: SubmissionID? = nil) {
+                submissionID: SubmissionID? = nil,
+                citations: [MessageCitation]? = nil) {
         self.messageId = messageId
         self.role = role
         self.agent = agent
         self.text = text
         self.submissionID = submissionID
+        self.citations = citations?.isEmpty == false ? citations : nil
     }
 }
 

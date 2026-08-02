@@ -460,7 +460,13 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
     ) {
         guard acceptsNewOperations else { return }
         let refreshedOptions = inferenceProfileOptions
-        let bindings = (refreshedOptions ?? self.inferenceProfileOptions).map(\.binding)
+        let approvedOptions = refreshedOptions ?? self.inferenceProfileOptions
+        let bindings = approvedOptions.map(\.binding)
+        let routingMetadata = approvedOptions.map {
+            InferenceProfileRoutingMetadata(
+                inferenceProfileID: $0.binding.inferenceProfileID,
+                declaredCapabilities: $0.declaredCapabilities)
+        }
         let operationID = UUID()
         let operation = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -468,6 +474,7 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             await self.registryBox.update(registry)
             await self.orchestrator?.updateAvailableInferenceProfiles(
                 bindings,
+                routingMetadata: routingMetadata,
                 hostAuthorized: true)
             // Publish new menu entries only after Orchestrator has accepted the
             // same host-approved snapshot, so a newly visible choice cannot
@@ -558,6 +565,11 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                 executionPolicy: CoworkExecutionPolicy(tokenBudget: projectSettings.tokenBudget),
                 skillRootAccess: AppConfig.skillRootAccess,
                 availableInferenceProfiles: inferenceProfileOptions.map(\.binding),
+                inferenceProfileRoutingMetadata: inferenceProfileOptions.map {
+                    InferenceProfileRoutingMetadata(
+                        inferenceProfileID: $0.binding.inferenceProfileID,
+                        declaredCapabilities: $0.declaredCapabilities)
+                },
                 requiresInferenceBindings: true,
                 imageGeneratorFor: { _ in await registryBox.imageToolService() },
                 toolSnapshotProvider:

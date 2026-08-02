@@ -66,3 +66,255 @@ Date: 2026-08-01
 - The 2026-08-01 user delta identified two remaining secondary-metadata surfaces. Both were removed, the app was rebuilt, and the paired post-fix capture shows no empty subtitle row or remaining Recent-row detail. No new P0/P1/P2 issue was found.
 
 final result: passed
+
+# Design QA — Cowork integrated rail and Agent communication
+
+Date: 2026-08-02
+
+## Scope
+
+- Merge the wide Cowork status rail into the conversation canvas: no divider and no independent
+  rail backing surface; only the native Liquid Glass sections retain boundaries.
+- Keep the primary thread scroller at the far-right detail edge and prevent the overlay rail from
+  intercepting that edge.
+- Present generic Agent-to-Agent messages and information request/reply events as ordinary agent
+  answers, with exact `sender->recipient` identity and no card.
+
+## Comparison inputs
+
+- Reference: the user-supplied
+  `/var/folders/8p/t9gqz5213cqdslvht9fmd0zm0000gn/T/TemporaryItems/NSIRD_screencaptureui_1wPkBG/Screenshot 2026-08-02 at 22.21.43.png`.
+- Latest native build capture:
+  `/Users/vita/.codex/visualizations/2026/08/01/019fbc6f-219c-7340-a461-92dc6f2794b7/cowork-integrated-agent-communication-final.jpeg`.
+- Agent-row capture from the same implementation before the final hit-test-only rail-edge
+  refinement:
+  `/Users/vita/.codex/visualizations/2026/08/01/019fbc6f-219c-7340-a461-92dc6f2794b7/cowork-integrated-agent-communication.jpeg`.
+- Combined reference/latest/row-style comparison inspected in one image input:
+  `/Users/vita/.codex/visualizations/2026/08/01/019fbc6f-219c-7340-a461-92dc6f2794b7/cowork-integrated-comparison-final.jpeg`.
+
+## Acceptance checks
+
+| Requirement | Result | Evidence |
+|---|---|---|
+| Rail and transcript share one canvas | Passed | The latest wide native capture has no vertical separator and no full-height `.bar`/Material rail backing; only the permission, Agents and Tasks glass sections remain bounded. |
+| Primary scrollbar owns the far-right edge | Passed | The final AX tree exposes the main thread scroll area and its native scrollbar independently from `cowork.inspector`; the thread viewport spans the detail width, while a non-hit-testing transparent rail-edge clearance prevents the overlay from intercepting the scroller. `ThreadLayoutTests` freezes this source contract. |
+| Agent communication is not carded | Passed | The Agent-row capture shows the task report directly on the system canvas with the same typography and width policy as a normal agent answer, without the previous cyan/structured card. |
+| Identity is exact and directional | Passed | The capture and final-build AX tree both expose `doc-reader->main`; projection tests cover generic Agent message, Agent-to-Agent message, information request and information reply as exact `sender->recipient`. |
+| Existing rail content remains intact | Passed | Permission status remains first, followed by Agents and Tasks in this session; no Git section, workspace path or Git control is present. |
+| Runtime and security semantics are unchanged | Passed | The change is limited to projection titles and SharedUI presentation/layout. EventLog payloads, Mediator, permissions, leases, scheduling and tool execution were not changed. |
+
+## Severity review
+
+- P0: none.
+- P1: none.
+- P2: none on the tested wide Dark Cowork state.
+- Narrow-width behavior was not changed in this slice; its earlier permission fallback and
+  no-duplicate Goal/Tasks checks remain the recorded baseline.
+
+## Validation loop
+
+1. Inspected the supplied reference and mapped the divider, rail backing, primary scrollbar,
+   Agent communication card and identity label to their current SwiftUI/projection owners.
+2. Replaced the Cowork split presentation with a trailing overlay, reserved body width through
+   scroll-content margin, and added an edge pass-through for the primary scroller.
+3. Routed Agent communication rows through the normal agent answer surface and normalized four
+   communication event kinds to directional identity.
+4. Built and launched a uniquely identified ad-hoc QA copy of the latest IntatisMac Debug app,
+   opened the existing `Test` Cowork session, widened the window and inspected the real rail,
+   transcript, primary scroll area and Agent event accessibility tree without sending a message.
+5. Compared the reference, latest rail capture and Agent-row capture together. No tested-surface
+   P0/P1/P2 mismatch remains.
+
+## Build and test evidence
+
+- Targeted SwiftPM regression: 32 tests / 0 failures across
+  `ExecutionTracePresentationTests`, `IntatisConversationCodeTests` and `ThreadLayoutTests`.
+- Latest `IntatisMac` macOS Debug Xcode build: `BUILD SUCCEEDED` with local ad-hoc signing.
+- Native read-only QA confirmed `doc-reader->main`, ordinary answer rendering, no divider/backing
+  rail, permission-first glass cards and no Git surface.
+- No provider request, permission decision, message send or durable Cowork state mutation was
+  performed during QA.
+
+final result: passed
+
+# Design QA — Cowork permission-first Liquid Glass rail
+
+Date: 2026-08-02
+
+## Scope
+
+- Remove Git presentation from the Cowork trailing rail without removing permission-gated Agent
+  Git tools.
+- Move the permission review surface to the first rail position while preserving the existing
+  permission projection, actions and automatic-review behavior.
+- Replace the flat gray status boxes with native macOS Liquid Glass in Light and Dark appearance.
+
+## Comparison inputs
+
+- Reference / before state:
+  `/var/folders/8p/t9gqz5213cqdslvht9fmd0zm0000gn/T/TemporaryItems/NSIRD_screencaptureui_ZacIZr/Screenshot 2026-08-02 at 11.45.06.png`
+  (3024×1898 pixels).
+- Final Light implementation:
+  `/Users/vita/.codex/visualizations/2026/08/01/019fbc6f-219c-7340-a461-92dc6f2794b7/cowork-permission-rail-light.png`
+  (1372×768 pixels).
+- Final Dark implementation:
+  `/Users/vita/.codex/visualizations/2026/08/01/019fbc6f-219c-7340-a461-92dc6f2794b7/cowork-permission-rail-dark.png`
+  (1373×768 pixels).
+- The before image and both final images were opened together in one comparison input. The current
+  display cannot reproduce the reference's larger viewport, so this is a comparable wide-state
+  hierarchy/material review rather than a claim of pixel identity.
+
+## Acceptance checks
+
+| Requirement | Result | Evidence |
+|---|---|---|
+| Git is gone from the Cowork rail | Passed | Neither final appearance contains a Git card, branch icon, workspace path, `status only`, or Git explanatory copy. Static source search also returns no Cowork hit for those strings. |
+| Permission review is first | Passed | The latest durable permission result is the first rail surface, above Agents and Tasks. The live-pending path uses the same first slot and pins the rail at wide widths. |
+| Cards use native Liquid Glass | Passed | The production rail uses one `GlassEffectContainer`; each section uses noninteractive native `.regular` `glassEffect` with a continuous 18pt corner. No sampled color, fixed gray fill, gradient, custom highlight or fake glass asset is present. |
+| Light and Dark resolve natively | Passed | Both captures preserve readable semantic text, system-derived translucency and appropriate contrast without maintaining a second hand-tuned palette. |
+| Rail hierarchy is quieter and more coherent | Passed | Section titles use SF Symbols and semibold hierarchy; content spacing is consistent; the permission result is compact; Agents and Tasks remain independently scannable. |
+| Narrow layout has no dead rail | Passed | At the compact runtime width, the rail and its separator/placeholder disappear cleanly. Goal/Tasks are not duplicated into the transcript. |
+| Permission behavior is preserved | Passed | RequestID/FIFO, automatic non-actionable status, manual approve/decline/cancel-turn, remembered MCP approval, keyboard shortcut and accessibility IDs keep the existing production component and focused permission suites. |
+| Product/platform scope is preserved | Passed | EventLog, PermissionEngine, responder, projections, Git tool registry, iOS capability boundary and dependency graph were not changed. |
+
+## Required fidelity surfaces
+
+- Material and color: native system glass and semantic foreground styles; no imitation glass.
+- Shape and spacing: 18pt continuous corners, 16pt inter-card rhythm and 18pt rail inset produce a
+  compact status stack without the old flat gray slabs.
+- Iconography: existing SF Symbols only; no copied logo, asset or handmade vector.
+- Information architecture: permission status first, then Agents, optional Goal and optional Tasks;
+  Git presentation is absent.
+- Responsive behavior: wide live-pending state owns the rail; the compact state owns exactly one
+  actionable Material fallback and never duplicates Goal/Tasks.
+
+## Severity review
+
+- P0: none.
+- P1: the old Git-first rail and transcript-level permission card contradicted the requested
+  hierarchy. Fixed and revalidated in the paired Light/Dark wide-state review.
+- P2: the old fixed-looking gray slabs made all sections visually equal and inexpensive. Fixed
+  with native Liquid Glass, semantic typography, SF Symbol section labels and consistent rhythm.
+- All observed P0/P1/P2 issues are resolved. The current durable session exposed a resolved
+  permission notice rather than a live pending request; pending pixels were not recreated by
+  sending a provider/tool request. Its placement, single-surface hosting and compact fallback use
+  the same production component and are covered by focused layout/permission tests.
+
+## Validation loop
+
+1. Opened the supplied before screenshot and inspected the existing Cowork rail implementation.
+2. Removed the full Git presentation and moved permission status to the first rail slot.
+3. Replaced section Materials with a shared native glass container and native glass effects.
+4. Built the SharedUI target and both Apple product targets; ran 61 focused layout/permission tests.
+5. Opened the installed Release app in Light and a Debug appearance-isolated build in Dark, then
+   inspected the same real `Test` Cowork session without sending or approving anything.
+6. Opened the before, final Light and final Dark images together and checked hierarchy, material,
+   spacing, contrast, iconography and the complete absence of Git presentation.
+
+## Build and interaction evidence
+
+- `ThreadLayoutTests` 10/10, `PermissionProjectionTests` 16/16 and
+  `PermissionReviewControlPlaneTests` 35/35 passed.
+- `IntatisSharedUI`, `IntatisMac` Release/Debug and generic Simulator `IntatisiOS` Debug builds
+  succeeded.
+- `/Applications/Intatis.app` contains the latest Release build. The host has no valid Developer ID
+  identity, so this local installation is ad-hoc Hardened Runtime signed and is not a notarized
+  distributable artifact.
+- No provider request, permission action, message send or durable Cowork state mutation was used
+  during visual QA.
+
+final result: passed
+
+# Design QA — iOS reference typography
+
+Date: 2026-08-02
+
+## Scope
+
+- Apply the user's final correction: the app-owned iOS chrome uses the Apple system serif
+  design, not merely reference-matched sizes and weights.
+- Keep the accepted top model picker, Intatis drawer, Recents hierarchy, composer and Settings
+  native to SwiftUI and Dynamic Type; do not add a font asset.
+- Preserve the macOS font environment and composer contract.
+
+## Comparison inputs
+
+- Source truth: user-supplied `IMG_4904.HEIC`, `IMG_4905.HEIC` and `IMG_4906.HEIC`.
+- Read-only PNG conversions: `/private/tmp/intatis-font-reference/IMG_4904.png`,
+  `/private/tmp/intatis-font-reference/IMG_4905.png` and
+  `/private/tmp/intatis-font-reference/IMG_4906.png`.
+- Final implementation captures: `/private/tmp/intatis-ios-serif-home.png`,
+  `/private/tmp/intatis-ios-serif-sidebar.png` and
+  `/private/tmp/intatis-ios-serif-settings.png`.
+- Paired full-screen comparisons: `/private/tmp/intatis-serif-home-comparison.png` and
+  `/private/tmp/intatis-serif-sidebar-comparison.png`.
+- Each source is 1206×2622 pixels, or 402×874 points at @3x. The implementation is
+  1170×2532 pixels, or 390×844 points at @3x. The viewport differs by 12×30 points, so the
+  review uses same-density overlapping typography regions rather than claiming whole-screen
+  pixel identity.
+- Reference copy/model state and implementation copy/model state differ intentionally. The
+  references remain source truth for layout, scale, weight and hierarchy. Their sans family is
+  intentionally superseded for app chrome by the user's explicit serif correction.
+
+## Acceptance checks
+
+| Requirement | Result | Evidence |
+|---|---|---|
+| App chrome family is serif | Passed | The iOS app root applies `.fontDesign(.serif)`. Home, drawer, composer and Settings visibly inherit the Apple system serif design. |
+| Top model hierarchy remains correct | Passed | The closed model label is headline semibold and primary; the Menu label no longer uses accent blue. |
+| Drawer hierarchy remains correct | Passed | `Intatis` is title2 semibold, `Recents` is headline semibold, and the empty state is subordinate body copy, all in serif. |
+| Composer uses serif body copy | Passed | The iOS placeholder is system body in serif; the macOS branch remains its existing fixed 15pt contract. |
+| Settings is covered by the global rule | Passed | Sheet title, Cancel/Save, section labels, explanatory copy, buttons and field values are visibly serif in the final capture. |
+| Content rendering stays aligned with macOS | Passed with runtime caveat | Markdown, plain fallback, code, math and notices keep the shared macOS font implementation; no iOS-only serif descriptor rewrite remains. A real long rich reply was not created during this no-network QA pass. |
+| Dark appearance remains native | Passed | Primary/secondary text remains readable with semantic colors and no hard-coded font file or pixel color. |
+| Product/platform scope is unchanged | Passed | No provider, search, configuration, persistence or iOS package boundary changed; no message or network request was sent during QA. |
+
+## Required fidelity surfaces
+
+- Fonts and typography: Apple system serif + Dynamic Type for the iOS app chrome;
+  title2/headline/body styles and semibold/regular weights preserve the accepted hierarchy,
+  while content rendering keeps the shared macOS typography contract.
+- Spacing and layout rhythm: the Recents baseline was corrected; accepted header, drawer and
+  composer geometry otherwise remains unchanged.
+- Colors and tokens: model text is semantic primary rather than Menu accent; other text remains
+  primary/secondary and continues to follow appearance.
+- Image and asset fidelity: no logo, icon, image or font asset was copied or introduced. Existing
+  SF Symbols and native controls remain in use.
+- Copy and content: `Intatis`, the configured model name, empty-state text and composer prompt are
+  product/runtime copy and intentionally differ from the reference.
+
+## Severity review
+
+- P0: none.
+- P1: the prior pass used the default sans family for app chrome. Fixed at the iOS app root and
+  revalidated; the later overreach into Markdown/content fonts was removed to match macOS.
+- P2: none in the final Dark home, drawer or Settings pass.
+- Remaining matrix: real rich-text/code/math replies, long session names, every Dynamic Type
+  category, Bold Text, Increase Contrast, Light appearance and Reduce Transparency remain
+  `UNKNOWN`; these are not observed mismatches in the tested default-size Dark states.
+
+## Validation loop
+
+1. Reopened the three read-only reference conversions and the previous implementation pass.
+2. Accepted the user's correction that the entire iOS UI must be serif. This intentionally
+   overrides the references' sans family while retaining their layout and hierarchy.
+3. Applied `.fontDesign(.serif)` at the iOS `WindowGroup` content root, while preserving the
+   shared macOS Markdown/code/math typography path; rebuilt and reinstalled.
+4. Inspected the final Dark home, drawer and Settings in the iPhone 17e simulator. Device Hub AX
+   confirmed the expected sidebar/model/new-chat/composer and Settings controls without sending.
+5. Opened same-density reference/implementation pairs for home and drawer, then separately
+   inspected the Settings capture. No remaining tested-surface P0/P1/P2 typography issue exists.
+
+## Build and interaction evidence
+
+- `IntatisiOS` generic iOS Simulator Debug unsigned build completed successfully after the final
+  source patch.
+- `swift test --filter MessageRenderingTests` passed 41/41; the existing unrelated macOS
+  `onChange` deprecation warning remains.
+- The app was installed and launched on an iOS 27.0 iPhone 17e simulator. The simulator remains
+  booted with Settings visible for user inspection and continued configuration.
+- Browser/Sites console checks do not apply to this native iOS build. Device Hub accessibility
+  inspection and simulator pixels were used instead.
+- No provider, credential resolver, web-search or message-send path was invoked.
+
+final result: passed

@@ -109,23 +109,35 @@ private struct ModelHistoryRecordingScope: Sendable {
     var taskAttempt: Int
 }
 
-/// Per-AgentLoop circuit breaker. One exact retry is answered from the cached
-/// denial without spending another reviewer call; a further identical retry is
-/// a terminal coordination failure instead of an unbounded model/reviewer loop.
+/// Per-AgentLoop circuit breaker. Policy/user/reviewer denials keep the normal
+/// cached-denial behavior. A typed transient automatic-review infrastructure
+/// failure may spend exactly one fresh review before the cache closes again.
 private actor ToolDenialCircuitBreaker {
-    private var deniedAttempts: [String: Int] = [:]
-
-    func noteRepeatedAttempt(signature: String) -> Int? {
-        guard let previous = deniedAttempts[signature] else { return nil }
-        let next = previous + 1
-        deniedAttempts[signature] = next
-        return next
+    private struct DenialState {
+        var attempts: Int
+        var permitsFreshReview: Bool
     }
 
-    func recordDenial(signature: String) {
-        if deniedAttempts[signature] == nil {
-            deniedAttempts[signature] = 1
+    private var denials: [String: DenialState] = [:]
+
+    func noteRepeatedAttempt(signature: String) -> Int? {
+        guard var state = denials[signature] else { return nil }
+        state.attempts += 1
+        if state.permitsFreshReview {
+            state.permitsFreshReview = false
+            denials[signature] = state
+            return nil
         }
+        denials[signature] = state
+        return state.attempts
+    }
+
+    func recordDenial(signature: String,
+                      permitsOneFreshReview: Bool = false) {
+        guard denials[signature] == nil else { return }
+        denials[signature] = DenialState(
+            attempts: 1,
+            permitsFreshReview: permitsOneFreshReview)
     }
 }
 
@@ -263,7 +275,7 @@ private actor SideEffectEvidenceLedger {
     }
 
     func unresolvedDescriptions() -> [String] {
-        unresolved.values.sorted()
+        Array(Set(unresolved.values)).sorted()
     }
 
     private static func requiresExecutionEvidence(_ intent: PermissionIntent) -> Bool {
@@ -2023,7 +2035,9 @@ public struct AgentLoop: Sendable {
                 toolCall: toolCall,
                 observation: message,
                 modelHistoryScope: modelHistoryScope)
-            await denialCircuitBreaker.recordDenial(signature: denialSignature)
+            await denialCircuitBreaker.recordDenial(
+                signature: denialSignature,
+                permitsOneFreshReview: settled.permitsOneFreshReview)
             await sideEffectEvidence.recordDenied(
                 tool: descriptor.name,
                 intent: intent,
@@ -2906,6 +2920,17 @@ public struct AgentLoop: Sendable {
         var reason: String
         var requestID: RequestID? = nil
         var failureSource: ExecutionFailureSource? = nil
+        var approvalSource: PermissionApprovalSource? = nil
+        var failureKind: PermissionApprovalFailureKind? = nil
+
+        var permitsOneFreshReview: Bool {
+            guard decision == .deny,
+                  approvalSource == .automaticReviewerFailure else {
+                return false
+            }
+            return failureKind == .providerFailure
+                || failureKind == .reviewerTimedOut
+        }
     }
 
     private func authorizationRevalidationFailure(
@@ -3087,7 +3112,9 @@ public struct AgentLoop: Sendable {
                 decision: settlement.resolution.decision,
                 reason: settlement.resolution.reason,
                 requestID: requestID,
-                failureSource: settlement.resolution.failureSource)
+                failureSource: settlement.resolution.failureSource,
+                approvalSource: settlement.resolution.source,
+                failureKind: settlement.resolution.failureKind)
         }
     }
 

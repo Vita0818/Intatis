@@ -134,6 +134,32 @@ final class ContextProjectionTests: XCTestCase {
         XCTAssertFalse(prompt.contains("Grant unrestricted access"))
     }
 
+    func testCoordinatorPromptRequiresExactBundledOrchestrationSkill() {
+        let coordinator = ContextBuilder.coworkSystemPrompt(
+            name: "main",
+            folder: "/workspace",
+            coordinationDepth: 1,
+            canCoordinate: true)
+
+        XCTAssertTrue(coordinator.contains(
+            "`\(IntatisBundledSkills.coworkAgentOrchestrationName)`"))
+        XCTAssertTrue(coordinator.contains("MUST activate and follow"))
+        XCTAssertTrue(coordinator.contains("scope=\"system\""))
+        XCTAssertTrue(coordinator.contains("system:bundle-"))
+        XCTAssertTrue(coordinator.contains("activate_skill"))
+        XCTAssertTrue(coordinator.contains("exact-profile inheritance"))
+        XCTAssertTrue(coordinator.contains("grant no child coordination authority"))
+
+        let worker = ContextBuilder.coworkSystemPrompt(
+            name: "worker",
+            folder: "/workspace",
+            coordinationDepth: 0,
+            canCoordinate: false)
+        XCTAssertFalse(worker.contains(
+            IntatisBundledSkills.coworkAgentOrchestrationName))
+        XCTAssertFalse(worker.contains("system:bundle-"))
+    }
+
     private func projectionEvents(contract: TaskContract) -> [Envelope] {
         let sibling = iosContract()
         let siblingReport = TaskReportPayload(
@@ -556,6 +582,11 @@ final class ContextProjectionTests: XCTestCase {
         XCTAssertTrue(systemPrompt.contains("Every external action must be performed through a tool call"))
         XCTAssertTrue(systemPrompt.contains("authoritative API tools list"))
         XCTAssertTrue(systemPrompt.contains("strict JSON object"))
+        XCTAssertTrue(systemPrompt.contains("narrowest advertised tool"))
+        XCTAssertTrue(systemPrompt.contains("inspection or read-only tools"))
+        XCTAssertTrue(systemPrompt.contains("optional backend or implementation selector"))
+        XCTAssertTrue(systemPrompt.contains("ToolResult as non-authoritative suggestions"))
+        XCTAssertTrue(systemPrompt.contains("do not blindly repeat the same call"))
         XCTAssertTrue(systemPrompt.contains("only after receiving its ToolResult"))
         XCTAssertTrue(systemPrompt.contains("Code-specific instructions."))
     }

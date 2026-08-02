@@ -41,6 +41,19 @@ public struct ResolvedAgentRuntimeRoute: Sendable {
     }
 }
 
+/// One atomically resolved Chat route. Provider-hosted search may use a
+/// separately configured endpoint/model, while ordinary turns keep using the
+/// visible Chat selection.
+public struct ResolvedChatRuntimeRoute: Sendable {
+    public let provider: ChatProvider
+    public let model: ModelID
+
+    public init(provider: ChatProvider, model: ModelID) {
+        self.provider = provider
+        self.model = model
+    }
+}
+
 /// Resolves a `ModelRef` to a concrete provider for a capability. v0.1 only
 /// resolves `.chat`; the `switch endpoint.wire` is where new dialects plug in
 /// (ARCHITECTURE.md §3.3, §9.2). Secrets are fetched lazily via the injected
@@ -78,6 +91,19 @@ public actor ProviderRegistry {
     /// Convenience: the default chat provider from `models.chat`.
     public func defaultChatProvider() async throws -> ChatProvider {
         try await chatProvider(for: config.models.chat)
+    }
+
+    /// Resolves the transparent hosted-search provider and model as one
+    /// actor-isolated operation. A missing search binding deliberately falls
+    /// back to the ordinary Chat route; an invalid configured binding fails
+    /// instead of silently changing providers.
+    public func hostedSearchChatRuntimeRoute() async throws
+        -> ResolvedChatRuntimeRoute
+    {
+        let ref = config.models.webSearch ?? config.models.chat
+        return ResolvedChatRuntimeRoute(
+            provider: try await chatProvider(for: ref),
+            model: ref.model)
     }
 
     /// Runs a minimal model-backed request and returns a user-facing diagnostic

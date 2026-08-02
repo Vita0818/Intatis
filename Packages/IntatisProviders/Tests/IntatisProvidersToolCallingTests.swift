@@ -487,6 +487,90 @@ final class IntatisProvidersToolCallingTests: XCTestCase {
         XCTAssertEqual(http.attemptCount, 2)
     }
 
+    func testToolCallingStreamingRetriesRetryableErrorOnlySSEBeforeAcceptedPayload() async throws {
+        let errorSSE = #"""
+        data: {"error":{"message":"Network connection lost","code":502}}
+
+        """#
+        let recoveredSSE = #"""
+        data: {"choices":[{"delta":{"content":"Recovered"}}]}
+
+        data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+
+        """#
+        let http = SequencedToolHTTP(attempts: [
+            ToolStreamAttempt(chunks: [Data(errorSSE.utf8)], error: nil),
+            ToolStreamAttempt(chunks: [Data(recoveredSSE.utf8)], error: nil),
+        ])
+        let provider = OpenAIWireProvider(
+            endpoint: endpoint,
+            apiKey: "k",
+            http: http,
+            runtimePolicy: ProviderRuntimePolicy(maxAttempts: 2,
+                                                 requestTimeoutSeconds: 1,
+                                                 initialRetryDelaySeconds: 0,
+                                                 maxRetryDelaySeconds: 0))
+
+        var text = ""
+        var doneCount = 0
+        for try await chunk in provider.stream(AgentRequest(model: ModelID(rawValue: "m"),
+                                                            messages: [.user("hi")],
+                                                            tools: [])) {
+            switch chunk {
+            case .textDelta(let delta):
+                text += delta
+            case .done:
+                doneCount += 1
+            case .toolCalls, .usage:
+                break
+            }
+        }
+
+        XCTAssertEqual(text, "Recovered")
+        XCTAssertEqual(doneCount, 1)
+        XCTAssertEqual(http.attemptCount, 2)
+    }
+
+    func testToolCallingStreamingDoesNotRetryErrorAfterAcceptedPayload() async throws {
+        let partialThenErrorSSE = #"""
+        data: {"choices":[{"delta":{"content":"Partial"}}]}
+
+        data: {"error":{"message":"Network connection lost","code":502}}
+
+        """#
+        let http = SequencedToolHTTP(attempts: [
+            ToolStreamAttempt(chunks: [Data(partialThenErrorSSE.utf8)], error: nil),
+            ToolStreamAttempt(
+                chunks: [Data("data: [DONE]\n\n".utf8)],
+                error: nil),
+        ])
+        let provider = OpenAIWireProvider(
+            endpoint: endpoint,
+            apiKey: "k",
+            http: http,
+            runtimePolicy: ProviderRuntimePolicy(maxAttempts: 2,
+                                                 requestTimeoutSeconds: 1,
+                                                 initialRetryDelaySeconds: 0,
+                                                 maxRetryDelaySeconds: 0))
+
+        var text = ""
+        do {
+            for try await chunk in provider.stream(AgentRequest(model: ModelID(rawValue: "m"),
+                                                                messages: [.user("hi")],
+                                                                tools: [])) {
+                if case .textDelta(let delta) = chunk {
+                    text += delta
+                }
+            }
+            XCTFail("A provider error after accepted output must fail without replaying the request.")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("Network connection lost"))
+        }
+
+        XCTAssertEqual(text, "Partial")
+        XCTAssertEqual(http.attemptCount, 1)
+    }
+
     func testToolCallingStreamingThrowsProviderErrorPayload() async throws {
         let sse = #"""
         data: {"error":{"message":"tool schema rejected","type":"invalid_request_error","code":"bad_tool_schema"}}

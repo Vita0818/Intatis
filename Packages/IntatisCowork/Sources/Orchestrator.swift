@@ -80,6 +80,25 @@ public enum AgentInferenceRebindResult: Equatable, Sendable {
     case failed(String)
 }
 
+/// Secret-free, host-projected routing facts for one selectable inference
+/// profile. This metadata is intentionally ephemeral: exact bindings remain
+/// the durable authorization identity, while declared capabilities are used
+/// only to help a coordinator choose an adequate child profile.
+public struct InferenceProfileRoutingMetadata: Equatable, Sendable {
+    public let inferenceProfileID: InferenceProfileID
+    public let declaredCapabilities: [Capability]
+
+    public init(
+        inferenceProfileID: InferenceProfileID,
+        declaredCapabilities: [Capability]
+    ) {
+        self.inferenceProfileID = inferenceProfileID
+        let declared = Set(declaredCapabilities)
+        self.declaredCapabilities = Capability.allCases.filter(
+            declared.contains)
+    }
+}
+
 public struct CoworkExecutionPolicy: Equatable, Sendable {
     public var maxConcurrentTasks: Int
     public var taskTimeoutSeconds: Double
@@ -357,6 +376,10 @@ public actor Orchestrator {
     /// Host-approved profiles that model-authored spawn requests may select.
     /// Existing agents/tasks always retain their exact binding revision.
     private var availableInferenceProfiles: [InferenceProfileID: AgentInferenceBinding]
+    /// Safe, configuration-declared capabilities for the current host catalog.
+    /// Missing metadata is never inferred from a vendor or model name.
+    private var availableInferenceProfileRoutingMetadata:
+        [InferenceProfileID: InferenceProfileRoutingMetadata]
     private let requiresInferenceBindings: Bool
     /// Shipping per-agent runtimes resolve one atomic route tuple. The
     /// Orchestrator, rather than each app, validates that tuple against the
@@ -397,6 +420,7 @@ public actor Orchestrator {
         taskGraphPolicy: TaskGraphPolicy = .default,
         skillRootAccess: SkillRootAccess = .workspaceOnly,
         availableInferenceProfiles: [AgentInferenceBinding] = [],
+        inferenceProfileRoutingMetadata: [InferenceProfileRoutingMetadata] = [],
         requiresInferenceBindings: Bool = false,
         imageGeneratorFor: @escaping @Sendable (Agent) async -> ImageGenerationToolService? = { _ in nil },
         toolSnapshotProvider:
@@ -422,6 +446,7 @@ public actor Orchestrator {
             taskGraphPolicy: taskGraphPolicy,
             skillRootAccess: skillRootAccess,
             availableInferenceProfiles: availableInferenceProfiles,
+            inferenceProfileRoutingMetadata: inferenceProfileRoutingMetadata,
             requiresInferenceBindings: requiresInferenceBindings,
             imageGeneratorFor: imageGeneratorFor,
             toolSnapshotProvider:
@@ -448,6 +473,7 @@ public actor Orchestrator {
         taskGraphPolicy: TaskGraphPolicy = .default,
         skillRootAccess: SkillRootAccess = .workspaceOnly,
         availableInferenceProfiles: [AgentInferenceBinding] = [],
+        inferenceProfileRoutingMetadata: [InferenceProfileRoutingMetadata] = [],
         requiresInferenceBindings: Bool = true,
         imageGeneratorFor: @escaping @Sendable (Agent) async -> ImageGenerationToolService? = { _ in nil },
         toolSnapshotProvider:
@@ -469,6 +495,7 @@ public actor Orchestrator {
             taskGraphPolicy: taskGraphPolicy,
             skillRootAccess: skillRootAccess,
             availableInferenceProfiles: availableInferenceProfiles,
+            inferenceProfileRoutingMetadata: inferenceProfileRoutingMetadata,
             requiresInferenceBindings: requiresInferenceBindings,
             imageGeneratorFor: imageGeneratorFor,
             toolSnapshotProvider:
@@ -496,6 +523,7 @@ public actor Orchestrator {
                 taskGraphPolicy: TaskGraphPolicy = .default,
                 skillRootAccess: SkillRootAccess = .workspaceOnly,
                 availableInferenceProfiles: [AgentInferenceBinding] = [],
+                inferenceProfileRoutingMetadata: [InferenceProfileRoutingMetadata] = [],
                 requiresInferenceBindings: Bool = false,
                 imageGeneratorFor: @escaping @Sendable (Agent) async -> ImageGenerationToolService? = { _ in nil },
                 toolSnapshotProvider:
@@ -550,8 +578,19 @@ public actor Orchestrator {
         self.reasoningEffort = reasoningEffort
         self.includeUsage = includeUsage || executionPolicy.tokenBudget != nil
         self.maxSteps = maxSteps
-        self.availableInferenceProfiles = Dictionary(
+        let approvedInferenceProfiles = Dictionary(
             availableInferenceProfiles.map { ($0.inferenceProfileID, $0) },
+            uniquingKeysWith: { _, newest in newest })
+        self.availableInferenceProfiles = approvedInferenceProfiles
+        self.availableInferenceProfileRoutingMetadata = Dictionary(
+            inferenceProfileRoutingMetadata.compactMap { metadata in
+                guard approvedInferenceProfiles[
+                    metadata.inferenceProfileID
+                ] != nil else {
+                    return nil
+                }
+                return (metadata.inferenceProfileID, metadata)
+            },
             uniquingKeysWith: { _, newest in newest })
         self.requiresInferenceBindings = requiresInferenceBindings
         self.resolvedInferenceFor = resolvedInferenceFor
@@ -1813,6 +1852,7 @@ public actor Orchestrator {
     /// and are deliberately not rewritten.
     public func updateAvailableInferenceProfiles(
         _ profiles: [AgentInferenceBinding],
+        routingMetadata: [InferenceProfileRoutingMetadata] = [],
         hostAuthorized: Bool
     ) async {
         guard hostAuthorized else { return }
@@ -1820,6 +1860,16 @@ public actor Orchestrator {
         defer { releaseAdmissionLock() }
         availableInferenceProfiles = Dictionary(
             profiles.map { ($0.inferenceProfileID, $0) },
+            uniquingKeysWith: { _, newest in newest })
+        availableInferenceProfileRoutingMetadata = Dictionary(
+            routingMetadata.compactMap { metadata in
+                guard availableInferenceProfiles[
+                    metadata.inferenceProfileID
+                ] != nil else {
+                    return nil
+                }
+                return (metadata.inferenceProfileID, metadata)
+            },
             uniquingKeysWith: { _, newest in newest })
     }
 
@@ -2476,7 +2526,7 @@ public actor Orchestrator {
                     message: "@\(agent.name.rawValue): \(error.localizedDescription)")))
             }
         }
-        await upgradeMainRenameCapabilityIfNeeded(
+        await upgradeMainControlCapabilitiesIfNeeded(
             referencedLeaseIDs: allReferencedCapabilityLeaseIDs)
         spawnedAgentOwners = projection.agentOwners.filter { registry.agent($0.key) != nil }
 
@@ -6463,7 +6513,13 @@ public actor Orchestrator {
         return profiles.map { binding in
             let label = binding.safeRouteLabel ?? binding.inferenceProfileID.rawValue
             let variant = binding.variantID.map { " · variant \($0)" } ?? ""
-            return "\(binding.inferenceProfileID.rawValue) · \(label) · model \(binding.modelID.rawValue)\(variant)"
+            let capabilities = availableInferenceProfileRoutingMetadata[
+                binding.inferenceProfileID
+            ]?.declaredCapabilities.map(\.rawValue) ?? []
+            let capabilitySummary = capabilities.isEmpty
+                ? " · capabilities unspecified"
+                : " · capabilities \(capabilities.joined(separator: ","))"
+            return "\(binding.inferenceProfileID.rawValue) · \(label) · model \(binding.modelID.rawValue)\(variant)\(capabilitySummary)"
         }.joined(separator: "\n")
     }
 
@@ -6588,7 +6644,8 @@ public actor Orchestrator {
             orchestrator: self,
             explicitGoalIntent: explicitGoalIntent,
             canCreate: capabilityLease.tools.contains(.createGoal),
-            canSubmitVerdict: capabilityLease.tools.contains(.submitGoalVerdict))
+            canSubmitVerdict: agent.name == Self.mainAgentID
+                && capabilityLease.tools.contains(.submitGoalVerdict))
         let skillSnapshot: SkillSnapshot?
         if let workspaceLease {
             let canonicalWorkspace =
@@ -7515,7 +7572,7 @@ public actor Orchestrator {
     ) -> [AgentID: CapabilityLeaseID] {
         var result: [AgentID: CapabilityLeaseID] = [:]
         let candidates = projection.capabilityLeaseAgents.compactMap {
-            leaseID, agent -> (agent: AgentID, leaseID: CapabilityLeaseID, supportsRename: Bool)? in
+            leaseID, agent -> (agent: AgentID, leaseID: CapabilityLeaseID, mainControlScore: Int)? in
             guard agent != Self.automaticPermissionReviewerID,
                   let lease = projection.capabilityLeases[leaseID],
                   lease.taskID == nil,
@@ -7524,12 +7581,17 @@ public actor Orchestrator {
             return (
                 agent: agent,
                 leaseID: leaseID,
-                supportsRename: lease.tools.contains(.renameSession))
+                mainControlScore: [
+                    ToolCapability.renameSession,
+                    ToolCapability.submitGoalVerdict,
+                ].reduce(into: 0) { score, capability in
+                    if lease.tools.contains(capability) { score += 1 }
+                })
         }.sorted {
             if $0.agent == $1.agent {
                 if $0.agent == Self.mainAgentID,
-                   $0.supportsRename != $1.supportsRename {
-                    return $0.supportsRename
+                   $0.mainControlScore != $1.mainControlScore {
+                    return $0.mainControlScore > $1.mainControlScore
                 }
                 return $0.leaseID.rawValue < $1.leaseID.rawValue
             }
@@ -7542,23 +7604,27 @@ public actor Orchestrator {
     }
 
     /// Old sessions can contain a perfectly valid @main default lease created
-    /// before `rename_session` existed. Upgrade that durable default without
-    /// mutating its historical grant in place. Leases referenced by any task
+    /// before current main-only session/Goal controls existed. Upgrade that
+    /// durable default without mutating its historical grant in place. Leases referenced by any task
     /// remain available to that frozen contract; an unreferenced default is
     /// revoked and replaced atomically.
-    private func upgradeMainRenameCapabilityIfNeeded(
+    private func upgradeMainControlCapabilitiesIfNeeded(
         referencedLeaseIDs: Set<CapabilityLeaseID>
     ) async {
+        let requiredCapabilities: Set<ToolCapability> = [
+            .renameSession,
+            .submitGoalVerdict,
+        ]
         guard registry.agent(Self.mainAgentID) != nil,
               let oldID = defaultCapabilityLeaseIDs[Self.mainAgentID],
               let oldLease = capabilityLeases[oldID],
               oldLease.taskID == nil,
-              !oldLease.tools.contains(.renameSession) else { return }
+              !requiredCapabilities.isSubset(of: oldLease.tools) else { return }
 
         var upgraded = oldLease
         upgraded.id = CapabilityLeaseID.new()
         upgraded.taskID = nil
-        upgraded.tools.insert(.renameSession)
+        upgraded.tools.formUnion(requiredCapabilities)
         upgraded.expiresAtTaskCompletion = false
         let revokeOld = !referencedLeaseIDs.contains(oldID)
         var events: [Event] = []
@@ -7566,7 +7632,7 @@ public actor Orchestrator {
             events.append(.capabilityLeaseRevoked(CapabilityLeaseRevokedPayload(
                 agent: Self.mainAgentID,
                 leaseID: oldID,
-                reason: "replace legacy @main default with rename_session capability",
+                reason: "replace legacy @main default with current main-only control capabilities",
                 metadata: CoworkEventMetadata(
                     agentID: Self.mainAgentID,
                     capabilityLeaseID: oldID,
@@ -7584,7 +7650,7 @@ public actor Orchestrator {
             try await appendAdmissionEvents(events)
         } catch {
             try? await log.append(.error(ErrorPayload(
-                code: "restore_main_rename_capability_upgrade_failed",
+                code: "restore_main_control_capability_upgrade_failed",
                 message: error.localizedDescription)))
             return
         }
@@ -7708,6 +7774,7 @@ public actor Orchestrator {
             ?? CapabilityLease.worker(taskID: taskID, workspaceAccess: workspaceAccess)
         if assignee.name != Self.mainAgentID {
             capabilityLease.tools.remove(.createGoal)
+            capabilityLease.tools.remove(.submitGoalVerdict)
             capabilityLease.tools.remove(.renameSession)
         }
         capabilityLease.id = CapabilityLeaseID.new()
@@ -7766,8 +7833,10 @@ public actor Orchestrator {
             : .worker(workspaceAccess: grantWorkerWriteCapabilities ? workspaceAccess : .readOnly)
         if agent.name == Self.mainAgentID {
             capabilityLease.tools.insert(.renameSession)
+            capabilityLease.tools.insert(.submitGoalVerdict)
         } else {
             capabilityLease.tools.remove(.createGoal)
+            capabilityLease.tools.remove(.submitGoalVerdict)
             capabilityLease.tools.remove(.renameSession)
         }
         capabilityLease.expiresAtTaskCompletion = false
@@ -7798,6 +7867,7 @@ public actor Orchestrator {
                 workspaceAccess: workspaceAccess == .readWrite ? .readWrite : .readOnly)
         var tools = baseline.tools.intersection(parentCapabilityLease.tools)
         tools.remove(.createGoal)
+        tools.remove(.submitGoalVerdict)
         tools.remove(.renameSession)
 
         let communication: CommunicationGrant
@@ -7916,6 +7986,7 @@ public actor Orchestrator {
         guard agentID != mainAgentID else { return lease }
         var scoped = lease
         scoped.tools.remove(.createGoal)
+        scoped.tools.remove(.submitGoalVerdict)
         scoped.tools.remove(.renameSession)
         return scoped
     }
@@ -9533,6 +9604,9 @@ public actor Orchestrator {
         if lease.tools.contains(.readPDF) {
             register([ReadPDFTool()], granting: [.readPDF])
         }
+        if lease.tools.contains(.readDocument) {
+            register([ReadDocumentTool()], granting: [.readDocument])
+        }
         if lease.tools.contains(.listWorkspace) {
             register([ListFilesTool()], granting: [.listWorkspace])
         }
@@ -9617,7 +9691,11 @@ public actor Orchestrator {
         if lease.tools.contains(.createGoal) {
             register([CreateGoalTool()], granting: [.createGoal])
         }
-        if lease.tools.contains(.submitGoalVerdict) {
+        // Production invocations always supply an identity, so the terminal
+        // Goal control is exposed only to exact @main. `nil` remains a narrow
+        // construction seam for the isolated verifier/tool-registry tests.
+        if (agentID == nil || agentID == mainAgentID),
+           lease.tools.contains(.submitGoalVerdict) {
             register([UpdateGoalTool()], granting: [.submitGoalVerdict])
         }
         if agentID == mainAgentID, lease.tools.contains(.renameSession) {
@@ -9713,6 +9791,7 @@ public actor Orchestrator {
     private static func hasWorkspaceMutationCapability(_ lease: CapabilityLease) -> Bool {
         !lease.tools.isDisjoint(with: [
             .applyPatch,
+            .readDocument,
             .editPDF,
             .reconstructDocument,
             .compileLaTeX,

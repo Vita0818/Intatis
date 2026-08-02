@@ -381,6 +381,69 @@ final class IntatisConversationCodeTests: XCTestCase {
         XCTAssertEqual(item?.goal, "ship v0.12")
     }
 
+    func testCodeProjectionPresentsAgentCommunicationWithDirectionalIdentity() {
+        let session = SessionID(rawValue: "agent_communication_presentation")
+        let main = AgentID(rawValue: "main")
+        let worker = AgentID(rawValue: "researcher")
+        let requestID = MessageID(rawValue: "request")
+        func env(_ seq: Int, _ event: Event) -> Envelope {
+            Envelope(
+                seq: seq,
+                ts: Date(timeIntervalSince1970: Double(seq)),
+                session: session,
+                event: event)
+        }
+
+        let items = CodeProjection.build(from: [
+            env(1, .agentMessage(.init(
+                from: main,
+                to: worker,
+                content: "Please inspect the workspace.",
+                kind: .sendMessage,
+                messageId: MessageID(rawValue: "message")))),
+            env(2, .agentToAgentMessage(.init(
+                from: worker,
+                to: main,
+                content: "Inspection complete.",
+                mediated: true))),
+            env(3, .informationRequested(.init(
+                requestID: requestID,
+                from: main,
+                to: worker,
+                question: "Which files changed?",
+                mediated: true))),
+            env(4, .informationReplied(.init(
+                replyID: MessageID(rawValue: "reply"),
+                inReplyTo: requestID,
+                from: worker,
+                to: main,
+                content: "Two Swift files changed.",
+                mediated: true))),
+        ]).items
+
+        XCTAssertEqual(items.map(\.kind), [
+            .agent,
+            .agentToAgent,
+            .agentToAgent,
+            .agentToAgent,
+        ])
+        XCTAssertEqual(items.map(\.title), [
+            "main->researcher",
+            "researcher->main",
+            "main->researcher",
+            "researcher->main",
+        ])
+        XCTAssertEqual(items.map(\.body), [
+            "Please inspect the workspace.",
+            "Inspection complete.",
+            "Which files changed?",
+            "Two Swift files changed.",
+        ])
+        XCTAssertEqual(
+            items.map(\.timestamp),
+            (1...4).map { Date(timeIntervalSince1970: Double($0)) })
+    }
+
     func testCodeProjectionUsesStableItemIDsAcrossReplay() {
         let s = SessionID(rawValue: "stable")
         func env(_ seq: Int, _ e: Event) -> Envelope {

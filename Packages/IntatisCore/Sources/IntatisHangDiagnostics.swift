@@ -1145,7 +1145,35 @@ public enum IntatisHangDiagnosticTextSanitizer {
             in: value,
             with: "[REDACTED]")
         value = replacing(
+            pattern: #"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b"#,
+            in: value,
+            with: "[REDACTED_EMAIL]")
+        value = replacing(
+            pattern: #"\bgh[pousr]_[A-Za-z0-9]{20,}\b"#,
+            in: value,
+            with: "[REDACTED]")
+        value = replacing(
+            pattern: #"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"#,
+            in: value,
+            with: "[REDACTED]")
+        value = replacing(
+            pattern: #"\bAKIA[0-9A-Z]{16}\b"#,
+            in: value,
+            with: "[REDACTED]")
+        value = replacing(
+            pattern: #"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"#,
+            in: value,
+            with: "[REDACTED]")
+        value = replacing(
+            pattern: #"(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----"#,
+            in: value,
+            with: "[REDACTED_PRIVATE_KEY]")
+        value = replacing(
             pattern: #"/Users/[^\s\)\]\}]+"#,
+            in: value,
+            with: "[REDACTED_PATH]")
+        value = replacing(
+            pattern: #"/Volumes/[^\n\r]+"#,
             in: value,
             with: "[REDACTED_PATH]")
         value = replacing(

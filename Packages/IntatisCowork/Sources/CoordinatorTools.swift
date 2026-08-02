@@ -181,7 +181,7 @@ public struct ListInferenceProfilesTool: Tool {
 
     public static let descriptor = ToolDescriptor(
         name: "list_inference_profiles",
-        description: "List host-approved inference profile IDs, safe labels, models, and variants for a new child agent. Recommended default: omit inference_profile_id in spawn_agent to inherit your exact revision; choose another profile only when its label/model/variant clearly fits the delegated work.",
+        description: "List host-approved inference profile IDs, safe labels, models, variants, and configuration-declared capabilities for a new child agent. Capabilities are authoritative routing requirements when present; never infer a missing capability from a model name. Recommended default: omit inference_profile_id in spawn_agent to inherit your exact revision; choose another profile only when the listed facts clearly fit the delegated work.",
         sideEffect: .readOnly,
         parameters: .object([
             "type": .string("object"),

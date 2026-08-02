@@ -307,6 +307,7 @@ public struct SkillDiscoveryConfiguration: Equatable, Sendable {
             access: access,
             homeDirectory: home,
             codexHome: codexHome,
+            bundledRoots: IntatisBundledSkills.discoveryRoots,
             adminRoots: [
                 URL(
                     fileURLWithPath: "/etc/codex/skills",

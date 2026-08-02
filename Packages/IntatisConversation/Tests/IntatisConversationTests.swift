@@ -15,6 +15,40 @@ private struct MockProvider: ChatProvider {
     }
 }
 
+private actor ChatRequestRecorder {
+    private var value: ChatRequest?
+
+    func record(_ request: ChatRequest) {
+        value = request
+    }
+
+    func recorded() -> ChatRequest? {
+        value
+    }
+}
+
+private struct SearchCitationProvider: ChatProvider {
+    let recorder: ChatRequestRecorder
+
+    func stream(_ request: ChatRequest) -> AsyncThrowingStream<ChatChunk, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                await recorder.record(request)
+                continuation.yield(.delta("Current answer"))
+                continuation.yield(.citation(MessageCitation(
+                    url: "https://example.com/current",
+                    title: "Current source")))
+                continuation.yield(.citation(MessageCitation(
+                    url: "https://example.com/current",
+                    title: "Duplicate source")))
+                continuation.yield(.done)
+                continuation.finish()
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+}
+
 private struct PartialThenFailingProvider: ChatProvider {
     func stream(_ request: ChatRequest) -> AsyncThrowingStream<ChatChunk, Error> {
         AsyncThrowingStream { continuation in
@@ -684,6 +718,41 @@ final class IntatisConversationTests: XCTestCase {
         }
         XCTAssertEqual(outcomes.count, 1)
         XCTAssertEqual(outcomes.first?.outcome, .completed)
+    }
+
+    func testChatLoopPassesWebSearchAndPersistsDeduplicatedCitations() async throws {
+        let url = tmpFile()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let log = try EventLog(
+            session: SessionID(rawValue: "sess_web_search"),
+            fileURL: url)
+        let recorder = ChatRequestRecorder()
+        let loop = ChatLoop(
+            log: log,
+            provider: SearchCitationProvider(recorder: recorder),
+            model: ModelID(rawValue: "m"),
+            webSearch: ChatWebSearchConfiguration(contextSize: .high))
+
+        try await loop.send("what is current?")
+
+        let request = await recorder.recorded()
+        XCTAssertEqual(request?.webSearch,
+                       ChatWebSearchConfiguration(contextSize: .high))
+        let replayed = await log.replay()
+        let completed = try XCTUnwrap(replayed.compactMap { envelope -> MessageCompletedPayload? in
+            guard case .messageCompleted(let payload) = envelope.event else {
+                return nil
+            }
+            return payload
+        }.last)
+        XCTAssertEqual(completed.citations, [
+            MessageCitation(
+                url: "https://example.com/current",
+                title: "Current source"),
+        ])
+        let projection = ConversationProjection.build(from: replayed)
+        XCTAssertEqual(projection.messages.last?.citations,
+                       completed.citations ?? [])
     }
 
     func testChatLoopPreservesPartialTextWhenStreamEndsWithoutCompletionMarker() async throws {

@@ -95,7 +95,11 @@ public final class ConfigSecretResolver: SecretResolver, @unchecked Sendable {
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(),
             withIntermediateDirectories: true)
+        #if os(iOS)
+        try data.write(to: url, options: [.atomic, .completeFileProtection])
+        #else
         try data.write(to: url, options: .atomic)
+        #endif
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
     }
 

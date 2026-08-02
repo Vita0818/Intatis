@@ -32,7 +32,10 @@ final class SubmissionProtocolTests: XCTestCase {
                 messageId: MessageID(rawValue: "msg_one"),
                 role: .assistant,
                 text: "complete",
-                submissionID: submissionID)),
+                submissionID: submissionID,
+                citations: [MessageCitation(
+                    url: "https://example.com/source",
+                    title: "Example source")])),
             .error(ErrorPayload(
                 code: "provider_unavailable",
                 message: "Provider unavailable",
@@ -88,6 +91,7 @@ final class SubmissionProtocolTests: XCTestCase {
         XCTAssertNil(user.submissionID)
         XCTAssertNil(delta.submissionID)
         XCTAssertNil(completed.submissionID)
+        XCTAssertNil(completed.citations)
         XCTAssertNil(error.submissionID)
     }
 }

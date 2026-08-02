@@ -816,7 +816,10 @@ final class IntatisCoworkTests: XCTestCase {
                 .contains("list_inference_profiles"))
         XCTAssertTrue(
             ListInferenceProfilesTool.descriptor.description
-                .contains("label/model/variant"))
+                .contains("configuration-declared capabilities"))
+        XCTAssertTrue(
+            ListInferenceProfilesTool.descriptor.description
+                .contains("never infer a missing capability"))
     }
 
     func testSpawnAgentIntentIsControlPlaneAndDefaultsToReadOnly() throws {

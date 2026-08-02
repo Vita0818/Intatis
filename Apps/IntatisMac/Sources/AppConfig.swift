@@ -199,6 +199,9 @@ struct AppProviderSettings: Identifiable, Codable, Equatable {
     var npm: String
     var baseURL: String
     var chatEndpoint: String
+    /// Optional Responses API override used by provider-hosted Chat search.
+    /// It is configuration-only and is not exposed as a Settings control.
+    var responsesEndpoint: String?
     var apiKeyAccount: String
     var apiKeySource: AppProviderAPIKeySource?
     var models: [AppProviderModel]
@@ -209,6 +212,7 @@ struct AppProviderSettings: Identifiable, Codable, Equatable {
              .openAICompatible.rawValue,
          baseURL: String,
          chatEndpoint: String? = nil,
+         responsesEndpoint: String? = nil,
          apiKeyAccount: String,
          apiKeySource: AppProviderAPIKeySource? = nil,
          models: [AppProviderModel]) {
@@ -218,6 +222,7 @@ struct AppProviderSettings: Identifiable, Codable, Equatable {
             .configuredProvider(npm).rawValue
         self.baseURL = baseURL
         self.chatEndpoint = chatEndpoint ?? AppConfig.chatEndpoint(forBaseURL: baseURL)
+        self.responsesEndpoint = responsesEndpoint
         self.apiKeyAccount = apiKeyAccount
         self.apiKeySource = apiKeySource
         self.models = models
@@ -229,6 +234,7 @@ struct AppProviderSettings: Identifiable, Codable, Equatable {
         case npm
         case baseURL
         case chatEndpoint
+        case responsesEndpoint
         case apiKeyAccount
         case apiKeySource
         case models
@@ -246,6 +252,9 @@ struct AppProviderSettings: Identifiable, Codable, Equatable {
         self.baseURL = baseURL
         self.chatEndpoint = try container.decodeIfPresent(String.self, forKey: .chatEndpoint)
             ?? AppConfig.chatEndpoint(forBaseURL: baseURL)
+        self.responsesEndpoint = try container.decodeIfPresent(
+            String.self,
+            forKey: .responsesEndpoint)
         self.apiKeyAccount = try container.decodeIfPresent(String.self, forKey: .apiKeyAccount)
             ?? (self.id == "default" ? AppConfig.legacyAPIKeyAccount : "provider-\(self.id)")
         self.apiKeySource = try container.decodeIfPresent(AppProviderAPIKeySource.self, forKey: .apiKeySource)
@@ -267,6 +276,9 @@ struct AppProviderCatalog: Codable, Equatable {
     var selectedProviderID: String
     var selectedModelID: String
     var selectedVariantID: String? = nil
+    /// Optional background route loaded from `web_search_model`. It is not a
+    /// visible model selection and never changes the composer label.
+    var webSearchModel: ModelRef? = nil
     var providers: [AppProviderSettings]
 
     var selectedProvider: AppProviderSettings? {
@@ -509,6 +521,7 @@ enum AppConfig {
                 id: provider.id,
                 baseURL: URL(string: provider.baseURL) ?? URL(string: defaultBaseURL)!,
                 chatEndpoint: URL(string: provider.chatEndpoint),
+                responsesEndpoint: provider.responsesEndpoint.flatMap { URL(string: $0) },
                 apiKeyRef: apiKeyRef(for: provider),
                 wire: .openai,
                 requestAdapter:
@@ -524,7 +537,10 @@ enum AppConfig {
                     modelCapabilities(for: provider))
         }
         let chat = ModelRef(endpoint: selectedProvider.id, model: ModelID(rawValue: selectedModel.id))
-        var models = ResolvedModels(chat: chat, agent: chat)
+        var models = ResolvedModels(
+            chat: chat,
+            webSearch: catalog.webSearchModel,
+            agent: chat)
         // image + transcription default to the selected endpoint until dedicated
         // role-specific model settings exist.
         models.imageGen = ModelRef(endpoint: selectedProvider.id, model: ModelID(rawValue: "dall-e-3"))
@@ -574,6 +590,8 @@ enum AppConfig {
                 npm: provider.npm,
                 baseURL: baseURL,
                 chatEndpoint: chatEndpoint,
+                responsesEndpoint: provider.responsesEndpoint?
+                    .trimmingCharacters(in: .whitespacesAndNewlines),
                 apiKeyAccount: provider.apiKeyAccount.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                     ? legacyAPIKeyAccount(forProviderID: id)
                     : provider.apiKeyAccount.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -599,12 +617,37 @@ enum AppConfig {
         let selectedModel = selectedProvider.models.first { $0.id == selectedModelID }
         let selectedVariantID = selectedModel?.variants
             .first(where: { $0.id == catalog.selectedVariantID })?.id
+        let webSearchModel = normalizedBackgroundModelRef(
+            catalog.webSearchModel,
+            providers: providers)
 
         return AppProviderCatalog(
             selectedProviderID: selectedProviderID,
             selectedModelID: selectedModelID,
             selectedVariantID: selectedVariantID,
+            webSearchModel: webSearchModel,
             providers: providers)
+    }
+
+    private static func normalizedBackgroundModelRef(
+        _ ref: ModelRef?,
+        providers: [AppProviderSettings]
+    ) -> ModelRef? {
+        guard let ref else { return nil }
+        let endpoint = ref.endpoint.trimmingCharacters(
+            in: .whitespacesAndNewlines)
+        let model = ref.model.rawValue.trimmingCharacters(
+            in: .whitespacesAndNewlines)
+        guard !endpoint.isEmpty, !model.isEmpty else { return nil }
+        let actualEndpoint = providers.first { $0.id == endpoint }?.id
+            ?? providers.first {
+                normalizedProviderID($0.id)
+                    == normalizedProviderID(endpoint)
+            }?.id
+            ?? endpoint
+        return ModelRef(
+            endpoint: actualEndpoint,
+            model: ModelID(rawValue: model))
     }
 
     fileprivate static func variantSort(_ lhs: AppProviderModelVariant,
@@ -692,6 +735,7 @@ enum AppConfig {
             id: provider.id,
             baseURL: URL(string: provider.baseURL) ?? URL(string: defaultBaseURL)!,
             chatEndpoint: URL(string: provider.chatEndpoint),
+            responsesEndpoint: provider.responsesEndpoint.flatMap { URL(string: $0) },
             apiKeyRef: apiKeyRef(for: provider),
             wire: .openai,
             requestAdapter:
@@ -887,11 +931,13 @@ enum AppConfig {
         }
         let configData = jsonCompatibleData(from: data)
         let decoder = JSONDecoder()
-        if let direct = try? decoder.decode(AppProviderCatalog.self, from: configData) {
-            return direct
+        if let compatible = try? decoder.decode(
+            AppProviderConfigFile.self,
+            from: configData),
+           let catalog = compatible.catalog(configFileURL: url) {
+            return catalog
         }
-        return try? decoder.decode(AppProviderConfigFile.self, from: configData)
-            .catalog(configFileURL: url)
+        return try? decoder.decode(AppProviderCatalog.self, from: configData)
     }
 
     private static func existingConfigFileURL() -> URL? {
@@ -1013,6 +1059,10 @@ enum AppConfig {
         root["$schema"] = "https://opencode.ai/config.json"
         root["enabled_providers"] = catalog.providers.map(\.id)
         root["model"] = selectedOpenCodeModel(in: catalog)
+        if let webSearchModel = catalog.webSearchModel {
+            root["web_search_model"] =
+                "\(webSearchModel.endpoint)/\(webSearchModel.model.rawValue)"
+        }
 
         var providerMap = root["provider"] as? [String: Any] ?? [:]
         for provider in catalog.providers {
@@ -1028,6 +1078,11 @@ enum AppConfig {
                 options["chatEndpoint"] = chatEndpoint
             } else {
                 options.removeValue(forKey: "chatEndpoint")
+            }
+            if let responsesEndpoint = provider.responsesEndpoint?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+               !responsesEndpoint.isEmpty {
+                options["responsesEndpoint"] = responsesEndpoint
             }
             options["apiKey"] = apiKeyConfigValue(
                 for: provider,
@@ -1252,12 +1307,14 @@ private struct AppProviderConfigTemplate: Encodable {
     var schema = "https://opencode.ai/config.json"
     var enabledProviders: [String]
     var model: String
+    var webSearchModel: String?
     var provider: [String: AppProviderConfigTemplateProvider]
 
     enum CodingKeys: String, CodingKey {
         case schema = "$schema"
         case enabledProviders = "enabled_providers"
         case model
+        case webSearchModel = "web_search_model"
         case provider
     }
 
@@ -1273,6 +1330,9 @@ private struct AppProviderConfigTemplate: Encodable {
             self.model = "\(selectedProvider.id)/\(modelID)"
         } else {
             self.model = AppConfig.defaultModel
+        }
+        self.webSearchModel = catalog.webSearchModel.map {
+            "\($0.endpoint)/\($0.model.rawValue)"
         }
 
         self.provider = Dictionary(uniqueKeysWithValues: catalog.providers.map { provider in
@@ -1301,10 +1361,16 @@ private struct AppProviderConfigTemplateProvider: Encodable {
 
 private struct AppProviderConfigTemplateOptions: Encodable {
     var baseURL: String
+    var responsesEndpoint: String?
     var apiKey: String?
 
     init(provider: AppProviderSettings, apiKey: String?) {
         self.baseURL = provider.baseURL
+        let responsesEndpoint = provider.responsesEndpoint?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        self.responsesEndpoint = responsesEndpoint?.isEmpty == false
+            ? responsesEndpoint
+            : nil
         let trimmed = apiKey?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if !trimmed.isEmpty {
             self.apiKey = trimmed
@@ -1322,9 +1388,12 @@ private struct AppProviderConfigTemplateModel: Encodable {
 private struct AppProviderConfigFile: Decodable {
     var selectedProviderID: String?
     var selectedModelID: String?
+    var selectedVariantID: String?
     var model: String?
     var smallModel: String?
     var small_model: String?
+    var webSearchModel: String?
+    var web_search_model: String?
     var enabledProviders: [String]?
     var enabled_providers: [String]?
     var disabledProviders: [String]?
@@ -1339,6 +1408,9 @@ private struct AppProviderConfigFile: Decodable {
         let disabled = disabledProviders ?? disabled_providers
         let resolvedModel = resolvedConfigValue(model ?? smallModel ?? small_model,
                                                 configDirectory: configDirectory)
+        let resolvedWebSearchModel = resolvedConfigValue(
+            webSearchModel ?? web_search_model,
+            configDirectory: configDirectory)
         let split = splitModel(resolvedModel)
         if !entries.isEmpty {
             entries = entries.filter {
@@ -1390,10 +1462,54 @@ private struct AppProviderConfigFile: Decodable {
             ?? entries.first(where: { $0.id == selectedProvider })?.models.first?.id
             ?? entries[0].models.first?.id
             ?? AppConfig.defaultModel
+        let webSearchRef = backgroundModelRef(
+            resolvedWebSearchModel,
+            preferredProviderID: selectedProvider,
+            entries: &entries)
 
         return AppProviderCatalog(selectedProviderID: selectedProvider,
                                   selectedModelID: selectedModel,
+                                  selectedVariantID: selectedVariantID,
+                                  webSearchModel: webSearchRef,
                                   providers: entries)
+    }
+
+    private func backgroundModelRef(
+        _ raw: String?,
+        preferredProviderID: String,
+        entries: inout [AppProviderSettings]
+    ) -> ModelRef? {
+        guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty else {
+            return nil
+        }
+
+        let selection: (providerID: String, modelID: String)
+        if let exact = exactModelSelection(raw, in: entries) {
+            selection = exact
+        } else {
+            let split = splitModel(raw)
+            if let providerID = split.providerID,
+               let modelID = split.modelID {
+                selection = (providerID, modelID)
+            } else {
+                selection = (preferredProviderID, raw)
+            }
+        }
+
+        let endpointID = actualProviderID(
+            matching: selection.providerID,
+            in: entries) ?? selection.providerID
+        if let index = entries.firstIndex(where: { $0.id == endpointID }),
+           !entries[index].models.contains(where: { $0.id == selection.modelID }) {
+            entries[index].models.append(AppProviderModel(
+                id: selection.modelID,
+                displayName: AppConfig.defaultDisplayName(
+                    for: selection.modelID)))
+        }
+        return ModelRef(
+            endpoint: endpointID,
+            model: ModelID(rawValue: selection.modelID))
     }
 
     private func fallbackProviderSettings(id: String, modelID: String) -> AppProviderSettings? {
@@ -1478,6 +1594,7 @@ private struct AppProviderConfigFileProvider: Decodable {
     var displayName: String?
     var baseURL: String?
     var chatEndpoint: String?
+    var responsesEndpoint: String?
     var apiKey: String?
     var apiKeyAccount: String?
     var apiKeySource: AppProviderAPIKeySource?
@@ -1537,6 +1654,7 @@ private struct AppProviderConfigFileProvider: Decodable {
                 .configuredProvider(npm).rawValue,
             baseURL: base,
             chatEndpoint: options?.chatEndpoint ?? chatEndpoint,
+            responsesEndpoint: options?.responsesEndpoint ?? responsesEndpoint,
             apiKeyAccount: apiKeyAccount ?? (id == "default" ? AppConfig.legacyAPIKeyAccount : "provider-\(id)"),
             apiKeySource: source?.isLegacyKeychain == true ? nil : source,
             models: modelList.isEmpty
@@ -1549,6 +1667,7 @@ private struct AppProviderConfigFileOptions: Decodable {
     var apiKey: String?
     var baseURL: String?
     var chatEndpoint: String?
+    var responsesEndpoint: String?
     var apiKeySource: AppProviderAPIKeySource?
     var apiKeyEnv: String?
     var apiKeyFile: String?

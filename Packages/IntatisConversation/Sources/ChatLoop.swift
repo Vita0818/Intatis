@@ -17,16 +17,19 @@ public struct ChatLoop: Sendable {
     private let systemPrompt: String?
     private let reasoningEffort: ReasoningEffort?
     private let includeUsage: Bool
+    private let webSearch: ChatWebSearchConfiguration?
 
     public init(log: EventLog, provider: ChatProvider, model: ModelID,
                 systemPrompt: String? = nil, reasoningEffort: ReasoningEffort? = nil,
-                includeUsage: Bool = false) {
+                includeUsage: Bool = false,
+                webSearch: ChatWebSearchConfiguration? = nil) {
         self.log = log
         self.provider = provider
         self.model = model
         self.systemPrompt = systemPrompt
         self.reasoningEffort = reasoningEffort
         self.includeUsage = includeUsage
+        self.webSearch = webSearch
     }
 
     /// Send one user message and stream the assistant reply into the log.
@@ -48,9 +51,13 @@ public struct ChatLoop: Sendable {
         let start = Date()
         var firstTokenAt: Date?
         var usage: Usage?
+        var citations: [MessageCitation] = []
+        var citationURLs: Set<String> = []
         do {
             let request = ChatRequest(model: model, messages: messages,
-                                      reasoningEffort: reasoningEffort, includeUsage: includeUsage)
+                                      reasoningEffort: reasoningEffort,
+                                      includeUsage: includeUsage,
+                                      webSearch: webSearch)
             for try await chunk in provider.stream(request) {
                 switch chunk {
                 case .delta(let d):
@@ -58,6 +65,10 @@ public struct ChatLoop: Sendable {
                     full += d
                     try await log.append(.messageDelta(
                         MessageDeltaPayload(messageId: assistantID, role: .assistant, textDelta: d)))
+                case .citation(let citation):
+                    if citationURLs.insert(citation.url).inserted {
+                        citations.append(citation)
+                    }
                 case .usage(let u):
                     usage = Usage.merging(usage, with: u)
                 case .done:
@@ -69,7 +80,11 @@ public struct ChatLoop: Sendable {
             // partial assistant message.
             try Task.checkCancellation()
             try await log.append(.messageCompleted(
-                MessageCompletedPayload(messageId: assistantID, role: .assistant, text: full)))
+                MessageCompletedPayload(
+                    messageId: assistantID,
+                    role: .assistant,
+                    text: full,
+                    citations: citations)))
             await appendTurnStats(start: start, firstTokenAt: firstTokenAt, usage: usage)
             try Task.checkCancellation()
             try await log.append(.turnOutcome(TurnOutcomePayload(

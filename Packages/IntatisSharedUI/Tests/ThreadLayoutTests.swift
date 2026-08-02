@@ -191,6 +191,20 @@ final class ThreadLayoutTests: XCTestCase {
             980)
         XCTAssertLessThan(visible.threadWidth, 980)
 
+        let integratedCowork = IntatisWorkspaceInspectorLayoutPolicy.resolve(
+            availableWidth: 980,
+            isRequested: true,
+            activationWidth: 980,
+            minimumThreadWidth: 620,
+            minimumInspectorWidth: 286,
+            idealInspectorWidth: 318,
+            maximumInspectorWidth: 390,
+            dividerWidth: 0)
+        XCTAssertTrue(integratedCowork.isVisible)
+        XCTAssertEqual(
+            integratedCowork.threadWidth + integratedCowork.inspectorWidth,
+            980)
+
         for _ in 0..<10_000 {
             XCTAssertEqual(
                 IntatisWorkspaceInspectorLayoutPolicy.resolve(
@@ -259,6 +273,16 @@ final class ThreadLayoutTests: XCTestCase {
                 source.contains("IntatisWorkspaceInspectorLayoutPolicy.resolve("),
                 filename)
         }
+
+        let coworkSource = try String(
+            contentsOf: packageRoot
+                .appendingPathComponent("Sources/CoworkViews.swift"),
+            encoding: .utf8)
+        XCTAssertTrue(coworkSource.contains("ZStack(alignment: .trailing)"))
+        XCTAssertTrue(coworkSource.contains("dividerWidth: 0"))
+        XCTAssertTrue(coworkSource.contains("for: .scrollContent"))
+        XCTAssertTrue(coworkSource.contains("primaryScrollerClearance"))
+        XCTAssertTrue(coworkSource.contains(".allowsHitTesting(false)"))
 
         let repositoryRoot = packageRoot
             .deletingLastPathComponent()

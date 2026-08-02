@@ -161,12 +161,118 @@ final class IntatisProvidersTests: XCTestCase {
                                                            messages: [ChatMessage(role: .user, content: "hi")])) {
             switch chunk {
             case .delta(let d): text += d
+            case .citation: break
             case .usage: break
             case .done: sawDone = true
             }
         }
         XCTAssertEqual(text, "Hello")
         XCTAssertTrue(sawDone)
+    }
+
+    func testWebSearchUsesResponsesHostedToolRequest() async throws {
+        let sse = """
+        data: {"type":"response.completed","response":{"id":"resp_search"}}
+
+        """
+        let http = CapturingHTTP(chunks: [Data(sse.utf8)])
+        let provider = OpenAIWireProvider(
+            endpoint: openAIEndpoint,
+            apiKey: "k",
+            http: http)
+        let request = ChatRequest(
+            model: ModelID(rawValue: "gpt-search"),
+            messages: [
+                ChatMessage(role: .system, content: "Be concise."),
+                ChatMessage(role: .user, content: "What changed?"),
+                ChatMessage(role: .assistant, content: "I will check."),
+            ],
+            webSearch: ChatWebSearchConfiguration(contextSize: .high))
+
+        var doneCount = 0
+        for try await chunk in provider.stream(request) {
+            if case .done = chunk { doneCount += 1 }
+        }
+
+        XCTAssertEqual(doneCount, 1)
+        XCTAssertEqual(http.lastRequest?.url?.absoluteString,
+                       "https://example.test/v1/responses")
+        let bodyData = try XCTUnwrap(http.lastBody)
+        let body = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: bodyData) as? [String: Any])
+        XCTAssertEqual(body["model"] as? String, "gpt-search")
+        XCTAssertEqual(body["instructions"] as? String, "Be concise.")
+        XCTAssertEqual(body["stream"] as? Bool, true)
+        XCTAssertEqual(body["store"] as? Bool, false)
+        XCTAssertEqual(body["tool_choice"] as? String, "auto")
+        XCTAssertNil(body["messages"])
+        XCTAssertNil(body["n"])
+
+        let tools = try XCTUnwrap(body["tools"] as? [[String: Any]])
+        XCTAssertEqual(tools.count, 1)
+        XCTAssertEqual(tools[0]["type"] as? String, "web_search")
+        XCTAssertEqual(tools[0]["search_context_size"] as? String, "high")
+
+        let input = try XCTUnwrap(body["input"] as? [[String: Any]])
+        XCTAssertEqual(input.count, 2)
+        XCTAssertEqual(input[0]["role"] as? String, "user")
+        XCTAssertEqual(input[1]["role"] as? String, "assistant")
+        let userContent = try XCTUnwrap(input[0]["content"] as? [[String: Any]])
+        let assistantContent = try XCTUnwrap(input[1]["content"] as? [[String: Any]])
+        XCTAssertEqual(userContent.first?["type"] as? String, "input_text")
+        XCTAssertEqual(assistantContent.first?["type"] as? String, "output_text")
+    }
+
+    func testWebSearchStreamingParsesAndDeduplicatesSafeCitations() async throws {
+        let sse = """
+        data: {"type":"response.output_text.delta","delta":"Latest"}
+
+        data: {"type":"response.output_text.annotation.added","annotation":{"type":"url_citation","url":"https://example.com/story","title":"Example\\nNews"}}
+
+        data: {"type":"response.output_text.annotation.added","annotation":{"type":"url_citation","url":"javascript:alert(1)","title":"Unsafe"}}
+
+        data: {"type":"response.output_item.done","item":{"type":"message","content":[{"type":"output_text","text":"Latest facts","annotations":[{"type":"url_citation","url":"https://example.com/story","title":"Example News"},{"type":"url_citation","url":"https://user:pass@unsafe.example/path","title":"Credentials"}]}]}}
+
+        data: {"type":"response.completed","response":{"id":"resp_search","output":[{"type":"message","content":[{"type":"output_text","text":"Latest facts","annotations":[{"type":"url_citation","url":"https://example.com/story","title":"Example News"}]}]}],"usage":{"input_tokens":12,"output_tokens":3,"total_tokens":15,"input_tokens_details":{"cached_tokens":2}}}}
+
+        """
+        let provider = OpenAIWireProvider(
+            endpoint: openAIEndpoint,
+            apiKey: "k",
+            http: FakeHTTP(chunks: [Data(sse.utf8)]))
+        let request = ChatRequest(
+            model: ModelID(rawValue: "gpt-search"),
+            messages: [ChatMessage(role: .user, content: "latest")],
+            webSearch: ChatWebSearchConfiguration())
+
+        var text = ""
+        var citations: [MessageCitation] = []
+        var usage: Usage?
+        var doneCount = 0
+        for try await chunk in provider.stream(request) {
+            switch chunk {
+            case .delta(let value):
+                text += value
+            case .citation(let citation):
+                citations.append(citation)
+            case .usage(let value):
+                usage = value
+            case .done:
+                doneCount += 1
+            }
+        }
+
+        XCTAssertEqual(text, "Latest facts")
+        XCTAssertEqual(citations, [
+            MessageCitation(
+                url: "https://example.com/story",
+                title: "Example News"),
+        ])
+        XCTAssertEqual(usage?.promptTokens, 12)
+        XCTAssertEqual(usage?.cachedPromptTokens, 2)
+        XCTAssertEqual(usage?.completionTokens, 3)
+        XCTAssertEqual(usage?.totalTokens, 15)
+        XCTAssertEqual(doneCount, 1)
     }
 
     func testOpenAIStreamingNormalizesBearerAPIKeyInAuthorizationHeader() async throws {
@@ -236,6 +342,8 @@ final class IntatisProvidersTests: XCTestCase {
             switch chunk {
             case .delta(let value):
                 text += value
+            case .citation:
+                break
             case .usage:
                 break
             case .done:
@@ -263,6 +371,8 @@ final class IntatisProvidersTests: XCTestCase {
             switch chunk {
             case .delta(let value):
                 text += value
+            case .citation:
+                break
             case .usage:
                 break
             case .done:
@@ -297,6 +407,8 @@ final class IntatisProvidersTests: XCTestCase {
             switch chunk {
             case .delta:
                 break
+            case .citation:
+                break
             case .usage(let value):
                 usage = value
             case .done:
@@ -326,6 +438,8 @@ final class IntatisProvidersTests: XCTestCase {
                 switch chunk {
                 case .delta(let value):
                     text += value
+                case .citation:
+                    break
                 case .usage:
                     break
                 case .done:
@@ -731,6 +845,64 @@ final class IntatisProvidersTests: XCTestCase {
         let provider = try XCTUnwrap(resolved as? OpenAIWireProvider)
         XCTAssertEqual(provider.runtimePolicy, .streaming)
         XCTAssertEqual(provider.runtimePolicy.requestTimeoutSeconds, 120)
+    }
+
+    func testRegistryAtomicallyResolvesConfiguredWebSearchRoute() async throws {
+        let chatEndpoint = ProviderEndpoint(
+            id: "chat",
+            baseURL: URL(string: "https://chat.example.test/v1")!,
+            apiKeyRef: KeychainRef(service: "s", account: "chat"),
+            wire: .openai)
+        let searchEndpoint = ProviderEndpoint(
+            id: "search",
+            baseURL: URL(string: "https://search.example.test/v1")!,
+            apiKeyRef: KeychainRef(service: "s", account: "search"),
+            wire: .openai)
+        let registry = ProviderRegistry(
+            config: ProviderConfig(
+                endpoints: [chatEndpoint, searchEndpoint],
+                models: ResolvedModels(
+                    chat: ModelRef(
+                        endpoint: "chat",
+                        model: ModelID(rawValue: "chat-model")),
+                    webSearch: ModelRef(
+                        endpoint: "search",
+                        model: ModelID(rawValue: "search-model")))),
+            resolver: StaticSecret(key: "k"),
+            http: FakeHTTP(chunks: []))
+
+        let searched = try await registry.hostedSearchChatRuntimeRoute()
+
+        XCTAssertEqual(searched.model.rawValue, "search-model")
+        XCTAssertEqual(
+            try XCTUnwrap(searched.provider as? OpenAIWireProvider)
+                .endpoint.id,
+            "search")
+    }
+
+    func testRegistryWebSearchRouteFallsBackToChatOnlyWhenUnconfigured()
+        async throws
+    {
+        let endpoint = ProviderEndpoint(
+            id: "chat",
+            baseURL: URL(string: "https://chat.example.test/v1")!,
+            apiKeyRef: KeychainRef(service: "s", account: "chat"),
+            wire: .openai)
+        let registry = ProviderRegistry(
+            config: ProviderConfig(
+                endpoints: [endpoint],
+                models: ResolvedModels(chat: ModelRef(
+                    endpoint: "chat",
+                    model: ModelID(rawValue: "chat-model")))),
+            resolver: StaticSecret(key: "k"),
+            http: FakeHTTP(chunks: []))
+
+        let route = try await registry.hostedSearchChatRuntimeRoute()
+
+        XCTAssertEqual(route.model.rawValue, "chat-model")
+        XCTAssertEqual(
+            try XCTUnwrap(route.provider as? OpenAIWireProvider).endpoint.id,
+            "chat")
     }
 
     func testRegistryUsesLongRunningStreamingPolicyOnlyForAgentProvider() async throws {

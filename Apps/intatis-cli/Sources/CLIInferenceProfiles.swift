@@ -76,6 +76,8 @@ struct CLIInferenceProfileOption: Sendable {
     let binding: AgentInferenceBinding
     let modelID: ModelID
     let reasoningEffort: ReasoningEffort?
+    /// Safe capability declarations copied from the configured model JSON.
+    let declaredCapabilities: [Capability]
     /// Local-only configuration selectors. Neither is written to EventLog.
     let routeID: String
     let configuredVariantID: String?
@@ -193,6 +195,8 @@ struct CLIInferenceProfiles: Sendable {
                 binding: resolution.binding,
                 modelID: resolution.profile.modelID,
                 reasoningEffort: local.reasoningEffort,
+                declaredCapabilities:
+                    resolution.profile.declaredCapabilities,
                 routeID: local.routeID,
                 configuredVariantID: local.configuredVariantID))
         }

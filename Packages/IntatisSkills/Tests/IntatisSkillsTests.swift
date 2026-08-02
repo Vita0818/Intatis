@@ -14,6 +14,88 @@ final class IntatisSkillsTests: XCTestCase {
         temporaryRoots.removeAll()
     }
 
+    func testProductBundleDiscoversCoworkOrchestrationAsSystemSkill()
+        async throws
+    {
+        let workspace = try makeDirectory("bundled-orchestration")
+        let roots = IntatisBundledSkills.discoveryRoots
+        XCTAssertEqual(roots.count, 1)
+
+        let standard = SkillDiscoveryConfiguration.standard(
+            workspaceRoot: workspace,
+            access: .workspaceAndGlobal)
+        XCTAssertEqual(standard.bundledRoots, roots)
+
+        let snapshot = try await SkillCatalogService.shared.snapshot(
+            configuration: SkillDiscoveryConfiguration(
+                workspaceRoot: workspace,
+                access: .workspaceAndGlobal,
+                bundledRoots: roots))
+        let skill = try XCTUnwrap(snapshot.skills.first {
+            $0.name == IntatisBundledSkills.coworkAgentOrchestrationName
+        })
+        XCTAssertEqual(skill.scope, .system)
+        XCTAssertTrue(skill.sourceLocator.hasPrefix("system:bundle-0/"))
+        XCTAssertTrue(skill.resourcePaths.contains(
+            "references/model-routing.md"))
+
+        let catalog = try XCTUnwrap(snapshot.catalogPrompt)
+        XCTAssertTrue(catalog.contains(
+            "name=\"\(IntatisBundledSkills.coworkAgentOrchestrationName)\""))
+        XCTAssertTrue(catalog.contains("scope=\"system\""))
+
+        let activation = try snapshot.activationPrompt(skillID: skill.id)
+        XCTAssertTrue(activation.contains("cost-efficient-balanced"))
+        XCTAssertTrue(activation.contains("Prefer the smallest team"))
+        XCTAssertTrue(activation.contains("Mandatory multimodal companion"))
+        XCTAssertTrue(activation.contains("prefer a more recently released"))
+        XCTAssertTrue(activation.contains("capabilities unspecified"))
+
+        let registry = snapshot.augmenting(
+            ToolRegistry([], registryVersion: "test.bundled"))
+        let resource = try await XCTUnwrap(
+            registry.registration(named: "read_skill_resource"))
+            .execute(
+                ToolArgs(raw: try arguments([
+                    "skill_id": skill.id,
+                    "path": "references/model-routing.md",
+                ])),
+                in: ToolContext(workspaceRoot: workspace))
+        XCTAssertTrue(resource.text.contains("cost-first"))
+        XCTAssertTrue(resource.text.contains("efficiency-first"))
+        XCTAssertTrue(resource.text.contains("list_inference_profiles"))
+        XCTAssertTrue(resource.text.contains("Multimodal capability gate"))
+        XCTAssertTrue(resource.text.contains("vision_input"))
+        XCTAssertTrue(resource.text.contains("DeepSeek-V4-Flash-0731"))
+        XCTAssertTrue(resource.text.contains("Formal recommendation matrix"))
+        XCTAssertTrue(resource.text.contains("OpenAI"))
+        XCTAssertTrue(resource.text.contains("Anthropic"))
+        XCTAssertTrue(resource.text.contains("Google"))
+        XCTAssertTrue(resource.text.contains("Meta"))
+        XCTAssertTrue(resource.text.contains("xAI"))
+        XCTAssertTrue(resource.text.contains("Mistral"))
+        XCTAssertTrue(resource.text.contains("Kimi / Moonshot AI"))
+        XCTAssertTrue(resource.text.contains("Z.ai"))
+        XCTAssertTrue(resource.text.contains("MiniMax"))
+        XCTAssertTrue(resource.text.contains("Qwen / Alibaba Cloud"))
+        XCTAssertTrue(resource.text.contains("Qwen3.8-Max-Preview"))
+        XCTAssertTrue(resource.text.contains("Muse Spark 1.1"))
+        XCTAssertFalse(resource.text.contains("Llama 4 Scout"))
+        XCTAssertTrue(resource.text.contains("Gemini 3.1 Pro Preview"))
+        XCTAssertTrue(resource.text.contains(
+            "recommendation is\n`DeepSeek-V4-Flash-0731`"))
+        XCTAssertTrue(resource.text.contains(
+            "documented `MODEL VERSION` is\n`DeepSeek-V4-Flash-0731`"))
+        XCTAssertTrue(resource.text.contains(
+            "| DeepSeek | `DeepSeek-V4-Flash-0731`"))
+        XCTAssertFalse(resource.text.contains("| DeepSeek | DeepSeek V4"))
+        XCTAssertTrue(resource.text.contains(
+            "current upper recommendation over V4-Pro"))
+        XCTAssertTrue(resource.text.contains("Qwen3.6-Flash"))
+        XCTAssertFalse(resource.text.contains("Qwen3.7-Flash"))
+        XCTAssertTrue(resource.text.contains("cannot add a profile"))
+    }
+
     func testWorkspaceSnapshotRendersCatalogActivatesAndFreezesResources()
         async throws
     {

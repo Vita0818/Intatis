@@ -973,10 +973,11 @@ func managedTerminalExecutionArguments(executable: URL,
 }
 
 func structuredRuntimeReadRoots() -> [URL] {
-    [
+    var roots = [
         "/opt/homebrew",
         "/usr/local",
         "/Library/TeX",
+        "/Applications/LibreOffice.app",
         "/Applications/Google Chrome.app",
         "/Applications/Microsoft Edge.app",
         "/Applications/Chromium.app",
@@ -984,6 +985,30 @@ func structuredRuntimeReadRoots() -> [URL] {
         "/Library/Developer/CommandLineTools",
     ].filter { FileManager.default.fileExists(atPath: $0) }
         .map { URL(fileURLWithPath: $0) }
+    if let documentRuntime = intatisDocumentRuntimeRoot(),
+       FileManager.default.fileExists(atPath: documentRuntime.path) {
+        roots.append(documentRuntime)
+    }
+    return roots
+}
+
+/// Optional user-managed Python environment for structured document parsers.
+/// Intatis never installs into or mutates this directory while running a tool;
+/// it is only added as a narrow read root when the user created it explicitly.
+func intatisDocumentRuntimeRoot() -> URL? {
+    #if os(macOS)
+    guard let applicationSupport = FileManager.default.urls(
+        for: .applicationSupportDirectory,
+        in: .userDomainMask).first else { return nil }
+    return applicationSupport
+        .appendingPathComponent("Intatis", isDirectory: true)
+        .appendingPathComponent("document-runtime", isDirectory: true)
+    #elseif os(Linux)
+    return FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".local/share/intatis/document-runtime", isDirectory: true)
+    #else
+    return nil
+    #endif
 }
 
 #if os(macOS)

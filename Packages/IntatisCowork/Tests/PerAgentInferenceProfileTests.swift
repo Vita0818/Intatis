@@ -451,6 +451,46 @@ final class PerAgentInferenceProfileTests: XCTestCase {
     private let main = AgentID(rawValue: "main")
     private let worker = AgentID(rawValue: "worker")
 
+    func testProfileListUsesDeclaredCapabilitiesAndDoesNotGuessMissingMetadata()
+        async throws
+    {
+        let environment = try PerAgentProfileEnvironment("routing-capabilities")
+        defer { environment.remove() }
+        let vision = perAgentBinding(
+            profile: "vision-profile",
+            model: "configured-vision-model")
+        let unspecified = perAgentBinding(
+            profile: "custom-profile",
+            model: "unrecognized-custom-model")
+        let provider = PerAgentProfileProvider()
+        let orchestrator = Orchestrator(
+            log: environment.log,
+            allowsShell: false,
+            responder: FixedResponder(.allow),
+            availableInferenceProfiles: [vision, unspecified],
+            inferenceProfileRoutingMetadata: [
+                InferenceProfileRoutingMetadata(
+                    inferenceProfileID: vision.inferenceProfileID,
+                    declaredCapabilities: [.visionInput, .chat]),
+            ],
+            providerFor: { _ in provider })
+
+        let listing = await orchestrator.listInferenceProfilesForTool()
+        let lines = listing.split(separator: "\n").map(String.init)
+        let visionLine = try XCTUnwrap(lines.first {
+            $0.hasPrefix("vision-profile ·")
+        })
+        let customLine = try XCTUnwrap(lines.first {
+            $0.hasPrefix("custom-profile ·")
+        })
+
+        XCTAssertTrue(visionLine.contains(
+            "capabilities chat,vision_input"))
+        XCTAssertTrue(customLine.contains(
+            "capabilities unspecified"))
+        XCTAssertFalse(customLine.contains("vision_input"))
+    }
+
     private func spawnArguments(_ object: [String: Any]) throws -> String {
         String(decoding: try JSONSerialization.data(
             withJSONObject: object,

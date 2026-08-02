@@ -177,6 +177,8 @@ enum ProviderHealthChecker {
                         firstTokenMillis = elapsedMillis(since: start)
                     }
                     appendPreview(text, to: &preview, limit: options.maxPreviewCharacters)
+                case .citation:
+                    break
                 case .usage(let value):
                     usage = Usage.merging(usage, with: value)
                 case .done:

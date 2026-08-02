@@ -63,6 +63,15 @@ public struct OpenAIWireProvider: ChatProvider {
     }
 
     public func stream(_ request: ChatRequest) -> AsyncThrowingStream<ChatChunk, Error> {
+        if request.webSearch != nil {
+            return streamResponsesChat(request)
+        }
+        return streamChatCompletions(request)
+    }
+
+    private func streamChatCompletions(
+        _ request: ChatRequest
+    ) -> AsyncThrowingStream<ChatChunk, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
@@ -120,6 +129,194 @@ public struct OpenAIWireProvider: ChatProvider {
         }
     }
 
+    private func streamResponsesChat(
+        _ request: ChatRequest
+    ) -> AsyncThrowingStream<ChatChunk, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    let urlRequest = try buildResponsesChatRequest(request)
+                    var attempt = 1
+
+                    while true {
+                        let parser = SSEParser()
+                        var completed = false
+                        var emittedText = ""
+                        var emittedCitationURLs: Set<String> = []
+                        var receivedResponseBytes = false
+
+                        func yieldMissingText(_ fullText: String) {
+                            guard !fullText.isEmpty else { return }
+                            if fullText.hasPrefix(emittedText) {
+                                let suffix = String(fullText.dropFirst(emittedText.count))
+                                if !suffix.isEmpty {
+                                    emittedText += suffix
+                                    continuation.yield(.delta(suffix))
+                                }
+                            } else if emittedText.isEmpty {
+                                emittedText = fullText
+                                continuation.yield(.delta(fullText))
+                            }
+                        }
+
+                        func yieldMessageItem(_ item: [String: JSONValue]) {
+                            yieldMissingText(Self.responsesChatMessageText(item))
+                            for citation in Self.responsesChatCitations(item) {
+                                if emittedCitationURLs.insert(citation.url).inserted {
+                                    continuation.yield(.citation(citation))
+                                }
+                            }
+                        }
+
+                        func handle(_ payload: String) throws -> Bool {
+                            if payload == "[DONE]" {
+                                guard completed else {
+                                    throw ProviderErrorFormatting.incompleteStream(
+                                        operation: "Responses web-search streaming request")
+                                }
+                                continuation.finish()
+                                return true
+                            }
+                            let trimmed = payload.trimmingCharacters(in: .whitespacesAndNewlines)
+                            guard !trimmed.isEmpty,
+                                  let data = trimmed.data(using: .utf8) else {
+                                return false
+                            }
+                            if let providerError = ProviderErrorFormatting.streamErrorPayload(data) {
+                                throw providerError
+                            }
+                            let value: JSONValue
+                            do {
+                                value = try JSONDecoder().decode(JSONValue.self, from: data)
+                            } catch {
+                                throw ProviderErrorFormatting.invalidStreamPayload(
+                                    trimmed,
+                                    underlying: error)
+                            }
+                            guard case .object(let event) = value,
+                                  case .string(let eventType)? = event["type"] else {
+                                throw IntatisError.decoding(
+                                    "Responses stream event is missing its type.")
+                            }
+
+                            switch eventType {
+                            case "response.output_text.delta":
+                                if case .string(let delta)? = event["delta"],
+                                   !delta.isEmpty {
+                                    emittedText += delta
+                                    continuation.yield(.delta(delta))
+                                }
+
+                            case "response.output_text.done":
+                                if case .string(let text)? = event["text"] {
+                                    yieldMissingText(text)
+                                }
+
+                            case "response.output_text.annotation.added":
+                                if case .object(let annotation)? = event["annotation"],
+                                   let citation = Self.responsesChatCitation(annotation),
+                                   emittedCitationURLs.insert(citation.url).inserted {
+                                    continuation.yield(.citation(citation))
+                                }
+
+                            case "response.output_item.done":
+                                guard case .object(let item)? = event["item"],
+                                      case .string(let itemType)? = item["type"] else {
+                                    throw IntatisError.decoding(
+                                        "Responses output_item.done is missing a typed item.")
+                                }
+                                if itemType == "message" {
+                                    yieldMessageItem(item)
+                                }
+
+                            case "response.completed":
+                                guard case .object(let response)? = event["response"],
+                                      case .string(let responseID)? = response["id"],
+                                      !responseID.isEmpty else {
+                                    throw IntatisError.decoding(
+                                        "Responses completion is missing its response ID.")
+                                }
+                                if case .array(let output)? = response["output"] {
+                                    for value in output {
+                                        guard case .object(let item) = value,
+                                              case .string("message")? = item["type"] else {
+                                            continue
+                                        }
+                                        yieldMessageItem(item)
+                                    }
+                                }
+                                if let usage = Self.responsesChatUsage(response) {
+                                    continuation.yield(.usage(usage))
+                                }
+                                continuation.yield(.done)
+                                completed = true
+                                continuation.finish()
+                                return true
+
+                            case "response.failed":
+                                if let contextWindow = ProviderErrorFormatting.contextWindowExceeded(
+                                    from: .object(event),
+                                    operation: "Responses web-search request") {
+                                    throw contextWindow
+                                }
+                                throw IntatisError.provider(
+                                    "Responses web-search request failed. \(Self.responsesChatFailureMessage(event))")
+
+                            case "response.incomplete":
+                                throw IntatisError.decoding(
+                                    "Responses web-search request was incomplete: \(Self.responsesChatIncompleteReason(event)).")
+
+                            default:
+                                break
+                            }
+                            return false
+                        }
+
+                        do {
+                            for try await chunk in http.stream(urlRequest) {
+                                receivedResponseBytes = true
+                                for payload in parser.consume(chunk) {
+                                    if try handle(payload) { return }
+                                }
+                            }
+                            for payload in parser.flush() {
+                                if try handle(payload) { return }
+                            }
+                            guard completed else {
+                                continuation.finish(throwing: ProviderErrorFormatting.incompleteStream(
+                                    operation: "Responses web-search streaming request"))
+                                return
+                            }
+                            continuation.finish()
+                            return
+                        } catch {
+                            if ProviderRuntime.shouldRetry(
+                                error: error,
+                                attempt: attempt,
+                                policy: runtimePolicy,
+                                receivedResponseBytes: receivedResponseBytes) {
+                                attempt += 1
+                                try await ProviderRuntime.sleepBeforeRetry(
+                                    nextAttempt: attempt,
+                                    policy: runtimePolicy,
+                                    retryHint: ProviderErrorFormatting.retryHint(from: error))
+                                continue
+                            }
+                            continuation.finish(throwing: ProviderRuntime.exhausted(
+                                error,
+                                attempts: attempt,
+                                operation: "Responses web-search streaming request"))
+                            return
+                        }
+                    }
+                } catch {
+                    continuation.finish(throwing: ProviderErrorFormatting.transport(error))
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
     /// Returns true if the stream is finished (saw `[DONE]`).
     private func emit(_ payload: String,
                       to continuation: AsyncThrowingStream<ChatChunk, Error>.Continuation,
@@ -163,6 +360,15 @@ public struct OpenAIWireProvider: ChatProvider {
     }
 
     func buildRequest(_ request: ChatRequest) throws -> URLRequest {
+        if request.webSearch != nil {
+            return try buildResponsesChatRequest(request)
+        }
+        return try buildChatCompletionsRequest(request)
+    }
+
+    private func buildChatCompletionsRequest(
+        _ request: ChatRequest
+    ) throws -> URLRequest {
         var r = URLRequest(url: try endpoint.validatedChatCompletionsURL(operation: "streaming request"))
         ProviderRuntime.apply(runtimePolicy, to: &r)
         r.httpMethod = "POST"
@@ -189,6 +395,204 @@ public struct OpenAIWireProvider: ChatProvider {
         if request.includeUsage { root["stream_options"] = .object(["include_usage": .bool(true)]) }
         r.httpBody = try Self.encodeRequestBody(root)
         return r
+    }
+
+    private func buildResponsesChatRequest(
+        _ request: ChatRequest
+    ) throws -> URLRequest {
+        guard let webSearch = request.webSearch else {
+            throw IntatisError.config(
+                "Responses web-search request is missing its search configuration.")
+        }
+        var root = try Self.configuredRequestBody(
+            endpoint: endpoint,
+            model: request.model)
+        let instructions = request.messages
+            .filter { $0.role == .system }
+            .map(\.content)
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n\n")
+        let input = request.messages.compactMap(Self.responsesChatInputJSON)
+
+        root["model"] = .string(request.model.rawValue)
+        if instructions.isEmpty {
+            root.removeValue(forKey: "instructions")
+        } else {
+            root["instructions"] = .string(instructions)
+        }
+        root["input"] = .array(input)
+        root["stream"] = .bool(true)
+        root["store"] = .bool(false)
+        root["tools"] = .array([
+            .object([
+                "type": .string("web_search"),
+                "search_context_size": .string(webSearch.contextSize.rawValue),
+            ]),
+        ])
+        // Search is a transparent Chat capability. Let the provider decide
+        // whether this prompt needs a hosted search instead of forcing one on
+        // every turn.
+        root["tool_choice"] = .string("auto")
+        root.removeValue(forKey: "messages")
+        root.removeValue(forKey: "n")
+        root.removeValue(forKey: "parallel_tool_calls")
+        root.removeValue(forKey: "stream_options")
+        if let temperature = request.temperature {
+            root["temperature"] = .number(temperature)
+        }
+        Self.applyResponsesReasoningOptions(
+            to: &root,
+            runtimeEffort: request.reasoningEffort)
+
+        var urlRequest = URLRequest(
+            url: try endpoint.validatedResponsesURL(
+                operation: "Responses web-search streaming request"))
+        ProviderRuntime.apply(runtimePolicy, to: &urlRequest)
+        urlRequest.httpMethod = "POST"
+        urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        urlRequest.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        urlRequest.setValue(
+            ProviderAuthorization.bearerHeaderValue(apiKey: apiKey),
+            forHTTPHeaderField: "Authorization")
+        urlRequest.httpBody = try Self.encodeRequestBody(root)
+        return urlRequest
+    }
+
+    private static func responsesChatInputJSON(
+        _ message: ChatMessage
+    ) -> JSONValue? {
+        guard message.role != .system,
+              let role = AgentRole(rawValue: message.role.rawValue) else {
+            return nil
+        }
+        return responsesInputJSON(.message(
+            role: role,
+            content: message.content,
+            images: message.images))
+    }
+
+    private static func responsesChatMessageText(
+        _ item: [String: JSONValue]
+    ) -> String {
+        guard case .array(let content)? = item["content"] else {
+            return ""
+        }
+        return content.compactMap { part -> String? in
+            guard case .object(let object) = part,
+                  case .string("output_text")? = object["type"],
+                  case .string(let text)? = object["text"] else {
+                return nil
+            }
+            return text
+        }.joined()
+    }
+
+    private static func responsesChatCitations(
+        _ item: [String: JSONValue]
+    ) -> [MessageCitation] {
+        guard case .array(let content)? = item["content"] else {
+            return []
+        }
+        var citations: [MessageCitation] = []
+        for part in content {
+            guard case .object(let object) = part,
+                  case .array(let annotations)? = object["annotations"] else {
+                continue
+            }
+            for annotation in annotations {
+                guard case .object(let value) = annotation,
+                      let citation = responsesChatCitation(value) else {
+                    continue
+                }
+                citations.append(citation)
+            }
+        }
+        return citations
+    }
+
+    private static func responsesChatCitation(
+        _ annotation: [String: JSONValue]
+    ) -> MessageCitation? {
+        guard case .string("url_citation")? = annotation["type"],
+              case .string(let rawURL)? = annotation["url"],
+              rawURL.count <= 4_096,
+              let url = URL(string: rawURL),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              let host = url.host,
+              !host.isEmpty,
+              url.user == nil,
+              url.password == nil else {
+            return nil
+        }
+        let rawTitle: String
+        if case .string(let value)? = annotation["title"] {
+            rawTitle = value
+        } else {
+            rawTitle = ""
+        }
+        let compactTitle = rawTitle
+            .components(separatedBy: .newlines)
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let title = compactTitle.isEmpty
+            ? host
+            : String(compactTitle.prefix(200))
+        return MessageCitation(url: url.absoluteString, title: title)
+    }
+
+    private static func responsesChatUsage(
+        _ response: [String: JSONValue]
+    ) -> Usage? {
+        guard case .object(let usage)? = response["usage"] else {
+            return nil
+        }
+        func integer(_ key: String) -> Int? {
+            guard case .number(let value)? = usage[key],
+                  value.isFinite else {
+                return nil
+            }
+            return Int(value)
+        }
+        var cachedTokens: Int?
+        if case .object(let details)? = usage["input_tokens_details"],
+           case .number(let value)? = details["cached_tokens"],
+           value.isFinite {
+            cachedTokens = Int(value)
+        }
+        return Usage(
+            promptTokens: integer("input_tokens"),
+            cachedPromptTokens: cachedTokens,
+            completionTokens: integer("output_tokens"),
+            totalTokens: integer("total_tokens"))
+    }
+
+    private static func responsesChatFailureMessage(
+        _ event: [String: JSONValue]
+    ) -> String {
+        guard case .object(let response)? = event["response"],
+              case .object(let error)? = response["error"],
+              case .string(let message)? = error["message"],
+              !message.isEmpty else {
+            return "The provider did not include an error message."
+        }
+        return PermissionReviewTextSanitizer.sanitizeDiagnostic(
+            message,
+            maxCharacters: 360).text
+    }
+
+    private static func responsesChatIncompleteReason(
+        _ event: [String: JSONValue]
+    ) -> String {
+        guard case .object(let response)? = event["response"],
+              case .object(let details)? = response["incomplete_details"],
+              case .string(let reason)? = details["reason"],
+              !reason.isEmpty else {
+            return "unknown"
+        }
+        return PermissionReviewTextSanitizer.sanitizeDiagnostic(
+            reason,
+            maxCharacters: 160).text
     }
 
     /// Model options are an open JSON extension point. Intatis protects only

@@ -1,5 +1,6 @@
 import Foundation
 import IntatisCore
+import IntatisProtocol
 
 #if canImport(PDFKit)
 import PDFKit
@@ -79,7 +80,7 @@ public struct ReadPDFTool: Tool {
     public init() {}
     public static let descriptor = ToolDescriptor(
         name: "read_pdf",
-        description: "Extract readable text from a PDF in the workspace, with optional 1-based page ranges such as '1-3,5'.",
+        description: "Read text already embedded in a workspace PDF, with optional 1-based page ranges such as '1-3,5'. This tool does not perform OCR. Use it for PDFs with an extractable text layer; for scanned or image-only PDFs that need reading or summarization, use read_document with backend omitted or set to 'auto'.",
         sideEffect: .readOnly,
         parameters: Schema.object([
             "path": Schema.nonEmptyString,
@@ -136,12 +137,266 @@ public struct ReadPDFTool: Tool {
             truncated = true
         }
         if text.contains("(no extractable text") {
-            text += "\n\nHint: for scanned or photographed documents, use reconstruct_document_image with a Docling/Marker/Tesseract backend."
+            text += "\n\nHint: this PDF has no extractable text layer. To read or summarize it, use read_document with backend omitted or set to 'auto'. Use reconstruct_document_image only when the user explicitly requests a new editable output artifact from an image file."
         }
         return ToolObservation(text: text, truncated: truncated)
         #else
         throw IntatisError.config("read_pdf requires PDFKit on Apple platforms; use an explicitly integrated, workspace-confined PDF backend on this platform.")
         #endif
+    }
+}
+
+// MARK: - read_document
+
+/// Reads common office/document formats through a fixed, locally installed
+/// parser command. The model controls only the input path, backend preference,
+/// and output bound; it never supplies a command line or enables networking.
+public struct ReadDocumentTool: Tool {
+    public init() {}
+
+    static let maximumInputMiB = 512
+    static let maximumInputBytes = maximumInputMiB * 1_024 * 1_024
+
+    public static let descriptor = ToolDescriptor(
+        name: "read_document",
+        description: "Read a workspace document up to 512 MiB as bounded Markdown for analysis or summarization using an installed local Docling or MarkItDown backend. This is the preferred reading tool for scanned or image-only PDFs and documents that need OCR or layout parsing; omit backend or use 'auto' unless the user explicitly requires a specific compatible backend. It returns text and does not create an output artifact. Supports modern and legacy Word, PowerPoint, and Excel formats plus common open document formats. Legacy .doc/.ppt/.xls parsing requires LibreOffice. Remote services and plugins remain disabled.",
+        sideEffect: .exec,
+        parameters: Schema.object([
+            "path": Schema.nonEmptyString,
+            "backend": Schema.nonEmptyString,
+            "maxCharacters": Schema.boundedInteger(minimum: 1, maximum: 500_000),
+        ], required: ["path"])
+    )
+
+    struct Args: Decodable {
+        let path: String
+        let backend: String?
+        let maxCharacters: Int?
+    }
+
+    private static let supportedExtensions: Set<String> = [
+        "doc", "docx", "ppt", "pptx", "xls", "xlsx", "xlsm", "xlsb",
+        "odt", "ods", "odp", "rtf", "csv", "html", "htm", "md",
+        "markdown", "txt", "epub", "pdf",
+    ]
+
+    public func touchedPaths(_ args: ToolArgs) -> [String] {
+        (try? args.decode(Args.self).path).map { [$0] } ?? []
+    }
+
+    public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {
+        let value = try args.decode(Args.self)
+        let inputURL: URL
+        do {
+            inputURL = try PathConfinement.resolve(value.path, within: context.workspaceRoot)
+        } catch {
+            throw ToolExecutionRejectedWithoutSideEffect(
+                code: "read_document_invalid_path",
+                message: "read_document input must resolve to a readable file inside the workspace")
+        }
+        let resourceValues: URLResourceValues
+        do {
+            resourceValues = try inputURL.resourceValues(forKeys: [
+                .isRegularFileKey,
+                .fileSizeKey,
+            ])
+        } catch {
+            throw ToolExecutionRejectedWithoutSideEffect(
+                code: "read_document_input_unavailable",
+                message: "read_document could not inspect the input file")
+        }
+        guard resourceValues.isRegularFile == true else {
+            throw ToolExecutionRejectedWithoutSideEffect(
+                code: "read_document_not_regular_file",
+                message: "read_document path must be a regular file")
+        }
+        if let fileSize = resourceValues.fileSize, fileSize > Self.maximumInputBytes {
+            throw ToolExecutionRejectedWithoutSideEffect(
+                code: "read_document_input_too_large",
+                message: "read_document input exceeds the \(Self.maximumInputMiB) MiB safety limit")
+        }
+
+        let fileExtension = inputURL.pathExtension.lowercased()
+        guard Self.supportedExtensions.contains(fileExtension) else {
+            throw ToolExecutionRejectedWithoutSideEffect(
+                code: "read_document_unsupported_extension",
+                message: "unsupported document extension '.\(fileExtension)'; supported formats include doc/docx, ppt/pptx, xls/xlsx, OpenDocument, RTF, CSV, HTML, Markdown, text, EPUB, and PDF")
+        }
+
+        let backend = (value.backend ?? "auto")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard ["auto", "docling", "markitdown"].contains(backend) else {
+            throw ToolExecutionRejectedWithoutSideEffect(
+                code: "read_document_unsupported_backend",
+                message: "unsupported read_document backend '\(backend)'; use auto, docling, or markitdown")
+        }
+
+        let runtimeRoot = intatisDocumentRuntimeRoot()
+        let runtimePath = runtimeRoot?.path ?? ""
+        let command = """
+        set -u
+        INPUT=\(shellQuote(inputURL.path))
+        BACKEND=\(shellQuote(backend))
+        DOCUMENT_RUNTIME=\(shellQuote(runtimePath))
+        if [ -n "$DOCUMENT_RUNTIME" ] && [ -d "$DOCUMENT_RUNTIME/bin" ]; then
+          PATH="$DOCUMENT_RUNTIME/bin:$PATH"
+        fi
+        if [ -d "/Applications/LibreOffice.app/Contents/MacOS" ]; then
+          PATH="/Applications/LibreOffice.app/Contents/MacOS:$PATH"
+        fi
+        export PATH
+
+        WORK=$(mktemp -d "$TMPDIR/intatis-read-document.XXXXXX") || exit 70
+        cleanup() { rm -rf "$WORK"; }
+        trap cleanup EXIT
+        trap 'exit 130' HUP INT TERM
+
+        DOCLING=$(command -v docling 2>/dev/null || true)
+        MARKITDOWN=$(command -v markitdown 2>/dev/null || true)
+
+        emit_result() {
+          printf '__INTATIS_DOCUMENT_BACKEND__=%s\\n' "$1"
+          cat "$2"
+        }
+
+        run_docling() {
+          mkdir -p "$WORK/docling-output"
+          if [ -n "$DOCUMENT_RUNTIME" ] && [ -d "$DOCUMENT_RUNTIME/models" ]; then
+            "$DOCLING" convert --to md --image-export-mode placeholder \
+              --html-image-fetch none --no-enable-remote-services \
+              --no-allow-external-plugins --abort-on-error \
+              --document-timeout 240 --num-threads 2 \
+              --artifacts-path "$DOCUMENT_RUNTIME/models" \
+              --output "$WORK/docling-output" "$INPUT" \
+              >"$WORK/docling.stdout" 2>"$WORK/docling.stderr" || return $?
+          else
+            "$DOCLING" convert --to md --image-export-mode placeholder \
+              --html-image-fetch none --no-enable-remote-services \
+              --no-allow-external-plugins --abort-on-error \
+              --document-timeout 240 --num-threads 2 \
+              --output "$WORK/docling-output" "$INPUT" \
+              >"$WORK/docling.stdout" 2>"$WORK/docling.stderr" || return $?
+          fi
+          GENERATED=$(find "$WORK/docling-output" -type f -name '*.md' -print | head -n 1)
+          if [ -z "$GENERATED" ] || [ ! -f "$GENERATED" ]; then
+            printf 'Docling produced no Markdown output.\\n' >>"$WORK/docling.stderr"
+            return 3
+          fi
+          emit_result docling "$GENERATED"
+        }
+
+        run_markitdown() {
+          "$MARKITDOWN" "$INPUT" -o "$WORK/markitdown.md" \
+            >"$WORK/markitdown.stdout" 2>"$WORK/markitdown.stderr" || return $?
+          if [ ! -f "$WORK/markitdown.md" ]; then
+            printf 'MarkItDown produced no Markdown output.\\n' >>"$WORK/markitdown.stderr"
+            return 3
+          fi
+          emit_result markitdown "$WORK/markitdown.md"
+        }
+
+        case "$BACKEND" in
+          docling)
+            if [ -z "$DOCLING" ]; then
+              printf 'Docling is not installed in the trusted document runtime or system PATH.\\n' >&2
+              exit 127
+            fi
+            if run_docling; then exit 0; fi
+            cat "$WORK/docling.stderr" >&2
+            exit 1
+            ;;
+          markitdown)
+            if [ -z "$MARKITDOWN" ]; then
+              printf 'MarkItDown is not installed in the trusted document runtime or system PATH.\\n' >&2
+              exit 127
+            fi
+            if run_markitdown; then exit 0; fi
+            cat "$WORK/markitdown.stderr" >&2
+            exit 1
+            ;;
+          auto)
+            if [ -n "$DOCLING" ] && run_docling; then exit 0; fi
+            if [ -n "$MARKITDOWN" ] && run_markitdown; then exit 0; fi
+            if [ -n "$DOCLING" ] && [ -f "$WORK/docling.stderr" ]; then
+              printf '[Docling]\\n' >&2
+              cat "$WORK/docling.stderr" >&2
+            fi
+            if [ -n "$MARKITDOWN" ] && [ -f "$WORK/markitdown.stderr" ]; then
+              printf '[MarkItDown]\\n' >&2
+              cat "$WORK/markitdown.stderr" >&2
+            fi
+            if [ -z "$DOCLING" ] && [ -z "$MARKITDOWN" ]; then
+              printf 'No local document backend was found. Install docling or markitdown[all] into the Intatis document runtime.\\n' >&2
+            fi
+            exit 127
+            ;;
+        esac
+        """
+
+        let result = try await context.structuredShell.run(
+            command,
+            cwd: context.workspaceRoot)
+        let sanitizedStdout = sanitizeProcessText(
+            result.stdout,
+            inputURL: inputURL,
+            inputPath: value.path,
+            workspaceRoot: context.workspaceRoot,
+            runtimeRoot: runtimeRoot)
+        let sanitizedStderr = sanitizeProcessText(
+            result.stderr,
+            inputURL: inputURL,
+            inputPath: value.path,
+            workspaceRoot: context.workspaceRoot,
+            runtimeRoot: runtimeRoot)
+        guard result.exitCode == 0 else {
+            let transcript = outputText(
+                stdout: sanitizedStdout,
+                stderr: sanitizedStderr,
+                exitCode: result.exitCode)
+            let legacyHint = ["doc", "ppt", "xls"].contains(fileExtension)
+                ? " Legacy Office formats also require LibreOffice."
+                : ""
+            throw IntatisError.io(
+                "document reading failed. Install a backend in the Intatis document runtime or select another backend.\(legacyHint) \(transcript)")
+        }
+
+        let markerPrefix = "__INTATIS_DOCUMENT_BACKEND__="
+        guard sanitizedStdout.hasPrefix(markerPrefix),
+              let firstNewline = sanitizedStdout.firstIndex(of: "\n") else {
+            throw IntatisError.io("document backend returned an invalid structured result")
+        }
+        let backendName = sanitizedStdout[
+            sanitizedStdout.index(sanitizedStdout.startIndex, offsetBy: markerPrefix.count)..<firstNewline]
+        let extracted = String(sanitizedStdout[sanitizedStdout.index(after: firstNewline)...])
+        let limit = max(1, min(value.maxCharacters ?? 200_000, 500_000))
+        let header = "Document: \(value.path)\nFormat: .\(fileExtension)\nBackend: \(backendName)\n\n"
+        let output = header + extracted
+        let truncated = output.count > limit
+        return ToolObservation(
+            text: truncated ? String(output.prefix(limit)) : output,
+            truncated: truncated)
+    }
+
+    private func sanitizeProcessText(
+        _ text: String,
+        inputURL: URL,
+        inputPath: String,
+        workspaceRoot: URL,
+        runtimeRoot: URL?
+    ) -> String {
+        var sanitized = text.replacingOccurrences(
+            of: inputURL.path,
+            with: inputPath)
+        sanitized = sanitized.replacingOccurrences(
+            of: workspaceRoot.path,
+            with: "<workspace>")
+        if let runtimeRoot {
+            sanitized = sanitized.replacingOccurrences(
+                of: runtimeRoot.path,
+                with: "<Intatis document runtime>")
+        }
+        return sanitized
     }
 }
 
@@ -257,7 +512,7 @@ public struct ReconstructDocumentImageTool: Tool {
     public init() {}
     public static let descriptor = ToolDescriptor(
         name: "reconstruct_document_image",
-        description: "Convert a photographed/scanned document image into an editable document file using installed mature OCR/layout CLIs such as Docling, Marker, or Tesseract.",
+        description: "Create a new editable document artifact from a photographed or scanned document image using installed OCR or layout CLIs such as Docling, Marker, or Tesseract. Use this only when the user explicitly requests conversion or reconstruction with an output file; do not use it for ordinary reading or summarization, and do not pass a PDF as imagePath. For scanned or image-only PDF reading, use read_document with backend omitted or set to 'auto'.",
         sideEffect: .exec,
         parameters: Schema.object([
             "imagePath": Schema.nonEmptyString,

@@ -112,7 +112,12 @@ let package = Package(
                 "IntatisCore", "IntatisProtocol", "IntatisTools",
                 "IntatisPermission",
             ],
-            path: "Packages/IntatisSkills/Sources"
+            path: "Packages/IntatisSkills",
+            exclude: ["Tests"],
+            sources: ["Sources"],
+            resources: [
+                .copy("Resources/BundledSkills"),
+            ]
         ),
         .target(
             name: "IntatisPermission",

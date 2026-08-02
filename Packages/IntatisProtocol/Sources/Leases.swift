@@ -11,6 +11,7 @@ public enum ToolCapability: String, Codable, Sendable, Hashable {
     case proposePatch = "propose_patch"
     case applyPatch = "apply_patch"
     case readPDF = "read_pdf"
+    case readDocument = "read_document"
     case editPDF = "edit_pdf"
     case reconstructDocument = "reconstruct_document"
     case compileLaTeX = "compile_latex"
@@ -134,6 +135,7 @@ public struct CapabilityLease: Codable, Sendable, Hashable {
                 .gitControl,
                 .gitRemote,
                 .applyPatch,
+                .readDocument,
                 .editPDF,
                 .reconstructDocument,
                 .compileLaTeX,

@@ -1473,6 +1473,9 @@ final class IntatisToolsTests: XCTestCase {
         let read = try await ReadPDFTool().execute(ToolArgs(raw: #"{"path":"input.pdf","pages":"1-2"}"#), in: ctx)
         XCTAssertTrue(read.text.contains("Pages: 3"))
         XCTAssertTrue(read.text.contains("--- page 1 ---"))
+        XCTAssertTrue(read.text.contains("use read_document"))
+        XCTAssertTrue(read.text.contains("backend omitted or set to 'auto'"))
+        XCTAssertFalse(read.text.contains("use reconstruct_document_image with"))
 
         let extractArgs = #"{"mode":"extract","inputPath":"input.pdf","pages":"2-3","outputPath":"out/extract.pdf"}"#
         let extracted = try await EditPDFPagesTool().execute(ToolArgs(raw: extractArgs), in: ctx)
@@ -1586,6 +1589,70 @@ final class IntatisToolsTests: XCTestCase {
 
         XCTAssertEqual(obs.changedFiles, ["docs/scan.md"])
         XCTAssertTrue(obs.text.contains("reconstructed scan.png"))
+    }
+
+    func testDocumentToolDescriptionsDefineNonOverlappingSelectionContract() {
+        let pdf = ReadPDFTool.descriptor.description
+        XCTAssertTrue(pdf.contains("does not perform OCR"))
+        XCTAssertTrue(pdf.contains("use read_document"))
+
+        let document = ReadDocumentTool.descriptor.description
+        XCTAssertTrue(document.contains("up to 512 MiB"))
+        XCTAssertTrue(document.contains("preferred reading tool"))
+        XCTAssertTrue(document.contains("omit backend or use 'auto'"))
+        XCTAssertTrue(document.contains("does not create an output artifact"))
+
+        let reconstruction = ReconstructDocumentImageTool.descriptor.description
+        XCTAssertTrue(reconstruction.contains("explicitly requests conversion or reconstruction"))
+        XCTAssertTrue(reconstruction.contains("do not use it for ordinary reading or summarization"))
+        XCTAssertTrue(reconstruction.contains("do not pass a PDF as imagePath"))
+    }
+
+    func testReadDocumentAccepts314MiBSparsePDF() async throws {
+        let ws = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let inputURL = ws.appendingPathComponent("textbook-scan.pdf")
+        XCTAssertTrue(FileManager.default.createFile(atPath: inputURL.path, contents: nil))
+        let handle = try FileHandle(forWritingTo: inputURL)
+        try handle.truncate(atOffset: 329_384_679)
+        try handle.close()
+        let shell = FakeShell(result: ShellResult(
+            stdout: "__INTATIS_DOCUMENT_BACKEND__=docling\n# Table of Contents\n",
+            stderr: "",
+            exitCode: 0))
+
+        let observation = try await ReadDocumentTool().execute(
+            ToolArgs(raw: #"{"path":"textbook-scan.pdf"}"#),
+            in: ToolContext(workspaceRoot: ws, shell: shell))
+
+        XCTAssertTrue(observation.text.contains("Backend: docling"))
+        XCTAssertTrue(observation.text.contains("# Table of Contents"))
+    }
+
+    func testReadDocumentOversizePreflightRejectsWithoutSideEffect() async throws {
+        let ws = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let inputURL = ws.appendingPathComponent("oversize.pdf")
+        XCTAssertTrue(FileManager.default.createFile(atPath: inputURL.path, contents: nil))
+        let handle = try FileHandle(forWritingTo: inputURL)
+        try handle.truncate(atOffset: UInt64(ReadDocumentTool.maximumInputBytes + 1))
+        try handle.close()
+        let recorder = CommandRecorder()
+        let shell = RecordingShell(
+            recorder: recorder,
+            result: ShellResult(stdout: "unexpected", stderr: "", exitCode: 0))
+
+        do {
+            _ = try await ReadDocumentTool().execute(
+                ToolArgs(raw: #"{"path":"oversize.pdf"}"#),
+                in: ToolContext(workspaceRoot: ws, shell: shell))
+            XCTFail("oversize input unexpectedly reached the document backend")
+        } catch let error as ToolExecutionRejectedWithoutSideEffect {
+            XCTAssertEqual(error.code, "read_document_input_too_large")
+            XCTAssertTrue(error.message.contains("512 MiB"))
+        }
+        let recordedCommands = await recorder.all()
+        XCTAssertTrue(recordedCommands.isEmpty)
     }
 
     func testGenerateImageUsesInjectedService() async throws {
@@ -3746,7 +3813,7 @@ final class IntatisToolsTests: XCTestCase {
 
     func testStandardRegistry() {
         let reg = ToolRegistry.standard()
-        XCTAssertEqual(reg.descriptors().count, 58)
+        XCTAssertEqual(reg.descriptors().count, 59)
         XCTAssertNotNil(reg.tool(named: "read_file"))
         XCTAssertNotNil(reg.tool(named: "apply_patch"))
         XCTAssertNil(reg.tool(named: "run_shell"))
@@ -3775,6 +3842,7 @@ final class IntatisToolsTests: XCTestCase {
         XCTAssertNotNil(reg.tool(named: "git_push"))
         XCTAssertNotNil(reg.tool(named: "git_switch"))
         XCTAssertNotNil(reg.tool(named: "read_pdf"))
+        XCTAssertNotNil(reg.tool(named: "read_document"))
         XCTAssertNotNil(reg.tool(named: "edit_pdf_pages"))
         XCTAssertNotNil(reg.tool(named: "reconstruct_document_image"))
         XCTAssertNotNil(reg.tool(named: "compile_latex"))

@@ -27,6 +27,9 @@ final class CLIModelContextMetadataTests: XCTestCase {
         XCTAssertEqual(
             model.requestOptions,
             ["temperature": .number(0.2)])
+        XCTAssertEqual(
+            model.declaredCapabilities,
+            [.chat, .toolCalling, .visionInput])
 
         let profiles =
             try await CLIInferenceProfiles.load(
@@ -44,6 +47,9 @@ final class CLIModelContextMetadataTests: XCTestCase {
             let resolution =
                 try profiles.snapshot.resolve(
                     option.binding)
+            XCTAssertEqual(
+                option.declaredCapabilities,
+                [.chat, .toolCalling, .visionInput])
             let policy =
                 resolution.profile
                     .modelContextPolicy
@@ -107,6 +113,9 @@ final class CLIModelContextMetadataTests: XCTestCase {
                     "models": [
                         "test-model": [
                             "name": "Test Model",
+                            "capabilities": [
+                                "vision_input",
+                            ],
                             "context_window": 200_000,
                             "max_context_window": 256_000,
                             "auto_compact_token_limit":

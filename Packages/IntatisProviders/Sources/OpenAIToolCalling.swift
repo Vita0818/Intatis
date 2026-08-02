@@ -185,10 +185,11 @@ extension OpenAIWireProvider: ToolCallingProvider {
                         let parser = SSEParser()
                         var acc: [ToolCallAccumKey: ToolCallAccum] = [:]
                         var finished = false
-                        var receivedResponseBytes = false
+                        var receivedAcceptedPayload = false
 
                         func handle(_ payload: String) throws -> Bool {
                             if payload == "[DONE]" {
+                                receivedAcceptedPayload = true
                                 if !finished {
                                     continuation.yield(.done(finishReason: nil))
                                     finished = true
@@ -209,6 +210,11 @@ extension OpenAIWireProvider: ToolCallingProvider {
                             } catch {
                                 throw ProviderErrorFormatting.invalidStreamPayload(trimmed, underlying: error)
                             }
+                            // A structured provider error is not a successful
+                            // response payload. Until one of these chunks is
+                            // accepted, retrying cannot duplicate model output
+                            // or a tool call.
+                            receivedAcceptedPayload = true
                             if let u = chunk.usage {
                                 continuation.yield(.usage(u.usage))
                             }
@@ -277,7 +283,6 @@ extension OpenAIWireProvider: ToolCallingProvider {
 
                         do {
                             for try await chunk in http.stream(urlRequest) {
-                                receivedResponseBytes = true
                                 for payload in parser.consume(chunk) {
                                     if try handle(payload) { return }
                                 }
@@ -296,7 +301,7 @@ extension OpenAIWireProvider: ToolCallingProvider {
                             if ProviderRuntime.shouldRetry(error: error,
                                                            attempt: attempt,
                                                            policy: runtimePolicy,
-                                                           receivedResponseBytes: receivedResponseBytes) {
+                                                           receivedResponseBytes: receivedAcceptedPayload) {
                                 attempt += 1
                                 try await ProviderRuntime.sleepBeforeRetry(
                                     nextAttempt: attempt,
@@ -331,11 +336,12 @@ extension OpenAIWireProvider: ToolCallingProvider {
                     while true {
                         let parser = SSEParser()
                         var completed = false
-                        var receivedResponseBytes = false
+                        var receivedAcceptedPayload = false
                         var emittedText = ""
 
                         func handle(_ payload: String) throws -> Bool {
                             if payload == "[DONE]" {
+                                receivedAcceptedPayload = true
                                 guard completed else {
                                     throw ProviderErrorFormatting
                                         .incompleteStream(
@@ -434,6 +440,7 @@ extension OpenAIWireProvider: ToolCallingProvider {
                                     throw IntatisError.decoding(
                                         "Responses completion is missing its response ID.")
                                 }
+                                receivedAcceptedPayload = true
                                 if let usage =
                                     Self.responsesUsage(response) {
                                     continuation.yield(.usage(usage))
@@ -468,12 +475,12 @@ extension OpenAIWireProvider: ToolCallingProvider {
                             default:
                                 break
                             }
+                            receivedAcceptedPayload = true
                             return false
                         }
 
                         do {
                             for try await chunk in http.stream(urlRequest) {
-                                receivedResponseBytes = true
                                 for payload in parser.consume(chunk) {
                                     if try handle(payload) { return }
                                 }
@@ -497,7 +504,7 @@ extension OpenAIWireProvider: ToolCallingProvider {
                                 attempt: attempt,
                                 policy: runtimePolicy,
                                 receivedResponseBytes:
-                                    receivedResponseBytes) {
+                                    receivedAcceptedPayload) {
                                 attempt += 1
                                 try await ProviderRuntime.sleepBeforeRetry(
                                     nextAttempt: attempt,

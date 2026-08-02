@@ -122,6 +122,8 @@ Provider resolution 也必须是原子的：shipping resolver 一次返回 exact
 
 `rename_session` 是普通工具协议中的 session-local metadata 能力，但不是普通 coordinator 能力。它只进入 exact `@main` 的 default capability lease；worker、spawn 出的 coordinator、task-scoped non-main lease 与 reviewer 都必须移除，不能通过 intersection/继承意外流下去。模型只提供名称，宿主绑定当前 session/kind 和 durable execution ID；不存在跨 session 目标解析。
 
+`update_goal` / `submit_goal_verdict` 同样不是普通 coordinator 能力。产品数据面只把它加入 exact `@main` 的 current default/task lease；worker、spawn coordinator、task-scoped non-main 与 reviewer 必须移除，legacy main default 必须通过 durable replacement 升级而非原地改写。该工具只能请求 complete/blocked 转换，不能创建 audit：complete 仍必须已有独立 GoalVerifier 输出并经 host-derived validation evidence 校验，blocked 仍必须已有连续三轮相同 verified blocker。因此 `@main` 获得调用入口不等于获得 Goal 自我认证 authority。
+
 Lease 不只是工具列表：task-scoped lease 必须核对 task ID、communication/delegation grant，并在终态撤销；WorkspaceLease 必须执行 root、read-only/read-write、allow/deny path，并固定 canonical root 的文件系统 identity。任何可能跨 await 的授权都不能只在入口校验：attach commit、权限等待后、durable prepare 后紧邻 executor、派生/retry 与 process 启动前必须复核 identity；同路径目录被替换或 legacy lease 无 identity 时 fail closed。retry 只可从原 lease 的持久审计记录克隆，缺失历史时收窄到 worker，禁止按 agent 默认角色扩大权限。
 
 ### 2.5 Task Graph + Scheduler
@@ -149,6 +151,40 @@ Goal Verifier 是另一条独立控制面，职责仅是判定 Goal 是否已有
 Goal 生命周期必须由 host 串行化：start、ordinary turn、Goal mutation 与 stop/shutdown 分别有 single-flight/mutation/stop gate；pending durable stop 未结算前不得启动新 run，start 取消后若已创建 continuation，必须先 scoped cancel、等待退出并 checkpoint 才返回失败。restore 必须持续暂停 scheduler，直到 roster/reviewer/main 与 Goal recovery/reconcile 完成。GUI 随后只释放新工作并继续围栏 restored roots；CLI 才执行显式 data-plane resume。Cowork `/goal` 是明确 host action；普通自然语言只有在窄、确定性的中英文持续目标分类器命中时才可为本轮提供 create intent，复杂请求、Goal 提及、一次性目标、引用示例或附件内容不得提升权限。
 
 模型可见的 agent/task/message/goal/session 操作与文件、网络、文档工具遵循同一个 ToolCall 协议。WorkTask CRUD、Goal create/update 与 session rename 都必须先过 schema、lease（Cowork）与 PermissionEngine；`rename_session` 的 exact current-session/no-path/no-network/no-data-effect intent 可由 deterministic gate 低风险放行，但 near-miss 与 locked 状态不能借此绕过。worker 默认只能读取 Goal/相关 WorkTask，并更新自己当前绑定的 WorkTask，不能改 DAG/owner/priority/retry/cancel、提交 Goal verdict或改 session 名称。一个外部 ToolCall 只能有一个权限决定；`spawn_agent` / 原子 `delegate_task` 获准后，内部 roster、lease、mailbox、task graph 与 scheduler admission 必须作为 executor 的 durable transaction 完成，不能再次递归进入 PermissionEngine。Code 与 Cowork agent 共用 headless `AgentRuntime`；首个 system message 必须稳定声明 Intatis 模式、API tools 权威性、严格 JSON Schema 与 ToolResult 完成语义，动态 workspace/task/lease/goal/run 数据仍放在 user-role untrusted context。
+
+### 2.3b Coordinator routing Skill
+
+拥有 coordinator lease 的 agent 必须在第一次 direct/reuse/delegate/spawn/profile/
+lease 调度决定前激活 exact bundled system Skill
+`cowork-agent-orchestration`。它是调度上下文而非权限：不得替代 scheduler、
+WorkTask graph、CapabilityLease、WorkspaceLease、PermissionEngine 或 exact
+inference binding。找不到 exact system entry 或激活失败时，不得采用同名
+workspace/user Skill，必须保守回退为 direct、继承 exact profile、read-only、
+无 child coordination，除非任务本身明确要求创建 agent。
+
+调度模式只有三种：`cost-first` 选择最低成本且明确足够的 approved profile；
+`cost-efficient-balanced` 优化包含协调/返工的预计总成本并作为默认；
+`efficiency-first` 优化关键路径 wall-clock 与首轮成功率。任何显式 child profile
+都必须先取当前 `list_inference_profiles` 的 exact ID；dated vendor reference 只
+辅助解释 host label，不能创建 route。选择必须先满足 exact declared capabilities，
+再排除 retired/deprecated route，并在足够候选中优先较新的 active generation；成本
+仍按三种模式作为真实 tradeoff，而非被“最新”完全覆盖。自定义/无法识别的 model
+不得伪造发布日期或价格。
+
+reference 的正式 provider 矩阵可以覆盖多于当前 JSON 的厂商（当前为 OpenAI、
+Anthropic、Google、Meta、xAI、Mistral、DeepSeek、Kimi、Z.ai、MiniMax、Qwen），
+但只能作为 exact configured candidates 的 dated shortlist。stable 默认优先于
+Preview；开放权重或经第三方托管的模型没有可假定的统一价格。任何 entry 不在当前
+profile list、未声明 required capability 或生命周期不合格，就必须先被删除。
+
+涉及 image/audio/video input 或 generation/editing 时，capability 是 hard gate。
+main 未声明所需能力必须搭配一个 `list_inference_profiles` 明确声明能力的副 agent；
+该副 agent 默认 read-only/no-coordinate，只承担 modality-specific WorkTask。没有
+合格 profile 或 attachment/artifact 不能真实交付时必须 fail closed/report blocked，
+不得把文本推断写成多模态验收结果。优先最小 team 和最小 lease：自动委派默认
+read-only/inherit，写任务才显式 read-write，需要真实子图所有权时才授予
+`canCoordinate`。不同 profile 或持久/write-capable worker 使用 `spawn_agent`
+成功后再委派；`delegate_task` 本身不能切换 profile。
 
 ## 3. 通信 vs 委派
 

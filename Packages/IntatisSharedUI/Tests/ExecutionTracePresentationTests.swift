@@ -37,15 +37,15 @@ final class ExecutionTracePresentationTests: XCTestCase {
         }
     }
 
-    func testDefaultProjectionKeepsConversationAndErrorsOnly() {
+    func testDefaultProjectionKeepsConversationAgentTrafficAndErrors() {
         let items = makeItems()
 
         let displayed = IntatisExecutionTracePresentation.displayedItems(
             items,
             showExecutionTrace: false)
 
-        XCTAssertEqual(displayed.map(\.kind), [.user, .agent, .error])
-        XCTAssertEqual(displayed.map(\.id), ["user", "agent", "error"])
+        XCTAssertEqual(displayed.map(\.kind), [.user, .agentToAgent, .agent, .error])
+        XCTAssertEqual(displayed.map(\.id), ["user", "agent-to-agent", "agent", "error"])
     }
 
     func testEnabledProjectionRestoresCompletePreviousTranscript() {

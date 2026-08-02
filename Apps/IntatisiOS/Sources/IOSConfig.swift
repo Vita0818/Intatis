@@ -1,6 +1,7 @@
 #if canImport(SwiftUI)
 import Foundation
 import IntatisCore
+import IntatisProtocol
 import IntatisProviders
 import IntatisConversation
 
@@ -156,6 +157,15 @@ private struct IOSProviderSelection: Codable, Equatable {
     var modelID: String
 }
 
+private struct IOSImportedProviderConfiguration: Codable, Equatable {
+    static let currentSchemaVersion = 1
+
+    var schemaVersion: Int
+    var sourceFilename: String
+    var catalog: IOSProviderCatalog
+    var providerConfig: ProviderConfig
+}
+
 /// iOS app configuration. Mirrors the macOS chat config with file-backed
 /// provider secrets; there is deliberately no workspace/shell/agent setup.
 enum IOSConfig {
@@ -167,6 +177,7 @@ enum IOSConfig {
     private static let modelKey = "intatis.model"
     private static let providerCatalogKey = "intatis.providerCatalog.v1"
     private static let providerSelectionKey = "intatis.providerSelection.v1"
+    private static let importedConfigFilename = "imported-chat-configuration.json"
     private static let defaultProviderID = "default"
     static let defaultBaseURL = "https://api.openai.com/v1"
     static let defaultChatEndpoint = "https://api.openai.com/v1/chat/completions"
@@ -220,7 +231,9 @@ enum IOSConfig {
     static var providerCatalog: IOSProviderCatalog {
         get {
             let catalog: IOSProviderCatalog
-            if let data = UserDefaults.standard.data(forKey: providerCatalogKey),
+            if let imported = importedConfiguration() {
+                catalog = normalizedCatalog(imported.catalog)
+            } else if let data = UserDefaults.standard.data(forKey: providerCatalogKey),
                let decoded = try? JSONDecoder().decode(IOSProviderCatalog.self, from: data) {
                 catalog = normalizedCatalog(decoded)
             } else {
@@ -229,18 +242,63 @@ enum IOSConfig {
             return applyingStoredSelection(to: catalog)
         }
         set {
-            let normalized = normalizedCatalog(newValue)
-            if let data = try? JSONEncoder().encode(normalized) {
-                UserDefaults.standard.set(data, forKey: providerCatalogKey)
-            }
-            storeSelection(from: normalized)
-            if let provider = normalized.selectedProvider {
-                UserDefaults.standard.set(provider.baseURL, forKey: baseURLKey)
-            }
-            if let model = normalized.selectedModel {
-                UserDefaults.standard.set(model.id, forKey: modelKey)
-            }
+            try? saveProviderCatalog(newValue)
         }
+    }
+
+    static var importedConfigDescription: String? {
+        importedConfiguration()?.sourceFilename
+    }
+
+    @discardableResult
+    static func installImportedConfiguration(
+        _ imported: ImportedChatConfiguration,
+        sourceFilename: String
+    ) throws -> IOSProviderCatalog {
+        let providers = imported.providers.map { provider in
+            IOSProviderSettings(
+                id: provider.id,
+                displayName: provider.displayName,
+                baseURL: provider.endpoint.baseURL.absoluteString,
+                chatEndpoint: provider.endpoint.chatEndpoint?.absoluteString,
+                apiKeyAccount: legacyAPIKeyAccount(forProviderID: provider.id),
+                apiKeySource: apiKeySource(for: provider.endpoint.apiKeyRef),
+                models: provider.models.map {
+                    IOSProviderModel(id: $0.id, displayName: $0.displayName)
+                })
+        }
+        let catalog = normalizedCatalog(IOSProviderCatalog(
+            selectedProviderID: imported.selectedProviderID,
+            selectedModelID: imported.selectedModelID,
+            providers: providers))
+        var providerConfig = imported.providerConfig
+        providerConfig.models = resolvedModels(
+            for: catalog,
+            webSearch: imported.webSearchModel)
+        let document = IOSImportedProviderConfiguration(
+            schemaVersion: IOSImportedProviderConfiguration.currentSchemaVersion,
+            sourceFilename: safeSourceFilename(sourceFilename),
+            catalog: catalog,
+            providerConfig: providerConfig)
+        try writeImportedConfiguration(document)
+        persistCatalogMirror(catalog)
+        return providerCatalog
+    }
+
+    static func saveProviderCatalog(_ rawCatalog: IOSProviderCatalog) throws {
+        let catalog = normalizedCatalog(rawCatalog)
+        if var imported = importedConfiguration() {
+            let webSearch = imported.providerConfig.models.webSearch
+            imported.catalog = catalog
+            imported.providerConfig.endpoints = mergedEndpoints(
+                catalog: catalog,
+                existing: imported.providerConfig.endpoints)
+            imported.providerConfig.models = resolvedModels(
+                for: catalog,
+                webSearch: webSearch)
+            try writeImportedConfiguration(imported)
+        }
+        persistCatalogMirror(catalog)
     }
 
     @discardableResult
@@ -287,6 +345,16 @@ enum IOSConfig {
 
     static func providerConfig() -> ProviderConfig {
         let catalog = providerCatalog
+        if var imported = importedConfiguration() {
+            let webSearch = imported.providerConfig.models.webSearch
+            imported.providerConfig.endpoints = mergedEndpoints(
+                catalog: catalog,
+                existing: imported.providerConfig.endpoints)
+            imported.providerConfig.models = resolvedModels(
+                for: catalog,
+                webSearch: webSearch)
+            return imported.providerConfig
+        }
         let selectedProvider = catalog.selectedProvider ?? defaultProvider()
         let selectedModel = catalog.selectedModel ?? selectedProvider.models.first
             ?? IOSProviderModel(id: defaultModel, displayName: defaultDisplayName(for: defaultModel))
@@ -411,6 +479,127 @@ enum IOSConfig {
         if let data = try? JSONEncoder().encode(selection) {
             UserDefaults.standard.set(data, forKey: providerSelectionKey)
         }
+    }
+
+    private static func persistCatalogMirror(_ catalog: IOSProviderCatalog) {
+        if let data = try? JSONEncoder().encode(catalog) {
+            UserDefaults.standard.set(data, forKey: providerCatalogKey)
+        }
+        storeSelection(from: catalog)
+        if let provider = catalog.selectedProvider {
+            UserDefaults.standard.set(provider.baseURL, forKey: baseURLKey)
+        }
+        if let model = catalog.selectedModel {
+            UserDefaults.standard.set(model.id, forKey: modelKey)
+        }
+    }
+
+    private static func importedConfigurationURL() -> URL {
+        appSupportDir().appendingPathComponent(importedConfigFilename)
+    }
+
+    private static func importedConfiguration() -> IOSImportedProviderConfiguration? {
+        let url = importedConfigurationURL()
+        guard let data = try? Data(contentsOf: url),
+              let document = try? JSONDecoder().decode(
+                  IOSImportedProviderConfiguration.self,
+                  from: data),
+              document.schemaVersion == IOSImportedProviderConfiguration.currentSchemaVersion else {
+            return nil
+        }
+        return document
+    }
+
+    private static func writeImportedConfiguration(
+        _ document: IOSImportedProviderConfiguration
+    ) throws {
+        let url = importedConfigurationURL()
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(document)
+        #if os(iOS)
+        try data.write(to: url, options: [.atomic, .completeFileProtection])
+        #else
+        try data.write(to: url, options: .atomic)
+        #endif
+        try? FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: url.path)
+    }
+
+    private static func safeSourceFilename(_ raw: String) -> String {
+        let name = URL(fileURLWithPath: raw).lastPathComponent
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let fallback = "intatis.json"
+        guard !name.isEmpty else { return fallback }
+        return String(name.prefix(255))
+    }
+
+    private static func apiKeySource(for ref: KeychainRef) -> IOSProviderAPIKeySource? {
+        switch ref.source {
+        case .keychain, .authFile:
+            return nil
+        case .environment:
+            return IOSProviderAPIKeySource(type: "env", value: ref.account)
+        case .file:
+            return IOSProviderAPIKeySource(type: "file", value: ref.account)
+        case .providerConfig:
+            return IOSProviderAPIKeySource(type: "providerConfig", value: ref.service)
+        }
+    }
+
+    private static func mergedEndpoints(
+        catalog: IOSProviderCatalog,
+        existing: [ProviderEndpoint]
+    ) -> [ProviderEndpoint] {
+        catalog.providers.map { provider in
+            var value = existing.first { $0.id == provider.id }
+                ?? endpoint(for: provider)
+            value.baseURL = URL(string: provider.baseURL)
+                ?? URL(string: defaultBaseURL)!
+            value.chatEndpoint = URL(string: provider.chatEndpoint)
+            value.apiKeyRef = apiKeyRef(for: provider)
+
+            let modelIDs = Set(provider.models.map(\.id))
+            value.modelRequestAdapters = value.modelRequestAdapters.filter {
+                modelIDs.contains($0.key)
+            }
+            value.modelRequestOptions = value.modelRequestOptions.filter {
+                modelIDs.contains($0.key)
+            }
+            value.modelCapabilities = value.modelCapabilities.filter {
+                modelIDs.contains($0.key)
+            }
+            return value
+        }
+    }
+
+    private static func resolvedModels(
+        for catalog: IOSProviderCatalog,
+        webSearch: ModelRef? = nil
+    ) -> ResolvedModels {
+        let selectedProvider = catalog.selectedProvider ?? defaultProvider()
+        let selectedModel = catalog.selectedModel ?? selectedProvider.models.first
+            ?? IOSProviderModel(
+                id: defaultModel,
+                displayName: defaultDisplayName(for: defaultModel))
+        let chat = ModelRef(
+            endpoint: selectedProvider.id,
+            model: ModelID(rawValue: selectedModel.id))
+        var models = ResolvedModels(
+            chat: chat,
+            webSearch: webSearch,
+            agent: chat)
+        models.imageGen = ModelRef(
+            endpoint: selectedProvider.id,
+            model: ModelID(rawValue: "dall-e-3"))
+        models.transcription = ModelRef(
+            endpoint: selectedProvider.id,
+            model: ModelID(rawValue: "whisper-1"))
+        return models
     }
 
     private static func defaultProvider() -> IOSProviderSettings {

@@ -672,45 +672,78 @@ public struct CoworkShell: View {
     }
 
     private func content(rawWidth: CGFloat) -> some View {
+        let inspectorIsPinnedForPermission = pending != nil
         let inspectorLayout = IntatisWorkspaceInspectorLayoutPolicy.resolve(
             availableWidth: rawWidth,
-            isRequested: showsInspector,
+            isRequested: showsInspector || inspectorIsPinnedForPermission,
             activationWidth: 980,
             minimumThreadWidth: 620,
             minimumInspectorWidth: 286,
             idealInspectorWidth: 318,
-            maximumInspectorWidth: 390)
+            maximumInspectorWidth: 390,
+            dividerWidth: 0)
+        let trailingStatusRailWidth = inspectorLayout.isVisible
+            ? inspectorLayout.inspectorWidth
+            : 0
+        let primaryScrollerClearance: CGFloat = inspectorLayout.isVisible
+            ? 10
+            : 0
 
-        return HStack(spacing: 0) {
+        return ZStack(alignment: .trailing) {
             threadColumn(
                 layout: IntatisThreadContentLayout(
                     rawWidth: inspectorLayout.threadWidth),
                 showsCompactActions: !inspectorLayout.isVisible,
-                inspectorIsAvailable: rawWidth >= 980)
-                .frame(width: inspectorLayout.threadWidth)
-                .frame(maxHeight: .infinity)
+                inspectorIsAvailable: rawWidth >= 980,
+                inspectorIsVisible: inspectorLayout.isVisible,
+                showsPermissionFallback: pending != nil
+                    && !inspectorLayout.isVisible,
+                trailingStatusRailWidth: trailingStatusRailWidth)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             if inspectorLayout.isVisible {
-                Divider()
-                inspectorColumn
-                    .frame(width: inspectorLayout.inspectorWidth)
-                    .frame(maxHeight: .infinity)
-                    .background(.bar)
-                    .accessibilityIdentifier("cowork.inspector")
+                HStack(spacing: 0) {
+                    inspectorColumn
+                        .frame(width: max(
+                            inspectorLayout.inspectorWidth
+                                - primaryScrollerClearance,
+                            1))
+                        .frame(maxHeight: .infinity)
+                    Color.clear
+                        .frame(width: primaryScrollerClearance)
+                        .allowsHitTesting(false)
+                }
+                .frame(width: inspectorLayout.inspectorWidth)
+                .frame(maxHeight: .infinity)
+                .accessibilityIdentifier("cowork.inspector")
             }
         }
     }
 
     private func threadColumn(layout: IntatisThreadContentLayout,
                               showsCompactActions: Bool,
-                              inspectorIsAvailable: Bool) -> some View {
+                              inspectorIsAvailable: Bool,
+                              inspectorIsVisible: Bool,
+                              showsPermissionFallback: Bool,
+                              trailingStatusRailWidth: CGFloat) -> some View {
         VStack(spacing: 0) {
             header(
                 layout: layout,
                 showsCompactActions: showsCompactActions,
-                inspectorIsAvailable: inspectorIsAvailable)
-            thread(layout: layout)
-            permissionArea(layout: layout)
+                inspectorIsAvailable: inspectorIsAvailable,
+                inspectorIsVisible: inspectorIsVisible)
+                .frame(width: layout.rawWidth)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            thread(
+                layout: layout,
+                trailingContentMargin: trailingStatusRailWidth)
+            if showsPermissionFallback {
+                permissionFallbackArea(layout: layout)
+                    .frame(width: layout.rawWidth)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
             composerArea(layout: layout)
+                .frame(width: layout.rawWidth)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -718,7 +751,8 @@ public struct CoworkShell: View {
     private func header(
         layout: IntatisThreadContentLayout,
         showsCompactActions: Bool,
-        inspectorIsAvailable: Bool
+        inspectorIsAvailable: Bool,
+        inspectorIsVisible: Bool
     ) -> some View {
         IntatisWorkspaceThreadHeader(
             title: sessionTitle,
@@ -726,7 +760,8 @@ public struct CoworkShell: View {
             style: threadStyle,
             actions: resolvedHeaderActions(
                 showsCompactActions: showsCompactActions,
-                inspectorIsAvailable: inspectorIsAvailable))
+                inspectorIsAvailable: inspectorIsAvailable,
+                inspectorIsVisible: inspectorIsVisible))
         .frame(maxWidth: layout.contentMaxWidth)
         .frame(maxWidth: .infinity)
         .padding(.horizontal, layout.horizontalPadding)
@@ -736,7 +771,8 @@ public struct CoworkShell: View {
 
     private func resolvedHeaderActions(
         showsCompactActions: Bool,
-        inspectorIsAvailable: Bool
+        inspectorIsAvailable: Bool,
+        inspectorIsVisible: Bool
     ) -> [IntatisThreadHeaderAction] {
         var actions = headerActions
         if showsCompactActions {
@@ -756,13 +792,16 @@ public struct CoworkShell: View {
                     action: onAddAgent))
             }
         }
-        let inspectorTitle = showsInspector && inspectorIsAvailable
-            ? IntatisLocalization.string("Hide Inspector")
-            : IntatisLocalization.string("Show Inspector")
+        let permissionPinsInspector = pending != nil && inspectorIsVisible
+        let inspectorTitle = permissionPinsInspector
+            ? IntatisLocalization.string("Permission Review")
+            : inspectorIsVisible
+                ? IntatisLocalization.string("Hide Inspector")
+                : IntatisLocalization.string("Show Inspector")
         actions.append(IntatisThreadHeaderAction(
             title: inspectorTitle,
-            systemImage: "sidebar.right",
-            isDisabled: !inspectorIsAvailable,
+            systemImage: permissionPinsInspector ? "lock.shield" : "sidebar.right",
+            isDisabled: !inspectorIsAvailable || permissionPinsInspector,
             isIconOnly: true,
             help: inspectorTitle,
             accessibilityIdentifier: "cowork.inspector.toggle") {
@@ -774,58 +813,46 @@ public struct CoworkShell: View {
 
     private var inspectorColumn: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
-                gitStatusSection
-                agentStatusSection
-                if goal != nil {
-                    goalCardSection
-                }
-                if !workTasks.tasks.isEmpty {
-                    workTasksSection
+            IntatisGlassEffectGroup(spacing: 18) {
+                VStack(alignment: .leading, spacing: 16) {
+                    if pending != nil || permissionNotice != nil {
+                        permissionStatusSection
+                    }
+                    agentStatusSection
+                    if goal != nil {
+                        goalCardSection
+                    }
+                    if !workTasks.tasks.isEmpty {
+                        workTasksSection
+                    }
                 }
             }
-            .padding(16)
+            .padding(18)
         }
+        .scrollIndicators(.hidden)
     }
 
-    private var gitStatusSection: some View {
-        rightRailSection("Git Status") {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 8) {
-                    Image(systemName: "arrow.triangle.branch")
-                        .font(.caption.bold())
-                        .foregroundStyle(threadStyle.accent)
-                        .frame(width: 18)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(primaryWorkspaceName)
-                            .font(.caption.bold())
-                            .foregroundStyle(threadStyle.primaryText)
-                            .lineLimit(1)
-                        Text("status only")
-                            .font(.caption2)
-                            .foregroundStyle(threadStyle.secondaryText)
-                            .lineLimit(1)
-                    }
-                    Spacer(minLength: 8)
-                    Image(systemName: "circle")
-                        .font(.caption2)
-                        .foregroundStyle(threadStyle.tertiaryText)
-                }
-                Text(primaryWorkspacePath)
-                    .font(.caption2)
-                    .foregroundStyle(threadStyle.tertiaryText)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                Text("Branch, commit, PR, CI, and review controls stay out of this rail.")
-                    .font(.caption2)
-                    .foregroundStyle(threadStyle.tertiaryText)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
+    @ViewBuilder private var permissionStatusSection: some View {
+        if let pending {
+            PermissionCard(
+                permission: pending,
+                embedsSurface: false,
+                onResolve: onResolve)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .intatisLiquidGlass(cornerRadius: 18)
+                .accessibilityIdentifier("cowork.permission.review")
+        } else if let permissionNotice {
+            PermissionResolutionNoticeView(
+                notice: permissionNotice,
+                embedsSurface: false)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .intatisLiquidGlass(cornerRadius: 18)
+                .accessibilityIdentifier("cowork.permission.review")
         }
     }
 
     private var agentStatusSection: some View {
-        rightRailSection("Agents") {
+        rightRailSection("Agents", systemImage: "person.2") {
             agentStatusList
         }
     }
@@ -836,7 +863,7 @@ public struct CoworkShell: View {
                 .font(.caption)
                 .foregroundStyle(threadStyle.tertiaryText)
         } else {
-            VStack(alignment: .leading, spacing: 7) {
+            VStack(alignment: .leading, spacing: 9) {
                 ForEach(visibleAgents) { agent in
                     agentStatusRow(agent)
                 }
@@ -882,14 +909,14 @@ public struct CoworkShell: View {
     }
 
     private var goalCardSection: some View {
-        rightRailSection("Goal") {
+        rightRailSection("Goal", systemImage: "scope") {
             goalCardContent
         }
         .accessibilityIdentifier("cowork.goal.card")
     }
 
     private var workTasksSection: some View {
-        rightRailSection("Tasks") {
+        rightRailSection("Tasks", systemImage: "checklist") {
             workTasksContent
         }
         .accessibilityIdentifier("cowork.tasks.card")
@@ -1080,11 +1107,20 @@ public struct CoworkShell: View {
         intatisLocalizedDisplayStatus(status)
     }
 
-    private func rightRailSection<Content: View>(_ title: String,
-                                                 @ViewBuilder content: () -> Content) -> some View {
-        inspectorSection(title) {
+    private func rightRailSection<Content: View>(
+        _ title: String,
+        systemImage: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 11) {
+            Label(IntatisLocalization.string(title), systemImage: systemImage)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(threadStyle.primaryText)
             content()
         }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .intatisLiquidGlass(cornerRadius: 18)
     }
 
     private var inspectorOverview: some View {
@@ -1198,13 +1234,6 @@ public struct CoworkShell: View {
         inspectorSection("Access") {
             inspectorRow("Workspace leases", value: "\(summary.workspaceLeaseCount)")
             inspectorRow("Capability leases", value: "\(summary.capabilityLeaseCount)")
-            inspectorRow(
-                "Git",
-                value: IntatisLocalization.string("status only"))
-            Text("Commit, branch, PR, CI, and review workflows are deferred.")
-                .font(.caption2)
-                .foregroundStyle(threadStyle.tertiaryText)
-                .fixedSize(horizontal: false, vertical: true)
         }
         if let latestTurnStats {
             inspectorSection("Last Turn") {
@@ -1573,19 +1602,6 @@ public struct CoworkShell: View {
         }
     }
 
-    private var primaryWorkspace: CoworkWorkspaceInfo? {
-        project.workspaces.first { $0.isPrimary } ?? project.workspaces.first
-    }
-
-    private var primaryWorkspaceName: String {
-        primaryWorkspace?.displayName ?? IntatisLocalization.string("No workspace")
-    }
-
-    private var primaryWorkspacePath: String {
-        primaryWorkspace?.path
-            ?? IntatisLocalization.string("Attach a workspace to inspect git state.")
-    }
-
     private func agentRoster(layout: IntatisThreadContentLayout) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             ScrollView(.horizontal) {
@@ -1744,10 +1760,14 @@ public struct CoworkShell: View {
         }
     }
 
-    @ViewBuilder private func thread(layout: IntatisThreadContentLayout) -> some View {
+    @ViewBuilder private func thread(
+        layout: IntatisThreadContentLayout,
+        trailingContentMargin: CGFloat
+    ) -> some View {
         if displayedItems.isEmpty && !showsThinkingIndicator {
             CoworkEmptyThreadView(style: threadStyle)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .frame(width: layout.rawWidth)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
                 .padding(.horizontal, layout.horizontalPadding)
         } else {
             let historyWindow = threadHistoryWindow
@@ -1816,6 +1836,10 @@ public struct CoworkShell: View {
                     .padding(.horizontal, layout.horizontalPadding)
                     .padding(.top, 16)
                 }
+                .contentMargins(
+                    .trailing,
+                    trailingContentMargin,
+                    for: .scrollContent)
                 .scrollContentBackground(.hidden)
                 .intatisThreadViewportFrameProbe()
                 .onPreferenceChange(
@@ -1844,6 +1868,7 @@ public struct CoworkShell: View {
                                     perform: scrollPerformer(proxy))
                             }
                         }
+                        .padding(.trailing, trailingContentMargin)
                     }
                 }
                 .onAppear {
@@ -1988,13 +2013,11 @@ public struct CoworkShell: View {
         }
     }
 
-    @ViewBuilder private func permissionArea(layout: IntatisThreadContentLayout) -> some View {
+    @ViewBuilder private func permissionFallbackArea(
+        layout: IntatisThreadContentLayout
+    ) -> some View {
         if let pending {
             PermissionCard(permission: pending, onResolve: onResolve)
-                .frame(maxWidth: layout.contentMaxWidth, alignment: .leading)
-                .padding(.horizontal, layout.horizontalPadding)
-        } else if let permissionNotice {
-            PermissionResolutionNoticeView(notice: permissionNotice)
                 .frame(maxWidth: layout.contentMaxWidth, alignment: .leading)
                 .padding(.horizontal, layout.horizontalPadding)
         }

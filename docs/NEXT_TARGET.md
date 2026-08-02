@@ -13,6 +13,131 @@ This temporary file records the next concrete objective for this project.
   Hardened Runtime 或 iOS target 边界。后续以
   `docs/MACOS_DISTRIBUTION.md` 为准。
 
+## Completed implementation slice — 2026-08-02 Settings progressive disclosure
+
+- macOS Settings 默认层级已收敛为 provider 基础项、Test/Save、Advanced 与
+  Diagnostics；Connection、Models 及 MCP/renderer/notices/config 等低频设置改为按需
+  展开，诊断导出保留为底部轻量行，不再常驻展示实现细节长文。
+- 所有既有设置与本地诊断导出能力仍可达；凭据、EventLog、权限、安全边界、配置 schema
+  和 iOS 产品边界不变。Computer Use 已验证默认态及三个 disclosure 的交互，默认 AX
+  元素约从 62 降到 33；Swift parse、localization JSON、focused tests 10/10、macOS/iOS
+  Debug builds 均通过。
+- 本轮运行态视觉验收覆盖深色模式；浅色模式、Reduce Transparency 与 Increase Contrast
+  仍是后续视觉 QA 项，不阻塞本次默认信息层级收口。
+
+## Completed implementation slice — 2026-08-02 main Goal transition and document reader
+
+- Cowork exact `@main` 的 fresh/default/task lease 现包含 `submit_goal_verdict`，因此可调用
+  `update_goal`；non-main、spawn coordinator 与 reviewer 显式移除。legacy main default
+  使用新的 durable lease 替换，历史 task 引用不被原地扩大。该调用仍不能自产 audit：
+  complete 要求独立 GoalVerifier + host-bound evidence，blocked 要求既有三轮相同 verified
+  blocker。
+- 新增结构化 `read_document`：读取 workspace 内 Office/OpenDocument/RTF/CSV/HTML/
+  Markdown/text/EPUB/PDF，通过本地 Docling 或 MarkItDown 转为有界 Markdown；legacy
+  Office 依赖 LibreOffice。它不接收 model-authored shell/URL，禁用 remote services 与
+  plugins，structured process 默认断网并保留 WorkspaceLease、timeout/cancel/process
+  cleanup。parser 只从系统受信路径或用户建立的 Intatis document runtime 读取，未加入
+  SwiftPM 依赖、未打包 Python runtime，iOS 产品图不变。
+- IntatisTools/IntatisCowork targets、CapabilityLease 4/4、ToolRegistryLease 16/16、
+  GoalManagerRuntime 7/7、GoalVerifierControlPlane 14/14、Agent request tool snapshot 6/6
+  通过；完整 SwiftPM、IntatisMac Debug 与 generic IntatisiOS Simulator Debug build 均成功。
+  本机 Docling 2.117.0 已把由 workspace README 生成的真实 DOCX 转回 27,699-byte Markdown。
+  完整 Tools bundle 在当前外层沙箱仍因 nested `sandbox-exec` 系统性失败；标准 registry
+  数量断言已随 `read_document` 同步为 59，并由 focused registry test 覆盖。
+  MarkItDown 未安装，真实 PPTX/XLSX、legacy DOC/PPT/XLS 质量矩阵与 App 内
+  provider-triggered E2E 仍为 UNKNOWN。
+- 2026-08-02 的工具选择 slice 只追加了计划第 1–2 点：共享系统提示词中的通用选择/失败重评规则，以及 `read_pdf` / `read_document` / `reconstruct_document_image` 互不重叠的 model-facing 说明和 no-text hint。通用宿主确定性路由、完整 executor 兼容性 preflight、输出原子分期和 typed side-effect/no-effect 链路（原第 3–5 点）仍是明确后续项。
+- 随后针对真实 314.1 MiB 扫描 PDF 只做了 `read_document` 局部热修：上限调为 512 MiB，并把 parser 启动前的 path/file/size/extension/backend 拒绝类型化为 no-effect。这不等于已完成通用宿主路由、分页、输出原子分期或整套第 3–5 点。
+
+## Completed implementation slice — 2026-08-02 local diagnostic export
+
+- macOS Settings 最底部现可生成并导出本地诊断 ZIP；覆盖 app/system 摘要、结构化脱敏
+  session EventLog、unified log、proxy、performance、hang 与 crash，并用 manifest
+  明确记录每项成功、失败和截断。
+- 原始会话、工具数据、endpoint、credential、配置/auth、workspace、artifact、browser
+  与 bookmark 不进入导出；reader/staging/process/ZIP 具备 bounded、owner-only、
+  no-follow、timeout/cancel 边界。空 session 的虚假 warning 已修复。
+- 专项与全量 SwiftPM tests、XcodeGen、IntatisMac/IntatisiOS Debug builds 和真实
+  Settings 导出均已完成；诊断服务仍为 macOS-only。远程上传按用户要求未实现；未来
+  若增加 support upload，必须作为新的、显式同意且经过服务端/隐私/安全设计的独立
+  目标，不能复用本地按钮暗中发送。
+
+## Completed implementation slice — 2026-08-02 bundled Cowork orchestration Skill
+
+- Cowork coordinator system prompt 现在要求在调度前激活 exact bundled system
+  `cowork-agent-orchestration`；正文仍经普通 `activate_skill` tool result 渐进
+  披露，不嵌入 system prompt。同名 workspace/user Skill 不可替代，缺失/失败时
+  使用 direct、exact-profile inheritance、read-only、no-child-coordination
+  fallback。
+- Skill 固化 direct/reuse/delegate/spawn、最小 agent/lease、write 与 coordination
+  分离，以及 `cost-first` / 默认 `cost-efficient-balanced` /
+  `efficiency-first` 三种调度模式。profile 先做 capability hard gate，再在 active/
+  adequate 候选中优先新 generation，并按模式权衡成本；main 缺少多模态能力时强制
+  搭配 JSON 声明相应 capability 的副 agent。dated vendor reference 只辅助从当前
+  `list_inference_profiles` 选择 exact host-approved ID，不新增 route、credential、
+  权限、配置 schema 或 UI。通用 attachment 到 child 的 bytes handoff 尚未闭环，
+  text-only main 的完整 multimodal companion E2E 仍待后续。
+- dated reference 已加入 11-provider 正式矩阵：OpenAI、Anthropic、Google、Meta、
+  xAI、Mistral、DeepSeek、Kimi、Z.ai、MiniMax、Qwen。矩阵区分 cost-first、balanced、
+  efficiency-first 与 multimodal companion，明确 stable/Preview/open-weight/host-price
+  边界，并始终先与用户 JSON exact profiles、declared capabilities 和 active lifecycle
+  取交集。
+- owner correction 已把 Meta 正式 anchor 换成 Public Preview 的 Muse Spark 1.1，
+  把 Gemini 3.1 Pro Preview 显式加入 Google 高能力路线，把
+  DeepSeek 完整版本 `DeepSeek-V4-Flash-0731` 排为 V4-Pro 的上位 agent 推荐，且把
+  `deepseek-v4-flash` 限定为 wire alias，并把 Qwen Flash exact anchor 固定为
+  Qwen3.6-Flash；这些推荐仍不能创建 JSON 中不存在的 profile。
+- correction validator、bundled Skill tests 29/29、Developer ID `IntatisMac`
+  unsigned Debug build 与最终 App bundle 正反向字符串检查均通过；未做真实 provider
+  或 GUI E2E。
+- Validator、focused Skill/Context tests、SwiftPM build、XcodeGen、macOS/iOS Debug
+  product builds 通过；macOS Bundle 内容与 iOS 零 Skills linkage 已检查。真实
+  provider/长时多 agent E2E 仍待后续；外层 managed sandbox 的既有 process/
+  Seatbelt/loopback 限制使 full SwiftPM suite 不能在本轮记为通过。
+- 正式 11-provider matrix 的增量验证也已完成：Skill validator 通过，bundled
+  resource assertions 29/29 通过，Developer ID `IntatisMac` unsigned Debug build
+  成功，最终 App bundle 已确认包含矩阵和新增 Kimi/Z.ai/MiniMax/Qwen anchors。
+
+## Completed implementation slice — 2026-08-02 Icon Composer app icon and installed Release
+
+- 用户提供的根目录 `Intatis.icon` 已作为原生 Icon Composer resource 只接入唯一发行
+  target `IntatisMac`，主图标名固定为 `Intatis`；遗留 App Store 与 iOS target 未改。
+- Xcode 27 Release build 成功，bundle 含 `Intatis.icns`、`Assets.car`、
+  `CFBundleIconFile=Intatis` 与 `CFBundleIconName=Intatis`，可执行文件仍为
+  `arm64 + x86_64` universal。
+- 最新 Release 已安装并单实例运行于 `/Applications/Intatis.app`；旧版保存在
+  `/private/tmp/Intatis.app.before-icon-20260802-1320`。构建/安装 payload 比对和
+  `codesign --verify --deep --strict` 通过。
+- 本机没有 Developer ID identity，故当前安装仅为 ad-hoc Hardened Runtime；
+  Developer ID 签名、公证与 Gatekeeper 分发验收仍未完成。图标来源未独立审计，
+  本轮没有新依赖或上游源码复用，`NOTICE.md` 不变。
+
+## Completed implementation slice — 2026-08-02 automatic-permission transient failure recovery
+
+- Tool-calling streaming now retries an error-only, retryable SSE provider frame only when no
+  non-error payload has been accepted. Any accepted text/tool/usage/completion payload closes the
+  retry boundary, so partial model output or tool calls are never replayed.
+- The first tool call remains durably denied on a typed reviewer provider failure/timeout. One exact
+  model retry may create a fresh permission RequestID/reviewer generation; explicit denials and all
+  other failure kinds retain the existing cached-denial fuse, and a second transient failure cannot
+  re-arm the exception.
+- Duplicate unresolved action descriptions are collapsed in the terminal error. Focused provider
+  and AgentLoop suites, full SwiftPM tests, IntatisMac Debug, and IntatisiOS Simulator Debug passed.
+  No live provider or executor smoke was run. This section supersedes the older raw-response-byte
+  shorthand below for the tool-calling path.
+
+## Completed implementation slice — 2026-08-02 Cowork permission-first Liquid Glass rail
+
+- Cowork trailing rail 已彻底移除 Git 状态、workspace path 与 Git 控件；Git 能力本身仍只作为 Agent tools，经 CapabilityLease、PermissionEngine 与既有安全链调用。
+- pending permission / 最近权限结果位于 rail 第一位，其后依次是 Agents、durable Goal、durable Tasks。各 section 统一使用系统原生 `GlassEffectContainer` + `glassEffect`，没有固定灰底、硬编码颜色或手绘玻璃。
+- pending permission 且 outer width 可容纳 rail 时，rail 临时固定可见；窄到无法容纳时只在 composer 上方显示一个默认 Material 权限卡兜底。RequestID/FIFO、manual approve/decline/cancel-turn、remembered MCP approval 与 automatic non-actionable 语义未改。
+- 已通过 SharedUI build、61 项布局/权限 focused tests、`IntatisMac` Release/Debug、
+  `IntatisiOS` generic Simulator Debug、Light/Dark 宽屏和 Light 窄屏只读视觉检查；
+  最新 Release 已安装到 `/Applications/Intatis.app`。本机无可用 Developer ID
+  identity，当前安装包是 ad-hoc Hardened Runtime 签名，不代表已完成对外分发所需的
+  Developer ID、公证或 Gatekeeper 验收。视觉比较和剩余矩阵见根目录
+  `design-qa.md`。
+
 ## Completed implementation slice — 2026-07-31 browser execution regression
 
 - 浏览器 action 已从 generic `networkStructuredShell` 分离到 shipping
@@ -229,11 +354,11 @@ The later “Next Implementation Slice” sections in this file are retained as 
 
 ## Current Progress Notes
 
-- 2026-08-01 workspace chrome layout-cycle 修复已完成：11:11 crash 的 main-thread 栈为 `NSSplitView.layout` / `NSHostingView.layout` 与 `ToolbarBridge.preferencesDidChange` 在 update-constraints transaction 中重入，不是 OOM/provider。Code/Cowork 已移除 mode-dependent window `.toolbar` 与 child-width-driven `.inspector` feedback；MCP/Project/Inspector action 进入内容 header，右栏由 stable outer width 的有界 HStack policy 决定。最终 `ThreadLayoutTests` 10/10（含真实 NSWindow 360 次 mode/threshold/inspector stress）、ThreadScroll 30/30、MessageRendering 41/41，macOS/iOS Debug build 通过；真实 Debug App 的 200 秒 watchdog 为 99 samples、max RSS 229,376 KiB、max CPU 0.4%，Unified Log 指定布局异常 0、1 秒 sample 主线程 872/872 idle、无新 crash、零残留。Computer Use 只读确认 window toolbar 只剩系统 Sidebar item；后续 resize/click 被控制器拒绝，未冒充完成。多小时与真实 streaming 中 resize 仍是外部验证项。
+- 2026-08-01 workspace chrome layout-cycle 修复已完成：11:11 crash 的 main-thread 栈为 `NSSplitView.layout` / `NSHostingView.layout` 与 `ToolbarBridge.preferencesDidChange` 在 update-constraints transaction 中重入，不是 OOM/provider。Code/Cowork 已移除 mode-dependent window `.toolbar` 与 child-width-driven `.inspector` feedback；MCP/Project/Inspector action 进入内容 header，右栏显隐继续只由 stable outer width policy 决定。Code 保留有界 HStack；2026-08-02 Cowork rail 改为同一 detail canvas 的 trailing overlay，不加 divider/整栏 `.bar` 背景，thread ScrollView 延伸到 detail 最右侧并以 trailing scroll-content margin 为 cards 留位，未恢复 child-width feedback。原最终 `ThreadLayoutTests` 10/10（含真实 NSWindow 360 次 mode/threshold/inspector stress）、ThreadScroll 30/30、MessageRendering 41/41，macOS/iOS Debug build 通过；最新 overlay 回归另见本轮记录。真实 Debug App 的 200 秒 watchdog 为 99 samples、max RSS 229,376 KiB、max CPU 0.4%，Unified Log 指定布局异常 0、1 秒 sample 主线程 872/872 idle、无新 crash、零残留。Computer Use 只读确认 window toolbar 只剩系统 Sidebar item；后续 resize/click 被控制器拒绝，未冒充完成。多小时与真实 streaming 中 resize 仍是外部验证项。
 - 2026-08-01 session title metadata 精简已完成：active Chat/Code/Cowork thread header 只显示 durable session display name，sidebar Recent row 只显示 session name；model/provider/host、workspace/state、agent/running、event/date/path/runtime 灰色副文本与对应空白行均删除。空态首页/Settings 说明、session selection、New、Rename/Delete 与 busy delete gate 保留。Swift parse、`ThreadLayoutTests` 6/6、Developer ID macOS Debug build 通过；独立 bundle 的真实历史 Chat 与 Cowork Recent 已用 Computer Use 只读验证，1100×760 前后对比见 `design-qa.md`，未发送 provider 请求。
 - 2026-07-31 conversation chrome refinement 已完成：macOS sidebar 品牌块只保留 `Intatis`；Chat/Code/Cowork 与共享 iOS Chat 的用户气泡继续 trailing 但不再重复 `You`；权限 review/resolution surface 改为紧凑、左对齐、低对比 Material，risk 只落小图标/chip，structured scope 与 patch 默认折叠且通用详情不读取 raw args。manual/automatic 权限动作、RequestID/FIFO、PermissionEngine/EventLog 均未改变。`ThreadLayoutTests` 6/6、Developer ID macOS Debug 与 iOS Simulator Debug build 通过；独立离线 fixture 的 Light/Dark、collapsed/expanded、automatic、approved 和真实历史 Chat 的 sidebar/user bubble 已用 Computer Use 验证，未发送 provider 请求。当前证据见 `design-qa.md`。
 - 2026-07-22 conversation surface 收口已完成：Cowork 对话页删除常驻 permission-reviewer 顶部横幅，Code/Cowork session header 顶部留白由 26pt 收紧为 12pt；横幅中唯一的 workspace reauthorization / automatic-review retry 入口迁入 Project Settings 的异常 Recovery 区，真正 pending `PermissionCard`、permission FIFO 和权限引擎保持不变。macOS Chat、Code、Cowork 与共享 iOS Chat 的正常 assistant/agent 回复不再套外层 Material/圆角/描边，正文/Markdown/公式直接继承系统 canvas；用户、失败/中断和 tool/error/permission/task 等结构化内容仍有容器。未修改字体、协议、EventLog 或平台边界。`MessageRenderingTests` 22/22、`swift build --disable-sandbox`、IntatisMac macOS Debug 与 IntatisiOS Simulator Debug build 通过；未启动 renderer/真实 App，运行态视觉仍待用户复核。
-- Code/Cowork 的 verbose execution trace 展示熔断已完成并补上重复回答修正：完整 EventLog / `CodeProjection` / agent context 继续保留，SharedUI 默认只把 user、真实 agent message、task-only/different-result fallback 与 actionable error 投入会话树；tool call/result、patch、内部 note、agent-to-agent trace，以及同一 TaskID/agent/attempt 下与最后完整 `message_completed` 正文完全相同的 `task_completed` scheduler 镜像不再参与默认气泡、auto-scroll、thinking 或 Code inspector。配对使用 per-agent active `{TaskID, attempt}`，不做全局正文去重；new start/retry 不继承旧配对，迟到旧 terminal 不清除新 attempt，跨任务同文不误删。后台 `-IntatisShowExecutionTrace` / `INTATIS_SHOW_EXECUTION_TRACE=1` 可在新进程中恢复原完整调试视图，没有 UI/UserDefaults。最终 focused 21/21、完整 Conversation 127/127、Swift build、XcodeGen 与 IntatisMac macOS Debug build 通过；真实 `cowork_9mdz9qkh` 的 seq 15/1553/1557 只读事件/hash 对应通过。未启动 App/renderer fixture，真实问题 session 单实例资源曲线与 GUI 滚动复验仍是验证项，不应把本次展示层修复提前写成 renderer release GO。
+- Code/Cowork 的 verbose execution trace 展示熔断已完成并补上重复回答修正：完整 EventLog / `CodeProjection` / agent context 继续保留。2026-08-02 起 SharedUI 默认把 user、真实 agent message、媒介化 `.agentToAgent` 通信（通用 agent message、information request/reply）、task-only/different-result fallback 与 actionable error 投入会话树；仍隐藏 tool call/result、patch、内部 note，以及同一 TaskID/agent/attempt 下与最后完整 `message_completed` 正文完全相同的 `task_completed` scheduler 镜像。配对使用 per-agent active `{TaskID, attempt}`，不做全局正文去重；new start/retry 不继承旧配对，迟到旧 terminal 不清除新 attempt，跨任务同文不误删。媒介化通信现在复用普通 agent 无外框回答版式，并统一显示 exact `sender->recipient`，不再添加 `info` / `reply` 前缀。后台 `-IntatisShowExecutionTrace` / `INTATIS_SHOW_EXECUTION_TRACE=1` 可在新进程中恢复原完整调试视图，没有 UI/UserDefaults。本次最新 `ExecutionTracePresentationTests` + `IntatisConversationCodeTests` + `ThreadLayoutTests` 合计 32/32 通过；运行态视觉结果由本轮 `design-qa.md` 记录。
 - 2026-07-21 的侧边原生滚动条小修是历史阶段：当时真实 `cowork_9mdz9qkh` 的 2-row/超高 rich row 证明纯 lazy 估算会跳过中后段，因而引入 `<= 4` eager、`>= 5` lazy 的 adaptive 合同。该合同及其 17-row production-lazy 说法已被上方 2026-07-30 最终 follow-up 废止；当前 macOS 产品合同是 16-row bounded eager page + 显式分页。该历史复验的 0.25/0.50/0.75/1.0、约 212 MiB 与 22/22 结果仍保留为当时证据，不得冒充当前容器的长时验证。
 - Phase A（Cowork composer / submitted-intent admission）已于 2026-07-20 完成：stable `SubmissionID`、owner-only outbox、唯一 `user_message + queued(attempt 1)`、FIFO、exact Retry/no duplicate message、restored-root pause、submission-scoped context 与 hardened ArtifactStore 已落地。验证为 focused **122/122**、完整 SwiftPM **824 tests / 14 skipped / 0 failures**、Swift/macOS/iOS builds 通过；Computer Use 在 reviewer failed 的历史验证 session 确认 composer 可编辑、文本 Send durable accept、`route_unavailable`/Retry、失败后继续编辑，以及附件 durable import/attachment-only Send eligibility。附件草稿没有点击 Send；没有真实 provider、permission review 或 model output。Phase B、Phase C 与 Phase L 随后均独立完成。
 - Phase S（session state / workspace authorization persistence）已于 2026-07-19 在本地完成并验证。`events.jsonl` 是 settings、migration、agent/lease 登记的唯一权威，append 返回/stream/replay 均发布实际落盘反解的 canonical Envelope；schema-v2 `session.json` 是 EventLog-wins 的 owner-only 可重建投影；Apple bookmark 只在 session-owned schema-v1 binary `workspace-access.plist` 中以 `0600` 保存，并由 macOS `WorkspaceAccessLease` 持有实际 security-scope 生命周期。fresh Cowork 固定为 settings-first 七事件（`seq 0...6`），main/reviewer 共享 exact inference binding 但身份和 leases 分离，初始化无模型请求。Legacy display name 先 append settings+marker 再 rebuild；workspace migration 需要 per-session provenance/all-required verification，symlink alias 仅在 scope 后验证并先写 canonical settings 再 marker，marker 后不回退 global map。共享 workspace capability 只有在 settings + live roster 证明零引用时才清理；primary 在 UI、ViewModel 和 plist store 三层默认不可删除，仅允许创建事务失败时显式回滚。Historical main recovery 使用严格 revision fold；CLI `/agent restore-main` 使用专用入口。验证为 focused 137/137、独立 scratch full SwiftPM 785 executed / 14 skipped / 0 failures、Swift/macOS/iOS builds 通过，Computer Use 新建/恢复/重授权、unsent draft 与最新 primary Trash disabled/37-event disk audit 通过；真实 symlink/shared-worker UI 未覆盖，未发送 provider 请求。本轮没有复制或翻译上游源码、没有引入依赖，`OPEN_SOURCE_REUSE.md` / `NOTICE.md` 无需修改。
@@ -255,8 +380,8 @@ The later “Next Implementation Slice” sections in this file are retained as 
 - macOS advanced provider config ownership is corrected: the canonical files are now `~/.config/intatis/intatis.json` / `intatis.jsonc` with app-support `intatis.json` / `intatis.jsonc` fallback, while the JSON content remains OpenCode-compatible. Default discovery, Open Intatis Config generation, settings write fallback and secret resolution no longer inspect any `opencode.json` or OpenCode app config; `INTATIS_CONFIG` remains the only explicit arbitrary-file override. The existing local Intatis-owned file was renamed to the canonical filename without reading its contents.
 - Cowork permission/reliability hardening is implemented locally: Permission Reviewer now has a dedicated structured control-plane queue and durable verdict; AgentLoop permission/tool audit is fail-closed; tool execution uses durable prepare/settle tickets and recovery refuses uncertain non-idempotent replay; timeout/cancel no longer waits for a non-cooperative provider; production registries no longer expose raw `run_shell` and the retained runner is additionally OS-confined/network-denied; EventLog has cross-process append locks plus a production session writer lease; detach/revoke are persistence-first; concurrent token requests reserve a soft budget slice before dispatch. Ordinary interrupted read-only work may still requeue with a new attempt, while unresolved write/exec/network/destructive or collaboration side effects fail with manual reconciliation required. Per-agent inference routing was not part of that historical defect repair, but is now implemented as the separate exact-profile slice recorded above; it does not weaken the permission/reliability boundaries.
 - Cowork permission/reliability remediation is now `fixed`: final focused runs passed `PermissionReviewControlPlaneTests` 17/17, `AutomaticPermissionReviewTests` 12/12, `OrchestrationReliabilityTests` 28/28, `AgentLoopPolicyTests` 14/14 and `WorkspaceLeaseTests` 4/4; the combined non-process suite passed 401 tests with 0 failures. IntatisMac Debug, generic IntatisiOS Simulator Debug (arm64 + x86_64), and the `intatis` CLI product all build. Production registries contain no raw `run_shell`; workspace leases pin canonical root device/inode identity and fail closed before permission, after permission wait, after durable prepare and before managed process launch; generic tools cannot mutate Git config paths. The Tools test bundle compiles, and earlier independent real macOS process smoke passed workspace confinement, external/symlink denial, loopback denial, cancellation, timeout and large dual-stream output. The final three process/Git runtime tests could not be rerun after their test-fixture portability fix because the host sandbox rejects nested `sandbox-exec`/loopback and outside-sandbox approval hit its usage limit; no source assertion failure remains known. Real provider/device, Linux bwrap, two-runtime writer-lease pressure, real browser and long-running recovery matrices remain verification follow-ups rather than code blockers.
-- v0.16 Agent document/media tool slice is implemented locally after GitHub/open-source survey. Standard tools now include `read_pdf`, `edit_pdf_pages`, `reconstruct_document_image`, `compile_latex`, and `generate_image`. The implementation deliberately wraps mature external backends instead of copying or vendoring them: PDF page operations use PDFKit in-process today and can map to qpdf/Poppler-style CLI backends later; scanned document/photo reconstruction supports installed Docling, Marker, and Tesseract wrappers; LaTeX supports installed Tectonic, latexmk, xelatex, or pdflatex; provider-backed image generation writes returned images into the workspace through `ImageGenerationToolService`.
-- v0.16 keeps the permission and platform model intact. All new tools run through AgentLoop schema validation, `PermissionEngine`, `PathConfinement`, and structured `tool_result` events. Cowork coordinator leases can expose the full document/media tool set, while ordinary workers default to read-only `read_pdf` and do not receive PDF editing, LaTeX execution, or image generation tools by default. iOS remains outside Tools/Permission/AgentKernel/Cowork linkage.
+- v0.16 Agent document/media tool slice is implemented locally after GitHub/open-source survey. Standard tools now include `read_pdf`, `read_document`, `edit_pdf_pages`, `reconstruct_document_image`, `compile_latex`, and `generate_image`. The implementation deliberately wraps mature external backends instead of copying or vendoring them: PDF page operations use PDFKit in-process today and can map to qpdf/Poppler-style CLI backends later; Office/general-document reading supports installed local Docling or MarkItDown (plus LibreOffice for legacy formats); scanned document/photo reconstruction supports installed Docling, Marker, and Tesseract wrappers; LaTeX supports installed Tectonic, latexmk, xelatex, or pdflatex; provider-backed image generation writes returned images into the workspace through `ImageGenerationToolService`.
+- v0.16 keeps the permission and platform model intact. All new tools run through AgentLoop schema validation, `PermissionEngine`, `PathConfinement`, and structured `tool_result` events. Cowork read-write coordinator/worker leases can expose process-backed `read_document` and the full document/media set, while ordinary workers default to read-only `read_pdf` and do not receive parser execution, PDF editing, LaTeX execution, or image generation tools by default. iOS remains outside Tools/Permission/AgentKernel/Cowork linkage.
 - v0.16 validation baseline before the new opt-in browser concurrency smoke: Tools focused tests passed locally (55 tests, 12 skipped, 0 failures, including same-workspace-profile browser command serialization, metadata-only browser profile inventory with runtime marker existence checks, explicit browser profile deletion with non-sensitive marker warning, browser search result/history, browser form submit payload/history, browser opened-page state/history metadata, browser_type credential-target rejection, and web_fetch local HTTP/truncation/non-HTTP rejection), full SwiftPM tests passed locally (331 tests, 12 skipped, 0 failures), AgentKernel focused tests passed locally (22 tests, 0 failures, including browser_search, browser_profile_delete, browser form-task, and dynamic-feed browsing AgentLoop permission flows), `swift build` passed, and the previous IntatisMac / IntatisiOS simulator Xcode Debug builds passed. Existing real Edge/CDP smoke coverage now includes backend fallback, DuckDuckGo search, profile persistence, upload/download, select/press, local HTTP form submit, popup/new-page following, scroll/wait, profile isolation, back/forward, local dynamic feed + online task flow, and headed handoff. Real Docling/Marker/Tesseract/Tectonic/qpdf/ComfyUI/Diffusers installations, real provider image generation, real document-photo reconstruction quality, third-party headed login/social/online-task browser matrices, third-party website downloads/uploads/form-submit, long-lived profile cleanup/pollution behavior under real browser process pressure, simultaneous real-browser profile launches, and real device/key matrices remain UNKNOWN; sequential profile isolation has passed.
 - v0.16 Agent network/browser tool slice is implemented locally after GitHub/open-source survey. Standard tools now include `web_fetch`, `browser_diagnostics`, `browser_profiles`, `browser_profile_delete`, `browser_history`, `browser_navigate`, `browser_snapshot`, `browser_handoff`, `browser_reload`, `browser_back`, `browser_forward`, `browser_click`, `browser_type`, `browser_submit`, `browser_select_option`, `browser_press_key`, `browser_scroll`, `browser_wait`, `browser_screenshot`, `browser_upload_file`, `browser_download`, `browser_downloads`, and `browser_search`. The implementation wraps URLSession for lightweight fetch and installed Node.js + Playwright for real Chromium/Chrome/Edge persistent browser profiles; when Playwright is not resolvable, it falls back to Node.js built-in `WebSocket` + Chrome DevTools Protocol against an installed Chrome/Edge/Chromium executable, instead of copying Chromium/CEF/Playwright source into the repo. Interactive actions that open a new tab/window now follow the opened page and persist that final URL/title in state/history; Playwright uses page/popup events, while CDP fallback uses real mouse events for click/download and target polling/switching. `browser_profiles` lists safe profile/state/history/download metadata plus active/lock runtime marker existence without reading cookies, localStorage, browser profile databases, marker contents, or downloaded file contents; `browser_profile_delete` is a destructive, confirmation-gated cleanup tool for one workspace-scoped profile and gives only a non-sensitive marker warning before deletion; `browser_submit` submits the current page form or a targeted form/control/submitter as an exec+network browser action; `browser_type` masks typed values in observations and refuses likely password, 2FA, token, or API-key targets before shell/backend entry, requiring `browser_handoff` for user takeover. `browser_handoff` opens a bounded headed persistent profile for user login/manual takeover, then returns a page snapshot and persists state/history. Playwright wrapper and CDP fallback both use command-level watchdogs, and CDP fallback also uses bounded send/close/process-exit handling so browser commands fail instead of hanging indefinitely.
 - v0.16 browser state is workspace-scoped: `.intatis/browser/profiles/<profile>` stores browser profile data, `.intatis/browser/downloads/<profile>` stores downloads, `.intatis/browser/state/<profile>.json` stores current page metadata plus Intatis-managed `navigationStack` / `navigationIndex`, and `.intatis/browser/history.jsonl` stores non-secret history metadata. `browser_history` only reads the history metadata file; `browser_back` / `browser_forward` use the state navigation stack to choose a target URL and execute the browser navigation inside the same profile-level critical section; `browser_screenshot` only writes workspace-confined PNG outputs; `browser_upload_file` only accepts workspace-confined input files; `browser_download` only writes explicit downloads under `.intatis/browser/downloads/<profile>`; `browser_downloads` only lists metadata. Same-workspace-profile Playwright/CDP browser commands are serialized in-process so multiple agents do not concurrently open/write the same persistent profile/state/history, while different profiles remain parallel. These profiles may contain cookies/login state and must not be treated as ordinary artifacts, committed files, or shareable logs.
@@ -272,7 +397,7 @@ The later “Next Implementation Slice” sections in this file are retained as 
 - Chat / Code / Cowork projections now derive compact recovery advice from `ErrorPayload` and failed `tool_result` observations, so GUI error cards can tell the user whether to retry, fix provider config, check endpoint/model compatibility, rerun after permission changes, or inspect tool inputs without changing the append-only event schema.
 - Provider health check/model test call has a shared implementation: `ProviderRegistry.healthCheck(role:options:)` resolves the selected provider/model/secret and uses `ProviderHealthReport` for chat/agent checks, timeout reporting, partial stream detection, and compact user-facing summaries. macOS Settings now runs both Chat and Code(agent) checks from that shared API and shows the non-secret key source type (`auth file`, `env`, `secret file`, or legacy keychain); iOS settings stays chat-only. Both chat and agent health checks request usage, and the agent request body is covered by provider tests.
 - OpenAI-compatible providers now normalize bearer authorization at request build time: accidental saved values like `Bearer <key>` or quoted keys are sent as a single `Authorization: Bearer <key>` token. macOS direct `provider.<id>.options.apiKey` values in Intatis-owned OpenCode-compatible config are now resolved from that provider config file instead of falling back to the broader auth-file scan, so stale auth JSON entries cannot shadow the config that selected the provider/model. macOS/iOS provider registry refresh also clears the in-process secret cache so model/provider changes and settings saves do not keep using a stale key value.
-- Provider runtime policy now applies shared request timeout and retry/backoff behavior to OpenAI-compatible chat streaming, tool-calling streaming, image generation, and transcription. Streaming retry is deliberately limited to failures before any response bytes are received, so partial text/tool-call streams are not duplicated. HTTP `Retry-After` and common rate-limit reset headers are parsed as numeric seconds, HTTP dates, or duration strings such as `750ms` / `1m30s`, then fed into both retry delays and user-facing error guidance with long server delays capped by policy.
+- Provider runtime policy now applies shared request timeout and retry/backoff behavior to OpenAI-compatible chat streaming, tool-calling streaming, image generation, and transcription. Tool-calling retry is limited to failures before any non-error payload is accepted; an error-only retryable SSE frame may consume the remaining attempt, while accepted partial text/tool/usage/completion prevents replay. HTTP `Retry-After` and common rate-limit reset headers are parsed as numeric seconds, HTTP dates, or duration strings such as `750ms` / `1m30s`, then fed into both retry delays and user-facing error guidance with long server delays capped by policy.
 - Provider endpoint URL validation now runs before transport for OpenAI-compatible chat streaming, tool-calling streaming, image generation, and transcription. Chat/tool-calling validate the effective Chat endpoint, while image/transcription validate Base URL plus their path; non-HTTP URLs, missing schemes, and missing hosts become `config` errors and health check failures instead of raw URLSession behavior.
 - Non-streaming image generation and transcription now normalize HTTP 2xx but schema-incompatible payloads into actionable decoding errors. A provider error object, HTML page, missing `data[].b64_json`, invalid base64, empty image data, or missing transcription `text` is reported with a structured provider message or a capped preview plus endpoint/model/response-format guidance. Plain HTML, missing-field JSON, and bad base64 previews are not mislabeled as `Provider said`.
 - OpenAI-compatible chat and tool-calling streams now accept either SSE `[DONE]` or chunk `finish_reason` as completion. They keep reading after `finish_reason` so separately emitted usage is preserved, avoid duplicate done events when `[DONE]` follows, and health check treats missing `[DONE]` plus present `finish_reason` as a completed stream rather than partial. If the stream ends with neither `[DONE]` nor `finish_reason`, adapters now throw a completion-marker compatibility error; Chat/Code preserve partial text and mark it stopped instead of writing a completed answer. Tool-calling now prefers `tool_calls` / legacy `function_call` over ordinary `stop` when multiple choices finish in one chunk. If tool-calling finishes with incomplete deltas or missing tool names, including provider drift that emits tool-call deltas and then incorrectly finishes with `stop`, the adapter throws an explicit provider tool-call stream compatibility error instead of silently succeeding with no tool execution.
@@ -311,7 +436,7 @@ Intatis should not chase AI IDE parity. The target is a local-first, multi-provi
 
 ## Next Implementation Slice: macOS UI Information Architecture
 
-Status: completed, revised on 2026-07-21, then revised three times on 2026-07-23. The single native `List(selection:)` and horizontal segmented-mode passes are both superseded by the current title + vertically stacked icon modes + history + Settings sidebar recorded above; the two-row composer remains, with a shared 40pt first-row selection menu and corrected 40pt second-row geometry. The planning text below and the 2026-07-21 `design-qa.md` images are historical; they do not establish current pixel, keyboard, focus, Light/Dark or narrow-width behavior. Current source tests and macOS/iOS Debug builds pass; current runtime visual validation remains `UNKNOWN`.
+Status: completed, revised on 2026-07-21, then revised three times on 2026-07-23. The single native `List(selection:)` and horizontal segmented-mode passes are both superseded by the current title + vertically stacked icon modes + history + Settings sidebar recorded above; the two-row composer remains, with a shared 40pt first-row selection menu and corrected 40pt second-row geometry. The planning text below and the 2026-07-21 `design-qa.md` images are historical; they do not establish current pixel, keyboard, focus, Light/Dark or narrow-width behavior. The Cowork right-rail portion is further superseded by the 2026-08-02 permission-first Liquid Glass slice above.
 
 Objective (historical planning record; superseded in control placement by the 2026-07-21 status above): restructure the macOS client layout so Intatis feels like a real local AI client/workbench rather than three separate demo screens.
 
@@ -381,7 +506,7 @@ Acceptance criteria for this slice:
 
 Implementation result:
 
-- Satisfied in code: sidebar mode/history/New session layout; composer-local model/context/token controls whose closed selector labels show only the model name; Chat without a default inspector; Code right inspector; Cowork `Git Status` / `Agents` / real `Goal` / real `Tasks` in the wide inspector with no compact Goal/Tasks duplicate when that inspector is unavailable or hidden; Git status-only treatment; reusable SharedUI surfaces; responsive message width/gutter calculation; explicit content width for message lists; Chat/Code/Cowork bubble rows aligned at the row level through shared `IntatisThreadBubbleRow` instead of spacer-only positioning; optional cached-input usage fields; OpenAI-compatible cached token parsing; old `turn_stats` decode compatibility; every assistant/agent answer keeps its first `Envelope.ts` and shows a localized 24-hour/7-day/full-date timestamp beside the agent name without changing EventLog schema.
+- Satisfied in code: sidebar mode/history/New session layout; composer-local model/context/token controls whose closed selector labels show only the model name; Chat without a default inspector; Code right inspector; Cowork permission-first native Liquid Glass rail with `Agents` / real `Goal` / real `Tasks`, no Git UI, pending-triggered rail pinning and one narrow pending fallback with no compact Goal/Tasks duplicate; reusable SharedUI surfaces; responsive message width/gutter calculation; explicit content width for message lists; Chat/Code/Cowork bubble rows aligned at the row level through shared `IntatisThreadBubbleRow` instead of spacer-only positioning; optional cached-input usage fields; OpenAI-compatible cached token parsing; old `turn_stats` decode compatibility; every assistant/agent answer keeps its first `Envelope.ts` and shows a localized 24-hour/7-day/full-date timestamp beside the agent name without changing EventLog schema.
 - Verified locally: `swift build`, full `swift test`, focused Provider/Conversation/AgentKernel checks, `IntatisMac` Xcode Debug build, and `IntatisiOS` Xcode Debug build.
 - Verified by synthetic render: `NSHostingView` layout probe covers Chat-shell, Chat-like bubble rows, CodeShell, and CoworkShell at 360/500/700/940/980/1180pt key widths, including short user bubble right alignment, long message wrapping, narrow-window gutter reduction, compact composer controls, and wide-window inspector layout.
 - Verified by pixel assertions: temporary `LayoutAssert` renders diagnostic rows through the real `IntatisThreadContentLayout` / `IntatisThreadBubbleRow` path at 320/360/380/420/500/560/700/760/940/1180/1440pt and confirms short user bubbles align to the trailing content edge, assistant bubbles align to the leading content edge, long user bubbles stay within `messageMaxWidth`, and all marker bubbles remain inside the content column. The same verifier renders a Chat-equivalent shell at 320/360/500/700/760/940/1180/1440pt, real `CodeShell` at 360/500/700/940/1180/1440pt, and real `CoworkShell` at 360/500/700/980/1180/1440pt with diagnostic bubble colors, confirming shell-level user/assistant bubbles keep the expected content-column edges when header, composer, and inspectors appear.

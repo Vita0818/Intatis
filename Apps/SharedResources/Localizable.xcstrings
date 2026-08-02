@@ -52,6 +52,23 @@
         }
       }
     },
+    "%lld models" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld models"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld 个模型"
+          }
+        }
+      }
+    },
     "\"%@\" and its Intatis event history and artifacts will be permanently deleted. Files in the linked workspace will not be changed." : {
       "extractionState" : "manual",
       "localizations" : {
@@ -1264,6 +1281,23 @@
         }
       }
     },
+    "1 model" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "1 model"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "1 个模型"
+          }
+        }
+      }
+    },
     "1 model · %@ · %@" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -1804,6 +1838,23 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "添加值"
+          }
+        }
+      }
+    },
+    "Advanced settings" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Advanced settings"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "高级设置"
           }
         }
       }
@@ -2603,6 +2654,23 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "挂载策略"
+          }
+        }
+      }
+    },
+    "Attachments and chat tools" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Attachments and chat tools"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "附件与对话功能"
           }
         }
       }
@@ -3746,6 +3814,23 @@
         }
       }
     },
+    "Close sidebar" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Close sidebar"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "关闭侧边栏"
+          }
+        }
+      }
+    },
     "Code" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -4167,6 +4252,23 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "无法打开 JSON 配置：%@"
+          }
+        }
+      }
+    },
+    "Could not import configuration: %@" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Could not import configuration: %@"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无法导入配置：%@"
           }
         }
       }
@@ -4915,6 +5017,142 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "诊断"
+          }
+        }
+      }
+    },
+    "Choose where to save a local diagnostic ZIP" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Choose where to save a local diagnostic ZIP"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "选择本地诊断 ZIP 的保存位置"
+          }
+        }
+      }
+    },
+    "Could not export diagnostic logs: %@" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Could not export diagnostic logs: %@"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无法导出诊断日志：%@"
+          }
+        }
+      }
+    },
+    "Create a privacy-redacted ZIP containing app and session structure, provider and network errors, performance and hang data, and recent Intatis crash reports. Message contents, API keys, configuration files, workspace files, and browser data are excluded. Nothing is uploaded." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Create a privacy-redacted ZIP containing app and session structure, provider and network errors, performance and hang data, and recent Intatis crash reports. Message contents, API keys, configuration files, workspace files, and browser data are excluded. Nothing is uploaded."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "生成经过隐私脱敏的 ZIP，包含 App 与会话结构、提供商和网络错误、性能与卡顿数据，以及近期 Intatis 崩溃报告。消息内容、API 密钥、配置文件、工作区文件和浏览器数据不会包含，也不会上传任何内容。"
+          }
+        }
+      }
+    },
+    "Diagnostic logs were exported as %@." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Diagnostic logs were exported as %@."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "诊断日志已导出为 %@。"
+          }
+        }
+      }
+    },
+    "Diagnostic logs were exported as %@ with %lld collection warnings recorded in manifest.json." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Diagnostic logs were exported as %@ with %lld collection warnings recorded in manifest.json."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "诊断日志已导出为 %@；%lld 项采集警告已记录在 manifest.json 中。"
+          }
+        }
+      }
+    },
+    "Export Diagnostic Logs" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Export Diagnostic Logs"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "导出诊断日志"
+          }
+        }
+      }
+    },
+    "Export Diagnostic Logs…" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Export Diagnostic Logs…"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "导出诊断日志…"
+          }
+        }
+      }
+    },
+    "Generating Diagnostic Logs…" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Generating Diagnostic Logs…"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在生成诊断日志…"
           }
         }
       }
@@ -6435,6 +6673,23 @@
         }
       }
     },
+    "Import an Intatis JSON or JSONC file from Files. Provider and model settings are stored in this app; literal credentials are migrated to the protected auth file." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Import an Intatis JSON or JSONC file from Files. Provider and model settings are stored in this app; literal credentials are migrated to the protected auth file."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "从“文件”App 导入 Intatis JSON 或 JSONC 文件。提供商和模型设置将存储在本 App 中；配置中的明文凭据会迁移至受保护的认证文件。"
+          }
+        }
+      }
+    },
     "Import Error" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -6448,6 +6703,23 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "导入错误"
+          }
+        }
+      }
+    },
+    "Import Intatis Config" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Import Intatis Config"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "导入 Intatis 配置"
           }
         }
       }
@@ -6469,6 +6741,23 @@
         }
       }
     },
+    "Imported providers: %lld · models: %lld." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Imported providers: %lld · models: %lld."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已导入：%lld 个提供商 · %lld 个模型。"
+          }
+        }
+      }
+    },
     "Imported arguments: %@" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -6482,6 +6771,108 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "已导入参数：%@"
+          }
+        }
+      }
+    },
+    "Imported file" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Imported file"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已导入文件"
+          }
+        }
+      }
+    },
+    "%lld compatibility warnings require review." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld compatibility warnings require review."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "有 %lld 项兼容性警告需要检查。"
+          }
+        }
+      }
+    },
+    "%@ uses an external %@ credential reference; verify or enter the credential on iOS." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ uses an external %@ credential reference; verify or enter the credential on iOS."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ 使用外部 %@ 凭据引用；请在 iOS 上验证或重新输入凭据。"
+          }
+        }
+      }
+    },
+    "%@ uses unsupported provider adapter %@; requests remain blocked until a supported OpenAI-compatible adapter is selected." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ uses unsupported provider adapter %@; requests remain blocked until a supported OpenAI-compatible adapter is selected."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ 使用不受支持的提供商适配器 %@；改用受支持的 OpenAI 兼容适配器前，请求将保持阻止状态。"
+          }
+        }
+      }
+    },
+    "%@ was skipped because it has no OpenAI-compatible Base URL for iOS Chat." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ was skipped because it has no OpenAI-compatible Base URL for iOS Chat."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ 未提供 iOS Chat 可用的 OpenAI 兼容 Base URL，因此已跳过。"
+          }
+        }
+      }
+    },
+    "Variants for %@/%@ are not imported on iOS." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Variants for %@/%@ are not imported on iOS."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "iOS 暂不导入 %@/%@ 的模型变体。"
           }
         }
       }
@@ -7043,6 +7434,23 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "本地 AI 工作台"
+          }
+        }
+      }
+    },
+    "Local ZIP. Nothing is uploaded." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Local ZIP. Nothing is uploaded."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "仅生成本地 ZIP，不会上传。"
           }
         }
       }
@@ -8883,6 +9291,23 @@
         }
       }
     },
+    "Open sidebar" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Open sidebar"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "打开侧边栏"
+          }
+        }
+      }
+    },
     "Open Source" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -10052,6 +10477,23 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "最近"
+          }
+        }
+      }
+    },
+    "Recents" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Recents"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "最近对话"
           }
         }
       }

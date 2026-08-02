@@ -118,7 +118,7 @@ public struct UpdateGoalTool: Tool {
 
     public static let descriptor = ToolDescriptor(
         name: "update_goal",
-        description: "Submit only a complete or blocked Goal status candidate using the current revision. Host authority and completion audit requirements remain final. This tool is reserved for a Goal verifier capability; it cannot pause, resume, edit, clear, or change budgets.",
+        description: "Submit only a complete or blocked Goal status candidate using the current revision. The independent GoalVerifier audit and host authority remain final; this tool cannot create evidence, pause, resume, edit, clear, or change budgets. In Cowork it is exposed only to the exact @main agent.",
         sideEffect: .write,
         parameters: .object([
             "type": .string("object"),

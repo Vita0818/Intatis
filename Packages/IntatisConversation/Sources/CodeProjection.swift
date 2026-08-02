@@ -312,7 +312,7 @@ public struct CodeProjection: Equatable, Sendable {
                                   body: "@\(p.agent.rawValue): \(p.path)"))
 
         case .agentMessage(let p):
-            let title = p.from.flatMap { from in p.to.map { "\(from.rawValue) -> \($0.rawValue)" } }
+            let title = p.from.flatMap { from in p.to.map { "\(from.rawValue)->\($0.rawValue)" } }
                 ?? p.agent.rawValue
             items.append(CodeItem(id: p.messageId.rawValue, kind: .agent,
                                   title: title, body: p.content,
@@ -323,15 +323,18 @@ public struct CodeProjection: Equatable, Sendable {
 
         case .agentToAgentMessage(let p):
             items.append(CodeItem(id: stableID(envelope, "agent_to_agent"), kind: .agentToAgent,
-                                  title: "\(p.from.rawValue) → \(p.to.rawValue)", body: p.content))
+                                  title: "\(p.from.rawValue)->\(p.to.rawValue)", body: p.content,
+                                  timestamp: envelope.ts))
 
         case .informationRequested(let p):
             items.append(CodeItem(id: p.requestID.rawValue, kind: .agentToAgent,
-                                  title: "info \(p.from.rawValue) -> \(p.to.rawValue)", body: p.question))
+                                  title: "\(p.from.rawValue)->\(p.to.rawValue)", body: p.question,
+                                  timestamp: envelope.ts))
 
         case .informationReplied(let p):
             items.append(CodeItem(id: p.replyID.rawValue, kind: .agentToAgent,
-                                  title: "reply \(p.from.rawValue) -> \(p.to.rawValue)", body: p.content))
+                                  title: "\(p.from.rawValue)->\(p.to.rawValue)", body: p.content,
+                                  timestamp: envelope.ts))
 
         case .delegationRequested(let p):
             items.append(CodeItem(id: p.requestID.rawValue, kind: .note, title: "delegation requested",

@@ -5,11 +5,12 @@ import IntatisCore
 import IntatisProtocol
 import IntatisProviders
 
-/// A presentation-only projection of one current inference profile revision.
+/// A secret-free host projection of one current inference profile revision.
 ///
 /// The option deliberately carries no endpoint, credential reference, or raw
 /// request options. `binding` is the durable, secret-free identity that callers
-/// may persist for a Cowork agent or new-agent default.
+/// may persist for a Cowork agent or new-agent default; declared capabilities
+/// may be passed to Cowork only as ephemeral routing metadata.
 struct AppInferenceProfileOption: Identifiable, Equatable, Sendable {
     let binding: AgentInferenceBinding
     let title: String
@@ -19,6 +20,9 @@ struct AppInferenceProfileOption: Identifiable, Equatable, Sendable {
     let modelTitle: String
     let variantID: String?
     let variantTitle: String?
+    /// Safe capability declarations copied from the user's model JSON.
+    /// They are routing hints only and never replace provider-side validation.
+    let declaredCapabilities: [Capability]
 
     var id: String {
         let ref = binding.inferenceProfileRef
@@ -145,7 +149,9 @@ enum AppInferenceCatalogCompiler {
                 modelID: metadata.modelID,
                 modelTitle: metadata.modelTitle,
                 variantID: metadata.variantID,
-                variantTitle: metadata.variantTitle)
+                variantTitle: metadata.variantTitle,
+                declaredCapabilities:
+                    resolution.profile.declaredCapabilities)
         }
         .sorted { lhs, rhs in
             let left = [lhs.providerTitle, lhs.modelTitle, lhs.variantTitle ?? "", lhs.id]

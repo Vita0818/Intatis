@@ -489,6 +489,11 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
         maxSteps: config.coworkMaxSteps,
         skillRootAccess: .workspaceAndGlobal,
         availableInferenceProfiles: inferenceProfiles.bindings,
+        inferenceProfileRoutingMetadata: inferenceProfiles.options.map {
+            InferenceProfileRoutingMetadata(
+                inferenceProfileID: $0.binding.inferenceProfileID,
+                declaredCapabilities: $0.declaredCapabilities)
+        },
         requiresInferenceBindings: true,
         imageGeneratorFor: { _ in ProviderImageGenerationToolService(registry: registry) },
         toolSnapshotProvider: {

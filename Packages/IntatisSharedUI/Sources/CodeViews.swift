@@ -531,7 +531,10 @@ struct CodeItemRow: View {
         case .error:
             card(icon: "exclamationmark.triangle", title: item.title, body: item.body, tint: .red)
         case .agentToAgent:
-            card(icon: "arrow.left.arrow.right", title: "↔ \(item.title)", body: item.body, tint: .teal)
+            bubble(
+                title: item.title,
+                body: item.body.isEmpty && !item.complete ? "…" : item.body,
+                isUser: false)
         }
     }
 
@@ -745,11 +748,27 @@ private struct CodeEmptyThreadView: View {
     }
 }
 
+private struct PermissionReviewSurfaceModifier: ViewModifier {
+    let isEnabled: Bool
+    let cornerRadius: CGFloat
+
+    @ViewBuilder func body(content: Content) -> some View {
+        if isEnabled {
+            content.intatisSubtleContentSurface(cornerRadius: cornerRadius)
+        } else {
+            content
+        }
+    }
+}
+
 public struct PermissionResolutionNoticeView: View {
     let notice: PermissionResolutionNotice
+    private let embedsSurface: Bool
 
-    public init(notice: PermissionResolutionNotice) {
+    public init(notice: PermissionResolutionNotice,
+                embedsSurface: Bool = true) {
         self.notice = notice
+        self.embedsSurface = embedsSurface
     }
 
     public var body: some View {
@@ -774,7 +793,9 @@ public struct PermissionResolutionNoticeView: View {
         .padding(.horizontal, 11)
         .padding(.vertical, 8)
         .frame(maxWidth: 620, alignment: .leading)
-        .intatisSubtleContentSurface(cornerRadius: 10)
+        .modifier(PermissionReviewSurfaceModifier(
+            isEnabled: embedsSurface,
+            cornerRadius: 10))
         .accessibilityIdentifier("permission.resolution")
     }
 
@@ -873,10 +894,14 @@ enum PermissionReviewPresentation {
 public struct PermissionCard: View {
     let permission: PendingPermission
     let onResolve: (PermissionResponseAction) -> Void
+    private let embedsSurface: Bool
     @State private var showsDetails = false
 
-    public init(permission: PendingPermission, onResolve: @escaping (PermissionResponseAction) -> Void) {
+    public init(permission: PendingPermission,
+                embedsSurface: Bool = true,
+                onResolve: @escaping (PermissionResponseAction) -> Void) {
         self.permission = permission
+        self.embedsSurface = embedsSurface
         self.onResolve = onResolve
     }
 
@@ -964,62 +989,118 @@ public struct PermissionCard: View {
                 .accessibilityIdentifier("permission.details")
             }
 
-            HStack(spacing: 8) {
-                if permission.state == .resolving {
-                    ProgressView()
-                        .controlSize(.small)
-                    Text(request.effectiveApprovalMode == .automaticReviewer
-                         ? IntatisLocalization.string("Automatic review in progress…")
-                         : IntatisLocalization.string("Resolving…"))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text(statusText)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                if permission.state.isActionable {
-                    Button("Cancel Turn") { onResolve(.cancelTurn) }
-                        .buttonStyle(.borderless)
-                        .accessibilityIdentifier("permission.cancel-turn")
-                    Button("Decline Call") { onResolve(.decline) }
-                        .buttonStyle(.bordered)
-                        .accessibilityIdentifier("permission.decline-call")
-                    Button(
-                        request.context?.authorization?
-                            .mcp == nil
-                            ? "Approve Call"
-                            : "Allow Call Once"
-                    ) {
-                        onResolve(.approve)
-                    }
-                        .intatisGlassButton(prominent: true)
-                        .keyboardShortcut(.defaultAction)
-                        .accessibilityIdentifier("permission.approve-call")
-                    if request.context?.authorization?
-                        .permitsMCPRememberedApproval
-                            == true {
-                        Button(
-                            "Remember Exact Tool Approval"
-                        ) {
-                            onResolve(
-                                .approveAndRemember)
-                        }
-                        .buttonStyle(.bordered)
-                        .accessibilityIdentifier(
-                            "permission.approve-and-remember")
-                    }
-                }
-            }
-            .controlSize(.small)
+            permissionFooter
         }
         .padding(13)
         .frame(maxWidth: 720, alignment: .leading)
-        .intatisSubtleContentSurface(cornerRadius: 14)
+        .modifier(PermissionReviewSurfaceModifier(
+            isEnabled: embedsSurface,
+            cornerRadius: 14))
         .onChange(of: request.requestId) { _, _ in
             showsDetails = false
         }
+    }
+
+    private var permissionFooter: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 8) {
+                permissionStatus
+                Spacer(minLength: 8)
+                if permission.state.isActionable {
+                    horizontalPermissionActions
+                }
+            }
+            VStack(alignment: .leading, spacing: 9) {
+                permissionStatus
+                if permission.state.isActionable {
+                    compactPermissionActions
+                }
+            }
+        }
+        .controlSize(.small)
+    }
+
+    @ViewBuilder private var permissionStatus: some View {
+        if permission.state == .resolving {
+            HStack(spacing: 7) {
+                ProgressView()
+                    .controlSize(.small)
+                Text(request.effectiveApprovalMode == .automaticReviewer
+                     ? IntatisLocalization.string("Automatic review in progress…")
+                     : IntatisLocalization.string("Resolving…"))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        } else {
+            Text(statusText)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var horizontalPermissionActions: some View {
+        HStack(spacing: 8) {
+            cancelTurnButton
+            declineCallButton
+            approveCallButton
+            if permitsRememberedApproval {
+                rememberApprovalButton
+            }
+        }
+    }
+
+    private var compactPermissionActions: some View {
+        VStack(alignment: .trailing, spacing: 7) {
+            approveCallButton
+                .frame(maxWidth: .infinity, alignment: .trailing)
+            if permitsRememberedApproval {
+                rememberApprovalButton
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+            }
+            HStack(spacing: 8) {
+                cancelTurnButton
+                Spacer(minLength: 8)
+                declineCallButton
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .trailing)
+    }
+
+    private var cancelTurnButton: some View {
+        Button("Cancel Turn") { onResolve(.cancelTurn) }
+            .buttonStyle(.borderless)
+            .accessibilityIdentifier("permission.cancel-turn")
+    }
+
+    private var declineCallButton: some View {
+        Button("Decline Call") { onResolve(.decline) }
+            .buttonStyle(.bordered)
+            .accessibilityIdentifier("permission.decline-call")
+    }
+
+    private var approveCallButton: some View {
+        Button(
+            request.context?.authorization?.mcp == nil
+                ? "Approve Call"
+                : "Allow Call Once"
+        ) {
+            onResolve(.approve)
+        }
+        .intatisGlassButton(prominent: true)
+        .keyboardShortcut(.defaultAction)
+        .accessibilityIdentifier("permission.approve-call")
+    }
+
+    private var rememberApprovalButton: some View {
+        Button("Remember Exact Tool Approval") {
+            onResolve(.approveAndRemember)
+        }
+        .buttonStyle(.bordered)
+        .accessibilityIdentifier("permission.approve-and-remember")
+    }
+
+    private var permitsRememberedApproval: Bool {
+        request.context?.authorization?.permitsMCPRememberedApproval == true
     }
 
     private var riskColor: Color {

@@ -1573,7 +1573,7 @@ public struct ToolRegistry: Sendable {
             GitWorktreeCreateTool(), GitWorktreeRemoveTool(),
             GitRemotesTool(), GitFetchTool(), GitPullFastForwardTool(),
             GitPushTool(), GitSwitchBranchTool(),
-            ReadPDFTool(), EditPDFPagesTool(), ReconstructDocumentImageTool(),
+            ReadPDFTool(), ReadDocumentTool(), EditPDFPagesTool(), ReconstructDocumentImageTool(),
             CompileLaTeXTool(), GenerateImageTool(),
             WebFetchTool(), BrowserDiagnosticsTool(), BrowserProfilesTool(), BrowserProfileDeleteTool(), BrowserHistoryTool(),
             BrowserNavigateTool(), BrowserSnapshotTool(), BrowserHandoffTool(), BrowserClickTool(),

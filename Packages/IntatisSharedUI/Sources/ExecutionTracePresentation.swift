@@ -48,9 +48,9 @@ public enum IntatisExecutionTracePresentation {
         return items.filter { item in
             guard item.presentationSource == .conversation else { return false }
             switch item.kind {
-            case .user, .agent, .error:
+            case .user, .agent, .agentToAgent, .error:
                 return true
-            case .toolCall, .toolResult, .patch, .note, .agentToAgent:
+            case .toolCall, .toolResult, .patch, .note:
                 return false
             }
         }

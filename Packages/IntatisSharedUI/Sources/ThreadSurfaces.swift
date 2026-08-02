@@ -2171,6 +2171,14 @@ public struct IntatisThreadComposer: View {
     private let onSend: () -> Void
     @FocusState private var focused: Bool
 
+    private var inputFont: Font {
+        #if os(iOS)
+        return .body
+        #else
+        return .system(size: 15)
+        #endif
+    }
+
     public init(placeholder: String,
                 input: Binding<String>,
                 canSend: Bool,
@@ -2289,7 +2297,7 @@ public struct IntatisThreadComposer: View {
     private var inputControl: some View {
         TextField(placeholder, text: $input, axis: .vertical)
             .textFieldStyle(.plain)
-            .font(.system(size: 15))
+            .font(inputFont)
             .foregroundStyle(.primary)
             .lineLimit(1...6)
             .focused($focused)
