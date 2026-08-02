@@ -2188,6 +2188,7 @@ public struct IntatisThreadComposer: View {
                 leadingAccessory: AnyView? = nil,
                 inputLeadingAccessory: AnyView? = nil,
                 stopAction: IntatisThreadComposerSecondaryAction? = nil,
+                accessory: AnyView? = nil,
                 onSend: @escaping () -> Void) {
         self.placeholder = placeholder
         self._input = input
@@ -2196,7 +2197,7 @@ public struct IntatisThreadComposer: View {
         self.style = style
         self.secondaryAction = secondaryAction
         self.stopAction = stopAction
-        self.accessory = nil
+        self.accessory = accessory
         self.leadingAccessory = leadingAccessory
         self.inputLeadingAccessory = inputLeadingAccessory
         self.onSend = onSend

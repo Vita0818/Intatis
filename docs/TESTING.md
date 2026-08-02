@@ -12,6 +12,40 @@ macOS 默认只验证 Developer ID/direct-distribution `IntatisMac`。不再构�
 待办。App Store 产品约束的取消不影响 SwiftPM 测试中的 sandbox、测试宿主
 sandbox、managed terminal Seatbelt、Linux bwrap、权限门或工作区围栏验证。
 
+## 2026-08-02 iOS 与 macOS 设计语言统一及最新版图标验证
+
+本轮把 iOS Chat shell 调整为 macOS 同一视觉语言，并把根目录最新版
+`Intatis.icon` 接入 iOS；未发送消息/provider 请求，也未扩大 iOS Chat-only 链接。
+
+```sh
+xcrun swiftc -parse \
+  Apps/IntatisiOS/Sources/IntatisiOSApp.swift \
+  Packages/IntatisSharedUI/Sources/Views.swift \
+  Packages/IntatisSharedUI/Sources/ThreadSurfaces.swift
+# exit 0
+
+CLANG_MODULE_CACHE_PATH=/private/tmp/intatis-ios-design-clang-cache \
+SWIFTPM_MODULECACHE_OVERRIDE=/private/tmp/intatis-ios-design-swiftpm-cache \
+swift test --disable-sandbox \
+  --filter 'ThreadLayoutTests|MessageRenderingTests'
+# passed：51 tests / 0 failures
+
+xcodegen generate
+
+xcodebuild -quiet -project Intatis.xcodeproj -scheme IntatisiOS \
+  -configuration Debug -destination 'generic/platform=iOS Simulator' \
+  -derivedDataPath /private/tmp/intatis-ios-design-dd \
+  COMPILER_INDEX_STORE_ENABLE=NO CODE_SIGNING_ALLOWED=NO build
+# succeeded；仅有仓内既有 onChange deprecation warning
+```
+
+产物 `Info.plist` 含 `CFBundleIconName=Intatis`，并列出 iPhone/iPad 主图标；bundle 含
+`Intatis60x60@2x.png`、`Intatis76x76@2x~ipad.png` 与 `Assets.car`。iOS 27.0 的
+iPhone 17e Simulator 已检查 Dark/Light 空 Chat、Light 抽屉、Light Settings 与主屏幕
+安装图标；serif 只出现在品牌/session/Settings 标题，正文、控件、表单与 composer
+保持系统 sans。截图和 macOS 同输入比较见根 `design-qa.md`。真实长 rich reply、全部
+Dynamic Type、Reduce Transparency、Increase Contrast 和真机仍为 `UNKNOWN`。
+
 ## 2026-08-02 macOS Settings 渐进披露验证
 
 本轮只调整 macOS Settings 的信息层级；没有改诊断包内容、执行远程上传或发送 provider
@@ -86,14 +120,15 @@ redacted log、最近 24 小时 unified log、proxy、performance、5 个 hang �
 
 ## 2026-08-02 Icon Composer Release 构建与正式安装
 
-本轮只验证根目录 `Intatis.icon` 接入唯一发行 target `IntatisMac`，以及真实
+本节记录当时先完成的 macOS 安装步骤；同日后续已把同一根 `Intatis.icon` 接入
+`IntatisiOS`，见上方 iOS 验证。本节的 macOS 命令只验证唯一发行 target `IntatisMac` 与真实
 `/Applications` 安装；没有构建遗留 `IntatisMacAppStore`。工具版本为 Xcode 27.0
 （27A5228h）与 XcodeGen 2.45.4。执行：
 
 ```sh
 xcodegen generate
-# succeeded；project.pbxproj 将 Intatis.icon 识别为 wrapper.icon，且只进入
-# IntatisMac Resources；Debug/Release 均使用 app icon name Intatis
+# succeeded；当时 project.pbxproj 将 Intatis.icon 识别为 wrapper.icon 并进入
+# IntatisMac Resources；同日后续 iOS target 也接入，两个 shipping target 均使用 Intatis
 
 xcodebuild -project Intatis.xcodeproj -scheme IntatisMac \
   -configuration Release -destination 'platform=macOS' \
@@ -1376,11 +1411,11 @@ plutil -lint /private/tmp/intatis-render-ios-dd/Build/Products/Debug-iphonesimul
 | Cowork Main-led agent 生命周期 | fake provider 中 `@main` 调用 `spawn_agent` → `delegate_task`；另测手动 attach worker 后 delegate | `spawn_agent` 记录 requester；`delegate_task` 等待 scheduler 执行子 agent 并把 mediated Task Report 作为 tool observation 回填给 `@main`；tool-spawned worker 完成且 idle 后自动 detach；手动 attach worker 不自动回收；`ask_agent` 仍返回直接答案 | `xcrun xctest -XCTest AgentInvocationNonRecursiveTests .build/debug/IntatisPackageTests.xctest` 通过（5 tests）；`xcrun xctest -XCTest SpawnAgentPermissionTests .build/debug/IntatisPackageTests.xctest` 通过（6 tests）；真实 GUI/provider E2E UNKNOWN |
 | Cowork 自动权限审查与授权身份绑定 | 打开 GUI Cowork session 或运行 `intatis cowork`；让 `write_file` / `apply_patch`、unknown/unleased/invalid tool、`delegate_task(to:auto)`、`ask_agent`、attach persistence fault 和跨重启副作用窗口进入权限流；制造 empty reason、risk downgrade、secret-bearing preview、queue/timeout/malformed/provider failure → CLI `/default` / `/auto` | session 默认启用独立 `@permission-reviewer`；同一 registry registration 解析 immutable `ResolvedToolAuthorization`，`write_file` / `apply_patch` canonical permission 均为 `filesystem.edit`；automatic review 只见 args digest/count + bounded secret-redacted preview，reason 必填且 risk 不得下降；同一 snapshot 贯穿 requested/settled/resolved/prepared/settled 并在 executor 前复核；auto delegate 在 review 前解析 exact target，deny 不创建 worker且 allow 后不 re-resolve；跨重启 unresolved side-effect evidence 阻止假完成；`ask_agent` 请求或返回路径的 Mediator failure 均无 succeeded settlement且 scheduler terminal 等待 reply delivery settlement；attach related events 通过 WAL 原子 batch，legacy/strict reader 均先恢复未决 WAL，安全关键路径使用 checked replay 并校验 session/sequence/known payload | 8 个专项 suite 合计 146/146，Conversation selected 67/67，独立终审相关组合 164/164；完整 SwiftPM 678 tests / 14 skipped / 36 failures，其中 34 条为 outer sandbox 下既有 Tools nested-sandbox/loopback，2 条为用户现有 highlight.js engine XCTest，权限与新 EventLog 回归无失败；`swift build` 通过；此前本轮 macOS/iOS Xcode Debug build 通过，最终 Xcode 重跑受托管 manifest nested-sandbox 限制；Computer Use 复验 reviewer enabled、2 agents/0 running、composer Send 门控通过，未发送 provider 请求；真实 provider verdict 质量、process-kill/syscall fault injection UNKNOWN |
 | IntatisMac 配置文件密钥 | 已有 auth JSON 或 OpenCode-compatible `options.apiKey` 时启动 app → 打开设置页 → 连续发送两条 chat | 启动、设置页和真实请求均不访问 OS Keychain；secret 从配置文件/env/file 读取并在进程内缓存；无 macOS Keychain 认证弹窗 | 构建通过；真机手动 UNKNOWN |
-| IntatisiOS 界面 serif | 用 Device Hub 打开空 Chat 首页、侧栏和 Settings；检查顶部模型、Intatis、Recents、空态、composer、sheet 标题/按钮/section/说明/表单；把同密度参考图与首页、侧栏实现放入同一比较输入；核对内容 renderer 未出现 iOS-only 字体分叉 | iOS app chrome 使用 Apple 系统 `.fontDesign(.serif)` + Dynamic Type；顶部模型为 headline semibold + primary，Intatis 为 title2 semibold，Recents 为 headline semibold，会话/空态和输入为 body；Markdown/plain fallback、代码块、公式和声明继续与 macOS 共用同一字体合同；参考图 sans 字体族只在 app chrome 上由用户明确的 serif 要求覆盖 | IntatisiOS generic Simulator Debug unsigned build与 `MessageRenderingTests` 41/41 通过；Dark 首页、侧栏和 Settings 的 @3x 截图/AX 检查无 P0/P1/P2；模拟器保持 Booted 且 Settings 留在前台，未发消息或 provider/网络请求；真实富文本长回复最终像素、所有 Dynamic Type 档位与辅助功能外观仍 UNKNOWN |
-| IntatisiOS chat shell | Xcode/Device Hub 运行 IntatisiOS → 检查空首页、顶部 sidebar/model/new、左抽屉、Settings、paperclip 菜单与 Send/Stop | 空首页不含第三方 onboarding/建议卡；约 82% 抽屉显示 Intatis/Recents/Settings、非交互 session-search 占位和 Chat；底部为仅含生图项的 paperclip 菜单 + 输入 + 最右 Send/Stop；不得显示 Chat 网络搜索按钮、菜单项、开关或状态；不自动弹 API-key 配置；无工具/shell | IntatisiOS generic Simulator Debug unsigned build 通过；iOS 27.0 iPhone 17e 的首页、抽屉、model 菜单、Settings/配置导入入口和 paperclip 菜单已用 Device Hub 实际检查；最新截图/AX 确认没有 web-search UI；设备保持 Booted，未发 provider 请求；流式回复与通用附件 E2E UNKNOWN |
+| IntatisiOS 跨平台字体角色 | 在 iPhone Simulator 打开空 Chat、抽屉和 Settings；检查品牌/session/page title 与正文/控件/表单；把 macOS 当前实现和 iOS 截图放入同一比较输入；核对 renderer 未出现 iOS-only 字体分叉 | `Intatis`、session 与 Settings 页面标题使用 Apple 系统 serif + Dynamic Type；正文、菜单、按钮、表单、状态、输入与 model label 使用系统 sans；Markdown/plain fallback、代码块、公式和声明继续与 macOS 共用语义字体；不得在 WindowGroup 恢复全局 `.fontDesign(.serif)` | focused `MessageRenderingTests|ThreadLayoutTests` 51/51 与 IntatisiOS generic Simulator Debug unsigned build通过；Dark/Light 首页、Light 抽屉和 Settings 截图检查无 P0/P1/P2；未发消息或 provider/网络请求；真实富文本长回复、所有 Dynamic Type 档位与辅助功能外观仍 UNKNOWN |
+| IntatisiOS chat shell | Xcode/Simulator 运行 IntatisiOS → 检查空首页、顶部 sidebar/session/new、左抽屉、Settings、两排 composer 与 Send/Stop | 空首页不含第三方 onboarding/建议卡；约 82% 抽屉依次显示 serif Intatis、选中 Chat、Recent/New 与底部 Settings，不含假 search/大 Chat CTA；底部第一排为 model + 可用 usage，第二排为仅含现有 Chat 能力的 paperclip 菜单 + 输入 + 最右 Send/Stop；不得显示 Chat 网络搜索 UI，不自动弹 API-key 配置，无工具/shell | IntatisiOS generic Simulator Debug unsigned build通过；iOS 27.0 iPhone 17e 的 Dark/Light 首页、Light 抽屉、Settings 已实际截图检查；最新画面无 web-search UI，未发 provider 请求；流式回复、通用附件 E2E 与抽屉手势自动化仍 UNKNOWN |
 | IntatisiOS 多 provider/model 设置 | iOS Settings sheet 新增 provider/model → 填 Base URL 或 Chat endpoint/API key → 保存 → 发 chat | iOS 仍只链接 chat 子集；Base URL 与 Chat endpoint 互相同步；API key 写入 app container auth JSON 而非 Keychain；已有 key 显示圆点占位；新请求使用选中 provider/model/chat endpoint | 构建通过；真实 endpoint/key UNKNOWN |
-| IntatisiOS Chat 模型切换 | Chat 顶部中央 model 菜单 → 选择另一个 provider/model → 发送下一条消息 | iOS 仍只链接 chat 子集；选择写入 `intatis.providerSelection.v1`；下一条 chat 使用新 provider/model | 构建与顶部菜单展开 GUI 通过；真实 endpoint/key UNKNOWN |
-| IntatisiOS Chat session/history | iOS 顶部新对话或抽屉底部 Chat 新建 → 发消息 → 抽屉 Recents 恢复旧 session | iOS 仍只链接 chat 子集；每个 Chat session 对应独立 app container `<session>/events.jsonl` 与 artifacts 目录；恢复历史不触发 workspace/tool 模块；抽屉搜索图标当前没有交互 | IntatisiOS Xcode build、顶部/抽屉新对话与抽屉开合 GUI 通过；含历史内容的真实 session 切换仍 UNKNOWN |
+| IntatisiOS Chat 模型切换 | Chat 底部 composer 第一排 model 菜单 → 选择另一个 provider/model → 发送下一条消息 | iOS 仍只链接 chat 子集；选择写入 `intatis.providerSelection.v1`；下一条 chat 使用新 provider/model | 构建与关闭态菜单视觉通过；菜单展开交互及真实 endpoint/key UNKNOWN |
+| IntatisiOS Chat session/history | iOS 顶部 New 或抽屉 Recent 旁 `+` 新建 → 发消息 → 抽屉 Recent 恢复旧 session | iOS 仍只链接 chat 子集；每个 Chat session 对应独立 app container `<session>/events.jsonl` 与 artifacts 目录；恢复历史不触发 workspace/tool 模块；抽屉不再包含非交互搜索占位 | IntatisiOS Xcode build、顶部/抽屉新对话与抽屉视觉状态通过；含历史内容的真实 session 切换仍 UNKNOWN |
 | IntatisiOS GUI token/turn stats | iOS Chat 发送一轮模型请求；fake provider 覆盖拆分 usage chunk 和 cached prompt tokens | iOS 仍只链接 chat 子集；最近一轮 `turn_stats` 通过 SharedUI 单行统计显示，不引入 workspace/tool 模块；同一响应内 split usage 字段级合并；cached/context 字段缺失时兼容旧显示 | full SwiftPM tests 通过（275 tests, 0 failures），Provider focused tests 通过（62 tests, 0 failures），Conversation focused tests 通过（34 tests, 0 failures），IntatisiOS Xcode build 通过；真实 endpoint usage 手动 UNKNOWN |
 | iOS 子集边界 | 检查 IntatisiOS 链接的 product | 不含 Tools/Permission/AgentKernel/Cowork | 已确认（project.yml） |
 | Cowork 同 session per-agent inference profiles | 准备至少两个 host-approved route/model/variant 与各自不同的临时 credential ref；新建 session 验证 `@main`，spawn 两个 agent（一个省略 profile、一个显式 profile），并发各发一次请求；修改 future-agent default；在 suspended resolver、ordinary attach review-await 和 bootstrap admission-wait 期间更新 catalog/roster；对 running/queued agent 尝试 rebind，再在 idle 后 rebind；重启并制造一个普通 agent unresolved；CLI 运行 offline `intatis selftest`，用 unique unqualified model 与 missing reasoning variant，并建立 non-empty missing-main fixture 后执行 `/agent restore-main <path> <profile-id>`；用 Computer Use 检查 macOS Project sheet/roster/rebind 状态 | 省略 profile 精确继承调用者 exact binding；显式选择只能来自 host-approved 列表；两个 agent 各自使用固定 model/opaque variant/connection/credential ref，selected route key 与 raw macOS variant config key 不进入其他 binding/EventLog；default 变化不改现有 agent；catalog update/admission lock、resolver await 后 recheck、ordinary attach review-await 与 bootstrap admission-wait 后 exact profile/empty-session revalidation 关闭 TOCTOU；startup 只 gate exact-resolved `@main` 与 reviewer/control plane，ordinary unresolved worker 不阻止其他 agents，其 queued invocation 在 provider 前 durable failed、清除 busy fence后才能 rebind；non-empty CLI missing-main 不套 current default，只接受显式 restore；unique unqualified model 选择唯一 route，reasoning mismatch fail closed；busy rebind 拒绝，idle rebind durable 且只影响下一 invocation；missing/mismatch/unsupported wire fail closed，不回退 current；durable unsafe options fail closed；所有 request 固定单候选；UI/CLI/diagnostics 不出现 raw endpoint、credential/options/raw variant key/完整 digest/完整 URL | 终审前基线为 focused 62/62、CLI selftest、SwiftPM 734 / 14 skipped / 0 failures、macOS/iOS Simulator builds；新增终审项最终自动测试、构建与 Computer Use 以总体验证记录为准。真实多上游/key/endpoint/effort 网络 E2E、credential rotation、非 OpenAI-compatible wire、route lease/跨 trust-domain 专用审批与完整 capability validation 仍为 UNKNOWN/未实现 |

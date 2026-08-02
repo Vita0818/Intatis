@@ -13,6 +13,20 @@ This temporary file records the next concrete objective for this project.
   Hardened Runtime 或 iOS target 边界。后续以
   `docs/MACOS_DISTRIBUTION.md` 为准。
 
+## Completed implementation slice — 2026-08-02 iOS macOS-design parity and latest icon
+
+- iOS Chat 现采用 macOS 的同一视觉语言：serif 品牌/session/Settings 标题，系统 sans
+  正文与控件；顶部 sidebar/session/New；抽屉 `Intatis`/选中 Chat/Recent/New/Settings；
+  底部 model+usage 与 paperclip/input/Send-or-Stop 两排 composer。
+- 共享 `ThreeColumnShell` / `IntatisThreadComposer` 只增加可选 composer leading accessory
+  与 usage placement，不改变 macOS 现有调用方；iOS 仍是 Chat-only 子集，没有新增
+  Tools、Permission、AgentKernel、Cowork、workspace、shell 或通用附件能力。
+- 根目录最新版 `Intatis.icon` 已同时接入 macOS/iOS shipping target；iOS bundle 的
+  `CFBundleIconName=Intatis`、iPhone/iPad icon PNG 和 iPhone 17e 主屏幕安装态均已验证。
+- focused 51/51、iOS generic Simulator Debug build、Light/Dark 首页、Light 抽屉与
+  Settings 视觉 QA 已通过。后续独立矩阵仅包括真实长富文本、全部 Dynamic Type、
+  Reduce Transparency/Increase Contrast 与真机；它们不是本次已观察到的设计缺陷。
+
 ## Completed implementation slice — 2026-08-02 Settings progressive disclosure
 
 - macOS Settings 默认层级已收敛为 provider 基础项、Test/Save、Advanced 与
@@ -100,8 +114,9 @@ This temporary file records the next concrete objective for this project.
 
 ## Completed implementation slice — 2026-08-02 Icon Composer app icon and installed Release
 
-- 用户提供的根目录 `Intatis.icon` 已作为原生 Icon Composer resource 只接入唯一发行
-  target `IntatisMac`，主图标名固定为 `Intatis`；遗留 App Store 与 iOS target 未改。
+- 用户提供的根目录 `Intatis.icon` 最初只接入唯一 macOS 发行 target `IntatisMac`，
+  主图标名固定为 `Intatis`；同日后续的 iOS parity slice 已把最新版资源也接入
+  `IntatisiOS`，遗留 App Store target 仍未接入。
 - Xcode 27 Release build 成功，bundle 含 `Intatis.icns`、`Assets.car`、
   `CFBundleIconFile=Intatis` 与 `CFBundleIconName=Intatis`，可执行文件仍为
   `arm64 + x86_64` universal。

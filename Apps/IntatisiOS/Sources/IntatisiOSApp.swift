@@ -207,6 +207,10 @@ final class IOSAppEnvironment: ObservableObject {
 struct IOSRootView: View {
     @EnvironmentObject var env: IOSAppEnvironment
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.colorScheme) private var colorScheme
+    @ScaledMetric(relativeTo: .title) private var brandTitleSize: CGFloat = 28
+    @ScaledMetric(relativeTo: .title2) private var sessionTitleSize: CGFloat = 22
+    @ScaledMetric(relativeTo: .largeTitle) private var settingsTitleSize: CGFloat = 30
     @State private var showSettings = false
     @State private var showSidebar = false
     @State private var showConfigImporter = false
@@ -286,7 +290,15 @@ struct IOSRootView: View {
         VStack(spacing: 0) {
             chatHeader
             sessionErrorBanner
-            ThreeColumnShell(model: env.viewModel, layout: .iOSChat)
+            ThreeColumnShell(
+                model: env.viewModel,
+                layout: .iOSChat,
+                composerLeadingAccessory: AnyView(
+                    IOSChatModelMenu(
+                        catalog: env.providerCatalog,
+                        isBusy: env.viewModel.isBusy,
+                        onSelect: env.selectProviderModel(providerID:modelID:))),
+                placesTurnStatsInComposer: true)
                 .id(env.chatSessionID.rawValue)
         }
         .background(.background)
@@ -307,11 +319,16 @@ struct IOSRootView: View {
             .accessibilityIdentifier("ios.sidebar.open")
             .frame(width: 48)
 
-            IOSChatModelMenu(
-                catalog: env.providerCatalog,
-                isBusy: env.viewModel.isBusy,
-                onSelect: env.selectProviderModel(providerID:modelID:))
+            Text(activeSessionTitle)
+                .font(.system(
+                    size: sessionTitleSize,
+                    weight: .semibold,
+                    design: .serif))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+                .truncationMode(.middle)
                 .frame(maxWidth: .infinity)
+                .accessibilityIdentifier("ios.chat.session-title")
 
             Button {
                 startNewChat()
@@ -333,87 +350,57 @@ struct IOSRootView: View {
 
     private func sidebar(width: CGFloat) -> some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(alignment: .center, spacing: 12) {
-                Text("Intatis")
-                    .font(.title2.weight(.semibold))
-                Spacer(minLength: 12)
-                Button {
-                    presentSettings()
-                } label: {
-                    Label(
-                        IntatisLocalization.string("Settings"),
-                        systemImage: "gearshape")
-                        .intatisComposerIconLabel()
-                }
-                .intatisCompactIconButton()
-                .accessibilityIdentifier("chat.settings")
-            }
-
-            Text(IntatisLocalization.string("Recents"))
-                .font(.headline.weight(.semibold))
-                .padding(.top, 20)
+            Text("Intatis")
+                .font(.system(
+                    size: brandTitleSize,
+                    weight: .semibold,
+                    design: .serif))
+                .foregroundStyle(.primary)
+                .padding(.horizontal, 6)
+                .padding(.top, 10)
                 .padding(.bottom, 12)
 
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 2) {
-                    if recentSessions.isEmpty {
-                        Text(IntatisLocalization.string("No chat sessions yet."))
-                            .font(.body)
-                            .foregroundStyle(.secondary)
-                            .padding(.vertical, 12)
-                    } else {
-                        ForEach(Array(recentSessions.prefix(24))) { session in
-                            Button {
-                                selectSession(session)
-                            } label: {
-                                Text(sessionMenuTitle(session))
-                                    .font(.body)
-                                    .fontWeight(
-                                        session.id == env.chatSessionID
-                                            ? .semibold
-                                            : .regular)
-                                    .foregroundStyle(.primary)
-                                    .lineLimit(2)
-                                    .multilineTextAlignment(.leading)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .padding(.vertical, 11)
-                                    .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                            .disabled(env.viewModel.isBusy)
-                        }
-                    }
+            IOSSidebarModeRow()
+                .padding(.bottom, 14)
+                .accessibilityIdentifier("ios.sidebar.mode.chat")
+
+            Divider()
+                .opacity(0.45)
+                .padding(.bottom, 12)
+
+            IntatisSessionHistoryList(
+                title: IntatisLocalization.string("Recent"),
+                newTitle: IntatisLocalization.string("New chat"),
+                emptyTitle: IntatisLocalization.string("No chat sessions yet."),
+                items: sidebarHistoryItems,
+                style: .standard(colorScheme),
+                isNewDisabled: env.viewModel.isBusy,
+                onNew: { startNewChat(closingSidebar: true) },
+                onSelect: selectSession(id:))
+                .frame(maxHeight: .infinity, alignment: .top)
+
+            Button {
+                presentSettings()
+            } label: {
+                HStack(spacing: 9) {
+                    Image(systemName: "gearshape")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 20)
+                    Text(IntatisLocalization.string("Settings"))
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
                 }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 9)
+                .contentShape(RoundedRectangle(
+                    cornerRadius: 8,
+                    style: .continuous))
             }
-            .scrollIndicators(.hidden)
-
-            HStack(alignment: .center, spacing: 12) {
-                // The reference reserves this position for search. It remains
-                // intentionally non-interactive until session search exists.
-                Image(systemName: "magnifyingglass")
-                    .font(.system(size: 17, weight: .semibold))
-                    .frame(width: 40, height: 40)
-                    .intatisLiquidGlass(cornerRadius: 20)
-                    .accessibilityHidden(true)
-
-                Spacer(minLength: 8)
-
-                Button {
-                    startNewChat(closingSidebar: true)
-                } label: {
-                    Label(
-                        IntatisLocalization.string("Chat"),
-                        systemImage: "square.and.pencil")
-                        .font(.headline)
-                        .padding(.horizontal, 18)
-                        .frame(height: 40)
-                }
-                .buttonBorderShape(.capsule)
-                .intatisGlassButton(prominent: true)
-                .disabled(env.viewModel.isBusy)
-                .accessibilityIdentifier("ios.sidebar.new-chat")
-            }
+            .buttonStyle(.plain)
             .padding(.top, 12)
+            .accessibilityIdentifier("chat.settings")
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 12)
@@ -473,6 +460,33 @@ struct IOSRootView: View {
         setSidebarVisible(false)
     }
 
+    private func selectSession(id: SessionID) {
+        guard let session = recentSessions.first(where: { $0.id == id }) else {
+            return
+        }
+        selectSession(session)
+    }
+
+    private var activeSessionTitle: String {
+        guard let session = recentSessions.first(where: {
+            $0.id == env.chatSessionID
+        }) else {
+            return IntatisLocalization.string("New chat")
+        }
+        return sessionMenuTitle(session)
+    }
+
+    private var sidebarHistoryItems: [IntatisSessionHistoryItem] {
+        recentSessions.prefix(24).map { session in
+            IntatisSessionHistoryItem(
+                id: session.id,
+                title: sessionMenuTitle(session),
+                detail: "",
+                systemImage: "bubble.left.and.bubble.right",
+                isSelected: session.id == env.chatSessionID)
+        }
+    }
+
     private func startNewChat(closingSidebar: Bool = false) {
         env.startNewChatSession()
         refreshSessions()
@@ -493,7 +507,18 @@ struct IOSRootView: View {
 
     private var settingsSheet: some View {
         NavigationStack {
-            Form {
+            VStack(alignment: .leading, spacing: 0) {
+                Text(IntatisLocalization.string("Settings"))
+                    .font(.system(
+                        size: settingsTitleSize,
+                        weight: .semibold,
+                        design: .serif))
+                    .foregroundStyle(.primary)
+                    .padding(.horizontal, 20)
+                    .padding(.top, 8)
+                    .padding(.bottom, 4)
+
+                Form {
                 Section("Configuration") {
                     Button {
                         showConfigImporter = true
@@ -631,8 +656,9 @@ struct IOSRootView: View {
                         Text(settingsError).font(.caption).foregroundStyle(.red)
                     }
                 }
+                }
             }
-            .navigationTitle("Settings")
+            .navigationTitle("")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { showSettings = false } }
                 ToolbarItem(placement: .confirmationAction) {
@@ -886,6 +912,27 @@ struct IOSRootView: View {
     }
 }
 
+private struct IOSSidebarModeRow: View {
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "bubble.left.and.bubble.right")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(Color.accentColor)
+                .frame(width: 22)
+            Text(IntatisLocalization.string("Chat"))
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(.primary)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .intatisLiquidGlass(cornerRadius: 10, interactive: true)
+        .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isSelected)
+    }
+}
+
 private struct IOSChatModelMenu: View {
     let catalog: IOSProviderCatalog
     let isBusy: Bool
@@ -909,18 +956,19 @@ private struct IOSChatModelMenu: View {
             selectedModelID: catalog.selectedModelID,
             isBusy: isBusy,
             onSelect: onSelect) {
-                HStack(spacing: 4) {
+                HStack(spacing: 8) {
                     Text(selectedModel?.title ?? IOSConfig.defaultModel)
-                        .font(.headline.weight(.semibold))
+                        .font(.system(size: 13, weight: .semibold))
                         .foregroundStyle(.primary)
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    Image(systemName: "chevron.right")
-                        .font(.caption2.weight(.semibold))
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 10, weight: .semibold))
                         .foregroundStyle(.secondary)
                 }
-                .frame(maxWidth: .infinity)
+                .intatisComposerSelectionLabel()
         }
+        .intatisComposerSelectionMenu()
         .tint(.primary)
         .accessibilityLabel(
             "\(selectedModel?.title ?? IOSConfig.defaultModel), \(selectedProvider?.title ?? "OpenAI")")
@@ -936,7 +984,6 @@ struct IntatisiOSApp: App {
         WindowGroup {
             IOSRootView()
                 .environmentObject(env)
-                .fontDesign(.serif)
         }
     }
 }

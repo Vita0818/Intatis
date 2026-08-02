@@ -13,11 +13,17 @@ import IntatisConversation
 public struct ThreeColumnShell: View {
     @ObservedObject private var model: ChatViewModel
     private let layout: ThreeColumnShellLayout
+    private let composerLeadingAccessory: AnyView?
+    private let placesTurnStatsInComposer: Bool
 
     public init(model: ChatViewModel,
-                layout: ThreeColumnShellLayout = .split) {
+                layout: ThreeColumnShellLayout = .split,
+                composerLeadingAccessory: AnyView? = nil,
+                placesTurnStatsInComposer: Bool = false) {
         self.model = model
         self.layout = layout
+        self.composerLeadingAccessory = composerLeadingAccessory
+        self.placesTurnStatsInComposer = placesTurnStatsInComposer
     }
 
     public var body: some View {
@@ -29,7 +35,10 @@ public struct ThreeColumnShell: View {
                         .navigationSplitViewColumnWidth(min: layout.columns.sidebarMin,
                                                         ideal: layout.columns.sidebarIdeal)
                 } content: {
-                    ThreadView(model: model)
+                    ThreadView(
+                        model: model,
+                        composerLeadingAccessory: composerLeadingAccessory,
+                        placesTurnStatsInComposer: placesTurnStatsInComposer)
                         .navigationSplitViewColumnWidth(min: layout.columns.contentMin,
                                                         ideal: layout.columns.contentIdeal)
                 } detail: {
@@ -42,7 +51,10 @@ public struct ThreeColumnShell: View {
                                                         ideal: layout.columns.detailIdeal)
                 }
             case .threadOnly:
-                ThreadView(model: model)
+                ThreadView(
+                    model: model,
+                    composerLeadingAccessory: composerLeadingAccessory,
+                    placesTurnStatsInComposer: placesTurnStatsInComposer)
             }
         }
         .task { model.start() }
@@ -88,6 +100,8 @@ struct SidebarView: View {
 
 struct ThreadView: View {
     @ObservedObject var model: ChatViewModel
+    let composerLeadingAccessory: AnyView?
+    let placesTurnStatsInComposer: Bool
     @Environment(\.colorScheme) private var scheme
     private static let bottomAnchorID = "intatis-shared-chat-thread-bottom"
 
@@ -124,7 +138,8 @@ struct ThreadView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal)
             }
-            if let latestTurnStats = model.latestTurnStats {
+            if !placesTurnStatsInComposer,
+               let latestTurnStats = model.latestTurnStats {
                 IntatisTurnStatsSummaryView(stats: latestTurnStats, style: .standard(scheme))
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal)
@@ -133,7 +148,10 @@ struct ThreadView: View {
             #if !os(iOS)
             Divider()
             #endif
-            ComposerView(model: model)
+            ComposerView(
+                model: model,
+                leadingAccessory: composerLeadingAccessory,
+                placesTurnStatsInComposer: placesTurnStatsInComposer)
         }
     }
 
@@ -321,6 +339,8 @@ public struct IntatisMessageCitationsView: View {
 
 struct ComposerView: View {
     @ObservedObject var model: ChatViewModel
+    let leadingAccessory: AnyView?
+    let placesTurnStatsInComposer: Bool
     @Environment(\.colorScheme) private var scheme
 
     private var canSend: Bool {
@@ -336,12 +356,18 @@ struct ComposerView: View {
             isInputDisabled: model.isBusy,
             style: .standard(scheme),
             secondaryAction: secondaryAction,
+            leadingAccessory: leadingAccessory,
             inputLeadingAccessory: inputLeadingAccessory,
             stopAction: model.isBusy
                 ? IntatisThreadComposerSecondaryAction(
                     systemImage: "stop.fill",
                     help: IntatisLocalization.string("Stop"),
                     action: { model.cancelCurrentOperation() })
+                : nil,
+            accessory: placesTurnStatsInComposer
+                ? AnyView(IntatisComposerUsageStrip(
+                    stats: model.latestTurnStats,
+                    style: .standard(scheme)))
                 : nil,
             onSend: { model.send() })
         .padding(10)

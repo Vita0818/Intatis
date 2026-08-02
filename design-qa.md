@@ -318,3 +318,103 @@ Date: 2026-08-02
 - No provider, credential resolver, web-search or message-send path was invoked.
 
 final result: passed
+
+# Design QA — macOS design language applied to iOS
+
+Date: 2026-08-02
+
+## Scope
+
+- Apply the current macOS visual language to the iOS Chat-only product: typography roles,
+  navigation hierarchy, session title, native Liquid Glass controls and two-row composer.
+- Keep the platform adaptation native to iOS rather than copying desktop geometry or adding
+  Code/Cowork/workspace capabilities.
+- Compile the latest root `Intatis.icon` into the iOS app and verify its installed appearance.
+
+This section supersedes the preceding same-day global-serif iOS pass. The macOS source of truth
+uses serif for brand/page/session titles and system sans for body copy, controls, menus, forms and
+input; the iOS implementation now follows that same role split.
+
+## Comparison inputs
+
+- macOS source truth:
+  `/Users/vita/.codex/visualizations/2026/08/01/019fbc6f-219c-7340-a461-92dc6f2794b7/cowork-integrated-agent-communication-final.jpeg`.
+- iOS final default states:
+  `/Users/vita/.codex/visualizations/2026/08/01/019fbc6f-219c-7340-a461-92dc6f2794b7/intatis-ios-dark-home.png`
+  and
+  `/Users/vita/.codex/visualizations/2026/08/01/019fbc6f-219c-7340-a461-92dc6f2794b7/intatis-ios-final-light-home.png`.
+- iOS component states:
+  `/Users/vita/.codex/visualizations/2026/08/01/019fbc6f-219c-7340-a461-92dc6f2794b7/intatis-ios-light-sidebar.png`
+  and
+  `/Users/vita/.codex/visualizations/2026/08/01/019fbc6f-219c-7340-a461-92dc6f2794b7/intatis-ios-light-settings.png`.
+- Installed icon:
+  `/Users/vita/.codex/visualizations/2026/08/01/019fbc6f-219c-7340-a461-92dc6f2794b7/intatis-ios-home-icon.png`.
+- Required combined reference/implementation input:
+  `/Users/vita/.codex/visualizations/2026/08/01/019fbc6f-219c-7340-a461-92dc6f2794b7/intatis-macos-ios-design-comparison.png`.
+
+The desktop and phone viewports intentionally differ. The comparison judges the design-token and
+hierarchy mapping—title family, control family, materials, information order and composer roles—
+rather than claiming cross-platform pixel identity.
+
+## Acceptance checks
+
+| Requirement | Result | Evidence |
+|---|---|---|
+| Typography matches macOS roles | Passed | `Intatis`, session and Settings titles use system serif; body, model label, buttons, menus, forms and input use system sans. The former root `.fontDesign(.serif)` is removed. |
+| Top header matches the product hierarchy | Passed | The center slot is the current serif session title; model selection no longer competes with navigation and New in the header. |
+| Drawer uses the same information architecture | Passed | Serif `Intatis`, selected Chat glass row, `Recent` + circular New, session list and bottom Settings replace the prior gear/search/large-Chat arrangement. |
+| Composer matches the macOS control cluster | Passed | Row one contains the model glass capsule and optional usage; row two contains the existing Chat paperclip menu, multiline input and the single Send/Stop slot. |
+| Native appearance works in Light and Dark | Passed | Semantic surfaces, text and glass controls remain legible in both captured appearances without fixed RGB/black/white or simulated glass. |
+| Settings keeps the same title/body split | Passed | Settings has a serif page title while native toolbar buttons, sections, descriptions and fields stay system sans. |
+| Latest app icon is installed | Passed | Built Info.plist declares `CFBundleIconName=Intatis`; iPhone/iPad icon files are present and the simulator home screen shows the new pointer icon. |
+| iOS product boundary is preserved | Passed | No Tools, Permission, AgentKernel, Cowork, workspace, shell or generic attachment dependency was added. |
+
+## Required fidelity surfaces
+
+- Fonts and typography: Apple system serif is limited to title roles; Apple system sans and
+  Dynamic Type remain the control/body default. Markdown, code and math keep their shared semantic
+  fonts.
+- Spacing and layout rhythm: the 64pt top header, 82% drawer, compact selected mode row, Recent
+  hierarchy and bottom two-row composer preserve the current native spacing system.
+- Colors and materials: `.primary`, `.secondary`, separators, system background and native
+  Liquid Glass resolve per appearance; no sampled color or handcrafted glass was introduced.
+- Iconography: only SF Symbols and the user-provided canonical Icon Composer source are used.
+- Copy and content: session/model/provider values remain runtime data. Empty Chat intentionally has
+  no onboarding or suggestion cards.
+
+## Severity review
+
+- P0: none.
+- P1: none.
+- P2: none on the tested home, drawer, Settings or installed-icon surfaces.
+- Remaining matrix: rich long replies, long session names, keyboard interaction, every Dynamic
+  Type category, Reduce Transparency, Increase Contrast and physical devices remain `UNKNOWN`;
+  they are not observed mismatches in the tested states.
+
+## Validation loop
+
+1. Re-opened the current macOS implementation screenshot and audited its typography hierarchy,
+   sidebar order, composer roles, semantic materials and control geometry.
+2. Removed the iOS global-serif override, moved model selection into a parameterized shared
+   composer first row, moved session title into the header and rebuilt the drawer from shared
+   session-history/native glass surfaces.
+3. Added the root `Intatis.icon` to the iOS resource graph, regenerated the Xcode project and
+   confirmed the compiled Info.plist/icon inventory.
+4. Installed on an iOS 27.0 iPhone 17e simulator and captured final Light/Dark home pixels. Two
+   QA-only incremental builds changed only the initial presentation state to expose drawer and
+   Settings for screenshots; both flags were restored to `false` before the final source build.
+5. Put the macOS reference, iOS Dark home and iOS Light drawer in one combined image and reviewed
+   hierarchy, type family, spacing, materials, iconography and capability scope. No tested-surface
+   P0/P1/P2 issue remained.
+
+## Build and interaction evidence
+
+- Swift parse passed for the three touched Swift files.
+- `MessageRenderingTests|ThreadLayoutTests` passed 51/51.
+- XcodeGen and generic `IntatisiOS` Simulator Debug unsigned build succeeded.
+- CoreSimulator supplied native installed pixels. This host has CoreSimulator runtimes but no
+  launchable `Simulator.app`, so Computer Use could not target the headless iOS process; drawer and
+  Settings interaction automation is not claimed.
+- No provider request, credential read, web search or message send occurred during visual QA.
+
+final result: passed

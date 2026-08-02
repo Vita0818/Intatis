@@ -151,6 +151,8 @@ targets:
     sources:
       - Apps/IntatisiOS/Sources
       - Apps/IntatisiOS/Resources
+      - path: Intatis.icon
+        buildPhase: resources
       - path: Apps/SharedResources
         buildPhase: resources
       - path: NOTICE.md
@@ -167,6 +169,7 @@ targets:
         INFOPLIST_KEY_CFBundleDisplayName: Intatis
         INFOPLIST_KEY_UILaunchScreen_Generation: "YES"
         INFOPLIST_KEY_NSMicrophoneUsageDescription: "Intatis uses the microphone for voice input transcription."
+        ASSETCATALOG_COMPILER_APPICON_NAME: Intatis
     dependencies:
       - package: Intatis
         product: IntatisCore
