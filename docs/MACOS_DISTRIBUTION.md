@@ -1,6 +1,9 @@
 # macOS 分发与沙箱边界
 
+文档状态：当前发行合同
 生效日期：2026-07-28
+最近核对：2026-08-03
+产品基线：v0.32（build 32）
 
 ## 产品决策
 
@@ -29,6 +32,70 @@ Intatis 的 macOS 产品只通过 Developer ID 签名、公证和直接下载分
 
 iOS 当前仍是独立的 chat 子集。本决策不自动删除或扩大 iOS 产品面，也不改变
 iOS 自身的系统 sandbox 与 target-linkage 限制。
+
+## 直分发打包入口
+
+仓库唯一正式打包入口是 `scripts/package-macos-release.sh`。它只构建
+`IntatisMac`，并且在以下所有条件成立后才把产物写入 `dist/`：
+
+1. 当前 Keychain 存在有效的 `Developer ID Application` identity；
+2. `INTATIS_NOTARY_PROFILE` 指向用户已通过 `notarytool store-credentials`
+   保存的 Keychain profile；
+3. universal Release build 同时包含 `arm64` 与 `x86_64`；
+4. 使用 Developer ID entitlements、secure timestamp 与 Hardened Runtime 完成签名；
+5. App 公证状态为 `Accepted`，staple/validate、严格 codesign 与 Gatekeeper assessment
+   全部通过；
+6. DMG 包含 `/Applications` 拖放入口，以 Developer ID 单独签名，再次公证并完成
+   staple/validate、codesign 与 Gatekeeper assessment。
+
+使用方式：
+
+```sh
+INTATIS_NOTARY_PROFILE=<本机 profile 名称> \
+  scripts/package-macos-release.sh
+```
+
+如果当前网络必须通过本机代理/VPN 才能访问 GitHub，但该代理/VPN 会阻断 Apple
+notarization，使用交互式两阶段模式：
+
+```sh
+INTATIS_PAUSE_BEFORE_NOTARIZATION=1 \
+INTATIS_NOTARY_PROFILE=<本机 profile 名称> \
+  scripts/package-macos-release.sh
+```
+
+运行命令时保持代理/VPN 开启，让 Xcode/SwiftPM 完成依赖解析、Release 构建和 Developer
+ID 签名。脚本提示 `GitHub is no longer used after this point` 后保持终端打开，关闭会阻断
+Apple 的代理/VPN，再按 Return。脚本会用当前 Keychain profile 探测 Apple notarization；
+若仍不可达，会保留已经签名的临时 App 并原地等待重试，不重新构建。不要为了这个流程删除
+Git 的 GitHub 专用 proxy 配置；该配置在暂停点之后不再参与后续步骤。
+
+上传使用 `notarytool submit --no-wait --progress`，终端持续显示上传进度并在上传结束后记录
+submission ID。随后 `notarytool wait` 默认最多等待 30 分钟；可通过
+`INTATIS_NOTARY_TIMEOUT=2h` 等正时长显式调整。超时不代表失败，Apple 会继续处理；若状态
+仍是 `In Progress`，脚本以非零状态安全退出并把签名 App、上传日志、submission ID 和后续
+DMG 状态保存在 owner-only 的 `.intatis/release-recovery/<run>/`。不得因此重复上传。按脚本
+打印的精确命令恢复同一提交，例如：
+
+```sh
+INTATIS_NOTARY_PROFILE=<本机 profile 名称> \
+INTATIS_RESUME_RELEASE_DIR=<脚本打印的绝对 recovery 路径> \
+  scripts/package-macos-release.sh
+```
+
+恢复模式重新核对版本、universal 架构、Developer ID、Hardened Runtime 和 entitlements，
+然后复用已记录的 App/DMG submission ID；不会重新构建或重新上传。签名完成后的 Control-C、
+TERM、网络错误、Apple 长时间处理或 Invalid 也保留 recovery 目录，成功输出最终产物后才自动
+清理。`INTATIS_RESUME_RELEASE_DIR` 只接受仓库 `.intatis/release-recovery/` 下当前用户拥有、
+模式为 `0700` 且 state/App 均非 symlink 的绝对路径。
+
+如果 Keychain 中存在多个 Developer ID Application identity，额外设置
+`INTATIS_DEVELOPER_IDENTITY` 为目标证书的完整 common name。可用
+`INTATIS_OUTPUT_DIR` 改变输出目录。证书、私钥、Apple 账号/App Store Connect
+凭据和 profile 内容都不得进入仓库；脚本只接收 identity/profile 名称。
+
+输出包括 stapled App 的 ZIP、已单独公证并 stapled 的 DMG，以及两者的 SHA-256
+清单。任一门槛失败都不得把 ad-hoc/未公证包发布为正式产物。
 
 ## “不再考虑 App Store 沙箱”的精确定义
 

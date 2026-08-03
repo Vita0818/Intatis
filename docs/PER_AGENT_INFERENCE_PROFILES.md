@@ -1,6 +1,8 @@
 # PER_AGENT_INFERENCE_PROFILES
 
-最后更新：2026-07-16
+文档状态：当前 durable inference binding 契约
+最后核对：2026-08-03
+产品基线：v0.32（build 32）
 
 ## 1. 状态与范围
 

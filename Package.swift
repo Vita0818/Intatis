@@ -1,14 +1,10 @@
 // swift-tools-version:5.9
 import PackageDescription
 
-// Intatis v0.1 — single root manifest.
-// One target per module; target dependencies enforce the acyclic DAG from
-// ARCHITECTURE.md §2.1. The conceptual `Packages/<Name>` split maps 1:1 to
-// these targets and can be promoted to standalone SwiftPM packages later.
-//
-// Buildable/testable today: Core / Protocol / Providers / Artifacts / Conversation
-// (pure Swift, no Apple-only frameworks). SharedUI + IntatisMac use SwiftUI/AppKit,
-// guarded with `#if canImport(SwiftUI)` so the package still builds on Linux.
+// Intatis root SwiftPM manifest. Product versioning is owned by project.yml;
+// package comments below that mention early v0.x milestones describe when a
+// subsystem was introduced, not the current product version. See
+// docs/VERSIONING.md.
 
 let package = Package(
     name: "Intatis",

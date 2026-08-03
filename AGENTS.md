@@ -5,15 +5,16 @@
 本文是 AI Agent 每轮进入本仓库时的入口文件。执行任何代码修改、配置修改、构建脚本修改或测试源码修改之前，必须先按顺序阅读并核对下列文档：
 
 0. `/Users/vita/Vitemis/AGENTS.md`
-1. `docs/CURRENT_STATE.md`
-2. `docs/MACOS_DISTRIBUTION.md`
-3. `docs/PROJECT_MAP.md`
-4. `docs/ARCHITECTURE.md`
-5. `docs/DO_NOT_BREAK.md`
-6. `docs/OPEN_SOURCE_REUSE.md`
-7. `docs/TESTING.md`
-8. `docs/NEXT_TARGET.md`（如果存在）
-9. `docs/COWORK_PRINCIPLES.md`（修改 Cowork / AgentKernel / MessageBus / 权限 / agent 编排前必读）
+1. `docs/VERSIONING.md`
+2. `docs/CURRENT_STATE.md`
+3. `docs/MACOS_DISTRIBUTION.md`
+4. `docs/PROJECT_MAP.md`
+5. `docs/ARCHITECTURE.md`
+6. `docs/DO_NOT_BREAK.md`
+7. `docs/OPEN_SOURCE_REUSE.md`
+8. `docs/TESTING.md`
+9. `docs/NEXT_TARGET.md`（如果存在）
+10. `docs/COWORK_PRINCIPLES.md`（修改 Cowork / AgentKernel / MessageBus / 权限 / agent 编排前必读）
 
 如果文档与源码、工程配置、测试或脚本冲突，必须以当前源码和配置为准，并在最终报告中明确指出冲突位置和采用源码为准的原因。
 
@@ -55,7 +56,8 @@ managed-terminal Seatbelt、Hardened Runtime、签名/公证或 iOS 平台边界
 除非用户明确要求，不要修改：
 
 - `Apps/`（IntatisMac / IntatisiOS / intatis-cli）
-- `Packages/`（11 个 Intatis* 模块及其 Tests）
+- `Packages/`（当前 14 个公共库、3 个内部 C/guard target、开发期 MCP
+  conformance executable 及其 Tests；精确清单以 `Package.swift` 为准）
 - `Package.swift`
 - `project.yml`
 - `Makefile`
@@ -66,7 +68,9 @@ managed-terminal Seatbelt、Hardened Runtime、签名/公证或 iOS 平台边界
 - 不执行破坏性 Git 操作：`git reset --hard`、`git clean -fd`、`git checkout .`、强制 push、删除用户未提交文件。
 - 未经用户明文要求具体 Git 操作，不 add、不 commit、不 push、不创建 PR；编辑、整理、修复、验证或准备工作都不等于提交请求。
 - 若用户要求提交，只提交当前 Git root 中与本任务相关的文件；不得递归进入、暂存、提交或推送子仓库、submodule、nested Git repo 或依赖 checkout。
-- 不引入新依赖，不改构建脚本，不改测试源码，除非任务明确要求。v0.1 零第三方依赖；计划中的 SwiftGit2/libgit2 须先过许可证审查。
+- 不引入新依赖，不改构建脚本，不改测试源码，除非任务明确要求。当前第三方依赖与
+  vendored 派生源码以 `NOTICE.md`、`ThirdPartyNotices/` 和
+  `docs/OPEN_SOURCE_REUSE.md` 为准；任何新增或升级都须先过许可证与 provenance 审查。
 - 不把密钥、token、证书私钥、shared secret、账号密码、完整指纹、完整 API 响应、完整转写文本或个人隐私路径写入文档。
 - 不绕过 3 层权限门（DeterministicPolicyGate / ModelPermissionReviewer / PermissionEngine）、PathConfinement 工作区边界、SecretScanner、Mediator 秘密拦截或 Keychain 凭据隔离。
 - 不把 Cowork 实现为硬编码递归 agent 树（main/coordinator/worker/leaf 永久角色）；遵循 `docs/COWORK_PRINCIPLES.md`。

@@ -1327,7 +1327,13 @@ final class AgentLoopPolicyTests: XCTestCase {
     }
 
     func testSharedSoftTokenBudgetReservesBeforeDispatchAndReportsProviderOverrun() async throws {
-        let meter = AgentTokenBudgetMeter(limit: 800)
+        // Leave ample room for the real model-facing prompt so this test stays
+        // focused on a provider ignoring its output ceiling rather than on the
+        // separately covered request-too-large admission path.
+        let budgetLimit = 100_000
+        let firstReportedTokens = 6
+        let overrunReportedTokens = budgetLimit - firstReportedTokens + 1
+        let meter = AgentTokenBudgetMeter(limit: budgetLimit)
         let (firstWorkspace, firstLog) = try makeWorkspaceAndLog("budget-first")
         let (secondWorkspace, secondLog) = try makeWorkspaceAndLog("budget-second")
         defer {
@@ -1336,13 +1342,19 @@ final class AgentLoopPolicyTests: XCTestCase {
         }
         let firstProvider = PolicyScriptedProvider([[
             .textDelta("first"),
-            .usage(Usage(promptTokens: 4, completionTokens: 2, totalTokens: 6)),
+            .usage(Usage(
+                promptTokens: 4,
+                completionTokens: 2,
+                totalTokens: firstReportedTokens)),
             .done(finishReason: "stop"),
         ]])
         let secondProvider = PolicyScriptedProvider([[
             .textDelta("second"),
             // Simulates a provider that ignores the requested output ceiling.
-            .usage(Usage(promptTokens: 80, completionTokens: 715, totalTokens: 795)),
+            .usage(Usage(
+                promptTokens: 80,
+                completionTokens: overrunReportedTokens - 80,
+                totalTokens: overrunReportedTokens)),
             .done(finishReason: "stop"),
         ]])
         let firstLoop = makeLoop(
@@ -1361,24 +1373,26 @@ final class AgentLoopPolicyTests: XCTestCase {
         let firstResult = try await firstLoop.send("Spend six tokens.")
         XCTAssertEqual(firstResult, "first")
         let afterFirst = await meter.snapshot()
-        XCTAssertEqual(afterFirst.consumed, 6)
-        XCTAssertEqual(afterFirst.remaining, 794)
+        XCTAssertEqual(afterFirst.consumed, firstReportedTokens)
+        XCTAssertEqual(afterFirst.remaining, budgetLimit - firstReportedTokens)
         XCTAssertNotNil(firstProvider.requests.first?.maxOutputTokens)
 
         do {
             _ = try await secondLoop.send("Simulate a provider that ignores its output ceiling.")
             XCTFail("Expected the explicitly soft budget to report the provider overrun.")
         } catch let error as AgentExecutionBudgetError {
-            XCTAssertEqual(error, .exhausted(limit: 800, consumed: 801))
+            XCTAssertEqual(
+                error,
+                .exhausted(limit: budgetLimit, consumed: budgetLimit + 1))
         } catch {
             XCTFail("Unexpected error: \(error)")
         }
 
         let finalSnapshot = await meter.snapshot()
-        XCTAssertEqual(finalSnapshot.consumed, 801)
+        XCTAssertEqual(finalSnapshot.consumed, budgetLimit + 1)
         XCTAssertEqual(finalSnapshot.remaining, 0)
         let requestedCeiling = try XCTUnwrap(secondProvider.requests.first?.maxOutputTokens)
-        XCTAssertLessThan(requestedCeiling, 795)
+        XCTAssertLessThan(requestedCeiling, overrunReportedTokens)
         let errorPayloads = await errors(in: secondLog)
         XCTAssertEqual(errorPayloads.count, 1)
         XCTAssertEqual(errorPayloads.first?.code, "token_budget_exhausted")

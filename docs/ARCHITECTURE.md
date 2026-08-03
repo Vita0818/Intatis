@@ -1,5 +1,12 @@
 # ARCHITECTURE
 
+文档状态：当前架构规范
+最近核对：2026-08-03
+产品基线：v0.32（build 32）
+
+文中较早的 v0.x 只表示能力最初引入或兼容格式冻结的里程碑；除明确标为历史的段落外，
+当前架构判断以本文件、源码和 `project.yml` 为准。
+
 ## macOS 发行架构边界
 
 macOS 唯一发行 App 是 Developer ID 签名、公证和直接分发的 `IntatisMac`。
@@ -626,7 +633,7 @@ Provider HTTP transport 统一使用 `ProviderURLSession.noRedirect`：Foundatio
 
 这一 slice 不是宿主路由器。它没有新增确定性 intent-to-tool 改写、extension/MIME/backend 执行前兼容性验证、输出 staging/原子 rename，也没有改动 durable tool ticket、`manual_reconciliation` 或 `effectDisposition` 语义。这些属于原计划第 3–5 点，仍需独立实现和验证。
 
-### Agent 文档/媒体工具链路（v0.16，Code / Cowork / CLI）
+### Agent 文档/媒体工具链路（当前实现；初始于 v0.16，Code / Cowork / CLI）
 
 ```text
 provider tool_call -> AgentLoop schema validation
@@ -700,7 +707,7 @@ provider tool_call -> AgentLoop schema validation
 - Cowork `ToolCapability.gitControl` 下 coordinator lease 默认可用本地 Git control；`ToolCapability.gitRemote` 下 coordinator lease 默认可用 remote Git control；worker lease 默认不暴露任何 Git 工具。旧 `runShell` lease 仍只暴露 `git_status` / `git_diff` / `git_info` / `git_recent_commits` / `git_diff_base` 这类 read-only 兼容工具。
 - 仍未实现 merge/rebase/reset/clean、force-push、remote auth 管理、PR/CI/review workflow；这些后续必须单独做风险分级、UI/权限和测试设计。
 
-### Agent 网络/浏览器工具链路（v0.16；2026-07-31 execution contract，Code / Cowork / CLI）
+### Agent 网络/浏览器工具链路（当前实现；初始于 v0.16，Code / Cowork / CLI）
 
 ```text
 provider tool_call -> AgentLoop schema validation
@@ -950,7 +957,8 @@ MultimodalService.generateImage/transcribe/generateVideo(轮询 job)
 
 ## 同步 / 通信机制
 
-- **进程内**：v0.1 内核全进程内运行。`Orchestrator`/`EventLog`/`MessageBus` 均为 `actor`。
+- **进程内**：当前 GUI/CLI kernel 仍在单进程内运行；
+  `Orchestrator`/`EventLog`/`MessageBus` 均为 `actor`。这是当前事实，不是仅限 v0.1 的规划。
 - **JSON-RPC 2.0 词汇**已定义（`JSONRPC.swift`：Command→request、Envelope→event notification），但**尚未挂传输**。未来 `intatis agent --stdio` / `intatis daemon` 是规划中管道。`UNKNOWN` — 当前无 out-of-process 传输实现。
 - **Provider 线协议**：OpenAI 兼容 HTTP/SSE（chat completion endpoint streaming）。`WireFormat.openai` 是唯一 shipped 格式；`ProviderEndpoint.chatEndpoint` 可覆盖默认 `baseURL + /chat/completions`，保留 `baseURL` 给 image/transcription 等后续路径。
 - **Provider tool-call delta 兼容**：`OpenAIToolCalling` 仍输出既有 `ToolCall(id:name:arguments:)`，但解码更宽容：单工具调用可缺省 `index`，`index` 可是字符串，`function.arguments` 可是字符串或 JSON object/array/number/bool，非字符串值会被压缩编码回 JSON 字符串再交给既有工具参数解析。Chat/tool-calling streaming 会遍历同一 SSE chunk 的全部 choices，不再只消费 `choices.first`；如果首个 choice 为空但后续 choice 带 content、tool_calls 或 `finish_reason`，仍会输出对应 delta/tool calls 并完成流；如果多个 choice 同时给出 finish reason，`tool_calls` / `function_call` 优先于普通 `stop`，避免工具轮被错误标成文本完成。若 provider 以 `finish_reason:"tool_calls"` 或旧式 `finish_reason:"function_call"` 结束但没有发出完整 tool-call delta / tool name，或已出现 tool-call delta 但最终错误给出 `stop` 且仍缺 tool name，则抛出 provider tool-call stream 兼容错误，不把空工具调用合成为成功。非空累计 `function.arguments` 在发出 `ToolCall` 前必须能解码为 JSONValue，截断或非法 JSON 会作为 provider tool-call stream 兼容错误暴露；空 arguments 仍保留，以兼容无参工具。此行为不改变 EventLog schema，不绕过权限门。

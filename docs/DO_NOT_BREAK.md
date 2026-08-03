@@ -1,5 +1,9 @@
 # DO_NOT_BREAK
 
+文档状态：当前回归禁区
+最近核对：2026-08-03
+产品基线：v0.32（build 32）
+
 ## macOS 分发不变量
 
 - macOS 唯一发行 App 是 Developer ID/direct-distribution `IntatisMac`；不得把
@@ -12,6 +16,14 @@
   WorkspaceLease、PathConfinement、SecretScanner、durable tool execution、
   managed-terminal Seatbelt/default-network-deny、Hardened Runtime、签名/
   公证或 iOS target 边界。
+- 面向人工运行的发行脚本不得用 JSON/plist 输出隐藏 `notarytool submit` 的上传进度；
+  必须在上传完成后立即显示并持久化 submission ID，再进入有界等待。
+- `.intatis/release-recovery/<run>/state.plist` 是 owner-only 的本地恢复状态（schema
+  v1）。恢复根目录与 run 目录必须为 `0700`，状态文件必须为 `0600` 并原子更新；
+  resume 只接受 canonical 仓库恢复根目录下、非 symlink、属于当前 UID 的状态与 App。
+- App/DMG submission ID 必须 first-write/reuse。超时、`In Progress`、中断、网络失败
+  或 `Invalid` 都必须保留恢复状态且不得自动重复提交；只有最终 ZIP、DMG 与 manifest
+  全部成功落盘后才可清理恢复目录。
 
 ## 诊断导出不变量
 

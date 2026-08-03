@@ -1,6 +1,8 @@
 # PROJECT_MAP
 
-最近自查日期：2026-08-02
+文档状态：当前仓库地图
+最近自查日期：2026-08-03
+产品基线：v0.32（build 32）
 
 本文描述当前仓库结构。判断依据来自 `Package.swift`、`project.yml`、`Makefile`、源码、测试文件和脚本。
 
@@ -79,9 +81,9 @@ macOS 唯一发行 target 是 Developer ID/direct-distribution `IntatisMac`。
 Intatis/
 ├── .build/            SwiftPM 构建产物（gitignored）
 ├── .agents/skills/    项目级 Agent Skills；当前含 intatis-skill-creator
-├── .git/              Git 仓库（remote: github.com/Vita0818/Intatis；当前 session 进入 v0.16 Agent 文档/媒体 + 网络/浏览器工具，project.yml 仍标 0.12）
+├── .git/              Git 仓库（产品版本以 project.yml 为准；commit 标题只记录里程碑）
 ├── .gitattributes     LF 规范化
-├── .gitignore         忽略 .build、Intatis.xcodeproj、*.env、.intatis 本地运行/受管 worktree 状态
+├── .gitignore         忽略 .build、Intatis.xcodeproj、dist、*.env、.intatis 本地运行/受管 worktree 状态
 ├── .swiftpm/          SwiftPM 缓存
 ├── AGENTS.md          项目常驻上下文与操作协议入口
 ├── Intatis.icon/      macOS/iOS 共用的 Apple Icon Composer 主图标源（由 Xcode 按平台编译）
@@ -90,7 +92,7 @@ Intatis/
 │   ├── IntatisMac/    全量 macOS app（默认 DeveloperID/non-sandbox workbench）+ entitlements
 │   ├── IntatisiOS/    Chat-only iOS app（7-product 子集）
 │   └── intatis-cli/   CLI
-├── ARCHITECTURE.md    Intatis 架构设计（draft-0，2026-06-11，中文）
+├── ARCHITECTURE.md    兼容入口；当前正文位于 docs/ARCHITECTURE.md
 ├── Experiments/       不接入生产 build graph 的独立实验；当前含 WebRendererParity
 ├── Makefile           build/test/release/install/app 便利 target
 ├── NOTICE.md          项目来源、当前上游采用状态 + 第三方依赖声明
@@ -234,11 +236,17 @@ Intatis/
 
 | 脚本 | 用途 | 调用方式 |
 |---|---|---|
-| `Makefile` | build/test/release/install/app/clean 便利 target | `make build` / `make test` / `make app` 等 |
+| `Makefile` | version/build/test/release/install/app/clean 便利 target；常用构建入口先核对版本 | `make version` / `make build` / `make test` / `make app` 等 |
 | `project.yml` | XcodeGen 工程规格 | `xcodegen generate`（`make app` 内调用） |
+| `scripts/check-version-consistency.sh` | 核对工程、参考 plist、当前文档和生成工程版本 | `scripts/check-version-consistency.sh` |
+| `scripts/package-macos-release.sh` | Developer ID 直分发 ZIP/DMG 严格流水线；可在签名后切换网络，并以 owner-only state 有界等待/恢复同一 App 或 DMG submission | 首次设置 `INTATIS_PAUSE_BEFORE_NOTARIZATION=1`；超时后按脚本打印的 `INTATIS_RESUME_RELEASE_DIR` 命令恢复 |
 | `scripts/RendererValidationWatchdog.swift` | hash-pinned 单实例 renderer/session replay、telemetry、runtime-log audit 与 TERM→KILL containment | 通过经批准的 Release validation 命令调用 |
 
 ## 不确定项
 
-- Intatis 仓与 Councis 仓共享同一 `ARCHITECTURE.md` 与 `Packages/` 结构。二者关系（Councis 是 Intatis 的 CLI 原型分支？独立产品？）`UNKNOWN` — 需用户确认。
-- `Apps/intatis-cli/Sources/Interactive.swift` REPL 是否接入 `main()` `UNKNOWN`（Councis 仓调研显示疑似死代码，Intatis 仓需独立确认）。
+- 当前仓库没有 Git tag；HEAD/origin main 的里程碑提交不替代 `project.yml` 这一产品版本
+  唯一事实源。
+- `Apps/intatis-cli/Sources/Interactive.swift` 已由 `IntatisCLI.main` 经 `runMode` 接入，
+  不再列为未知。
+- 最终 notarization/staple/Gatekeeper、最低支持设备、第三方 provider/MCP/OAuth 与长时
+  性能矩阵仍是环境证据缺口，详见 `CURRENT_STATE.md` 和 `TESTING.md`。

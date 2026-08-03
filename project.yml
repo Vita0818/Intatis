@@ -26,8 +26,8 @@ packages:
 settings:
   base:
     SWIFT_VERSION: "5.9"
-    MARKETING_VERSION: "0.12"
-    CURRENT_PROJECT_VERSION: "1"
+    MARKETING_VERSION: "0.32"
+    CURRENT_PROJECT_VERSION: "32"
     CODE_SIGN_STYLE: Automatic
     GENERATE_INFOPLIST_FILE: "NO"
     # To run on a device or archive for distribution, set your team:
@@ -60,6 +60,7 @@ targets:
         INFOPLIST_KEY_NSHumanReadableCopyright: "Copyright © 2026 Intatis contributors. See NOTICE.md."
         ASSETCATALOG_COMPILER_APPICON_NAME: Intatis
         CODE_SIGN_ENTITLEMENTS: Apps/IntatisMac/IntatisMac.DeveloperID.entitlements
+        ENABLE_HARDENED_RUNTIME: "YES"
         # The separately declared IntatisMacAppStore target is the only
         # App-Store profile; do not turn this stdio-capable target into one by
         # swapping entitlements.

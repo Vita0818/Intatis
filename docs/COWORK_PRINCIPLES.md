@@ -1,6 +1,12 @@
 # COWORK_PRINCIPLES
 
-本文提炼自仓内 `docs/COWORK_AGENT_ARCHITECTURE.md` / `COWORK_TASK_CONTEXT_MODEL.md` / `COWORK_CURRENT_FINDINGS.md` / `COWORK_MIGRATION_PLAN.md` / `COWORK_AGENT_INVOCATION_MODEL.md` / `PER_AGENT_INFERENCE_PROFILES.md` 及原 `AGENTS.md` 的英文原则。它是 Cowork 架构的原则基准，**不是**当前完成度声明。修改 Cowork / AgentKernel / MessageBus / 权限 / agent 编排前必读。
+文档状态：当前 Cowork/AgentKernel 原则
+最近核对：2026-08-03
+产品基线：v0.32（build 32）
+
+本文提炼自仓内 v0.10 历史 Cowork 设计文档、`PER_AGENT_INFERENCE_PROFILES.md` 及
+项目操作规则。旧设计文档只保留迁移 provenance；本文件是当前原则基准，**不是**完成度
+声明。修改 Cowork / AgentKernel / MessageBus / 权限 / agent 编排前必读。
 
 ## 1. 核心原则
 

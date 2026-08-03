@@ -1,5 +1,9 @@
 # Intatis Cowork Agent Architecture
 
+> **历史文档：冻结于 v0.10 迁移阶段。** 本文只保留设计/迁移 provenance，不是当前
+> 状态、测试或实现事实源。产品基线与当前规则见 `docs/VERSIONING.md`、
+> `docs/COWORK_PRINCIPLES.md`、`docs/ARCHITECTURE.md` 和 `docs/CURRENT_STATE.md`。
+
 This document defines the intended architecture for Intatis Cowork. It replaces a fixed recursive-agent model with a task-scoped, context-scoped, capability-scoped multi-agent system.
 
 ## 1. Core Principle

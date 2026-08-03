@@ -1,5 +1,9 @@
 # Design QA — permission review and conversation chrome
 
+文档状态：截至 2026-08-02 的历史视觉验证日志
+当前产品版本与 UI 规范分别见 `docs/VERSIONING.md` 和
+`docs/CURRENT_UI_COLOR_SYSTEM.md`；本文中的日期、截图和结果只证明对应构建。
+
 Date: 2026-08-01
 
 ## Scope
