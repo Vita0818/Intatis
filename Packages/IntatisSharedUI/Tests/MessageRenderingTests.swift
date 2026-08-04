@@ -77,7 +77,12 @@ private struct StableThreadWindowHostingFixture: View {
                     Color.clear
                         .frame(height: 1)
                         .id(IntatisThreadBottomAnchorID(scope: scope))
-                        .intatisThreadBottomAnchorFrameProbe()
+                        .onScrollVisibilityChange(threshold: 0.99) {
+                            isVisible in
+                            coordinator.enqueueBottomAnchorVisibility(
+                                isVisible,
+                                scope: scope)
+                        }
                 }
                 .environment(
                     \.intatisMessageViewportAdmission,
@@ -92,19 +97,6 @@ private struct StableThreadWindowHostingFixture: View {
                     coordinator.effectiveRichSettleSource(for: scope))
                 .frame(width: 560)
                 .padding(.vertical, 16)
-            }
-            .intatisThreadViewportFrameProbe()
-            .onPreferenceChange(
-                IntatisThreadViewportFramesPreferenceKey.self
-            ) { frames in
-                guard let isVisible =
-                        IntatisThreadViewportFrames
-                            .isBottomAnchorVisible(frames) else {
-                    return
-                }
-                coordinator.enqueueBottomAnchorVisibility(
-                    isVisible,
-                    scope: scope)
             }
             .onScrollGeometryChange(
                 for: IntatisThreadScrollGeometry.self

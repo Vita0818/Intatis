@@ -1,7 +1,7 @@
 # CURRENT_UI_COLOR_SYSTEM — 系统原生表面与 Liquid Glass 规范
 
 文档状态：当前 UI 实施规范
-最近核对日期：2026-08-03
+最近核对日期：2026-08-04
 产品基线：v0.32（build 32）
 
 > Intatis 不再把“系统外观”解释为固定的纯白和纯黑。页面、侧栏、内容层与控制层均使用 Apple 平台的动态语义资源；在支持的系统上，导航与交互控件采用原生 Liquid Glass。`docs/UI_COLOR_SYSTEM.md` 只保存上一版香槟金 / 暖中性色方案，不随当前方案修改。
@@ -63,8 +63,11 @@
 ### 3.4 Cowork
 
 - 正常 agent 回复与 Code 共用无外框正文渲染；通用 Agent message、`information_requested`、`information_replied` 与其他 agent-to-agent 正文也使用同一普通回答版式，身份只显示 exact `sender->recipient`。tool、error、permission 与 task 等结构化记录继续保留语义容器。
-- Cowork trailing status rail 是用户明确指定的紧凑玻璃状态层：待处理权限 / 最近权限结果置顶，其后依次为 Agents、Goal、Tasks；各 section 使用系统原生 `glassEffect`，由一个 `GlassEffectContainer` 组织。rail 作为 conversation detail 同一 canvas 上的 trailing overlay，不再使用 divider、整栏 `.bar` / Material 背板或固定灰底；主 thread 滚动容器延伸到 detail 最右侧，以 trailing scroll-content margin 给 cards 留位，原生滚动条保持在整个内容区最右端；rail 最右透明边缘不参与命中测试，不能遮挡滚动条交互。Cowork rail 不显示 Git。
+- Cowork trailing status rail 是用户明确指定的紧凑玻璃状态层：待处理权限 / 最近权限结果置顶，其后依次为 Agents、Goal、Tasks；各 section 使用独立、稳定的系统原生 `Glass.clear` backdrop，不放进会融合或重组 shape 的 `GlassEffectContainer`。rail 作为 conversation detail 同一 canvas 上的 trailing overlay，不再使用 divider、整栏 `.bar` / Material 背板或固定灰底；主 thread 滚动容器延伸到 detail 最右侧，以 trailing scroll-content margin 给 cards 留位，原生滚动条保持在整个内容区最右端；rail 最右透明边缘不参与命中测试，不能遮挡滚动条交互。Cowork rail 不显示 Git。
 - 有 pending permission 且窗口可安全容纳 rail 时，rail 临时固定可见；窗口窄到无法容纳 rail 时，只在 composer 上方保留同一个低对比 Material 权限卡作为安全兜底。两种布局不得同时显示权限卡，也不得在 thread 顶部复制 Goal/Tasks 或保留对应占位高度。
+- Cowork session header 不显示独立 MCP Content 快捷按钮；该浏览能力位于
+  `Project Settings → MCP → Browse Content`。status rail 的显隐使用系统 compact 圆形
+  glass/bordered icon control，不用默认的横向 glass action chrome，也不进入 window toolbar。
 - Goal 操作、agent 操作、task action、项目设置按钮和紧凑 agent pill 属于功能层，可使用 Liquid Glass 并以 `GlassEffectContainer` 组织相邻效果。
 - 红、橙、绿继续只承担错误、等待 / 阻塞、成功等语义状态，并同时保留文字或图标。
 
@@ -188,14 +191,14 @@ rg -n 'glassEffect|GlassEffectContainer|buttonStyle\(\.glass|regularMaterial|win
   根 `Intatis.icon` 的 2026-08-02 22:26:51 版本正确显示为新版指针图标。对比图与详细
   severity review 见根目录 `design-qa.md`。
 
-## 15. 2026-08-02 Cowork permission-first Liquid Glass rail
+## 15. 2026-08-02 Cowork permission-first Liquid Glass rail（历史）
 
 - 用户提供的宽屏 Light 截图作为改造前基线；最新 Light 与 Dark 运行态截图和该基线
   已放入同一比较输入。新 rail 第一位为待处理权限或最近权限结果，其后为 Agents、
   可选 Goal、可选 Tasks；旧 `Git Status`、workspace path 和 Git 说明完全消失。
-- rail 由系统 `.bar` 提供区域分层，section 只使用原生 `GlassEffectContainer` /
-  `glassEffect(.regular, in: .rect(cornerRadius: 18))`。没有固定灰底、采样 RGB、
-  自绘高光、假阴影或手写玻璃资产；Light/Dark 的透射、明暗和边界均由系统解析。
+- 当时版本由系统 `.bar` 提供区域分层，section 使用原生 `GlassEffectContainer` /
+  `glassEffect(.regular, in: .rect(cornerRadius: 18))`；该整栏 `.bar` 已由第 17 节的同画布
+  overlay 取代。两版都没有固定灰底、采样 RGB、自绘高光、假阴影或手写玻璃资产。
 - 权限卡允许宿主关闭其默认 Material，由 rail 的单层 glass 承担表面，避免双层卡片。
   按钮仍使用原生 glass/bordered action style，并通过 `ViewThatFits` 在紧凑 rail 中换行；
   permission action、keyboard shortcut 与 accessibility identifier 不变。
@@ -222,3 +225,59 @@ rg -n 'glassEffect|GlassEffectContainer|buttonStyle\(\.glass|regularMaterial|win
 - 继续使用系统字体、语义色、Divider、DisclosureGroup 和原生 button style，没有新增固定
   色、手绘玻璃或自定义资产。深色运行态已用改前/改后同窗截图和 AX 树检查；浅色、Reduce
   Transparency 与 Increase Contrast 本轮未运行，不能仅凭语义 API 宣称已完成视觉验收。
+
+## 17. 2026-08-04 Cowork Agent rail 视觉收口
+
+- Cowork session header 再次收口为 durable session name 单行，不显示当前正在查看的 Agent；
+  当前选择仍由 Agents 行的选中背景表达，不保留不可见 subtitle 占位。
+- 宽屏 rail 仍是 conversation detail 同一 canvas 上的 trailing overlay，没有 divider、整栏
+  Material 或 `.bar` 背景。rail 使用更宽的稳定几何和更小的 leading inset，让原生 Liquid Glass
+  section 明确浮在画布上而不是形成独立侧栏；最右透明命中边界与主滚动条合同不变。
+- Agents section 使用更大的原生标题、18pt 内容 inset、52pt 最小行高和系统 semantic text/status
+  color。选中 ordinary agent 只显示 accent 蓝色圆角背景，不再叠加 checkmark；detached 和控制面
+  identity 继续由既有状态图标及是否可点击表达，颜色不是唯一状态通道。
+- Agents 按 identity 第一次 durable admission 的创建顺序稳定显示。实时消息、运行状态、detach
+  或 reattach 不会重排列表，从而避免用户点击目标移动，也避免为 last-message 排序扫描长会话。
+- rail 的“割裂”按光学层级处理，而不是再增加背景板：各 passive section 使用系统原生
+  `Glass.clear`（旧系统为 `.ultraThinMaterial` 语义 fallback），且 glass 位于与动态文字/选中背景
+  分离的稳定 backdrop。彼此独立的 status cards 不再放入 `GlassEffectContainer`，避免 selection、
+  focus 或邻卡内容变化触发整组 glass shape 的光学重组；不自绘渐变、投影或高光。
+- 宽屏几何由未压缩 outer width 唯一决定：rail 固定 348pt、glass card 固定 318pt，并单独保留
+  10pt 原生滚动条命中净空。选中 Agent、消息数量、文本长度、空态、rich/raw 状态或滚动条出现
+  都不得参与宽度计算。transcript 始终复用一个 `ScrollViewReader` / `ScrollView` 根，并先固定
+  `contentWidth` 与 thread raw width，再让 overlay 覆盖其上。
+- Agents 标题、名称、模型与 Goal/Tasks 的次级文字各提高一个系统文本层级。rail 顶部权限结果
+  只保留状态图标与“tool + decision”；pending 权限只保留 tool、安全摘要和必要 actions，risk chip、
+  raw arguments 与默认展开详情不进入 compact rail。人工 Approve/Decline/Cancel、automatic
+  non-actionable、RequestID/FIFO 与权限引擎语义不变。
+
+## 18. 2026-08-04 Cowork rail 窗口移动与切换稳定性（已被第 19 节取代）
+
+- rail 从参与父级布局的 trailing `ZStack` child 收口为 thread 上真正的
+  `.overlay(alignment: .trailing)`；348pt rail、318pt card 与 10pt scroller clearance 不变。
+- 本节记录的是被用户再次复现问题的第一版尝试：曾按 global origin 做 backing-pixel 补偿，并保留
+  一个收窄 interaction spacing 的 `GlassEffectContainer`。后续真实 Test session 证明该方案仍有
+  viewport preference 同帧重复更新，且 screen-global 补偿不是正确的窗口内布局依据，因此二者已删除。
+- 每个 passive glass 外叠系统动态 separator 的单物理像素 `strokeBorder`，固定的是结构轮廓而非
+  玻璃光线；没有固定 RGB、整栏 separator/Material 背板、自绘渐变、投影或高光。
+- 1372×768 Light 原生 fixture 中，Main/Research 的 Agents card 外轮廓均为 x=1076…1366；
+  切到 Finder 再返回的 rail crop 逐像素一致。该结果不替代 Dark、Reduce Transparency、
+  Increase Contrast、VoiceOver 或不同显示器 scale 的完整矩阵。
+
+## 19. 2026-08-04 Cowork rail 稳定 surface 与无坐标回写
+
+- rail 继续由 outer detail width 固定为 348pt、card 固定 318pt，并作为 trailing overlay；不做任何
+  screen-global origin 或 backing-pixel translation。
+- rail 使用仅含 Agents/permission/Goal/Tasks/selection/appearance 的 Equatable render snapshot；
+  transcript 的 empty/loading/page/rich 更新不会重新物化 rail subtree。
+- 每个 `Glass.clear` 位于独立稳定 backdrop；蓝色 selected-row 内容更新与原生 glass surface 分层。
+  independent cards 不共享 `GlassEffectContainer`，从根源上取消邻卡光学融合/重组。
+- Code/Cowork 删除 `IntatisThreadViewportFramesPreferenceKey`、GeometryReader frame probe 和
+  `.global`/named coordinate comparison；raw bottom-anchor 改由系统 `onScrollVisibilityChange`
+  观察，窗口移动、focus 与全屏变化不再因 origin 改变触发布局 preference。
+- 85 个 MessageRendering/ThreadLayout/ThreadScrollCoordinator focused tests 通过；其中 AppKit host
+  交错完成 360 次 agent selection、mode、inspector 和 window size 变化。真实 Test 长历史完成
+  main/code-reader/doc-reader 连续切换、Xcode 失焦/回焦和全屏变化；同 viewport strip 中 card 外边界
+  保持一致，回焦 AX tree 无结构变化，且系统日志中旧 viewport preference warning 为 0。原生
+  全屏过渡仍出现一次 AppKit/ThemeWidget 的系统 negative-geometry warning；该 warning 未在 agent
+  或 focus 操作中复发，不作为 rail 通过证据，也不得误记成已消除全部 AppKit runtime warning。

@@ -75,6 +75,9 @@ final class CoworkProjectionRegressionTests: XCTestCase {
         ])
 
         XCTAssertEqual(try XCTUnwrap(projection.agentRoster[worker]), attached)
+        XCTAssertEqual(
+            try XCTUnwrap(projection.historicalAgentRoster[worker]),
+            attached)
         XCTAssertEqual(projection.agentOwners[worker], main)
     }
 
@@ -93,7 +96,115 @@ final class CoworkProjectionRegressionTests: XCTestCase {
         XCTAssertEqual(attached.model, ModelID(rawValue: "legacy-model"))
         XCTAssertEqual(attached.profile, "reviewed")
         XCTAssertNil(attached.agentInferenceBinding)
+        XCTAssertEqual(projection.historicalAgentRoster[worker], attached)
         XCTAssertEqual(projection.agentOwners[worker], main)
+    }
+
+    func testDetachedAgentLeavesLiveRosterButRemainsInHistoricalRoster() throws {
+        let binding = inferenceBinding(profile: "profile-worker")
+        let attached = AgentAttachedPayload(
+            agent: worker,
+            path: "/workspace/worker",
+            model: binding.modelID,
+            profile: "reviewed",
+            agentInferenceBinding: binding)
+        let projection = CoworkProjection.build(from: [
+            envelope(0, .agentAttached(attached)),
+            envelope(1, .agentStatus(.init(agent: worker, state: .thinking))),
+            envelope(2, .agentDetached(.init(
+                agent: worker,
+                reason: "work complete"))),
+        ])
+
+        XCTAssertNil(projection.agentRoster[worker])
+        XCTAssertEqual(
+            try XCTUnwrap(projection.historicalAgentRoster[worker]),
+            attached)
+        XCTAssertNil(projection.agentStatuses[worker])
+    }
+
+    func testReattachingHistoricalAgentUpdatesOneStableIdentity() throws {
+        let first = AgentAttachedPayload(
+            agent: worker,
+            path: "/workspace/first",
+            model: ModelID(rawValue: "first-model"),
+            profile: "reviewed")
+        let reattached = AgentAttachedPayload(
+            agent: worker,
+            path: "/workspace/second",
+            model: ModelID(rawValue: "second-model"),
+            profile: "reviewed")
+        let projection = CoworkProjection.build(from: [
+            envelope(0, .agentAttached(first)),
+            envelope(1, .agentDetached(.init(agent: worker))),
+            envelope(2, .agentAttached(reattached)),
+        ])
+
+        XCTAssertEqual(projection.agentRoster.count, 1)
+        XCTAssertEqual(projection.historicalAgentRoster.count, 1)
+        XCTAssertEqual(projection.agentRoster[worker], reattached)
+        XCTAssertEqual(projection.historicalAgentRoster[worker], reattached)
+    }
+
+    func testHistoricalAgentsKeepFirstAdmissionOrderAcrossLiveChanges() {
+        let first = AgentID(rawValue: "z-first")
+        let second = AgentID(rawValue: "a-second")
+        let third = AgentID(rawValue: "m-third")
+        func attached(_ agent: AgentID, path: String) -> AgentAttachedPayload {
+            AgentAttachedPayload(
+                agent: agent,
+                path: path,
+                model: ModelID(rawValue: "fixture-model"),
+                profile: "reviewed")
+        }
+
+        let projection = CoworkProjection.build(from: [
+            envelope(0, .agentAttached(attached(first, path: "/workspace/first"))),
+            envelope(1, .agentStatus(.init(agent: first, state: .thinking))),
+            envelope(2, .agentAttached(attached(second, path: "/workspace/second"))),
+            envelope(3, .agentDetached(.init(agent: first))),
+            envelope(4, .agentAttached(attached(third, path: "/workspace/third"))),
+            envelope(5, .agentAttached(attached(first, path: "/workspace/reattached"))),
+        ])
+
+        XCTAssertEqual(projection.historicalAgentOrder, [first, second, third])
+        XCTAssertEqual(
+            projection.historicalAgentsInCreationOrder.map(\.agent),
+            [first, second, third])
+        XCTAssertEqual(
+            projection.historicalAgentRoster[first]?.path,
+            "/workspace/reattached")
+    }
+
+    func testLargeHistoricalRosterDoesNotInflateLiveRoster() {
+        let count = 512
+        var events: [Envelope] = []
+        events.reserveCapacity(count * 2)
+        for index in 0..<count {
+            let agent = AgentID(rawValue: "worker-\(index)")
+            events.append(envelope(
+                index,
+                .agentAttached(.init(
+                    agent: agent,
+                    path: "/workspace/\(index)",
+                    model: ModelID(rawValue: "fixture-model"),
+                    profile: "reviewed"))))
+        }
+        for index in 0..<(count - 12) {
+            events.append(envelope(
+                count + index,
+                .agentDetached(.init(
+                    agent: AgentID(rawValue: "worker-\(index)")))))
+        }
+
+        let projection = CoworkProjection.build(from: events)
+
+        XCTAssertEqual(projection.historicalAgentRoster.count, count)
+        XCTAssertEqual(projection.agentRoster.count, 12)
+        XCTAssertNotNil(
+            projection.historicalAgentRoster[
+                AgentID(rawValue: "worker-0")])
+        XCTAssertNil(projection.agentRoster[AgentID(rawValue: "worker-0")])
     }
 
     func testTaskCancelledBecomesTerminalAndLeavesPendingMailbox() throws {

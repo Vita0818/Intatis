@@ -239,7 +239,13 @@ public struct CodeShell: View {
                             .frame(height: 1)
                             .padding(.bottom, 16)
                             .id(IntatisThreadBottomAnchorID(scope: pageScope))
-                            .intatisThreadBottomAnchorFrameProbe()
+                            .onScrollVisibilityChange(threshold: 0.99) {
+                                isVisible in
+                                scrollCoordinator
+                                    .enqueueBottomAnchorVisibility(
+                                        isVisible,
+                                        scope: pageScope)
+                            }
                     }
                     .environment(
                         \.intatisMessageViewportAdmission,
@@ -260,19 +266,6 @@ public struct CodeShell: View {
                     .padding(.top, 16)
                 }
                 .scrollContentBackground(.hidden)
-                .intatisThreadViewportFrameProbe()
-                .onPreferenceChange(
-                    IntatisThreadViewportFramesPreferenceKey.self
-                ) { frames in
-                    guard let isVisible =
-                            IntatisThreadViewportFrames
-                                .isBottomAnchorVisible(frames) else {
-                        return
-                    }
-                    scrollCoordinator.enqueueBottomAnchorVisibility(
-                        isVisible,
-                        scope: pageScope)
-                }
                 .overlay(alignment: .bottomTrailing) {
                     if historyWindow.hasLater
                         || scrollCoordinator.followState == .detachedByUser {
@@ -761,23 +754,44 @@ private struct PermissionReviewSurfaceModifier: ViewModifier {
     }
 }
 
+public enum PermissionReviewCardStyle: Equatable, Sendable {
+    case standard
+    case compactRail
+}
+
 public struct PermissionResolutionNoticeView: View {
     let notice: PermissionResolutionNotice
     private let embedsSurface: Bool
+    private let presentationStyle: PermissionReviewCardStyle
 
     public init(notice: PermissionResolutionNotice,
-                embedsSurface: Bool = true) {
+                embedsSurface: Bool = true,
+                presentationStyle: PermissionReviewCardStyle = .standard) {
         self.notice = notice
         self.embedsSurface = embedsSurface
+        self.presentationStyle = presentationStyle
     }
 
-    public var body: some View {
+    @ViewBuilder public var body: some View {
+        Group {
+            switch presentationStyle {
+            case .standard:
+                standardContent
+            case .compactRail:
+                compactRailContent
+            }
+        }
+        .modifier(PermissionReviewSurfaceModifier(
+            isEnabled: embedsSurface,
+            cornerRadius: presentationStyle == .compactRail ? 14 : 10))
+        .accessibilityIdentifier("permission.resolution")
+    }
+
+    private var standardContent: some View {
         HStack(alignment: .top, spacing: 9) {
-            Image(systemName: notice.decision == .allow
-                ? "checkmark.circle.fill"
-                : "xmark.circle.fill")
+            Image(systemName: statusIcon)
                 .font(.caption)
-                .foregroundStyle(notice.decision == .allow ? .green : .orange)
+                .foregroundStyle(statusColor)
                 .padding(.top, 1)
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 1) {
@@ -793,10 +807,34 @@ public struct PermissionResolutionNoticeView: View {
         .padding(.horizontal, 11)
         .padding(.vertical, 8)
         .frame(maxWidth: 620, alignment: .leading)
-        .modifier(PermissionReviewSurfaceModifier(
-            isEnabled: embedsSurface,
-            cornerRadius: 10))
-        .accessibilityIdentifier("permission.resolution")
+    }
+
+    private var compactRailContent: some View {
+        HStack(alignment: .center, spacing: 10) {
+            Image(systemName: statusIcon)
+                .font(.body.weight(.semibold))
+                .foregroundStyle(statusColor)
+                .accessibilityHidden(true)
+            Text(title)
+                .font(.body.weight(.semibold))
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .help(notice.reason)
+        .accessibilityHint(notice.reason)
+    }
+
+    private var statusIcon: String {
+        notice.decision == .allow
+            ? "checkmark.circle.fill"
+            : "xmark.circle.fill"
+    }
+
+    private var statusColor: Color {
+        notice.decision == .allow ? .green : .orange
     }
 
     private var title: String {
@@ -883,6 +921,17 @@ enum PermissionReviewPresentation {
         return details
     }
 
+    static func compactSummary(
+        for request: PermissionRequestPayload
+    ) -> String {
+        let reason = request.reason.trimmingCharacters(
+            in: .whitespacesAndNewlines)
+        if !reason.isEmpty {
+            return reason
+        }
+        return details(for: request).first?.text ?? request.tool
+    }
+
     private static func humanized(_ value: String) -> String {
         value
             .replacingOccurrences(of: "_", with: " ")
@@ -895,13 +944,16 @@ public struct PermissionCard: View {
     let permission: PendingPermission
     let onResolve: (PermissionResponseAction) -> Void
     private let embedsSurface: Bool
+    private let presentationStyle: PermissionReviewCardStyle
     @State private var showsDetails = false
 
     public init(permission: PendingPermission,
                 embedsSurface: Bool = true,
+                presentationStyle: PermissionReviewCardStyle = .standard,
                 onResolve: @escaping (PermissionResponseAction) -> Void) {
         self.permission = permission
         self.embedsSurface = embedsSurface
+        self.presentationStyle = presentationStyle
         self.onResolve = onResolve
     }
 
@@ -914,7 +966,24 @@ public struct PermissionCard: View {
         !reviewDetails.isEmpty || proposedDiff != nil
     }
 
-    public var body: some View {
+    @ViewBuilder public var body: some View {
+        Group {
+            switch presentationStyle {
+            case .standard:
+                standardContent
+            case .compactRail:
+                compactRailContent
+            }
+        }
+        .modifier(PermissionReviewSurfaceModifier(
+            isEnabled: embedsSurface,
+            cornerRadius: presentationStyle == .compactRail ? 18 : 14))
+        .onChange(of: request.requestId) { _, _ in
+            showsDetails = false
+        }
+    }
+
+    private var standardContent: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .top, spacing: 10) {
                 Image(systemName: "lock.shield")
@@ -993,11 +1062,49 @@ public struct PermissionCard: View {
         }
         .padding(13)
         .frame(maxWidth: 720, alignment: .leading)
-        .modifier(PermissionReviewSurfaceModifier(
-            isEnabled: embedsSurface,
-            cornerRadius: 14))
-        .onChange(of: request.requestId) { _, _ in
-            showsDetails = false
+    }
+
+    private var compactRailContent: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "lock.shield")
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(riskColor)
+                    .frame(width: 20)
+                    .padding(.top, 1)
+                    .accessibilityLabel(
+                        IntatisLocalization.format("%@ risk", riskLabel))
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(IntatisLocalization.string("Permission Review"))
+                        .font(.body.weight(.semibold))
+                    Text(request.tool)
+                        .font(.callout.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    Text(PermissionReviewPresentation.compactSummary(
+                        for: request))
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 0)
+            }
+            compactRailFooter
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder private var compactRailFooter: some View {
+        if permission.state.isActionable {
+            ViewThatFits(in: .horizontal) {
+                horizontalPermissionActions
+                compactPermissionActions
+            }
+            .controlSize(.small)
+        } else {
+            permissionStatus
         }
     }
 

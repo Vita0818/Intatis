@@ -11,6 +11,7 @@ private final class WorkspaceChromeStressModel: ObservableObject {
     @Published var mode = 0
     @Published var codeInspector = true
     @Published var coworkInspector = true
+    @Published var coworkSelectedAgentID = "main"
 }
 
 private struct WorkspaceChromeStressHarness: View {
@@ -57,12 +58,28 @@ private struct WorkspaceChromeStressHarness: View {
                 onResolve: { _ in })
         case 2:
             CoworkShell(
-                items: [],
+                threadPage: .empty(
+                    agentID: AgentID(
+                        rawValue: model.coworkSelectedAgentID)),
                 presentationScope: IntatisThreadPresentationScope(
                     kind: "cowork",
                     sessionID: "layout-stress-cowork"),
                 sessionTitle: "Cowork",
-                agents: [],
+                agents: [
+                    CoworkAgentInfo(
+                        id: "main",
+                        name: "main",
+                        workspace: "Workspace",
+                        model: "Model A",
+                        profile: "full"),
+                    CoworkAgentInfo(
+                        id: "worker",
+                        name: "worker",
+                        workspace: "Workspace",
+                        model: "Model B",
+                        profile: "read-only",
+                        isAttached: false),
+                ],
                 pending: nil,
                 summary: CoworkStatusSummary(),
                 composerError: nil,
@@ -72,7 +89,12 @@ private struct WorkspaceChromeStressHarness: View {
                     set: { model.coworkInspector = $0 }),
                 input: $coworkInput,
                 onSend: {},
-                onResolve: { _ in })
+                onResolve: { _ in },
+                selectedAgentID: model.coworkSelectedAgentID,
+                onSelectAgent: { model.coworkSelectedAgentID = $0 },
+                onShowEarlier: {},
+                onShowNewer: {},
+                onShowLatest: {})
         default:
             VStack(alignment: .leading, spacing: 8) {
                 Text("Chat")
@@ -160,6 +182,21 @@ final class ThreadLayoutTests: XCTestCase {
             "*** Begin Patch\n*** End Patch")
     }
 
+    func testCompactPermissionSummaryDoesNotRenderRawArguments() {
+        let request = PermissionRequestPayload(
+            requestId: RequestID(rawValue: "compact-permission-ui-test"),
+            tool: "write_file",
+            args: #"{"apiKey":"must-not-render","path":"Sources/App.swift"}"#,
+            risk: .medium,
+            reason: "Update the selected workspace file")
+
+        let summary = PermissionReviewPresentation.compactSummary(for: request)
+
+        XCTAssertEqual(summary, "Update the selected workspace file")
+        XCTAssertFalse(summary.contains("must-not-render"))
+        XCTAssertFalse(summary.contains("apiKey"))
+    }
+
     func testWorkspaceInspectorUsesOnlyTheStableOuterWidth() {
         let hidden = IntatisWorkspaceInspectorLayoutPolicy.resolve(
             availableWidth: 979,
@@ -219,6 +256,63 @@ final class ThreadLayoutTests: XCTestCase {
         }
     }
 
+    func testCoworkStatusRailAndConversationWidthStayFixedAcrossContentStates() {
+        XCTAssertEqual(IntatisCoworkStatusRailLayoutPolicy.railWidth, 348)
+        XCTAssertEqual(IntatisCoworkStatusRailLayoutPolicy.cardWidth, 318)
+        XCTAssertEqual(IntatisCoworkStatusRailLayoutPolicy.cardSpacing, 18)
+
+        for availableWidth in [CGFloat(980), 1_100, 1_372, 1_800] {
+            let emptyConversation =
+                IntatisCoworkStatusRailLayoutPolicy.resolve(
+                    availableWidth: availableWidth,
+                    isRequested: true)
+            let longConversation =
+                IntatisCoworkStatusRailLayoutPolicy.resolve(
+                    availableWidth: availableWidth,
+                    isRequested: true)
+
+            XCTAssertEqual(emptyConversation, longConversation)
+            XCTAssertTrue(emptyConversation.isVisible)
+            XCTAssertEqual(emptyConversation.inspectorWidth, 348)
+            XCTAssertEqual(
+                emptyConversation.threadWidth
+                    + emptyConversation.inspectorWidth,
+                availableWidth)
+        }
+    }
+
+    func testCoworkStatusRailRenderSnapshotExcludesConversationSelection() {
+        let beforeSelection = CoworkStatusRailRenderSnapshot(
+            agents: [],
+            pending: nil,
+            permissionNotice: nil,
+            goal: nil,
+            workTasks: CoworkWorkTaskSummary(),
+            colorScheme: .light)
+        let afterSelection = CoworkStatusRailRenderSnapshot(
+            agents: [],
+            pending: nil,
+            permissionNotice: nil,
+            goal: nil,
+            workTasks: CoworkWorkTaskSummary(),
+            colorScheme: .light)
+        let changedRailState = CoworkStatusRailRenderSnapshot(
+            agents: [],
+            pending: nil,
+            permissionNotice: nil,
+            goal: nil,
+            workTasks: CoworkWorkTaskSummary(tasks: [
+                CoworkWorkTaskLine(
+                    id: "finished",
+                    title: "Finished",
+                    status: "completed"),
+            ]),
+            colorScheme: .light)
+
+        XCTAssertEqual(beforeSelection, afterSelection)
+        XCTAssertNotEqual(beforeSelection, changedRailState)
+    }
+
     func testWorkspaceInspectorNeverProducesInvalidGeometry() {
         for width in stride(from: CGFloat(-100), through: 2_000, by: 0.5) {
             let layout = IntatisWorkspaceInspectorLayoutPolicy.resolve(
@@ -269,20 +363,77 @@ final class ThreadLayoutTests: XCTestCase {
                 encoding: .utf8)
             XCTAssertFalse(source.contains(".toolbar {"), filename)
             XCTAssertFalse(source.contains(".inspector("), filename)
-            XCTAssertTrue(
-                source.contains("IntatisWorkspaceInspectorLayoutPolicy.resolve("),
-                filename)
+            if filename == "CoworkViews.swift" {
+                XCTAssertTrue(
+                    source.contains(
+                        "IntatisCoworkStatusRailLayoutPolicy.resolve("),
+                    filename)
+            } else {
+                XCTAssertTrue(
+                    source.contains(
+                        "IntatisWorkspaceInspectorLayoutPolicy.resolve("),
+                    filename)
+            }
         }
 
         let coworkSource = try String(
             contentsOf: packageRoot
                 .appendingPathComponent("Sources/CoworkViews.swift"),
             encoding: .utf8)
-        XCTAssertTrue(coworkSource.contains("ZStack(alignment: .trailing)"))
-        XCTAssertTrue(coworkSource.contains("dividerWidth: 0"))
+        XCTAssertTrue(
+            coworkSource.contains(".overlay(alignment: .trailing)"))
+        XCTAssertFalse(
+            coworkSource.contains("ZStack(alignment: .trailing)"))
+        XCTAssertTrue(
+            coworkSource.contains(
+                "IntatisCoworkStatusRailLayoutPolicy.resolve("))
         XCTAssertTrue(coworkSource.contains("for: .scrollContent"))
         XCTAssertTrue(coworkSource.contains("primaryScrollerClearance"))
         XCTAssertTrue(coworkSource.contains(".allowsHitTesting(false)"))
+        XCTAssertTrue(
+            coworkSource.contains("CoworkStatusRailRenderBoundary("))
+        XCTAssertTrue(coworkSource.contains(".equatable()"))
+        XCTAssertTrue(coworkSource.contains(
+            ".frame(width: rawWidth, height: rawHeight)"))
+        XCTAssertTrue(coworkSource.contains(
+            ".overlay(alignment: .leading)"))
+        XCTAssertTrue(coworkSource.contains(
+            "not the transcript's intrinsic size"))
+        XCTAssertFalse(coworkSource.contains(".visualEffect { content, proxy in"))
+        XCTAssertFalse(coworkSource.contains(".pixelAlignmentOffset("))
+        XCTAssertTrue(coworkSource.contains(
+            "selection.selectedAgentID == agentID ? 1 : 0"))
+        XCTAssertTrue(coworkSource.contains("transaction.animation = nil"))
+        XCTAssertTrue(coworkSource.contains(
+            "transaction.disablesAnimations = true"))
+        XCTAssertFalse(
+            coworkSource.contains(
+                "IntatisGlassEffectGroup(\n                spacing: IntatisCoworkStatusRailLayoutPolicy"))
+
+        let surfaceSource = try String(
+            contentsOf: packageRoot
+                .appendingPathComponent("Sources/ThreadSurfaces.swift"),
+            encoding: .utf8)
+        XCTAssertTrue(surfaceSource.contains(
+            "private struct IntatisClearLiquidGlassBackdrop"))
+        XCTAssertTrue(surfaceSource.contains(
+            "content.background {\n                IntatisClearLiquidGlassBackdrop("))
+        XCTAssertTrue(surfaceSource.contains(
+            "colorScheme: colorScheme)\n                    .equatable()"))
+
+        let railSnapshotStart = try XCTUnwrap(
+            coworkSource.range(
+                of: "struct CoworkStatusRailRenderSnapshot: Equatable"))
+        let railSnapshotEnd = try XCTUnwrap(
+            coworkSource.range(
+                of: "private final class CoworkStatusRailSelectionState",
+                range: railSnapshotStart.upperBound..<coworkSource.endIndex))
+        let railSnapshotSource = coworkSource[
+            railSnapshotStart.lowerBound..<railSnapshotEnd.lowerBound]
+        XCTAssertFalse(railSnapshotSource.contains("threadPage"))
+        XCTAssertFalse(railSnapshotSource.contains("isThreadPageLoading"))
+        XCTAssertFalse(railSnapshotSource.contains("isRichRenderingEligible"))
+        XCTAssertFalse(railSnapshotSource.contains("selectedAgentID"))
 
         let repositoryRoot = packageRoot
             .deletingLastPathComponent()
@@ -328,6 +479,9 @@ final class ThreadLayoutTests: XCTestCase {
             model.mode = cycle % 3
             model.codeInspector = cycle % 4 != 0
             model.coworkInspector = cycle % 5 != 0
+            model.coworkSelectedAgentID = cycle.isMultiple(of: 2)
+                ? "main"
+                : "worker"
             window.setContentSize(NSSize(
                 width: widths[cycle % widths.count],
                 height: cycle.isMultiple(of: 2) ? 720 : 800))

@@ -1,7 +1,7 @@
 # COWORK_PRINCIPLES
 
 文档状态：当前 Cowork/AgentKernel 原则
-最近核对：2026-08-03
+最近核对：2026-08-04
 产品基线：v0.32（build 32）
 
 本文提炼自仓内 v0.10 历史 Cowork 设计文档、`PER_AGENT_INFERENCE_PROFILES.md` 及
@@ -52,6 +52,8 @@ Task Graph + Scheduler  任务图 + 调度器驱动协作
 
 ### 2.1 Agent Identity
 Agent 是持久本地身份。应含 `id` / `displayName` / exact `AgentInferenceBinding` / `workspace lease or default workspace` / `local memory or mailbox` / `status`。兼容 `model` 字段不能覆盖 exact binding。**不应**含永久 "leaf" 或 "coordinator" 角色。
+
+必须区分 durable identity history 与 live operational roster。`agent_detached` 终止当前运行时成员资格、lease 与可操作入口，但不抹除该 identity 已写入 EventLog 的对话和生命周期。GUI 的 session 历史目录保留所有曾 durable attach/spawn 的 agent；ordinary detached agent 仍可只读查看，当前正在查看它时不得强制跳回 `@main`，状态由既有状态图标显示为 detached。send/delegate/message/ask/rebind/remove、workspace 恢复与 capability 引用判断仍只接受 live roster；控制面 identity 即使保留在历史目录也继续 status-only。
 
 ### 2.2 Task Contract（AgentInvocation 层）
 角色按 AgentInvocation 分派。Task contract 应告诉 agent 它为何存在于当前工作流、预期交付什么；它不是用户可见 WorkTask。建议 shape：

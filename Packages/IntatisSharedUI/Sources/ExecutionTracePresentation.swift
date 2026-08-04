@@ -45,14 +45,6 @@ public enum IntatisExecutionTracePresentation {
         showExecutionTrace: Bool
     ) -> [CodeItem] {
         guard !showExecutionTrace else { return items }
-        return items.filter { item in
-            guard item.presentationSource == .conversation else { return false }
-            switch item.kind {
-            case .user, .agent, .agentToAgent, .error:
-                return true
-            case .toolCall, .toolResult, .patch, .note:
-                return false
-            }
-        }
+        return items.filter(\.isDefaultConversationPresentationItem)
     }
 }

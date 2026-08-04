@@ -422,3 +422,221 @@ rather than claiming cross-platform pixel identity.
 - No provider request, credential read, web search or message send occurred during visual QA.
 
 final result: passed
+
+# Design QA — Cowork Agent rail polish
+
+Date: 2026-08-04
+
+## Scope and comparison input
+
+This pass evaluates the user-provided Cowork screenshot against the shipping `CoworkShell` surface
+driven by the offline DEBUG agent-conversation fixture. The fixture changes only data and exposes a
+diagnostic strip; the session header, transcript, composer, inspector overlay, Liquid Glass section
+and Agent rows are the production views.
+
+- Reference: `/var/folders/8p/t9gqz5213cqdslvht9fmd0zm0000gn/T/TemporaryItems/NSIRD_screencaptureui_WIaMnh/Screenshot 2026-08-04 at 15.07.05.png`
+- Main implementation state: `/Users/vita/.codex/visualizations/2026/08/03/019fc7e8-65d2-71b3-9bf2-9e29ab9af97c/cowork-agent-rail-main.png`
+- Selected-agent state: `/Users/vita/.codex/visualizations/2026/08/03/019fc7e8-65d2-71b3-9bf2-9e29ab9af97c/cowork-agent-rail-research.png`
+- Required combined input: `/Users/vita/.codex/visualizations/2026/08/03/019fc7e8-65d2-71b3-9bf2-9e29ab9af97c/cowork-agent-rail-comparison.png`
+
+The fixture does not reproduce the reference session's permission and task card contents, so this
+comparison judges the requested header and Agent rail surfaces rather than claiming whole-window
+pixel identity.
+
+## Acceptance checks
+
+| Requirement | Result | Evidence |
+|---|---|---|
+| Header no longer repeats the viewed agent | Passed | The production header presents only the durable session name; the former `Viewing @…` subtitle is absent. |
+| Cards read as floating on the conversation canvas | Passed | The rail remains a trailing ZStack overlay with no divider or full-column material; the canvas continues beneath the native Liquid Glass card. |
+| Agent card feels spacious and native | Passed | The section uses native headline typography, 18pt insets, 52pt minimum rows, SF Symbols and semantic system colors/materials. |
+| Selection is blue without a checkmark | Passed | Both main and research states use only the accent rounded background; AX reports the selected row and no visual checkmark is mounted. |
+| Agent ordering is stable | Passed | The GUI consumes first durable-admission order; status, messages, detach and reattach do not reorder rows. Projection and source-contract tests cover this behavior. |
+| Rapid switching remains bounded | Passed | Computer Use completed 1,000 switches under the 8 × 1,000-row / 500 delta/s fixture with 0 warnings, 0 incidents and no more than 16 mounted rows. |
+
+## Severity review
+
+- P0: none.
+- P1: none.
+- P2: none on the tested header, rail, row-selection and rapid-switch surfaces.
+- Remaining matrix: Reduce Transparency, Increase Contrast, every Dynamic Type category and the
+  exact user session with simultaneous permission/Goal/Tasks cards remain `UNKNOWN`.
+
+## Validation loop
+
+1. Compared the reference and implementation in the same combined image, concentrating on header
+   hierarchy, shared-canvas continuity, section geometry, status iconography and selection language.
+2. Switched from `@main` to `@research` through the native accessibility action and confirmed that
+   only the selected transcript changed while the composer continued to target Main.
+3. Ran the native 1,000-switch action during the four-agent background delta burst; it finished on
+   `@docs` with 0 warnings, 0 incidents and the bounded 16-row page intact.
+4. No provider request, EventLog, workspace, permission runtime, credential, network request or
+   message send was opened by this visual fixture.
+
+final result: passed
+
+# Design QA — Cowork rail lighting and fixed conversation geometry
+
+Date: 2026-08-04
+
+## Scope and combined evidence
+
+This corrective pass follows the user's rejection of the prior rail-polish result. The visible
+separation was treated as a lighting/material problem, while the transcript-width change was treated
+as a geometry ownership problem. The production `CoworkShell` was exercised through the offline
+DEBUG fixture with eight 1,000-row conversations and a compact resolved-permission example.
+
+- User reference: `/var/folders/8p/t9gqz5213cqdslvht9fmd0zm0000gn/T/TemporaryItems/NSIRD_screencaptureui_WIaMnh/Screenshot 2026-08-04 at 15.07.05.png`
+- Current Main state: `/Users/vita/.codex/visualizations/2026/08/03/019fc7e8-65d2-71b3-9bf2-9e29ab9af97c/cowork-agent-rail-clear-main.png`
+- Current selected-agent state: `/Users/vita/.codex/visualizations/2026/08/03/019fc7e8-65d2-71b3-9bf2-9e29ab9af97c/cowork-agent-rail-clear-research.png`
+- User-reference/current combined input: `/Users/vita/.codex/visualizations/2026/08/03/019fc7e8-65d2-71b3-9bf2-9e29ab9af97c/cowork-agent-rail-user-reference-vs-current.png`
+- Same-viewport old/current/switch input: `/Users/vita/.codex/visualizations/2026/08/03/019fc7e8-65d2-71b3-9bf2-9e29ab9af97c/cowork-agent-rail-before-after-and-switch.png`
+
+The user reference and fixture have different session content. The same-viewport input therefore
+provides the direct material and geometry comparison; the supplied screenshot provides the product
+hierarchy reference rather than a claim of whole-window pixel identity.
+
+## Acceptance checks
+
+| Requirement | Result | Evidence |
+|---|---|---|
+| Rail shares the conversation's light | Passed | Passive cards now use native `Glass.clear` in the existing shared `GlassEffectContainer`; no rail backing, gradient, custom shadow or highlight was added. On the same host/window, the sampled card interior moved from 240/255 to 244/255 while the canvas remained 255/255, reducing the independent gray-light block without erasing the native glass edge. |
+| Middle and rail widths do not react to selection | Passed | One outer-width policy owns exact 348pt rail and 318pt card widths. At 1372×768, both Main and Research captures have identical composer runs and the same rail pixel range x=1076…1365. |
+| Switching does not replace the scroll geometry | Passed | Empty, loading and populated states share one `ScrollViewReader`/`ScrollView`; content/raw frames are fixed before the scroller expands under the trailing overlay. Source contracts and layout tests freeze this. |
+| Right-card typography is larger | Passed | Section title, agent name/model and Goal/Task supporting text each use the next native text role; no custom font or fixed-size bitmap text was introduced. |
+| Permission review is concise | Passed | The resolved example shows only icon plus `task_get approved`. The pending compact variant keeps tool, a bounded safe summary and necessary actions while omitting risk chip, raw arguments and default details. Existing manual/automatic permission semantics remain unchanged. |
+| Heavy switching remains responsive | Passed | The native 1,000-switch action completed under 8×1,000 rows plus a 500 delta/s burst with 0 warnings, 0 incidents and at most 16 mounted rows. |
+
+## Severity review
+
+- P0: none.
+- P1: none.
+- P2: none on the tested Light material, fixed-width, typography, compact-permission and rapid-switch surfaces.
+- Remaining matrix: Dark, Reduce Transparency, Increase Contrast, all Dynamic Type categories,
+  VoiceOver, 180-second soak and the exact production session with simultaneous Goal/Tasks remain
+  `UNKNOWN` and are not implied by this pass.
+
+## Validation loop
+
+1. Put the supplied screenshot and current native output in one combined input, then put the rejected
+   old fixture, current Main and current Research in a second same-viewport input.
+2. Replaced only the passive rail material with the system clear-glass variant; the shared canvas,
+   semantic colors and native glass container remain the design-system owners.
+3. Froze rail/card/thread geometry to stable outer width and verified identical Main/Research pixel
+   boundaries after native accessibility clicks.
+4. Ran 30 focused layout/presentation tests, macOS and iOS Debug builds, and the fixture's 1,000-switch
+   stress action. No provider, EventLog, workspace, permission runtime, credential, network request or
+   message send was opened.
+
+final result: passed
+
+# Design QA — Cowork rail window-position stability
+
+Date: 2026-08-04
+
+## Scope and combined evidence
+
+This corrective pass follows the user's report that the right-side Liquid Glass cards still drifted
+slightly when the window moved and jumped when focus or the selected Agent changed. The existing
+fixed-width checks were retained, but this pass measures the rendered card boundary rather than
+inferring stability from layout constants.
+
+- User reference: `/var/folders/8p/t9gqz5213cqdslvht9fmd0zm0000gn/T/TemporaryItems/NSIRD_screencaptureui_WIaMnh/Screenshot 2026-08-04 at 15.07.05.png`
+- Final native state: `/Users/vita/.codex/visualizations/2026/08/03/019fc7e8-65d2-71b3-9bf2-9e29ab9af97c/cowork-rail-final-pass.png`
+- Required reference/final combined input: `/Users/vita/.codex/visualizations/2026/08/03/019fc7e8-65d2-71b3-9bf2-9e29ab9af97c/cowork-rail-reference-vs-final-stable.png`
+- Main/Research/window-return strip: `/Users/vita/.codex/visualizations/2026/08/03/019fc7e8-65d2-71b3-9bf2-9e29ab9af97c/cowork-rail-final-stability-strip.png`
+
+The supplied session and fixture contain different Agent/Task data. The comparison therefore judges
+the rail's hierarchy, light integration and structural boundaries; same-viewport fixture states are
+the direct geometry evidence.
+
+## Acceptance checks
+
+| Requirement | Result | Evidence |
+|---|---|---|
+| Window movement does not leave card edges on alternating pixel phases | Passed | The whole rail is snapped once to the current backing-pixel grid. The Computer Use crop itself changed from 1373px to 1372px after dragging; after correcting that one-pixel window crop, the rail aligns at the same physical phase. |
+| Agent switching does not move the cards | Passed | At 1372×768, both `@main` and `@research` render the Agents card at x=1076…1366. Only the selected-row fill moves. |
+| Window focus switching does not rematerialize or jump the rail | Passed | Switching to Finder and back produced a byte-identical rail crop: RMS 0 and maximum channel delta 0. |
+| Glass cards remain native but optically isolated | Passed | `Glass.clear` and one `GlassEffectContainer` remain. The 8pt interaction spacing is smaller than the 18pt card gap, passive cards use the identity glass transition, and inspector transactions carry no implicit animation. |
+| The structural edge remains visible when glass lighting changes | Passed | Each passive surface has a one-backing-pixel system separator `strokeBorder`; no sampled color, custom highlight, gradient, shadow or rail backing was introduced. |
+| Heavy Agent switching remains bounded | Passed | 1,000 rapid switches completed under 8×1,000 rows plus 500 delta/s with 0 warnings, 0 incidents and no more than 16 mounted rows. |
+
+## Severity review
+
+- P0: none.
+- P1: none.
+- P2: none on the tested Light window-move, Agent-switch, focus-return and stress surfaces.
+- Remaining matrix: Dark, Reduce Transparency, Increase Contrast, VoiceOver, 180-second soak,
+  cross-display scale changes and the exact production session with simultaneous Goal/Tasks remain
+  `UNKNOWN`; this pass does not claim them.
+
+## Validation loop
+
+1. Reproduced the visible optical drift and audited the production modifier/container hierarchy.
+2. Confirmed from Apple's Liquid Glass documentation that a container spacing larger than the
+   interior stack spacing makes glass shapes blend at rest and permits morphing during transitions.
+3. Made the rail a non-layout overlay, isolated glass interaction, disabled glass/layout morphing,
+   added a semantic one-pixel structural anchor and aligned the whole rail to backing pixels.
+4. Rebuilt the native fixture, moved the window, switched Main/Research, switched to Finder and back,
+   and compared rendered rail crops rather than only screenshots or source constants.
+5. Ran 31 focused tests and the fixture's 1,000-switch stress action. No provider, EventLog,
+   workspace, permission runtime, credential, network request or message send was opened.
+
+final result: passed
+
+# Design QA — Cowork rail stable surface and feedback-loop removal
+
+Date: 2026-08-04
+
+## Scope and corrective evidence
+
+This pass supersedes the earlier window-position conclusion after the user reproduced the same jump.
+The production Test session then exposed the actual feedback loop: the old
+`IntatisThreadViewportFramesPreferenceKey` updated more than once in a frame during window changes.
+The final build removes that preference path instead of compensating its output.
+
+- User reference: `/var/folders/8p/t9gqz5213cqdslvht9fmd0zm0000gn/T/TemporaryItems/NSIRD_screencaptureui_WIaMnh/Screenshot 2026-08-04 at 15.07.05.png`
+- Final Main: `/Users/vita/.codex/visualizations/2026/08/03/019fc7e8-65d2-71b3-9bf2-9e29ab9af97c/cowork-rail-final-main.jpeg`
+- Final code-reader: `/Users/vita/.codex/visualizations/2026/08/03/019fc7e8-65d2-71b3-9bf2-9e29ab9af97c/cowork-rail-final-code-reader.jpeg`
+- Final focus return: `/Users/vita/.codex/visualizations/2026/08/03/019fc7e8-65d2-71b3-9bf2-9e29ab9af97c/cowork-rail-final-focus-return.jpeg`
+- Required reference/current combined input: `/Users/vita/.codex/visualizations/2026/08/03/019fc7e8-65d2-71b3-9bf2-9e29ab9af97c/cowork-rail-final-reference-comparison.png`
+- Same-viewport Main/code-reader/focus-return input: `/Users/vita/.codex/visualizations/2026/08/03/019fc7e8-65d2-71b3-9bf2-9e29ab9af97c/cowork-rail-final-switch-focus-strip.png`
+
+The reference and current capture use different appearance and session content, so the combined
+reference input is used for hierarchy and material direction. The same-viewport strip is the direct
+position and focus-lighting comparison.
+
+## Acceptance checks
+
+| Requirement | Result | Evidence |
+|---|---|---|
+| Agent switching does not move the cards | Passed | Real Test history was switched repeatedly among Main, code-reader and doc-reader. The same-viewport strip keeps every card edge and gap in the same place; only transcript and blue row selection change. |
+| Focus lighting does not become a position jump | Passed | The app was raised behind Xcode and returned. Native glass lighting changed as expected, while the structural outlines and card geometry stayed fixed; the returned accessibility tree reported no rail structure change. |
+| Transcript updates cannot remount the glass rail | Passed | The rail is behind an Equatable boundary whose snapshot excludes empty/loading/page/rich transcript state. AX diffs across real switches removed and added transcript nodes but retained the rail. |
+| Card content cannot remount the optical surface | Passed | Each `Glass.clear` now lives on a dedicated backdrop behind its dynamic content. Independent status cards are no longer grouped by a morphing `GlassEffectContainer`. |
+| Window position cannot feed back into thread layout | Passed | GeometryReader frame probes and `IntatisThreadViewportFramesPreferenceKey` were removed; bottom restoration uses `onScrollVisibilityChange`. The old preference warning count was zero after real full-screen, repeated agent switching and focus return. |
+| Heavy layout churn remains bounded | Passed | 85 focused rendering/layout/scroll tests passed, including a production-shaped AppKit host with 360 interleaved agent-selection, mode, inspector and window-size changes. |
+
+## Severity review
+
+- P0: none.
+- P1: none.
+- P2: native AppKit emitted one negative-geometry warning only during the operating system full-screen
+  transition, next to `ThemeWidgetControlViewService` and `NSLocalWindowSharingWindow`; it did not recur
+  during agent switching or focus return and is not the removed viewport-preference issue.
+- Remaining matrix: Light appearance, cross-display scale changes, Reduce Transparency, Increase
+  Contrast, VoiceOver and 180-second soak were not rerun in this corrective pass.
+
+## Validation loop
+
+1. Reproduced and read the old preference warning from the real production-shaped Test session.
+2. Removed the coordinate preference path, separated glass from dynamic content and removed the
+   grouping container around independent cards.
+3. Ran 85 focused tests and rebuilt the native RailLiveQA app.
+4. Loaded the real long Test history, entered full screen, switched Main/code-reader/doc-reader six
+   times, moved focus to Xcode and returned, then checked the same-viewport visual strip and AX diffs.
+5. Re-read the process log after each interaction group: the old `Bound preference` warning remained
+   at zero. No provider request, message send, workspace mutation, permission action or network call
+   was performed.
+
+final result: passed

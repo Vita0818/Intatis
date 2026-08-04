@@ -619,7 +619,10 @@ private final class MCPProjectSettingsModel:
 struct MCPProjectSettingsView: View {
     @StateObject private var model:
         MCPProjectSettingsModel
+    private let contentHost:
+        MCPConversationContentHost?
     @State private var showsAttach = false
+    @State private var showsContent = false
     @State private var policyTarget:
         MCPAttachmentTarget?
     @State private var detachTarget:
@@ -627,10 +630,14 @@ struct MCPProjectSettingsView: View {
     @State private var grantTarget:
         MCPProjectGrantTarget?
 
-    init(host: MCPProjectSettingsHost) {
+    init(
+        host: MCPProjectSettingsHost,
+        contentHost: MCPConversationContentHost? = nil
+    ) {
         _model = StateObject(
             wrappedValue:
                 MCPProjectSettingsModel(host: host))
+        self.contentHost = contentHost
     }
 
     var body: some View {
@@ -646,6 +653,18 @@ struct MCPProjectSettingsView: View {
                         .textSelection(.enabled)
                 }
                 Spacer()
+                if contentHost != nil {
+                    Button {
+                        showsContent = true
+                    } label: {
+                        Label(
+                            "Browse Content",
+                            systemImage:
+                                "shippingbox.and.arrow.backward")
+                    }
+                    .help(
+                        "Browse granted MCP resources, prompts, tasks, and calls")
+                }
                 Button {
                     Task { await model.reload() }
                 } label: {
@@ -669,6 +688,12 @@ struct MCPProjectSettingsView: View {
         .task { await model.reload() }
         .sheet(isPresented: $showsAttach) {
             MCPAttachServerSheet(model: model)
+        }
+        .sheet(isPresented: $showsContent) {
+            if let contentHost {
+                MCPConversationCenterSheet(
+                    host: contentHost)
+            }
         }
         .sheet(item: $policyTarget) { target in
             MCPAttachmentPolicySheet(

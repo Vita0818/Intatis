@@ -1,7 +1,7 @@
 # TESTING
 
 文档状态：当前验证矩阵
-最近核对：2026-08-03
+最近核对：2026-08-04
 产品基线：v0.32（build 32）
 
 历史测试数量、性能数字和事故复验保留在 Git 历史及 dated reports；它们不能替代当前
@@ -167,14 +167,45 @@ recovery App metadata/architecture/signature/entitlements 重新验证；超时�
 
 - macOS/iOS Light 与 Dark；
 - Chat/Code/Cowork session 切换、16-row paging、Earlier/Newer/Latest；
+- Cowork 默认查看 `@main`；右侧 ordinary agent 点击后只出现该 agent 内容；
+  detach 当前 agent 后它仍留在同一列表、状态图标变为 detached、选择和历史页不跳回 main，
+  且所有运行时操作禁用；`@permission-reviewer` 为 status-only；两个窗口选择互不覆盖；切走再
+  返回仍恢复各 agent 自己的 Earlier/Newer/Latest boundary；查看 worker 时 composer 仍路由 `@main`；
 - long rich response、Markdown/table/code/math 和 plain-safe fallback；
 - composer 单行/多行、model menu、usage、Send/Stop；
 - Cowork wide rail、narrow permission fallback、Goal/Tasks/Agents；
+- wide rail 连续切换 agent、应用失焦/回焦、窗口移动与进入/退出全屏；系统日志中不得出现
+  `IntatisThreadViewportFramesPreferenceKey tried to update multiple times per frame`，源码不得恢复
+  viewport GeometryReader/PreferenceKey 坐标回写；
 - Settings disclosure、provider test、本地诊断 ZIP；
 - Dynamic Type、Reduce Transparency、Increase Contrast、VoiceOver 和 clipboard/selection。
 
 截图或 Computer Use 只能证明对应 viewport/appearance 的视觉行为，不能替代 EventLog、
 权限、bundle、签名或长时性能验证。
+
+### Cowork agent-thread 性能门禁
+
+Debug-only `CoworkAgentConversationFixtureView` 通过启动参数
+`-IntatisCoworkAgentConversationFixture` 使用真实 `CoworkShell`，但不打开 EventLog、provider、
+workspace、permission runtime 或 credential。Computer Use 无法传入启动参数时，DEBUG 构建也可用
+以 `.CoworkAgentConversationFixture` 结尾的独立 bundle identifier 启动同一 fixture；该入口不进入
+Release。固定负载为 8 个 selectable agent × 每个 1,000 rows、4-agent 合计 500 canonical
+delta/s（50 ms projection coalescing）、最多 16 visible rows。
+
+专项验收至少执行：
+
+1. `Run 1,000 switches`，确认最终 selection/内容一致且 warning/incident 均为 0；
+2. `Run 180s soak`，nominal 10 selected-agent changes/s；记录实际 timed switches；
+3. 结束后保持窗口打开并静置到 rich document 恢复，再记录 RSS、`vmmap -summary` 与
+   `heap` 中 `NSTextViewSharedData` / `Gestures.GestureNode<()>` 数量；
+4. 再手动验证一个 streaming agent、一个静态 agent、Earlier 页，以及切走再返回的 per-agent
+   boundary；确认 reviewer 没有 conversation button。
+
+通过条件：全过程 UI 可访问，main-thread warning/incident 为 0；可见 page 始终 ≤16；RSS/physical
+footprint 和 native text/gesture objects 不随切换次数线性增长；停止后 rich view 数量回到一个
+bounded visible page 的量级。`heap`/`vmmap` 会短暂停顿目标进程，只在自动 soak 完成后采样，
+避免把外部采样暂停误计为产品 heartbeat incident。该 offline fixture 只证明 presentation
+pipeline，不替代真实 EventLog I/O、provider、VoiceOver、最低支持设备或多小时运行。
 
 ## 最近一次真实结果
 
@@ -200,6 +231,38 @@ recovery App metadata/architecture/signature/entitlements 重新验证；超时�
   0 failures；
 - 完整 `swift test`：通过。真实 browser/Git/provider/credential/network 等显式 opt-in
   用例仍按设计 skipped，不计为已执行的真实环境验证；
+- Cowork agent-thread Computer Use：8 × 1,000 rows + 500 delta/s 下，1,000 rapid switches 与
+  180 秒 soak（1,486 timed switches）均通过，0 warning / 0 incident；结束后 14 个
+  `NSTextViewSharedData`、173 个 `GestureNode`，`vmmap` 62.1 MiB physical / 74.8 MiB peak，
+  `ps` RSS 约 156.6 MiB；
+- 2026-08-04 historical-roster 增量：`CoworkProjectionRegressionTests` 8/8、
+  `CoworkAgentThreadPresentationModelTests` 10/10、`CoworkInferencePresentationTests` 6/6、
+  `IntatisConversationTests` 172/172；Computer Use 实测 detach 当前 agent 后保持选择、离开再返回
+  仍可读，并在 500 delta/s 下追加完成 1,000 rapid switches，0 warning / 0 incident、16 rows。
+  当前 Codex managed sandbox 的完整 suite 只因 `IntatisToolsTests` process/Seatbelt/loopback 限制
+  失败；一次完整 `IntatisSharedUITests` target 在 build 后无测试输出并被中止，相关定向用例已独立
+  通过；
+- 2026-08-04 rail lighting/fixed-geometry 增量：
+  `ThreadLayoutTests|CoworkInferencePresentationTests|CoworkAgentThreadPresentationModelTests`
+  30/30；IntatisMac macOS Debug 与 IntatisiOS generic Simulator Debug unsigned build 通过。
+  原生 Light fixture 在同一 1372×768 viewport 中切换 `@main` / `@research`，composer 水平像素
+  run 完全一致，rail 两态均为 x=1076…1365；旧 `.regular` glass card 的一次性 QA sample
+  为 240/255，新系统 `Glass.clear` sample 为 244/255。该数值只用于同机同窗对照，不是颜色 token。
+  8×1,000 rows + 500 delta/s 下再次完成 1,000 rapid switches，0 warning / 0 incident、≤16 rows。
+  本次未重跑 180 秒 soak、Dark、Reduce Transparency、Increase Contrast、VoiceOver 或完整
+  SwiftPM suite；不得从该 Light fixture 外推这些矩阵。
+- 2026-08-04 rail window-stability 第一版的 31/31 与截图数据只保留为历史记录；用户随后仍稳定
+  复现跳动，真实 Test session 也记录到 viewport preference 同帧重复更新，因此该结论已作废。
+- 第二版 corrective pass（删除 GeometryReader/PreferenceKey 坐标链、改用
+  `onScrollVisibilityChange`、拆除 shared glass container）的 85/85、360-cycle host 与当时的 AX/
+  视觉结论已经被用户在新构建中的稳定复现推翻，不得继续当作 rail 不跳动的通过证据。当前第三版
+  必须额外验证：outer-detail canvas 而非 `threadColumn` 直接拥有 trailing rail；selection 不在 rail
+  render snapshot；蓝色 selection child 可独立更新；`Glass.clear` backdrop 是 content-independent
+  Equatable view；transaction 同时关闭 animation 与 disablesAnimations。当前
+  `ThreadLayoutTests|CoworkInferencePresentationTests|CoworkAgentThreadPresentationModelTests`
+  31/31 通过，production-shaped host 包含 360 次交错 selection/mode/inspector/window-size 循环；
+  IntatisMac macOS Debug 与 IntatisiOS generic Simulator Debug unsigned build 通过。按用户要求不使用
+  Computer Use 或截图差分，因此最终几像素光学稳定性保留为用户新构建手动验收项，不能由自动化外推。
 - 用户普通终端的 `security find-identity -v -p codesigning` 已报告两个有效 identity，发行
   脚本也已进入真实 Developer ID 签名和 App 上传；Codex 托管沙箱无法读取登录 Keychain，
   因而在沙箱内仍返回 `0 valid identities found`，不能覆盖宿主证据。两次 App submission

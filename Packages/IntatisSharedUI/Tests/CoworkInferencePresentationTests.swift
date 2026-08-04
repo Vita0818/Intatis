@@ -73,5 +73,123 @@ final class CoworkInferencePresentationTests: XCTestCase {
         XCTAssertEqual(agent.inferenceDisplayLabel, "Inference unavailable")
         XCTAssertTrue(agent.inferenceResolution.requiresAttention)
     }
+
+    func testDetachedAgentRemainsSelectableButHasNoRuntimeMutation() {
+        let agent = CoworkAgentInfo(
+            id: "worker",
+            name: "worker",
+            workspace: "/workspace",
+            model: "gpt-test",
+            permissionProfile: "reviewed",
+            inferenceResolution: .resolved,
+            status: "detached",
+            isAttached: false,
+            canRemove: false,
+            isConversationSelectable: true)
+
+        XCTAssertFalse(agent.isAttached)
+        XCTAssertFalse(agent.canRemove)
+        XCTAssertTrue(agent.isConversationSelectable)
+        XCTAssertEqual(agent.statusLine, "detached")
+    }
+
+    func testHistoricalAgentRailUsesLazyUnfilteredRoster() throws {
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: packageRoot
+                .appendingPathComponent("Sources/CoworkViews.swift"),
+            encoding: .utf8)
+        let start = try XCTUnwrap(
+            source.range(of: "private var agentStatusList"))
+        let end = try XCTUnwrap(
+            source.range(
+                of: "private func agentStatusRow(",
+                range: start.upperBound..<source.endIndex))
+        let roster = source[start.lowerBound..<end.lowerBound]
+
+        XCTAssertTrue(roster.contains("LazyVStack("))
+        XCTAssertTrue(roster.contains("ForEach(agents)"))
+        XCTAssertFalse(source.contains("private var visibleAgents"))
+        XCTAssertTrue(source.contains("return \"minus.circle.fill\""))
+
+        let rowStart = try XCTUnwrap(
+            source.range(of: "private func agentStatusRowContent("))
+        let rowEnd = try XCTUnwrap(
+            source.range(
+                of: "private var goalCardSection",
+                range: rowStart.upperBound..<source.endIndex))
+        let selectedRow = source[rowStart.lowerBound..<rowEnd.lowerBound]
+        XCTAssertTrue(source.contains(".fill(accent.opacity(0.16))"))
+        XCTAssertFalse(selectedRow.contains("checkmark.circle.fill"))
+        XCTAssertTrue(selectedRow.contains(".font(.body.weight(.semibold))"))
+        XCTAssertTrue(selectedRow.contains(".font(.callout)"))
+        XCTAssertTrue(source.contains(".intatisClearLiquidGlass(cornerRadius: 22)"))
+        XCTAssertTrue(source.contains("presentationStyle: .compactRail"))
+
+        let surfaces = try String(
+            contentsOf: packageRoot
+                .appendingPathComponent("Sources/ThreadSurfaces.swift"),
+            encoding: .utf8)
+        XCTAssertTrue(surfaces.contains(".glassEffectTransition(.identity)"))
+        XCTAssertTrue(surfaces.contains(".strokeBorder("))
+
+        let headerStart = try XCTUnwrap(source.range(of: "private func header("))
+        let headerEnd = try XCTUnwrap(
+            source.range(
+                of: "private func resolvedHeaderActions(",
+                range: headerStart.upperBound..<source.endIndex))
+        let header = source[headerStart.lowerBound..<headerEnd.lowerBound]
+        XCTAssertTrue(header.contains("subtitle: nil"))
+        XCTAssertFalse(source.contains("\"Viewing @%@\""))
+    }
+
+    func testCoworkTranscriptKeepsOneFixedConversationGeometry() throws {
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: packageRoot
+                .appendingPathComponent("Sources/CoworkViews.swift"),
+            encoding: .utf8)
+        let start = try XCTUnwrap(
+            source.range(of: "@ViewBuilder private func thread("))
+        let end = try XCTUnwrap(
+            source.range(
+                of: "private func resolvedViewportAdmission(",
+                range: start.upperBound..<source.endIndex))
+        let thread = source[start.lowerBound..<end.lowerBound]
+
+        XCTAssertEqual(thread.components(separatedBy: "ScrollViewReader").count, 2)
+        XCTAssertTrue(thread.contains(".frame(width: layout.contentWidth)"))
+        XCTAssertTrue(thread.contains(".frame(width: layout.rawWidth)"))
+        XCTAssertTrue(thread.contains("cowork.agent-thread.empty"))
+        XCTAssertFalse(thread.contains(".padding(.horizontal, layout.horizontalPadding)"))
+    }
+
+    func testAppPresentsHistoricalAgentsInCreationOrder() throws {
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let repositoryRoot = packageRoot
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Apps/IntatisMac/Sources/CoworkViewModel.swift"),
+            encoding: .utf8)
+        let start = try XCTUnwrap(
+            source.range(of: "private func agentPresentation("))
+        let end = try XCTUnwrap(
+            source.range(
+                of: "private func liveAgentInfo(",
+                range: start.upperBound..<source.endIndex))
+        let presentation = source[start.lowerBound..<end.lowerBound]
+
+        XCTAssertTrue(
+            presentation.contains("projection.historicalAgentsInCreationOrder"))
+        XCTAssertFalse(presentation.contains(".sorted"))
+    }
 }
 #endif

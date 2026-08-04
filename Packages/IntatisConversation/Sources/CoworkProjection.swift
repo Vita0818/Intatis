@@ -137,7 +137,19 @@ public struct CoworkProjection: Equatable, Sendable {
     public private(set) var goals: [GoalID: Goal] = [:]
     public private(set) var continuationRuns: [ContinuationRunID: ContinuationRun] = [:]
     public private(set) var currentGoalID: GoalID?
+    /// Agents that are currently attached and may participate in runtime
+    /// operations. Detach keeps the existing live-roster semantics so callers
+    /// cannot accidentally route work to a historical identity.
     public private(set) var agentRoster: [AgentID: AgentAttachedPayload] = [:]
+    /// Every agent identity durably admitted by this session, including agents
+    /// that were later detached. The latest attached payload is retained so a
+    /// replay can rebuild the history picker without a second persistence
+    /// format; current operability must still be checked against `agentRoster`.
+    public private(set) var historicalAgentRoster: [AgentID: AgentAttachedPayload] = [:]
+    /// Stable first-admission order for the historical roster. Keeping this
+    /// separately from the dictionary prevents live status/message changes
+    /// from reordering the UI and avoids sorting the roster on every fold.
+    public private(set) var historicalAgentOrder: [AgentID] = []
     public private(set) var mailboxes: [AgentID: CoworkMailboxView] = [:]
     public private(set) var pendingDelegations: [RequestID: DelegationRequestedPayload] = [:]
     public private(set) var rejectedDelegations: [DelegationRejectedPayload] = []
@@ -151,6 +163,10 @@ public struct CoworkProjection: Equatable, Sendable {
     public private(set) var toolExecutions: [String: CoworkToolExecutionView] = [:]
 
     public init() {}
+
+    public var historicalAgentsInCreationOrder: [AgentAttachedPayload] {
+        historicalAgentOrder.compactMap { historicalAgentRoster[$0] }
+    }
 
     public var activeTasks: [CoworkTaskView] {
         tasks.values.filter { $0.status == .created || $0.status == .assigned || $0.status == .queued || $0.status == .running }
@@ -309,6 +325,7 @@ public struct CoworkProjection: Equatable, Sendable {
             submittedIntents[index].failure = payload.failure
         case .agentAttached(let payload):
             agentRoster[payload.agent] = payload
+            upsertHistoricalAgent(payload)
         case .agentSpawned(let payload):
             // `agentAttached` is the durable admission fact and may carry the
             // exact inference binding approved for this agent. New logs emit it
@@ -316,13 +333,18 @@ public struct CoworkProjection: Equatable, Sendable {
             // that frozen identity. A spawn-only legacy log can still recover a
             // roster entry, but its historical inference route is unresolved.
             if agentRoster[payload.agent] == nil {
-                agentRoster[payload.agent] = AgentAttachedPayload(
+                let legacyAttached = AgentAttachedPayload(
                     agent: payload.agent,
                     path: payload.path,
                     model: payload.model,
                     profile: "reviewed",
                     agentInferenceBinding: nil,
                     metadata: payload.metadata)
+                agentRoster[payload.agent] = legacyAttached
+                upsertHistoricalAgent(legacyAttached)
+            } else if historicalAgentRoster[payload.agent] == nil,
+                      let attached = agentRoster[payload.agent] {
+                upsertHistoricalAgent(attached)
             }
             if let requestedBy = payload.requestedBy ?? payload.metadata?.sender {
                 agentOwners[payload.agent] = requestedBy
@@ -581,6 +603,15 @@ public struct CoworkProjection: Equatable, Sendable {
             projection.apply(envelope)
         }
         return projection
+    }
+
+    private mutating func upsertHistoricalAgent(
+        _ payload: AgentAttachedPayload
+    ) {
+        if historicalAgentRoster[payload.agent] == nil {
+            historicalAgentOrder.append(payload.agent)
+        }
+        historicalAgentRoster[payload.agent] = payload
     }
 
     private mutating func upsertTask(_ contract: TaskContract,

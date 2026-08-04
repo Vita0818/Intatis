@@ -1,7 +1,7 @@
 # CURRENT_STATE
 
 文档状态：当前源码摘要
-最近核对：2026-08-03
+最近核对：2026-08-04
 产品基线：v0.32（build 32）
 
 ## 版本与发行状态
@@ -29,7 +29,10 @@ macOS 是完整产品：Chat、Code、Cowork、Settings 和本地诊断导出。
   execution ticket 在执行前逐层核对。
 - Cowork 使用 `Orchestrator`、FIFO scheduler、MessageBus/Mediator、WorkTask/Goal、
   per-agent exact inference binding、独立 permission reviewer 与 goal verifier 控制面。
-  AgentLoop 不同步递归调用另一个 AgentLoop。
+  AgentLoop 不同步递归调用另一个 AgentLoop。右侧 Agents 区域中的 ordinary agent 可作为
+  当前窗口的只读对话选择；列表保留 session 历史上所有 durable agent，detached identity 继续
+  可点击并由原状态图标显示已移除，当前选择不会跳回 `@main`。新窗口默认显示 `@main`，
+  `@permission-reviewer` 等控制面 identity 仍为不可选择的状态项。
 - Settings 已收敛为渐进披露结构，保留 provider、模型、MCP、renderer、声明、配置和本地
   诊断 ZIP。诊断包尝试采集系统/App/session 诊断源，但排除原始会话、工具参数/结果、
   endpoint、credential、workspace、artifact、browser profile 与 bookmark；不远程上传。
@@ -76,6 +79,37 @@ profiles 与外部 MCP client。macOS/Linux 的 stdio、sandbox、bwrap/guard �
 - macOS Chat/Code/Cowork history 使用最多 16-row eager page 与显式分页，避免旧的 rich +
   lazy session-entry layout cycle。旧性能数字只保留在 Git/report 历史，不是当前 release
   readiness 证明。
+- Cowork 不再把完整 `CodeProjection.items` 发布给 MainActor，也不在点击时扫描/过滤完整
+  历史。Conversation actor 在 fold 时维护 typed per-agent index；每个窗口只持有选中 agent
+  的一个最多 16-row page、独立分页边界和 stale-request generation。非选中 agent 的增量
+  不会刷新当前 transcript，查看选择也不改变 runtime、scheduler、mailbox、lease 或发送目标。
+- Cowork roster 现分成 EventLog-derived historical identity catalog 与 live operational roster：
+  前者驱动 stable-ID lazy Agents 列表和只读 conversation selection，后者独占 send/delegate/
+  message/ask/rebind/remove、settings 与 workspace/capability 操作。presentation 会先按 agent
+  线性聚合 task/lease/status，避免历史 agent 数量增长后形成 agent×task/lease 重扫。Agents
+  使用 durable 首次 admission 的创建顺序；status、消息、detach 或 reattach 不会触发重排。
+- Cowork thread header 只显示 session durable name。宽屏 rail 继续作为同一 conversation canvas
+  的 trailing overlay；outer rail 固定 348pt、glass card 固定 318pt，并使用系统 `Glass.clear`
+  降低独立光块感，不增加整栏背景、手绘阴影或渐变。Agents 使用更大的系统文字，选中态只保留
+  accent 蓝色背景，不再叠加勾选图标；顶部 compact permission 只显示状态、tool、安全摘要与必要
+  action，不展示 risk chip、raw arguments 或默认展开详情。
+- Cowork thread header 不再提供独立 MCP Content 快捷按钮；内容浏览保留在
+  `Project Settings → MCP → Browse Content`。右侧 status rail 显隐开关使用系统 compact 圆形
+  glass/bordered icon control；这两项只改变 header chrome，不进入 rail overlay、固定宽度或
+  render-boundary 输入。
+- rail 现在是 thread 上不参与布局协商的 `.overlay(alignment: .trailing)`，并关闭 inspector
+  transaction 的隐式动画。rail 由只包含 rail 输入的 Equatable render boundary 隔离；thread 的
+  empty/loading/page/rich 状态不能重新物化 cards。每个 passive `Glass.clear` 都位于自己的稳定
+  backdrop，独立 status cards 不再放入会融合/重组 shape 的 `GlassEffectContainer`；系统动态
+  separator 的单物理像素 `strokeBorder` 继续作为轮廓锚点，不使用固定 RGB、渐变、投影或自绘高光。
+- Code/Cowork 的 raw bottom-anchor 恢复不再通过 GeometryReader、屏幕全局坐标或
+  `PreferenceKey` 回写布局；系统 `onScrollVisibilityChange` 只在 anchor 可见性真正变化时提交
+  observation。窗口移动、focus 或全屏变化因此不会仅因 screen origin 改变而触发 thread 布局链。
+- Cowork transcript 复用一个固定 ScrollView 根和最多 16 个稳定行槽。agent/page 切换及选中
+  agent 的连续增量期间先显示轻量 raw text；同一选择和内容静止 300 ms 后才重新准入 rich
+  Markdown，避免快速点击或 streaming 为每次更新挂载新的 AppKit 文本/选择子树。content/raw
+  frame 在 ScrollView 扩展到 overlay 下方前固定，因此 Agent 内容、空态和 scroller 可见性都不会
+  改变中栏或 composer 的水平边界。
 
 ## 持久化与安全边界
 
@@ -102,6 +136,43 @@ profiles 与外部 MCP client。macOS/Linux 的 stdio、sandbox、bwrap/guard �
   soft-budget overrun；生产 `requestTooLarge` 保护未修改，独立 admission/concurrency 回归仍保留。
 - 完整 `swift test` 已在允许 Swift/Clang cache、process 与 loopback 测试的宿主环境通过；
   需要真实 browser/Git/provider/credential/network 的 opt-in 用例仍按声明跳过，不能冒充已验证。
+- 2026-08-03 Cowork agent-thread 专项：Debug fixture 使用 8 个 selectable agent、每个 1,000
+  条记录、4-agent 合计 500 canonical delta/s，先完成 1,000 次 rapid switch，再完成 180 秒
+  10 Hz nominal soak（实际 1,486 次 timed switch）；Computer Use 观测为 0 main-thread warning、
+  0 incident，结束时仍只挂载 16 条，`NSTextViewSharedData` 为 14、`GestureNode` 为 173。
+  `vmmap` physical footprint 为 62.1 MiB、峰值 74.8 MiB；`ps` RSS 为约 156.6 MiB。两者口径
+  不同，均未出现旧实现的线性增长。本 fixture 是 offline presentation stress，不替代真实
+  provider/EventLog/低端设备长时矩阵。
+- 2026-08-04 historical roster 修正：512 identity 投影用例在 detach 500 个后仍保留 512 个
+  历史项且 live roster 仅 12 个；detached selection、512-ID presentation catalog、lazy/unfiltered
+  rail 与 read-only operation fence 的定向测试通过，IntatisConversationTests 172/172、IntatisMac
+  Debug unsigned 构建通过。Computer Use 实测 detach 当前 `@research` 后不跳回 main，离开再返回
+  仍可查看 985–1,000 / 1,000；随后在 500 delta/s 下完成 1,000 rapid switches，0 warning / 0
+  incident，仍只挂载 16 rows。
+- 2026-08-04 rail lighting/fixed-geometry 修正：`ThreadLayoutTests`、
+  `CoworkInferencePresentationTests` 与 `CoworkAgentThreadPresentationModelTests` 组合共 30 tests /
+  0 failures；IntatisMac 与 IntatisiOS Simulator Debug unsigned build 通过。1372×768 原生 Light
+  对照中，`@main` / `@research` 的 composer 像素边界一致，rail 均位于 x=1076…1365；8×1,000
+  rows + 500 delta/s 下再次完成 1,000 rapid switches，0 warning / 0 incident、最多 16 rows。
+  该次没有重跑 180 秒 soak、Dark、Reduce Transparency、Increase Contrast 或完整 SwiftPM suite。
+- 2026-08-04 rail window-stability 第一版结论已被用户复现结果推翻，不再作为当前通过证据。
+  后续真实 Test session 日志证明旧 `IntatisThreadViewportFramesPreferenceKey` 在全屏变化时仍会同帧
+  重复更新；仅做像素相位修正不能解决问题，相关旧截图/数值只保留为历史排查记录。
+- 2026-08-04 上述第二版 corrective pass 随后也被用户在新构建中稳定复现结果推翻：删除 viewport
+  preference 与 shared glass container 仍不够，因为 trailing overlay 的几何宿主仍是会随 transcript
+  更新的 `threadColumn`，且 `selectedAgentID` 仍在整个 rail 的 Equatable snapshot 中；每次点击都会
+  让所有原生 glass section 重新进入更新周期。当前源码改为由 exact outer-detail canvas 分别托管
+  leading thread 与 trailing rail，thread 不再是 rail 的 alignment guide；selection 从 rail snapshot
+  中移除并通过独立轻量状态只更新蓝色行背景/无障碍 value；每个 `Glass.clear` backdrop 也成为
+  content-independent Equatable view。`ThreadLayoutTests|CoworkInferencePresentationTests|
+  CoworkAgentThreadPresentationModelTests` 31/31 通过，其中 production-shaped host 完成 360 次
+  agent selection/mode/inspector/window-size 交错变化；IntatisMac macOS Debug 与 IntatisiOS generic
+  Simulator Debug unsigned build 通过。按用户要求不使用 Computer Use 或截图采样，真实视觉是否消除
+  数像素光学跳变仍需用户在新构建中确认，不能沿用前两版的截图/AX 结论。
+- 同日 Codex managed sandbox 内的完整 `swift test --disable-sandbox --quiet` 仍只有
+  `IntatisToolsTests` 的 process/Seatbelt/loopback 用例受宿主限制失败；单独完整
+  `IntatisSharedUITests` 一次在 build 后无用例输出并被中止，当前修改直接覆盖的 SharedUI 定向
+  用例均独立通过。不得把这次 sandbox 运行记成全量通过。
 - 直分发脚本已在用户宿主环境进入真实 Developer ID 构建/签名链路；一次开启代理/VPN的
   运行在 Apple notarization 网络阶段未完成，另一次先关闭代理/VPN的运行则在 SwiftPM
   克隆 `swift-system` 时因 GitHub 专用代理 `127.0.0.1:1082` 已停而失败。脚本现在支持

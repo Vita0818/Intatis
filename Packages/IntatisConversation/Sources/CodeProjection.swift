@@ -67,6 +67,123 @@ public struct CodeItem: Identifiable, Equatable, Sendable {
         self.submissionFailure = submissionFailure
         self.timestamp = timestamp
     }
+
+    /// The normal Chat/Code/Cowork transcript deliberately hides execution
+    /// trace rows. Keeping the predicate beside the projected item lets the
+    /// Cowork per-agent index apply the exact same policy before pagination,
+    /// without making Conversation depend on SharedUI.
+    public var isDefaultConversationPresentationItem: Bool {
+        guard presentationSource == .conversation else { return false }
+        switch kind {
+        case .user, .agent, .agentToAgent, .error:
+            return true
+        case .toolCall, .toolResult, .patch, .note:
+            return false
+        }
+    }
+}
+
+/// Agent-scoped presentation impact produced by one exact EventLog fold.
+/// `agentIDs` includes hidden execution-trace rows, while `visibleAgentIDs`
+/// contains only rows that can change the default transcript.
+public struct CodeProjectionChange: Equatable, Sendable {
+    public var didChangeItems: Bool
+    public var agentIDs: Set<AgentID>
+    public var visibleAgentIDs: Set<AgentID>
+
+    public init(
+        didChangeItems: Bool = false,
+        agentIDs: Set<AgentID> = [],
+        visibleAgentIDs: Set<AgentID> = []
+    ) {
+        self.didChangeItems = didChangeItems
+        self.agentIDs = agentIDs
+        self.visibleAgentIDs = visibleAgentIDs
+    }
+
+    public static let none = Self()
+
+    public mutating func formUnion(_ other: Self) {
+        didChangeItems = didChangeItems || other.didChangeItems
+        agentIDs.formUnion(other.agentIDs)
+        visibleAgentIDs.formUnion(other.visibleAgentIDs)
+    }
+}
+
+/// One bounded, actor-owned Cowork transcript page. The page contains at most
+/// `capacity` rows; canonical history remains unbounded in CodeProjection.
+public struct CoworkAgentThreadPage: Equatable, Sendable {
+    public let agentID: AgentID
+    public let items: [CodeItem]
+    public let lowerBound: Int
+    public let upperBound: Int
+    public let totalCount: Int
+    public let capacity: Int
+    public let projectedThroughSeq: Int
+    public let projectionGeneration: UUID
+    public let isAgentWorking: Bool
+
+    public init(
+        agentID: AgentID,
+        items: [CodeItem],
+        lowerBound: Int,
+        upperBound: Int,
+        totalCount: Int,
+        capacity: Int,
+        projectedThroughSeq: Int,
+        projectionGeneration: UUID,
+        isAgentWorking: Bool
+    ) {
+        self.agentID = agentID
+        self.items = items
+        self.lowerBound = lowerBound
+        self.upperBound = upperBound
+        self.totalCount = totalCount
+        self.capacity = capacity
+        self.projectedThroughSeq = projectedThroughSeq
+        self.projectionGeneration = projectionGeneration
+        self.isAgentWorking = isAgentWorking
+    }
+
+    public static func empty(
+        agentID: AgentID,
+        capacity: Int = 16
+    ) -> Self {
+        Self(
+            agentID: agentID,
+            items: [],
+            lowerBound: 0,
+            upperBound: 0,
+            totalCount: 0,
+            capacity: max(1, min(capacity, 16)),
+            projectedThroughSeq: -1,
+            projectionGeneration: UUID(),
+            isAgentWorking: false)
+    }
+
+    public var hasEarlier: Bool { lowerBound > 0 }
+    public var hasLater: Bool { upperBound < totalCount }
+    public var isLatest: Bool { !hasLater }
+    public var earlierRequestedUpperBound: Int? {
+        hasEarlier ? lowerBound : nil
+    }
+    public var newerRequestedUpperBound: Int? {
+        guard hasLater else { return nil }
+        let nextUpperBound = min(totalCount, upperBound + capacity)
+        return nextUpperBound == totalCount ? nil : nextUpperBound
+    }
+}
+
+public struct CoworkAgentThreadUpdate: Equatable, Sendable {
+    public let agentID: AgentID
+    public let throughSeq: Int
+    public let revision: UInt64
+
+    public init(agentID: AgentID, throughSeq: Int, revision: UInt64) {
+        self.agentID = agentID
+        self.throughSeq = throughSeq
+        self.revision = revision
+    }
 }
 
 public struct ArtifactProgressSnapshot: Identifiable, Equatable, Sendable {
@@ -191,14 +308,38 @@ public struct CodeProjection: Equatable, Sendable {
     public private(set) var items: [CodeItem] = []
     private var activeTaskByAgent: [AgentID: TaskAttemptKey] = [:]
     private var latestCompletedMessageByTaskAttempt: [TaskAttemptKey: CompletedMessageReference] = [:]
+    private let tracksAgentThreadIndex: Bool
+    private var defaultConversationAgentID: AgentID?
+    private var unattributedDefaultItemIndices: Set<Int> = []
+    private var itemIndexByID: [String: Int] = [:]
+    private var userItemIndexBySubmissionID: [SubmissionID: Int] = [:]
+    private var submissionAgentByID: [SubmissionID: AgentID] = [:]
+    private var toolNameByCallID: [String: String] = [:]
+    private var toolAgentByCallID: [String: AgentID] = [:]
+    private var itemAgentIDs: [[AgentID]] = []
+    private var itemIndicesByAgent: [AgentID: [Int]] = [:]
+    private var visibleItemIndicesByAgent: [AgentID: [Int]] = [:]
 
-    public init() {}
+    public init() {
+        tracksAgentThreadIndex = false
+    }
 
-    public mutating func apply(_ envelope: Envelope) {
+    /// Per-agent attribution and deferred durable-main repair exist only for
+    /// Cowork presentation. Code still uses the O(1) message/tool indices, but
+    /// must not retain Cowork's per-item attribution arrays for a long ordinary
+    /// transcript.
+    init(tracksAgentThreadIndex: Bool) {
+        self.tracksAgentThreadIndex = tracksAgentThreadIndex
+    }
+
+    @discardableResult
+    public mutating func apply(_ envelope: Envelope) -> CodeProjectionChange {
+        let initialItemCount = items.count
+        var mutationChange = CodeProjectionChange.none
         switch envelope.event {
         case .userMessage(let p):
             if let submissionID = p.submissionID,
-               items.contains(where: { $0.kind == .user && $0.submissionID == submissionID }) {
+               userItemIndexBySubmissionID[submissionID] != nil {
                 // The first accepted payload is immutable. A retry reuses its
                 // submission identity and must not create or overwrite a user
                 // message.
@@ -214,9 +355,8 @@ public struct CodeProjection: Equatable, Sendable {
                                   submissionID: p.submissionID))
 
         case .submissionStatusChanged(let p):
-            guard let index = items.firstIndex(where: {
-                $0.kind == .user && $0.submissionID == p.submissionID
-            }), SubmissionStatusFold.accepts(
+            guard let index = userItemIndexBySubmissionID[p.submissionID],
+                  SubmissionStatusFold.accepts(
                 currentStatus: items[index].submissionStatus,
                 currentAttempt: items[index].submissionAttempt,
                 next: p)
@@ -225,13 +365,20 @@ public struct CodeProjection: Equatable, Sendable {
             items[index].submissionAttempt = p.attempt
             items[index].submissionFailure = p.failure
             items[index].isFailure = p.status == .failed || p.status == .cancelled
+            mutationChange = changeForItem(at: index)
 
         case .messageDelta(let p):
             if let i = agentIndex(p.messageId.rawValue) {
+                let previousAttributionChange = changeForItem(at: i)
                 items[i].body += p.textDelta
                 if items[i].timestamp == nil {
                     items[i].timestamp = envelope.ts
                 }
+                if let agent = p.agent {
+                    replaceAttribution(at: i, with: [agent])
+                }
+                mutationChange = previousAttributionChange
+                mutationChange.formUnion(changeForItem(at: i))
             } else {
                 items.append(CodeItem(id: p.messageId.rawValue, kind: .agent,
                                       title: p.agent?.rawValue ?? "Agent", body: p.textDelta, complete: false,
@@ -241,12 +388,18 @@ public struct CodeProjection: Equatable, Sendable {
 
         case .messageCompleted(let p):
             if let i = agentIndex(p.messageId.rawValue) {
+                let previousAttributionChange = changeForItem(at: i)
                 items[i].body = p.text
                 items[i].complete = true
                 if items[i].timestamp == nil {
                     items[i].timestamp = envelope.ts
                 }
+                if let agent = p.agent {
+                    replaceAttribution(at: i, with: [agent])
+                }
                 recordCompletedMessage(at: i, from: p.agent)
+                mutationChange = previousAttributionChange
+                mutationChange.formUnion(changeForItem(at: i))
             } else {
                 items.append(CodeItem(id: p.messageId.rawValue, kind: .agent,
                                       title: p.agent?.rawValue ?? "Agent", body: p.text,
@@ -456,10 +609,11 @@ public struct CodeProjection: Equatable, Sendable {
             let body = p.diagnostic.map {
                 "\(status)\n\($0.summary)"
             } ?? status
-            if let index = items.firstIndex(where: { $0.id == id }) {
+            if let index = itemIndexByID[id] {
                 items[index].body = body
                 items[index].complete = p.phase != .reported
                 items[index].timestamp = envelope.ts
+                mutationChange = changeForItem(at: index)
             } else {
                 items.append(CodeItem(
                     id: id,
@@ -501,6 +655,22 @@ public struct CodeProjection: Equatable, Sendable {
              .mcpConnectionTerminal, .mcpCatalogTerminal, .mcpExecutionUncertain:
             break
         }
+
+        var change = mutationChange
+        if items.count > initialItemCount {
+            let agents = tracksAgentThreadIndex
+                ? attributedAgents(for: envelope.event)
+                : []
+            for index in initialItemCount..<items.count {
+                change.formUnion(registerItem(at: index, agents: agents))
+                if tracksAgentThreadIndex,
+                   agents.isEmpty,
+                   requiresDefaultAttribution(envelope.event) {
+                    unattributedDefaultItemIndices.insert(index)
+                }
+            }
+        }
+        return change
     }
 
     public static func build(from envelopes: [Envelope]) -> CodeProjection {
@@ -509,12 +679,310 @@ public struct CodeProjection: Equatable, Sendable {
         return p
     }
 
+    /// Sets the durable Cowork main identity used only for otherwise
+    /// untargeted presentation rows. When deferred attribution is enabled by
+    /// the Cowork reducer, legacy logs that place user rows before their
+    /// settings event are repaired once during replay, rather than at click
+    /// time.
+    @discardableResult
+    public mutating func setDefaultConversationAgentID(
+        _ agentID: AgentID
+    ) -> CodeProjectionChange {
+        guard tracksAgentThreadIndex else { return .none }
+        guard defaultConversationAgentID != agentID else { return .none }
+        defaultConversationAgentID = agentID
+        let pending = unattributedDefaultItemIndices
+        unattributedDefaultItemIndices.removeAll(keepingCapacity: false)
+        var change = CodeProjectionChange.none
+        for index in pending where items.indices.contains(index) {
+            replaceAttribution(at: index, with: [agentID])
+            change.formUnion(changeForItem(at: index))
+        }
+        return change
+    }
+
+    public var indexedAgentIDs: Set<AgentID> {
+        Set(itemIndicesByAgent.keys)
+    }
+
+    public var visibleIndexedAgentIDs: Set<AgentID> {
+        Set(visibleItemIndicesByAgent.keys)
+    }
+
+    /// Reads only the requested agent's index slice. `additionalItems` is a
+    /// pre-indexed owner-only outbox tail supplied by the app; it is never
+    /// scanned from canonical history here.
+    public func coworkAgentThreadPage(
+        agentID: AgentID,
+        requestedUpperBound: Int?,
+        capacity requestedCapacity: Int = 16,
+        showsExecutionTrace: Bool,
+        additionalItems: [CodeItem] = [],
+        projectedThroughSeq: Int,
+        projectionGeneration: UUID,
+        isAgentWorking: Bool
+    ) -> CoworkAgentThreadPage {
+        let capacity = max(1, min(requestedCapacity, 16))
+        let indices = showsExecutionTrace
+            ? itemIndicesByAgent[agentID] ?? []
+            : visibleItemIndicesByAgent[agentID] ?? []
+        // The app pre-indexes this owner-only tail using the same visibility
+        // policy. Do not filter it here: a click must slice at most `capacity`
+        // rows rather than scan an arbitrarily long outbox.
+        let visibleAdditionalItems = additionalItems
+        let totalCount = indices.count + visibleAdditionalItems.count
+        let upperBound = min(
+            max(requestedUpperBound ?? totalCount, 0),
+            totalCount)
+        let lowerBound = max(upperBound - capacity, 0)
+        var pageItems: [CodeItem] = []
+        pageItems.reserveCapacity(upperBound - lowerBound)
+        for position in lowerBound..<upperBound {
+            if position < indices.count {
+                pageItems.append(items[indices[position]])
+            } else {
+                pageItems.append(
+                    visibleAdditionalItems[position - indices.count])
+            }
+        }
+        return CoworkAgentThreadPage(
+            agentID: agentID,
+            items: pageItems,
+            lowerBound: lowerBound,
+            upperBound: upperBound,
+            totalCount: totalCount,
+            capacity: capacity,
+            projectedThroughSeq: projectedThroughSeq,
+            projectionGeneration: projectionGeneration,
+            isAgentWorking: isAgentWorking)
+    }
+
     private func agentIndex(_ id: String) -> Int? {
-        items.firstIndex { $0.id == id && $0.kind == .agent }
+        guard let index = itemIndexByID[id],
+              items[index].kind == .agent else { return nil }
+        return index
     }
 
     private func toolName(for toolCallId: String) -> String? {
-        items.first { $0.id == toolCallId && $0.kind == .toolCall }?.title
+        toolNameByCallID[toolCallId]
+    }
+
+    private func changeForItem(at index: Int) -> CodeProjectionChange {
+        guard items.indices.contains(index) else { return .none }
+        let agents = itemAgentIDs.indices.contains(index)
+            ? Set(itemAgentIDs[index])
+            : []
+        return CodeProjectionChange(
+            didChangeItems: true,
+            agentIDs: agents,
+            visibleAgentIDs:
+                items[index].isDefaultConversationPresentationItem
+                    ? agents
+                    : [])
+    }
+
+    private mutating func registerItem(
+        at index: Int,
+        agents: [AgentID]
+    ) -> CodeProjectionChange {
+        guard items.indices.contains(index) else { return .none }
+        let item = items[index]
+        if itemIndexByID[item.id] == nil {
+            itemIndexByID[item.id] = index
+        }
+        if item.kind == .user,
+           let submissionID = item.submissionID,
+           userItemIndexBySubmissionID[submissionID] == nil {
+            userItemIndexBySubmissionID[submissionID] = index
+        }
+        if item.kind == .toolCall {
+            toolNameByCallID[item.id] = item.title
+        }
+        replaceAttribution(at: index, with: agents)
+        return changeForItem(at: index)
+    }
+
+    private mutating func replaceAttribution(
+        at index: Int,
+        with candidateAgents: [AgentID]
+    ) {
+        guard tracksAgentThreadIndex,
+              items.indices.contains(index) else { return }
+        while itemAgentIDs.count <= index {
+            itemAgentIDs.append([])
+        }
+        let agents = Array(Set(candidateAgents)).sorted {
+            $0.rawValue < $1.rawValue
+        }
+        let previous = itemAgentIDs[index]
+        guard previous != agents else { return }
+        for agent in previous {
+            itemIndicesByAgent[agent]?.removeAll { $0 == index }
+            visibleItemIndicesByAgent[agent]?.removeAll { $0 == index }
+            if itemIndicesByAgent[agent]?.isEmpty == true {
+                itemIndicesByAgent.removeValue(forKey: agent)
+            }
+            if visibleItemIndicesByAgent[agent]?.isEmpty == true {
+                visibleItemIndicesByAgent.removeValue(forKey: agent)
+            }
+        }
+        itemAgentIDs[index] = agents
+        if !agents.isEmpty {
+            unattributedDefaultItemIndices.remove(index)
+        }
+        for agent in agents {
+            insertItemIndexInOrder(
+                index,
+                for: agent,
+                into: &itemIndicesByAgent)
+            if items[index].isDefaultConversationPresentationItem {
+                insertItemIndexInOrder(
+                    index,
+                    for: agent,
+                    into: &visibleItemIndicesByAgent)
+            }
+        }
+        if let submissionID = items[index].submissionID,
+           let first = agents.first {
+            submissionAgentByID[submissionID] = first
+        }
+        if items[index].kind == .toolCall,
+           let first = agents.first {
+            toolAgentByCallID[items[index].id] = first
+        }
+    }
+
+    private func insertItemIndexInOrder(
+        _ index: Int,
+        for agent: AgentID,
+        into indexMap: inout [AgentID: [Int]]
+    ) {
+        var indices = indexMap[agent] ?? []
+        guard indices.last.map({ $0 >= index }) == true else {
+            indices.append(index)
+            indexMap[agent] = indices
+            return
+        }
+        var lower = 0
+        var upper = indices.count
+        while lower < upper {
+            let middle = lower + (upper - lower) / 2
+            if indices[middle] < index {
+                lower = middle + 1
+            } else {
+                upper = middle
+            }
+        }
+        if lower == indices.count || indices[lower] != index {
+            indices.insert(index, at: lower)
+        }
+        indexMap[agent] = indices
+    }
+
+    private func requiresDefaultAttribution(_ event: Event) -> Bool {
+        switch event {
+        case .userMessage(let payload):
+            return payload.to == nil
+        case .messageDelta(let payload):
+            return payload.agent == nil
+        case .messageCompleted(let payload):
+            return payload.agent == nil
+        case .toolCall(let payload):
+            return payload.agent == nil
+        case .patchProposed(let payload):
+            return payload.agent == nil
+        default:
+            return false
+        }
+    }
+
+    private func attributedAgents(for event: Event) -> [AgentID] {
+        switch event {
+        case .userMessage(let payload):
+            return compactAgents(payload.to ?? defaultConversationAgentID)
+        case .messageDelta(let payload):
+            return compactAgents(payload.agent ?? defaultConversationAgentID)
+        case .messageCompleted(let payload):
+            return compactAgents(payload.agent ?? defaultConversationAgentID)
+        case .toolCall(let payload):
+            return compactAgents(payload.agent ?? defaultConversationAgentID)
+        case .toolResult(let payload):
+            return compactAgents(toolAgentByCallID[payload.toolCallId])
+        case .patchProposed(let payload):
+            return compactAgents(payload.agent ?? defaultConversationAgentID)
+        case .error(let payload):
+            return compactAgents(
+                payload.submissionID.flatMap { submissionAgentByID[$0] })
+        case .agentAttached(let payload):
+            return [payload.agent]
+        case .agentAttachRequested(let payload):
+            return [payload.agent]
+        case .agentDetached(let payload):
+            return [payload.agent]
+        case .agentSpawnRequested(let payload):
+            return [payload.agent]
+        case .agentSpawned(let payload):
+            return [payload.agent]
+        case .agentMessage(let payload):
+            return uniqueAgents([
+                payload.from ?? payload.agent,
+                payload.to,
+            ])
+        case .agentToAgentMessage(let payload):
+            return uniqueAgents([payload.from, payload.to])
+        case .informationRequested(let payload):
+            return uniqueAgents([payload.from, payload.to])
+        case .informationReplied(let payload):
+            return uniqueAgents([payload.from, payload.to])
+        case .delegationRequested(let payload):
+            return uniqueAgents([payload.requester, payload.recipient])
+        case .delegationApproved(let payload):
+            return uniqueAgents([
+                payload.contract.issuer,
+                payload.contract.assignee,
+            ])
+        case .delegationRejected(let payload):
+            return uniqueAgents([payload.requester, payload.assignee])
+        case .taskDelegated(let payload):
+            return uniqueAgents([payload.issuer, payload.assignee])
+        case .taskCreated(let payload):
+            return uniqueAgents([
+                payload.contract.issuer,
+                payload.contract.assignee,
+            ])
+        case .taskAssigned(let payload):
+            return uniqueAgents([
+                payload.contract.issuer,
+                payload.contract.assignee,
+            ])
+        case .taskQueued(let payload):
+            return [payload.assignee]
+        case .taskStarted(let payload):
+            return [payload.agent]
+        case .taskCompleted(let payload):
+            return [payload.agent]
+        case .taskFailed(let payload):
+            return [payload.agent]
+        case .taskCancelled(let payload):
+            return [payload.agent]
+        case .taskRejected(let payload):
+            return uniqueAgents([
+                payload.requester ?? payload.contract?.issuer,
+                payload.assignee ?? payload.contract?.assignee,
+            ])
+        default:
+            return []
+        }
+    }
+
+    private func compactAgents(_ agent: AgentID?) -> [AgentID] {
+        agent.map { [$0] } ?? []
+    }
+
+    private func uniqueAgents(_ agents: [AgentID?]) -> [AgentID] {
+        Array(Set(agents.compactMap { $0 })).sorted {
+            $0.rawValue < $1.rawValue
+        }
     }
 
     private mutating func beginTaskTracking(taskID: TaskID, agent: AgentID, attempt: Int?) {

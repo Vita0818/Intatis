@@ -23,6 +23,31 @@ final class ThreadScrollCoordinatorTests: XCTestCase {
             IntatisThreadBottomAnchorID(scope: codeB))
     }
 
+    func testBottomVisibilityDoesNotUseGeometryPreferences() throws {
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let surfaces = try String(
+            contentsOf: packageRoot
+                .appendingPathComponent("Sources/ThreadSurfaces.swift"),
+            encoding: .utf8)
+        XCTAssertFalse(
+            surfaces.contains("IntatisThreadViewportFramesPreferenceKey"))
+
+        for filename in ["CodeViews.swift", "CoworkViews.swift"] {
+            let source = try String(
+                contentsOf: packageRoot
+                    .appendingPathComponent("Sources")
+                    .appendingPathComponent(filename),
+                encoding: .utf8)
+            XCTAssertTrue(
+                source.contains(".onScrollVisibilityChange(threshold: 0.99)"),
+                filename)
+            XCTAssertFalse(source.contains("onPreferenceChange("), filename)
+            XCTAssertFalse(source.contains("frame(in: .global)"), filename)
+        }
+    }
+
     func testScopeChangeCancelsPendingRequest() async {
         let coordinator = IntatisThreadScrollCoordinator()
         var executed: [IntatisThreadScrollRequest] = []
@@ -679,9 +704,22 @@ final class ThreadScrollCoordinatorTests: XCTestCase {
             XCTAssertTrue(
                 transcript.contains("IntatisThreadHistoryPager("),
                 sourceURL.lastPathComponent)
-            XCTAssertTrue(
-                transcript.contains("ForEach(historyWindow.items)"),
-                sourceURL.lastPathComponent)
+            if sourceURL.lastPathComponent == "CoworkViews.swift" {
+                XCTAssertTrue(
+                    transcript.contains(
+                        "Array(historyWindow.items.enumerated())"),
+                    sourceURL.lastPathComponent)
+                XCTAssertTrue(
+                    transcript.contains("id: \\.offset"),
+                    sourceURL.lastPathComponent)
+                XCTAssertFalse(
+                    transcript.contains(".id(item.id)"),
+                    sourceURL.lastPathComponent)
+            } else {
+                XCTAssertTrue(
+                    transcript.contains("ForEach(historyWindow.items)"),
+                    sourceURL.lastPathComponent)
+            }
             XCTAssertFalse(
                 transcript.contains("IntatisAdaptiveThreadStack("),
                 sourceURL.lastPathComponent)

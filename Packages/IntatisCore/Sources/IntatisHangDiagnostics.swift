@@ -338,6 +338,18 @@ public enum IntatisDiagnosticCounter: String, Codable, CaseIterable, Sendable {
     case scrollStale
     case mainThreadWarnings
     case mainThreadIncidents
+    case coworkAgentSwitchRequested
+    case coworkAgentSwitchCommitted
+    case coworkAgentSwitchStale
+    case coworkAgentPageQueries
+    case coworkAgentPageRows
+    case coworkAgentThreadPublications
+}
+
+public enum IntatisCoworkAgentSwitchDiagnosticOutcome: Int, Codable, Sendable {
+    case requested = 1
+    case committed = 2
+    case stale = 3
 }
 
 public struct IntatisDiagnosticMetricsSnapshot: Codable, Equatable, Sendable {
@@ -833,6 +845,59 @@ public final class IntatisPerformanceDiagnostics: @unchecked Sendable {
         signposter.emitEvent(
             "ScrollRequest",
             "reason=\(reason.rawValue, privacy: .public) outcome=\(outcome.rawValue, privacy: .public) pending=\(pendingCount, privacy: .public)")
+        #endif
+    }
+
+    /// Low-cardinality Cowork agent-thread diagnostics. Agent IDs and message
+    /// contents are intentionally excluded; Instruments receives only timing,
+    /// row-count, generation, and outcome fields.
+    public func recordCoworkAgentSwitch(
+        outcome: IntatisCoworkAgentSwitchDiagnosticOutcome,
+        durationNanoseconds: UInt64 = 0,
+        generation: UInt64 = 0,
+        rowCount: Int = 0
+    ) {
+        switch outcome {
+        case .requested:
+            increment(.coworkAgentSwitchRequested)
+        case .committed:
+            increment(.coworkAgentSwitchCommitted)
+            increment(.coworkAgentThreadPublications)
+        case .stale:
+            increment(.coworkAgentSwitchStale)
+        }
+        #if canImport(os)
+        guard signposter.isEnabled else { return }
+        signposter.emitEvent(
+            "CoworkAgentSwitch",
+            "outcome=\(outcome.rawValue, privacy: .public) duration_ns=\(durationNanoseconds, privacy: .public) generation=\(generation, privacy: .public) rows=\(rowCount, privacy: .public)")
+        #endif
+    }
+
+    public func recordCoworkAgentPageQuery(
+        durationNanoseconds: UInt64,
+        rowCount: Int,
+        totalCount: Int
+    ) {
+        increment(.coworkAgentPageQueries)
+        increment(
+            .coworkAgentPageRows,
+            by: UInt64(max(0, rowCount)))
+        #if canImport(os)
+        guard signposter.isEnabled else { return }
+        signposter.emitEvent(
+            "CoworkAgentPageQuery",
+            "duration_ns=\(durationNanoseconds, privacy: .public) rows=\(rowCount, privacy: .public) total=\(totalCount, privacy: .public)")
+        #endif
+    }
+
+    public func recordCoworkAgentThreadPublication(rowCount: Int) {
+        increment(.coworkAgentThreadPublications)
+        #if canImport(os)
+        guard signposter.isEnabled else { return }
+        signposter.emitEvent(
+            "CoworkAgentThreadPublication",
+            "rows=\(rowCount, privacy: .public)")
         #endif
     }
 

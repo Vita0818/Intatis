@@ -6,6 +6,14 @@
         {
           "fill-specializations" : [
             {
+              "value" : {
+                "linear-gradient" : [
+                  "display-p3:0.00000,0.00000,0.00000,1.00000",
+                  "display-p3:0.39898,0.40356,0.40356,1.00000"
+                ]
+              }
+            },
+            {
               "appearance" : "dark",
               "value" : "system-light"
             }
@@ -13,7 +21,7 @@
           "image-name" : "pointer.arrow.ipad.png",
           "name" : "pointer.arrow.ipad",
           "position" : {
-            "scale" : 0.8,
+            "scale" : 0.77,
             "translation-in-points" : [
               47.796875,
               7.600000000000023

@@ -1,7 +1,7 @@
 # DO_NOT_BREAK
 
 文档状态：当前回归禁区
-最近核对：2026-08-03
+最近核对：2026-08-04
 产品基线：v0.32（build 32）
 
 ## macOS 分发不变量
@@ -235,6 +235,53 @@
 - runtime 删除必须先取得 exact-key removal fence，并在 fence 内复核 busy、drain exact runtime、完成 session storage delete 或明确 abort、撤销 exact observation，最后才向所有窗口发布 removal；异步删除未完成时其他窗口不得 reopen/register 同 key，`.removing` 也不得被 activity 覆盖。删除仍不得影响其他 session 或工作区文件。
 - Chat 历史恢复必须从 strict snapshot 一次折叠并一次发布，再增量发布 live 事件；不得从历史起点把每个 delta 重新喂给 SwiftUI。subscriber 必须先于 strict catch-up 注册，snapshot/catch-up/live 按 seq 去重；任一 strict read 失败都必须在历史/live publication 前 fail closed 并允许显式 reentry 重试。stop/shutdown/restart 后 stale fold 不得发布。该规则不改变 EventLog raw truth、实时 streaming 或旧日志解码。
 
+## 2026-08-03 Cowork Agent 对话切换不变量
+
+- 新窗口和 session 默认查看 durable `@main`。ordinary agent 可切换查看；
+  `@permission-reviewer`、GoalVerifier 或其他保留控制面 identity 只能显示状态，不得成为普通
+  conversation selection、send、delegate、message 或 ask target。查看选择不得改变 composer
+  默认 `@main` 路由、runtime、scheduler、mailbox、Goal、lease、权限或 agent status。
+- 不得在点击时对完整 `CodeProjection.items` 做 `filter`/`contains`/排序/重放，也不得把完整
+  Cowork item array 复制发布到 MainActor。fold 时必须增量维护 typed agent index，窗口查询
+  最多 16-row page；非选中 agent publication 只能更新其 latest-only channel，不能刷新当前
+  transcript。
+- 归因只可信 typed payload 和 durable correlation。缺失 target 的 legacy user/model/tool/patch
+  row 只能回退 durable main；tool result 继承 exact call，submission error 继承 exact submission。
+  A2A/information/delegation/task row 可属于双方索引，但 canonical row 不得复制两份。不得从
+  title/body、`@mention` 字符串、展示文案或当前选中 agent 反推归属。
+- selected agent、每-agent paging boundary 和 request generation 必须 window-local。A→B→C
+  race、session replacement、disappear、page change 或新一代请求都必须取消/拒绝 stale
+  load/update；多个窗口可以查看不同 agent，互不覆盖。ordinary agent detach 不是 identity 删除：
+  当前窗口必须继续停留在该 historical agent 并保留其 bounded page，不得自动回退 `@main`。
+- Agents 列表必须来自 EventLog-derived historical identity roster，并在同一列表保留所有曾 durable
+  attach/spawn 的 agent；不得过滤 `detached` / `removed` / `cleaned`。既有状态图标显示 detached
+  lifecycle，ordinary historical agent 仍 conversation-selectable，控制面仍 status-only。发送、
+  委派、message/ask、rebind/remove、settings 与 workspace/capability 引用必须只认 live roster，
+  不得因为历史项仍可点击而恢复其运行时权限。大量历史项必须使用 stable ID lazy list；构建
+  presentation 不得对每个 agent 重扫全部 task、workspace lease 或 capability lease。列表顺序必须
+  使用 identity 第一次 durable admission 的稳定创建顺序；status、消息、detach/reattach 不得让行在
+  用户点击期间跳位，也不得为了排序扫描 transcript。
+- Cowork transcript 必须复用一个 ScrollView 根和最多 16 个稳定 row slot。不得恢复
+  `.id(pageScope)` root replacement 或按 message ID 在每次 agent 切换时重建整页 AppKit selection
+  subtree。agent/page/selected-agent delta 到达时 rich admission 必须先暂停；同一精确状态连续
+  静止 300 ms 后才可恢复，持续 streaming 使用 raw projection。raw/rich 切换不得改变内容字节、
+  canonical item、分页总数或 EventLog。
+- Cowork agent/page/content 切换不得改变横向几何。wide rail 必须继续由 stable outer width
+  唯一决定，visible width 固定 348pt、glass section 固定 318pt，并单独保留 10pt primary-scroller
+  clearance；selected agent、消息数量/长度、空态、rich/raw admission 和 scrollbar 可见性不得
+  参与宽度计算。thread 必须先固定 content/raw frame 再扩展到 overlay 下方，不能因换 Agent 替换
+  ScrollView 根、重新协商 composer/header 宽度或让中栏左右边界跳动。exact outer-detail canvas
+  必须直接拥有 leading thread 与 trailing rail；禁止把 rail overlay 重新挂到 `threadColumn` 或任何
+  transcript/content intrinsic-size 宿主上。selected-agent ID 不得进入会使整条 rail 失效的 render
+  snapshot；只允许独立更新选中行蓝底与 accessibility value。passive glass backdrop 必须是与行内容
+  更新隔离的稳定 identity，independent status cards 不得放进会自动融合/重组 shape 的
+  `GlassEffectContainer`，inspector/selection 状态变化不得带入隐式 layout animation。不得使用
+  screen-global origin、窗口位置补偿或 backing-pixel translation 改动 rail 位置。
+  bottom-anchor 恢复必须使用系统 scroll visibility observation；不得恢复 GeometryReader + global/named
+  frame + `PreferenceKey` 的布局回写链。
+- 性能诊断只能记录 duration/count/generation/rowCount/totalCount 等 content-free 数值；不得写入
+  agent 名称、message body、tool args/result、workspace、endpoint、credential 或完整响应。
+
 ## 2026-07-23 UI / history 不变量
 
 - recent sessions 必须按 durable `turn_outcome` 时间倒序排列；不得使用点击/选择顺序、Cowork reconciliation-only submission terminal 或 `events.jsonl` mtime。打开、replay、rename、migration、recovery、settings/lease append 均不得提升排序；运行中 turn 在 terminal 落盘前不得提前提升；相同时间必须 deterministic。mtime 只可参与缓存失效。
@@ -250,7 +297,7 @@
 - 未经用户明文要求具体 Git 操作，不 add、不 commit、不 push、不创建 PR；编辑、整理、修复、验证或准备工作都不等于提交请求。
 - 若用户要求提交，只提交当前 Git root 中与本任务相关的文件；不得递归进入、暂存、提交或推送子仓库、submodule、nested Git repo 或依赖 checkout。
 - 不引入或升级第三方依赖，不改构建脚本，不改测试源码，除非任务明确要求。当前对话渲染依赖/资源已按精确版本与 hash 锁定；任何变更均须重做许可证、传递依赖、资源范围、安全与 NOTICE 审查。计划中的 SwiftGit2/libgit2 仍须先过许可证审查。
-- 系统原生表面与 Liquid Glass 是当前视觉基线：不得把浅色 / 深色写死为 `.white` / `.black`、固定 RGB、Hex 或取色器采样值。macOS detail 使用动态 window surface，sidebar 交给 `NavigationSplitView`；正常 assistant/agent 及媒介化 Agent 通信正文直接继承系统 canvas，用户消息、失败回复与其他结构化内容卡片使用系统 Material；Liquid Glass 主要用于导航与交互功能层，用户明确指定的 Cowork 紧凑 trailing status rail 是唯一内容层例外，并且也必须使用原生 `GlassEffectContainer` / `glassEffect`。Apple deployment target 已是 macOS 26 / iOS 26，旧系统 fallback 不属于当前验收面。不得自行模拟玻璃，也不得把 glass 铺成页面或长内容背景。修改配色语义、材质、明暗模式或跨平台映射时必须同步更新 `docs/CURRENT_UI_COLOR_SYSTEM.md` 并复验 macOS/iOS；`docs/UI_COLOR_SYSTEM.md` 是上一版配色的历史底稿，不得被当前方案覆盖。
+- 系统原生表面与 Liquid Glass 是当前视觉基线：不得把浅色 / 深色写死为 `.white` / `.black`、固定 RGB、Hex 或取色器采样值。macOS detail 使用动态 window surface，sidebar 交给 `NavigationSplitView`；正常 assistant/agent 及媒介化 Agent 通信正文直接继承系统 canvas，用户消息、失败回复与其他结构化内容卡片使用系统 Material；Liquid Glass 主要用于导航与交互功能层，用户明确指定的 Cowork 紧凑 trailing status rail 是唯一内容层例外，并且必须使用原生 `glassEffect`。`GlassEffectContainer` 只用于确实需要融合/形变的交互 cluster，不得包裹彼此独立且位置必须稳定的 status cards。Apple deployment target 已是 macOS 26 / iOS 26，旧系统 fallback 不属于当前验收面。不得自行模拟玻璃，也不得把 glass 铺成页面或长内容背景。修改配色语义、材质、明暗模式或跨平台映射时必须同步更新 `docs/CURRENT_UI_COLOR_SYSTEM.md` 并复验 macOS/iOS；`docs/UI_COLOR_SYSTEM.md` 是上一版配色的历史底稿，不得被当前方案覆盖。
 - 不绕过 3 层权限门、`PathConfinement`、`SecretScanner`、`Mediator` 秘密拦截或配置文件凭据隔离。
 - 不把 CapabilityLease/WorkspaceLease 当成某次调用的 effect，也不再用 `SideEffect.write/readOnly` 代替结构化 `PermissionIntent`。agent/task/message/workspace admission 属于控制面动作；实际文件、网络、exec、destructive effect 由具体工具调用决定。`spawn_agent` 默认 read-only，显式 `requestedAccess=read_write` 与 `canCoordinate` 必须独立授权且不能超过 issuer lease；一个外部 spawn ToolCall 只能有一次审批，内部 atomic admission 不得二次进入 PermissionEngine，child 后续数据面调用仍须逐次审批。
 
@@ -464,8 +511,8 @@
 - 根 `Intatis.icon` 是 `IntatisMac` 与 `IntatisiOS` 的 canonical Apple 图标源；两个
   shipping target 都必须以 `ASSETCATALOG_COMPILER_APPICON_NAME=Intatis` 编译它，
   不得手工导出另一套 iOS PNG 或让遗留 `IntatisMacAppStore` 成为图标事实源。
-- macOS UI 信息架构不得回退为三套 demo screen：mode navigation、mode-specific session history、New 与 Settings 必须保持在同一个连贯 sidebar navigation/session center 中；当前实现是系统 `NavigationSplitView` sidebar 内的 `Intatis` 标题、带 SF Symbol 的 Chat/Code/Cowork 竖向三行导航（仅选中项使用 interactive Liquid Glass）、mode-specific history/New 与底部 Settings。不得把模式导航改回横向 segmented control、单一 `List(selection:)` 或三套独立入口，也不得把 session/history 移回主内容工具栏。主 thread header 必须显示 session durable display name（仅缺失时回退 `SessionID`），不得写死 Chat/Code/Cowork；Code/Cowork header 保持紧凑顶部留白，Cowork 不得在标题之前恢复常驻 permission-reviewer 横幅。composer 第一排必须是 model/profile 左、Context/Input/Cached/Output/Time usage 右；Chat/Code/Cowork 的选择器必须保持同一个 40pt 高、原生 `Menu` 语义的 interactive Liquid Glass 胶囊，不得让 `Menu` 自带的压缩 chrome 把可见控件降回 24pt；关闭态只能显示选中模型名，不得恢复 CPU/芯片图标、provider 前缀或 variant/reasoning detail，弹出菜单内部的 provider 分组与 exact variant 选择仍需保留。第二排必须是当前产品面已经具备的 attachment/image action 左、原生多行输入居中、可选 Cowork stop 与 Send 右；attachment/image action/stop/Send 必须复用同一 40×40 原生圆形 glass/bordered control，输入容器单行最小高度必须同为 40，同行 spacing 使用共享 token，多行输入增长时按钮保持底边对齐，Send 使用 prominent。sidebar `Recent` 旁 `+` 必须保持原生小型圆形 glass control 与 30×30 fitting size；不得因布局调整给 Chat/Code 新增附件能力。没有 top accessories 的共享 iOS composer 不得产生空白行。消息不得重新添加 agent 头像或通用 Agent badge；agent 名称与状态只显示真实 structured identity/status。正常完成的 assistant/agent 回复（包括通用 Agent message、`information_requested` 与 `information_replied`）不得恢复外层 Material、圆角或描边，应直接继承系统 canvas；Agent 通信身份必须显示 exact `sender->recipient`，不得添加 `info` / `reply` 前缀。用户消息、失败/中断回复和 tool/error/permission/task 等结构化卡片继续保留容器，不得为实现“白底”硬编码 `Color.white`。Chat 默认不显示右 inspector；Code/Cowork 宽屏 status rail 只能消费 structured projections/view-model state，不能解析 assistant transcript；显隐必须由同一个稳定 outer geometry 的未压缩 available width 与用户请求状态决定，禁止用已经压缩后的 child/thread width 反推自身显隐。Code 保留有界分栏；Cowork rail 必须作为同一 detail canvas 的 trailing overlay，不得用 divider 或独立 `.bar` 背景切成另一块面板，主 thread `ScrollView` 必须延伸至 detail 最右端并只用 trailing scroll-content margin 给 rail 留出正文空间，使原生滚动条位于整个内容区最右侧。Code/Cowork 不得在 mode/session 切换时动态增删 window `.toolbar` item，也不得重新嵌套 SwiftUI `.inspector` preference；相关 MCP、Project 与 inspector toggle 只进入内容 header。
-- Cowork 宽屏右栏必须把 pending permission 或最近权限结果放在第一位，其后才是未清理 agent 名字+状态图标、真实 `Goal` card 与 `Tasks` card；这些 section 统一使用原生 `GlassEffectContainer` / `glassEffect`，不得恢复廉价固定灰框或手绘玻璃。rail 只能由各 glass section 自身建立边界，外层不得再加 separator、整栏 Material 或 `.bar` 背板。Cowork 右栏不得显示 Git 状态、workspace path 或任何 Git 控件；本地 Git control 仍只能通过 Agent 工具 + 权限门执行。pending permission 在 rail 可安全容纳时必须临时固定右栏，人工模式保留 exact RequestID/FIFO、Approve Call、Decline Call、Cancel Turn 与 remembered MCP approval 语义，automatic 模式保持不可人工操作；窗口窄到无法容纳 rail 时只在 composer 上方显示一个同请求权限兜底卡，不能与 rail 重复。无 pending 时用户仍可隐藏右栏；任何窄屏或隐藏状态都不得在 thread 顶部复制 Goal/Tasks dock或保留空白占位。不得重新以 TaskContract objective 伪造 Goals 表，也不得塞入 project summary、选中 agent 详情、workspace/lease 列表或 Last Turn。Goal card actions 与 Tasks detail 必须绑定 durable state。
+- macOS UI 信息架构不得回退为三套 demo screen：mode navigation、mode-specific session history、New 与 Settings 必须保持在同一个连贯 sidebar navigation/session center 中；当前实现是系统 `NavigationSplitView` sidebar 内的 `Intatis` 标题、带 SF Symbol 的 Chat/Code/Cowork 竖向三行导航（仅选中项使用 interactive Liquid Glass）、mode-specific history/New 与底部 Settings。不得把模式导航改回横向 segmented control、单一 `List(selection:)` 或三套独立入口，也不得把 session/history 移回主内容工具栏。主 thread header 必须显示 session durable display name（仅缺失时回退 `SessionID`），不得写死 Chat/Code/Cowork；Code/Cowork header 保持紧凑顶部留白，Cowork 不得在标题之前恢复常驻 permission-reviewer 横幅。composer 第一排必须是 model/profile 左、Context/Input/Cached/Output/Time usage 右；Chat/Code/Cowork 的选择器必须保持同一个 40pt 高、原生 `Menu` 语义的 interactive Liquid Glass 胶囊，不得让 `Menu` 自带的压缩 chrome 把可见控件降回 24pt；关闭态只能显示选中模型名，不得恢复 CPU/芯片图标、provider 前缀或 variant/reasoning detail，弹出菜单内部的 provider 分组与 exact variant 选择仍需保留。第二排必须是当前产品面已经具备的 attachment/image action 左、原生多行输入居中、可选 Cowork stop 与 Send 右；attachment/image action/stop/Send 必须复用同一 40×40 原生圆形 glass/bordered control，输入容器单行最小高度必须同为 40，同行 spacing 使用共享 token，多行输入增长时按钮保持底边对齐，Send 使用 prominent。sidebar `Recent` 旁 `+` 必须保持原生小型圆形 glass control 与 30×30 fitting size；不得因布局调整给 Chat/Code 新增附件能力。没有 top accessories 的共享 iOS composer 不得产生空白行。消息不得重新添加 agent 头像或通用 Agent badge；agent 名称与状态只显示真实 structured identity/status。正常完成的 assistant/agent 回复（包括通用 Agent message、`information_requested` 与 `information_replied`）不得恢复外层 Material、圆角或描边，应直接继承系统 canvas；Agent 通信身份必须显示 exact `sender->recipient`，不得添加 `info` / `reply` 前缀。用户消息、失败/中断回复和 tool/error/permission/task 等结构化卡片继续保留容器，不得为实现“白底”硬编码 `Color.white`。Chat 默认不显示右 inspector；Code/Cowork 宽屏 status rail 只能消费 structured projections/view-model state，不能解析 assistant transcript；显隐必须由同一个稳定 outer geometry 的未压缩 available width 与用户请求状态决定，禁止用已经压缩后的 child/thread width 反推自身显隐。Code 保留有界分栏；Cowork rail 必须作为同一 detail canvas 的 trailing overlay，不得用 divider 或独立 `.bar` 背景切成另一块面板，主 thread `ScrollView` 必须延伸至 detail 最右端并只用 trailing scroll-content margin 给 rail 留出正文空间，使原生滚动条位于整个内容区最右侧。Code/Cowork 不得在 mode/session 切换时动态增删 window `.toolbar` item，也不得重新嵌套 SwiftUI `.inspector` preference。Code 的 MCP/inspector action 与 Cowork 的 Project action 仍只能进入内容 header；Cowork header 不得恢复独立 MCP Content 快捷按钮，内容浏览必须位于 `Project Settings → MCP → Browse Content`，status rail toggle 必须保持系统 compact 圆形 glass/bordered icon control。
+- Cowork 宽屏右栏必须把 pending permission 或最近权限结果放在第一位，其后才是未清理 agent 名字+状态图标、真实 `Goal` card 与 `Tasks` card；每个 section 独立使用系统 `Glass.clear`，glass backdrop 必须与动态内容分层，不得恢复包住整组 status cards 的 `GlassEffectContainer`、廉价固定灰框、独立强光块或手绘玻璃。rail 只能由各 glass section 自身建立边界；允许在每个 passive glass 之外使用系统动态 separator 的单物理像素 `strokeBorder` 作为不随玻璃光线漂移的轮廓锚点，但不得使用固定 RGB、整栏 separator/Material/`.bar` 背板、自绘渐变、投影或高光伪造“融合”。Cowork 右栏不得显示 Git 状态、workspace path 或任何 Git 控件；本地 Git control 仍只能通过 Agent 工具 + 权限门执行。wide rail 的 compact permission 只能显示状态、tool、安全 structured summary 与必要 actions，不得显示 raw args、risk chip 或默认详情；人工模式仍保留 exact RequestID/FIFO、Approve Call、Decline Call、Cancel Turn 与 remembered MCP approval 语义，automatic 模式保持不可人工操作。pending permission 在 rail 可安全容纳时必须临时固定右栏；窗口窄到无法容纳 rail 时只在 composer 上方显示一个同请求完整权限兜底卡，不能与 rail 重复。无 pending 时用户仍可隐藏右栏；任何窄屏或隐藏状态都不得在 thread 顶部复制 Goal/Tasks dock或保留空白占位。不得重新以 TaskContract objective 伪造 Goals 表，也不得塞入 project summary、选中 agent 详情、workspace/lease 列表或 Last Turn。Goal card actions 与 Tasks detail 必须绑定 durable state。
 - macOS Chat/Code/Cowork 的用户消息必须继续使用 trailing 气泡、原 `messageMaxWidth` 和左侧 gutter；assistant/agent 正文与 Thinking 必须使用整个 thread `contentWidth`，不得重新套用用户气泡的宽度上限或在右侧放同等 gutter。system message 及 tool/error/permission/task 等结构化卡片继续使用各自既有宽度策略；不得用放大全局 `messageMaxWidth` 的方式实现 AI 全宽，以免连带拉宽用户气泡。本 UI pass 不得替换既有字体 token 或用户选择的字体体系。
 - 用户消息由 trailing alignment + Material surface 已充分表达归属，Chat/Code/Cowork 与共享 iOS Chat 不得重新显示冗余 `You` sender label；assistant/agent/system 的真实 structured identity 和 agent timestamp 不得一并删掉。macOS sidebar 品牌块只显示 `Intatis`，不得恢复 `Local AI workbench` 副标题；active Chat/Code/Cowork thread header 与 sidebar Recent row 均只显示 durable session name，不得在名称下恢复 model/provider/host、workspace/state、agent/running、event/date/path/runtime 等灰色 metadata，也不得用空 subtitle 保留不可见占位。selection、New、Rename/Delete、busy delete gate、空态首页和 Settings 的非 session 说明不受此视觉规则影响。待处理权限卡必须保持可操作但不主导 transcript：风险色只用于小面积 semantic indicator，详情默认折叠且通用摘要只能来自 structured authorization preview/intent/resource/touched path，不能直接渲染 raw args；manual approve/decline/cancel、automatic non-actionable、RequestID/FIFO 与 PermissionEngine 语义不得因视觉收口改变。
 - English / 简体中文本地化必须保持为 App presentation concern：`Localizable.xcstrings` 的 English source/fallback 不得被删除，两个 App target 必须同时携带 `en` 与 `zh-Hans`，语言选择继续交给系统 Preferred Languages / App Language；不得写 `AppleLanguages`、强制根 locale 或另造会与系统冲突的启动偏好。只能翻译产品外壳、按钮、状态、设置、错误和辅助说明；session/agent/provider/model identity、文件与工作区路径、用户输入、模型输出、Markdown/公式/代码、EventLog/schema/raw enum、tool payload、permission correlation 与 model-facing prompt 必须保持原文。新增格式文案必须保持 English/zh-Hans 的 `%@` / `%lld` 等占位符类型和数量一致；iOS `Settings.bundle` 与 `InfoPlist.strings` 需单独校验，不能用主 catalog 的存在替代。

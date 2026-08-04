@@ -37,6 +37,8 @@ private func intatisLocalizedRawStatus(_ status: String) -> String {
         return IntatisLocalization.string("in progress")
     case "cancelled", "canceled":
         return IntatisLocalization.string("cancelled")
+    case "detached", "removed", "cleaned":
+        return IntatisLocalization.string("detached")
     default: return status
     }
 }
@@ -66,6 +68,8 @@ private func intatisLocalizedDisplayStatus(_ status: String) -> String {
         return IntatisLocalization.string("In Progress")
     case "cancelled", "canceled":
         return IntatisLocalization.string("Cancelled")
+    case "detached", "removed", "cleaned":
+        return IntatisLocalization.string("Detached")
     default:
         let display = status
             .replacingOccurrences(of: "_", with: " ")
@@ -115,7 +119,12 @@ public struct CoworkAgentInfo: Identifiable, Equatable, Sendable {
     public let completedTasks: Int
     public let workspaceLease: String?
     public let capabilityLease: String?
+    /// Whether this historical identity is still present in the runtime's live
+    /// roster. Detached agents remain conversation-selectable but expose no
+    /// runtime mutation actions.
+    public let isAttached: Bool
     public let canRemove: Bool
+    public let isConversationSelectable: Bool
 
     /// Compatibility alias for callers compiled before inference profiles made
     /// the permission/inference distinction explicit.
@@ -138,7 +147,9 @@ public struct CoworkAgentInfo: Identifiable, Equatable, Sendable {
                 completedTasks: Int = 0,
                 workspaceLease: String? = nil,
                 capabilityLease: String? = nil,
-                canRemove: Bool = true) {
+                isAttached: Bool = true,
+                canRemove: Bool = true,
+                isConversationSelectable: Bool = true) {
         self.id = id
         self.name = name
         self.workspace = workspace
@@ -156,7 +167,9 @@ public struct CoworkAgentInfo: Identifiable, Equatable, Sendable {
         self.completedTasks = completedTasks
         self.workspaceLease = workspaceLease
         self.capabilityLease = capabilityLease
+        self.isAttached = isAttached
         self.canRemove = canRemove
+        self.isConversationSelectable = isConversationSelectable
     }
 
     /// Source-compatible initializer for the existing CoworkViewModel. New
@@ -173,7 +186,9 @@ public struct CoworkAgentInfo: Identifiable, Equatable, Sendable {
                 completedTasks: Int = 0,
                 workspaceLease: String? = nil,
                 capabilityLease: String? = nil,
-                canRemove: Bool = true) {
+                isAttached: Bool = true,
+                canRemove: Bool = true,
+                isConversationSelectable: Bool = true) {
         self.init(
             id: id,
             name: name,
@@ -187,7 +202,9 @@ public struct CoworkAgentInfo: Identifiable, Equatable, Sendable {
             completedTasks: completedTasks,
             workspaceLease: workspaceLease,
             capabilityLease: capabilityLease,
-            canRemove: canRemove)
+            isAttached: isAttached,
+            canRemove: canRemove,
+            isConversationSelectable: isConversationSelectable)
     }
 
     public var statusLine: String {
@@ -531,10 +548,95 @@ public struct CoworkStatusSummary: Equatable, Sendable {
     }
 }
 
+/// Only state rendered by the trailing status rail belongs in this snapshot.
+/// Transcript paging, loading and rich-rendering admission intentionally stay
+/// out so those high-frequency updates cannot rematerialize Liquid Glass.
+struct CoworkStatusRailRenderSnapshot: Equatable {
+    let agents: [CoworkAgentInfo]
+    let pending: PendingPermission?
+    let permissionNotice: PermissionResolutionNotice?
+    let goal: CoworkGoalCardInfo?
+    let workTasks: CoworkWorkTaskSummary
+    let colorScheme: ColorScheme
+}
+
+/// Selection is intentionally not part of the rail render snapshot. Updating
+/// it must repaint only the selected-row affordance; rebuilding the rail would
+/// make every native Glass backdrop reacquire its optical phase on each click.
+private final class CoworkStatusRailSelectionState: ObservableObject {
+    @Published private(set) var selectedAgentID: String
+
+    init(selectedAgentID: String) {
+        self.selectedAgentID = selectedAgentID
+    }
+
+    func update(_ selectedAgentID: String) {
+        guard self.selectedAgentID != selectedAgentID else { return }
+        var transaction = Transaction(animation: nil)
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            self.selectedAgentID = selectedAgentID
+        }
+    }
+}
+
+private struct CoworkAgentSelectionBackground: View {
+    @ObservedObject var selection: CoworkStatusRailSelectionState
+    let agentID: String
+    let accent: Color
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: 12, style: .continuous)
+            .fill(accent.opacity(0.16))
+            .opacity(selection.selectedAgentID == agentID ? 1 : 0)
+    }
+}
+
+private struct CoworkAgentSelectionAccessibilityModifier: ViewModifier {
+    @ObservedObject var selection: CoworkStatusRailSelectionState
+    let agentID: String
+
+    func body(content: Content) -> some View {
+        content.accessibilityValue(
+            selection.selectedAgentID == agentID
+                ? IntatisLocalization.string("Selected")
+                : IntatisLocalization.string("Not selected"))
+    }
+}
+
+/// SwiftUI otherwise walks the rail again whenever its transcript sibling
+/// publishes an empty/loading/loaded/rich state. This boundary keeps the
+/// existing rail subtree mounted until an actual rail input changes.
+private struct CoworkStatusRailRenderBoundary<Content: View>: View, Equatable {
+    let snapshot: CoworkStatusRailRenderSnapshot
+    let content: () -> Content
+
+    init(
+        snapshot: CoworkStatusRailRenderSnapshot,
+        @ViewBuilder content: @escaping () -> Content
+    ) {
+        self.snapshot = snapshot
+        self.content = content
+    }
+
+    static func == (
+        lhs: CoworkStatusRailRenderBoundary<Content>,
+        rhs: CoworkStatusRailRenderBoundary<Content>
+    ) -> Bool {
+        lhs.snapshot == rhs.snapshot
+    }
+
+    var body: some View {
+        content()
+    }
+}
+
 /// Presentational Cowork project thread: the user gives work to Main, while
 /// the roster/inspector exposes the sub-agent activity Main schedules.
 public struct CoworkShell: View {
-    private let displayedItems: [CodeItem]
+    @Environment(\.colorScheme) private var colorScheme
+
+    private let threadPage: CoworkAgentThreadPage
     private let presentationScope: IntatisThreadPresentationScope
     private let sessionTitle: String
     private let thinkingPhaseID: String
@@ -569,13 +671,20 @@ public struct CoworkShell: View {
     private let onResumeGoal: (() -> Void)?
     private let onEditGoal: (() -> Void)?
     private let onClearGoal: (() -> Void)?
-    @State private var selectedAgentID: String?
+    private let selectedAgentID: String
+    private let isThreadPageLoading: Bool
+    private let isRichRenderingEligible: Bool
+    private let onSelectAgent: (String) -> Void
+    private let onShowEarlier: () -> Void
+    private let onShowNewer: () -> Void
+    private let onShowLatest: () -> Void
     @State private var inspectorTab: CoworkInspectorTab = .agents
     @Binding private var showsInspector: Bool
     @StateObject private var scrollCoordinator = IntatisThreadScrollCoordinator()
-    @State private var historySelection: IntatisThreadHistorySelection?
+    @StateObject private var statusRailSelection:
+        CoworkStatusRailSelectionState
 
-    public init(items: [CodeItem],
+    public init(threadPage: CoworkAgentThreadPage,
                 presentationScope: IntatisThreadPresentationScope,
                 sessionTitle: String = IntatisLocalization.string("Cowork"),
                 thinkingScopeID: String = "cowork",
@@ -611,11 +720,18 @@ public struct CoworkShell: View {
                 onPauseGoal: (() -> Void)? = nil,
                 onResumeGoal: (() -> Void)? = nil,
                 onEditGoal: (() -> Void)? = nil,
-                onClearGoal: (() -> Void)? = nil) {
-        self.displayedItems = IntatisExecutionTracePresentation.displayedItems(items)
+                onClearGoal: (() -> Void)? = nil,
+                selectedAgentID: String,
+                isThreadPageLoading: Bool = false,
+                isRichRenderingEligible: Bool = true,
+                onSelectAgent: @escaping (String) -> Void,
+                onShowEarlier: @escaping () -> Void,
+                onShowNewer: @escaping () -> Void,
+                onShowLatest: @escaping () -> Void) {
+        self.threadPage = threadPage
         self.presentationScope = presentationScope
         self.sessionTitle = sessionTitle
-        self.thinkingPhaseID = "\(thinkingScopeID):\(items.last?.id ?? "initial")"
+        self.thinkingPhaseID = "\(thinkingScopeID):\(selectedAgentID):\(threadPage.items.last?.id ?? "initial")"
         self.agents = agents
         self.pending = pending
         self.permissionNotice = permissionNotice
@@ -648,6 +764,16 @@ public struct CoworkShell: View {
         self.onResumeGoal = onResumeGoal
         self.onEditGoal = onEditGoal
         self.onClearGoal = onClearGoal
+        self.selectedAgentID = selectedAgentID
+        self.isThreadPageLoading = isThreadPageLoading
+        self.isRichRenderingEligible = isRichRenderingEligible
+        self.onSelectAgent = onSelectAgent
+        self.onShowEarlier = onShowEarlier
+        self.onShowNewer = onShowNewer
+        self.onShowLatest = onShowLatest
+        self._statusRailSelection = StateObject(
+            wrappedValue: CoworkStatusRailSelectionState(
+                selectedAgentID: selectedAgentID))
         _ = splitLayout
     }
 
@@ -661,62 +787,96 @@ public struct CoworkShell: View {
     }
 
     private var selectedAgent: CoworkAgentInfo? {
-        guard let selectedAgentID else { return agents.first }
-        return agents.first { $0.id == selectedAgentID } ?? agents.first
+        agents.first { $0.id == selectedAgentID }
+    }
+
+    private var inspectorRenderSnapshot: CoworkStatusRailRenderSnapshot {
+        CoworkStatusRailRenderSnapshot(
+            agents: agents,
+            pending: pending,
+            permissionNotice: permissionNotice,
+            goal: goal,
+            workTasks: workTasks,
+            colorScheme: colorScheme)
     }
 
     public var body: some View {
         GeometryReader { proxy in
-            content(rawWidth: proxy.size.width)
+            content(outerSize: proxy.size)
+        }
+        .onChange(of: selectedAgentID, initial: true) { _, nextSelection in
+            statusRailSelection.update(nextSelection)
         }
     }
 
-    private func content(rawWidth: CGFloat) -> some View {
+    private func content(outerSize: CGSize) -> some View {
+        let rawWidth = outerSize.width.isFinite
+            ? max(outerSize.width, 1)
+            : 1
+        let rawHeight = outerSize.height.isFinite
+            ? max(outerSize.height, 1)
+            : 1
         let inspectorIsPinnedForPermission = pending != nil
-        let inspectorLayout = IntatisWorkspaceInspectorLayoutPolicy.resolve(
+        let inspectorLayout = IntatisCoworkStatusRailLayoutPolicy.resolve(
             availableWidth: rawWidth,
-            isRequested: showsInspector || inspectorIsPinnedForPermission,
-            activationWidth: 980,
-            minimumThreadWidth: 620,
-            minimumInspectorWidth: 286,
-            idealInspectorWidth: 318,
-            maximumInspectorWidth: 390,
-            dividerWidth: 0)
+            isRequested: showsInspector || inspectorIsPinnedForPermission)
         let trailingStatusRailWidth = inspectorLayout.isVisible
             ? inspectorLayout.inspectorWidth
             : 0
         let primaryScrollerClearance: CGFloat = inspectorLayout.isVisible
-            ? 10
+            ? IntatisCoworkStatusRailLayoutPolicy.scrollerClearance
             : 0
 
-        return ZStack(alignment: .trailing) {
-            threadColumn(
-                layout: IntatisThreadContentLayout(
-                    rawWidth: inspectorLayout.threadWidth),
-                showsCompactActions: !inspectorLayout.isVisible,
-                inspectorIsAvailable: rawWidth >= 980,
-                inspectorIsVisible: inspectorLayout.isVisible,
-                showsPermissionFallback: pending != nil
-                    && !inspectorLayout.isVisible,
-                trailingStatusRailWidth: trailingStatusRailWidth)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            if inspectorLayout.isVisible {
-                HStack(spacing: 0) {
-                    inspectorColumn
-                        .frame(width: max(
-                            inspectorLayout.inspectorWidth
-                                - primaryScrollerClearance,
-                            1))
-                        .frame(maxHeight: .infinity)
-                    Color.clear
-                        .frame(width: primaryScrollerClearance)
-                        .allowsHitTesting(false)
-                }
-                .frame(width: inspectorLayout.inspectorWidth)
-                .frame(maxHeight: .infinity)
-                .accessibilityIdentifier("cowork.inspector")
+        // This exact outer canvas, not the transcript's intrinsic size, owns
+        // both placements. The thread can change content, scroller state and
+        // rendering mode without ever becoming the rail's alignment guide.
+        return Color.clear
+            .frame(width: rawWidth, height: rawHeight)
+            .overlay(alignment: .leading) {
+                threadColumn(
+                    layout: IntatisThreadContentLayout(
+                        rawWidth: inspectorLayout.threadWidth),
+                    showsCompactActions: !inspectorLayout.isVisible,
+                    inspectorIsAvailable: rawWidth
+                        >= IntatisCoworkStatusRailLayoutPolicy.activationWidth,
+                    inspectorIsVisible: inspectorLayout.isVisible,
+                    showsPermissionFallback: pending != nil
+                        && !inspectorLayout.isVisible,
+                    trailingStatusRailWidth: trailingStatusRailWidth)
+                    .frame(
+                        width: rawWidth,
+                        height: rawHeight,
+                        alignment: .topLeading)
             }
-        }
+            .overlay(alignment: .trailing) {
+                if inspectorLayout.isVisible {
+                    HStack(spacing: 0) {
+                        CoworkStatusRailRenderBoundary(
+                            snapshot: inspectorRenderSnapshot
+                        ) {
+                            inspectorColumn
+                        }
+                        .equatable()
+                            .frame(width: max(
+                                inspectorLayout.inspectorWidth
+                                    - primaryScrollerClearance,
+                                1))
+                            .frame(maxHeight: .infinity)
+                        Color.clear
+                            .frame(width: primaryScrollerClearance)
+                            .allowsHitTesting(false)
+                    }
+                    .frame(
+                        width: inspectorLayout.inspectorWidth,
+                        height: rawHeight,
+                        alignment: .top)
+                    .transaction { transaction in
+                        transaction.animation = nil
+                        transaction.disablesAnimations = true
+                    }
+                    .accessibilityIdentifier("cowork.inspector")
+                }
+            }
     }
 
     private func threadColumn(layout: IntatisThreadContentLayout,
@@ -803,6 +963,7 @@ public struct CoworkShell: View {
             systemImage: permissionPinsInspector ? "lock.shield" : "sidebar.right",
             isDisabled: !inspectorIsAvailable || permissionPinsInspector,
             isIconOnly: true,
+            presentation: .compactSystemIcon,
             help: inspectorTitle,
             accessibilityIdentifier: "cowork.inspector.toggle") {
                 guard inspectorIsAvailable else { return }
@@ -813,21 +974,32 @@ public struct CoworkShell: View {
 
     private var inspectorColumn: some View {
         ScrollView {
-            IntatisGlassEffectGroup(spacing: 18) {
-                VStack(alignment: .leading, spacing: 16) {
-                    if pending != nil || permissionNotice != nil {
-                        permissionStatusSection
-                    }
-                    agentStatusSection
-                    if goal != nil {
-                        goalCardSection
-                    }
-                    if !workTasks.tasks.isEmpty {
-                        workTasksSection
-                    }
+            // These are independent status surfaces, not a morphing control
+            // cluster. Keeping them outside GlassEffectContainer prevents
+            // focus or selection updates from optically regrouping the cards.
+            VStack(
+                alignment: .leading,
+                spacing: IntatisCoworkStatusRailLayoutPolicy.cardSpacing
+            ) {
+                if pending != nil || permissionNotice != nil {
+                    permissionStatusSection
+                }
+                agentStatusSection
+                if goal != nil {
+                    goalCardSection
+                }
+                if !workTasks.tasks.isEmpty {
+                    workTasksSection
                 }
             }
-            .padding(18)
+            .frame(width: IntatisCoworkStatusRailLayoutPolicy.cardWidth)
+            .padding(
+                .leading,
+                IntatisCoworkStatusRailLayoutPolicy.leadingInset)
+            .padding(
+                .trailing,
+                IntatisCoworkStatusRailLayoutPolicy.trailingInset)
+            .padding(.vertical, 16)
         }
         .scrollIndicators(.hidden)
     }
@@ -837,16 +1009,22 @@ public struct CoworkShell: View {
             PermissionCard(
                 permission: pending,
                 embedsSurface: false,
+                presentationStyle: .compactRail,
                 onResolve: onResolve)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .intatisLiquidGlass(cornerRadius: 18)
+                .frame(
+                    width: IntatisCoworkStatusRailLayoutPolicy.cardWidth,
+                    alignment: .leading)
+                .intatisClearLiquidGlass(cornerRadius: 22)
                 .accessibilityIdentifier("cowork.permission.review")
         } else if let permissionNotice {
             PermissionResolutionNoticeView(
                 notice: permissionNotice,
-                embedsSurface: false)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .intatisLiquidGlass(cornerRadius: 18)
+                embedsSurface: false,
+                presentationStyle: .compactRail)
+                .frame(
+                    width: IntatisCoworkStatusRailLayoutPolicy.cardWidth,
+                    alignment: .leading)
+                .intatisClearLiquidGlass(cornerRadius: 22)
                 .accessibilityIdentifier("cowork.permission.review")
         }
     }
@@ -858,34 +1036,60 @@ public struct CoworkShell: View {
     }
 
     @ViewBuilder private var agentStatusList: some View {
-        if visibleAgents.isEmpty {
-            Text("No active agents")
+        if agents.isEmpty {
+            Text("No agents in this session")
                 .font(.caption)
                 .foregroundStyle(threadStyle.tertiaryText)
         } else {
-            VStack(alignment: .leading, spacing: 9) {
-                ForEach(visibleAgents) { agent in
+            LazyVStack(alignment: .leading, spacing: 5) {
+                ForEach(agents) { agent in
                     agentStatusRow(agent)
                 }
             }
         }
     }
 
+    @ViewBuilder
     private func agentStatusRow(_ agent: CoworkAgentInfo) -> some View {
-        HStack(alignment: .top, spacing: 8) {
+        if agent.isConversationSelectable {
+            Button {
+                onSelectAgent(agent.id)
+            } label: {
+                agentStatusRowContent(agent)
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier(
+                "cowork.agent.\(agent.id).conversation")
+            .accessibilityLabel(
+                IntatisLocalization.format(
+                    "View @%@ conversation",
+                    agent.name))
+            .modifier(CoworkAgentSelectionAccessibilityModifier(
+                selection: statusRailSelection,
+                agentID: agent.id))
+        } else {
+            agentStatusRowContent(agent)
+                .accessibilityIdentifier(
+                    "cowork.agent.\(agent.id).status-only")
+        }
+    }
+
+    private func agentStatusRowContent(_ agent: CoworkAgentInfo) -> some View {
+        return HStack(alignment: .center, spacing: 10) {
             Image(systemName: statusIconName(for: agent.status))
-                .font(.caption)
+                .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(statusColor(for: agent.status))
-                .frame(width: 18)
-            VStack(alignment: .leading, spacing: 2) {
+                .frame(width: 20, height: 20)
+            VStack(alignment: .leading, spacing: 3) {
                 Text("@\(agent.name)")
-                    .font(.caption.bold())
+                    .font(.body.weight(.semibold))
                     .foregroundStyle(threadStyle.primaryText)
                     .lineLimit(1)
                 if let inferenceLabel = agent.inferenceDisplayLabel {
                     Text(inferenceLabel)
-                        .font(.caption2)
-                        .foregroundStyle(agent.inferenceResolution.requiresAttention
+                        .font(.callout)
+                        .foregroundStyle(agent.isAttached
+                            && agent.inferenceResolution.requiresAttention
                             ? threadStyle.accent
                             : threadStyle.tertiaryText)
                         .lineLimit(1)
@@ -893,16 +1097,25 @@ public struct CoworkShell: View {
                         .accessibilityIdentifier("cowork.agent.\(agent.id).inference")
                 }
             }
-            Spacer(minLength: 8)
-            if agent.inferenceResolution.requiresAttention {
+            Spacer(minLength: 10)
+            if agent.isAttached && agent.inferenceResolution.requiresAttention {
                 Image(systemName: "exclamationmark.triangle.fill")
-                    .font(.caption2)
+                    .font(.caption)
                     .foregroundStyle(threadStyle.accent)
                     .accessibilityLabel(agent.inferenceDisplayLabel
                         ?? IntatisLocalization.string("Inference unavailable"))
             }
         }
-        .padding(.vertical, 2)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .frame(minHeight: 52)
+        .background {
+            CoworkAgentSelectionBackground(
+                selection: statusRailSelection,
+                agentID: agent.id,
+                accent: threadStyle.accent)
+        }
+        .contentShape(Rectangle())
         .help(["\(agent.name): \(intatisLocalizedRawStatus(agent.status))", agent.inferenceDisplayLabel]
             .compactMap { $0 }
             .joined(separator: " · "))
@@ -928,19 +1141,19 @@ public struct CoworkShell: View {
                 VStack(alignment: .leading, spacing: 9) {
                     HStack(alignment: .firstTextBaseline, spacing: 7) {
                         Label(displayStatus(goal.status), systemImage: statusIconName(for: goal.status))
-                            .font(.caption2.bold())
+                            .font(.caption.bold())
                             .foregroundStyle(statusColor(for: goal.status))
                             .lineLimit(1)
                             .accessibilityIdentifier("cowork.goal.status")
                         Spacer(minLength: 6)
                         Label(formatElapsed(goal.elapsedSeconds(at: timeline.date)), systemImage: "timer")
-                            .font(.caption2.monospacedDigit())
+                            .font(.caption.monospacedDigit())
                             .foregroundStyle(threadStyle.secondaryText)
                             .lineLimit(1)
                     }
 
                     Text(goal.objective)
-                        .font(.caption.bold())
+                        .font(.callout.weight(.semibold))
                         .foregroundStyle(threadStyle.primaryText)
                         .fixedSize(horizontal: false, vertical: true)
                         .textSelection(.enabled)
@@ -958,7 +1171,7 @@ public struct CoworkShell: View {
 
                     if let auditSummary = auditSummary(for: goal) {
                         Label(auditSummary, systemImage: "checkmark.shield")
-                            .font(.caption2)
+                            .font(.caption)
                             .foregroundStyle(threadStyle.secondaryText)
                             .fixedSize(horizontal: false, vertical: true)
                     }
@@ -967,7 +1180,7 @@ public struct CoworkShell: View {
                         Text(IntatisLocalization.format(
                             "Revision %lld",
                             Int64(goal.revision)))
-                            .font(.caption2)
+                            .font(.caption)
                             .foregroundStyle(threadStyle.tertiaryText)
                     }
 
@@ -984,10 +1197,10 @@ public struct CoworkShell: View {
     private func goalMetric(_ title: String, value: String) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(IntatisLocalization.string(title).uppercased())
-                .font(.caption2.bold())
+                .font(.caption.bold())
                 .foregroundStyle(threadStyle.tertiaryText)
             Text(value)
-                .font(.caption2.monospacedDigit())
+                .font(.caption.monospacedDigit())
                 .foregroundStyle(threadStyle.primaryText)
                 .lineLimit(2)
         }
@@ -1043,13 +1256,13 @@ public struct CoworkShell: View {
                         "%lld / %lld complete",
                         Int64(workTasks.completedCount),
                         Int64(workTasks.totalCount)))
-                        .font(.caption2.bold())
+                        .font(.caption.bold())
                         .foregroundStyle(threadStyle.secondaryText)
                     if workTasks.runningCount > 0 {
                         Text(IntatisLocalization.format(
                             "· %lld running",
                             Int64(workTasks.runningCount)))
-                            .font(.caption2)
+                            .font(.caption)
                             .foregroundStyle(threadStyle.accent)
                     }
                     Spacer(minLength: 0)
@@ -1112,15 +1325,17 @@ public struct CoworkShell: View {
         systemImage: String,
         @ViewBuilder content: () -> Content
     ) -> some View {
-        VStack(alignment: .leading, spacing: 11) {
+        VStack(alignment: .leading, spacing: 14) {
             Label(IntatisLocalization.string(title), systemImage: systemImage)
-                .font(.subheadline.weight(.semibold))
+                .font(.title3.weight(.semibold))
                 .foregroundStyle(threadStyle.primaryText)
             content()
         }
-        .padding(14)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .intatisLiquidGlass(cornerRadius: 18)
+        .padding(18)
+        .frame(
+            width: IntatisCoworkStatusRailLayoutPolicy.cardWidth,
+            alignment: .leading)
+        .intatisClearLiquidGlass(cornerRadius: 22)
     }
 
     private var inspectorOverview: some View {
@@ -1314,11 +1529,11 @@ public struct CoworkShell: View {
 
     @ViewBuilder private var agentRosterList: some View {
         if agents.isEmpty {
-            Text("No agents attached")
+            Text("No agents in this session")
                 .font(.caption)
                 .foregroundStyle(threadStyle.tertiaryText)
         } else {
-            VStack(alignment: .leading, spacing: 2) {
+            LazyVStack(alignment: .leading, spacing: 2) {
                 ForEach(agents) { agent in
                     agentListRow(agent)
                 }
@@ -1421,7 +1636,7 @@ public struct CoworkShell: View {
     private func agentListRow(_ agent: CoworkAgentInfo) -> some View {
         let selected = selectedAgentID == agent.id
         return Button {
-            selectedAgentID = agent.id
+            onSelectAgent(agent.id)
         } label: {
             HStack(alignment: .center, spacing: 8) {
                 Circle()
@@ -1459,6 +1674,7 @@ public struct CoworkShell: View {
             }
         }
         .buttonStyle(.plain)
+        .disabled(!agent.isConversationSelectable)
     }
 
     private func selectedAgentDetails(_ agent: CoworkAgentInfo) -> some View {
@@ -1525,7 +1741,7 @@ public struct CoworkShell: View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(alignment: .firstTextBaseline, spacing: 6) {
                 Text(task.title)
-                    .font(.caption.bold())
+                    .font(.callout.weight(.semibold))
                     .foregroundStyle(threadStyle.primaryText)
                     .lineLimit(1)
                 Spacer(minLength: 6)
@@ -1583,6 +1799,8 @@ public struct CoworkShell: View {
             return "checkmark.circle.fill"
         case "cancelled", "canceled":
             return "slash.circle.fill"
+        case "detached", "removed", "cleaned":
+            return "minus.circle.fill"
         default:
             return "circle"
         }
@@ -1595,20 +1813,13 @@ public struct CoworkShell: View {
             .lowercased()
     }
 
-    private var visibleAgents: [CoworkAgentInfo] {
-        agents.filter { agent in
-            let status = agent.status.lowercased()
-            return status != "cleaned" && status != "removed" && status != "detached"
-        }
-    }
-
     private func agentRoster(layout: IntatisThreadContentLayout) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             ScrollView(.horizontal) {
                 IntatisGlassEffectGroup(spacing: 8) {
-                    HStack(spacing: 8) {
+                    LazyHStack(spacing: 8) {
                         if agents.isEmpty {
-                            Text("No agents attached")
+                            Text("No agents in this session")
                                 .font(.caption)
                                 .foregroundStyle(threadStyle.secondaryText)
                                 .padding(.horizontal, 12)
@@ -1644,7 +1855,7 @@ public struct CoworkShell: View {
     private func agentPill(_ agent: CoworkAgentInfo) -> some View {
         let selected = selectedAgentID == agent.id
         return Button {
-            selectedAgentID = agent.id
+            onSelectAgent(agent.id)
         } label: {
             HStack(spacing: 7) {
                 Text("@\(agent.name)")
@@ -1664,6 +1875,7 @@ public struct CoworkShell: View {
             .intatisLiquidGlass(cornerRadius: 18, interactive: true)
         }
         .buttonStyle(.plain)
+        .disabled(!agent.isConversationSelectable)
     }
 
     private func selectedAgentCard(_ agent: CoworkAgentInfo) -> some View {
@@ -1764,16 +1976,10 @@ public struct CoworkShell: View {
         layout: IntatisThreadContentLayout,
         trailingContentMargin: CGFloat
     ) -> some View {
-        if displayedItems.isEmpty && !showsThinkingIndicator {
-            CoworkEmptyThreadView(style: threadStyle)
-                .frame(width: layout.rawWidth)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
-                .padding(.horizontal, layout.horizontalPadding)
-        } else {
-            let historyWindow = threadHistoryWindow
-            let pageScope = threadPresentationScope
-            ScrollViewReader { proxy in
-                ScrollView {
+        let historyWindow = threadHistoryWindow
+        let pageScope = threadPresentationScope
+        ScrollViewReader { proxy in
+            ScrollView {
                     VStack(alignment: .leading, spacing: 10) {
                         if historyWindow.hasEarlier || historyWindow.hasLater {
                             IntatisThreadHistoryPager(
@@ -1784,18 +1990,32 @@ public struct CoworkShell: View {
                                 hasLater: historyWindow.hasLater,
                                 accessibilityPrefix: "cowork.history",
                                 onEarlier: {
-                                    selectHistoryWindow(
-                                        historyWindow.earlierRequestedUpperBound)
+                                    onShowEarlier()
                                 },
                                 onNewer: {
-                                    selectHistoryWindow(
-                                        historyWindow.newerRequestedUpperBound)
+                                    onShowNewer()
                                 },
                                 onLatest: {
-                                    selectHistoryWindow(nil)
+                                    onShowLatest()
                                 })
                         }
-                        ForEach(historyWindow.items) { item in
+                        if isThreadPageLoading && historyWindow.items.isEmpty {
+                            ProgressView()
+                                .controlSize(.small)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 20)
+                                .accessibilityIdentifier(
+                                    "cowork.agent-thread.loading")
+                        }
+                        // A Cowork page has at most 16 rows. Key those rows by
+                        // their bounded viewport slot rather than by message
+                        // identity so an agent switch updates the existing
+                        // native view pool instead of mounting another AppKit
+                        // text-selection subtree for every historical row.
+                        ForEach(
+                            Array(historyWindow.items.enumerated()),
+                            id: \.offset
+                        ) { _, item in
                             CodeItemRow(
                                 item: item,
                                 style: threadStyle,
@@ -1803,7 +2023,6 @@ public struct CoworkShell: View {
                                 onRetrySubmission: onRetrySubmission == nil
                                     ? nil
                                     : retrySubmission)
-                                .id(item.id)
                         }
                         if showsVisibleThinkingIndicator {
                             IntatisThreadThinkingRow(
@@ -1816,14 +2035,18 @@ public struct CoworkShell: View {
                             .frame(height: 1)
                             .padding(.bottom, 16)
                             .id(IntatisThreadBottomAnchorID(scope: pageScope))
-                            .intatisThreadBottomAnchorFrameProbe()
+                            .onScrollVisibilityChange(threshold: 0.99) {
+                                isVisible in
+                                scrollCoordinator
+                                    .enqueueBottomAnchorVisibility(
+                                        isVisible,
+                                        scope: pageScope)
+                            }
                     }
                     .environment(
                         \.intatisMessageViewportAdmission,
-                        scrollCoordinator.effectiveViewportAdmission(
-                            for: pageScope,
-                            defersUntilInitialRestore:
-                                defersRichUntilInitialRestore))
+                        resolvedViewportAdmission(
+                            for: pageScope))
                     .environment(
                         \.intatisThreadScrollCoordinator,
                         scrollCoordinator)
@@ -1832,8 +2055,12 @@ public struct CoworkShell: View {
                         scrollCoordinator.effectiveRichSettleSource(
                             for: pageScope))
                     .frame(width: layout.contentWidth)
-                    .frame(maxWidth: .infinity)
-                    .padding(.horizontal, layout.horizontalPadding)
+                    // The transcript is centered inside one exact conversation
+                    // column before the ScrollView expands under the trailing
+                    // rail. A selected agent's content or scroller visibility
+                    // therefore cannot move either horizontal edge.
+                    .frame(width: layout.rawWidth)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.top, 16)
                 }
                 .contentMargins(
@@ -1841,18 +2068,21 @@ public struct CoworkShell: View {
                     trailingContentMargin,
                     for: .scrollContent)
                 .scrollContentBackground(.hidden)
-                .intatisThreadViewportFrameProbe()
-                .onPreferenceChange(
-                    IntatisThreadViewportFramesPreferenceKey.self
-                ) { frames in
-                    guard let isVisible =
-                            IntatisThreadViewportFrames
-                                .isBottomAnchorVisible(frames) else {
-                        return
+                .overlay {
+                    if threadPage.items.isEmpty
+                        && !showsThinkingIndicator
+                        && !isThreadPageLoading {
+                        CoworkEmptyThreadView(style: threadStyle)
+                            .frame(width: layout.contentWidth)
+                            .frame(width: layout.rawWidth)
+                            .frame(
+                                maxWidth: .infinity,
+                                maxHeight: .infinity,
+                                alignment: .leading)
+                            .allowsHitTesting(false)
+                            .accessibilityIdentifier(
+                                "cowork.agent-thread.empty")
                     }
-                    scrollCoordinator.enqueueBottomAnchorVisibility(
-                        isVisible,
-                        scope: pageScope)
                 }
                 .overlay(alignment: .bottomTrailing) {
                     if historyWindow.hasLater
@@ -1861,7 +2091,7 @@ public struct CoworkShell: View {
                             accessibilityIdentifier: "cowork.jump-to-latest"
                         ) {
                             if historyWindow.hasLater {
-                                selectHistoryWindow(nil)
+                                onShowLatest()
                             } else {
                                 scrollCoordinator.jumpToLatest(
                                     scope: pageScope,
@@ -1880,6 +2110,17 @@ public struct CoworkShell: View {
                         proxy,
                         reason: .initialRestore,
                         scope: pageScope)
+                }
+                .onChange(of: pageScope) { previous, current in
+                    scrollCoordinator.deactivate(scope: previous)
+                    scrollCoordinator.activate(
+                        scope: current,
+                        defersRichUntilInitialRestore:
+                            defersRichUntilInitialRestore)
+                    requestScroll(
+                        proxy,
+                        reason: .initialRestore,
+                        scope: current)
                 }
                 .onChange(of: itemScrollSignature) { _, _ in
                     guard historyWindow.isLatest else { return }
@@ -1923,16 +2164,36 @@ public struct CoworkShell: View {
                 .onDisappear {
                     scrollCoordinator.deactivate(scope: pageScope)
                 }
-            }
-            .id(pageScope)
         }
+    }
+
+    private func resolvedViewportAdmission(
+        for pageScope: IntatisThreadPresentationScope
+    ) -> IntatisMessageViewportAdmission {
+        guard isRichRenderingEligible else {
+            return .suspended(generation: UInt64.max)
+        }
+        return scrollCoordinator.effectiveViewportAdmission(
+            for: pageScope,
+            defersUntilInitialRestore: defersRichUntilInitialRestore)
     }
 
     private var showsThinkingIndicator: Bool {
         IntatisThreadActivity.isAwaitingModelOutput(
-            items: displayedItems,
-            isWorking: isWorking && summary.runningCount > 0,
+            items: threadPage.items,
+            isWorking: selectedAgentIsWorking,
             permissionBlocksResponse: permissionBlocksComposer)
+    }
+
+    private var selectedAgentIsWorking: Bool {
+        if threadPage.isAgentWorking { return true }
+        guard let selectedAgent else { return false }
+        switch normalizedStatus(selectedAgent.status) {
+        case "active", "running", "thinking", "tool":
+            return true
+        default:
+            return false
+        }
     }
 
     private var defersRichUntilInitialRestore: Bool {
@@ -1941,28 +2202,30 @@ public struct CoworkShell: View {
     }
 
     private var threadHistoryWindow: IntatisThreadHistoryWindow<CodeItem> {
-        .resolve(
-            allItems: displayedItems,
-            requestedUpperBound: requestedHistoryWindowUpperBound)
+        IntatisThreadHistoryWindow(
+            items: threadPage.items,
+            lowerBound: threadPage.lowerBound,
+            upperBound: threadPage.upperBound,
+            totalCount: threadPage.totalCount,
+            capacity: threadPage.capacity)
     }
 
     private var requestedHistoryWindowUpperBound: Int? {
-        historySelection?.upperBound(for: presentationScope)
+        threadPage.isLatest ? nil : threadPage.upperBound
     }
 
     private var threadPresentationScope: IntatisThreadPresentationScope {
-        presentationScope.historyWindowScope(
+        IntatisThreadPresentationScope(
+            kind: presentationScope.kind,
+            sessionID: presentationScope.sessionID,
+            presentationID:
+                "\(presentationScope.presentationID):agent:\(selectedAgentID)")
+        .historyWindowScope(
             requestedUpperBound: requestedHistoryWindowUpperBound)
     }
 
-    private func selectHistoryWindow(_ requestedUpperBound: Int?) {
-        historySelection = IntatisThreadHistorySelection(
-            scope: presentationScope,
-            requestedUpperBound: requestedUpperBound)
-    }
-
     private func retrySubmission(_ submissionID: SubmissionID) {
-        selectHistoryWindow(nil)
+        onShowLatest()
         onRetrySubmission?(submissionID)
     }
 
@@ -1978,7 +2241,7 @@ public struct CoworkShell: View {
             lastItemID: last?.id,
             lastBodyUTF8Count: last?.body.utf8.count ?? 0,
             lastItemComplete: last?.complete ?? false,
-            isWorking: historyWindow.isLatest && isWorking,
+            isWorking: historyWindow.isLatest && selectedAgentIsWorking,
             showsThinkingIndicator: showsVisibleThinkingIndicator)
     }
 
@@ -1987,7 +2250,8 @@ public struct CoworkShell: View {
         guard let last = historyWindow.items.last else {
             return .liveUpdate
         }
-        let visibleIsWorking = historyWindow.isLatest && isWorking
+        let visibleIsWorking = historyWindow.isLatest
+            && selectedAgentIsWorking
         return last.complete && !visibleIsWorking
             ? .completion
             : .liveUpdate
@@ -2053,7 +2317,7 @@ public struct CoworkShell: View {
                         style: threadStyle)
                 },
                 onSend: {
-                    selectHistoryWindow(nil)
+                    onShowLatest()
                     onSend()
                 })
         }
@@ -2100,12 +2364,12 @@ private struct CoworkWorkTaskRow: View {
                     .fixedSize(horizontal: false, vertical: true)
                 HStack(alignment: .firstTextBaseline, spacing: 5) {
                     Text(displayStatus)
-                        .font(.caption2.bold())
+                        .font(.caption.bold())
                         .foregroundStyle(statusColor)
                         .lineLimit(1)
                     if let owner = task.owner, !owner.isEmpty {
                         Text("· \(displayOwner(owner))")
-                            .font(.caption2)
+                            .font(.caption)
                             .foregroundStyle(style.tertiaryText)
                             .lineLimit(1)
                     }
@@ -2194,10 +2458,10 @@ private struct CoworkWorkTaskRow: View {
     private func detailBlock(_ title: String, value: String) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(IntatisLocalization.string(title).uppercased())
-                .font(.caption2.bold())
+                .font(.caption.bold())
                 .foregroundStyle(style.tertiaryText)
             Text(value)
-                .font(.caption2)
+                .font(.caption)
                 .foregroundStyle(style.secondaryText)
                 .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
@@ -2209,17 +2473,17 @@ private struct CoworkWorkTaskRow: View {
                             monospaced: Bool = false) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(IntatisLocalization.string(title).uppercased())
-                .font(.caption2.bold())
+                .font(.caption.bold())
                 .foregroundStyle(style.tertiaryText)
             ForEach(Array(values.enumerated()), id: \.offset) { _, value in
                 HStack(alignment: .top, spacing: 5) {
                     Text("•")
                     Text(value)
-                        .font(monospaced ? .caption2.monospaced() : .caption2)
+                        .font(monospaced ? .caption.monospaced() : .caption)
                         .fixedSize(horizontal: false, vertical: true)
                         .textSelection(.enabled)
                 }
-                .font(.caption2)
+                .font(.caption)
                 .foregroundStyle(style.secondaryText)
             }
         }

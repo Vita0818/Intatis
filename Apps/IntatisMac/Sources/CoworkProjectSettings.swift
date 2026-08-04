@@ -512,7 +512,9 @@ struct CoworkProjectSettingsSheet: View {
     }
 
     private var ordinaryAgents: [CoworkAgentInfo] {
-        vm.agents.filter { $0.name != "permission-reviewer" }
+        vm.agents.filter {
+            $0.isAttached && $0.name != "permission-reviewer"
+        }
     }
 
     @ViewBuilder private var agentInferenceSection: some View {

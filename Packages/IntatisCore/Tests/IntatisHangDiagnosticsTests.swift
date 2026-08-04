@@ -107,6 +107,37 @@ final class IntatisHangDiagnosticsTests: XCTestCase {
         XCTAssertNil(snapshot.counters["message"])
     }
 
+    func testCoworkAgentThreadDiagnosticsRemainNumericAndContentFree() {
+        let diagnostics = IntatisPerformanceDiagnostics()
+        diagnostics.recordCoworkAgentSwitch(
+            outcome: .requested,
+            generation: 4)
+        diagnostics.recordCoworkAgentSwitch(
+            outcome: .committed,
+            durationNanoseconds: 900,
+            generation: 4,
+            rowCount: 16)
+        diagnostics.recordCoworkAgentSwitch(
+            outcome: .stale,
+            durationNanoseconds: 100,
+            generation: 3)
+        diagnostics.recordCoworkAgentPageQuery(
+            durationNanoseconds: 800,
+            rowCount: 16,
+            totalCount: 100_000)
+        diagnostics.recordCoworkAgentThreadPublication(rowCount: 16)
+
+        let snapshot = diagnostics.snapshot()
+        XCTAssertEqual(snapshot.value(for: .coworkAgentSwitchRequested), 1)
+        XCTAssertEqual(snapshot.value(for: .coworkAgentSwitchCommitted), 1)
+        XCTAssertEqual(snapshot.value(for: .coworkAgentSwitchStale), 1)
+        XCTAssertEqual(snapshot.value(for: .coworkAgentPageQueries), 1)
+        XCTAssertEqual(snapshot.value(for: .coworkAgentPageRows), 16)
+        XCTAssertEqual(snapshot.value(for: .coworkAgentThreadPublications), 2)
+        XCTAssertNil(snapshot.counters["agentID"])
+        XCTAssertNil(snapshot.counters["message"])
+    }
+
     func testDurationSummariesUseFixedBucketsAndSaturate() {
         let diagnostics = IntatisPerformanceDiagnostics()
         let samples: [UInt64] = [

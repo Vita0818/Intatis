@@ -195,6 +195,11 @@ public struct CoworkSessionProjectionSnapshot: Equatable, Sendable {
     public var cowork: CoworkProjection?
     public var permission: PermissionProjection?
     public var turnStats: TurnStatsProjection?
+    /// Agent-scoped thread publications accumulated in this snapshot. The two
+    /// lists are kept separate so the app can honor the process-wide execution
+    /// trace policy without filtering the canonical item array on MainActor.
+    public var threadAgentIDs: [AgentID]
+    public var visibleThreadAgentIDs: [AgentID]
     public var barrierEnvelope: Envelope?
 
     public init(
@@ -207,6 +212,8 @@ public struct CoworkSessionProjectionSnapshot: Equatable, Sendable {
         cowork: CoworkProjection?,
         permission: PermissionProjection?,
         turnStats: TurnStatsProjection?,
+        threadAgentIDs: [AgentID] = [],
+        visibleThreadAgentIDs: [AgentID] = [],
         barrierEnvelope: Envelope?
     ) {
         self.identity = identity
@@ -217,6 +224,8 @@ public struct CoworkSessionProjectionSnapshot: Equatable, Sendable {
         self.cowork = cowork
         self.permission = permission
         self.turnStats = turnStats
+        self.threadAgentIDs = threadAgentIDs
+        self.visibleThreadAgentIDs = visibleThreadAgentIDs
         self.barrierEnvelope = barrierEnvelope
     }
 
@@ -232,6 +241,8 @@ public struct CoworkSessionProjectionSnapshot: Equatable, Sendable {
             && lhs.cowork == rhs.cowork
             && lhs.permission == rhs.permission
             && lhs.turnStats == rhs.turnStats
+            && lhs.threadAgentIDs == rhs.threadAgentIDs
+            && lhs.visibleThreadAgentIDs == rhs.visibleThreadAgentIDs
             && lhs.barrierEnvelope
                 == rhs.barrierEnvelope
     }
@@ -255,7 +266,7 @@ public protocol SessionProjectionReducing: Sendable {
 
     mutating func markRestoredPermissionsNeedsRerun()
 
-    func makeSnapshot(
+    mutating func makeSnapshot(
         identity: SessionProjectionIdentity,
         throughSeq: Int,
         dirtyDomains: SessionProjectionDirtyDomains,
@@ -283,22 +294,20 @@ public struct CodeSessionProjectionState:
     public mutating func apply(
         _ envelope: Envelope
     ) -> SessionProjectionDirtyDomains {
+        let codeChange = code.apply(envelope)
         if case .messageDelta = envelope.event {
-            code.apply(envelope)
             // These reducers intentionally receive the exact envelope too.
             // They are no-ops for message_delta, so Cowork-only presentation
             // work is not marked dirty during a text burst.
             permission.apply(envelope)
             turnStats.apply(envelope)
-            return .thread
+            return codeChange.didChangeItems ? .thread : []
         }
 
-        let previousCode = code
         let previousPermission = permission
         let previousTurnStats = turnStats
         let previousAgentState = agentState
 
-        code.apply(envelope)
         permission.apply(envelope)
         turnStats.apply(envelope)
         if case .agentStatus(let payload) = envelope.event {
@@ -306,7 +315,7 @@ public struct CodeSessionProjectionState:
         }
 
         var dirty: SessionProjectionDirtyDomains = []
-        if code != previousCode { dirty.insert(.thread) }
+        if codeChange.didChangeItems { dirty.insert(.thread) }
         if permission != previousPermission {
             dirty.insert(.permission)
         }
@@ -323,7 +332,7 @@ public struct CodeSessionProjectionState:
         permission.markNeedsRerun()
     }
 
-    public func makeSnapshot(
+    public mutating func makeSnapshot(
         identity: SessionProjectionIdentity,
         throughSeq: Int,
         dirtyDomains: SessionProjectionDirtyDomains,
@@ -360,36 +369,45 @@ public struct CoworkSessionProjectionState:
     public static let allDirtyDomains =
         SessionProjectionDirtyDomains.coworkAll
 
-    private var code = CodeProjection()
+    private var code = CodeProjection(
+        tracksAgentThreadIndex: true)
     private var cowork = CoworkProjection()
     private var permission = PermissionProjection()
     private var turnStats = TurnStatsProjection()
+    private var pendingThreadAgentIDs: Set<AgentID> = []
+    private var pendingVisibleThreadAgentIDs: Set<AgentID> = []
 
     public init() {}
 
     public mutating func apply(
         _ envelope: Envelope
     ) -> SessionProjectionDirtyDomains {
+        let previousCowork = cowork
+        cowork.apply(envelope)
+        var codeChange = CodeProjectionChange.none
+        if let settings = cowork.sessionSettings?.cowork {
+            codeChange.formUnion(
+                code.setDefaultConversationAgentID(
+                    AgentID(rawValue: settings.mainAgentName)))
+        }
+        codeChange.formUnion(code.apply(envelope))
+        pendingThreadAgentIDs.formUnion(codeChange.agentIDs)
+        pendingVisibleThreadAgentIDs.formUnion(
+            codeChange.visibleAgentIDs)
+
         if case .messageDelta = envelope.event {
-            code.apply(envelope)
-            cowork.apply(envelope)
             permission.apply(envelope)
             turnStats.apply(envelope)
-            return .thread
+            return codeChange.didChangeItems ? .thread : []
         }
 
-        let previousCode = code
-        let previousCowork = cowork
         let previousPermission = permission
         let previousTurnStats = turnStats
-
-        code.apply(envelope)
-        cowork.apply(envelope)
         permission.apply(envelope)
         turnStats.apply(envelope)
 
         var dirty: SessionProjectionDirtyDomains = []
-        if code != previousCode { dirty.insert(.thread) }
+        if codeChange.didChangeItems { dirty.insert(.thread) }
         if cowork != previousCowork { dirty.insert(.cowork) }
         if permission != previousPermission {
             dirty.insert(.permission)
@@ -404,7 +422,7 @@ public struct CoworkSessionProjectionState:
         permission.markNeedsRerun()
     }
 
-    public func makeSnapshot(
+    public mutating func makeSnapshot(
         identity: SessionProjectionIdentity,
         throughSeq: Int,
         dirtyDomains: SessionProjectionDirtyDomains,
@@ -412,14 +430,25 @@ public struct CoworkSessionProjectionState:
             IntatisProjectionBatchPublication?,
         barrierEnvelope: Envelope?
     ) -> CoworkSessionProjectionSnapshot {
-        CoworkSessionProjectionSnapshot(
+        let publishesAllThreadAgents =
+            dirtyDomains == Self.allDirtyDomains
+        let threadAgentIDs = publishesAllThreadAgents
+            ? pendingThreadAgentIDs.union(code.indexedAgentIDs)
+            : pendingThreadAgentIDs
+        let visibleThreadAgentIDs = publishesAllThreadAgents
+            ? pendingVisibleThreadAgentIDs.union(
+                code.visibleIndexedAgentIDs)
+            : pendingVisibleThreadAgentIDs
+        pendingThreadAgentIDs.removeAll(keepingCapacity: true)
+        pendingVisibleThreadAgentIDs.removeAll(keepingCapacity: true)
+        return CoworkSessionProjectionSnapshot(
             identity: identity,
             throughSeq: throughSeq,
             dirtyDomains: dirtyDomains,
             projectionBatch: projectionBatch,
-            items: dirtyDomains.contains(.thread)
-                ? code.items
-                : nil,
+            // Cowork windows query the actor-owned bounded page API below.
+            // Never publish the unbounded canonical item array to MainActor.
+            items: nil,
             cowork: dirtyDomains.contains(.cowork)
                 ? cowork
                 : nil,
@@ -429,7 +458,41 @@ public struct CoworkSessionProjectionState:
             turnStats: dirtyDomains.contains(.stats)
                 ? turnStats
                 : nil,
+            threadAgentIDs: threadAgentIDs.sorted {
+                $0.rawValue < $1.rawValue
+            },
+            visibleThreadAgentIDs: visibleThreadAgentIDs.sorted {
+                $0.rawValue < $1.rawValue
+            },
             barrierEnvelope: barrierEnvelope)
+    }
+
+    public func agentThreadPage(
+        identity: SessionProjectionIdentity,
+        throughSeq: Int,
+        agentID: AgentID,
+        requestedUpperBound: Int?,
+        capacity: Int,
+        showsExecutionTrace: Bool,
+        additionalItems: [CodeItem]
+    ) -> CoworkAgentThreadPage {
+        let isWorking = cowork.runningTasks.contains {
+            $0.assignee == agentID
+        } || {
+            guard let status = cowork.agentStatuses[agentID] else {
+                return false
+            }
+            return status == .thinking || status == .tool
+        }()
+        return code.coworkAgentThreadPage(
+            agentID: agentID,
+            requestedUpperBound: requestedUpperBound,
+            capacity: capacity,
+            showsExecutionTrace: showsExecutionTrace,
+            additionalItems: additionalItems,
+            projectedThroughSeq: throughSeq,
+            projectionGeneration: identity.generation,
+            isAgentWorking: isWorking)
     }
 }
 
@@ -959,5 +1022,36 @@ public actor SessionProjectionPump<
         cancelScheduledPublication()
         cancelPendingProjectionBatch()
         outputContinuation = nil
+    }
+}
+
+public extension SessionProjectionPump
+where State == CoworkSessionProjectionState {
+    /// Actor-isolated, bounded transcript lookup used by each Cowork window.
+    /// It reads the already-folded in-memory index and never replays EventLog.
+    func coworkAgentThreadPage(
+        agentID: AgentID,
+        requestedUpperBound: Int?,
+        capacity: Int = 16,
+        showsExecutionTrace: Bool,
+        additionalItems: [CodeItem] = []
+    ) -> CoworkAgentThreadPage {
+        let startedAt = DispatchTime.now().uptimeNanoseconds
+        let page = state.agentThreadPage(
+            identity: identity,
+            throughSeq: lastAppliedSeq,
+            agentID: agentID,
+            requestedUpperBound: requestedUpperBound,
+            capacity: capacity,
+            showsExecutionTrace: showsExecutionTrace,
+            additionalItems: additionalItems)
+        let endedAt = DispatchTime.now().uptimeNanoseconds
+        IntatisPerformanceDiagnostics.shared.recordCoworkAgentPageQuery(
+            durationNanoseconds: endedAt >= startedAt
+                ? endedAt - startedAt
+                : 0,
+            rowCount: page.items.count,
+            totalCount: page.totalCount)
+        return page
     }
 }

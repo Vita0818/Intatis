@@ -112,6 +112,43 @@ public enum IntatisWorkspaceInspectorLayoutPolicy {
     }
 }
 
+/// Cowork's trailing status rail has one geometry owner: the stable outer
+/// detail width. Its width never depends on the selected agent, transcript
+/// length, card content, or whether a vertical scroller is currently visible.
+public enum IntatisCoworkStatusRailLayoutPolicy {
+    public static let activationWidth: CGFloat = 980
+    public static let minimumThreadWidth: CGFloat = 620
+    public static let railWidth: CGFloat = 348
+    public static let scrollerClearance: CGFloat = 10
+    public static let leadingInset: CGFloat = 6
+    public static let trailingInset: CGFloat = 14
+    public static let cardSpacing: CGFloat = 18
+
+    public static var cardWidth: CGFloat {
+        max(
+            railWidth
+                - scrollerClearance
+                - leadingInset
+                - trailingInset,
+            1)
+    }
+
+    public static func resolve(
+        availableWidth: CGFloat,
+        isRequested: Bool
+    ) -> IntatisWorkspaceInspectorLayout {
+        IntatisWorkspaceInspectorLayoutPolicy.resolve(
+            availableWidth: availableWidth,
+            isRequested: isRequested,
+            activationWidth: activationWidth,
+            minimumThreadWidth: minimumThreadWidth,
+            minimumInspectorWidth: railWidth,
+            idealInspectorWidth: railWidth,
+            maximumInspectorWidth: railWidth,
+            dividerWidth: 0)
+    }
+}
+
 public struct ThreeColumnShellLayout: Equatable {
     public enum Presentation: Equatable {
         case split

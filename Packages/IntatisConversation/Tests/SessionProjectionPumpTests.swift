@@ -398,13 +398,13 @@ final class SessionProjectionPumpTests:
             terminal.barrierEnvelope,
             completion)
         XCTAssertNil(terminal.cowork)
-        XCTAssertEqual(
-            terminal.items,
-            CodeProjection.build(
-                from: envelopes).items)
-        XCTAssertEqual(
-            terminal.items?.last?.body,
-            finalText)
+        XCTAssertNil(terminal.items)
+        let page = await pump.coworkAgentThreadPage(
+            agentID: agent,
+            requestedUpperBound: nil,
+            showsExecutionTrace: false)
+        XCTAssertEqual(page.items.map(\.body), [finalText])
+        XCTAssertLessThanOrEqual(page.items.count, 16)
         let throughSeq =
             await pump.currentThroughSeq()
         XCTAssertEqual(throughSeq, 500)
@@ -665,23 +665,17 @@ final class SessionProjectionPumpTests:
                 $0.dirtyDomains == .thread
                     && $0.cowork == nil
             })
-        XCTAssertEqual(
-            publications.last?.items,
-            CodeProjection.build(
-                from: ordered).items)
-        XCTAssertEqual(
-            publications.last?.items?
-                .first(where: {
-                    $0.id == message.rawValue
-                })?.body.count,
-            250)
-        XCTAssertEqual(
-            publications.last?.items?
-                .first(where: {
-                    $0.id
-                        == secondMessage.rawValue
-                })?.body.count,
-            250)
+        XCTAssertTrue(publications.allSatisfy { $0.items == nil })
+        let mainPage = await pump.coworkAgentThreadPage(
+            agentID: agent,
+            requestedUpperBound: nil,
+            showsExecutionTrace: false)
+        let workerPage = await pump.coworkAgentThreadPage(
+            agentID: secondAgent,
+            requestedUpperBound: nil,
+            showsExecutionTrace: false)
+        XCTAssertEqual(mainPage.items.last?.body.count, 250)
+        XCTAssertEqual(workerPage.items.last?.body.count, 250)
     }
 
     func testPermissionTaskAndTurnEventsAreImmediateOrderedBarriers()
@@ -1140,9 +1134,6 @@ final class SessionProjectionPumpTests:
             await pump.flushNow()
         let final =
             try XCTUnwrap(finalCandidate)
-        let directCode =
-            CodeProjection.build(
-                from: durable)
         let directCowork =
             CoworkProjection.build(
                 from: durable)
@@ -1160,9 +1151,13 @@ final class SessionProjectionPumpTests:
             final.dirtyDomains,
             .coworkAll)
         XCTAssertNil(final.barrierEnvelope)
-        XCTAssertEqual(
-            final.items,
-            directCode.items)
+        XCTAssertNil(final.items)
+        let workerPage = await pump.coworkAgentThreadPage(
+            agentID: worker,
+            requestedUpperBound: nil,
+            showsExecutionTrace: true)
+        XCTAssertEqual(workerPage.items.last?.body, "done")
+        XCTAssertLessThanOrEqual(workerPage.items.count, 16)
         XCTAssertEqual(
             final.cowork,
             directCowork)
