@@ -390,6 +390,17 @@ public actor ProviderRegistry {
         }
     }
 
+    public func imageEditingProvider(for ref: ModelRef) async throws -> ImageEditingProvider {
+        guard let endpoint = config.endpoint(id: ref.endpoint) else {
+            throw IntatisError.config("unknown endpoint '\(ref.endpoint)'")
+        }
+        let apiKey = try await resolver.secret(for: endpoint.apiKeyRef)
+        switch endpoint.wire {
+        case .openai:
+            return OpenAIImageProvider(endpoint: endpoint, apiKey: apiKey, http: dataClient)
+        }
+    }
+
     public func transcriptionProvider(for ref: ModelRef) async throws -> TranscriptionProvider {
         guard let endpoint = config.endpoint(id: ref.endpoint) else {
             throw IntatisError.config("unknown endpoint '\(ref.endpoint)'")
@@ -405,6 +416,13 @@ public actor ProviderRegistry {
     public func defaultImageProvider() async throws -> ImageGenerationProvider? {
         guard let ref = config.models.imageGen else { return nil }
         return try await imageProvider(for: ref)
+    }
+
+    /// Uses the same host-owned `image_model` route as generation. The model
+    /// never selects a provider or model through `edit_image` arguments.
+    public func defaultImageEditingProvider() async throws -> ImageEditingProvider? {
+        guard let ref = config.models.imageGen else { return nil }
+        return try await imageEditingProvider(for: ref)
     }
 
     public func defaultTranscriptionProvider() async throws -> TranscriptionProvider? {

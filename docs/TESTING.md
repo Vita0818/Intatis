@@ -2,7 +2,7 @@
 
 文档状态：当前验证矩阵
 最近核对：2026-08-05
-产品基线：v0.35（build 35）
+产品基线：v0.36（build 36）
 
 历史测试数量、性能数字和事故复验保留在 Git 历史及 dated reports；它们不能替代当前
 working tree 的验证。这里只记录现行命令、release gate 和最近一次真实结果。
@@ -27,11 +27,11 @@ scripts/check-version-consistency.sh
 
 必须同时满足：
 
-- `project.yml`：`MARKETING_VERSION=0.35`，`CURRENT_PROJECT_VERSION=35`；
-- macOS/iOS 参考 Info.plist：`0.35 (35)`；
+- `project.yml`：`MARKETING_VERSION=0.36`，`CURRENT_PROJECT_VERSION=36`；
+- macOS/iOS 参考 Info.plist：`0.36 (36)`；
 - 生成的 `Intatis.xcodeproj`：相同版本；
 - README、文档索引、CURRENT_STATE 和 PROJECT_MAP：相同当前基线；
-- 最终 App bundle：`CFBundleShortVersionString=0.35`、`CFBundleVersion=35`。
+- 最终 App bundle：`CFBundleShortVersionString=0.36`、`CFBundleVersion=36`。
 
 旧设计文档、依赖版本、协议 schema 和 dated reports 中的其他 v0.x 不属于该一致性检查。
 
@@ -248,7 +248,60 @@ adapter/capability 矩阵。2026-08-05 已新增并通过 provider focused tests
 routing options、结构化 unsupported 同路由一次降级、裸 404 拒绝降级、partial payload 后禁止重放
 及 citation 安全解析。macOS/iOS app build 与完整回归结果以本文件“最近一次真实结果”为准。
 
+## 图片工具与 `image_model` 配置验收矩阵
+
+涉及 macOS/modern CLI 图片路由时，至少验证：
+
+- 顶层 canonical `image_model` 的 `<provider>/<model-id>` 精确解析到
+  `ResolvedModels.imageGen`，不改变当前 Chat/Code/Cowork inference selection；
+- 专用图片 provider 可使用空 `models`，连接仍保留，但不生成 inference profile 或进入模型菜单；
+- 图片 model ID 不需要作为推理 model 重复登记；model-facing `generate_image` 与
+  `edit_image` schema 都不包含 provider/model 字段；
+- 缺少 `image_model` 时 `models.imageGen == nil`，两个工具执行都明确报未配置，不能出现
+  `dall-e-3` 或其他 hidden fallback；
+- provider wire 继续只接受合法 HTTP(S) Base URL；生成调用 OpenAI-compatible
+  `/images/generations`，编辑调用 multipart `/images/edits`，两者都验证
+  `data[].b64_json`；
+- `edit_image` 必须在任何网络请求前验证输入/输出均位于 workspace、输入是受支持且魔数匹配的
+  PNG/JPEG/WebP 普通文件、输入不超过 50 MiB、输入输出不相同且输出扩展名是 `.png`；
+- 两个工具的文件写入都经过 permission、workspace lease 与 `PathConfinement`；Cowork
+  read-only worker 与 reviewer 不得看到 `edit_image`。当前首版只支持单张输入图，不支持 mask、
+  多参考图或原地覆盖。
+
 ## 最近一次真实结果
+
+2026-08-05 `v0.36 (36)` 版本、shipping target 构建与本机安装的直接证据：
+
+- `xcodegen generate`：通过；`scripts/check-version-consistency.sh`：通过并输出
+  `Intatis version is consistent: 0.36 (build 36)`；
+- `IntatisMac` unsigned universal Release：通过；最终 bundle 为 `0.36 (36)`，可执行文件包含
+  `x86_64 arm64`。安装前以仓库 Developer ID entitlements 完成 ad-hoc Hardened Runtime 签名，
+  `codesign --verify --deep --strict` 通过；
+- `/Applications/Intatis.app` 已替换为上述 `0.36 (36)` 开发构建，bundle identifier 为
+  `com.Vita0818.IntatisMac` 且无 quarantine xattr；旧 `0.35 (35)` 已移入废纸篓作为可恢复备份；
+- `IntatisiOS` generic Simulator Debug unsigned build：通过；最终 bundle 为 `0.36 (36)`；
+- 本轮没有运行 Developer ID 签名、公证、staple、Gatekeeper 或 DMG/ZIP 打包，因此这只是本机
+  开发安装证据，不是正式 release 证据。完整离线图片工具测试仍见紧随其后的专项结果。
+
+2026-08-05 `image_model` / `generate_image` / `edit_image` 配置路由的直接证据：
+
+- `CLIProviderAdapterTests`：4 tests / 0 failures；新增用例验证 image-only provider 的空
+  `models` 不影响 Chat selection、`image_model` 精确映射到独立 opaque endpoint/model，以及字段
+  缺失时无隐藏 fallback；
+- `IntatisProvidersMultimodalTests`：17 tests / 0 failures；覆盖 image provider registry、
+  `images/generations` JSON、`images/edits` multipart reference、DALL-E 2 的显式 base64 response、
+  `b64_json` decode、非法 URL、provider payload error、timeout/retry 与 no-image-model nil route；
+- `IntatisToolsTests`：144 tests / 15 skipped / 0 failures；覆盖 `edit_image` schema/registry、单图
+  preflight、输入/输出权限资源分离、无副作用拒绝与宿主 service 注入；
+- `IntatisAgentKernelTests`：171 tests / 0 failures；其中 provider image service 用例验证编辑调用使用
+  configured image model 而非 Chat model，并把结果写回 workspace；
+- `CoworkEndToEndTests`、`MessageDelegationSplitTests`、`ToolRegistryLeaseTests`：合计 28 tests /
+  0 failures；覆盖 coordinator/read-write worker 的 `generateMedia` 暴露以及 read-only worker 的
+  `edit_image` 抑制；
+- `IntatisMac` macOS Debug unsigned build：通过；构建和上述离线测试均不需要 API Key；
+- 当前尚未执行真实 provider/credential/network 图片生成或编辑 smoke，因此不声称任何具体线上
+  模型、provider 方言、size/count/quality 组合或计费路径已通过。首版编辑只支持单张输入图；mask、
+  多参考图和原地覆盖仍未实现。
 
 2026-08-05 Cowork coordinator 主动推进与外部目录恢复提示词的直接证据：
 
@@ -350,7 +403,7 @@ routing options、结构化 unsupported 同路由一次降级、裸 404 拒绝�
 只有以下条件同时满足才能写 release GO：
 
 - 当前 working tree 相关 tests/builds 通过，已知失败有明确处置；
-- 最终 App/ZIP/DMG 元数据为 `0.35 (35)`；
+- 最终 App/ZIP/DMG 元数据为 `0.36 (36)`；
 - Developer ID、notarization、staple、codesign、Gatekeeper 全部通过；
 - NOTICE/ThirdPartyNotices 和最终 bundle resource/link inventory 一致；
 - 关键真实环境矩阵完成，未完成项以明确的风险接受记录处理。

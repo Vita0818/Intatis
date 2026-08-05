@@ -2,7 +2,7 @@
 
 文档状态：当前 Cowork/AgentKernel 原则
 最近核对：2026-08-05
-产品基线：v0.35（build 35）
+产品基线：v0.36（build 36）
 
 本文提炼自仓内 v0.10 历史 Cowork 设计文档、`PER_AGENT_INFERENCE_PROFILES.md` 及
 项目操作规则。旧设计文档只保留迁移 provenance；本文件是当前原则基准，**不是**完成度

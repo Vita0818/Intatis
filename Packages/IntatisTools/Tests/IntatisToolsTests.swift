@@ -211,6 +211,22 @@ private struct FakeImageGenerator: ImageGenerationToolService {
         try Data("fake-image".utf8).write(to: url)
         return ToolObservation(text: "generated fake image: \(outputPath)", changedFiles: [outputPath])
     }
+
+    func editImage(image: Data,
+                   filename: String,
+                   mime: String,
+                   prompt: String,
+                   outputPath: String,
+                   workspaceRoot: URL) async throws -> ToolObservation {
+        let url = try PathConfinement.resolve(outputPath, within: workspaceRoot)
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true)
+        try Data("fake-edited-image".utf8).write(to: url)
+        return ToolObservation(
+            text: "edited \(filename) (\(mime), \(image.count) bytes) with \(prompt)",
+            changedFiles: [outputPath])
+    }
 }
 
 final class IntatisToolsTests: XCTestCase {
@@ -1666,6 +1682,61 @@ final class IntatisToolsTests: XCTestCase {
 
         XCTAssertEqual(obs.changedFiles, ["art/icon.png"])
         XCTAssertEqual(try String(contentsOf: ws.appendingPathComponent("art/icon.png"), encoding: .utf8), "fake-image")
+    }
+
+    func testEditImageUsesInjectedService() async throws {
+        let ws = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let input = ws.appendingPathComponent("source.png")
+        try Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00])
+            .write(to: input)
+        let ctx = ToolContext(workspaceRoot: ws, imageGenerator: FakeImageGenerator())
+
+        let observation = try await EditImageTool().execute(
+            ToolArgs(raw: #"{"imagePath":"source.png","prompt":"make the sky warmer","outputPath":"art/edited.png"}"#),
+            in: ctx)
+
+        XCTAssertEqual(observation.changedFiles, ["art/edited.png"])
+        XCTAssertEqual(
+            try String(contentsOf: ws.appendingPathComponent("art/edited.png"), encoding: .utf8),
+            "fake-edited-image")
+    }
+
+    func testEditImageRejectsSameInputAndOutputBeforeCallingService() async throws {
+        let ws = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let input = ws.appendingPathComponent("source.png")
+        try Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00])
+            .write(to: input)
+
+        do {
+            _ = try await EditImageTool().execute(
+                ToolArgs(raw: #"{"imagePath":"source.png","prompt":"change it","outputPath":"source.png"}"#),
+                in: ToolContext(workspaceRoot: ws, imageGenerator: FakeImageGenerator()))
+            XCTFail("same input and output path should be rejected")
+        } catch let error as ToolExecutionRejectedWithoutSideEffect {
+            XCTAssertEqual(error.code, "edit_image_same_path")
+        }
+        XCTAssertEqual(try Data(contentsOf: input),
+                       Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00]))
+    }
+
+    func testEditImagePermissionIntentSeparatesReadAndWritePaths() {
+        let intent = EditImageTool().permissionIntent(
+            ToolArgs(raw: #"{"imagePath":"source.webp","prompt":"change it","outputPath":"result.png"}"#),
+            workspaceRoot: URL(fileURLWithPath: "/workspace"))
+
+        XCTAssertEqual(intent.action, "media.edit")
+        XCTAssertEqual(intent.dataEffects, [.read, .mutate, .network])
+        XCTAssertEqual(intent.replayPolicy, .requiresManualReconciliation)
+        XCTAssertEqual(intent.resources, [
+            PermissionResource(kind: .workspacePath,
+                               value: "source.webp",
+                               access: .readOnly),
+            PermissionResource(kind: .workspacePath,
+                               value: "result.png",
+                               access: .readWrite),
+        ])
     }
 
     // MARK: Network/browser tools
@@ -3813,7 +3884,7 @@ final class IntatisToolsTests: XCTestCase {
 
     func testStandardRegistry() {
         let reg = ToolRegistry.standard()
-        XCTAssertEqual(reg.descriptors().count, 59)
+        XCTAssertEqual(reg.descriptors().count, 60)
         XCTAssertNotNil(reg.tool(named: "read_file"))
         XCTAssertNotNil(reg.tool(named: "apply_patch"))
         XCTAssertNil(reg.tool(named: "run_shell"))
@@ -3847,6 +3918,7 @@ final class IntatisToolsTests: XCTestCase {
         XCTAssertNotNil(reg.tool(named: "reconstruct_document_image"))
         XCTAssertNotNil(reg.tool(named: "compile_latex"))
         XCTAssertNotNil(reg.tool(named: "generate_image"))
+        XCTAssertNotNil(reg.tool(named: "edit_image"))
         XCTAssertNotNil(reg.tool(named: "web_fetch"))
         XCTAssertNotNil(reg.tool(named: "browser_diagnostics"))
         XCTAssertNotNil(reg.tool(named: "browser_profiles"))
@@ -3893,6 +3965,7 @@ final class IntatisToolsTests: XCTestCase {
         XCTAssertTrue(GitPushTool().risksNetwork(ToolArgs(raw: "{}")))
         XCTAssertEqual(GitSwitchBranchTool.descriptor.sideEffect, .destructive)
         XCTAssertEqual(GenerateImageTool.descriptor.sideEffect, .write)
+        XCTAssertEqual(EditImageTool.descriptor.sideEffect, .write)
         XCTAssertEqual(WebFetchTool.descriptor.sideEffect, .network)
         XCTAssertEqual(BrowserNavigateTool.descriptor.sideEffect, .exec)
         XCTAssertEqual(BrowserProfilesTool.descriptor.sideEffect, .readOnly)

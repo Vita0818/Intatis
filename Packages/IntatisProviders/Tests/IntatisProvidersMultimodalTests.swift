@@ -8,6 +8,27 @@ private struct FakeDataClient: HTTPDataClient {
     func send(_ request: URLRequest) async throws -> (data: Data, status: Int) { (response, status) }
 }
 
+private final class CapturingDataClient: HTTPDataClient, @unchecked Sendable {
+    private let queue = DispatchQueue(label: "intatis.tests.image-edit-http")
+    private let response: Data
+    private let status: Int
+    private var requests: [URLRequest] = []
+
+    init(response: Data, status: Int = 200) {
+        self.response = response
+        self.status = status
+    }
+
+    var lastRequest: URLRequest? {
+        queue.sync { requests.last }
+    }
+
+    func send(_ request: URLRequest) async throws -> (data: Data, status: Int) {
+        queue.sync { requests.append(request) }
+        return (response, status)
+    }
+}
+
 private final class SequencedDataClient: HTTPDataClient, @unchecked Sendable {
     private let queue = DispatchQueue(label: "intatis.tests.sequenced-data")
     private var index = 0
@@ -215,6 +236,52 @@ final class IntatisProvidersMultimodalTests: XCTestCase {
         }
     }
 
+    func testImageEditSendsMultipartReferenceAndParsesBase64() async throws {
+        let b64 = Data("EDITED-PNG".utf8).base64EncodedString()
+        let response = Data("{\"data\":[{\"b64_json\":\"\(b64)\"}]}".utf8)
+        let client = CapturingDataClient(response: response)
+        let provider = OpenAIImageProvider(endpoint: ep, apiKey: "k", http: client)
+
+        let image = try await provider.edit(ImageEditRequest(
+            model: ModelID(rawValue: "image-model"),
+            prompt: "make the sky warmer",
+            image: Data("PNGDATA".utf8),
+            filename: "input.png",
+            mime: "image/png"))
+
+        XCTAssertEqual(image.data, Data("EDITED-PNG".utf8))
+        XCTAssertEqual(image.mime, "image/png")
+        let request = try XCTUnwrap(client.lastRequest)
+        XCTAssertEqual(request.url?.absoluteString, "https://example.test/v1/images/edits")
+        XCTAssertEqual(request.httpMethod, "POST")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer k")
+        XCTAssertTrue(request.value(forHTTPHeaderField: "Content-Type")?
+            .hasPrefix("multipart/form-data; boundary=intatis-image-edit-") == true)
+        let body = String(decoding: try XCTUnwrap(request.httpBody), as: UTF8.self)
+        XCTAssertTrue(body.contains("name=\"model\"\r\n\r\nimage-model"))
+        XCTAssertTrue(body.contains("name=\"image[]\"; filename=\"input.png\""))
+        XCTAssertTrue(body.contains("Content-Type: image/png\r\n\r\nPNGDATA"))
+        XCTAssertTrue(body.contains("name=\"prompt\"\r\n\r\nmake the sky warmer"))
+        XCTAssertFalse(body.contains("name=\"response_format\""))
+    }
+
+    func testDallE2ImageEditRequestsBase64Response() async throws {
+        let b64 = Data("EDITED-PNG".utf8).base64EncodedString()
+        let response = Data("{\"data\":[{\"b64_json\":\"\(b64)\"}]}".utf8)
+        let client = CapturingDataClient(response: response)
+        let provider = OpenAIImageProvider(endpoint: ep, apiKey: "k", http: client)
+
+        _ = try await provider.edit(ImageEditRequest(
+            model: ModelID(rawValue: "dall-e-2"),
+            prompt: "change it",
+            image: Data("PNGDATA".utf8)))
+
+        let body = String(
+            decoding: try XCTUnwrap(client.lastRequest?.httpBody),
+            as: UTF8.self)
+        XCTAssertTrue(body.contains("name=\"response_format\"\r\n\r\nb64_json"))
+    }
+
     func testTranscriptionParsesText() async throws {
         let json = Data(#"{"text":"hello world"}"#.utf8)
         let provider = OpenAITranscriptionProvider(endpoint: ep, apiKey: "k", http: FakeDataClient(response: json, status: 200))
@@ -302,6 +369,8 @@ final class IntatisProvidersMultimodalTests: XCTestCase {
                                         dataClient: FakeDataClient(response: Data(), status: 200))
         let provider = try await registry.defaultImageProvider()
         XCTAssertNotNil(provider)
+        let editor = try await registry.defaultImageEditingProvider()
+        XCTAssertNotNil(editor)
     }
 
     func testRegistryNilWhenNoImageModelConfigured() async throws {
@@ -310,5 +379,7 @@ final class IntatisProvidersMultimodalTests: XCTestCase {
                                         resolver: FixedSecret(key: "k"))
         let provider = try await registry.defaultImageProvider()
         XCTAssertNil(provider)
+        let editor = try await registry.defaultImageEditingProvider()
+        XCTAssertNil(editor)
     }
 }

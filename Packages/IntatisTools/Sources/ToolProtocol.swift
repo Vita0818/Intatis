@@ -320,6 +320,12 @@ public protocol ImageGenerationToolService: Sendable {
                        count: Int,
                        outputPath: String,
                        workspaceRoot: URL) async throws -> ToolObservation
+    func editImage(image: Data,
+                   filename: String,
+                   mime: String,
+                   prompt: String,
+                   outputPath: String,
+                   workspaceRoot: URL) async throws -> ToolObservation
 }
 
 /// Seam for agent-to-agent messaging (v0.3). Cowork provides an implementation
@@ -1574,7 +1580,7 @@ public struct ToolRegistry: Sendable {
             GitRemotesTool(), GitFetchTool(), GitPullFastForwardTool(),
             GitPushTool(), GitSwitchBranchTool(),
             ReadPDFTool(), ReadDocumentTool(), EditPDFPagesTool(), ReconstructDocumentImageTool(),
-            CompileLaTeXTool(), GenerateImageTool(),
+            CompileLaTeXTool(), GenerateImageTool(), EditImageTool(),
             WebFetchTool(), BrowserDiagnosticsTool(), BrowserProfilesTool(), BrowserProfileDeleteTool(), BrowserHistoryTool(),
             BrowserNavigateTool(), BrowserSnapshotTool(), BrowserHandoffTool(), BrowserClickTool(),
             BrowserReloadTool(), BrowserBackTool(), BrowserForwardTool(),

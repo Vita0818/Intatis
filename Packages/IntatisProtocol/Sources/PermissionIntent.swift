@@ -158,6 +158,7 @@ public struct PermissionIntent: Codable, Equatable, Sendable {
         case "reconstruct_document_image": return "document.reconstruct"
         case "compile_latex": return "document.compile"
         case "generate_image": return "media.generate"
+        case "edit_image": return "media.edit"
         case "web_fetch": return "network.fetch"
         case "run_shell": return "process.execute"
         default:

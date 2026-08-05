@@ -3,8 +3,8 @@ import IntatisCore
 import IntatisProviders
 import IntatisTools
 
-/// Bridges the generic `generate_image` tool to the configured provider catalog
-/// without making IntatisTools depend on provider code.
+/// Bridges the generic image tools to the configured provider catalog without
+/// making IntatisTools depend on provider code.
 public struct ProviderImageGenerationToolService: ImageGenerationToolService {
     private let registry: ProviderRegistry
 
@@ -40,6 +40,35 @@ public struct ProviderImageGenerationToolService: ImageGenerationToolService {
         return ToolObservation(
             text: "generated \(images.count) image(s) with \(model.rawValue): \(changed.joined(separator: ", "))",
             changedFiles: changed)
+    }
+
+    public func editImage(image: Data,
+                          filename: String,
+                          mime: String,
+                          prompt: String,
+                          outputPath: String,
+                          workspaceRoot: URL) async throws -> ToolObservation {
+        guard let provider = try await registry.defaultImageEditingProvider(),
+              let model = await registry.imageModel() else {
+            throw IntatisError.config("image editing is not configured")
+        }
+
+        let outputURL = try PathConfinement.resolve(outputPath, within: workspaceRoot)
+        let edited = try await provider.edit(ImageEditRequest(
+            model: model,
+            prompt: prompt,
+            image: image,
+            filename: filename,
+            mime: mime))
+        try FileManager.default.createDirectory(
+            at: outputURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true)
+        try edited.data.write(to: outputURL, options: .atomic)
+
+        let changed = PathConfinement.relativePath(of: outputURL, root: workspaceRoot)
+        return ToolObservation(
+            text: "edited image with \(model.rawValue): \(changed)",
+            changedFiles: [changed])
     }
 
     private func numberedURL(_ url: URL, index: Int) -> URL {

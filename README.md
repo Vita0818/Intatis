@@ -1,7 +1,7 @@
 # Intatis
 
-当前版本：**v0.35**（build 35）
-状态：pre-1.0；源码与构建可验证，v0.35 Developer ID 发行候选尚待完成最终公证验收。
+当前版本：**v0.36**（build 36）
+状态：pre-1.0；源码与构建可验证，v0.36 Developer ID 发行候选尚待完成最终公证验收。
 
 Intatis 是 Apple-first、Swift-native 优先的本地 AI 工作区。macOS 提供 Chat、Code、
 Cowork 三个产品面；iOS 是严格的 Chat 子集；CLI 提供 headless Code/Cowork 和外部 MCP
@@ -117,10 +117,49 @@ SHA-256 清单。不要把证书私钥、Apple 密码或 app-specific password �
 
 - macOS/CLI 高级配置读取 `INTATIS_CONFIG`、Intatis-owned JSON/JSONC 路径及兼容 fallback；
   不默认读取 OpenCode app 配置。
+- Code/Cowork 的 `generate_image` 与 `edit_image` 共用顶层 `image_model` 宿主路由；主 agent
+  只提交任务参数，不选择 provider/model。`edit_image` 接收工作区内的 `imagePath`、编辑 prompt
+  和新的 `.png` `outputPath`。未配置时明确失败，不再暗中回退到固定模型。
 - session 数据默认位于用户 App Support 下，每个 session 使用 append-only EventLog。
 - browser profile、workspace artifact、credential 和 bookmark 不应提交到 Git，也不会进入
   本地诊断 ZIP。
 - 日志导出当前不做远程上传；Apple notarization 仅在用户显式运行发行脚本时发生。
+
+最小配置示例（图片 provider 也可与 Chat provider 相同）：
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "chat/chat-model",
+  "image_model": "images/gpt-image-1",
+  "provider": {
+    "chat": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "https://chat.example.com/v1",
+        "apiKey": "{env:CHAT_API_KEY}"
+      },
+      "models": {
+        "chat-model": { "name": "Chat Model" }
+      }
+    },
+    "images": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "https://images.example.com/v1",
+        "apiKey": "{env:IMAGE_API_KEY}"
+      },
+      "models": {}
+    }
+  }
+}
+```
+
+`image_model` 是 Intatis 的顶层扩展字段，格式为 `<provider>/<model-id>`。专用图片 provider
+可保持空 `models`，因此不会混入 Chat/Code/Cowork 的推理模型菜单；当前 backend 要求该 route
+兼容 `POST <baseURL>/images/generations` 与 multipart `POST <baseURL>/images/edits`，并返回
+`data[].b64_json`。`edit_image` 当前支持单张 PNG/JPEG/WebP 输入（最多 50 MiB）并写出新的 PNG；
+尚不支持 mask、多参考图或原地覆盖输入图。
 
 ## 许可证
 

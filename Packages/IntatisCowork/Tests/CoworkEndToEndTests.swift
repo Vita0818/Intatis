@@ -381,6 +381,7 @@ final class CoworkEndToEndTests: XCTestCase {
         XCTAssertFalse(tools.contains("edit_pdf_pages"), file: file, line: line)
         XCTAssertFalse(tools.contains("compile_latex"), file: file, line: line)
         XCTAssertFalse(tools.contains("generate_image"), file: file, line: line)
+        XCTAssertFalse(tools.contains("edit_image"), file: file, line: line)
         XCTAssertFalse(tools.contains("web_fetch"), file: file, line: line)
         XCTAssertFalse(tools.contains("browser_diagnostics"), file: file, line: line)
         XCTAssertFalse(tools.contains("browser_profiles"), file: file, line: line)

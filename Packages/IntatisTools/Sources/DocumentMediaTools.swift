@@ -800,6 +800,183 @@ public struct GenerateImageTool: Tool {
     }
 }
 
+// MARK: - edit_image
+
+public struct EditImageTool: Tool {
+    public init() {}
+
+    static let maximumInputMiB = 50
+    static let maximumInputBytes = maximumInputMiB * 1_024 * 1_024
+    private static let supportedImageMIMEs: [String: String] = [
+        "jpeg": "image/jpeg",
+        "jpg": "image/jpeg",
+        "png": "image/png",
+        "webp": "image/webp",
+    ]
+
+    public static let descriptor = ToolDescriptor(
+        name: "edit_image",
+        description: "Edit one existing PNG, JPEG, or WebP image in the workspace using the configured image provider. Writes a new PNG file; imagePath and outputPath must be different.",
+        sideEffect: .write,
+        parameters: Schema.object([
+            "imagePath": Schema.nonEmptyString,
+            "prompt": Schema.boundedString(minLength: 1, maxLength: 32_000),
+            "outputPath": Schema.nonEmptyString,
+        ], required: ["imagePath", "prompt", "outputPath"])
+    )
+
+    struct Args: Decodable {
+        let imagePath: String
+        let prompt: String
+        let outputPath: String
+    }
+
+    public func touchedPaths(_ args: ToolArgs) -> [String] {
+        guard let value = try? args.decode(Args.self) else { return [] }
+        return [value.imagePath, value.outputPath]
+    }
+
+    public func risksNetwork(_ args: ToolArgs) -> Bool { true }
+
+    public func permissionIntent(_ args: ToolArgs, workspaceRoot: URL) -> PermissionIntent {
+        let value = try? args.decode(Args.self)
+        var resources: [PermissionResource] = []
+        if let imagePath = value?.imagePath {
+            resources.append(PermissionResource(
+                kind: .workspacePath,
+                value: imagePath,
+                access: .readOnly))
+        }
+        if let outputPath = value?.outputPath {
+            resources.append(PermissionResource(
+                kind: .workspacePath,
+                value: outputPath,
+                access: .readWrite))
+        }
+        return PermissionIntent(
+            action: "media.edit",
+            resources: resources,
+            metadata: [
+                "operation": .string("edit_image"),
+                "promptCharacterCount": .number(Double(value?.prompt.count ?? 0)),
+            ],
+            dataEffects: [.read, .mutate, .network],
+            risks: [.workspaceMutation, .networkAccess, .modelCost],
+            replayPolicy: .requiresManualReconciliation)
+    }
+
+    public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {
+        let value = try args.decode(Args.self)
+        let prompt = value.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !prompt.isEmpty else {
+            throw ToolExecutionRejectedWithoutSideEffect(
+                code: "edit_image_empty_prompt",
+                message: "edit_image prompt must contain non-whitespace text")
+        }
+
+        let inputURL: URL
+        let outputURL: URL
+        do {
+            inputURL = try PathConfinement.resolve(value.imagePath, within: context.workspaceRoot)
+            outputURL = try PathConfinement.resolve(value.outputPath, within: context.workspaceRoot)
+        } catch {
+            throw ToolExecutionRejectedWithoutSideEffect(
+                code: "edit_image_invalid_path",
+                message: "edit_image input and output must resolve inside the workspace")
+        }
+        guard inputURL.standardizedFileURL.path != outputURL.standardizedFileURL.path else {
+            throw ToolExecutionRejectedWithoutSideEffect(
+                code: "edit_image_same_path",
+                message: "edit_image outputPath must be different from imagePath")
+        }
+        guard outputURL.pathExtension.lowercased() == "png" else {
+            throw ToolExecutionRejectedWithoutSideEffect(
+                code: "edit_image_output_must_be_png",
+                message: "edit_image outputPath must use the .png extension")
+        }
+
+        let resourceValues: URLResourceValues
+        do {
+            resourceValues = try inputURL.resourceValues(forKeys: [
+                .isRegularFileKey,
+                .fileSizeKey,
+            ])
+        } catch {
+            throw ToolExecutionRejectedWithoutSideEffect(
+                code: "edit_image_input_unavailable",
+                message: "edit_image could not inspect the input image")
+        }
+        guard resourceValues.isRegularFile == true else {
+            throw ToolExecutionRejectedWithoutSideEffect(
+                code: "edit_image_not_regular_file",
+                message: "edit_image imagePath must be a regular file")
+        }
+        if let fileSize = resourceValues.fileSize,
+           fileSize > Self.maximumInputBytes {
+            throw ToolExecutionRejectedWithoutSideEffect(
+                code: "edit_image_input_too_large",
+                message: "edit_image input exceeds the \(Self.maximumInputMiB) MiB safety limit")
+        }
+
+        let fileExtension = inputURL.pathExtension.lowercased()
+        guard let mime = Self.supportedImageMIMEs[fileExtension] else {
+            throw ToolExecutionRejectedWithoutSideEffect(
+                code: "edit_image_unsupported_format",
+                message: "edit_image supports PNG, JPEG, and WebP input images")
+        }
+
+        let image: Data
+        do {
+            image = try Data(contentsOf: inputURL, options: .mappedIfSafe)
+        } catch {
+            throw ToolExecutionRejectedWithoutSideEffect(
+                code: "edit_image_input_unreadable",
+                message: "edit_image could not read the input image")
+        }
+        guard !image.isEmpty, image.count <= Self.maximumInputBytes else {
+            throw ToolExecutionRejectedWithoutSideEffect(
+                code: image.isEmpty ? "edit_image_input_empty" : "edit_image_input_too_large",
+                message: image.isEmpty
+                    ? "edit_image input image is empty"
+                    : "edit_image input exceeds the \(Self.maximumInputMiB) MiB safety limit")
+        }
+        guard Self.matchesImageSignature(image, fileExtension: fileExtension) else {
+            throw ToolExecutionRejectedWithoutSideEffect(
+                code: "edit_image_invalid_image",
+                message: "edit_image input bytes do not match the file extension")
+        }
+        guard let generator = context.imageGenerator else {
+            throw IntatisError.config("edit_image is not configured; attach an image provider or local image backend before using this tool")
+        }
+
+        let normalizedExtension = fileExtension == "jpeg" ? "jpg" : fileExtension
+        return try await generator.editImage(
+            image: image,
+            filename: "input.\(normalizedExtension)",
+            mime: mime,
+            prompt: prompt,
+            outputPath: value.outputPath,
+            workspaceRoot: context.workspaceRoot)
+    }
+
+    private static func matchesImageSignature(_ data: Data,
+                                              fileExtension: String) -> Bool {
+        let bytes = [UInt8](data.prefix(12))
+        switch fileExtension {
+        case "png":
+            return bytes.starts(with: [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+        case "jpg", "jpeg":
+            return bytes.starts(with: [0xFF, 0xD8, 0xFF])
+        case "webp":
+            return bytes.count >= 12
+                && Array(bytes[0..<4]) == [0x52, 0x49, 0x46, 0x46]
+                && Array(bytes[8..<12]) == [0x57, 0x45, 0x42, 0x50]
+        default:
+            return false
+        }
+    }
+}
+
 private extension String {
     var nilIfEmpty: String? {
         isEmpty ? nil : self

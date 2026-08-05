@@ -9659,7 +9659,7 @@ public actor Orchestrator {
             register([CompileLaTeXTool()], granting: [.compileLaTeX])
         }
         if lease.tools.contains(.generateMedia) {
-            register([GenerateImageTool()], granting: [.generateMedia])
+            register([GenerateImageTool(), EditImageTool()], granting: [.generateMedia])
         }
         if lease.tools.contains(.browseWeb) {
             register([

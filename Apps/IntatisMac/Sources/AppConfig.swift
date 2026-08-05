@@ -276,6 +276,9 @@ struct AppProviderCatalog: Codable, Equatable {
     var selectedProviderID: String
     var selectedModelID: String
     var selectedVariantID: String? = nil
+    /// Host-owned default for image generation and editing. Model-facing image
+    /// tools never receive or select this route.
+    var imageModel: ModelRef? = nil
     /// Legacy field retained only so existing configuration can be decoded and
     /// preserved. Chat runtime routing deliberately ignores it.
     var webSearchModel: ModelRef? = nil
@@ -541,9 +544,11 @@ enum AppConfig {
             chat: chat,
             webSearch: catalog.webSearchModel,
             agent: chat)
-        // image + transcription default to the selected endpoint until dedicated
-        // role-specific model settings exist.
-        models.imageGen = ModelRef(endpoint: selectedProvider.id, model: ModelID(rawValue: "dall-e-3"))
+        // Image generation is an explicit role-specific route. Missing config
+        // stays nil so the tool fails closed instead of selecting a hidden model.
+        models.imageGen = catalog.imageModel
+        // Transcription retains its legacy selected-endpoint default until it
+        // receives a separate role-specific configuration contract.
         models.transcription = ModelRef(endpoint: selectedProvider.id, model: ModelID(rawValue: "whisper-1"))
         return ProviderConfig(endpoints: endpoints.isEmpty ? [endpoint(for: selectedProvider)] : endpoints,
                               models: models)
@@ -565,6 +570,11 @@ enum AppConfig {
             let id = provider.id.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !id.isEmpty, !seenProviders.contains(id) else { return nil }
             seenProviders.insert(id)
+            let isDedicatedImageProvider = catalog.imageModel.map {
+                normalizedProviderID($0.endpoint) == normalizedProviderID(id)
+            } ?? false
+            let isSelectedProvider = normalizedProviderID(catalog.selectedProviderID)
+                == normalizedProviderID(id)
 
             let baseURL = baseURL(fromChatEndpoint: provider.baseURL)
             let rawChatEndpoint = provider.chatEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -596,7 +606,7 @@ enum AppConfig {
                     ? legacyAPIKeyAccount(forProviderID: id)
                     : provider.apiKeyAccount.trimmingCharacters(in: .whitespacesAndNewlines),
                 apiKeySource: provider.apiKeySource,
-                models: models.isEmpty
+                models: models.isEmpty && (!isDedicatedImageProvider || isSelectedProvider)
                     ? [AppProviderModel(id: defaultModel, displayName: defaultDisplayName(for: defaultModel))]
                     : models)
         }
@@ -617,7 +627,10 @@ enum AppConfig {
         let selectedModel = selectedProvider.models.first { $0.id == selectedModelID }
         let selectedVariantID = selectedModel?.variants
             .first(where: { $0.id == catalog.selectedVariantID })?.id
-        let webSearchModel = normalizedBackgroundModelRef(
+        let imageModel = normalizedRoleModelRef(
+            catalog.imageModel,
+            providers: providers)
+        let webSearchModel = normalizedRoleModelRef(
             catalog.webSearchModel,
             providers: providers)
 
@@ -625,11 +638,12 @@ enum AppConfig {
             selectedProviderID: selectedProviderID,
             selectedModelID: selectedModelID,
             selectedVariantID: selectedVariantID,
+            imageModel: imageModel,
             webSearchModel: webSearchModel,
             providers: providers)
     }
 
-    private static func normalizedBackgroundModelRef(
+    private static func normalizedRoleModelRef(
         _ ref: ModelRef?,
         providers: [AppProviderSettings]
     ) -> ModelRef? {
@@ -1059,6 +1073,10 @@ enum AppConfig {
         root["$schema"] = "https://opencode.ai/config.json"
         root["enabled_providers"] = catalog.providers.map(\.id)
         root["model"] = selectedOpenCodeModel(in: catalog)
+        if let imageModel = catalog.imageModel {
+            root.removeValue(forKey: "imageModel")
+            root["image_model"] = openCodeModelReference(imageModel)
+        }
 
         var providerMap = root["provider"] as? [String: Any] ?? [:]
         for provider in catalog.providers {
@@ -1100,6 +1118,10 @@ enum AppConfig {
         let selectedModel = selectedProvider.models.first { $0.id == catalog.selectedModelID }
             ?? selectedProvider.models.first
         return "\(selectedProvider.id)/\(selectedModel?.id ?? defaultModel)"
+    }
+
+    private static func openCodeModelReference(_ ref: ModelRef) -> String {
+        "\(ref.endpoint)/\(ref.model.rawValue)"
     }
 
     private static func modelConfigValues(for provider: AppProviderSettings,
@@ -1303,12 +1325,14 @@ private struct AppProviderConfigTemplate: Encodable {
     var schema = "https://opencode.ai/config.json"
     var enabledProviders: [String]
     var model: String
+    var imageModel: String?
     var provider: [String: AppProviderConfigTemplateProvider]
 
     enum CodingKeys: String, CodingKey {
         case schema = "$schema"
         case enabledProviders = "enabled_providers"
         case model
+        case imageModel = "image_model"
         case provider
     }
 
@@ -1324,6 +1348,9 @@ private struct AppProviderConfigTemplate: Encodable {
             self.model = "\(selectedProvider.id)/\(modelID)"
         } else {
             self.model = AppConfig.defaultModel
+        }
+        self.imageModel = catalog.imageModel.map {
+            "\($0.endpoint)/\($0.model.rawValue)"
         }
         self.provider = Dictionary(uniqueKeysWithValues: catalog.providers.map { provider in
             (provider.id, AppProviderConfigTemplateProvider(
@@ -1382,6 +1409,8 @@ private struct AppProviderConfigFile: Decodable {
     var model: String?
     var smallModel: String?
     var small_model: String?
+    var imageModel: String?
+    var image_model: String?
     var webSearchModel: String?
     var web_search_model: String?
     var enabledProviders: [String]?
@@ -1398,10 +1427,14 @@ private struct AppProviderConfigFile: Decodable {
         let disabled = disabledProviders ?? disabled_providers
         let resolvedModel = resolvedConfigValue(model ?? smallModel ?? small_model,
                                                 configDirectory: configDirectory)
+        let resolvedImageModel = resolvedConfigValue(
+            image_model ?? imageModel,
+            configDirectory: configDirectory)
         let resolvedWebSearchModel = resolvedConfigValue(
             webSearchModel ?? web_search_model,
             configDirectory: configDirectory)
         let split = splitModel(resolvedModel)
+        let imageSplit = splitModel(resolvedImageModel)
         if !entries.isEmpty {
             entries = entries.filter {
                 shouldIncludeProvider(id: $0.id, enabled: enabled, disabled: disabled)
@@ -1415,6 +1448,7 @@ private struct AppProviderConfigFile: Decodable {
                 return provider[id]?.settings(
                     id: id,
                     selectedModelID: providerIDsMatch(split.providerID, id) ? split.modelID : nil,
+                    allowsEmptyModels: providerIDsMatch(imageSplit.providerID, id),
                     configDirectory: configDirectory,
                     configFileURL: configFileURL)
             }
@@ -1452,6 +1486,10 @@ private struct AppProviderConfigFile: Decodable {
             ?? entries.first(where: { $0.id == selectedProvider })?.models.first?.id
             ?? entries[0].models.first?.id
             ?? AppConfig.defaultModel
+        let imageRef = backgroundModelRef(
+            resolvedImageModel,
+            preferredProviderID: selectedProvider,
+            entries: entries)
         let webSearchRef = backgroundModelRef(
             resolvedWebSearchModel,
             preferredProviderID: selectedProvider,
@@ -1460,6 +1498,7 @@ private struct AppProviderConfigFile: Decodable {
         return AppProviderCatalog(selectedProviderID: selectedProvider,
                                   selectedModelID: selectedModel,
                                   selectedVariantID: selectedVariantID,
+                                  imageModel: imageRef,
                                   webSearchModel: webSearchRef,
                                   providers: entries)
     }
@@ -1588,6 +1627,7 @@ private struct AppProviderConfigFileProvider: Decodable {
 
     func settings(id: String,
                   selectedModelID: String?,
+                  allowsEmptyModels: Bool,
                   configDirectory: URL?,
                   configFileURL: URL?) -> AppProviderSettings? {
         let base = options?.baseURL ?? baseURL ?? AppConfig.defaultBaseURL(forProviderID: id)
@@ -1640,7 +1680,7 @@ private struct AppProviderConfigFileProvider: Decodable {
             responsesEndpoint: options?.responsesEndpoint ?? responsesEndpoint,
             apiKeyAccount: apiKeyAccount ?? (id == "default" ? AppConfig.legacyAPIKeyAccount : "provider-\(id)"),
             apiKeySource: source?.isLegacyKeychain == true ? nil : source,
-            models: modelList.isEmpty
+            models: modelList.isEmpty && !allowsEmptyModels
                 ? [AppProviderModel(id: AppConfig.defaultModel, displayName: AppConfig.defaultModel)]
                 : modelList)
     }

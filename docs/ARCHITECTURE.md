@@ -2,7 +2,7 @@
 
 文档状态：当前架构规范
 最近核对：2026-08-05
-产品基线：v0.35（build 35）
+产品基线：v0.36（build 36）
 
 文中较早的 v0.x 只表示能力最初引入或兼容格式冻结的里程碑；除明确标为历史的段落外，
 当前架构判断以本文件、源码和 `project.yml` 为准。
@@ -659,7 +659,17 @@ provider tool_call -> AgentLoop schema validation
 - `edit_pdf_pages`：PDF 页面级 `extract` / `split`，输出路径仍受 `PathConfinement` 限制。
 - `reconstruct_document_image`：只在用户明确要求转换/重建并创建新输出文件时，把文档照片或扫描图像交给已安装的外部成熟后端；当前 wrapper 支持 `docling`、`marker_single`、`tesseract`，输出 Markdown/HTML/text。PDF 阅读不走该工具。
 - `compile_latex`：调用已安装的 `tectonic`、`latexmk`、`xelatex` 或 `pdflatex` 编译 `.tex`，并确认 PDF 产物存在。
-- `generate_image`：通过 `ImageGenerationToolService` 调用现有 provider image capability，将返回图片写入工作区。
+- `generate_image`：主 agent 从用户意图自主决定是否调用；model-facing schema 只包含 `prompt`、
+  `outputPath`、可选 `size` 和 `count`，不暴露 provider/model 选择。宿主通过
+  `ImageGenerationToolService` 从顶层 `image_model` 解析 exact provider/model，调用现有
+  OpenAI-compatible image capability，并将返回图片写入工作区。缺少路由时明确返回未配置，
+  不使用隐藏模型 fallback。
+- `edit_image`：与 `generate_image` 共用上述宿主 route 和 service seam。model-facing schema
+  只有 `imagePath`、`prompt`、`outputPath`；executor 在网络前确认输入是工作区内不超过 50 MiB
+  的 PNG/JPEG/WebP regular file、文件签名与扩展名一致、输出是不同路径的 PNG。权限 intent 把
+  输入标为只读、输出标为可写，并同时声明网络与模型成本；宿主调用 multipart
+  `POST <baseURL>/images/edits`（单个 `image[]`）并原子写回输出。当前不支持 mask、多参考图或
+  原地覆盖。
 
 设计取舍：
 - 当前不把 Docling/Marker/Tesseract/Tectonic/qpdf/ComfyUI/Diffusers 复制进仓库，也不新增 SwiftPM 第三方依赖；它们是可安装后端或后续集成方向。
@@ -1038,6 +1048,16 @@ MultimodalService.generateImage/transcribe/generateVideo(轮询 job)
 - **Chat 搜索路由配置**：搜索运行时只有用户当前选择的 exact Chat route，不存在隐藏第二模型。`web_search_model` / `webSearchModel` 的后台路由语义已取消；兼容 decoder 可以接受并保留旧字段，但 runtime 忽略它，新生成配置不再主动写入，也不因字段存在显示警告或阻止普通 Chat。`responsesEndpoint`、URL、provider/model 名称同样不能证明兼容；能力来自受审声明和 exact adapter。设置表单、模型菜单和对话均不显示搜索状态或降级提示，durable stats/诊断关联当前实际执行的安全 provider/model identity。
 - **Cowork inference catalog 同步**：macOS `AppInferenceCatalog` 将当前 provider/model/variant 配置编译为 connection/profile drafts，并由 `InferenceCatalogStore` reconcile immutable revisions；connection/trust identity 与 durable variant ID 均使用不暴露 raw URL/config key 的 opaque hash，egress 标为 `user-configured-external`。配置刷新只改变 host-approved candidates/current refs；已有 agent 继续引用原 revision，且 catalog update 与 admission/rebind 通过同一 admission lock 串行化。Refresh 失败时，初始启动 fail closed，已有有效 snapshot 的进程保留上一份有效 snapshot并显示 resolution 错误。CLI 的 `CLIConfig` / `CLIModernProviderConfig` 读取所有启用的 OpenAI-compatible route、model、variant，`CLIInferenceProfiles` 将其全部编译为 immutable profiles；每个 connection revision 保留自己的 exact env/file/auth/config credential reference，`CLIExactSecretResolver` 不会用 selected route 的 credential 替代其他 route 或旧 revision。Modern CLI 的 unqualified model 仅在全 catalog 唯一匹配时切到其 route；显式 reasoning 只能命中 configured variant/base effort，否则 config fail closed。Non-empty recovery 缺失 `@main` 时要求显式 `/agent restore-main`。GUI 将 exact resolution/reviewer health 作为执行状态而非 composer/本地 Send gate；CLI 仍以它们控制显式 data-plane resume。普通 worker unresolved 仍显示在 roster，但不全局暂停 scheduler：其 queued invocation 在 provider dispatch 前 durable fail closed，清除 busy fence 后才可显式 rebind，其他 agents 可继续运行。两端的 list/roster 只投影 safe label/identity/trust classification/resolution，不投影 endpoint、credential 或 options。
 - **macOS advanced config**：macOS GUI 启动时先检查用户显式设置的 `INTATIS_CONFIG` 文件；未设置时按顺序只检查 Intatis-owned 路径：`~/.config/intatis/intatis.json` / `intatis.jsonc`、app support 的 `intatis.json` / `intatis.jsonc`，最后才兜底读取旧 Intatis `config.json` / `config.jsonc`。不会自动发现任何名为 `opencode.json` 的文件，也不读取 `~/.config/opencode/` 下的 OpenCode app 配置；OpenCode-compatible 只表示 JSON shape 兼容。找到可解码的 JSON/JSONC 后覆盖 UserDefaults provider catalog；聊天页当前选择覆盖层仍可覆盖 JSON 顶层 `model`。设置页的 Open Intatis Config 按钮会打开当前生效的 Intatis-owned 文件或 `INTATIS_CONFIG` 显式指定文件；若只发现旧 `config.json`，会从当前 catalog 生成新的 `~/.config/intatis/intatis.json` 模板并优先打开。保存设置时，用户本次主动输入的 API key 会写入同一个可编辑 provider JSON 的 `provider.<id>.options.apiKey`；写入用户 config 失败时回退到 app support `intatis.json`。创建的模板来自当前 provider catalog，只输出 OpenCode-compatible `$schema` / `enabled_providers` / `model` / `provider.<id>.npm` / `name` / `options.baseURL` / `options.apiKey` / `models`，`options.apiKey` 默认是 `{env:...}` 引用而非明文。支持兼容读取旧 direct `providers` 数组，也兼容读取 Intatis 扩展字段 `chatEndpoint` / `apiKeySource`；推荐新配置使用 `provider.<id>.options.baseURL`、`options.apiKey`（OpenCode-style 明文、`{env:NAME}` 或 `{file:path}` 均可由真实请求懒加载）、`models`，以及顶层 `model` 形如 `<provider>/<model-id>`。支持 OpenCode-compatible 的 `enabled_providers` / `disabled_providers` 过滤；`disabled_providers` 优先。省略 `options.apiKey` 时 provider 请求按 provider id 尝试 Intatis auth JSON 与当前 Intatis-owned OpenCode-compatible config，不再回落 OS Keychain。
+- **Image model route**：macOS 与 modern CLI 兼容读取顶层 `image_model`，并兼容旧式 camelCase
+  alias `imageModel`；新模板和保存路径只写 canonical `image_model`。其值为
+  `<provider>/<model-id>`，只绑定宿主 `ResolvedModels.imageGen`，不会修改当前 Chat/Code/Cowork
+  inference selection。显式引用的专用 image provider 可以使用空 `models` map：连接与 credential
+  仍可解析，但不会生成 inference profile 或进入模型菜单。图片 model ID 也不要求重复登记在
+  provider 的推理 `models` 中。`generate_image` / `edit_image` 执行时由宿主读取这一 exact
+  route；字段缺失时 fail closed，模型不能通过工具参数覆盖它。当前 generation wire 调用
+  OpenAI-compatible `POST <baseURL>/images/generations` 并请求 `response_format=b64_json`；edit
+  wire 调用 multipart `POST <baseURL>/images/edits` 并发送单个 `image[]`。两者只接受
+  `data[].b64_json`，不跟随输出 URL；mask 与多参考图尚未进入 tool schema。
 - **provider config reference confinement**：从 provider JSON 产生的直接 `options.apiKey` secret ref 会绑定当前配置文件；历史 UserDefaults 中的 `providerConfig` 路径只有匹配 Intatis 自有候选或当前显式 `INTATIS_CONFIG` 时才可读取，其他路径由 resolver fail closed。
 - **Cowork automatic permission review**：brand-new GUI/CLI Cowork session 以一个本地 durable 七事件 bootstrap 同时记录 settings、fixed `@main` 与 `@permission-reviewer`；初始化不产生模型审批或 provider 请求。恢复的非空 session 先恢复 durable settings/roster；若缺失 `@main`，GUI 从 canonical settings 走 host-authorized exact historical-main recovery，随后才 replacement/retry reviewer，CLI 使用专用 `/agent restore-main`。审查者固定 read_only、无工具 lease、无通信/委派、`coordinationDepth=0`，不会启动嵌套 `AgentLoop`；`AgentPermissionResponder` 把宿主解析的 `ResolvedToolAuthorization`、参数 digest/count、有界秘密脱敏 action preview 与紧凑 causal/lease metadata 放入 untrusted block 后交给独立 FIFO/single-flight 控制面。审查者只返回 `{"decision":"allow|deny","reason":"non-empty bounded reason"}`，且 risk 不得低于 gate；pre-submit caller cancel 返回 typed deny且不创建 review lifecycle；不可解析输出、空 reason、tool call、timeout、provider error、settled persistence failure 与已登记 review 在 terminal-claim 前被观察到的 cancel durable deny 当前调用；claim 后 cancel 保留唯一 settlement 但 authorization delivery deny。Phase B 将 producer lifecycle 收窄到 request generation：factory 逐代 exact-resolve，provider/timeout race 与 provider-backed terminal claim 校验 exact generation，pre-dispatch terminal 从 running/no-generation 状态唯一 claim；retired producer 不持有 EventLog/actor/authorization，下一 request 不继承 process-lifetime quarantine。`ToolCallingProvider.stream` 必须立即返回 request-owned stream，并传播 consumer termination，shipped OpenAI/URLSession 路径符合；同步永久阻塞的任意第三方实现不在该契约内。GUI 不做隐式人工 fallback；Phase A 后 reviewer 未就绪不锁定 composer，普通请求继续，只有 ask-class tool fail closed；对话页不常驻 reviewer 横幅，异常恢复入口位于 Project Settings 的 Recovery 区。CLI `/auto` 重新启用，只有用户明确 `/default` 才移除审查者并恢复终端人工确认。
 
@@ -1046,8 +1066,9 @@ MultimodalService.generateImage/transcribe/generateVideo(轮询 job)
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "enabled_providers": ["OpenRouter"],
+  "enabled_providers": ["OpenRouter", "Images"],
   "model": "OpenRouter/deepseek/deepseek-chat",
+  "image_model": "Images/gpt-image-1",
   "provider": {
     "OpenRouter": {
       "npm": "@ai-sdk/openai-compatible",
@@ -1059,6 +1080,15 @@ MultimodalService.generateImage/transcribe/generateVideo(轮询 job)
       "models": {
         "deepseek/deepseek-chat": { "name": "DeepSeek Chat" }
       }
+    },
+    "Images": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Images",
+      "options": {
+        "baseURL": "https://images.example.com/v1",
+        "apiKey": "{env:IMAGE_API_KEY}"
+      },
+      "models": {}
     }
   }
 }

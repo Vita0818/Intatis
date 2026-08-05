@@ -2,15 +2,15 @@
 
 文档状态：唯一活跃目标
 最近核对：2026-08-05
-产品基线：v0.35（build 35）
+产品基线：v0.36（build 36）
 
-## 目标：完成 v0.35 Developer ID 直接分发候选
+## 目标：完成 v0.36 Developer ID 直接分发候选
 
-把当前 v0.35 源码收敛为可验证、可安装、可直接分发的 macOS ZIP/DMG；不走 App Store。
+把当前 v0.36 源码收敛为可验证、可安装、可直接分发的 macOS ZIP/DMG；不走 App Store。
 
 ## 已完成
 
-- 版本事实源已推进为 `0.35 (35)`。
+- 版本事实源已推进为 `0.36 (36)`。
 - 新增版本一致性检查，覆盖 `project.yml`、参考 Info.plist、当前入口文档和生成工程。
 - `IntatisMac` 显式启用 Hardened Runtime。
 - `scripts/package-macos-release.sh` 已实现 universal Release、Developer ID App/DMG
@@ -19,7 +19,8 @@
 - 当前仓库文档已重新划分为当前规范和历史证据，README/状态/测试不再以旧 v0.9/v0.16
   里程碑冒充当前版本。
 - Xcode 工程已重新生成；macOS universal Release 与 iOS Simulator Debug 均构建通过，最终
-  bundle 均为 `0.32 (32)`。
+  bundle 均为 `0.36 (36)`；本机已安装 ad-hoc Hardened Runtime 开发构建，但尚未形成
+  Developer ID 公证发行证据。
 - AgentKernel soft-token-budget stale fixture 已在不改生产预算保护的前提下收口；focused
   用例、169 项 AgentKernel suite 与完整 `swift test` 均通过。
 - 用户宿主环境已具备有效 Developer ID Application identity，并已保存 `Intatis-Notary`
@@ -55,6 +56,6 @@
 - 不为 App Store App Sandbox 裁剪 terminal、Git、MCP、Skills 或 workspace 能力。
 - 不实现诊断日志远程上传。
 - 不在缺证书、公证或 Gatekeeper 证据时输出“正式发行”结论。
-- 不把历史 v0.10/v0.16 文档批量改名为 v0.35；它们是历史证据。
+- 不把历史 v0.10/v0.16 文档批量改名为 v0.36；它们是历史证据。
 
 目标完成后删除本文件或替换为下一个单一目标，不再追加已完成里程碑流水账。

@@ -2,18 +2,21 @@
 
 文档状态：当前源码摘要
 最近核对：2026-08-05
-产品基线：v0.35（build 35）
+产品基线：v0.36（build 36）
 
 ## 版本与发行状态
 
 - `HEAD` 与 `origin/main` 当前均为标题为 `v0.34` 的提交 `c4727c1`。仓库没有 Git tag；该
-  commit 标题不是产品版本事实源，`project.yml` 把当前产品基线定义为 `0.35 (35)`。
-- `MARKETING_VERSION` / `CURRENT_PROJECT_VERSION` 已推进为 `0.35 (35)`。两个仓库参考
+  commit 标题不是产品版本事实源，`project.yml` 把当前产品基线定义为 `0.36 (36)`。
+- `MARKETING_VERSION` / `CURRENT_PROJECT_VERSION` 已推进为 `0.36 (36)`。两个仓库参考
   Info.plist、README、文档入口和发行脚本使用同一基线。
+- 2026-08-05 已完成 macOS universal Release 与 iOS Simulator Debug 构建；本机
+  `/Applications/Intatis.app` 已安装 `0.36 (36)` 的 ad-hoc Hardened Runtime 开发构建，旧
+  `0.35 (35)` 位于废纸篓，可恢复。该本机安装不是 Developer ID 公证发行产物。
 - macOS 只发行 `IntatisMac` Developer ID/direct-distribution 产品；不做 Mac App Store。
   `IntatisMacAppStore` 仍是 legacy source target，不进入默认构建、测试或 release gate。
 - 用户宿主终端已报告两个有效 codesigning identity，其中 Developer ID Application 可被发行
-  脚本选取；`Intatis-Notary` Keychain profile 也已配置。v0.35 最终 App/DMG 尚未完成 Apple
+  脚本选取；`Intatis-Notary` Keychain profile 也已配置。v0.36 最终 App/DMG 尚未完成 Apple
   notarization、staple 与 Gatekeeper 全链路，因此仍不得描述为正式 release。
 
 ## 当前产品面
@@ -29,6 +32,14 @@ macOS 是完整产品：Chat、Code、Cowork、Settings 和本地诊断导出。
 - Code 使用共享 headless `AgentRuntime.code`，提供工作区文件、patch、Git、managed
   terminal、Skills、外部 MCP、文档/媒体及浏览器工具。工具可见性、lease、权限和 durable
   execution ticket 在执行前逐层核对。
+- Code/Cowork/CLI 的 `generate_image` 与 `edit_image` 已接入 macOS/CLI 高级配置顶层
+  `image_model`。主 agent 根据用户意图决定是否调用普通工具；model-facing schema 不接受
+  provider/model，宿主统一从配置解析。缺少 `image_model` 时明确返回未配置，不再使用隐藏的
+  `dall-e-3` fallback。专用图片 provider 可以不声明任何推理模型，因而不会进入 Chat/Code/
+  Cowork 模型菜单。`generate_image` 调用 OpenAI-compatible `images/generations`；`edit_image`
+  接受工作区内单张 PNG/JPEG/WebP（最多 50 MiB）、prompt 与不同的 PNG 输出路径，经同一权限、
+  WorkspaceLease、`PathConfinement` 和 durable tool execution 链调用 multipart `images/edits`，
+  两者均只接受 `data[].b64_json` 输出。mask、多参考图与原地覆盖尚未支持。
 - Cowork 使用 `Orchestrator`、FIFO scheduler、MessageBus/Mediator、WorkTask/Goal、
   per-agent exact inference binding、独立 permission reviewer 与 goal verifier 控制面。
   AgentLoop 不同步递归调用另一个 AgentLoop。右侧 Agents 区域中的 ordinary agent 可作为

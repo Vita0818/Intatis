@@ -47,6 +47,9 @@ struct CLIConfig {
     let providerRoutes: [CLIProviderRoute]
     let selectedProviderID: String
     let selectedVariantID: String?
+    /// Host-side route used by `generate_image` and `edit_image`. Agent tool
+    /// arguments never carry this provider/model selection.
+    let imageModel: CLIProviderModelSelection?
     /// The explicitly selected Intatis config is retained only so a lazy
     /// `providerConfig` credential reference can be revalidated. It is never
     /// copied into EventLog/profile bindings or printed by the CLI.
@@ -67,6 +70,7 @@ struct CLIConfig {
          providerRoutes: [CLIProviderRoute]? = nil,
          selectedProviderID: String? = nil,
          selectedVariantID: String? = nil,
+         imageModel: CLIProviderModelSelection? = nil,
          configurationFileURL: URL? = nil) {
         self.baseURL = baseURL
         self.apiKey = apiKey
@@ -85,6 +89,7 @@ struct CLIConfig {
         self.providerRoutes = providerRoutes?.isEmpty == false ? providerRoutes! : [legacy]
         self.selectedProviderID = selectedProviderID ?? legacy.id
         self.selectedVariantID = selectedVariantID
+        self.imageModel = imageModel
         self.configurationFileURL = configurationFileURL
     }
 
@@ -249,6 +254,7 @@ struct CLIConfig {
             providerRoutes: routes,
             selectedProviderID: selectedRoute.id,
             selectedVariantID: selectedVariantID,
+            imageModel: document.imageModel,
             configurationFileURL: configurationFileURL.standardizedFileURL)
     }
 
@@ -321,7 +327,16 @@ struct CLIConfig {
         let ref = ModelRef(
             endpoint: CLIInferenceRouteIdentity.endpointID(route: selectedRoute),
             model: ModelID(rawValue: model))
-        return ProviderConfig(endpoints: endpoints, models: ResolvedModels(chat: ref, agent: ref))
+        var models = ResolvedModels(chat: ref, agent: ref)
+        if let imageModel,
+           let imageRoute = providerRoutes.first(where: {
+               $0.id == imageModel.providerID
+           }) {
+            models.imageGen = ModelRef(
+                endpoint: CLIInferenceRouteIdentity.endpointID(route: imageRoute),
+                model: ModelID(rawValue: imageModel.modelID))
+        }
+        return ProviderConfig(endpoints: endpoints, models: models)
     }
 
     var selectedRouteLabel: String {
