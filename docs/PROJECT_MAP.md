@@ -1,8 +1,8 @@
 # PROJECT_MAP
 
 文档状态：当前仓库地图
-最近自查日期：2026-08-04
-产品基线：v0.32（build 32）
+最近自查日期：2026-08-05
+产品基线：v0.35（build 35）
 
 本文描述当前仓库结构。判断依据来自 `Package.swift`、`project.yml`、`Makefile`、源码、测试文件和脚本。
 
@@ -125,7 +125,7 @@ Intatis/
 |---|---|---|---|
 | `IntatisCore` | lib | — | 类型化 ID、错误、工作区路径约束、平台能力信封、会话类型、`SessionHistoryStore`、session-owned `SessionWorkspaceAccessStore`、进程级低开销 performance diagnostics 与 owner-only bounded hang bundle |
 | `IntatisProtocol` | lib | Core | 结构化事件/线协议词汇（Event/Envelope/JSONRPC/Command/CoworkEvents/Goal/WorkTask/ContinuationRun/TaskGoalEvents/ModelHistory/SessionStateEvents/InferenceProfile/PermissionIntent/PermissionReview/ToolAuthorization/ToolExecution/MultimodalEvents/TurnStats/MessageCitation/JSONValue） |
-| `IntatisProviders` | lib | Core, Protocol | OpenAI-compatible 模型访问、macOS/iOS Chat 的 Responses 托管 `web_search`、可选 exact 搜索 route 与结构化 URL citations、bounded/secret-aware `ChatConfigurationImporter`、OpenCode-shaped npm package adapter selection/lowering、Chat/Code lossless model options、Cowork 显式 durable-options schema、exact per-agent inference catalog/resolver 与只读配置展示投影（ProviderRequestAdapter/ProviderRegistry/InferenceCatalog/InferenceCatalogStore/Capability/Endpoints/ChatProvider/OpenAIWireProvider/OpenAIToolCalling/ChatConfigurationImport/ModelConfigurationPresentation/SSE/HTTPDataClient/ImageGeneration/Transcription/VideoGeneration/ToolCalling） |
+| `IntatisProviders` | lib | Core, Protocol | OpenAI-compatible 模型访问、当前 exact Chat route 的独立 `hosted_web_search` capability/planner、OpenAI `web_search` 与 OpenRouter `openrouter:web_search` dialect encoder、结构化 URL citations 与 typed same-route ordinary fallback、bounded/secret-aware `ChatConfigurationImporter`、OpenCode-shaped npm package adapter selection/lowering、Chat/Code lossless model options、Cowork 显式 durable-options schema、exact per-agent inference catalog/resolver 与只读配置展示投影（ProviderRequestAdapter/ProviderRegistry/InferenceCatalog/InferenceCatalogStore/Capability/Endpoints/ChatProvider/OpenAIWireProvider/OpenAIToolCalling/ChatConfigurationImport/ModelConfigurationPresentation/SSE/HTTPDataClient/ImageGeneration/Transcription/VideoGeneration/ToolCalling） |
 | `IntatisArtifacts` | lib | Core, Protocol | 文件-backed blob 存储 + JSON 索引 |
 | `IntatisConversation` | lib | Core, Protocol, Providers, Artifacts | 事件溯源会话 + UI 投影（跨进程锁定、multi-event WAL 与 checked replay 的 EventLog JSONL / schema-v2 `SessionProjectionStore` / 无本地工具且可冻结托管 web-search 请求与 citation 的 ChatLoop / GoalInputParser / Projection / CodeProjection typed per-agent index 与最多 16-row Cowork page / Cowork live roster + EventLog-derived historical identity roster / settings/Goal/WorkTask/ContinuationRun/tool-execution recovery projection / TurnStatsProjection / `SessionProjectionPump` 逐 seq exact fold、50 ms delta publication、agent-scoped publication、non-delta barrier 与 session/generation/throughSeq fence） |
 | `IntatisPTYLauncher` | internal C helper | libc / macOS `forkpty` | 为 managed terminal 建立真实 controlling PTY；child 在 fork 后只执行 C/POSIX signal/FD/chdir/exec，CLOEXEC error pipe 把启动错误返回父进程；非 macOS 返回不支持 |
@@ -147,10 +147,17 @@ Intatis/
 
 | Target | 类型 | 平台 | Bundle ID | 链接 |
 |---|---|---|---|---|
-| `IntatisMac` | application | macOS 26+ | `com.Vita0818.IntatisMac` | 完整 Chat/Code/Cowork + Skills；Chat 把 provider-hosted Responses 搜索作为无 UI 的透明能力并展示返回 citations，Code/Cowork 网络搜索仍走权限工具；链接 `IntatisMCP` + `IntatisMCPStdio`，DeveloperID/non-sandbox workbench 支持 stdio/HTTP 与显式启用的全局 Skill roots |
+| `IntatisMac` | application | macOS 26+ | `com.Vita0818.IntatisMac` | 完整 Chat/Code/Cowork + Skills；Chat 无搜索 UI，只在当前 exact model 明确声明且 adapter dialect 已实现时以 `tool_choice:auto` 提供托管搜索，否则同模型静默普通 Chat；旧 `web_search_model` 不参与路由。Code/Cowork 网络搜索仍走权限工具；链接 `IntatisMCP` + `IntatisMCPStdio`，DeveloperID/non-sandbox workbench 支持 stdio/HTTP 与显式启用的全局 Skill roots |
 | `IntatisMacAppStore` | legacy application（非发行） | macOS 26+ | `com.Vita0818.IntatisMac` | 源码中尚未删除的旧 App Sandbox/HTTP-only target；不属于产品、默认构建、回归或 release gate |
-| `IntatisiOS` | application | iOS 26+ | `com.Vita0818.Intatis` | 7 个 chat 子集 products；iOS root 在唯一原生 `NavigationStack` 内组合 Chat canvas、顶部 sidebar/session/new、82% 的 `Intatis`/Chat/Recent/New/Settings 抽屉与两排 composer（model/usage；paperclip/input/Send-or-Stop）；品牌/session/Settings 标题为系统 serif，正文与控件为系统 sans；Settings 支持系统 Files 导入 Intatis JSON/JSONC；根 `Intatis.icon` 编译为 iPhone/iPad 主图标；provider-hosted Responses `web_search` 无可见 UI，消息支持可点击 citations；通用照片/文件附件尚未接通；无 MCP client runtime/transport/product surface，也无 Tools/Permission/AgentKernel/Cowork |
+| `IntatisiOS` | application | iOS 26+ | `com.Vita0818.Intatis` | 7 个 chat 子集 products；iOS root 在唯一原生 `NavigationStack` 内组合 Chat canvas、顶部 sidebar/session/new、82% 的 `Intatis`/Chat/Recent/New/Settings 抽屉与两排 composer（model/usage；paperclip/input/Send-or-Stop）；品牌/session/Settings 标题为系统 serif，正文与控件为系统 sans；Settings 支持系统 Files 导入 Intatis JSON/JSONC；根 `Intatis.icon` 编译为 iPhone/iPad 主图标；与 macOS 共用当前 exact-route hosted-search planner，无可见搜索 UI并支持结构化 citations；通用照片/文件附件尚未接通；无 MCP client runtime/transport/product surface，也无 Tools/Permission/AgentKernel/Cowork |
 | `intatis-cli` | executable | CLI（macOS/Linux） | — | Code/Cowork + Skills + external MCP client；macOS/Linux 支持 stdio/HTTP，CLI 持有 exact session MCP owner |
+
+Chat 托管搜索的用户确认合同见 `docs/CHAT_HOSTED_SEARCH.md`。目标 runtime 只有当前所选 exact
+Chat route；`web_search_model` 旧字段可兼容 decode/preserve，但不参与路由或产生提示。
+`IntatisSharedUI/ChatViewModel.send()` 与 CLI Chat 调用 `ProviderRegistry.chatRuntimeRoute()`，后者从
+当前 endpoint/model 的普通 adapter、`hosted_web_search` capability 与 exact dialect 原子规划
+`ChatLoop.webSearch`。`OpenAIWireProvider` 分别编码 OpenAI/OpenRouter tool type；未规划搜索时只生成
+普通 `/chat/completions` 请求。
 
 ### 测试 target（14）
 
@@ -181,7 +188,7 @@ Intatis/
   （单一 width owner 与 one-entry exact-width measurement）。
 
 - 入口：`Apps/IntatisMac/Sources/IntatisMacApp.swift`、`Apps/IntatisiOS/Sources/IntatisiOSApp.swift`、`Apps/intatis-cli/Sources/IntatisCLI.swift`
-- Skills：`Packages/IntatisSkills/Sources/SkillTypes.swift`（root/limit/metadata/snapshot、Codex Core-style 2%/8k catalog budget、count-only metrics/mention）、`BundledSkills.swift`（SwiftPM `Bundle.module` 内产品 Skill roots）、`SkillCatalogService.swift`（canonical discovery、frontmatter、no-follow bounded freeze）、`SkillMCPDependencies.swift`（严格 `agents/openai.yaml` MCP-only metadata 与 locator fingerprint）、`SkillTools.swift`（snapshot-bound dynamic tools、request-owned MCP preflight、registry revision）；`Packages/IntatisSkills/Resources/BundledSkills/cowork-agent-orchestration/` 保存 coordinator 调度正文与按需读取的 dated model-routing reference（capability hard gate、新 generation preference、cost modes、multimodal companion、11-provider 正式 recommendation matrix）。`Packages/IntatisCowork/Sources/Orchestrator.swift` 的 runtime-only `InferenceProfileRoutingMetadata` 与 `list_inference_profiles` 把 macOS/CLI 用户 JSON 已声明 capability 安全投影给 coordinator，不进入 EventLog/binding。`Packages/IntatisTools/Sources/MCPToolAvailabilitySnapshot.swift` 冻结不披露 endpoint/command 的 exact server/tool/dependency host assertion，`Packages/IntatisAgentKernel/Sources/AgentRequestToolSnapshot.swift` 把它与同一 provider request 的 dynamic registry/specs 绑定，`MCPEventLogHostAdapters.swift` 只从 capability/policy-filtered agent-visible tool entries 派生 production assertion（每个 server 至少一个可见 tool）。`ContextBuilder.swift` 负责 system → developer catalog → history/context → explicit user Skill → current user 的角色排序，并要求 coordinator 在调度前激活 exact bundled system Skill；Code hosts 与 `Orchestrator.run` 负责每次 send/invocation 的独立冻结。
+- Skills：`Packages/IntatisSkills/Sources/SkillTypes.swift`（root/limit/metadata/snapshot、Codex Core-style 2%/8k catalog budget、count-only metrics/mention）、`BundledSkills.swift`（SwiftPM `Bundle.module` 内产品 Skill roots）、`SkillCatalogService.swift`（canonical discovery、frontmatter、no-follow bounded freeze）、`SkillMCPDependencies.swift`（严格 `agents/openai.yaml` MCP-only metadata 与 locator fingerprint）、`SkillTools.swift`（snapshot-bound dynamic tools、request-owned MCP preflight、registry revision）；`Packages/IntatisSkills/Resources/BundledSkills/cowork-agent-orchestration/` 保存 coordinator 的主动执行循环、调度正文与按需读取的 dated model-routing reference（capability hard gate、新 generation preference、cost modes、multimodal companion、11-provider 正式 recommendation matrix）。`Packages/IntatisCowork/Sources/Orchestrator.swift` 的 runtime-only `InferenceProfileRoutingMetadata` 与 `list_inference_profiles` 把 macOS/CLI 用户 JSON 已声明 capability 安全投影给 coordinator，不进入 EventLog/binding。`Packages/IntatisTools/Sources/MCPToolAvailabilitySnapshot.swift` 冻结不披露 endpoint/command 的 exact server/tool/dependency host assertion，`Packages/IntatisAgentKernel/Sources/AgentRequestToolSnapshot.swift` 把它与同一 provider request 的 dynamic registry/specs 绑定，`MCPEventLogHostAdapters.swift` 只从 capability/policy-filtered agent-visible tool entries 派生 production assertion（每个 server 至少一个可见 tool）。`ContextBuilder.swift` 负责 system → developer catalog → history/context → explicit user Skill → current user 的角色排序，要求 coordinator 先建立 execution objective、检查/激活明确相关的 exact Skills、为非简单工作维护最小 WorkTask 图并尽早委派有收益的分支，同时继续自己的关键路径；请求真实暴露 `spawn_agent` 时，外部目录工作还必须从直接越界重试改路由为目录绑定子 agent + `delegate_task`。Code hosts 与 `Orchestrator.run` 负责每次 send/invocation 的独立冻结。
 - 项目级 Skill：`.agents/skills/intatis-skill-creator/` 是面向 Intatis
   Code/Cowork 的创建与验证 Skill，含 `SKILL.md`、两个 reference 和三个
   Python 标准库 helper；以独立名称避免与

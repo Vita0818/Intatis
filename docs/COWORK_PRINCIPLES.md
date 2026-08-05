@@ -1,8 +1,8 @@
 # COWORK_PRINCIPLES
 
 文档状态：当前 Cowork/AgentKernel 原则
-最近核对：2026-08-04
-产品基线：v0.32（build 32）
+最近核对：2026-08-05
+产品基线：v0.35（build 35）
 
 本文提炼自仓内 v0.10 历史 Cowork 设计文档、`PER_AGENT_INFERENCE_PROFILES.md` 及
 项目操作规则。旧设计文档只保留迁移 provenance；本文件是当前原则基准，**不是**完成度
@@ -162,6 +162,19 @@ Goal 生命周期必须由 host 串行化：start、ordinary turn、Goal mutatio
 
 ### 2.3b Coordinator routing Skill
 
+拥有 coordinator lease 的 agent 默认是主动执行者，而不是等待用户逐步给出下一步：每个请求先
+建立本轮执行目标、交付物、约束和验证方式，检查 bounded Skill catalog 并激活/完整读取明确相关的
+exact Skill；非简单工作在 task tools 可用时建立最小可验证 WorkTask DAG，持续更新开始、进展、
+阻塞、重规划、result 与 evidence。它应在任务开始时识别真正受益于并行、专业能力、独立复核、
+多模态或不同 workspace 的分支，满足调度收益时尽早委派，并在子 agent 运行时继续自己的关键路径，
+最后核验报告、显式结算 WorkTask 并持续推进到验证完成或真实 blocker。这里的“本轮执行目标”不自动
+创建 durable Goal；后者仍只由用户明确要求的持续/跨 run 意图触发。
+
+主动性不改变既有边界：coordinator 仍只能使用 authoritative tool list 中的工具，Skill 仍只是上下文，
+必须服从 CapabilityLease、WorkspaceLease、PermissionEngine、exact inference binding、最小 team 与
+最小权限；一步两步可直接完成的工作不得仪式化 spawn，child report 也不能自动证明 WorkTask/Goal
+完成。普通 worker 继续只执行自己的 task，不获得上述全局拆解、spawn 或协调语义。
+
 拥有 coordinator lease 的 agent 必须在第一次 direct/reuse/delegate/spawn/profile/
 lease 调度决定前激活 exact bundled system Skill
 `cowork-agent-orchestration`。它是调度上下文而非权限：不得替代 scheduler、
@@ -254,6 +267,16 @@ secret/token/key directories
 ```
 
 所有文件访问必须经工作区约束与权限策略。
+
+`@main` 与其他 agent 本身仍只有一个 `workspaceRoot`。如果 coordinator 预先知道任务所需目录
+在根外，或直接工具返回 out-of-workspace denial，不应重复同一路径、尝试 `..`/绝对路径逃逸，
+也不应因目录内工作很小就停在错误路径上。只有当当前 authoritative tool list 包含
+`spawn_agent` 时，system prompt 才应要求它以目标绝对目录创建子 agent：默认
+`requestedAccess=read_only`，只有目录内交付物需要修改时才请求 `read_write`，并保持
+`canCoordinate=false`，除非子 agent 确实需要拥有下级任务图；spawn 成功后再用 `delegate_task`
+交付目录内工作。工具不存在或 workspace expansion 被拒时，coordinator 应报告需要的目录能力
+与 blocker；普通 worker 只报告给上级/用户，不得宣称能 spawn。这是失败后的可行动路由，不是
+对 WorkspaceLease、bookmark、PathConfinement、PermissionEngine 或 hard deny 的例外。
 
 managed terminal 不能成为这条规则的例外。macOS process/PTY 必须在 WorkspaceLease 对应的 OS sandbox 内运行并默认断网；交互输入也要经过危险命令 hard deny。输出要持续有界 drain，stdin 原文/无盐固定摘要/延迟回显不能进入 EventLog 或 agent 间消息；取消、失败、task terminal 与 runtime shutdown 必须先 drain terminal process tree，再发布上层终态。Linux 缺少可证明的 sandbox/PTY backend 时应 fail closed。
 

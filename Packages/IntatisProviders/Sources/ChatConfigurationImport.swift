@@ -330,10 +330,10 @@ public enum ChatConfigurationImporter {
             selectedModelID: root.string("selectedModelID"),
             selectedRaw: selectedRaw,
             providers: providers)
-        let webSearchModel = try backgroundModelRef(
+        let webSearchModel = try? backgroundModelRef(
             webSearchRaw,
             preferredProviderID: selection.providerID,
-            providers: &providers)
+            providers: providers)
         return ImportedChatConfiguration(
             selectedProviderID: selection.providerID,
             selectedModelID: selection.modelID,
@@ -461,13 +461,13 @@ public enum ChatConfigurationImporter {
             selectedModelID: root.string("selectedModelID"),
             selectedRaw: selectedRaw,
             providers: providers)
-        let webSearchModel = try backgroundModelRef(
+        let webSearchModel = try? backgroundModelRef(
             resolvedSelection(
                 root.string("web_search_model")
                     ?? root.string("webSearchModel"),
                 environment: environment),
             preferredProviderID: selection.providerID,
-            providers: &providers)
+            providers: providers)
         return ImportedChatConfiguration(
             selectedProviderID: selection.providerID,
             selectedModelID: selection.modelID,
@@ -671,7 +671,7 @@ public enum ChatConfigurationImporter {
     private static func backgroundModelRef(
         _ raw: String?,
         preferredProviderID: String,
-        providers: inout [ImportedChatConfiguration.Provider]
+        providers: [ImportedChatConfiguration.Provider]
     ) throws -> ModelRef? {
         guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
               !raw.isEmpty else {
@@ -707,18 +707,19 @@ public enum ChatConfigurationImporter {
                   }) {
             providerIndex = preferred
             modelID = raw
+        } else if let separator = raw.firstIndex(of: "/") {
+            let endpoint = String(raw[..<separator])
+            let modelStart = raw.index(after: separator)
+            let unknownModel = String(raw[modelStart...])
+            return ModelRef(
+                endpoint: try boundedIdentifier(endpoint),
+                model: ModelID(rawValue:
+                    try boundedIdentifier(unknownModel)))
         } else {
             throw ChatConfigurationImportError.invalidModelSelection
         }
 
         let boundedModelID = try boundedIdentifier(modelID)
-        if !providers[providerIndex].models.contains(where: {
-            $0.id == boundedModelID
-        }) {
-            providers[providerIndex].models.append(.init(
-                id: boundedModelID,
-                displayName: boundedModelID))
-        }
         return ModelRef(
             endpoint: providers[providerIndex].id,
             model: ModelID(rawValue: boundedModelID))

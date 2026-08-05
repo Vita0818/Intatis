@@ -33,6 +33,28 @@ private struct OpenAIStreamChunk: Decodable {
     let usage: UsageDTO?
 }
 
+/// Internal typed signal used only to permit one same-route ordinary Chat
+/// retry before any valid hosted-search payload has been accepted.
+private struct HostedWebSearchUnsupportedError:
+    Error, LocalizedError, Sendable
+{
+    var dialect: ChatHostedWebSearchDialect
+    var signal: String
+    var parameter: String?
+
+    var errorDescription: String? {
+        var message =
+            "The selected provider rejected its hosted web-search request shape."
+        if !signal.isEmpty {
+            message += " Provider signal: \(signal)."
+        }
+        if let parameter, !parameter.isEmpty {
+            message += " Parameter: \(parameter)."
+        }
+        return message
+    }
+}
+
 // MARK: - Adapter
 
 /// Maps Intatis chat requests onto the OpenAI-compatible `/chat/completions`
@@ -144,6 +166,7 @@ public struct OpenAIWireProvider: ChatProvider {
                         var emittedText = ""
                         var emittedCitationURLs: Set<String> = []
                         var receivedResponseBytes = false
+                        var acceptedResponsePayload = false
 
                         func yieldMissingText(_ fullText: String) {
                             guard !fullText.isEmpty else { return }
@@ -182,6 +205,12 @@ public struct OpenAIWireProvider: ChatProvider {
                                   let data = trimmed.data(using: .utf8) else {
                                 return false
                             }
+                            if let unsupported =
+                                Self.hostedWebSearchUnsupported(
+                                    from: data,
+                                    dialect: Self.webSearchDialect(request)) {
+                                throw unsupported
+                            }
                             if let providerError = ProviderErrorFormatting.streamErrorPayload(data) {
                                 throw providerError
                             }
@@ -198,6 +227,10 @@ public struct OpenAIWireProvider: ChatProvider {
                                 throw IntatisError.decoding(
                                     "Responses stream event is missing its type.")
                             }
+                            // Even status-only Responses events prove that the
+                            // first request was accepted. Never replay the user
+                            // turn after this point.
+                            acceptedResponsePayload = true
 
                             switch eventType {
                             case "response.output_text.delta":
@@ -290,6 +323,21 @@ public struct OpenAIWireProvider: ChatProvider {
                             continuation.finish()
                             return
                         } catch {
+                            if !acceptedResponsePayload,
+                               let webSearch = request.webSearch,
+                               Self.isHostedWebSearchUnsupported(
+                                   error,
+                                   dialect: webSearch.dialect) {
+                                try Task.checkCancellation()
+                                var ordinaryRequest = request
+                                ordinaryRequest.webSearch = nil
+                                for try await chunk in
+                                    streamChatCompletions(ordinaryRequest) {
+                                    continuation.yield(chunk)
+                                }
+                                continuation.finish()
+                                return
+                            }
                             if ProviderRuntime.shouldRetry(
                                 error: error,
                                 attempt: attempt,
@@ -315,6 +363,103 @@ public struct OpenAIWireProvider: ChatProvider {
             }
             continuation.onTermination = { _ in task.cancel() }
         }
+    }
+
+    private static func webSearchDialect(
+        _ request: ChatRequest
+    ) -> ChatHostedWebSearchDialect {
+        // `streamResponsesChat` is reached only when this configuration exists;
+        // keep the helper total so the nested parser does not need to unwrap it.
+        request.webSearch?.dialect ?? .openAIResponses
+    }
+
+    private static func isHostedWebSearchUnsupported(
+        _ error: Error,
+        dialect: ChatHostedWebSearchDialect
+    ) -> Bool {
+        if let unsupported = error as? HostedWebSearchUnsupportedError {
+            return unsupported.dialect == dialect
+        }
+        guard let status = error as? ProviderHTTPStatusError else {
+            return false
+        }
+        return hostedWebSearchUnsupported(
+            from: status.body,
+            dialect: dialect,
+            statusCode: status.statusCode) != nil
+    }
+
+    /// Classifies only structured provider codes plus structural parameter
+    /// fields. Free text and a bare HTTP status are deliberately insufficient.
+    private static func hostedWebSearchUnsupported(
+        from data: Data,
+        dialect: ChatHostedWebSearchDialect,
+        statusCode: Int? = nil
+    ) -> HostedWebSearchUnsupportedError? {
+        if let statusCode,
+           statusCode != 400,
+           statusCode != 404,
+           statusCode != 422 {
+            return nil
+        }
+        guard let value = try? JSONDecoder().decode(
+            JSONValue.self,
+            from: data),
+              case .object(let root) = value else {
+            return nil
+        }
+
+        let errorObject: [String: JSONValue]
+        if case .object(let nested)? = root["error"] {
+            errorObject = nested
+        } else if case .object(let response)? = root["response"],
+                  case .object(let nested)? = response["error"] {
+            errorObject = nested
+        } else {
+            errorObject = root
+        }
+
+        func string(_ key: String) -> String? {
+            guard case .string(let value)? = errorObject[key] else {
+                return nil
+            }
+            let trimmed = value.trimmingCharacters(
+                in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+
+        let rawSignal = string("code") ?? string("type")
+        guard let rawSignal else { return nil }
+        let signal = rawSignal.lowercased()
+        let directSignals: Set<String> = [
+            "web_search_not_supported",
+            "web_search_unsupported",
+            "unsupported_web_search",
+        ]
+        let parameterSignals: Set<String> = [
+            "unsupported_parameter",
+            "unknown_parameter",
+            "unsupported_value",
+        ]
+        let parameter = string("param") ?? string("parameter")
+        let normalizedParameter = parameter?
+            .lowercased()
+            .replacingOccurrences(of: " ", with: "")
+        let isSearchParameter = normalizedParameter.map {
+            $0 == "tool_choice"
+                || $0 == "tools"
+                || $0.hasPrefix("tools[")
+                || $0.hasPrefix("tools.")
+        } ?? false
+
+        guard directSignals.contains(signal)
+            || (parameterSignals.contains(signal) && isSearchParameter) else {
+            return nil
+        }
+        return HostedWebSearchUnsupportedError(
+            dialect: dialect,
+            signal: rawSignal,
+            parameter: parameter)
     }
 
     /// Returns true if the stream is finished (saw `[DONE]`).
@@ -424,10 +569,7 @@ public struct OpenAIWireProvider: ChatProvider {
         root["stream"] = .bool(true)
         root["store"] = .bool(false)
         root["tools"] = .array([
-            .object([
-                "type": .string("web_search"),
-                "search_context_size": .string(webSearch.contextSize.rawValue),
-            ]),
+            Self.hostedWebSearchToolJSON(webSearch),
         ])
         // Search is a transparent Chat capability. Let the provider decide
         // whether this prompt needs a hosted search instead of forcing one on
@@ -456,6 +598,28 @@ public struct OpenAIWireProvider: ChatProvider {
             forHTTPHeaderField: "Authorization")
         urlRequest.httpBody = try Self.encodeRequestBody(root)
         return urlRequest
+    }
+
+    private static func hostedWebSearchToolJSON(
+        _ configuration: ChatWebSearchConfiguration
+    ) -> JSONValue {
+        switch configuration.dialect {
+        case .openAIResponses:
+            return .object([
+                "type": .string("web_search"),
+                "search_context_size":
+                    .string(configuration.contextSize.rawValue),
+            ])
+
+        case .openRouterServerTool:
+            return .object([
+                "type": .string("openrouter:web_search"),
+                "parameters": .object([
+                    "search_context_size":
+                        .string(configuration.contextSize.rawValue),
+                ]),
+            ])
+        }
     }
 
     private static func responsesChatInputJSON(
@@ -513,8 +677,16 @@ public struct OpenAIWireProvider: ChatProvider {
     private static func responsesChatCitation(
         _ annotation: [String: JSONValue]
     ) -> MessageCitation? {
-        guard case .string("url_citation")? = annotation["type"],
-              case .string(let rawURL)? = annotation["url"],
+        guard case .string("url_citation")? = annotation["type"] else {
+            return nil
+        }
+        let citation: [String: JSONValue]
+        if case .object(let nested)? = annotation["url_citation"] {
+            citation = nested
+        } else {
+            citation = annotation
+        }
+        guard case .string(let rawURL)? = citation["url"],
               rawURL.count <= 4_096,
               let url = URL(string: rawURL),
               let scheme = url.scheme?.lowercased(),
@@ -526,7 +698,7 @@ public struct OpenAIWireProvider: ChatProvider {
             return nil
         }
         let rawTitle: String
-        if case .string(let value)? = annotation["title"] {
+        if case .string(let value)? = citation["title"] {
             rawTitle = value
         } else {
             rawTitle = ""
@@ -848,8 +1020,8 @@ public struct URLSessionStreamingClient: HTTPByteStreaming {
                     let (bytes, response) = try await ProviderURLSession.noRedirect.bytes(for: request)
                     if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
                         let body = try await ProviderErrorFormatting.cappedBody(from: bytes)
-                        continuation.finish(throwing: ProviderErrorFormatting.httpStatus(
-                            http.statusCode,
+                        continuation.finish(throwing: ProviderHTTPStatusError(
+                            statusCode: http.statusCode,
                             body: body,
                             headers: HTTPDataResponse.headers(from: http),
                             operation: "streaming request"))

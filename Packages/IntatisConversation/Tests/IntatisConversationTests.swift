@@ -731,13 +731,17 @@ final class IntatisConversationTests: XCTestCase {
             log: log,
             provider: SearchCitationProvider(recorder: recorder),
             model: ModelID(rawValue: "m"),
-            webSearch: ChatWebSearchConfiguration(contextSize: .high))
+            webSearch: ChatWebSearchConfiguration(
+                dialect: .openAIResponses,
+                contextSize: .high))
 
         try await loop.send("what is current?")
 
         let request = await recorder.recorded()
         XCTAssertEqual(request?.webSearch,
-                       ChatWebSearchConfiguration(contextSize: .high))
+                       ChatWebSearchConfiguration(
+                           dialect: .openAIResponses,
+                           contextSize: .high))
         let replayed = await log.replay()
         let completed = try XCTUnwrap(replayed.compactMap { envelope -> MessageCompletedPayload? in
             guard case .messageCompleted(let payload) = envelope.event else {

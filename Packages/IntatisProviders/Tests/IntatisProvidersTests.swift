@@ -38,6 +38,7 @@ private struct StreamAttempt {
 private final class SequencedHTTP: HTTPByteStreaming, @unchecked Sendable {
     private let queue = DispatchQueue(label: "intatis.tests.sequenced-http")
     private var index = 0
+    private var requests: [URLRequest] = []
     private let attempts: [StreamAttempt]
 
     init(attempts: [StreamAttempt]) {
@@ -48,8 +49,13 @@ private final class SequencedHTTP: HTTPByteStreaming, @unchecked Sendable {
         queue.sync { index }
     }
 
+    var recordedRequests: [URLRequest] {
+        queue.sync { requests }
+    }
+
     func stream(_ request: URLRequest) -> AsyncThrowingStream<Data, Error> {
         let attempt = queue.sync { () -> StreamAttempt in
+            requests.append(request)
             let value = attempts[min(index, attempts.count - 1)]
             index += 1
             return value
@@ -83,6 +89,10 @@ private final class CapturingHTTP: HTTPByteStreaming, @unchecked Sendable {
 
     var lastRequest: URLRequest? {
         queue.sync { requests.last }
+    }
+
+    var requestCount: Int {
+        queue.sync { requests.count }
     }
 
     func stream(_ request: URLRequest) -> AsyncThrowingStream<Data, Error> {
@@ -187,7 +197,9 @@ final class IntatisProvidersTests: XCTestCase {
                 ChatMessage(role: .user, content: "What changed?"),
                 ChatMessage(role: .assistant, content: "I will check."),
             ],
-            webSearch: ChatWebSearchConfiguration(contextSize: .high))
+            webSearch: ChatWebSearchConfiguration(
+                dialect: .openAIResponses,
+                contextSize: .high))
 
         var doneCount = 0
         for try await chunk in provider.stream(request) {
@@ -223,6 +235,199 @@ final class IntatisProvidersTests: XCTestCase {
         XCTAssertEqual(assistantContent.first?["type"] as? String, "output_text")
     }
 
+    func testOpenRouterHostedSearchUsesItsServerToolDialectAndKeepsRoutingOptions()
+        async throws
+    {
+        let sse = """
+        data: {"type":"response.completed","response":{"id":"resp_router"}}
+
+        """
+        let http = CapturingHTTP(chunks: [Data(sse.utf8)])
+        let endpoint = ProviderEndpoint(
+            id: "router",
+            baseURL: URL(string: "https://openrouter.example/api/v1")!,
+            apiKeyRef: KeychainRef(service: "s", account: "router"),
+            wire: .openai,
+            requestAdapter: .openRouter,
+            modelRequestOptions: [
+                "router-model": [
+                    "provider": .object([
+                        "only": .array([.string("provider-a")]),
+                        "allow_fallbacks": .bool(false),
+                        "require_parameters": .bool(true),
+                    ]),
+                ],
+            ])
+        let provider = OpenAIWireProvider(
+            endpoint: endpoint,
+            apiKey: "k",
+            http: http)
+        let request = ChatRequest(
+            model: ModelID(rawValue: "router-model"),
+            messages: [ChatMessage(role: .user, content: "latest")],
+            webSearch: ChatWebSearchConfiguration(
+                dialect: .openRouterServerTool,
+                contextSize: .low))
+
+        for try await _ in provider.stream(request) {}
+
+        let bodyData = try XCTUnwrap(http.lastBody)
+        let body = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: bodyData) as? [String: Any])
+        XCTAssertEqual(body["tool_choice"] as? String, "auto")
+        let tools = try XCTUnwrap(body["tools"] as? [[String: Any]])
+        XCTAssertEqual(tools.count, 1)
+        XCTAssertEqual(tools[0]["type"] as? String,
+                       "openrouter:web_search")
+        let parameters = try XCTUnwrap(
+            tools[0]["parameters"] as? [String: Any])
+        XCTAssertEqual(parameters["search_context_size"] as? String, "low")
+        XCTAssertNil(tools[0]["search_context_size"])
+
+        let routing = try XCTUnwrap(body["provider"] as? [String: Any])
+        XCTAssertEqual(routing["allow_fallbacks"] as? Bool, false)
+        XCTAssertEqual(routing["require_parameters"] as? Bool, true)
+        XCTAssertEqual(routing["only"] as? [String], ["provider-a"])
+    }
+
+    func testStructuredHostedSearchRejectionFallsBackOnceOnSameRoute()
+        async throws
+    {
+        let ordinarySSE = """
+        data: {"choices":[{"delta":{"content":"ordinary"},"finish_reason":"stop"}]}
+
+        data: [DONE]
+
+        """
+        let http = SequencedHTTP(attempts: [
+            StreamAttempt(
+                chunks: [],
+                error: ProviderHTTPStatusError(
+                    statusCode: 400,
+                    body: Data(#"{"error":{"code":"unsupported_parameter","param":"tools[0].type","message":"not supported"}}"#.utf8),
+                    headers: [:],
+                    operation: "streaming request")),
+            StreamAttempt(chunks: [Data(ordinarySSE.utf8)], error: nil),
+        ])
+        let endpoint = ProviderEndpoint(
+            id: "router",
+            baseURL: URL(string: "https://router.example/v1")!,
+            apiKeyRef: KeychainRef(service: "s", account: "router"),
+            wire: .openai,
+            requestAdapter: .openRouter,
+            modelRequestOptions: [
+                "m": [
+                    "provider": .object([
+                        "only": .array([.string("provider-a")]),
+                        "allow_fallbacks": .bool(false),
+                    ]),
+                ],
+            ])
+        let provider = OpenAIWireProvider(
+            endpoint: endpoint,
+            apiKey: "k",
+            http: http,
+            runtimePolicy: ProviderRuntimePolicy(
+                maxAttempts: 2,
+                requestTimeoutSeconds: 1,
+                initialRetryDelaySeconds: 0,
+                maxRetryDelaySeconds: 0))
+        let request = ChatRequest(
+            model: ModelID(rawValue: "m"),
+            messages: [ChatMessage(role: .user, content: "hi")],
+            webSearch: ChatWebSearchConfiguration(
+                dialect: .openRouterServerTool))
+
+        var text = ""
+        for try await chunk in provider.stream(request) {
+            if case .delta(let value) = chunk { text += value }
+        }
+
+        XCTAssertEqual(text, "ordinary")
+        XCTAssertEqual(http.attemptCount, 2)
+        let requests = http.recordedRequests
+        XCTAssertEqual(requests.map { $0.url?.path }, [
+            "/v1/responses",
+            "/v1/chat/completions",
+        ])
+        let ordinaryBody = try XCTUnwrap(requests.last?.httpBody)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: ordinaryBody) as? [String: Any])
+        XCTAssertNil(object["tools"])
+        let routing = try XCTUnwrap(object["provider"] as? [String: Any])
+        XCTAssertEqual(routing["allow_fallbacks"] as? Bool, false)
+        XCTAssertEqual(routing["only"] as? [String], ["provider-a"])
+    }
+
+    func testBareHostedSearch404DoesNotTriggerOrdinaryFallback()
+        async throws
+    {
+        let http = SequencedHTTP(attempts: [
+            StreamAttempt(
+                chunks: [],
+                error: ProviderHTTPStatusError(
+                    statusCode: 404,
+                    body: Data(#"{"error":{"message":"No endpoints found"}}"#.utf8),
+                    headers: [:],
+                    operation: "streaming request")),
+        ])
+        let provider = OpenAIWireProvider(
+            endpoint: ProviderEndpoint(
+                id: "router",
+                baseURL: URL(string: "https://router.example/v1")!,
+                apiKeyRef: KeychainRef(service: "s", account: "router"),
+                wire: .openai,
+                requestAdapter: .openRouter),
+            apiKey: "k",
+            http: http)
+
+        do {
+            for try await _ in provider.stream(ChatRequest(
+                model: ModelID(rawValue: "m"),
+                messages: [ChatMessage(role: .user, content: "hi")],
+                webSearch: ChatWebSearchConfiguration(
+                    dialect: .openRouterServerTool))) {}
+            XCTFail("expected provider error")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("HTTP 404"))
+            XCTAssertEqual(http.attemptCount, 1)
+        }
+    }
+
+    func testHostedSearchRejectionAfterValidPayloadDoesNotReplayTurn()
+        async throws
+    {
+        let sse = """
+        data: {"type":"response.created","response":{"id":"resp_1"}}
+
+        data: {"type":"error","code":"unsupported_parameter","param":"tools","message":"not supported"}
+
+        """
+        let http = SequencedHTTP(attempts: [
+            StreamAttempt(chunks: [Data(sse.utf8)], error: nil),
+        ])
+        let provider = OpenAIWireProvider(
+            endpoint: ProviderEndpoint(
+                id: "router",
+                baseURL: URL(string: "https://router.example/v1")!,
+                apiKeyRef: KeychainRef(service: "s", account: "router"),
+                wire: .openai,
+                requestAdapter: .openRouter),
+            apiKey: "k",
+            http: http)
+
+        do {
+            for try await _ in provider.stream(ChatRequest(
+                model: ModelID(rawValue: "m"),
+                messages: [ChatMessage(role: .user, content: "hi")],
+                webSearch: ChatWebSearchConfiguration(
+                    dialect: .openRouterServerTool))) {}
+            XCTFail("expected provider error")
+        } catch {
+            XCTAssertEqual(http.attemptCount, 1)
+        }
+    }
+
     func testWebSearchStreamingParsesAndDeduplicatesSafeCitations() async throws {
         let sse = """
         data: {"type":"response.output_text.delta","delta":"Latest"}
@@ -230,6 +435,8 @@ final class IntatisProvidersTests: XCTestCase {
         data: {"type":"response.output_text.annotation.added","annotation":{"type":"url_citation","url":"https://example.com/story","title":"Example\\nNews"}}
 
         data: {"type":"response.output_text.annotation.added","annotation":{"type":"url_citation","url":"javascript:alert(1)","title":"Unsafe"}}
+
+        data: {"type":"response.output_text.annotation.added","annotation":{"type":"url_citation","url_citation":{"url":"https://router.example/source","title":"Router source"}}}
 
         data: {"type":"response.output_item.done","item":{"type":"message","content":[{"type":"output_text","text":"Latest facts","annotations":[{"type":"url_citation","url":"https://example.com/story","title":"Example News"},{"type":"url_citation","url":"https://user:pass@unsafe.example/path","title":"Credentials"}]}]}}
 
@@ -243,7 +450,8 @@ final class IntatisProvidersTests: XCTestCase {
         let request = ChatRequest(
             model: ModelID(rawValue: "gpt-search"),
             messages: [ChatMessage(role: .user, content: "latest")],
-            webSearch: ChatWebSearchConfiguration())
+            webSearch: ChatWebSearchConfiguration(
+                dialect: .openAIResponses))
 
         var text = ""
         var citations: [MessageCitation] = []
@@ -267,6 +475,9 @@ final class IntatisProvidersTests: XCTestCase {
             MessageCitation(
                 url: "https://example.com/story",
                 title: "Example News"),
+            MessageCitation(
+                url: "https://router.example/source",
+                title: "Router source"),
         ])
         XCTAssertEqual(usage?.promptTokens, 12)
         XCTAssertEqual(usage?.cachedPromptTokens, 2)
@@ -847,12 +1058,18 @@ final class IntatisProvidersTests: XCTestCase {
         XCTAssertEqual(provider.runtimePolicy.requestTimeoutSeconds, 120)
     }
 
-    func testRegistryAtomicallyResolvesConfiguredWebSearchRoute() async throws {
+    func testRegistryIgnoresLegacyWebSearchRouteAndPlansCurrentOpenRouterModel()
+        async throws
+    {
         let chatEndpoint = ProviderEndpoint(
             id: "chat",
             baseURL: URL(string: "https://chat.example.test/v1")!,
             apiKeyRef: KeychainRef(service: "s", account: "chat"),
-            wire: .openai)
+            wire: .openai,
+            requestAdapter: .openRouter,
+            modelCapabilities: [
+                "chat-model": [.chat, .hostedWebSearch],
+            ])
         let searchEndpoint = ProviderEndpoint(
             id: "search",
             baseURL: URL(string: "https://search.example.test/v1")!,
@@ -871,16 +1088,21 @@ final class IntatisProvidersTests: XCTestCase {
             resolver: StaticSecret(key: "k"),
             http: FakeHTTP(chunks: []))
 
-        let searched = try await registry.hostedSearchChatRuntimeRoute()
+        let route = try await registry.chatRuntimeRoute()
 
-        XCTAssertEqual(searched.model.rawValue, "search-model")
+        XCTAssertEqual(route.model.rawValue, "chat-model")
         XCTAssertEqual(
-            try XCTUnwrap(searched.provider as? OpenAIWireProvider)
+            try XCTUnwrap(route.provider as? OpenAIWireProvider)
                 .endpoint.id,
-            "search")
+            "chat")
+        XCTAssertEqual(
+            route.webSearch,
+            ChatWebSearchConfiguration(
+                dialect: .openRouterServerTool,
+                contextSize: .medium))
     }
 
-    func testRegistryWebSearchRouteFallsBackToChatOnlyWhenUnconfigured()
+    func testRegistrySilentlyUsesOrdinaryChatWhenHostedSearchIsUndeclared()
         async throws
     {
         let endpoint = ProviderEndpoint(
@@ -897,12 +1119,127 @@ final class IntatisProvidersTests: XCTestCase {
             resolver: StaticSecret(key: "k"),
             http: FakeHTTP(chunks: []))
 
-        let route = try await registry.hostedSearchChatRuntimeRoute()
+        let route = try await registry.chatRuntimeRoute()
 
         XCTAssertEqual(route.model.rawValue, "chat-model")
         XCTAssertEqual(
             try XCTUnwrap(route.provider as? OpenAIWireProvider).endpoint.id,
             "chat")
+        XCTAssertNil(route.webSearch)
+    }
+
+    func testRegistrySilentlyUsesOrdinaryChatForCompatibleAdapterEvenWhenDeclared()
+        async throws
+    {
+        let endpoint = ProviderEndpoint(
+            id: "chat",
+            baseURL: URL(string: "https://chat.example.test/v1")!,
+            apiKeyRef: KeychainRef(service: "s", account: "chat"),
+            wire: .openai,
+            requestAdapter: .openAICompatible,
+            modelCapabilities: [
+                "chat-model": [.chat, .hostedWebSearch],
+            ])
+        let registry = ProviderRegistry(
+            config: ProviderConfig(
+                endpoints: [endpoint],
+                models: ResolvedModels(
+                    chat: ModelRef(
+                        endpoint: "chat",
+                        model: ModelID(rawValue: "chat-model")),
+                    webSearch: ModelRef(
+                        endpoint: "missing-legacy-route",
+                        model: ModelID(rawValue: "ignored")))),
+            resolver: StaticSecret(key: "k"),
+            http: FakeHTTP(chunks: []))
+
+        let route = try await registry.chatRuntimeRoute()
+
+        XCTAssertEqual(route.model.rawValue, "chat-model")
+        XCTAssertEqual(
+            try XCTUnwrap(route.provider as? OpenAIWireProvider).endpoint.id,
+            "chat")
+        XCTAssertNil(route.webSearch)
+    }
+
+    func testUnsupportedHostedSearchRouteSendsOneOrdinaryRequestWithoutProbe()
+        async throws
+    {
+        let sse = """
+        data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}
+
+        data: [DONE]
+
+        """
+        let http = CapturingHTTP(chunks: [Data(sse.utf8)])
+        let endpoint = ProviderEndpoint(
+            id: "chat",
+            baseURL: URL(string: "https://chat.example.test/v1")!,
+            apiKeyRef: KeychainRef(service: "s", account: "chat"),
+            wire: .openai,
+            requestAdapter: .openAICompatible,
+            modelCapabilities: [
+                "chat-model": [.chat, .hostedWebSearch],
+            ])
+        let registry = ProviderRegistry(
+            config: ProviderConfig(
+                endpoints: [endpoint],
+                models: ResolvedModels(
+                    chat: ModelRef(
+                        endpoint: "chat",
+                        model: ModelID(rawValue: "chat-model")),
+                    webSearch: ModelRef(
+                        endpoint: "unused",
+                        model: ModelID(rawValue: "unused")))),
+            resolver: StaticSecret(key: "k"),
+            http: http)
+
+        let route = try await registry.chatRuntimeRoute()
+        for try await _ in route.provider.stream(ChatRequest(
+            model: route.model,
+            messages: [ChatMessage(role: .user, content: "hi")],
+            webSearch: route.webSearch)) {}
+
+        XCTAssertEqual(http.requestCount, 1)
+        XCTAssertEqual(http.lastRequest?.url?.path, "/v1/chat/completions")
+        let body = try XCTUnwrap(http.lastBody)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: body) as? [String: Any])
+        XCTAssertNil(object["tools"])
+        XCTAssertNil(object["tool_choice"])
+    }
+
+    func testChatRuntimeRouteReplansCapabilityForModelOverride()
+        async throws
+    {
+        let endpoint = ProviderEndpoint(
+            id: "chat",
+            baseURL: URL(string: "https://chat.example.test/v1")!,
+            apiKeyRef: KeychainRef(service: "s", account: "chat"),
+            wire: .openai,
+            requestAdapter: .openRouter,
+            modelCapabilities: [
+                "search-model": [.chat, .hostedWebSearch],
+                "plain-model": [.chat],
+            ])
+        let registry = ProviderRegistry(
+            config: ProviderConfig(
+                endpoints: [endpoint],
+                models: ResolvedModels(chat: ModelRef(
+                    endpoint: "chat",
+                    model: ModelID(rawValue: "search-model")))),
+            resolver: StaticSecret(key: "k"),
+            http: FakeHTTP(chunks: []))
+
+        let searchable = try await registry.chatRuntimeRoute()
+        let plain = try await registry.chatRuntimeRoute(
+            model: ModelID(rawValue: "plain-model"))
+
+        XCTAssertEqual(searchable.model.rawValue, "search-model")
+        XCTAssertEqual(searchable.webSearch?.dialect,
+                       .openRouterServerTool)
+        XCTAssertEqual(plain.model.rawValue, "plain-model")
+        XCTAssertNil(plain.webSearch)
     }
 
     func testRegistryUsesLongRunningStreamingPolicyOnlyForAgentProvider() async throws {

@@ -92,8 +92,8 @@ public struct ProviderEndpoint: Codable, Equatable, Sendable {
     /// outgoing request without enumerating provider-specific keys.
     public var modelRequestOptions: [String: [String: JSONValue]]
     /// Explicit route-scoped model capabilities. Absence is intentionally
-    /// conservative: an OpenAI-compatible URL alone never proves Responses
-    /// `tool_search` support.
+    /// conservative: an OpenAI-compatible URL alone never proves deferred
+    /// `tool_search` or Chat provider-hosted web-search support.
     public var modelCapabilities: [String: [Capability]]
 
     public init(id: String, baseURL: URL, chatEndpoint: URL? = nil,
@@ -268,8 +268,9 @@ public struct ModelRef: Codable, Equatable, Sendable {
 /// Default model per role. v0.1 only requires `chat`; the rest are forward slots.
 public struct ResolvedModels: Codable, Equatable, Sendable {
     public var chat: ModelRef
-    /// Optional provider-hosted search route for Chat. When absent, searched
-    /// turns use the ordinary `chat` route.
+    /// Legacy compatibility field decoded from `web_search_model`. Runtime
+    /// Chat routing deliberately ignores it; provider-hosted search belongs to
+    /// the current exact `chat` route.
     public var webSearch: ModelRef?
     public var agent: ModelRef?
     public var reviewer: ModelRef?

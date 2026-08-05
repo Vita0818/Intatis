@@ -192,6 +192,10 @@ enum ProviderRuntime {
         if error is CancellationError { return false }
         if error is ProviderUsageLimitError { return false }
         if error is ProviderContextWindowExceededError { return false }
+        if let status = error as? ProviderHTTPStatusError {
+            return ProviderErrorFormatting.isRetryableHTTPStatus(
+                status.statusCode)
+        }
         if let intatis = error as? IntatisError {
             switch intatis {
             case .cancelled, .config, .decoding, .permissionDenied, .notFound:

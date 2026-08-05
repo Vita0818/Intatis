@@ -1,19 +1,19 @@
 # CURRENT_STATE
 
 文档状态：当前源码摘要
-最近核对：2026-08-04
-产品基线：v0.32（build 32）
+最近核对：2026-08-05
+产品基线：v0.35（build 35）
 
 ## 版本与发行状态
 
-- `HEAD` 与 `origin/main` 当前均为里程碑提交 `v0.32`。仓库没有 Git tag；commit 标题只作
-  里程碑证据，产品版本事实源是 `project.yml`。
-- `MARKETING_VERSION` / `CURRENT_PROJECT_VERSION` 已从长期滞留的 `0.12 (1)` 校准为
-  `0.32 (32)`。两个仓库参考 Info.plist、README、文档入口和发行脚本使用同一基线。
+- `HEAD` 与 `origin/main` 当前均为标题为 `v0.34` 的提交 `c4727c1`。仓库没有 Git tag；该
+  commit 标题不是产品版本事实源，`project.yml` 把当前产品基线定义为 `0.35 (35)`。
+- `MARKETING_VERSION` / `CURRENT_PROJECT_VERSION` 已推进为 `0.35 (35)`。两个仓库参考
+  Info.plist、README、文档入口和发行脚本使用同一基线。
 - macOS 只发行 `IntatisMac` Developer ID/direct-distribution 产品；不做 Mac App Store。
   `IntatisMacAppStore` 仍是 legacy source target，不进入默认构建、测试或 release gate。
 - 用户宿主终端已报告两个有效 codesigning identity，其中 Developer ID Application 可被发行
-  脚本选取；`Intatis-Notary` Keychain profile 也已配置。v0.32 最终 App/DMG 尚未完成 Apple
+  脚本选取；`Intatis-Notary` Keychain profile 也已配置。v0.35 最终 App/DMG 尚未完成 Apple
   notarization、staple 与 Gatekeeper 全链路，因此仍不得描述为正式 release。
 
 ## 当前产品面
@@ -22,8 +22,10 @@
 
 macOS 是完整产品：Chat、Code、Cowork、Settings 和本地诊断导出。
 
-- Chat 使用无工具 `ChatLoop`，支持 OpenAI-compatible streaming、provider/model/variant
-  配置、透明 hosted web search、citations、会话历史、图片生成与 artifact 投影。
+- Chat 使用无 Intatis Tools 的 `ChatLoop`，支持 OpenAI-compatible streaming、provider/model/
+  variant 配置、provider-hosted search wire、citations、会话历史、图片生成与 artifact 投影。
+  每次 Send 只按当前 exact route 的显式 capability 与 adapter dialect 可选地提供 hosted search；
+  不支持、未知或未适配时在同一路由静默发送普通 Chat。
 - Code 使用共享 headless `AgentRuntime.code`，提供工作区文件、patch、Git、managed
   terminal、Skills、外部 MCP、文档/媒体及浏览器工具。工具可见性、lease、权限和 durable
   execution ticket 在执行前逐层核对。
@@ -33,6 +35,16 @@ macOS 是完整产品：Chat、Code、Cowork、Settings 和本地诊断导出。
   当前窗口的只读对话选择；列表保留 session 历史上所有 durable agent，detached identity 继续
   可点击并由原状态图标显示已移除，当前选择不会跳回 `@main`。新窗口默认显示 `@main`，
   `@permission-reviewer` 等控制面 identity 仍为不可选择的状态项。
+- Cowork 中每个 agent 的文件、Git、文档、浏览器文件与 terminal 工具仍只作用于自己的单一
+  `workspaceRoot`。具有 `spawn_agent` 的 coordinator 提示词会在预知目标位于根外或收到
+  out-of-workspace denial 后停止直接重试，改为按目标绝对目录创建默认只读的子 agent，再用
+  `delegate_task` 交付目录内工作；确需修改时才请求 `read_write`。工具不可用或扩展被拒时只报告
+  所需目录/访问级别的 blocker，不伪称完成；Code 与普通 worker 不宣称该恢复能力。
+- Cowork coordinator 的固定提示词以主动执行为默认：每轮先建立 execution objective、交付物、约束
+  与验证方式，检查 catalog 并激活/读取明确相关的 exact Skills；非简单任务维护最小 WorkTask DAG，
+  在开始时识别适合并行、专业复核、多模态或独立 workspace 的分支并在收益成立时尽早委派，child
+  运行期间继续自己的关键路径，最终验证报告、结算 WorkTask 并持续推进到验证完成或真实 blocker。
+  该行为不自动创建 durable Goal，也不改变最小团队、工具、lease、权限或 worker 能力边界。
 - Settings 已收敛为渐进披露结构，保留 provider、模型、MCP、renderer、声明、配置和本地
   诊断 ZIP。诊断包尝试采集系统/App/session 诊断源，但排除原始会话、工具参数/结果、
   endpoint、credential、workspace、artifact、browser profile 与 bookmark；不远程上传。
@@ -40,9 +52,9 @@ macOS 是完整产品：Chat、Code、Cowork、Settings 和本地诊断导出。
 ### iOS
 
 iOS 是结构性 Chat 子集，只链接 Core、Protocol、Providers、Conversation、Artifacts、
-Multimodal 与 SharedUI。它支持 provider 配置导入、Chat/history、托管搜索、citations、
-图片生成和当前系统原生界面，但不链接 Tools、Permission、AgentKernel、Cowork、MCP 或
-本地 workspace/shell。
+Multimodal 与 SharedUI。它支持 provider 配置导入、Chat/history、当前托管搜索 wire、
+citations、图片生成和当前系统原生界面，但不链接 Tools、Permission、AgentKernel、Cowork、
+MCP 或本地 workspace/shell。其 Chat 与 macOS 共用同一个 exact-route hosted-search planner。
 
 ### CLI
 
@@ -67,6 +79,22 @@ profiles 与外部 MCP client。macOS/Linux 的 stdio、sandbox、bwrap/guard �
   OAuth/callback/task 和 process ownership 仍受产品边界与权限控制。
 - Provider catalog 保留 model options/variant/adapter 语义；credential 只从受控 reference
   懒加载，不进入 EventLog、projection、诊断包或文档。
+
+## Chat 托管搜索
+
+- 搜索只属于当前所选 exact Chat route。该 route 明确支持时，向当前模型
+  提供厂商对应能力并以 `tool_choice: auto` 让它自行决定是否搜索；不支持、未知或未适配时，当前
+  模型静默发送普通 Chat，不显示提示或错误，不执行任何模型/服务/tool fallback。
+- v0.31 引入的 `web_search_model` / `webSearchModel` 后台路由行为已取消。runtime 不读取它
+  覆盖当前选择或发起额外模型请求；为旧配置兼容可继续 decode/preserve，但字段运行时无效、无
+  警告，新生成配置不再主动加入。
+- `Capability.hostedWebSearch` 与 MCP `toolSearch` 已分离；`ProviderRegistry.chatRuntimeRoute()` 先验证
+  普通 Chat adapter，再按 exact model capability 与 exact adapter 规划 dialect。OpenRouter 使用
+  `openrouter:web_search`，OpenAI Responses encoder 使用 `web_search`，compatible/legacy/custom
+  默认关闭，因此不会再为了探测能力先发送可能失败的搜索请求。
+- 只有 provider-specific 结构化 unsupported code/parameter 且首个有效 payload 尚未被接受时，
+  provider 才允许在同一 provider/model/variant 上重发一次普通 Chat；裸 404、自由文本和 partial
+  payload 都不会触发重放。完整合同与当前 adapter 边界见 `docs/CHAT_HOSTED_SEARCH.md`。
 
 ## UI 与内容渲染
 
@@ -195,6 +223,10 @@ profiles 与外部 MCP client。macOS/Linux 的 stdio、sandbox、bwrap/guard �
    iPhone/iPad 与长 soak 仍有环境矩阵空白；不得用离线 fixture 冒充。
 3. macOS 27/Xcode 27 当前仍是 beta toolchain evidence；最低支持系统/设备的正式矩阵需要
    独立验证。
+4. `@ai-sdk/openai` 的普通 Chat adapter 仍未实现，所以该 exact adapter 即使声明
+   `hosted_web_search` 也会按既有规则在网络前 config fail closed；在普通 adapter 完成前不能把
+   已有 OpenAI Responses search encoder 宣传为完整 native OpenAI route 支持。真实厂商 smoke 仍待
+   用户凭据环境验证。
 
 ## 文档治理
 

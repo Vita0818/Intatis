@@ -1,16 +1,16 @@
 # NEXT_TARGET
 
 文档状态：唯一活跃目标
-最近核对：2026-08-03
-产品基线：v0.32（build 32）
+最近核对：2026-08-05
+产品基线：v0.35（build 35）
 
-## 目标：完成 v0.32 Developer ID 直接分发候选
+## 目标：完成 v0.35 Developer ID 直接分发候选
 
-把当前 v0.32 源码收敛为可验证、可安装、可直接分发的 macOS ZIP/DMG；不走 App Store。
+把当前 v0.35 源码收敛为可验证、可安装、可直接分发的 macOS ZIP/DMG；不走 App Store。
 
 ## 已完成
 
-- 版本事实源已从滞留的 `0.12 (1)` 校准为 `0.32 (32)`。
+- 版本事实源已推进为 `0.35 (35)`。
 - 新增版本一致性检查，覆盖 `project.yml`、参考 Info.plist、当前入口文档和生成工程。
 - `IntatisMac` 显式启用 Hardened Runtime。
 - `scripts/package-macos-release.sh` 已实现 universal Release、Developer ID App/DMG
@@ -55,6 +55,6 @@
 - 不为 App Store App Sandbox 裁剪 terminal、Git、MCP、Skills 或 workspace 能力。
 - 不实现诊断日志远程上传。
 - 不在缺证书、公证或 Gatekeeper 证据时输出“正式发行”结论。
-- 不把历史 v0.10/v0.16 文档批量改名为 v0.32；它们是历史证据。
+- 不把历史 v0.10/v0.16 文档批量改名为 v0.35；它们是历史证据。
 
 目标完成后删除本文件或替换为下一个单一目标，不再追加已完成里程碑流水账。

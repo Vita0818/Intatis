@@ -1,8 +1,8 @@
 # TESTING
 
 文档状态：当前验证矩阵
-最近核对：2026-08-04
-产品基线：v0.32（build 32）
+最近核对：2026-08-05
+产品基线：v0.35（build 35）
 
 历史测试数量、性能数字和事故复验保留在 Git 历史及 dated reports；它们不能替代当前
 working tree 的验证。这里只记录现行命令、release gate 和最近一次真实结果。
@@ -27,11 +27,11 @@ scripts/check-version-consistency.sh
 
 必须同时满足：
 
-- `project.yml`：`MARKETING_VERSION=0.32`，`CURRENT_PROJECT_VERSION=32`；
-- macOS/iOS 参考 Info.plist：`0.32 (32)`；
+- `project.yml`：`MARKETING_VERSION=0.35`，`CURRENT_PROJECT_VERSION=35`；
+- macOS/iOS 参考 Info.plist：`0.35 (35)`；
 - 生成的 `Intatis.xcodeproj`：相同版本；
 - README、文档索引、CURRENT_STATE 和 PROJECT_MAP：相同当前基线；
-- 最终 App bundle：`CFBundleShortVersionString=0.32`、`CFBundleVersion=32`。
+- 最终 App bundle：`CFBundleShortVersionString=0.35`、`CFBundleVersion=35`。
 
 旧设计文档、依赖版本、协议 schema 和 dated reports 中的其他 v0.x 不属于该一致性检查。
 
@@ -155,6 +155,13 @@ recovery App metadata/architecture/signature/entitlements 重新验证；超时�
 - permission RequestID/FIFO/correlation、manual decline 与 cancel-turn 语义不混淆；
 - tool authorization、durable ticket、executor result 和 turn outcome 关联完整；
 - path escape、symlink/hardlink、secret、credential path、workspace lease fail closed；
+- 只有持有 coordinator lease 的 Cowork prompt 才主动建立 execution objective、检查并激活明确相关的
+  exact Skills、为非简单工作维护最小 WorkTask DAG、在收益成立时尽早委派并继续自己的关键路径，
+  最终验证 child report 与结果；普通请求不自动创建 durable Goal，一步两步工作不仪式化 spawn，
+  worker、authoritative tool list、lease 与 PermissionEngine 边界不变；
+- Cowork coordinator prompt 在 `spawn_agent` 可用时把预知的根外目录或 out-of-workspace denial
+  路由为 exact-directory child + `delegate_task`，默认只读、写入显式；Code/worker prompt 不宣称
+  coordinator 能力，工具缺失/扩展拒绝只报告 blocker，直接越界仍 fail closed；
 - runtime stop 先 drain provider/tool/process，再释放 waiter/subscription/scope；
 - Cowork worker 默认无 coordinator tools，reviewer/verifier 不进入普通 scheduler；
 - iOS target closure 不出现 Tools/Permission/AgentKernel/Cowork/MCP。
@@ -207,7 +214,77 @@ bounded visible page 的量级。`heap`/`vmmap` 会短暂停顿目标进程，�
 避免把外部采样暂停误计为产品 heartbeat incident。该 offline fixture 只证明 presentation
 pipeline，不替代真实 EventLog I/O、provider、VoiceOver、最低支持设备或多小时运行。
 
+## Chat 托管搜索验收矩阵
+
+`docs/CHAT_HOSTED_SEARCH.md` 是当前产品合同。相关业务源码修改至少必须用离线 request fixture
+和 Chat integration tests 证明：
+
+- OpenAI Responses request fixture 只生成该 dialect 的 `web_search` + `tool_choice: auto`；
+  OpenRouter exact route 明确声明 `hosted_web_search` 时只生成
+  `openrouter:web_search` + `tool_choice: auto`，两者不得共用硬编码 tool type。
+- `@ai-sdk/openai` 普通 Chat adapter 尚未实现期间，registry 必须在网络前维持既有 config error，
+  不能仅凭已有 OpenAI search encoder 跳过普通 adapter gate。
+- 当前 Chat route 不支持、未知、adapter 尚未实现，或只有 `responsesEndpoint`/URL/名称 heuristic
+  时，发送同一 Chat route 的普通 request，body 不含 hosted-search 字段，且不会先发送失败请求。
+- 配置包含任意有效、无效或未知 `web_search_model` / `webSearchModel` 时，runtime 都不得解析或
+  调用该 route，不得覆盖当前模型，也不得新增 UI 警告；新生成配置 fixture 不再写入该字段。
+- 用户切换 provider/model/variant 后，下一次 Send 只按新的 exact selection 重新规划；不得沿用
+  上一 route 的 capability，也不得产生不同 provider/model 的请求。
+- 普通与搜索分支都保留 exact model/variant options；`provider.only`、`allow_fallbacks`、
+  `require_parameters` 不得被删除或放宽。搜索不支持时只移除搜索字段。
+- 模型拥有搜索能力但未调用时正常完成且 citations 为空；实际返回结构化 annotation 时才写
+  additive citations，非法 URL、正文猜测来源和空 Sources UI 继续被拒绝。
+- typed provider-specific “hosted search unsupported” 在任何有效 payload 前只允许在同一
+  provider/model/variant 上一次普通 Chat 重发。任意 404、自由文本匹配、不同 provider/model
+  fallback、partial payload 后重放必须被测试拒绝。
+- unsupported/unknown 分支不产生 toast、banner、错误卡、状态、提示词或 Settings 项，也不注册/
+  调用通用 Intatis search tool、`web_fetch`、`browser_search`、MCP、shell 或本地浏览器。
+- macOS/iOS 共用相同 planner 语义；iOS target closure 仍没有 Tools、Permission、AgentKernel、
+  Cowork 或 MCP。Chat cancellation、TurnID、EventLog 与旧 citation decode 不因分支改变。
+
+真实 provider smoke 只能作为 adapter fixture 之外的补充，不能用单一厂商成功替代上述 exact
+adapter/capability 矩阵。2026-08-05 已新增并通过 provider focused tests，覆盖独立 capability、
+当前 route/legacy route ignore、compatible 静默普通 Chat、OpenAI/OpenRouter tool shape、strict
+routing options、结构化 unsupported 同路由一次降级、裸 404 拒绝降级、partial payload 后禁止重放
+及 citation 安全解析。macOS/iOS app build 与完整回归结果以本文件“最近一次真实结果”为准。
+
 ## 最近一次真实结果
+
+2026-08-05 Cowork coordinator 主动推进与外部目录恢复提示词的直接证据：
+
+- `ContextProjectionTests`：22 tests / 0 failures；验证 coordinator 会先建立 execution objective、
+  检查 bounded Skill catalog、只在用户明确要求持续/跨 run 目标时创建 durable Goal、为非简单工作
+  建立最小 WorkTask 图、尽早委派有收益的分支并继续自己的关键路径，同时保留最小 team/lease；也验证
+  coordinator 在工具真实可用时
+  停止根外直接重试，使用 exact-directory `spawn_agent`、默认 `read_only`、按需
+  `read_write`、随后 `delegate_task`，工具/扩展失败则报告 blocker；同一用例验证 worker 与
+  Code 默认提示词不宣称 `spawn_agent`；
+- `ToolRegistryLeaseTests`：16 tests / 0 failures；验证 Orchestrator 按 coordinator task lease
+  生成的真实 provider request 同时含主动推进规则、`spawn_agent` 工具与上述恢复规则，worker lease
+  边界不变；
+- `IntatisSkillsTests`：29 tests / 0 failures；验证产品内置 `cowork-agent-orchestration` Skill 包含主动
+  执行循环，同时继续保留 capability hard gate、最小团队与 exact profile 路由约束；
+- `intatis-skill-creator/scripts/quick_validate.py`：`Skill is valid`；目录名/frontmatter、结构、文本安全
+  与资源引用校验通过；
+- `IntatisAgentKernelTests`：170 tests / 0 failures；`IntatisCoworkTests`：320 tests / 0 failures；
+- SwiftPM 测试过程完成受影响源码/CLI package 的 Debug 编译。本次未改 App/UI、协议、权限实现或
+  Xcode 工程，未另跑 macOS/iOS app build；也未执行真实模型的外部目录行为 smoke，因此这里只
+  证明稳定提示词、工具表面与 lease 集成，不把任一模型一定遵循提示词写成确定性保证。
+
+2026-08-05 Chat 托管搜索路由修订的直接证据：
+
+- `IntatisProvidersTests`：171 tests / 0 failures；覆盖 exact route capability、OpenAI/OpenRouter
+  request shape、strict routing options、legacy search route ignore、静默普通 Chat、窄化的同路由
+  fallback、partial-response replay guard、两类 citation annotation，以及无效 legacy 搜索字段不
+  阻止 Chat/有效 legacy 搜索字段不污染可见模型列表；
+- `IntatisConversationTests`：173 tests / 0 failures；
+- `IntatisCLITests`：28 tests / 2 opt-in real-provider tests skipped / 0 failures；
+- `IntatisSharedUITests`：133 tests / 0 failures；
+- `IntatisMac` macOS Debug unsigned build：通过；`IntatisiOS` generic Simulator Debug unsigned
+  build：通过。iOS 首次独立依赖解析遇到 GitHub proxy 503，复用已成功解析并缓存的同一
+  working-tree dependencies 后构建通过，该网络失败不计为源码失败；
+- 未执行真实 provider/credential/network smoke，因此这里只证明离线 wire fixture、planner、
+  integration 与两端编译，不声称任何具体厂商当前线上 endpoint 已通过。
 
 2026-08-03 版本校准后的直接证据：
 
@@ -273,7 +350,7 @@ pipeline，不替代真实 EventLog I/O、provider、VoiceOver、最低支持设
 只有以下条件同时满足才能写 release GO：
 
 - 当前 working tree 相关 tests/builds 通过，已知失败有明确处置；
-- 最终 App/ZIP/DMG 元数据为 `0.32 (32)`；
+- 最终 App/ZIP/DMG 元数据为 `0.35 (35)`；
 - Developer ID、notarization、staple、codesign、Gatekeeper 全部通过；
 - NOTICE/ThirdPartyNotices 和最终 bundle resource/link inventory 一致；
 - 关键真实环境矩阵完成，未完成项以明确的风险接受记录处理。

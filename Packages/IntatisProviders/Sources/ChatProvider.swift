@@ -40,6 +40,14 @@ public enum ReasoningEffort: String, Codable, Sendable {
     case minimal, low, medium, high
 }
 
+/// The reviewed provider-specific hosted-search request shape for one exact
+/// Chat route. Compatible/custom endpoints do not inherit a dialect merely
+/// because they use an OpenAI-shaped wire.
+public enum ChatHostedWebSearchDialect: Equatable, Sendable {
+    case openAIResponses
+    case openRouterServerTool
+}
+
 /// Hosted web-search options for a chat request. This is provider-side search,
 /// not an Intatis local tool, so the iOS Chat subset keeps its no-tools boundary.
 public struct ChatWebSearchConfiguration: Equatable, Sendable {
@@ -47,9 +55,12 @@ public struct ChatWebSearchConfiguration: Equatable, Sendable {
         case low, medium, high
     }
 
+    public var dialect: ChatHostedWebSearchDialect
     public var contextSize: ContextSize
 
-    public init(contextSize: ContextSize = .medium) {
+    public init(dialect: ChatHostedWebSearchDialect,
+                contextSize: ContextSize = .medium) {
+        self.dialect = dialect
         self.contextSize = contextSize
     }
 }

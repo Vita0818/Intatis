@@ -276,8 +276,8 @@ struct AppProviderCatalog: Codable, Equatable {
     var selectedProviderID: String
     var selectedModelID: String
     var selectedVariantID: String? = nil
-    /// Optional background route loaded from `web_search_model`. It is not a
-    /// visible model selection and never changes the composer label.
+    /// Legacy field retained only so existing configuration can be decoded and
+    /// preserved. Chat runtime routing deliberately ignores it.
     var webSearchModel: ModelRef? = nil
     var providers: [AppProviderSettings]
 
@@ -1059,10 +1059,6 @@ enum AppConfig {
         root["$schema"] = "https://opencode.ai/config.json"
         root["enabled_providers"] = catalog.providers.map(\.id)
         root["model"] = selectedOpenCodeModel(in: catalog)
-        if let webSearchModel = catalog.webSearchModel {
-            root["web_search_model"] =
-                "\(webSearchModel.endpoint)/\(webSearchModel.model.rawValue)"
-        }
 
         var providerMap = root["provider"] as? [String: Any] ?? [:]
         for provider in catalog.providers {
@@ -1307,14 +1303,12 @@ private struct AppProviderConfigTemplate: Encodable {
     var schema = "https://opencode.ai/config.json"
     var enabledProviders: [String]
     var model: String
-    var webSearchModel: String?
     var provider: [String: AppProviderConfigTemplateProvider]
 
     enum CodingKeys: String, CodingKey {
         case schema = "$schema"
         case enabledProviders = "enabled_providers"
         case model
-        case webSearchModel = "web_search_model"
         case provider
     }
 
@@ -1331,10 +1325,6 @@ private struct AppProviderConfigTemplate: Encodable {
         } else {
             self.model = AppConfig.defaultModel
         }
-        self.webSearchModel = catalog.webSearchModel.map {
-            "\($0.endpoint)/\($0.model.rawValue)"
-        }
-
         self.provider = Dictionary(uniqueKeysWithValues: catalog.providers.map { provider in
             (provider.id, AppProviderConfigTemplateProvider(
                 provider: provider,
@@ -1465,7 +1455,7 @@ private struct AppProviderConfigFile: Decodable {
         let webSearchRef = backgroundModelRef(
             resolvedWebSearchModel,
             preferredProviderID: selectedProvider,
-            entries: &entries)
+            entries: entries)
 
         return AppProviderCatalog(selectedProviderID: selectedProvider,
                                   selectedModelID: selectedModel,
@@ -1477,7 +1467,7 @@ private struct AppProviderConfigFile: Decodable {
     private func backgroundModelRef(
         _ raw: String?,
         preferredProviderID: String,
-        entries: inout [AppProviderSettings]
+        entries: [AppProviderSettings]
     ) -> ModelRef? {
         guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
               !raw.isEmpty else {
@@ -1500,13 +1490,6 @@ private struct AppProviderConfigFile: Decodable {
         let endpointID = actualProviderID(
             matching: selection.providerID,
             in: entries) ?? selection.providerID
-        if let index = entries.firstIndex(where: { $0.id == endpointID }),
-           !entries[index].models.contains(where: { $0.id == selection.modelID }) {
-            entries[index].models.append(AppProviderModel(
-                id: selection.modelID,
-                displayName: AppConfig.defaultDisplayName(
-                    for: selection.modelID)))
-        }
         return ModelRef(
             endpoint: endpointID,
             model: ModelID(rawValue: selection.modelID))

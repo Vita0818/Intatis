@@ -101,4 +101,21 @@ extension ProviderRequestAdapter {
                 "the selected provider npm adapter is not supported by the native runtime")
         }
     }
+
+    /// Returns a hosted-search dialect only for exact, reviewed provider
+    /// adapters. Callers must independently verify that the ordinary Chat
+    /// adapter is executable and that the exact model declares the capability.
+    func hostedWebSearchDialect() -> ChatHostedWebSearchDialect? {
+        switch self {
+        case .openAI:
+            return .openAIResponses
+        case .openRouter:
+            return .openRouterServerTool
+        case .legacyOpenAIWire,
+             .openAICompatible:
+            return nil
+        default:
+            return nil
+        }
+    }
 }

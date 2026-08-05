@@ -51,6 +51,32 @@ final class ResponsesToolSearchParityTests: XCTestCase {
                 .contains(.toolSearch))
     }
 
+    func testHostedWebSearchCapabilityIsExplicitAndDistinctFromToolSearch()
+        throws
+    {
+        let hosted = ModelCapabilityMetadata.declaredCapabilities(in: [
+            "capabilities": .array([
+                .string("hosted_web_search"),
+            ]),
+        ])
+        XCTAssertTrue(hosted.contains(.hostedWebSearch))
+        XCTAssertFalse(hosted.contains(.toolSearch))
+
+        let toolSearch = ModelCapabilityMetadata.declaredCapabilities(in: [
+            "supports_search_tool": .bool(true),
+        ])
+        XCTAssertTrue(toolSearch.contains(.toolSearch))
+        XCTAssertFalse(toolSearch.contains(.hostedWebSearch))
+
+        let explicitFalse = ModelCapabilityMetadata.declaredCapabilities(in: [
+            "capabilities": .array([
+                .string("hosted_web_search"),
+            ]),
+            "supports_hosted_web_search": .bool(false),
+        ])
+        XCTAssertFalse(explicitFalse.contains(.hostedWebSearch))
+    }
+
     func testEndpointCapabilityConfigurationRoundTripsAndLegacyDefaultsClosed()
         throws {
         let configured = ProviderEndpoint(

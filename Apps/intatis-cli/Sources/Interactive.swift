@@ -278,9 +278,15 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
         do {
             switch mode {
             case .chat:
-                let provider = try await registry.defaultChatProvider()
-                try await ChatLoop(log: log, provider: provider, model: ModelID(rawValue: model),
-                                   reasoningEffort: reasoning, includeUsage: config.includeUsage)
+                let route = try await registry.chatRuntimeRoute(
+                    model: ModelID(rawValue: model))
+                try await ChatLoop(
+                    log: log,
+                    provider: route.provider,
+                    model: route.model,
+                    reasoningEffort: reasoning,
+                    includeUsage: config.includeUsage,
+                    webSearch: route.webSearch)
                     .send(sendText, images: sendImages)
             case .code:
                 let mcpActivation:

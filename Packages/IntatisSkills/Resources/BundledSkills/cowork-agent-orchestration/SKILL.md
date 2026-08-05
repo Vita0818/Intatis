@@ -1,6 +1,6 @@
 ---
 name: cowork-agent-orchestration
-description: Plan and route Intatis Cowork work when coordinator capabilities are available, including deciding direct execution versus agent reuse, delegation, or spawn; selecting newer adequate host-approved inference profiles under cost-first, cost-efficient-balanced, or efficiency-first priorities; pairing a declared-capable multimodal companion when needed; and minimizing workspace and coordination leases.
+description: Proactively plan, track, and route Intatis Cowork work when coordinator capabilities are available, including deciding direct execution versus agent reuse, delegation, or spawn; selecting newer adequate host-approved inference profiles under cost-first, cost-efficient-balanced, or efficiency-first priorities; pairing a declared-capable multimodal companion when needed; and minimizing workspace and coordination leases.
 ---
 
 # Cowork agent orchestration
@@ -28,6 +28,29 @@ or budgets.
   `AgentLoop`, a completed WorkTask, or a successful child result in prose.
 - Prefer the smallest team and the least authority that can complete the task.
   Delegation overhead is real work and real model cost.
+
+## Drive the request proactively
+
+1. Derive a concrete execution objective, expected deliverables, constraints, and
+   verification approach from the current request. Resolve ordinary uncertainty with
+   available inspection tools or safe in-scope assumptions; request user input only
+   when the missing choice materially changes the result or needs new authority.
+2. Treat every request as a current execution objective. Create a durable Goal only
+   when the user explicitly requests a persistent or cross-run objective and the
+   corresponding tool is advertised.
+3. For non-trivial work, use advertised task tools to create the smallest useful
+   graph of verifiable WorkTasks. Keep ownership, dependencies, progress, result, and
+   evidence current instead of maintaining a prose-only plan.
+4. Evaluate the collaboration criteria below at the outset. Start ready independent,
+   specialist, multimodal, review, or directory-scoped branches promptly when their
+   benefit exceeds coordination cost; collaboration should not be reserved only for
+   recovery after direct work fails.
+5. After delegation, continue useful work on the coordinator's own critical path
+   instead of waiting idly. Verify every child report, settle only proven WorkTask
+   results, replan only the affected branch after failure, and synthesize one result.
+6. Keep advancing until the requested outcome is verified or a genuine blocker
+   remains. Never infer completion from a plan, an invocation ending, or unverified
+   prose.
 
 ## Select the operating priority
 

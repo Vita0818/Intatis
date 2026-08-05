@@ -760,6 +760,13 @@ final class ToolRegistryLeaseTests: XCTestCase {
 
         let systemPrompt = try XCTUnwrap(request.messages.first?.content)
         XCTAssertTrue(systemPrompt.contains("You may also act as a COORDINATOR"))
+        XCTAssertTrue(systemPrompt.contains("Proactively drive the user's requested outcome"))
+        XCTAssertTrue(systemPrompt.contains("Inspect the bounded INTATIS_SKILL_CATALOG"))
+        XCTAssertTrue(systemPrompt.contains("those branches early rather than using collaboration"))
+        XCTAssertTrue(systemPrompt.contains("instead of waiting idly"))
+        XCTAssertTrue(systemPrompt.contains("out-of-workspace denial"))
+        XCTAssertTrue(systemPrompt.contains("spawn_agent is present in the authoritative API tools list"))
+        XCTAssertTrue(systemPrompt.contains("directory-scoped work with delegate_task"))
         XCTAssertFalse(systemPrompt.contains("You are executing the assigned task as a worker agent."))
 
         let events = await log.replay()

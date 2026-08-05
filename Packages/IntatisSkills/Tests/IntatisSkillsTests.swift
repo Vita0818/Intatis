@@ -45,6 +45,10 @@ final class IntatisSkillsTests: XCTestCase {
         XCTAssertTrue(catalog.contains("scope=\"system\""))
 
         let activation = try snapshot.activationPrompt(skillID: skill.id)
+        XCTAssertTrue(activation.contains("Drive the request proactively"))
+        XCTAssertTrue(activation.contains("Create a durable Goal only"))
+        XCTAssertTrue(activation.contains("collaboration should not be reserved only"))
+        XCTAssertTrue(activation.contains("instead of waiting idly"))
         XCTAssertTrue(activation.contains("cost-efficient-balanced"))
         XCTAssertTrue(activation.contains("Prefer the smallest team"))
         XCTAssertTrue(activation.contains("Mandatory multimodal companion"))

@@ -85,6 +85,28 @@ public struct ProviderContextWindowExceededError:
     }
 }
 
+/// Raw, bounded HTTP failure retained inside the provider layer long enough for
+/// an exact adapter to perform structured classification. It is always reduced
+/// to the existing sanitized public error before crossing that boundary.
+struct ProviderHTTPStatusError: Error, LocalizedError, Sendable {
+    var statusCode: Int
+    var body: Data
+    var headers: [String: String]
+    var operation: String
+
+    var formattedError: Error {
+        ProviderErrorFormatting.httpStatus(
+            statusCode,
+            body: body,
+            headers: headers,
+            operation: operation)
+    }
+
+    var errorDescription: String? {
+        formattedError.localizedDescription
+    }
+}
+
 struct ProviderRetryHint: Equatable, Sendable {
     var delaySeconds: Double
     var source: String
@@ -171,7 +193,10 @@ enum ProviderErrorFormatting {
     }
 
     static func retryHint(from error: Error) -> ProviderRetryHint? {
-        retryHint(fromMessage: error.localizedDescription)
+        if let status = error as? ProviderHTTPStatusError {
+            return retryHint(headers: status.headers)
+        }
+        return retryHint(fromMessage: error.localizedDescription)
     }
 
     static func transport(_ error: Error) -> Error {
@@ -184,6 +209,9 @@ enum ProviderErrorFormatting {
         if let contextWindow =
             error as? ProviderContextWindowExceededError {
             return contextWindow
+        }
+        if let status = error as? ProviderHTTPStatusError {
+            return status.formattedError
         }
         if let intatis = error as? IntatisError {
             return sanitized(intatis)

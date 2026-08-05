@@ -1,7 +1,7 @@
 # Intatis
 
-当前版本：**v0.32**（build 32）
-状态：pre-1.0；源码与构建可验证，v0.32 Developer ID 发行候选尚待完成最终公证验收。
+当前版本：**v0.35**（build 35）
+状态：pre-1.0；源码与构建可验证，v0.35 Developer ID 发行候选尚待完成最终公证验收。
 
 Intatis 是 Apple-first、Swift-native 优先的本地 AI 工作区。macOS 提供 Chat、Code、
 Cowork 三个产品面；iOS 是严格的 Chat 子集；CLI 提供 headless Code/Cowork 和外部 MCP

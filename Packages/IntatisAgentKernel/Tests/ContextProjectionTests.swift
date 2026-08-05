@@ -149,6 +149,18 @@ final class ContextProjectionTests: XCTestCase {
         XCTAssertTrue(coordinator.contains("activate_skill"))
         XCTAssertTrue(coordinator.contains("exact-profile inheritance"))
         XCTAssertTrue(coordinator.contains("grant no child coordination authority"))
+        XCTAssertTrue(coordinator.contains("Proactively drive the user's requested outcome"))
+        XCTAssertTrue(coordinator.contains("establish a concrete execution objective"))
+        XCTAssertTrue(coordinator.contains("Inspect the bounded INTATIS_SKILL_CATALOG"))
+        XCTAssertTrue(coordinator.contains("activate and read each clearly relevant Skill"))
+        XCTAssertTrue(coordinator.contains("Create a durable Goal only"))
+        XCTAssertTrue(coordinator.contains("user explicitly requests a persistent or cross-run objective"))
+        XCTAssertTrue(coordinator.contains("proactively create the"))
+        XCTAssertTrue(coordinator.contains("smallest useful dependency graph"))
+        XCTAssertTrue(coordinator.contains("those branches early rather than using collaboration"))
+        XCTAssertTrue(coordinator.contains("instead of waiting idly"))
+        XCTAssertTrue(coordinator.contains("effective team and least authority"))
+        XCTAssertTrue(coordinator.contains("Keep advancing the request until the outcome is verified"))
 
         let worker = ContextBuilder.coworkSystemPrompt(
             name: "worker",
@@ -158,6 +170,37 @@ final class ContextProjectionTests: XCTestCase {
         XCTAssertFalse(worker.contains(
             IntatisBundledSkills.coworkAgentOrchestrationName))
         XCTAssertFalse(worker.contains("system:bundle-"))
+        XCTAssertFalse(worker.contains("Proactively drive the user's requested outcome"))
+    }
+
+    func testCoordinatorPromptRoutesExternalDirectoryWorkThroughSpawnedAgent() {
+        let coordinator = ContextBuilder.coworkSystemPrompt(
+            name: "main",
+            folder: "/workspace",
+            coordinationDepth: 1,
+            canCoordinate: true)
+
+        XCTAssertTrue(coordinator.contains("existing directory outside"))
+        XCTAssertTrue(coordinator.contains("out-of-workspace denial"))
+        XCTAssertTrue(coordinator.contains("do not retry direct access"))
+        XCTAssertTrue(coordinator.contains("spawn_agent is present in the authoritative API tools list"))
+        XCTAssertTrue(coordinator.contains("requestedAccess"))
+        XCTAssertTrue(coordinator.contains("read_only"))
+        XCTAssertTrue(coordinator.contains("read_write"))
+        XCTAssertTrue(coordinator.contains("directory-scoped work with delegate_task"))
+        XCTAssertTrue(coordinator.contains("workspace-expansion request is denied"))
+        XCTAssertTrue(coordinator.contains("needed access instead of claiming the"))
+        XCTAssertTrue(coordinator.contains("workspace-boundary routing is required"))
+
+        let worker = ContextBuilder.coworkSystemPrompt(
+            name: "worker",
+            folder: "/workspace",
+            coordinationDepth: 0,
+            canCoordinate: false)
+        XCTAssertFalse(worker.contains("out-of-workspace denial"))
+        XCTAssertFalse(worker.contains("spawn_agent"))
+
+        XCTAssertFalse(ContextBuilder.defaultSystemPrompt.contains("spawn_agent"))
     }
 
     private func projectionEvents(contract: TaskContract) -> [Envelope] {

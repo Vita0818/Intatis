@@ -275,21 +275,17 @@ public final class ChatViewModel: ObservableObject {
         input = ""
         isStreaming = true
         errorText = nil
-        // Hosted search is a transparent Chat capability. The provider receives
-        // it on every turn and decides whether the current prompt needs search;
-        // there is intentionally no composer or Settings toggle.
-        let webSearch = ChatWebSearchConfiguration(contextSize: .medium)
         let operation = Task { @MainActor [weak self] in
             guard let self else { return }
             let startSeq = await self.log.replay().last?.seq ?? -1
             do {
                 let route = try await self.registry
-                    .hostedSearchChatRuntimeRoute()
+                    .chatRuntimeRoute()
                 let loop = ChatLoop(
                     log: self.log,
                     provider: route.provider,
                     model: route.model,
-                    webSearch: webSearch)
+                    webSearch: route.webSearch)
                 try await loop.send(parsed.text, userMessage: parsed.userMessagePayload)
             } catch {
                 if IntatisCancellation.isCurrentTaskCancellation(error) {

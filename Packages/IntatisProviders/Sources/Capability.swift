@@ -12,6 +12,9 @@ public enum Capability:
     /// The exact model/provider route supports the Responses `tool_search`
     /// contract, including namespaced deferred tool definitions.
     case toolSearch = "tool_search"
+    /// The exact Chat provider/model route supports provider-hosted web
+    /// search. This is distinct from the MCP deferred `tool_search` contract.
+    case hostedWebSearch = "hosted_web_search"
     case visionInput = "vision_input"
     case realtimeTranscription = "realtime_transcription"
     case audioInput = "audio_input"
@@ -24,9 +27,10 @@ public enum Capability:
 }
 
 /// Parses only explicit, non-secret model metadata. `supports_search_tool`
-/// matches Codex model metadata naming; the optional `capabilities` array uses
-/// Intatis `Capability.rawValue` values. An explicit false value wins over the
-/// array so contradictory configuration fails closed.
+/// matches Codex model metadata naming; `supports_hosted_web_search` controls
+/// Chat provider-hosted search. The optional `capabilities` array uses Intatis
+/// `Capability.rawValue` values. An explicit false value wins over the array so
+/// contradictory configuration fails closed.
 public enum ModelCapabilityMetadata {
     public static func declaredCapabilities(
         in metadata: [String: JSONValue],
@@ -53,6 +57,14 @@ public enum ModelCapabilityMetadata {
                 capabilities.insert(.toolSearch)
             } else {
                 capabilities.remove(.toolSearch)
+            }
+        }
+        if case .bool(let supportsHostedSearch) =
+            metadata["supports_hosted_web_search"] {
+            if supportsHostedSearch {
+                capabilities.insert(.hostedWebSearch)
+            } else {
+                capabilities.remove(.hostedWebSearch)
             }
         }
         return Capability.allCases.filter(
