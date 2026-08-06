@@ -419,6 +419,33 @@ macOS root sidebar or iOS drawer/top New Chat -> selected SessionID -> per-sessi
 （无工具、无权限、无工作区）
 ```
 
+### Composer 语音输入链路（macOS Chat/Code/Cowork 与 iOS Chat）
+
+```text
+composer mic -> ComposerVoiceInputController
+  -> exact top-level transcription_model (<provider>/<model-id>)
+  -> recorded-file runtime plan (WAV, 16 kHz, mono, 120 s / 25 MiB)
+  -> system microphone permission -> Flotis-derived AVAudioRecorder generation state machine
+  -> second tap or 120-second limit stops recording
+  -> ProviderRegistry resolves the frozen exact transcription route and credential
+  -> disk-backed owner-only request body
+     -> compatible/legacy/OpenAI adapter: multipart POST <baseURL>/audio/transcriptions
+     -> exact OpenRouter adapter: JSON input_audio(base64) POST <baseURL>/audio/transcriptions
+  -> append returned text to the current editable draft
+  -> clean temporary audio/body on success, failure, cancellation, or runtime shutdown
+```
+
+该路径是用户直接触发的本地 composer 输入能力，不是 model-facing tool，因此不进入
+`PermissionEngine`、WorkspaceLease 或 durable tool ticket；OS 麦克风权限仍是前置条件。录音开始时
+冻结 registry 与 exact `transcription_model`，但 credential 只在真正转写时懒加载。配置缺失或 route
+无效、adapter 不受支持时 fail closed，不回退到当前 Chat/Code/Cowork inference model。录音 runtime
+沿用 Flotis 的 recorded-file 边界：默认 WAV/16 kHz/mono，不设置 AAC bitrate；generation 防止权限回调
+或取消后的旧录音复活，stop 后验证普通非 symlink 文件且非空。录音最多 120 秒、上传前最多 25 MiB，
+音频与 multipart/JSON body 都是随机 owner-only 临时文件，并清理超过 24 小时的本应用 stale 文件；
+转写完成、失败、取消或 shutdown 后均删除。结果只合并到完成时的当前草稿，不自动 Send；用户真正
+发送前，不产生 EventLog、ArtifactStore 或 session projection 写入。该能力复用既有配置文件/importer，
+没有单独的设置页，也没有迁入 Flotis 的多模型对比、全局快捷键、review/clipboard 或输入法链路。
+
 ### Code 链路（单 agent，macOS 全量）
 
 ```text
@@ -971,6 +998,9 @@ MessageBus.deliver -> Mediator.mediate
 - 删除 session 先对 exact key 执行 runtime shutdown，再删除 durable session；manager 发出 removal 后，其他窗口清理对应 Code/Cowork detail 或切换到仍存在的 Chat session。只删除一个 session 不影响其他 session 的后台工作。
 - AppKit termination 使用 `applicationShouldTerminate` 的 terminate-later 协议。manager 先进入 quiescing、关闭全部 runtime 的新操作 admission，再同时广播 stop，并由 `BoundedSessionRuntimeShutdown` 使用单调时钟等待 bounded deadline。已完成项记为 settled；超时项只记 timedOut，不能冒充工具/任务已经 durable settlement。应用最后只调用一次 termination reply。
 - Chat/Code/Cowork shutdown 均取消并等待其拥有的 send/provider/tool/direct-operation task，再清理 permission waiter、EventLog subscription 与 workspace access lease。Cowork 所有公开 mutation 入口共同检查 admission fence，并登记到统一 operation registry，避免 shutdown snapshot 之后又出现未等待写入。
+- Chat/Code/Cowork shutdown 也必须取消并等待各自的 composer voice operation，停止 recorder、释放
+  进程级 microphone lease 并删除临时音频；窗口切换或 Command-W 仍不能隐式 shutdown 由 manager
+  持有的 session runtime。
 - 冷启动和 crash/force-quit 后重开不复用进程内 runtime，只从 durable state 构建新 runtime并 reconcile。恢复出的 running/stopping 显示 interrupted；active Goal 变 paused/budget-limited。继续执行必须由用户显式 Send、Retry 或 Resume 发起。
 
 ### 多模态链路
@@ -980,6 +1010,10 @@ MultimodalService.generateImage/transcribe/generateVideo(轮询 job)
   -> provider 调用 -> ArtifactStore 写入
   -> log: artifact_added / artifact_progress
 ```
+
+上述 artifact-producing `MultimodalService.transcribe` 与 composer 语音草稿路径是两个边界：composer
+voice 不创建 artifact，也不在用户 Send 前写 EventLog；其 exact route、临时文件与生命周期合同见
+“Composer 语音输入链路”。
 
 ## 数据模型
 
@@ -1040,7 +1074,7 @@ MultimodalService.generateImage/transcribe/generateVideo(轮询 job)
 - **Chat 托管网络搜索**：macOS/iOS/CLI Chat 不展示搜索按钮、菜单项、开关、状态或 provider/model 路由提示。每次 Send 只冻结用户当前选择的 exact Chat provider/model/variant/request adapter；`ProviderRegistry.chatRuntimeRoute()` 先验证普通 Chat adapter，再同时要求 exact model 的 `hosted_web_search` 声明与受审 adapter dialect。满足时向当前模型提供对应能力并保持 `tool_choice: auto`，由当前模型自行决定是否搜索；明确不支持、未声明、无法确认或尚未适配时，在同一 route 上静默发送普通 Chat，不提示、不切换模型，也不调用通用 Intatis search tool、`web_fetch`、`browser_search`、本地浏览器、MCP 或第三方搜索后端。OpenAI Responses `web_search` 与 OpenRouter `openrouter:web_search` 分别编码；unknown/compatible/legacy/custom 接入点默认不声明搜索。该能力不进入 PermissionEngine/AgentLoop，也不扩大 iOS linkage。只有当前模型实际返回结构化 URL annotation 时才保存 optional additive citations，并在持久化与 SwiftUI `Link` 前执行既有双重校验。provider-specific structured unsupported 在首个有效 payload 前可触发一次同路由普通 Chat 重发；裸 404、自由文本和 partial payload 不可触发。精确合同见 `docs/CHAT_HOSTED_SEARCH.md`。
 - **Agent 网络/浏览器工具**：`ToolRegistry.standard()` 暴露轻量 `web_fetch` 和 Playwright/CDP-backed `browser_*` 工具。浏览器工具依赖用户环境里已安装的 Node.js，并优先使用 Playwright + Chromium/Chrome/Edge channel；若 Playwright 不可解析，则通过 Node.js 内置 `WebSocket` 使用 Chrome DevTools Protocol 启动已安装 Chrome/Edge/Chromium。缺少后端时返回配置错误或 `browser_diagnostics` 的可行动诊断。profile/state/history/downloads 全部通过 `PathConfinement` 限定在 workspace `.intatis/browser/` 下，刷新、历史前进/后退、表单点击/输入/提交/下拉选择/按键/滚动/等待交互通过 locator 或当前焦点执行；click/download 的 CDP 路径使用真实鼠标事件，打开新页面的交互会跟随到新 tab/window 并把最终页面写回 state/history；截图只能写入工作区 PNG 路径，上传只能引用 workspace 内文件，显式下载只能写入 `.intatis/browser/downloads/<profile>`；`browser_profiles` 可报告 active browser / profile lock runtime marker 是否存在，但不得列内部 marker 文件名或读取内容；`browser_profile_delete` 只在目标 profile 与 `confirmProfile` 匹配时删除 `.intatis/browser/profiles/<profile>`、`downloads/<profile>`、`state/<profile>.json` 并剪除对应 history metadata，删除前如果发现 marker 只给概括性提示；profile 可能包含 cookies 与登录态，不能当成普通日志、artifact 或 secret-free 文本处理。
 - **macOS UI information architecture**：`IntatisMacRootView` 是 macOS Chat/Code/Cowork 的 shell。左侧继续由 `NavigationSplitView` 提供系统 sidebar 材质，内部使用一个连贯的自定义结构：`Intatis` 标题、带 SF Symbol 的 Chat/Code/Cowork 竖向三行导航、当前 mode 的 `Recent` session history/New 与底部 Settings；仅选中模式行使用 interactive Liquid Glass。Cowork New session 仍先要求用户选择主 workspace 并初始化 per-session project settings。主 thread header 显示 session durable display name（无 display name 时回退 immutable `SessionID`），不写死 Chat/Code/Cowork，也不承载 New/session/model 控件；Code/Cowork 使用紧凑 12pt 顶部留白，Cowork 不再在标题之前常驻 permission-reviewer 横幅。共享 `IntatisThreadComposer` 固定两排：第一排 model/profile 在左、最近一轮 Context/Input/Cached/Output/Time usage 在右；Chat/Code/Cowork 的选择器共用原生 `Menu` 语义与 40pt 高 interactive Liquid Glass 胶囊，关闭态只显示模型名，不显示 CPU/芯片图标、provider 或 variant/reasoning detail；弹出菜单内部仍按 provider 分组并保留 variant detail。第二排是当前产品面已有的 attachment/image action、原生多行 `TextField`、可选 Cowork stop 与 Send；action/stop/Send 使用同一个 40×40 原生圆形控件合同，输入容器单行最小高度同为 40，同行 spacing 为 8，外层保持 bottom alignment，因此多行输入只向上增长。没有 top accessories 时不创建空白第一排。消息本体不使用 agent 头像或通用 Agent badge，缺失的 agent 展示名回退 `Intatis`；正常完成的 assistant/agent 回复无外层卡片，通用 Agent message、`information_requested`、`information_replied` 与其他 agent-to-agent 记录沿用同一普通回答版式并以 exact `sender->recipient` 标识，用户消息、失败回复与 tool/error/permission/task 等结构化项保留容器；既有字体 token 不随本次视觉架构更新。Thread content 使用共享 responsive layout 计算 horizontal padding、显式 `contentWidth`、message gutter 与 bubble max width；对话行通过 `IntatisThreadBubbleRow` 在整行层面按 user trailing、assistant/agent leading 对齐。Chat 默认无右 inspector；Code/Cowork 的显隐都只由同一个稳定外层 `GeometryReader` 提供的未压缩 outer available width 与用户请求状态决定，不使用已经压缩后的 thread width 反推自身可见性。Code 继续用有界 `HStack` 展示 structured plan/workspace/Git-status-only/recent failure。Cowork 则把 rail 作为 detail 同一 canvas 上的 trailing overlay：不使用 divider 或整栏 `.bar` 背景，主 thread 复用一个固定 `ScrollView` 根并延伸至 detail 最右端，visible rail 固定 348pt、section 固定 318pt，正文通过 trailing scroll-content margin 给 cards 留位，使原生滚动条位于整个内容区最右端。rail subtree 由只含 rail input 的 Equatable boundary 隔离；每个 passive section 独立使用系统 `Glass.clear` 的稳定 backdrop，不用 `GlassEffectContainer` 组织这些必须保持固定位置的 status cards。第一位显示 compact pending permission 或最近权限结果，其后为 `Agents`、真实 `Goal`、真实 `Tasks`，不显示 Git。compact permission 只展示状态、tool、安全摘要与必要 action，不渲染 raw args 或默认详情；pending 且 outer width 足以容纳 rail 时临时固定为可见，窄到无法安全容纳时只在 composer 上方保留同一请求的完整 Material 权限卡兜底，二者不得重复。无 pending 时用户仍可隐藏 Cowork rail；任何窄屏或隐藏状态都不在 thread 顶部复制 Goal/Tasks，也不保留对应高度。Code/Cowork 的 bottom-anchor 恢复使用系统 `onScrollVisibilityChange`，不建立 GeometryReader/PreferenceKey 坐标回写；session controls 位于内容 header，不向 window toolbar 动态增删 item，也不嵌套 SwiftUI `.inspector` preference。Cowork header 不提供独立 MCP Content 快捷按钮，内容浏览位于 `Project Settings → MCP → Browse Content`；header 只用系统 compact 圆形 glass/bordered icon control 切换 status rail。Goal/Tasks 继续来自 durable projections；Cowork 的 Git UI 已移除，但本地 Git controls 仍只通过 Agent Git tools + PermissionEngine 执行。
-- **UI 配色与跨平台设计语言**：macOS detail 由 `IntatisSystemCanvas` 使用 SwiftUI `.windowBackground`（macOS 13 fallback 为 `NSVisualEffectView.Material.windowBackground`）提供动态系统 window surface，`NavigationSplitView` sidebar 不再被自定义底色覆盖。`IntatisThreadStyle.intatisMac` / `.standard` 注入系统 `.primary` / `.secondary`、separator、accent 与错误语义；正常完成的 assistant/agent 正文直接继承系统 canvas，不叠 Material 或描边；用户消息、失败回复、数据卡片、权限和 artifact 等结构化内容层默认使用 `.regularMaterial`。composer、模型菜单、主要操作及确实需要融合的紧凑 action group 在 macOS 26 / iOS 26 使用 `glassEffect`、`GlassEffectContainer` 与 `.glass` / `.glassProminent`，旧系统走 Material / bordered control fallback；用户明确指定的 Cowork 紧凑 trailing status rail 是唯一内容层玻璃例外，权限、Agents、Goal、Tasks 各自使用独立原生 `Glass.clear` backdrop，不绘制固定灰框或自制玻璃，也不由一个会重组 shape 的 container 包住。macOS 与 iOS Chat composer 现在都采用共享两排结构：首排为关闭态只显示模型名的 interactive glass `Menu` 与可用 usage，第二排为当前产品面已有 action、输入和唯一 Send/Stop；iOS 仍只提供 paperclip Chat 功能菜单，不能伪造通用附件。macOS sidebar `Recent` 旁 `+` 使用 30×30 原生小型圆形 glass control；iOS 左抽屉使用同一品牌/模式/history/Settings 层级。两平台仅品牌、session 与页面级标题使用系统 serif，正文与控件使用系统 sans；Markdown/代码/公式保持语义字体。Glass 不铺页面或长内容。iOS 根视图与约 82% 抽屉继续使用系统容器背景，不复制参考应用固定渐变或另建平台私有底色。当前规范见 `docs/CURRENT_UI_COLOR_SYSTEM.md`；上一版方案独立保存在 `docs/UI_COLOR_SYSTEM.md`。
+- **UI 配色与跨平台设计语言**：macOS detail 由 `IntatisSystemCanvas` 使用 SwiftUI `.windowBackground`（macOS 13 fallback 为 `NSVisualEffectView.Material.windowBackground`）提供动态系统 window surface，`NavigationSplitView` sidebar 不再被自定义底色覆盖。`IntatisThreadStyle.intatisMac` / `.standard` 注入系统 `.primary` / `.secondary`、separator、accent 与错误语义；正常完成的 assistant/agent 正文直接继承系统 canvas，不叠 Material 或描边；用户消息、失败回复、数据卡片、权限和 artifact 等结构化内容层默认使用 `.regularMaterial`。composer、模型菜单、主要操作及确实需要融合的紧凑 action group 在 macOS 26 / iOS 26 使用 `glassEffect`、`GlassEffectContainer` 与 `.glass` / `.glassProminent`，旧系统走 Material / bordered control fallback；用户明确指定的 Cowork 紧凑 trailing status rail 是唯一内容层玻璃例外，权限、Agents、Goal、Tasks 各自使用独立原生 `Glass.clear` backdrop，不绘制固定灰框或自制玻璃，也不由一个会重组 shape 的 container 包住。macOS 与 iOS Chat composer 现在都采用共享两排结构：首排为关闭态只显示模型名的 interactive glass `Menu` 与可用 usage，第二排为当前产品面已有 action、输入、紧邻主操作左侧的 voice 和唯一 Send/Stop；iOS 仍只提供 paperclip Chat 功能菜单，不能伪造通用附件。macOS sidebar `Recent` 旁 `+` 使用 30×30 原生小型圆形 glass control；iOS 左抽屉使用同一品牌/模式/history/Settings 层级。两平台仅品牌、session 与页面级标题使用系统 serif，正文与控件使用系统 sans；Markdown/代码/公式保持语义字体。Glass 不铺页面或长内容。iOS 根视图与约 82% 抽屉继续使用系统容器背景，不复制参考应用固定渐变或另建平台私有底色。当前规范见 `docs/CURRENT_UI_COLOR_SYSTEM.md`；上一版方案独立保存在 `docs/UI_COLOR_SYSTEM.md`。
 - **GUI token/turn stats**：ChatLoop 与 AgentLoop 每轮结束追加 `turn_stats`，包含 endpoint 返回的 prompt/completion/total token（若有）、可选 cached prompt tokens、可选 context window tokens、TTFT、总耗时和 model。OpenAI-compatible `prompt_tokens_details.cached_tokens` 会进入 `Usage.cachedPromptTokens`；未缓存 input 可由 prompt-cached 在 UI 层展示。ChatLoop、AgentLoop 与 ProviderHealthCheck 共用 `Usage` 规则：同一次响应内的 usage chunk 字段级合并，Agent 工具循环中多个模型请求再按请求累计。GUI 不解析消息文本计算 token，而是通过共享 `TurnStatsProjection` 折叠最近一轮统计；macOS Chat / Code / Cowork 与 iOS Chat 均复用 `IntatisComposerUsageStrip` 在 composer 第一排右侧显示低噪音 usage，第一排左侧保留 model/profile。endpoint 不返回 cached/context usage 时，只显示可证明字段，不虚构数值。
 - **Chat/Code/Cowork session/history**：macOS `IntatisMacRootView` 通过 root-owned view models 和 `SessionHistoryStore.recentSessions(kind:)` 将当前 mode 的最近 sessions 投影到同一 sidebar navigation/session center；Chat 启动时优先恢复最近 Chat session，无历史时才使用 `sess_default`，Code/Cowork 在首次进入时创建对应 session。iOS `IOSAppEnvironment` 仍只恢复 Chat session，无历史时才使用 `sess_ios`。新建会话生成新的 `SessionID.new()`，打开独立 `EventLog` 与 artifact store，停止旧 view model 并重建当前 view model。恢复历史会话只切换到对应 `events.jsonl`，不会把新消息继续追加到旧的固定默认日志。macOS session row 的原生右键菜单支持 Rename/Delete；Code 与 Cowork `@main` 另可通过 `rename_session` 改当前会话，model 不提供 SessionID/kind。两条 Rename 路径都先追加 EventLog settings rename 事件并刷新派生 `<session>/session.json`，再通过 exact-session、revision/seq 有序的低频 publisher 更新所有窗口；不改目录名、`SessionID` 或既有 envelope。Delete 在二次确认后删除目标 session 目录及其 session-owned bookmark/settings/projection，不触碰绑定工作区内容，当前运行中的 session 禁止删除。路径与元数据规则在 `IntatisCore` 复用，平台层只传不同 application-support root。
 - **GUI provider catalog**：macOS `AppConfig` 与 iOS `IOSConfig` 使用 UserDefaults 主键 `intatis.providerCatalog.v1` 保存两层 mutable 配置。第一层 provider 存 `id` / 展示名 / `baseURL` / `chatEndpoint` / secret ref 元数据；第二层 model 存模型 id / 展示名。macOS Chat/Code 模型菜单把配置中的 variants 作为同一 model 的独立选择项；切换后只把 provider/model/variant identity 写入 `intatis.providerSelection.v1` 并重建 `ProviderRegistry`，Chat/Code 下一条请求使用新选择的基础 options + variant 覆盖。Cowork composer 复用同一份配置所编译的 secret-free `AppInferenceProfileOption` 列表，以 provider 分组显示“下一次 `@main`”的 exact 暂存项；三个产品面的弹出菜单均保留 provider 分组与 variant detail，但关闭态 label 只读取选中项的 model title。新 options 先交给 Orchestrator 更新 host-approved catalog，再发布到菜单，避免可见项与 admission catalog 竞态。工作中仍可选择，选择本身不 rebind，只有随后按下 Send 才把当时值冻结进该 submission；FIFO 执行边界把仅 `@main` 的 durable rebind 与对应 root queue admission 原子提交。既有 worker、当前/已冻结 task、控制面 agent 与未来新 agent 默认值均不跟随。Project Settings 的独立 exact-profile picker 仍只更新**未来新 agent 默认值**，逐 agent Rebind 继续用于显式修改其他空闲 ordinary agent。iOS 保持 provider/model 两层 Chat 选择。设置页编辑 Base URL 时自动生成 Chat endpoint；编辑 Chat endpoint 时清洗 `/chat/completions` 后缀回填 Base URL。旧 `intatis.baseURL` / `intatis.model` 仍作为迁移来源与兼容镜像。
@@ -1117,7 +1151,7 @@ Phase C 把 approval response 与 turn terminal 拆成两个层次。人工 `app
 - `Mediator`：agent 间转发时拦截秘密 + 超长原始转储（>4000 字符要求发摘要）。
 
 ### Sandbox / Entitlements
-- `IntatisMac.DeveloperID.entitlements`：默认 `IntatisMac` 使用；非 sandbox、Hardened Runtime，本地 Code/Cowork 的 shell/git/browser 能力仍必须经过 `PlatformProfile.macDeveloperID` 与权限门。
+- `IntatisMac.DeveloperID.entitlements`：默认 `IntatisMac` 使用；非 sandbox、Hardened Runtime，本地 Code/Cowork 的 shell/git/browser 能力仍必须经过 `PlatformProfile.macDeveloperID` 与权限门。composer voice 只增加最小 `com.apple.security.device.audio-input=true`，真实录音仍需 `NSMicrophoneUsageDescription` 与用户 TCC 授权；该 entitlement 不代表启用 App Sandbox。
 - managed terminal 在 macOS 额外套 Seatbelt：只允许 WorkspaceLease 映射出的文件访问，默认拒绝网络；只允许同一 sandbox 中的 fork/exec、process info 与 signal，不开放全局 `process*`，也不开放所有 `/dev/ttys*`。PTY 仅使用已继承的 controlling terminal descriptor。Linux 要求 bwrap，缺失时 fail closed；Linux PTY 当前不支持。
 - `IntatisMac.AppStore.entitlements`：当前源码中的未使用 legacy artifact，不是
   未来版本规划或 release input；除非用户明确要求清理，不自动删除，也不为它

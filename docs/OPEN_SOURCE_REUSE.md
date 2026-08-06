@@ -2,7 +2,7 @@
 
 文档状态：当前开源复用政策
 生效日期：2026-07-12
-最近核对：2026-08-03
+最近核对：2026-08-05
 产品基线：v0.36（build 36）
 
 ## 项目立场
@@ -360,6 +360,33 @@ external-runtime 以独立 helper/process/service 运行上游实现
   checksum、读取完整 SBOM/pkg-config/headers、重算双架构 archive
   hash、比较许可证/NOTICE、更新上述记录，并重跑双架构静态 build。
   仅复用旧 notice 或仅看到库名相同不构成升级准入。
+
+## Flotis 第一方兄弟项目语音 runtime 迁移记录
+
+- 来源仓库：`https://github.com/Vita0818/Flotis`；本地兄弟工作树
+  `/Users/vita/Vitemis/Flotis`，迁移时 Git base commit 为
+  `e998c9dbe2ceb9d9b4973c250530e9d6e5dabe52`。该工作树存在未提交改动，因此仅记录 base commit
+  不足以复现本轮来源；实际读取文件的 SHA-256 为：
+  `AudioRecorder.swift` = `d1cdfdb81b33509d44b1cf737ba6e1c937a4361894f9588f16ca35b91d209c31`，
+  `VoiceInputController.swift` = `02f2822bafdd3f8c39eaaf56af228cd3e8a7a683e6060bd2fb485cc05b954123`，
+  `TranscriptionAdapterRegistry.swift` = `db4e35993aad1191747d8574f86affc048df9dcffe842f11c3aaec68e92483cb`，
+  `OpenAICompatibleTranscriber.swift` = `e0d92850431e7f5cb99029e4a8c26c35df876fab389d3739402c44fa6a96d22b`，
+  `TranscriptionAdapterRuntimeTests.swift` = `49fc745656792494374f0758d3d92860fe592ea115e1d4b8067ed3847ec35c1c`。
+- Flotis 根目录当前没有 `LICENSE` / `NOTICE`。本批不是把无许可证第三方代码作为开源上游准入；
+  用户在本任务中以两个本地项目所有者身份明确要求把该第一方兄弟项目实现迁入 Intatis。因此本批
+  仅在该明确第一方授权前提下按 `derived` 记录；若未来无法继续证明同一权利主体或授权范围，必须
+  立即按“缺少许可证”规则停止升级/分发，不得把本记录冒充开放许可证。
+- 实际迁移范围是单模型 recorded-file 子系统：录音 format/settings、permission-pending generation、
+  stop/cancel/temp cleanup、runtime configuration、普通文件/扩展/大小校验、disk-backed multipart、
+  OpenRouter JSON-base64 `input_audio`、严格 JSON response 与对应 tests。Swift 文件头保留相邻来源说明；
+  Intatis 另外保留 exact `transcription_model`/adapter、credential lazy resolution、process-wide microphone
+  lease、no-redirect provider runtime、bounded shutdown 和 composer draft-only 边界。
+- 明确未采用 Flotis 的多模型并发对比、候选选择、provider/语音设置页、floating panel、全局快捷键、
+  review/clipboard、Accessibility 注入、InputMethodKit target、品牌、图标、文案或其他 provider/realtime
+  runtime。没有新增 package、外部 runtime、二进制或视觉资产。
+- OpenRouter JSON 请求/响应另外只按官方 Speech-to-Text 文档作协议核对；没有复制其 SDK 源码或示例。
+  本批没有新增第三方分发物，因而 `NOTICE.md` 不增加 Flotis 第三方条目。若后续把 Flotis 作为独立
+  第三方发布物或引入其其他文件，必须先补齐权利/许可证结论并重新评估 NOTICE。
 
 ## 上游升级规则
 

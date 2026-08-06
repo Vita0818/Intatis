@@ -18,6 +18,8 @@
     <string>26.0</string>
     <key>NSHumanReadableCopyright</key>
     <string>Copyright © 2026 Intatis contributors. See NOTICE.md.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Intatis uses the microphone to turn voice into editable message drafts.</string>
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.developer-tools</string>
 </dict>

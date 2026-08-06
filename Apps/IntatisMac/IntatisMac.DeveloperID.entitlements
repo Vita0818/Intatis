@@ -14,5 +14,10 @@
     <false/>
     <key>com.apple.security.cs.disable-library-validation</key>
     <false/>
+
+    <!-- Composer voice input is user initiated and still gated by macOS TCC.
+         Hardened Runtime requires this explicit resource entitlement. -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
 </dict>
 </plist>

@@ -30,12 +30,29 @@ public struct HTTPDataResponse: Sendable {
 public protocol HTTPDataClient: Sendable {
     func send(_ request: URLRequest) async throws -> (data: Data, status: Int)
     func sendResponse(_ request: URLRequest) async throws -> HTTPDataResponse
+    func uploadResponse(
+        _ request: URLRequest,
+        fromFile fileURL: URL
+    ) async throws -> HTTPDataResponse
 }
 
 public extension HTTPDataClient {
     func sendResponse(_ request: URLRequest) async throws -> HTTPDataResponse {
         let response = try await send(request)
         return HTTPDataResponse(data: response.data, status: response.status)
+    }
+
+    /// Test/custom transports that only implement `send` still receive the
+    /// exact upload bytes. The shipping URLSession transport overrides this
+    /// fallback so bounded transcription bodies are streamed from disk rather
+    /// than copied into a second in-memory `Data` value.
+    func uploadResponse(
+        _ request: URLRequest,
+        fromFile fileURL: URL
+    ) async throws -> HTTPDataResponse {
+        var request = request
+        request.httpBody = try Data(contentsOf: fileURL)
+        return try await sendResponse(request)
     }
 }
 
@@ -58,6 +75,27 @@ public struct URLSessionDataClient: HTTPDataClient {
                                 headers: HTTPDataResponse.headers(from: http))
         #else
         throw IntatisError.provider("HTTP data client is unavailable on this platform")
+        #endif
+    }
+
+    public func uploadResponse(
+        _ request: URLRequest,
+        fromFile fileURL: URL
+    ) async throws -> HTTPDataResponse {
+        #if canImport(Darwin)
+        let (data, response) = try await ProviderURLSession.noRedirect.upload(
+            for: request,
+            fromFile: fileURL)
+        guard let http = response as? HTTPURLResponse else {
+            return HTTPDataResponse(data: data, status: 0)
+        }
+        return HTTPDataResponse(
+            data: data,
+            status: http.statusCode,
+            headers: HTTPDataResponse.headers(from: http))
+        #else
+        throw IntatisError.provider(
+            "HTTP file upload client is unavailable on this platform")
         #endif
     }
 }

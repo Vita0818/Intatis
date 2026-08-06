@@ -131,7 +131,7 @@ struct ThreadView: View {
                     scrollToBottom(proxy)
                 }
             }
-            if let errorText = model.errorText {
+            if let errorText = presentedErrorText {
                 Text(errorText)
                     .font(.caption)
                     .foregroundStyle(.red)
@@ -164,6 +164,14 @@ struct ThreadView: View {
             "\(last.isComplete)",
             "\(model.isStreaming)"
         ].joined(separator: ":")
+    }
+
+    private var presentedErrorText: String? {
+        #if canImport(AVFoundation)
+        return model.voiceInput.errorText ?? model.errorText
+        #else
+        return model.errorText
+        #endif
     }
 
     private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool = true) {
@@ -345,6 +353,7 @@ struct ComposerView: View {
 
     private var canSend: Bool {
         !model.isBusy
+            && voiceAllowsSubmission
             && !model.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
@@ -358,6 +367,7 @@ struct ComposerView: View {
             secondaryAction: secondaryAction,
             leadingAccessory: leadingAccessory,
             inputLeadingAccessory: inputLeadingAccessory,
+            trailingAction: voiceAction,
             stopAction: model.isBusy
                 ? IntatisThreadComposerSecondaryAction(
                     systemImage: "stop.fill",
@@ -383,6 +393,30 @@ struct ComposerView: View {
             isBusy: model.isGeneratingArtifact,
             isDisabled: !canSend,
             action: { model.generateImage() })
+        #endif
+    }
+
+    private var voiceAllowsSubmission: Bool {
+        #if canImport(AVFoundation)
+        return !model.voiceInput.isEngaged
+        #else
+        return true
+        #endif
+    }
+
+    private var voiceAction: IntatisThreadComposerSecondaryAction? {
+        #if canImport(AVFoundation)
+        let voice = model.voiceInput
+        return IntatisThreadComposerSecondaryAction(
+            systemImage: voice.buttonSystemImage,
+            help: voice.buttonHelp,
+            isBusy: voice.showsProgress,
+            isDisabled: voice.isToggleDisabled
+                || (model.isBusy && !voice.isRecording),
+            blocksSubmission: voice.isEngaged,
+            action: { model.toggleVoiceInput() })
+        #else
+        return nil
         #endif
     }
 

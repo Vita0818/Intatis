@@ -120,18 +120,22 @@ SHA-256 清单。不要把证书私钥、Apple 密码或 app-specific password �
 - Code/Cowork 的 `generate_image` 与 `edit_image` 共用顶层 `image_model` 宿主路由；主 agent
   只提交任务参数，不选择 provider/model。`edit_image` 接收工作区内的 `imagePath`、编辑 prompt
   和新的 `.png` `outputPath`。未配置时明确失败，不再暗中回退到固定模型。
+- macOS Chat/Code/Cowork 与 iOS Chat 的输入栏语音按钮共用顶层 `transcription_model` 宿主路由；
+  再次点击会停止录音并转写，结果只追加到当前可编辑草稿，不会自动发送。未配置时在本地明确
+  提示，不会回退到当前 Chat 模型，也不会为此增加另一套设置页面。
 - session 数据默认位于用户 App Support 下，每个 session 使用 append-only EventLog。
 - browser profile、workspace artifact、credential 和 bookmark 不应提交到 Git，也不会进入
   本地诊断 ZIP。
 - 日志导出当前不做远程上传；Apple notarization 仅在用户显式运行发行脚本时发生。
 
-最小配置示例（图片 provider 也可与 Chat provider 相同）：
+最小配置示例（图片、语音 provider 也可与 Chat provider 相同）：
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
   "model": "chat/chat-model",
   "image_model": "images/gpt-image-1",
+  "transcription_model": "speech/whisper-1",
   "provider": {
     "chat": {
       "npm": "@ai-sdk/openai-compatible",
@@ -150,6 +154,14 @@ SHA-256 清单。不要把证书私钥、Apple 密码或 app-specific password �
         "apiKey": "{env:IMAGE_API_KEY}"
       },
       "models": {}
+    },
+    "speech": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "https://speech.example.com/v1",
+        "apiKey": "{env:SPEECH_API_KEY}"
+      },
+      "models": {}
     }
   }
 }
@@ -160,6 +172,13 @@ SHA-256 清单。不要把证书私钥、Apple 密码或 app-specific password �
 兼容 `POST <baseURL>/images/generations` 与 multipart `POST <baseURL>/images/edits`，并返回
 `data[].b64_json`。`edit_image` 当前支持单张 PNG/JPEG/WebP 输入（最多 50 MiB）并写出新的 PNG；
 尚不支持 mask、多参考图或原地覆盖输入图。
+
+`transcription_model` 同样是 Intatis 的顶层扩展字段，格式为 `<provider>/<model-id>`。专用语音
+provider 可保持空 `models`，不会混入推理模型菜单；输入栏按 Flotis 的单模型 recorded-file runtime
+录制 WAV/16 kHz/mono。compatible provider 使用 multipart，exact OpenRouter adapter 使用 JSON-base64
+`input_audio`，两者都调用 `POST <baseURL>/audio/transcriptions`。录音和 upload body 使用有界、
+owner-only 的临时文件，转写完成、失败或取消后即清理；用户按下 Send 前，音频和转写草稿都不会写入
+EventLog 或 ArtifactStore。该接入不包含多模型对比，也没有新增设置页。
 
 ## 许可证
 

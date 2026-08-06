@@ -405,10 +405,23 @@ public actor ProviderRegistry {
         guard let endpoint = config.endpoint(id: ref.endpoint) else {
             throw IntatisError.config("unknown endpoint '\(ref.endpoint)'")
         }
+        let adapter = try endpoint.requestAdapter(for: ref.model)
+            .transcriptionAdapter()
+        let requestEncoding: TranscriptionRequestEncoding
+        switch adapter {
+        case .openAICompatibleMultipart:
+            requestEncoding = .multipartFormData
+        case .openRouterJSONBase64:
+            requestEncoding = .jsonBase64
+        }
         let apiKey = try await resolver.secret(for: endpoint.apiKeyRef)
         switch endpoint.wire {
         case .openai:
-            return OpenAITranscriptionProvider(endpoint: endpoint, apiKey: apiKey, http: dataClient)
+            return OpenAITranscriptionProvider(
+                endpoint: endpoint,
+                apiKey: apiKey,
+                http: dataClient,
+                requestEncoding: requestEncoding)
         }
     }
 
@@ -428,6 +441,39 @@ public actor ProviderRegistry {
     public func defaultTranscriptionProvider() async throws -> TranscriptionProvider? {
         guard let ref = config.models.transcription else { return nil }
         return try await transcriptionProvider(for: ref)
+    }
+
+    /// Builds the single recorded-file runtime without resolving its
+    /// credential. This mirrors Flotis's adapter-plan boundary while keeping
+    /// Intatis configuration intentionally narrow: WAV/16 kHz/mono and the
+    /// duration/upload bounds are host defaults, not new settings fields.
+    public func configuredTranscriptionRuntime() throws
+        -> ConfiguredTranscriptionRuntime? {
+        guard let ref = config.models.transcription else { return nil }
+        guard let endpoint = config.endpoint(id: ref.endpoint) else {
+            throw IntatisError.config(
+                "unknown endpoint '\(ref.endpoint)'")
+        }
+        _ = try endpoint.requestAdapter(for: ref.model)
+            .transcriptionAdapter()
+        return ConfiguredTranscriptionRuntime(
+            model: ref,
+            audio: RecordedFileTranscriptionConfiguration(
+                format: .wav,
+                sampleRate: 16_000,
+                channels: 1,
+                maximumRecordingDurationSeconds: 120,
+                stopLeadSeconds: 0,
+                maximumUploadBytes: maximumTranscriptionUploadBytes))
+    }
+
+    /// Returns the exact host-configured transcription route without resolving
+    /// its credential. Composer voice input freezes this reference when
+    /// recording starts, then resolves the provider only when audio is ready to
+    /// transcribe. A missing endpoint or unsupported adapter is a configuration
+    /// error rather than a reason to fall back to the current Chat model.
+    public func configuredTranscriptionModelRef() throws -> ModelRef? {
+        try configuredTranscriptionRuntime()?.model
     }
 
     public func imageModel() -> ModelID? { config.models.imageGen?.model }

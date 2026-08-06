@@ -140,6 +140,7 @@ struct IOSProviderSettings: Identifiable, Codable, Equatable {
 struct IOSProviderCatalog: Codable, Equatable {
     var selectedProviderID: String
     var selectedModelID: String
+    var transcriptionModel: ModelRef? = nil
     var providers: [IOSProviderSettings]
 
     var selectedProvider: IOSProviderSettings? {
@@ -270,11 +271,13 @@ enum IOSConfig {
         let catalog = normalizedCatalog(IOSProviderCatalog(
             selectedProviderID: imported.selectedProviderID,
             selectedModelID: imported.selectedModelID,
+            transcriptionModel: imported.transcriptionModel,
             providers: providers))
         var providerConfig = imported.providerConfig
         providerConfig.models = resolvedModels(
             for: catalog,
-            webSearch: imported.webSearchModel)
+            webSearch: imported.webSearchModel,
+            transcription: imported.transcriptionModel)
         let document = IOSImportedProviderConfiguration(
             schemaVersion: IOSImportedProviderConfiguration.currentSchemaVersion,
             sourceFilename: safeSourceFilename(sourceFilename),
@@ -289,13 +292,15 @@ enum IOSConfig {
         let catalog = normalizedCatalog(rawCatalog)
         if var imported = importedConfiguration() {
             let webSearch = imported.providerConfig.models.webSearch
+            let transcription = imported.providerConfig.models.transcription
             imported.catalog = catalog
             imported.providerConfig.endpoints = mergedEndpoints(
                 catalog: catalog,
                 existing: imported.providerConfig.endpoints)
             imported.providerConfig.models = resolvedModels(
                 for: catalog,
-                webSearch: webSearch)
+                webSearch: webSearch,
+                transcription: transcription)
             try writeImportedConfiguration(imported)
         }
         persistCatalogMirror(catalog)
@@ -347,12 +352,14 @@ enum IOSConfig {
         let catalog = providerCatalog
         if var imported = importedConfiguration() {
             let webSearch = imported.providerConfig.models.webSearch
+            let transcription = imported.providerConfig.models.transcription
             imported.providerConfig.endpoints = mergedEndpoints(
                 catalog: catalog,
                 existing: imported.providerConfig.endpoints)
             imported.providerConfig.models = resolvedModels(
                 for: catalog,
-                webSearch: webSearch)
+                webSearch: webSearch,
+                transcription: transcription)
             return imported.providerConfig
         }
         let selectedProvider = catalog.selectedProvider ?? defaultProvider()
@@ -370,7 +377,7 @@ enum IOSConfig {
         let chat = ModelRef(endpoint: selectedProvider.id, model: ModelID(rawValue: selectedModel.id))
         var models = ResolvedModels(chat: chat, agent: chat)
         models.imageGen = ModelRef(endpoint: selectedProvider.id, model: ModelID(rawValue: "dall-e-3"))
-        models.transcription = ModelRef(endpoint: selectedProvider.id, model: ModelID(rawValue: "whisper-1"))
+        models.transcription = catalog.transcriptionModel
         return ProviderConfig(endpoints: endpoints.isEmpty ? [endpoint(for: selectedProvider)] : endpoints,
                               models: models)
     }
@@ -391,6 +398,12 @@ enum IOSConfig {
             let id = provider.id.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !id.isEmpty, !seenProviders.contains(id) else { return nil }
             seenProviders.insert(id)
+            let isDedicatedTranscriptionProvider = catalog.transcriptionModel.map {
+                normalizedProviderID($0.endpoint)
+                    == normalizedProviderID(id)
+            } ?? false
+            let isSelectedProvider = normalizedProviderID(
+                catalog.selectedProviderID) == normalizedProviderID(id)
 
             let baseURL = baseURL(fromChatEndpoint: provider.baseURL)
             let rawChatEndpoint = provider.chatEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -417,6 +430,7 @@ enum IOSConfig {
                 : provider.apiKeyAccount.trimmingCharacters(in: .whitespacesAndNewlines),
             apiKeySource: provider.apiKeySource,
             models: models.isEmpty
+                && (!isDedicatedTranscriptionProvider || isSelectedProvider)
                 ? [IOSProviderModel(id: defaultModel, displayName: defaultDisplayName(for: defaultModel))]
                 : models)
         }
@@ -425,17 +439,21 @@ enum IOSConfig {
             providers = [defaultProvider()]
         }
 
-        let selectedProviderID = providers.contains { $0.id == catalog.selectedProviderID }
-            ? catalog.selectedProviderID
-            : providers[0].id
+        let selectedProviderID = providers.first {
+            $0.id == catalog.selectedProviderID && !$0.models.isEmpty
+        }?.id ?? providers.first { !$0.models.isEmpty }!.id
         let selectedProvider = providers.first { $0.id == selectedProviderID } ?? providers[0]
         let selectedModelID = selectedProvider.models.contains { $0.id == catalog.selectedModelID }
             ? catalog.selectedModelID
             : selectedProvider.models[0].id
 
+        let transcriptionModel = normalizedRoleModelRef(
+            catalog.transcriptionModel,
+            providers: providers)
         return IOSProviderCatalog(
             selectedProviderID: selectedProviderID,
             selectedModelID: selectedModelID,
+            transcriptionModel: transcriptionModel,
             providers: providers)
     }
 
@@ -579,7 +597,8 @@ enum IOSConfig {
 
     private static func resolvedModels(
         for catalog: IOSProviderCatalog,
-        webSearch: ModelRef? = nil
+        webSearch: ModelRef? = nil,
+        transcription: ModelRef? = nil
     ) -> ResolvedModels {
         let selectedProvider = catalog.selectedProvider ?? defaultProvider()
         let selectedModel = catalog.selectedModel ?? selectedProvider.models.first
@@ -596,10 +615,33 @@ enum IOSConfig {
         models.imageGen = ModelRef(
             endpoint: selectedProvider.id,
             model: ModelID(rawValue: "dall-e-3"))
-        models.transcription = ModelRef(
-            endpoint: selectedProvider.id,
-            model: ModelID(rawValue: "whisper-1"))
+        models.transcription = transcription ?? catalog.transcriptionModel
         return models
+    }
+
+    private static func normalizedRoleModelRef(
+        _ ref: ModelRef?,
+        providers: [IOSProviderSettings]
+    ) -> ModelRef? {
+        guard let ref else { return nil }
+        let endpoint = ref.endpoint.trimmingCharacters(
+            in: .whitespacesAndNewlines)
+        let model = ref.model.rawValue.trimmingCharacters(
+            in: .whitespacesAndNewlines)
+        guard !endpoint.isEmpty, !model.isEmpty else { return nil }
+        let actualEndpoint = providers.first { $0.id == endpoint }?.id
+            ?? providers.first {
+                normalizedProviderID($0.id)
+                    == normalizedProviderID(endpoint)
+            }?.id
+            ?? endpoint
+        return ModelRef(
+            endpoint: actualEndpoint,
+            model: ModelID(rawValue: model))
+    }
+
+    private static func normalizedProviderID(_ id: String) -> String {
+        id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
     private static func defaultProvider() -> IOSProviderSettings {

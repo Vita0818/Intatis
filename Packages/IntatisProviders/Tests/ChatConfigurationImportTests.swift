@@ -167,6 +167,43 @@ final class ChatConfigurationImportTests: XCTestCase {
             "https://search.example.test/responses")
     }
 
+    func testImportsExplicitTranscriptionRouteWithoutAddingItToChatModels() throws {
+        let data = Data(
+            #"""
+            {
+              "model": "chat/chat-model",
+              "transcription_model": "speech/whisper-test",
+              "provider": {
+                "chat": {
+                  "baseURL": "https://chat.example.test/v1",
+                  "models": { "chat-model": "Chat Model" }
+                },
+                "speech": {
+                  "baseURL": "https://speech.example.test/v1",
+                  "models": {}
+                }
+              }
+            }
+            """#.utf8)
+
+        let imported = try ChatConfigurationImporter.parse(
+            data: data,
+            environment: [:])
+
+        let expected = ModelRef(
+            endpoint: "speech",
+            model: ModelID(rawValue: "whisper-test"))
+        XCTAssertEqual(imported.transcriptionModel, expected)
+        XCTAssertEqual(
+            imported.providerConfig.models.transcription,
+            expected)
+        XCTAssertEqual(
+            imported.providers.first { $0.id == "speech" }?.models,
+            [])
+        XCTAssertEqual(imported.selectedProviderID, "chat")
+        XCTAssertEqual(imported.selectedModelID, "chat-model")
+    }
+
     func testWebSearchModelDefaultsToOrdinaryChatRouteWhenOmitted() throws {
         let data = Data(
             #"""

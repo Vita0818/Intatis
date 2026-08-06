@@ -39,6 +39,8 @@ public struct CodeShell: View {
     private let onShowSessions: (() -> Void)?
     private let onNewSession: (() -> Void)?
     private let composerAccessory: AnyView?
+    private let composerTrailingAction:
+        IntatisThreadComposerSecondaryAction?
     private let headerActions: [IntatisThreadHeaderAction]
     @Binding private var input: String
     private let onSend: () -> Void
@@ -64,6 +66,8 @@ public struct CodeShell: View {
                 onShowSessions: (() -> Void)? = nil,
                 onNewSession: (() -> Void)? = nil,
                 composerAccessory: AnyView? = nil,
+                composerTrailingAction:
+                    IntatisThreadComposerSecondaryAction? = nil,
                 headerActions: [IntatisThreadHeaderAction] = [],
                 showsInspector: Binding<Bool>,
                 input: Binding<String>,
@@ -85,6 +89,7 @@ public struct CodeShell: View {
         self.onShowSessions = onShowSessions
         self.onNewSession = onNewSession
         self.composerAccessory = composerAccessory
+        self.composerTrailingAction = composerTrailingAction
         self.headerActions = headerActions
         self._showsInspector = showsInspector
         self._input = input
@@ -444,10 +449,12 @@ public struct CodeShell: View {
                 input: $input,
                 canSend: !isWorking
                     && !permissionBlocksComposer
+                    && composerTrailingAction?.blocksSubmission != true
                     && !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                 isInputDisabled: isWorking || permissionBlocksComposer,
                 style: threadStyle,
                 leadingAccessory: composerAccessory,
+                trailingAction: composerTrailingAction,
                 stopAction: isWorking
                     ? onCancelCurrent.map { onCancelCurrent in
                         IntatisThreadComposerSecondaryAction(

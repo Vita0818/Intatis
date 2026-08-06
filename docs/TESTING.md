@@ -268,6 +268,32 @@ routing options、结构化 unsupported 同路由一次降级、裸 404 拒绝�
   read-only worker 与 reviewer 不得看到 `edit_image`。当前首版只支持单张输入图，不支持 mask、
   多参考图或原地覆盖。
 
+## 输入栏语音与 `transcription_model` 配置验收矩阵
+
+涉及 macOS Chat/Code/Cowork 或 iOS Chat 语音输入时，至少验证：
+
+- 顶层 canonical `transcription_model` 的 `<provider>/<model-id>` 精确解析到
+  `ResolvedModels.transcription`，不改变 Chat/Code/Cowork inference selection；缺字段时为 `nil`，
+  不得使用当前 Chat model、`whisper-1` 或其他 hidden fallback；
+- 显式 transcription-only provider 可使用空 `models`，连接和 credential reference 仍保留，但不
+  进入模型菜单；macOS 高级 JSON/JSONC 和 iOS Files import 均保留同一个 exact route，不新增设置页；
+- Chat/Code/Cowork/iOS Chat 的 mic 位于唯一 Send/Stop 左侧：第一次点击开始录音，第二次点击停止
+  并转写；结果追加而不是覆盖完成时的当前草稿，空结果不改变草稿且永不自动 Send；
+- 录音开始前验证 recorded-file runtime 并冻结 registry/route，credential 只在转写边界懒加载；
+  compatible/legacy/OpenAI adapter 使用 disk-backed multipart `/audio/transcriptions`，exact OpenRouter
+  adapter 使用 JSON-base64 `input_audio` 同 endpoint；不得按 provider 名称或 URL 猜测方言；
+- 默认录音必须是 WAV/16 kHz/mono；WAV 为 16-bit little-endian PCM，M4A 兼容设置也不得包含
+  `AVEncoderBitRateKey`。临时音频与 upload body 均为 owner-only 随机文件，最多录制 120 秒，读取/
+  上传前限制为 25 MiB；空文件、symlink、非普通文件、非法扩展与超限内容在请求前拒绝；
+- 成功、失败、取消、VM/runtime shutdown 后均停止 recorder、释放 process-wide microphone lease 并
+  删除音频/body；取消或迟到的 TCC callback 不得复活旧 generation；
+- 用户 Send 前不得产生 EventLog、ArtifactStore 或 projection 写入；macOS/iOS bundle 均包含
+  `NSMicrophoneUsageDescription`，English/简体中文说明可用；
+- 不迁入多模型对比、第二设置页、全局快捷键、review/clipboard 或输入法 target；至少运行 draft
+  merge、recorder settings、multipart/OpenRouter JSON/config route focused tests、完整 SwiftPM tests、
+  `IntatisMac` macOS Debug 与 `IntatisiOS` generic Simulator Debug unsigned build。真实麦克风权限与
+  线上 provider smoke 必须单独记录，不能从离线测试或编译外推。
+
 ## 最近一次真实结果
 
 2026-08-05 `v0.36 (36)` 版本、shipping target 构建与本机安装的直接证据：
@@ -302,6 +328,33 @@ routing options、结构化 unsupported 同路由一次降级、裸 404 拒绝�
 - 当前尚未执行真实 provider/credential/network 图片生成或编辑 smoke，因此不声称任何具体线上
   模型、provider 方言、size/count/quality 组合或计费路径已通过。首版编辑只支持单张输入图；mask、
   多参考图和原地覆盖仍未实现。
+
+2026-08-05 Flotis 单模型 recorded-file runtime 迁移后的 composer voice /
+`transcription_model` 直接证据：
+
+- `ComposerVoiceInputTests`：6 tests / 0 failures；除空草稿、已有草稿、尾部空白和空转写 no-op
+  外，精确验证默认 WAV 为 16-bit little-endian PCM，且 WAV/M4A 设置都不注入
+  `AVEncoderBitRateKey`；
+- `IntatisProvidersMultimodalTests`：22 tests / 0 failures；覆盖 owner-only disk-backed multipart
+  WAV、exact OpenRouter JSON-base64 `input_audio`、25 MiB recorded-file runtime、严格 JSON
+  `Content-Type`、timeout/retry 与安全错误 payload；原有 modern/iOS importer focused tests 继续验证
+  `transcription_model` 精确保留、transcription-only provider 空 `models`、exact route 与无 hidden
+  fallback；
+- 完整 `swift test`：退出码 0；真实 provider、credential、browser、Keychain 等显式 opt-in 用例仍
+  按各自声明跳过，不将其记为真实环境通过；
+- `xcodegen generate` 与 `scripts/check-version-consistency.sh` 通过，后者输出
+  `Intatis version is consistent: 0.36 (build 36)`；`IntatisMac` macOS Debug unsigned build 与
+  `IntatisiOS` generic Simulator Debug unsigned build 均通过，两端只有既有 deprecated `onChange` /
+  unused-result 等 warning；
+- 最终 macOS/iOS App bundle 都含 `NSMicrophoneUsageDescription` 与 English/简体中文
+  `InfoPlist.strings`。macOS Developer ID target 的说明为“turn voice into editable message drafts”；
+  shipping entitlements 另含最小 `com.apple.security.device.audio-input=true`，App Sandbox 仍关闭；
+  本地 ad-hoc Debug 签名包的 embedded entitlements 已读回该值且
+  `codesign --verify --deep --strict` 通过。ad-hoc 不证明正式 Developer ID/Hardened Runtime 或公证；
+  遗留 `IntatisMacAppStore` target 未修改、未构建；
+- 当前未启动 App、未授予真实麦克风权限，也未以真实 credential/network 调用线上
+  `audio/transcriptions`，因此录音设备、具体 provider 方言、模型可用性、计费与运行态像素仍为
+  `UNKNOWN`，需要下一步手动 smoke；本轮未执行签名、公证、staple、Gatekeeper 或发行打包。
 
 2026-08-05 Cowork coordinator 主动推进与外部目录恢复提示词的直接证据：
 

@@ -121,7 +121,9 @@ private struct IntatisChatSessionScreen: View {
     }
 
     @ViewBuilder private func errorText(layout: IntatisMacScreenLayout) -> some View {
-        if let err = env.chatSessionError ?? model.errorText {
+        if let err = env.chatSessionError
+            ?? model.voiceInput.errorText
+            ?? model.errorText {
             Text(err)
                 .font(IntatisType.caption(12))
                 .foregroundStyle(.red)
@@ -550,7 +552,9 @@ struct IntatisComposer: View {
     @Environment(\.colorScheme) private var scheme
 
     private var canSend: Bool {
-        !model.isBusy && !model.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        !model.isBusy
+            && !model.voiceInput.isEngaged
+            && !model.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     var body: some View {
@@ -570,6 +574,14 @@ struct IntatisComposer: View {
                 catalog: catalog,
                 isBusy: model.isBusy,
                 onSelectModel: onSelectModel)),
+            trailingAction: IntatisThreadComposerSecondaryAction(
+                systemImage: model.voiceInput.buttonSystemImage,
+                help: model.voiceInput.buttonHelp,
+                isBusy: model.voiceInput.showsProgress,
+                isDisabled: model.voiceInput.isToggleDisabled
+                    || (model.isBusy && !model.voiceInput.isRecording),
+                blocksSubmission: model.voiceInput.isEngaged,
+                action: { model.toggleVoiceInput() }),
             stopAction: model.isBusy
                 ? IntatisThreadComposerSecondaryAction(
                     systemImage: "stop.fill",

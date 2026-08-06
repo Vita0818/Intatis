@@ -279,6 +279,10 @@ struct AppProviderCatalog: Codable, Equatable {
     /// Host-owned default for image generation and editing. Model-facing image
     /// tools never receive or select this route.
     var imageModel: ModelRef? = nil
+    /// Host-owned route for composer voice transcription. It is configured by
+    /// the top-level `transcription_model` field and never follows Chat model
+    /// selection implicitly.
+    var transcriptionModel: ModelRef? = nil
     /// Legacy field retained only so existing configuration can be decoded and
     /// preserved. Chat runtime routing deliberately ignores it.
     var webSearchModel: ModelRef? = nil
@@ -547,9 +551,9 @@ enum AppConfig {
         // Image generation is an explicit role-specific route. Missing config
         // stays nil so the tool fails closed instead of selecting a hidden model.
         models.imageGen = catalog.imageModel
-        // Transcription retains its legacy selected-endpoint default until it
-        // receives a separate role-specific configuration contract.
-        models.transcription = ModelRef(endpoint: selectedProvider.id, model: ModelID(rawValue: "whisper-1"))
+        // Composer voice input uses only the explicit host route. Missing
+        // configuration stays nil and never falls back to the Chat selection.
+        models.transcription = catalog.transcriptionModel
         return ProviderConfig(endpoints: endpoints.isEmpty ? [endpoint(for: selectedProvider)] : endpoints,
                               models: models)
     }
@@ -570,9 +574,12 @@ enum AppConfig {
             let id = provider.id.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !id.isEmpty, !seenProviders.contains(id) else { return nil }
             seenProviders.insert(id)
-            let isDedicatedImageProvider = catalog.imageModel.map {
+            let isDedicatedRoleProvider = [
+                catalog.imageModel,
+                catalog.transcriptionModel,
+            ].compactMap { $0 }.contains {
                 normalizedProviderID($0.endpoint) == normalizedProviderID(id)
-            } ?? false
+            }
             let isSelectedProvider = normalizedProviderID(catalog.selectedProviderID)
                 == normalizedProviderID(id)
 
@@ -606,7 +613,7 @@ enum AppConfig {
                     ? legacyAPIKeyAccount(forProviderID: id)
                     : provider.apiKeyAccount.trimmingCharacters(in: .whitespacesAndNewlines),
                 apiKeySource: provider.apiKeySource,
-                models: models.isEmpty && (!isDedicatedImageProvider || isSelectedProvider)
+                models: models.isEmpty && (!isDedicatedRoleProvider || isSelectedProvider)
                     ? [AppProviderModel(id: defaultModel, displayName: defaultDisplayName(for: defaultModel))]
                     : models)
         }
@@ -630,6 +637,9 @@ enum AppConfig {
         let imageModel = normalizedRoleModelRef(
             catalog.imageModel,
             providers: providers)
+        let transcriptionModel = normalizedRoleModelRef(
+            catalog.transcriptionModel,
+            providers: providers)
         let webSearchModel = normalizedRoleModelRef(
             catalog.webSearchModel,
             providers: providers)
@@ -639,6 +649,7 @@ enum AppConfig {
             selectedModelID: selectedModelID,
             selectedVariantID: selectedVariantID,
             imageModel: imageModel,
+            transcriptionModel: transcriptionModel,
             webSearchModel: webSearchModel,
             providers: providers)
     }
@@ -1077,6 +1088,12 @@ enum AppConfig {
             root.removeValue(forKey: "imageModel")
             root["image_model"] = openCodeModelReference(imageModel)
         }
+        if let transcriptionModel = catalog.transcriptionModel {
+            root["transcription_model"] = openCodeModelReference(
+                transcriptionModel)
+        } else {
+            root.removeValue(forKey: "transcription_model")
+        }
 
         var providerMap = root["provider"] as? [String: Any] ?? [:]
         for provider in catalog.providers {
@@ -1326,6 +1343,7 @@ private struct AppProviderConfigTemplate: Encodable {
     var enabledProviders: [String]
     var model: String
     var imageModel: String?
+    var transcriptionModel: String?
     var provider: [String: AppProviderConfigTemplateProvider]
 
     enum CodingKeys: String, CodingKey {
@@ -1333,6 +1351,7 @@ private struct AppProviderConfigTemplate: Encodable {
         case enabledProviders = "enabled_providers"
         case model
         case imageModel = "image_model"
+        case transcriptionModel = "transcription_model"
         case provider
     }
 
@@ -1350,6 +1369,9 @@ private struct AppProviderConfigTemplate: Encodable {
             self.model = AppConfig.defaultModel
         }
         self.imageModel = catalog.imageModel.map {
+            "\($0.endpoint)/\($0.model.rawValue)"
+        }
+        self.transcriptionModel = catalog.transcriptionModel.map {
             "\($0.endpoint)/\($0.model.rawValue)"
         }
         self.provider = Dictionary(uniqueKeysWithValues: catalog.providers.map { provider in
@@ -1411,6 +1433,7 @@ private struct AppProviderConfigFile: Decodable {
     var small_model: String?
     var imageModel: String?
     var image_model: String?
+    var transcription_model: String?
     var webSearchModel: String?
     var web_search_model: String?
     var enabledProviders: [String]?
@@ -1430,11 +1453,15 @@ private struct AppProviderConfigFile: Decodable {
         let resolvedImageModel = resolvedConfigValue(
             image_model ?? imageModel,
             configDirectory: configDirectory)
+        let resolvedTranscriptionModel = resolvedConfigValue(
+            transcription_model,
+            configDirectory: configDirectory)
         let resolvedWebSearchModel = resolvedConfigValue(
             webSearchModel ?? web_search_model,
             configDirectory: configDirectory)
         let split = splitModel(resolvedModel)
         let imageSplit = splitModel(resolvedImageModel)
+        let transcriptionSplit = splitModel(resolvedTranscriptionModel)
         if !entries.isEmpty {
             entries = entries.filter {
                 shouldIncludeProvider(id: $0.id, enabled: enabled, disabled: disabled)
@@ -1448,7 +1475,11 @@ private struct AppProviderConfigFile: Decodable {
                 return provider[id]?.settings(
                     id: id,
                     selectedModelID: providerIDsMatch(split.providerID, id) ? split.modelID : nil,
-                    allowsEmptyModels: providerIDsMatch(imageSplit.providerID, id),
+                    allowsEmptyModels:
+                        providerIDsMatch(imageSplit.providerID, id)
+                        || providerIDsMatch(
+                            transcriptionSplit.providerID,
+                            id),
                     configDirectory: configDirectory,
                     configFileURL: configFileURL)
             }
@@ -1490,6 +1521,10 @@ private struct AppProviderConfigFile: Decodable {
             resolvedImageModel,
             preferredProviderID: selectedProvider,
             entries: entries)
+        let transcriptionRef = backgroundModelRef(
+            resolvedTranscriptionModel,
+            preferredProviderID: selectedProvider,
+            entries: entries)
         let webSearchRef = backgroundModelRef(
             resolvedWebSearchModel,
             preferredProviderID: selectedProvider,
@@ -1499,6 +1534,7 @@ private struct AppProviderConfigFile: Decodable {
                                   selectedModelID: selectedModel,
                                   selectedVariantID: selectedVariantID,
                                   imageModel: imageRef,
+                                  transcriptionModel: transcriptionRef,
                                   webSearchModel: webSearchRef,
                                   providers: entries)
     }

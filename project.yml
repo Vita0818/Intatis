@@ -41,6 +41,7 @@ targets:
     platform: macOS
     sources:
       - Apps/IntatisMac/Sources
+      - Apps/IntatisMac/Resources
       - path: Intatis.icon
         buildPhase: resources
       - path: Apps/SharedResources
@@ -58,9 +59,11 @@ targets:
         INFOPLIST_KEY_CFBundleDisplayName: Intatis
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
         INFOPLIST_KEY_NSHumanReadableCopyright: "Copyright © 2026 Intatis contributors. See NOTICE.md."
+        INFOPLIST_KEY_NSMicrophoneUsageDescription: "Intatis uses the microphone to turn voice into editable message drafts."
         ASSETCATALOG_COMPILER_APPICON_NAME: Intatis
         CODE_SIGN_ENTITLEMENTS: Apps/IntatisMac/IntatisMac.DeveloperID.entitlements
         ENABLE_HARDENED_RUNTIME: "YES"
+        ENABLE_RESOURCE_ACCESS_AUDIO_INPUT: "YES"
         # The separately declared IntatisMacAppStore target is the only
         # App-Store profile; do not turn this stdio-capable target into one by
         # swapping entitlements.

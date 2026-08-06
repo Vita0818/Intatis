@@ -2165,17 +2165,20 @@ public struct IntatisThreadComposerSecondaryAction {
     public var help: String
     public var isBusy: Bool
     public var isDisabled: Bool
+    public var blocksSubmission: Bool
     public var action: () -> Void
 
     public init(systemImage: String,
                 help: String,
                 isBusy: Bool = false,
                 isDisabled: Bool = false,
+                blocksSubmission: Bool = false,
                 action: @escaping () -> Void) {
         self.systemImage = systemImage
         self.help = help
         self.isBusy = isBusy
         self.isDisabled = isDisabled
+        self.blocksSubmission = blocksSubmission
         self.action = action
     }
 }
@@ -2198,6 +2201,7 @@ public struct IntatisThreadComposer: View {
     private let isInputDisabled: Bool
     private let style: IntatisThreadStyle
     private let secondaryAction: IntatisThreadComposerSecondaryAction?
+    private let trailingAction: IntatisThreadComposerSecondaryAction?
     private let stopAction: IntatisThreadComposerSecondaryAction?
     private let accessory: AnyView?
     private let leadingAccessory: AnyView?
@@ -2221,6 +2225,7 @@ public struct IntatisThreadComposer: View {
                 secondaryAction: IntatisThreadComposerSecondaryAction? = nil,
                 leadingAccessory: AnyView? = nil,
                 inputLeadingAccessory: AnyView? = nil,
+                trailingAction: IntatisThreadComposerSecondaryAction? = nil,
                 stopAction: IntatisThreadComposerSecondaryAction? = nil,
                 accessory: AnyView? = nil,
                 onSend: @escaping () -> Void) {
@@ -2230,6 +2235,7 @@ public struct IntatisThreadComposer: View {
         self.isInputDisabled = isInputDisabled
         self.style = style
         self.secondaryAction = secondaryAction
+        self.trailingAction = trailingAction
         self.stopAction = stopAction
         self.accessory = accessory
         self.leadingAccessory = leadingAccessory
@@ -2245,6 +2251,7 @@ public struct IntatisThreadComposer: View {
                                  secondaryAction: IntatisThreadComposerSecondaryAction? = nil,
                                  leadingAccessory: AnyView? = nil,
                                  inputLeadingAccessory: AnyView? = nil,
+                                 trailingAction: IntatisThreadComposerSecondaryAction? = nil,
                                  stopAction: IntatisThreadComposerSecondaryAction? = nil,
                                  @ViewBuilder accessory: () -> Accessory,
                                  onSend: @escaping () -> Void) {
@@ -2254,6 +2261,7 @@ public struct IntatisThreadComposer: View {
         self.isInputDisabled = isInputDisabled
         self.style = style
         self.secondaryAction = secondaryAction
+        self.trailingAction = trailingAction
         self.stopAction = stopAction
         self.accessory = AnyView(accessory())
         self.leadingAccessory = leadingAccessory
@@ -2303,6 +2311,9 @@ public struct IntatisThreadComposer: View {
         ) {
             inputLeadingControls
             inputControl
+            if let trailingAction {
+                compactActionButton(trailingAction)
+            }
             if let stopAction {
                 stopButton(stopAction)
             } else {

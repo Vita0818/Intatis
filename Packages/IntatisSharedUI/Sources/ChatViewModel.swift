@@ -79,6 +79,11 @@ public final class ChatViewModel: ObservableObject {
     @Published public private(set) var imageGenerationState: ChatArtifactGenerationState = .idle
     @Published public var errorText: String?
 
+    #if canImport(AVFoundation)
+    public let voiceInput: ComposerVoiceInputController
+    private var voiceInputObservation: AnyCancellable?
+    #endif
+
     /// Wired by the app (v0.4): generate an image from a prompt. The resulting
     /// `artifact_added` event flows back through the log subscription.
     public var onGenerateImage: (@MainActor (String) async throws -> Void)?
@@ -97,8 +102,14 @@ public final class ChatViewModel: ObservableObject {
     public init(log: EventLog, registry: ProviderRegistry) {
         self.log = log
         self.registry = registry
+        #if canImport(AVFoundation)
+        self.voiceInput = ComposerVoiceInputController(registry: registry)
+        #endif
         self.historyProjectionBuilder = ChatHistoryProjectionBuilder()
         self.historySnapshotLoader = defaultChatHistorySnapshotLoader
+        #if canImport(AVFoundation)
+        observeVoiceInput()
+        #endif
     }
 
     init(
@@ -109,12 +120,21 @@ public final class ChatViewModel: ObservableObject {
     ) {
         self.log = log
         self.registry = registry
+        #if canImport(AVFoundation)
+        self.voiceInput = ComposerVoiceInputController(registry: registry)
+        #endif
         self.historyProjectionBuilder = historyProjectionBuilder
         self.historySnapshotLoader = historySnapshotLoader
+        #if canImport(AVFoundation)
+        observeVoiceInput()
+        #endif
     }
 
     public func updateProviderRegistry(_ registry: ProviderRegistry) {
         self.registry = registry
+        #if canImport(AVFoundation)
+        voiceInput.updateProviderRegistry(registry)
+        #endif
     }
 
     public var isGeneratingArtifact: Bool { imageGenerationState.isRunning }
@@ -242,7 +262,10 @@ public final class ChatViewModel: ObservableObject {
         let imageGenerationOperation = imageGenerationOperation
         runningOperation?.cancel()
         imageGenerationOperation?.cancel()
-        let task = Task<Void, Never> {
+        let task = Task<Void, Never> { @MainActor [weak self] in
+            #if canImport(AVFoundation)
+            if let self { await self.voiceInput.shutdown() }
+            #endif
             if let runningOperation { await runningOperation.value }
             if let imageGenerationOperation { await imageGenerationOperation.value }
             if let runningSubscription { await runningSubscription.value }
@@ -261,6 +284,9 @@ public final class ChatViewModel: ObservableObject {
     /// Send the composed message. Streaming output arrives via the log subscription.
     public func send() {
         guard !isShutdown, !isBusy else { return }
+        #if canImport(AVFoundation)
+        guard !voiceInput.isEngaged else { return }
+        #endif
         let originalInput = input
         let parsed: ParsedUserInput
         switch GoalInputParser.parse(originalInput) {
@@ -315,6 +341,9 @@ public final class ChatViewModel: ObservableObject {
     public func generateImage() {
         let prompt = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !isShutdown, !prompt.isEmpty, !isBusy else { return }
+        #if canImport(AVFoundation)
+        guard !voiceInput.isEngaged else { return }
+        #endif
         guard let onGenerateImage else {
             let message = IntatisLocalization.string("Image generation is not available.")
             imageGenerationState = .failed(message)
@@ -352,5 +381,27 @@ public final class ChatViewModel: ObservableObject {
         }
         imageGenerationOperation = operation
     }
+
+    #if canImport(AVFoundation)
+    public func toggleVoiceInput() {
+        guard !isShutdown else { return }
+        if !voiceInput.isRecording {
+            guard !isBusy else { return }
+        }
+        voiceInput.toggle { [weak self] transcript in
+            guard let self else { return }
+            self.input = ComposerVoiceDraft.appending(
+                transcript: transcript,
+                to: self.input)
+        }
+    }
+
+    private func observeVoiceInput() {
+        voiceInputObservation = voiceInput.objectWillChange
+            .sink { [weak self] _ in
+                self?.objectWillChange.send()
+            }
+    }
+    #endif
 }
 #endif

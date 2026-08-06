@@ -118,7 +118,8 @@ Intatis 自己的安全边界。以下要求继续有效：
 - managed terminal 的 workspace-scoped Seatbelt、默认断网、凭据环境过滤、
   进程清理和输出边界；
 - Developer ID Hardened Runtime、代码签名、公证、Keychain 与最小必要
-  entitlements；
+  entitlements；输入栏语音使用系统 TCC 麦克风授权，并在 shipping Developer ID target 只增加
+  Hardened Runtime 所需的 `com.apple.security.device.audio-input=true`，不启用 App Sandbox；
 - iOS target 的 chat-only linkage 边界。
 
 因此，后续文档和报告提到 `sandbox` 时必须说明具体含义。`App Sandbox` /

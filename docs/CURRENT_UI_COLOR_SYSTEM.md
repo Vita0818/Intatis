@@ -43,12 +43,12 @@
 
 - 用户消息保留内容层 Material；正常完成的助手 / agent 回复没有外层卡片、底色或描边，Markdown、公式等直接显示在系统 canvas 上。失败 / 中断回复继续保留结构化容器与恢复建议。
 - assistant / agent 名称右侧的消息时间属于三级只读元数据，不加 badge、图标、头像、玻璃或独立容器；它跟随系统本地化，24 小时内仅时间、7 天内星期加时间、更早为年月日加时间。
-- composer 固定为两排：第一排左侧是模型选择控件，右侧是 Context / Input / Cached / Output / Time 只读 usage；Chat/Code/Cowork 的选择器共用原生 `Menu` 语义与 40pt 高 interactive Liquid Glass 胶囊。选择按钮关闭态只显示模型名，不显示 CPU/芯片图标、provider 名或 variant/reasoning 辅助文字；弹出菜单内部仍按 provider 分组并保留 variant 明细。第二排从左到右是当前产品面已有的附件或图像 action、原生多行 `TextField`、唯一主操作位。
-- composer 第二排的附件/图像 action 与主操作使用 40×40 原生圆形 glass/bordered control，输入容器单行最小高度同为 40，同行 spacing 为 8；多行输入只向上增长，左右按钮保持底边对齐。主操作 idle 时是 Send，工作时在同一位置替换为 `Button(role: .destructive)` + `stop.fill` 的系统红色 Stop，不并排显示两个操作。
-- composer 的附件、图像 action、Stop 与 Send 复用 `.controlSize(.regular)`、圆形 button border shape 和系统原生 glass / bordered 表现；Send 使用 prominent 语义，Stop 使用系统 destructive/red 语义且不自绘。sidebar `Recent` 旁 `+` 则使用 `.controlSize(.small)`、圆形 border shape 与原生 glass，fitting size 为 30×30。没有对应能力的 Chat / Code 不凭空增加附件入口。
+- composer 固定为两排：第一排左侧是模型选择控件，右侧是 Context / Input / Cached / Output / Time 只读 usage；Chat/Code/Cowork 的选择器共用原生 `Menu` 语义与 40pt 高 interactive Liquid Glass 胶囊。选择按钮关闭态只显示模型名，不显示 CPU/芯片图标、provider 名或 variant/reasoning 辅助文字；弹出菜单内部仍按 provider 分组并保留 variant 明细。第二排从左到右是当前产品面已有的附件或图像 action、原生多行 `TextField`、voice、唯一主操作位；voice 始终紧邻主操作左侧。
+- composer 第二排的附件/图像 action、voice 与主操作使用 40×40 原生圆形 glass/bordered control，输入容器单行最小高度同为 40，同行 spacing 为 8；多行输入只向上增长，左右按钮保持底边对齐。主操作 idle 时是 Send，工作时在同一位置替换为 `Button(role: .destructive)` + `stop.fill` 的系统红色 Stop，不并排显示两个操作。voice 不占用该唯一槽位：第一次点击开始录音，第二次点击停止并转写，结果只进入可编辑草稿。
+- composer 的附件、图像 action、voice、Stop 与 Send 复用 `.controlSize(.regular)`、圆形 button border shape 和系统原生 glass / bordered 表现；Send 使用 prominent 语义，Stop 使用系统 destructive/red 语义且不自绘。sidebar `Recent` 旁 `+` 则使用 `.controlSize(.small)`、圆形 border shape 与原生 glass，fitting size 为 30×30。没有对应能力的 Chat / Code 不凭空增加附件入口；voice 是四个 composer 共用的输入能力，不生成设置页或自动发送。
 - iOS 复用同一两排 composer 几何：第一排左侧是关闭态只显示模型名的原生 glass
   `Menu`，右侧在有统计时显示 usage；第二排固定为左侧 paperclip Chat 功能菜单、中间
-  输入、右侧唯一 Send/Stop。菜单中的图片生成必须继续使用已有能力；托管网络搜索仍是
+  输入、右侧 voice + 唯一 Send/Stop。菜单中的图片生成必须继续使用已有能力；托管网络搜索仍是
   后台透明路由，不生成 UI。通用附件链没有实现前不得伪装成可发送文件，也不得扩大
   Chat-only 产品边界。
 - 现有 macOS Chat 与共享 Code/Cowork `Thinking…` 行在 spinner 后显示 phase-local elapsed 文案（例如 `15s Thinking…`）；秒数使用等宽数字并进入 accessibility label，等待行结束即停止并重置，不改变协议或模型内容。
@@ -110,7 +110,7 @@ Apple 官方设计与 API 依据：
 - Liquid Glass 主要出现在导航和交互功能层；用户明确指定的 Cowork 紧凑 trailing status rail 是唯一内容层例外。正常 agent 正文仍直接位于系统 canvas，用户消息和其余结构化卡片使用 Material，页面与长 transcript 不整片玻璃化。
 - 支持的系统上使用真实 `glassEffect` / glass button；旧系统 fallback 仍由系统语义 Material / control 渲染。
 - macOS Chat / Code / Cowork 与 iOS Chat 的 Light / Dark 运行态都经过视觉核对；不能只用源码搜索或固定像素值推断。
-- thread header 显示 session display name；Code / Cowork header 使用紧凑顶部留白且 Cowork 不常驻 permission-reviewer 横幅；消息无 agent 头像与通用 Agent badge；正常 agent 回复无外层卡片；agent 名称旁有本地化三级时间元数据；macOS sidebar 模式为带图标的竖向三行且仅选中行使用玻璃，Recent New `+` 为 30×30 原生圆形 glass；macOS composer 第一排保持 40pt、关闭态仅模型名的 model/profile glass 菜单左、usage 右，第二排保持已有 action 左、输入居中、可选 stop 与 Send 右。iOS 顶部固定 sidebar/session/new，抽屉为 serif `Intatis`、选中 Chat、Recent/New 和底部 Settings，空页无 onboarding/建议卡；底部同样为 model/usage 第一排和 paperclip/input/Send-or-Stop 第二排。两平台标题使用系统 serif、正文与控件使用系统 sans；两平台第二排 action/stop/Send 与单行输入均为 40pt，输入变为多行时按钮底边不漂移；Cowork 宽屏 rail 第一位为权限审查、其后为 Agents/Goal/Tasks 且无 Git，pending 时 rail 固定；无法容纳 rail 时只显示一个权限兜底卡且不复制 Goal/Tasks。
+- thread header 显示 session display name；Code / Cowork header 使用紧凑顶部留白且 Cowork 不常驻 permission-reviewer 横幅；消息无 agent 头像与通用 Agent badge；正常 agent 回复无外层卡片；agent 名称旁有本地化三级时间元数据；macOS sidebar 模式为带图标的竖向三行且仅选中行使用玻璃，Recent New `+` 为 30×30 原生圆形 glass；macOS composer 第一排保持 40pt、关闭态仅模型名的 model/profile glass 菜单左、usage 右，第二排保持已有 action 左、输入居中、voice 紧邻唯一 Send/Stop 左侧。iOS 顶部固定 sidebar/session/new，抽屉为 serif `Intatis`、选中 Chat、Recent/New 和底部 Settings，空页无 onboarding/建议卡；底部同样为 model/usage 第一排和 paperclip/input/voice/Send-or-Stop 第二排。两平台标题使用系统 serif、正文与控件使用系统 sans；两平台第二排 action/voice/stop/Send 与单行输入均为 40pt，输入变为多行时按钮底边不漂移；Cowork 宽屏 rail 第一位为权限审查、其后为 Agents/Goal/Tasks 且无 Git，pending 时 rail 固定；无法容纳 rail 时只显示一个权限兜底卡且不复制 Goal/Tasks。
 - macOS 与 iOS touched targets 均可编译，全量 SwiftPM 测试通过。
 
 静态复核重点：
@@ -183,7 +183,8 @@ rg -n 'glassEffect|GlassEffectContainer|buttonStyle\(\.glass|regularMaterial|win
   公式和第三方声明继续与 macOS 共用 renderer 的语义字体，不增加字体文件。
 - 顶部中央从 model picker 改为 serif session title；model 选择移入 composer 第一排，
   使用 13pt semibold sans、向下 chevron 与原生 interactive Liquid Glass capsule。
-  有 turn stats 时同排右侧显示共享 usage strip；第二排继续是 paperclip/input/Send-or-Stop。
+  有 turn stats 时同排右侧显示共享 usage strip；第二排继续是
+  paperclip/input/voice/Send-or-Stop，voice 紧邻唯一主操作左侧。
 - 左抽屉采用 macOS 的同一信息层级：serif `Intatis`、选中 Chat 玻璃模式行、`Recent`
   session history/New 与底部 Settings；删除旧顶部 gear、假 search 占位和底部大 Chat CTA。
   Settings 使用 serif 页面标题，原生 toolbar、section、说明和字段保持 sans。
@@ -281,3 +282,19 @@ rg -n 'glassEffect|GlassEffectContainer|buttonStyle\(\.glass|regularMaterial|win
   保持一致，回焦 AX tree 无结构变化，且系统日志中旧 viewport preference warning 为 0。原生
   全屏过渡仍出现一次 AppKit/ThemeWidget 的系统 negative-geometry warning；该 warning 未在 agent
   或 focus 操作中复发，不作为 rail 通过证据，也不得误记成已消除全部 AppKit runtime warning。
+
+## 20. 2026-08-05 输入栏语音按钮
+
+- macOS Chat/Code/Cowork 与 iOS Chat 的 composer 第二排在唯一 Send/Stop 左侧新增同一个 40×40
+  原生圆形 voice control；它不改变第一排 model/usage，也不复制或挪动 Send↔Stop 主操作槽位。
+- idle 显示 `mic.fill`；第一次点击开始录音，recording 显示 `stop.fill`，第二次点击停止并转写；
+  requesting permission 与 transcribing 使用同一位置的 progress 状态。转写结果只追加到当前可编辑
+  草稿，不自动 Send，错误显示在 composer 本地状态区。
+- 该功能只复用顶层 `transcription_model` 与既有 provider 配置/importer，没有新增 Settings 字段、
+  页面、固定颜色、自绘图标或第三方视觉资产。English/简体中文按钮、状态、错误与麦克风 usage
+  description 已接入两端 bundle。后续把底层替换为 Flotis-derived WAV recorded-file runtime、
+  disk-backed upload 与 OpenRouter JSON adapter，没有改变上述 control 尺寸、位置或视觉状态，也没有
+  迁入 Flotis 的 panel、设置 UI、快捷键或输入法外观。
+- draft/config focused tests、完整 SwiftPM tests、XcodeGen、macOS Debug 与 iOS Simulator Debug build
+  已通过；本轮未启动 App、未请求真实麦克风权限，也未做 Light/Dark、窄宽、Dynamic Type、
+  VoiceOver 或真实录音的运行态视觉检查，因此这些像素与交互结果仍为 `UNKNOWN`。

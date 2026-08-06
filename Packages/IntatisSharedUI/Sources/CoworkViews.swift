@@ -658,6 +658,8 @@ public struct CoworkShell: View {
     private let onShowProjectSettings: (() -> Void)?
     private let composerAccessory: AnyView?
     private let composerInputAccessory: AnyView?
+    private let composerTrailingAction:
+        IntatisThreadComposerSecondaryAction?
     private let headerActions: [IntatisThreadHeaderAction]
     @Binding private var input: String
     private let onSend: () -> Void
@@ -707,6 +709,8 @@ public struct CoworkShell: View {
                 onShowProjectSettings: (() -> Void)? = nil,
                 composerAccessory: AnyView? = nil,
                 composerInputAccessory: AnyView? = nil,
+                composerTrailingAction:
+                    IntatisThreadComposerSecondaryAction? = nil,
                 headerActions: [IntatisThreadHeaderAction] = [],
                 showsInspector: Binding<Bool>,
                 input: Binding<String>,
@@ -750,6 +754,7 @@ public struct CoworkShell: View {
         self.onShowProjectSettings = onShowProjectSettings
         self.composerAccessory = composerAccessory
         self.composerInputAccessory = composerInputAccessory
+        self.composerTrailingAction = composerTrailingAction
         self.headerActions = headerActions
         self._showsInspector = showsInspector
         self._input = input
@@ -2299,12 +2304,14 @@ public struct CoworkShell: View {
                 placeholder: IntatisLocalization.string("Give Main a project task..."),
                 input: $input,
                 canSend: !isAcceptingSubmission
+                    && composerTrailingAction?.blocksSubmission != true
                     && (!input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                         || hasDraftAttachments),
                 isInputDisabled: false,
                 style: threadStyle,
                 leadingAccessory: composerAccessory,
                 inputLeadingAccessory: composerInputAccessory,
+                trailingAction: composerTrailingAction,
                 stopAction: onCancelCurrent.map { onCancelCurrent in
                     IntatisThreadComposerSecondaryAction(
                         systemImage: "stop.fill",

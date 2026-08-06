@@ -163,6 +163,77 @@ enum ProviderRuntime {
         }
     }
 
+    /// Sends a request whose body is already materialized as an owner-only
+    /// temporary file. Keeping retry/timeout/status handling here gives file
+    /// transcription the same provider runtime contract as other non-streaming
+    /// operations while avoiding a second full multipart body allocation in
+    /// the shipping transport.
+    static func sendUploadResponse(
+        _ request: URLRequest,
+        fromFile fileURL: URL,
+        via client: HTTPDataClient,
+        policy: ProviderRuntimePolicy,
+        operation: String
+    ) async throws -> HTTPDataResponse {
+        var attempt = 1
+        while true {
+            let response: HTTPDataResponse
+            do {
+                response = try await withTimeout(
+                    seconds: policy.requestTimeoutSeconds,
+                    operation: operation
+                ) {
+                    try await client.uploadResponse(
+                        request,
+                        fromFile: fileURL)
+                }
+            } catch {
+                if shouldRetry(
+                    error: error,
+                    attempt: attempt,
+                    policy: policy) {
+                    attempt += 1
+                    try await sleepBeforeRetry(
+                        nextAttempt: attempt,
+                        policy: policy,
+                        retryHint: ProviderErrorFormatting.retryHint(
+                            from: error))
+                    continue
+                }
+                throw exhausted(
+                    error,
+                    attempts: attempt,
+                    operation: operation)
+            }
+
+            if (200..<300).contains(response.status) {
+                return response
+            }
+
+            let error = ProviderErrorFormatting.httpStatus(
+                response.status,
+                body: response.data,
+                headers: response.headers,
+                operation: operation)
+            if shouldRetry(
+                error: error,
+                attempt: attempt,
+                policy: policy) {
+                attempt += 1
+                try await sleepBeforeRetry(
+                    nextAttempt: attempt,
+                    policy: policy,
+                    retryHint: ProviderErrorFormatting.retryHint(
+                        headers: response.headers))
+                continue
+            }
+            throw exhausted(
+                error,
+                attempts: attempt,
+                operation: operation)
+        }
+    }
+
     private static func withTimeout<T: Sendable>(seconds: Double,
                                                  operation: String,
                                                  body: @escaping @Sendable () async throws -> T) async throws -> T {

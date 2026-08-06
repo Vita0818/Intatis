@@ -12,6 +12,7 @@ import IntatisAgentKernel
 import IntatisSkills
 import IntatisArtifacts
 import IntatisMCP
+import IntatisSharedUI
 
 private final class CodePermissionWaiter: @unchecked Sendable {
     private let lock = NSLock()
@@ -69,6 +70,11 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
     @Published private(set) var composerError: String?
     @Published private(set) var pendingMCPExternalContextCount = 0
 
+    #if canImport(AVFoundation)
+    let voiceInput: ComposerVoiceInputController
+    private var voiceInputObservation: AnyCancellable?
+    #endif
+
     let sessionID: SessionID
     let workspaceName: String
     var mcpEventLog: EventLog { log }
@@ -124,7 +130,13 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
         self.artifactStore = artifactStore
         self.sessionNaming = sessionNaming
         self.registry = registry
+        #if canImport(AVFoundation)
+        self.voiceInput = ComposerVoiceInputController(registry: registry)
+        #endif
         self.mcpSnapshots = mcpSnapshots
+        #if canImport(AVFoundation)
+        observeVoiceInput()
+        #endif
     }
 
     deinit {
@@ -135,6 +147,9 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
 
     func updateProviderRegistry(_ registry: ProviderRegistry) {
         self.registry = registry
+        #if canImport(AVFoundation)
+        voiceInput.updateProviderRegistry(registry)
+        #endif
     }
 
     func start() {
@@ -343,6 +358,9 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
         operation?.cancel()
         let task = Task { @MainActor [weak self] in
             if let self {
+                #if canImport(AVFoundation)
+                await self.voiceInput.shutdown()
+                #endif
                 await self.terminal.shutdown(reason: reason)
             }
             if let operation { await operation.value }
@@ -372,6 +390,9 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
 
     func send() {
         guard !isShutdown, !isWorking else { return }
+        #if canImport(AVFoundation)
+        guard !voiceInput.isEngaged else { return }
+        #endif
         let originalInput = input
         let frozenExternalContexts =
             pendingMCPExternalContexts
@@ -537,6 +558,28 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
         }
         runningOperation = operation
     }
+
+    #if canImport(AVFoundation)
+    func toggleVoiceInput() {
+        guard !isShutdown else { return }
+        if !voiceInput.isRecording {
+            guard !isWorking else { return }
+        }
+        voiceInput.toggle { [weak self] transcript in
+            guard let self else { return }
+            self.input = ComposerVoiceDraft.appending(
+                transcript: transcript,
+                to: self.input)
+        }
+    }
+
+    private func observeVoiceInput() {
+        voiceInputObservation = voiceInput.objectWillChange
+            .sink { [weak self] _ in
+                self?.objectWillChange.send()
+            }
+    }
+    #endif
 
     private func consumeMCPExternalContexts(
         _ frozen: [UntrustedExternalContext]

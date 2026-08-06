@@ -40,6 +40,18 @@ macOS 是完整产品：Chat、Code、Cowork、Settings 和本地诊断导出。
   接受工作区内单张 PNG/JPEG/WebP（最多 50 MiB）、prompt 与不同的 PNG 输出路径，经同一权限、
   WorkspaceLease、`PathConfinement` 和 durable tool execution 链调用 multipart `images/edits`，
   两者均只接受 `data[].b64_json` 输出。mask、多参考图与原地覆盖尚未支持。
+- macOS Chat/Code/Cowork 与 iOS Chat 的 composer 已在 Send/Stop 左侧接入同一个语音输入按钮。
+  第一次点击开始录音，第二次点击停止并通过顶层 canonical `transcription_model` 指定的 exact
+  provider/model 调用 `audio/transcriptions`；转写结果追加到完成时仍然可编辑的当前草稿，不自动
+  发送。单模型 recorded-file runtime 已按 Flotis 当前实现迁入：默认 WAV/16 kHz/mono，录音 generation、
+  stale-file 清理、stop/file-size 校验、取消/cleanup 与 disk-backed upload body 均保留；不再强制设置
+  AAC bitrate。compatible adapter 使用 multipart，exact OpenRouter adapter 使用 JSON-base64
+  `input_audio`。字段缺失或 adapter 不受支持时明确失败，不使用当前 Chat 模型或固定模型 fallback。
+  专用 transcription provider 可为空 `models`，不会进入推理模型菜单；没有新增设置页或第二套模型
+  配置。录音只使用 owner-only、有时长/大小边界且必清理的临时文件，Send 前不进入 EventLog 或
+  ArtifactStore。Flotis 的多模型对比、全局快捷键、review/clipboard 与输入法未迁入。macOS shipping
+  target 同时保留 TCC usage description 与 Hardened Runtime 最小 audio-input entitlement；App
+  Sandbox 和遗留 App Store target 均未改变。
 - Cowork 使用 `Orchestrator`、FIFO scheduler、MessageBus/Mediator、WorkTask/Goal、
   per-agent exact inference binding、独立 permission reviewer 与 goal verifier 控制面。
   AgentLoop 不同步递归调用另一个 AgentLoop。右侧 Agents 区域中的 ordinary agent 可作为
@@ -64,7 +76,7 @@ macOS 是完整产品：Chat、Code、Cowork、Settings 和本地诊断导出。
 
 iOS 是结构性 Chat 子集，只链接 Core、Protocol、Providers、Conversation、Artifacts、
 Multimodal 与 SharedUI。它支持 provider 配置导入、Chat/history、当前托管搜索 wire、
-citations、图片生成和当前系统原生界面，但不链接 Tools、Permission、AgentKernel、Cowork、
+citations、图片生成、输入栏语音转写和当前系统原生界面，但不链接 Tools、Permission、AgentKernel、Cowork、
 MCP 或本地 workspace/shell。其 Chat 与 macOS 共用同一个 exact-route hosted-search planner。
 
 ### CLI
@@ -112,7 +124,8 @@ profiles 与外部 MCP client。macOS/Linux 的 stdio、sandbox、bwrap/guard �
 - macOS/iOS 当前使用系统语义表面和原生 Liquid Glass；正常 assistant/agent 正文直接落在
   conversation canvas，结构化状态、用户消息、错误、权限、Goal/Task 使用 Material 边界。
 - iOS 与 macOS 已统一品牌/session/Settings 的 serif 标题和系统 sans 正文/控件，两端使用
-  model/usage + action/input/Send-or-Stop 的两排 composer。
+  model/usage + action/input/voice/Send-or-Stop 的两排 composer；voice 始终紧邻主操作左侧，
+  不占用或复制唯一的 Send↔Stop 槽位。
 - rich text 使用仓内经审计的 Microsoft SwiftStreamingMarkdown thin derivative 与
   exact iosMath Apple-native 数学排版；plain-safe 仍是运行时救援路径。
 - macOS Chat/Code/Cowork history 使用最多 16-row eager page 与显式分页，避免旧的 rich +
@@ -162,6 +175,16 @@ profiles 与外部 MCP client。macOS/Linux 的 stdio、sandbox、bwrap/guard �
 
 ## 最近验证状态
 
+- 2026-08-05 Flotis 单模型语音 runtime 迁移：`ComposerVoiceInputTests` 6/6，覆盖 draft merge、
+  WAV 16-bit PCM 及 WAV/M4A 均不注入 `AVEncoderBitRateKey`；
+  `IntatisProvidersMultimodalTests` 22/22，覆盖 owner-only disk-backed multipart WAV、OpenRouter
+  JSON-base64 `input_audio`、exact runtime route、严格 JSON Content-Type、timeout 与错误 payload。
+  完整 `swift test`、XcodeGen、版本一致性检查、`IntatisMac` macOS Debug 和 `IntatisiOS` generic
+  Simulator Debug unsigned build 均通过；两端最终 bundle 含麦克风 usage description。先前本地
+  ad-hoc macOS Debug 签名包已读回 `com.apple.security.device.audio-input=true` 且 strict codesign
+  verify 通过，但这不替代正式 Developer ID/Hardened Runtime/公证验证。未执行真实麦克风或线上
+  transcription provider smoke，也未启动 App 做视觉检查，因而真实权限交互、设备录音、具体
+  provider/model 可用性、计费和像素表现仍为 `UNKNOWN`。
 - 2026-08-03：`xcodegen generate` 与 `scripts/check-version-consistency.sh` 通过。
 - `IntatisMac` unsigned universal Release 构建通过；最终 bundle 为 `0.32 (32)`，可执行文件
   同时包含 `arm64` 与 `x86_64`。该构建用于源码与元数据验收，不是可分发签名产物。

@@ -298,6 +298,11 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
     @Published private(set) var inferenceResolutionFailures: [String: String] = [:]
     @Published private var nextMainInferenceOption: AppInferenceProfileOption?
 
+    #if canImport(AVFoundation)
+    let voiceInput: ComposerVoiceInputController
+    private var voiceInputObservation: AnyCancellable?
+    #endif
+
     var isAutomaticPermissionReviewReady: Bool {
         switch permissionReviewerStatus {
         case .enabled, .degraded:
@@ -441,6 +446,9 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         self.registryBox = ProviderRegistryBox(
             registry,
             controlPlaneBinding: nil)
+        #if canImport(AVFoundation)
+        self.voiceInput = ComposerVoiceInputController(registry: registry)
+        #endif
         self.mcpSnapshots = mcpSnapshots
         self.inferenceProfileOptions = inferenceProfileOptions
         self.nextMainInferenceOption = nil
@@ -454,6 +462,9 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             sessionID: sessionID,
             settings: projectSettings,
             projection: CoworkProjection())
+        #if canImport(AVFoundation)
+        observeVoiceInput()
+        #endif
     }
 
     deinit {
@@ -506,6 +517,9 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         inferenceProfileOptions: [AppInferenceProfileOption]? = nil
     ) {
         guard acceptsNewOperations else { return }
+        #if canImport(AVFoundation)
+        voiceInput.updateProviderRegistry(registry)
+        #endif
         let refreshedOptions = inferenceProfileOptions
         let approvedOptions = refreshedOptions ?? self.inferenceProfileOptions
         let bindings = approvedOptions.map(\.binding)
@@ -1025,6 +1039,9 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         addAgentStatus = .idle
         setPermissionReviewerStatus(.disabled)
         let task = Task<Void, Never> {
+            #if canImport(AVFoundation)
+            await self.voiceInput.shutdown()
+            #endif
             // Let the cancelled startup/stream task observe cancellation before
             // teardown touches the captured runtime. This prevents a stale
             // startup continuation from releasing the restore scheduler gate.
@@ -2493,6 +2510,9 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
 
     func send() {
         guard acceptsNewOperations, !isAcceptingSubmission else { return }
+        #if canImport(AVFoundation)
+        guard !voiceInput.isEngaged else { return }
+        #endif
         let originalInput = input
         let originalAttachments = draftAttachments
         let frozenExternalContexts =
@@ -2633,6 +2653,28 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             activeOperations[operationID] = operation
         }
     }
+
+    #if canImport(AVFoundation)
+    func toggleVoiceInput() {
+        guard acceptsNewOperations else { return }
+        if !voiceInput.isRecording {
+            guard !isAcceptingSubmission else { return }
+        }
+        voiceInput.toggle { [weak self] transcript in
+            guard let self else { return }
+            self.input = ComposerVoiceDraft.appending(
+                transcript: transcript,
+                to: self.input)
+        }
+    }
+
+    private func observeVoiceInput() {
+        voiceInputObservation = voiceInput.objectWillChange
+            .sink { [weak self] _ in
+                self?.objectWillChange.send()
+            }
+    }
+    #endif
 
     private func consumeMCPExternalContexts(
         _ frozen: [UntrustedExternalContext]

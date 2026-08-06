@@ -867,7 +867,8 @@ struct CodeSessionView: View {
                   isWorking: vm.isWorking,
                   workspaceName: vm.workspaceName,
                   agentState: vm.agentState,
-                  composerError: vm.composerError,
+                  composerError: vm.voiceInput.errorText
+                    ?? vm.composerError,
                   threadStyle: .intatisMac(scheme),
                   onShowSessions: onShowSessions,
                   onNewSession: onNewSession,
@@ -886,6 +887,16 @@ struct CodeSessionView: View {
                             vm.cancelPendingMCPExternalContexts()
                         })
                   }),
+                  composerTrailingAction:
+                    IntatisThreadComposerSecondaryAction(
+                        systemImage: vm.voiceInput.buttonSystemImage,
+                        help: vm.voiceInput.buttonHelp,
+                        isBusy: vm.voiceInput.showsProgress,
+                        isDisabled: vm.voiceInput.isToggleDisabled
+                            || (vm.isWorking
+                                && !vm.voiceInput.isRecording),
+                        blocksSubmission: vm.voiceInput.isEngaged,
+                        action: { vm.toggleVoiceInput() }),
                   headerActions: [
                     IntatisThreadHeaderAction(
                         title: "MCP Content",
@@ -1019,7 +1030,8 @@ struct CoworkSessionView: View {
                         project: vm.project,
                         goal: vm.goal,
                         workTasks: vm.workTasks,
-                        composerError: vm.composerError
+                        composerError: vm.voiceInput.errorText
+                            ?? vm.composerError
                             ?? vm.inferenceComposerError
                             ?? vm.projectionError
                             ?? vm.sessionStorageWarning,
@@ -1084,6 +1096,22 @@ struct CoworkSessionView: View {
                         .frame(
                             minHeight: IntatisComposerControlMetrics.controlHeight,
                             alignment: .center)),
+                        composerTrailingAction:
+                            IntatisThreadComposerSecondaryAction(
+                                systemImage:
+                                    vm.voiceInput.buttonSystemImage,
+                                help: vm.voiceInput.buttonHelp,
+                                isBusy:
+                                    vm.voiceInput.showsProgress,
+                                isDisabled:
+                                    vm.voiceInput.isToggleDisabled
+                                    || (vm.isAcceptingSubmission
+                                        && !vm.voiceInput.isRecording),
+                                blocksSubmission:
+                                    vm.voiceInput.isEngaged,
+                                action: {
+                                    vm.toggleVoiceInput()
+                                }),
                         showsInspector: $showsInspector,
                         input: $vm.input,
                         onSend: { vm.send() },
