@@ -2378,6 +2378,10 @@ public struct IntatisThreadComposer: View {
                 }
         }
         .intatisCompactIconButton()
+        .frame(
+            width: IntatisComposerControlMetrics.controlHeight,
+            height: IntatisComposerControlMetrics.controlHeight)
+        .contentShape(Circle())
         .help(action.help)
         .accessibilityLabel(action.help)
         .disabled(action.isDisabled)

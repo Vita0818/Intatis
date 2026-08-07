@@ -3,6 +3,9 @@ import IntatisCore
 import IntatisProtocol
 import IntatisProviders
 
+public typealias ChatAttachmentResolver =
+    @Sendable ([ArtifactID]) async throws -> [ImageAttachment]
+
 /// The tool-free chat loop (ARCHITECTURE.md §3.4). Lives in Conversation — not
 /// in the Agent Kernel — so the iOS subset and the Chat surface get streaming
 /// chat without linking any tools, permissions, or workspace code (§4).
@@ -18,11 +21,13 @@ public struct ChatLoop: Sendable {
     private let reasoningEffort: ReasoningEffort?
     private let includeUsage: Bool
     private let webSearch: ChatWebSearchConfiguration?
+    private let attachmentResolver: ChatAttachmentResolver?
 
     public init(log: EventLog, provider: ChatProvider, model: ModelID,
                 systemPrompt: String? = nil, reasoningEffort: ReasoningEffort? = nil,
                 includeUsage: Bool = false,
-                webSearch: ChatWebSearchConfiguration? = nil) {
+                webSearch: ChatWebSearchConfiguration? = nil,
+                attachmentResolver: ChatAttachmentResolver? = nil) {
         self.log = log
         self.provider = provider
         self.model = model
@@ -30,16 +35,20 @@ public struct ChatLoop: Sendable {
         self.reasoningEffort = reasoningEffort
         self.includeUsage = includeUsage
         self.webSearch = webSearch
+        self.attachmentResolver = attachmentResolver
     }
 
     /// Send one user message and stream the assistant reply into the log.
     public func send(_ userText: String,
                      images: [ImageAttachment] = [],
-                     userMessage: UserMessagePayload? = nil) async throws {
+                     userMessage: UserMessagePayload? = nil,
+                     userMessageDidPersist:
+                        (@Sendable () async -> Void)? = nil) async throws {
         let turnID = TurnID.new()
         let submissionID = userMessage?.submissionID
-        let history = await buildHistory()
+        let history = try await buildHistory()
         try await log.append(.userMessage(userMessage ?? UserMessagePayload(text: userText)))
+        await userMessageDidPersist?()
 
         var messages: [ChatMessage] = []
         if let systemPrompt { messages.append(ChatMessage(role: .system, content: systemPrompt)) }
@@ -54,6 +63,7 @@ public struct ChatLoop: Sendable {
         var citations: [MessageCitation] = []
         var citationURLs: Set<String> = []
         do {
+            try Task.checkCancellation()
             let request = ChatRequest(model: model, messages: messages,
                                       reasoningEffort: reasoningEffort,
                                       includeUsage: includeUsage,
@@ -135,17 +145,37 @@ public struct ChatLoop: Sendable {
     }
 
     /// Rebuild prior turns from the log as provider-shaped messages.
-    private func buildHistory() async -> [ChatMessage] {
+    private func buildHistory() async throws -> [ChatMessage] {
         let projection = ConversationProjection.build(from: await log.replay())
-        return projection.messages.compactMap { m in
-            switch m.role {
+        var history: [ChatMessage] = []
+        history.reserveCapacity(projection.messages.count)
+        for message in projection.messages {
+            try Task.checkCancellation()
+            switch message.role {
             case .user:
-                return ChatMessage(role: .user, content: m.text)
+                let images: [ImageAttachment]
+                if message.attachments.isEmpty {
+                    images = []
+                } else if let attachmentResolver {
+                    images = try await attachmentResolver(message.attachments)
+                } else {
+                    throw IntatisError.config(
+                        "Chat history contains attachments, but no attachment resolver is available")
+                }
+                history.append(ChatMessage(
+                    role: .user,
+                    content: message.text,
+                    images: images))
             case .assistant, .agent:
-                return m.isComplete ? ChatMessage(role: .assistant, content: m.text) : nil
+                if message.isComplete {
+                    history.append(ChatMessage(
+                        role: .assistant,
+                        content: message.text))
+                }
             case .system:
-                return nil
+                break
             }
         }
+        return history
     }
 }

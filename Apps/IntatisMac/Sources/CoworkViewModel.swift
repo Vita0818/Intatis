@@ -14,7 +14,6 @@ import IntatisSkills
 import IntatisMCP
 import IntatisTools
 import IntatisSharedUI
-import UniformTypeIdentifiers
 
 private actor ProviderRegistryBox {
     private var registry: ProviderRegistry
@@ -146,11 +145,7 @@ struct CoworkGoalEditDraft: Equatable {
     var tokenBudget: String
 }
 
-struct CoworkDraftAttachment: Identifiable, Equatable {
-    var id: ArtifactID
-    var name: String
-    var mime: String
-}
+typealias CoworkDraftAttachment = IntatisComposerDraftAttachment
 
 enum CoworkSessionLaunchMode: Sendable {
     case fresh
@@ -177,38 +172,6 @@ private struct CoworkUnavailableAutomaticPermissionResponder: PermissionResponde
             source: .automaticReviewerFailure,
             failureKind: .controlPlaneShutdown,
             failureSource: .reviewerFailed)
-    }
-}
-
-private enum CoworkSubmissionAttachmentError: LocalizedError {
-    case missing(ArtifactID)
-    case unsupported(ArtifactID, String)
-    case unreadable(ArtifactID, String)
-
-    var errorDescription: String? {
-        switch self {
-        case .missing(let id):
-            return "Attachment \(id.rawValue) is no longer available in this session."
-        case .unsupported(let id, let mime):
-            return "Attachment \(id.rawValue) uses \(mime), but Cowork remote execution currently accepts image attachments only. The submitted file remains preserved locally."
-        case .unreadable(let id, let message):
-            return "Attachment \(id.rawValue) could not be read: \(message)"
-        }
-    }
-
-    var code: String {
-        switch self {
-        case .missing: return "attachment_missing"
-        case .unsupported: return "attachment_type_unsupported"
-        case .unreadable: return "attachment_unreadable"
-        }
-    }
-
-    var retryable: Bool {
-        switch self {
-        case .missing, .unsupported: return false
-        case .unreadable: return true
-        }
     }
 }
 
@@ -373,6 +336,7 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
     }
     private let sessionNaming: SessionNamingService
     private let artifactStore: ArtifactStore
+    private let composerAttachmentStore: IntatisComposerAttachmentStore
     private let submittedIntentStore: SubmittedIntentStore
     private let registryBox: ProviderRegistryBox
     private let mcpSnapshots:
@@ -442,6 +406,8 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         self.log = log
         self.sessionNaming = sessionNaming
         self.artifactStore = artifactStore
+        self.composerAttachmentStore = IntatisComposerAttachmentStore(
+            store: artifactStore)
         self.submittedIntentStore = SubmittedIntentStore(log: log)
         self.registryBox = ProviderRegistryBox(
             registry,
@@ -2396,30 +2362,11 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             guard let self else { return }
             defer { self.activeOperations.removeValue(forKey: operationID) }
             for url in urls {
-                let accessed = url.startAccessingSecurityScopedResource()
-                defer {
-                    if accessed { url.stopAccessingSecurityScopedResource() }
-                }
                 do {
-                    let data = try Data(contentsOf: url, options: [.mappedIfSafe])
-                    let type = UTType(filenameExtension: url.pathExtension)
-                    let mime = type?.preferredMIMEType ?? "application/octet-stream"
-                    let ref = try await self.artifactStore.addAttachment(
-                        name: url.lastPathComponent,
-                        data: data,
-                        mime: mime)
-                    // Admission may retain only ArtifactID references, so
-                    // verify the blob/index pair before exposing the draft.
-                    let verifiedRef = await self.artifactStore.ref(for: ref.id)
-                    let verifiedData = try await self.artifactStore.data(for: ref.id)
-                    guard verifiedRef == ref,
-                          verifiedData.count == data.count else {
-                        throw IntatisError.io("attachment read-back verification failed")
-                    }
-                    self.draftAttachments.append(CoworkDraftAttachment(
-                        id: ref.id,
-                        name: url.lastPathComponent,
-                        mime: mime))
+                    let file = try IntatisComposerAttachmentFileReader.read(url)
+                    let attachment = try await self.composerAttachmentStore
+                        .preserve(file)
+                    self.draftAttachments.append(attachment)
                 } catch {
                     self.composerError = IntatisLocalization.format(
                         "Attachment %@ could not be preserved: %@",
@@ -2852,7 +2799,7 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                     } else {
                         executionFailure = nil
                     }
-                } catch let error as CoworkSubmissionAttachmentError {
+                } catch let error as IntatisComposerAttachmentResolutionError {
                     executionFailure = SubmissionFailure(
                         code: error.code,
                         message: error.localizedDescription,
@@ -2906,25 +2853,9 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
     private func submissionImages(
         for payload: UserMessagePayload
     ) async throws -> [ImageAttachment] {
-        var result: [ImageAttachment] = []
-        for id in payload.attachments ?? [] {
-            guard let ref = await artifactStore.ref(for: id) else {
-                throw CoworkSubmissionAttachmentError.missing(id)
-            }
-            guard ref.mime.hasPrefix("image/") else {
-                throw CoworkSubmissionAttachmentError.unsupported(id, ref.mime)
-            }
-            let data: Data
-            do {
-                data = try await artifactStore.data(for: id)
-            } catch {
-                throw CoworkSubmissionAttachmentError.unreadable(
-                    id,
-                    error.localizedDescription)
-            }
-            result.append(.base64(mime: ref.mime, base64: data.base64EncodedString()))
-        }
-        return result
+        try await composerAttachmentStore.imageAttachments(
+            for: payload.attachments ?? [],
+            surface: "Cowork remote execution")
     }
 
     private func settleSubmissionFailure(

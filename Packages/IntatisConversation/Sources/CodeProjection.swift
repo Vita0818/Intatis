@@ -443,6 +443,10 @@ public struct CodeProjection: Equatable, Sendable {
                                   recoveryAdvice: RuntimeErrorPresentation.recoveryAdvice(for: p),
                                   submissionID: p.submissionID))
 
+        case .turnOutcome(let p):
+            guard p.outcome != .completed else { break }
+            mutationChange = markInvalidatedAgentCompletion(for: p)
+
         // v0.3 (Cowork)
         case .agentAttached(let p):
             items.append(CodeItem(id: stableID(envelope, "agent_attached"), kind: .note, title: "agent",
@@ -639,7 +643,7 @@ public struct CodeProjection: Equatable, Sendable {
              .goalBudgetLimited, .goalUsageLimited, .goalCompleted, .goalCleared,
              .continuationRunCreated, .continuationRunStarted, .continuationRunCheckpointed,
              .continuationRunCompleted, .continuationRunCancelled, .continuationRunRecovered,
-             .artifactProgress, .turnStats, .turnOutcome,
+             .artifactProgress, .turnStats,
              .mcpServerAttached, .mcpServerDetached, .mcpAttachmentPolicyUpdated,
              .mcpConsentGranted, .mcpConsentRevoked,
              .mcpControlOperationRequested, .mcpControlOperationSettled,
@@ -1027,6 +1031,63 @@ public struct CodeProjection: Equatable, Sendable {
         guard items[index].kind == .agent, !items[index].complete else { return }
         items[index].isFailure = true
         items[index].recoveryAdvice = RuntimeErrorPresentation.partialResponseAdvice(for: payload)
+    }
+
+    /// Repairs logs written by older AgentLoop builds that published a normal
+    /// `message_completed` before the authoritative turn terminal failed. The
+    /// exact active task/attempt mapping is preferred; submission correlation
+    /// is only a compatibility fallback and must resolve to one latest item.
+    private mutating func markInvalidatedAgentCompletion(
+        for payload: TurnOutcomePayload
+    ) -> CodeProjectionChange {
+        let exactIndex: Int? = {
+            guard let agent = payload.agentID,
+                  let key = activeTaskByAgent[agent],
+                  payload.taskID == nil || key.taskID == payload.taskID,
+                  let reference = latestCompletedMessageByTaskAttempt[key],
+                  reference.agent == agent,
+                  items.indices.contains(reference.itemIndex) else {
+                return nil
+            }
+            return reference.itemIndex
+        }()
+
+        let fallbackIndex: Int? = exactIndex == nil ? items.indices.reversed().first { index in
+            let item = items[index]
+            guard item.kind == .agent,
+                  item.complete,
+                  let submissionID = payload.submissionID,
+                  item.submissionID == submissionID else {
+                return false
+            }
+            guard let agent = payload.agentID else { return true }
+            if itemAgentIDs.indices.contains(index),
+               !itemAgentIDs[index].isEmpty {
+                return itemAgentIDs[index].contains(agent)
+            }
+            return item.title == agent.rawValue
+        } : nil
+
+        guard let index = exactIndex ?? fallbackIndex,
+              items.indices.contains(index),
+              items[index].kind == .agent else {
+            return .none
+        }
+
+        items[index].complete = false
+        items[index].isFailure = true
+        let reason = payload.reason?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let boundedReason = reason.map { String($0.prefix(1_024)) }
+        let detail = boundedReason.flatMap { $0.isEmpty ? nil : $0 }
+            ?? "The authoritative turn outcome did not accept this response as complete. The partial text is preserved for review."
+        items[index].recoveryAdvice = RuntimeRecoveryAdvice(
+            title: payload.outcome == .interrupted
+                ? "Response interrupted"
+                : "Response was not accepted as complete",
+            detail: detail,
+            retryable: true)
+        return changeForItem(at: index)
     }
 
     private static func isFailureObservation(_ observation: String) -> Bool {

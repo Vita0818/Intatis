@@ -956,6 +956,7 @@ public struct AgentModelHistoryProjector: Sendable {
     ) throws -> [SubmissionID: ProjectedTurn] {
         var seenItemIDs: [String: ModelHistoryItemPayload] = [:]
         var grouped: [SubmissionID: [SequencedItem]] = [:]
+        let terminalOutcomes = try terminalOutcomesByTurn(events: events)
 
         for envelope in events.sorted(by: { $0.seq < $1.seq }) {
             guard case .modelHistoryItem(let payload) = envelope.event,
@@ -982,6 +983,11 @@ public struct AgentModelHistoryProjector: Sendable {
                 throw AgentModelHistoryProjectionError.invalidItem(
                     payload.itemID,
                     "accepted Code user target does not match the item agent")
+            }
+            guard !isInvalidatedFinalAssistant(
+                payload,
+                terminalOutcomes: terminalOutcomes) else {
+                continue
             }
             let trimmedItemID = payload.itemID.trimmingCharacters(
                 in: .whitespacesAndNewlines)
@@ -1140,6 +1146,7 @@ public struct AgentModelHistoryProjector: Sendable {
     ) throws -> [SubmissionID: ProjectedTurn] {
         var seenItemIDs: [String: ModelHistoryItemPayload] = [:]
         var grouped: [SubmissionID: [SequencedItem]] = [:]
+        let terminalOutcomes = try terminalOutcomesByTurn(events: events)
 
         for envelope in events.sorted(by: { $0.seq < $1.seq }) {
             guard case .modelHistoryItem(let payload) = envelope.event,
@@ -1180,6 +1187,11 @@ public struct AgentModelHistoryProjector: Sendable {
                     "item agent does not match the durable root assignee")
             }
             guard rootBinding.assignee == agentID else {
+                continue
+            }
+            guard !isInvalidatedFinalAssistant(
+                payload,
+                terminalOutcomes: terminalOutcomes) else {
                 continue
             }
 
@@ -1233,6 +1245,44 @@ public struct AgentModelHistoryProjector: Sendable {
                     : nil)
         }
         return result
+    }
+
+    /// `turn_outcome` is the authoritative terminal for a model turn. Older
+    /// AgentLoop builds could append a final assistant item before discovering
+    /// unresolved Cowork side effects and then write a failed outcome. Keep
+    /// the real user/tool transcript, but never feed that invalidated final
+    /// answer into a later provider request.
+    private static func terminalOutcomesByTurn(
+        events: [Envelope]
+    ) throws -> [TurnID: TurnOutcomePayload] {
+        var result: [TurnID: TurnOutcomePayload] = [:]
+        for envelope in events.sorted(by: { $0.seq < $1.seq }) {
+            guard case .turnOutcome(let payload) = envelope.event else {
+                continue
+            }
+            if let existing = result[payload.turnID] {
+                guard existing == payload else {
+                    throw AgentModelHistoryProjectionError.invalidItem(
+                        "turn-outcome:\(payload.turnID.rawValue)",
+                        "one turn has conflicting terminal outcomes")
+                }
+                continue
+            }
+            result[payload.turnID] = payload
+        }
+        return result
+    }
+
+    private static func isInvalidatedFinalAssistant(
+        _ payload: ModelHistoryItemPayload,
+        terminalOutcomes: [TurnID: TurnOutcomePayload]
+    ) -> Bool {
+        guard payload.kind == .message,
+              payload.role == .assistant,
+              let outcome = terminalOutcomes[payload.turnID] else {
+            return false
+        }
+        return outcome.outcome == .failed || outcome.outcome == .interrupted
     }
 
     /// A retried submission replaces an earlier failed invocation. Within the

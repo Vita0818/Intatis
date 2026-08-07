@@ -89,6 +89,11 @@ public struct TaskContract: Codable, Sendable, Hashable {
     public var agentInferenceBinding: AgentInferenceBinding?
     public var relatedAgents: [AgentID]
     public var relatedTasks: [TaskID]
+    /// Exact durable mailbox items owned by this delivery invocation. Nil is
+    /// reserved for legacy and non-mailbox contracts so existing JSONL stays
+    /// decodable. New mailbox tasks freeze a bounded non-empty set at
+    /// admission and never widen it while queued or retried.
+    public var mailboxMessageIDs: [MessageID]?
     public var constraints: [String]
     public var replyMode: TaskReplyMode?
     public var executionTimeoutSeconds: Double?
@@ -112,6 +117,7 @@ public struct TaskContract: Codable, Sendable, Hashable {
                 agentInferenceBinding: AgentInferenceBinding? = nil,
                 relatedAgents: [AgentID] = [],
                 relatedTasks: [TaskID] = [],
+                mailboxMessageIDs: [MessageID]? = nil,
                 constraints: [String] = [],
                 replyMode: TaskReplyMode? = nil,
                 executionTimeoutSeconds: Double? = nil,
@@ -134,6 +140,7 @@ public struct TaskContract: Codable, Sendable, Hashable {
         self.agentInferenceBinding = agentInferenceBinding
         self.relatedAgents = relatedAgents
         self.relatedTasks = relatedTasks
+        self.mailboxMessageIDs = mailboxMessageIDs
         self.constraints = constraints
         self.replyMode = replyMode
         self.executionTimeoutSeconds = executionTimeoutSeconds

@@ -1,22 +1,27 @@
 # CURRENT_STATE
 
 文档状态：当前源码摘要
-最近核对：2026-08-05
-产品基线：v0.36（build 36）
+最近核对：2026-08-07
+产品基线：v0.38（build 38）
 
 ## 版本与发行状态
 
 - `HEAD` 与 `origin/main` 当前均为标题为 `v0.34` 的提交 `c4727c1`。仓库没有 Git tag；该
-  commit 标题不是产品版本事实源，`project.yml` 把当前产品基线定义为 `0.36 (36)`。
-- `MARKETING_VERSION` / `CURRENT_PROJECT_VERSION` 已推进为 `0.36 (36)`。两个仓库参考
+  commit 标题不是产品版本事实源，`project.yml` 把当前产品基线定义为 `0.38 (38)`。
+- `MARKETING_VERSION` / `CURRENT_PROJECT_VERSION` 已推进为 `0.38 (38)`。两个仓库参考
   Info.plist、README、文档入口和发行脚本使用同一基线。
-- 2026-08-05 已完成 macOS universal Release 与 iOS Simulator Debug 构建；本机
-  `/Applications/Intatis.app` 已安装 `0.36 (36)` 的 ad-hoc Hardened Runtime 开发构建，旧
-  `0.35 (35)` 位于废纸篓，可恢复。该本机安装不是 Developer ID 公证发行产物。
+- 2026-08-07 已重新生成 Xcode 工程并通过版本一致性门；`IntatisMac` unsigned
+  universal Release 与 `IntatisiOS` generic Simulator Debug 均构建通过，最终 bundle
+  均为 `0.38 (38)`，macOS 可执行文件包含 `x86_64 arm64`。本轮未安装 v0.38 App。
+- 2026-08-07 版本推进前已从当时的未提交工作树完成 macOS universal Release 构建；本机
+  `/Applications/Intatis.app` 已安装包含最新 Chat/Cowork composer 附件改动和 Cowork
+  terminal/mailbox reconciliation 修复的 `0.36 (36)` ad-hoc Hardened Runtime 开发构建。
+  安装前的同版本 App 已以 timestamped `Intatis-before-install-*.app` 移入废纸篓，可恢复。
+  该本机安装不是 Developer ID 公证发行产物。
 - macOS 只发行 `IntatisMac` Developer ID/direct-distribution 产品；不做 Mac App Store。
   `IntatisMacAppStore` 仍是 legacy source target，不进入默认构建、测试或 release gate。
 - 用户宿主终端已报告两个有效 codesigning identity，其中 Developer ID Application 可被发行
-  脚本选取；`Intatis-Notary` Keychain profile 也已配置。v0.36 最终 App/DMG 尚未完成 Apple
+  脚本选取；`Intatis-Notary` Keychain profile 也已配置。v0.38 最终 App/DMG 尚未完成 Apple
   notarization、staple 与 Gatekeeper 全链路，因此仍不得描述为正式 release。
 
 ## 当前产品面
@@ -26,7 +31,11 @@
 macOS 是完整产品：Chat、Code、Cowork、Settings 和本地诊断导出。
 
 - Chat 使用无 Intatis Tools 的 `ChatLoop`，支持 OpenAI-compatible streaming、provider/model/
-  variant 配置、provider-hosted search wire、citations、会话历史、图片生成与 artifact 投影。
+  variant 配置、provider-hosted search wire、citations、会话历史和本地图片附件。macOS Chat 已移除
+  composer 中独立的“按提示词生成图片”入口，改为直接复用 Cowork 的 paperclip、系统文件选择器、
+  多文件拖放和草稿附件菜单；旧 `artifact_added` / `artifact_progress` 仍可回放，不改历史协议。
+  附件先进入 session `ArtifactStore` 并读回校验，`user_message` 只保存 `ArtifactID`；当前轮及后续
+  历史重建时再解析为 provider `ImageAttachment`，不会把 base64 图片写入 EventLog。
   每次 Send 只按当前 exact route 的显式 capability 与 adapter dialect 可选地提供 hosted search；
   不支持、未知或未适配时在同一路由静默发送普通 Chat。
 - Code 使用共享 headless `AgentRuntime.code`，提供工作区文件、patch、Git、managed
@@ -58,6 +67,13 @@ macOS 是完整产品：Chat、Code、Cowork、Settings 和本地诊断导出。
   当前窗口的只读对话选择；列表保留 session 历史上所有 durable agent，detached identity 继续
   可点击并由原状态图标显示已移除，当前选择不会跳回 `@main`。新窗口默认显示 `@main`，
   `@permission-reviewer` 等控制面 identity 仍为不可选择的状态项。
+- Cowork final turn 现在先校验 side-effect evidence，再原子发布 final message/model-history、idle
+  与 completed outcome；旧日志中 failed/interrupted turn 的先行完成气泡会被展示投影纠正，失效的
+  final assistant 也不再进入下一次 provider history。mailbox wake contract 冻结 1–8 个 exact
+  MessageID，ordinary delivery 使用 read-only/reply-only 窄 lease，失败只在同一 TaskID 上有界重试；
+  task completion、candidate progress 与 consumed IDs 同批落盘后才 ack。legacy nil binding 的歧义或
+  耗尽 lineage 保持 pending/fail closed，新消息仍可独立投递。WorkTask 工具的 reviewer preview 已
+  补齐 bounded semantic fields，并明确 `wt_…`、AgentInvocation `task_…` 与 latest revision 的边界。
 - Cowork 中每个 agent 的文件、Git、文档、浏览器文件与 terminal 工具仍只作用于自己的单一
   `workspaceRoot`。具有 `spawn_agent` 的 coordinator 提示词会在预知目标位于根外或收到
   out-of-workspace denial 后停止直接重试，改为按目标绝对目录创建默认只读的子 agent，再用
@@ -125,7 +141,10 @@ profiles 与外部 MCP client。macOS/Linux 的 stdio、sandbox、bwrap/guard �
   conversation canvas，结构化状态、用户消息、错误、权限、Goal/Task 使用 Material 边界。
 - iOS 与 macOS 已统一品牌/session/Settings 的 serif 标题和系统 sans 正文/控件，两端使用
   model/usage + action/input/voice/Send-or-Stop 的两排 composer；voice 始终紧邻主操作左侧，
-  不占用或复制唯一的 Send↔Stop 槽位。
+  不占用或复制唯一的 Send↔Stop 槽位。composer 的 compact secondary/voice control 另显式固定
+  40pt 外层布局与圆形 `contentShape`，使屏幕上完整圆形控件与真实点击区域一致，而不是只让内部
+  SF Symbol 字形响应点击。macOS Chat 与 Cowork 的 paperclip、附件数量/移除菜单、文件 importer
+  和 URL drop modifier 现在是同一套共享 surface；Code 与 iOS Chat 的现有能力边界不随之扩大。
 - rich text 使用仓内经审计的 Microsoft SwiftStreamingMarkdown thin derivative 与
   exact iosMath Apple-native 数学排版；plain-safe 仍是运行时救援路径。
 - macOS Chat/Code/Cowork history 使用最多 16-row eager page 与显式分页，避免旧的 rich +

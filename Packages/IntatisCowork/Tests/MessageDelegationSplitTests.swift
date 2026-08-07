@@ -132,12 +132,56 @@ final class MessageDelegationSplitTests: XCTestCase {
             $0.kind == .mailboxDelivery && $0.assignee == worker
         })
         XCTAssertEqual(wakeTask.issuer, main)
+        XCTAssertEqual(wakeTask.mailboxMessageIDs, [message.messageId])
+        let capabilityLease = try XCTUnwrap(events.compactMap { envelope -> CapabilityLease? in
+            guard case .capabilityLeaseCreated(let payload) = envelope.event,
+                  payload.lease.taskID == wakeTask.id else { return nil }
+            return payload.lease
+        }.first)
+        let workspaceLease = try XCTUnwrap(events.compactMap { envelope -> WorkspaceLease? in
+            guard case .workspaceLeaseGranted(let payload) = envelope.event,
+                  payload.lease.taskID == wakeTask.id else { return nil }
+            return payload.lease
+        }.first)
+        XCTAssertEqual(workspaceLease.access, .readOnly)
+        XCTAssertEqual(capabilityLease.communication, .replyOnly)
+        XCTAssertEqual(capabilityLease.delegation, .none)
+        XCTAssertTrue(capabilityLease.mcpGrants.isEmpty)
+        XCTAssertFalse(capabilityLease.tools.contains(.manageWorkTasks))
+        XCTAssertFalse(capabilityLease.tools.contains(.updateOwnedWorkTask))
+        XCTAssertFalse(capabilityLease.tools.contains(.delegateTask))
+        XCTAssertFalse(capabilityLease.tools.contains(.runShell))
+        XCTAssertFalse(capabilityLease.tools.contains(.gitControl))
+        XCTAssertFalse(capabilityLease.tools.contains(.gitRemote))
+        XCTAssertFalse(capabilityLease.tools.contains(.applyPatch))
+        XCTAssertFalse(capabilityLease.tools.contains(.browseWeb))
+        let mailboxToolNames = Set(Orchestrator.toolRegistry(
+            for: capabilityLease).descriptors().map(\.name))
+        XCTAssertFalse(mailboxToolNames.contains("task_create"))
+        XCTAssertFalse(mailboxToolNames.contains("task_update"))
+        XCTAssertFalse(mailboxToolNames.contains("delegate_task"))
+        XCTAssertFalse(mailboxToolNames.contains("ask_agent"))
+        XCTAssertFalse(mailboxToolNames.contains("exec_command"))
+        XCTAssertFalse(mailboxToolNames.contains("write_stdin"))
+        XCTAssertFalse(mailboxToolNames.contains("apply_patch"))
+        XCTAssertFalse(mailboxToolNames.contains("web_fetch"))
+        XCTAssertFalse(mailboxToolNames.contains { $0.hasPrefix("git_") })
+        XCTAssertFalse(mailboxToolNames.contains { $0.hasPrefix("browser_") })
         XCTAssertTrue(events.contains {
             if case .taskQueued(let payload) = $0.event {
                 return payload.contract.id == wakeTask.id && payload.reason == "mailbox delivery"
             }
             return false
         })
+        let completedSeq = try XCTUnwrap(events.first {
+            guard case .taskCompleted(let payload) = $0.event else { return false }
+            return payload.taskID == wakeTask.id
+        }?.seq)
+        let consumedSeq = try XCTUnwrap(events.first {
+            guard case .agentMessageConsumed(let payload) = $0.event else { return false }
+            return payload.messageID == message.messageId
+        }?.seq)
+        XCTAssertEqual(consumedSeq, completedSeq + 1)
         XCTAssertTrue(events.contains {
             if case .agentMessageConsumed(let payload) = $0.event {
                 return payload.messageID == message.messageId
@@ -182,7 +226,7 @@ final class MessageDelegationSplitTests: XCTestCase {
             profile: .reviewed))
         XCTAssertTrue(mainAttached)
         XCTAssertTrue(workerAttached)
-        await orch.setMessageConsumptionAppender { _ in
+        await orch.setMessageConsumptionPreflightForTesting { _ in
             throw SplitProviderFailure.forcedFailure
         }
 
@@ -201,9 +245,22 @@ final class MessageDelegationSplitTests: XCTestCase {
         let mailbox = await orch.mailbox(for: worker)
         XCTAssertEqual(
             workerProvider.requestCount,
-            4,
-            "the unacknowledged message is redelivered, then the failed delivery task uses its bounded three attempts")
+            3,
+            "consumption failure retries one exact delivery TaskID through its bounded attempts")
         XCTAssertEqual(mailbox.pendingMessages, [message.messageId])
+        let deliveryQueues = events.compactMap { envelope -> (TaskID, Int)? in
+            guard case .taskQueued(let payload) = envelope.event,
+                  payload.contract.kind == .mailboxDelivery,
+                  let attempt = payload.attempt else { return nil }
+            return (payload.contract.id, attempt)
+        }
+        XCTAssertEqual(Set(deliveryQueues.map(\.0)).count, 1)
+        XCTAssertEqual(deliveryQueues.map(\.1), [1, 2, 3])
+        let deliveryTaskID = try XCTUnwrap(deliveryQueues.first?.0)
+        XCTAssertFalse(events.contains {
+            guard case .taskCompleted(let payload) = $0.event else { return false }
+            return payload.taskID == deliveryTaskID
+        })
         XCTAssertFalse(events.contains {
             guard case .agentMessageConsumed(let payload) = $0.event else { return false }
             return payload.messageID == message.messageId
@@ -233,6 +290,7 @@ final class MessageDelegationSplitTests: XCTestCase {
         let wakeTask = try XCTUnwrap(splitTaskContracts(events).first {
             $0.kind == .mailboxDelivery && $0.assignee == worker
         })
+        XCTAssertEqual(wakeTask.mailboxMessageIDs, [request.requestID])
         XCTAssertTrue(events.contains {
             if case .agentMessageConsumed(let payload) = $0.event {
                 return payload.messageID == request.requestID
@@ -285,6 +343,7 @@ final class MessageDelegationSplitTests: XCTestCase {
             $0.kind == .mailboxDelivery && $0.assignee == main
         })
         XCTAssertEqual(wakeTask.relatedTasks, [currentTaskID])
+        XCTAssertEqual(wakeTask.mailboxMessageIDs, [reply.replyID])
         XCTAssertTrue(events.contains {
             if case .agentMessageConsumed(let payload) = $0.event {
                 return payload.messageID == reply.replyID
@@ -366,6 +425,22 @@ final class MessageDelegationSplitTests: XCTestCase {
             $0.kind == .mailboxDelivery && $0.assignee == main
         })
         XCTAssertEqual(wakeTask.relatedTasks, [currentTaskID])
+        XCTAssertEqual(
+            wakeTask.mailboxMessageIDs,
+            [MessageID(rawValue: request.requestID.rawValue)])
+        let wakeLease = try XCTUnwrap(events.compactMap { envelope -> CapabilityLease? in
+            guard case .capabilityLeaseCreated(let payload) = envelope.event,
+                  payload.lease.taskID == wakeTask.id else { return nil }
+            return payload.lease
+        }.first)
+        XCTAssertEqual(wakeLease.communication, .replyOnly)
+        XCTAssertEqual(
+            wakeLease.delegation,
+            .granted(DelegationBudget(maxTasks: 1, maxDepth: 1)))
+        XCTAssertTrue(wakeLease.tools.contains(.delegateTask))
+        XCTAssertFalse(wakeLease.tools.contains(.attachWorkspace))
+        XCTAssertFalse(wakeLease.tools.contains(.manageWorkTasks))
+        XCTAssertFalse(wakeLease.tools.contains(.runShell))
         XCTAssertTrue(events.contains {
             if case .agentMessageConsumed(let payload) = $0.event {
                 return payload.messageID == MessageID(rawValue: request.requestID.rawValue)

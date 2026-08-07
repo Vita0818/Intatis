@@ -54,7 +54,10 @@ final class IOSAppEnvironment: ObservableObject {
             fatalError("Failed to open artifact store: \(error)")
         }
         self.multimodal = MultimodalService(log: log, store: store)
-        self.viewModel = ChatViewModel(log: log, registry: initialRegistry)
+        self.viewModel = ChatViewModel(
+            log: log,
+            registry: initialRegistry,
+            artifactStore: store)
         self.needsAPIKey = !Self.hasAPIKey(ref: IOSConfig.selectedAPIKeyRef)
 
         wireImageGeneration()
@@ -178,7 +181,10 @@ final class IOSAppEnvironment: ObservableObject {
         viewModel.stop()
         let log = try EventLog(session: session, fileURL: IOSConfig.sessionFile(session))
         let store = try ArtifactStore(root: IOSConfig.artifactsDir(session))
-        let model = ChatViewModel(log: log, registry: registry)
+        let model = ChatViewModel(
+            log: log,
+            registry: registry,
+            artifactStore: store)
         self.log = log
         self.multimodal = MultimodalService(log: log, store: store)
         self.viewModel = model

@@ -25,6 +25,34 @@ private func normalizedWorkTaskAgentID(_ raw: String) -> AgentID {
     return AgentID(rawValue: trimmed.hasPrefix("@") ? String(trimmed.dropFirst()) : trimmed)
 }
 
+private func joinedWorkTaskPreviewValues(_ values: [String]?) -> String {
+    values?.joined(separator: ", ") ?? ""
+}
+
+private func workTaskNamespaceHint(
+    rawID: String,
+    underlyingError: Error
+) -> Error {
+    let isNotFound: Bool
+    if let error = underlyingError as? IntatisError,
+       case .notFound = error {
+        isNotFound = true
+    } else if let violation = underlyingError as? WorkTaskGraphViolation,
+              violation.kind == .missingTask {
+        isNotFound = true
+    } else {
+        isNotFound = false
+    }
+    guard isNotFound,
+          rawID.trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased().hasPrefix("task_") else {
+        return underlyingError
+    }
+    return ToolExecutionRejectedWithoutSideEffect(
+        code: "work_task_id_required",
+        message: "\(rawID) is an AgentInvocation TaskID, not a WorkTask ID. Use task_get or task_list to obtain the durable WorkTask ID (normally wt_…), then retry with its latest authoritative revision.")
+}
+
 public struct TaskCreateTool: Tool {
     public init() {}
 
@@ -83,6 +111,23 @@ public struct TaskCreateTool: Tool {
             replayPolicy: .requiresManualReconciliation)
     }
 
+    public func permissionActionPreview(
+        _ args: ToolArgs
+    ) -> PermissionActionPreview? {
+        guard let value = try? args.decode(Args.self) else { return nil }
+        return PermissionActionPreview(
+            kind: Self.descriptor.name,
+            fields: [
+                "title": value.title,
+                "description": value.description,
+                "owner": value.owner ?? "unassigned",
+                "acceptance_criteria": joinedWorkTaskPreviewValues(value.acceptanceCriteria),
+                "expected_artifacts": joinedWorkTaskPreviewValues(value.expectedArtifacts),
+                "depends_on": joinedWorkTaskPreviewValues(value.dependsOn),
+                "priority": (value.priority ?? .normal).rawValue,
+            ])
+    }
+
     public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {
         let value = try args.decode(Args.self)
         guard let manager = context.workTaskManager else {
@@ -106,12 +151,16 @@ public struct TaskUpdateTool: Tool {
 
     public static let descriptor = ToolDescriptor(
         name: "task_update",
-        description: "Patch a durable WorkTask using optimistic concurrency. expected_revision is required; send only fields that must change and omit repeated contract fields. Workers may update progress/status/result/evidence on their assigned task but cannot change its contract. Only an explicit completed update with a non-empty result, and evidence when acceptance criteria exist, settles a WorkTask. AgentInvocation completion alone never does.",
+        description: "Patch a durable WorkTask (normally wt_…), never an AgentInvocation TaskID (task_…). Use task_get/task_list to obtain the WorkTask ID and its latest authoritative revision before updating. expected_revision is required; send only fields that must change and omit repeated contract fields. Workers may update progress/status/result/evidence on their assigned task but cannot change its contract. Do not redundantly settle an already-terminal WorkTask. Only an explicit completed update with a non-empty result, and evidence when acceptance criteria exist, settles a WorkTask. AgentInvocation completion alone never does.",
         sideEffect: .write,
         parameters: .object([
             "type": .string("object"),
             "properties": .object([
-                "task_id": workTaskStringSchema,
+                "task_id": .object([
+                    "type": .string("string"),
+                    "minLength": .number(1),
+                    "description": .string("Durable WorkTask ID, normally wt_…. Do not pass an AgentInvocation task_… ID."),
+                ]),
                 "expected_revision": .object([
                     "type": .string("integer"),
                     "minimum": .number(0),
@@ -202,6 +251,37 @@ public struct TaskUpdateTool: Tool {
             replayPolicy: .requiresManualReconciliation)
     }
 
+    public func permissionActionPreview(
+        _ args: ToolArgs
+    ) -> PermissionActionPreview? {
+        guard let value = try? args.decode(Args.self) else { return nil }
+        var changedFields: [String] = []
+        if value.title != nil { changedFields.append("title") }
+        if value.description != nil { changedFields.append("description") }
+        if value.acceptanceCriteria != nil { changedFields.append("acceptance_criteria") }
+        if value.expectedArtifacts != nil { changedFields.append("expected_artifacts") }
+        if value.owner != nil { changedFields.append("owner") }
+        if value.dependsOn != nil { changedFields.append("depends_on") }
+        if value.priority != nil { changedFields.append("priority") }
+        if value.progressNote != nil { changedFields.append("progress_note") }
+        if value.status != nil { changedFields.append("status") }
+        if value.result != nil { changedFields.append("result") }
+        if value.evidence != nil { changedFields.append("evidence") }
+        if value.retry != nil { changedFields.append("retry") }
+        return PermissionActionPreview(
+            kind: Self.descriptor.name,
+            fields: [
+                "task_id": value.taskID,
+                "expected_revision": String(value.expectedRevision),
+                "status": value.status?.rawValue ?? "unchanged",
+                "changed_fields": changedFields.joined(separator: ", "),
+                "progress_note": value.progressNote ?? "",
+                "result": value.result ?? "",
+                "evidence_count": String(value.evidence?.count ?? 0),
+                "retry": String(value.retry ?? false),
+            ])
+    }
+
     static func decodeRequest(_ args: ToolArgs) throws -> WorkTaskUpdateRequest {
         let value = try args.decode(Args.self)
         let owner: WorkTaskOwnerUpdate
@@ -235,8 +315,14 @@ public struct TaskUpdateTool: Tool {
         guard let manager = context.workTaskManager else {
             return ToolObservation(text: "WorkTask management is not available in this session")
         }
-        let detail = try await manager.updateWorkTask(request)
-        return ToolObservation(text: try encodeWorkTaskToolResult(detail))
+        do {
+            let detail = try await manager.updateWorkTask(request)
+            return ToolObservation(text: try encodeWorkTaskToolResult(detail))
+        } catch {
+            throw workTaskNamespaceHint(
+                rawID: request.taskID.rawValue,
+                underlyingError: error)
+        }
     }
 }
 
@@ -245,11 +331,17 @@ public struct TaskGetTool: Tool {
 
     public static let descriptor = ToolDescriptor(
         name: "task_get",
-        description: "Read one authoritative durable WorkTask, including dependency states, downstream tasks, linked invocations, candidate results, evidence, and revision.",
+        description: "Read one authoritative durable WorkTask (normally wt_…), including dependency states, downstream tasks, linked AgentInvocations, candidate results, evidence, and revision. Do not pass an AgentInvocation task_… ID.",
         sideEffect: .readOnly,
         parameters: .object([
             "type": .string("object"),
-            "properties": .object(["task_id": workTaskStringSchema]),
+            "properties": .object([
+                "task_id": .object([
+                    "type": .string("string"),
+                    "minLength": .number(1),
+                    "description": .string("Durable WorkTask ID, normally wt_…. Do not pass an AgentInvocation task_… ID."),
+                ]),
+            ]),
             "required": .array([.string("task_id")]),
             "additionalProperties": .bool(false),
         ]))
@@ -273,8 +365,14 @@ public struct TaskGetTool: Tool {
         guard let manager = context.workTaskManager else {
             return ToolObservation(text: "WorkTask management is not available in this session")
         }
-        return ToolObservation(text: try encodeWorkTaskToolResult(
-            await manager.getWorkTask(WorkTaskID(rawValue: value.taskID))))
+        do {
+            return ToolObservation(text: try encodeWorkTaskToolResult(
+                await manager.getWorkTask(WorkTaskID(rawValue: value.taskID))))
+        } catch {
+            throw workTaskNamespaceHint(
+                rawID: value.taskID,
+                underlyingError: error)
+        }
     }
 }
 

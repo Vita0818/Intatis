@@ -22,6 +22,10 @@ final class TaskContractTests: XCTestCase {
             capabilityLeaseID: CapabilityLeaseID(rawValue: "clease_macos"),
             relatedAgents: [AgentID(rawValue: "ios-counter")],
             relatedTasks: [TaskID(rawValue: "task_count_ios")],
+            mailboxMessageIDs: [
+                MessageID(rawValue: "mailbox_1"),
+                MessageID(rawValue: "mailbox_2"),
+            ],
             constraints: ["Complete only the assigned task."],
             replyMode: .taskReport,
             executionTimeoutSeconds: 45,
@@ -37,6 +41,10 @@ final class TaskContractTests: XCTestCase {
         XCTAssertEqual(decoded.replyMode, .taskReport)
         XCTAssertEqual(decoded.executionTimeoutSeconds, 45)
         XCTAssertEqual(decoded.maxAttempts, 3)
+        XCTAssertEqual(decoded.mailboxMessageIDs, [
+            MessageID(rawValue: "mailbox_1"),
+            MessageID(rawValue: "mailbox_2"),
+        ])
     }
 
     func testLegacyTaskContractWithoutExecutionFieldsDecodes() throws {
@@ -68,6 +76,30 @@ final class TaskContractTests: XCTestCase {
         XCTAssertNil(decoded.executionTimeoutSeconds)
         XCTAssertNil(decoded.maxAttempts)
         XCTAssertNil(decoded.submissionID)
+        XCTAssertNil(decoded.mailboxMessageIDs)
+    }
+
+    func testLegacyMailboxTaskWithoutMessageIDsDecodesAsNil() throws {
+        let json = """
+        {
+          "id": "task_legacy_mailbox",
+          "kind": "mailbox_delivery",
+          "issuer": "worker",
+          "assignee": "main",
+          "objective": "Review pending mailbox messages.",
+          "roleHint": "mailbox responder",
+          "expectedDeliverable": "Handle the pending message.",
+          "relatedAgents": [],
+          "relatedTasks": ["task_causal"],
+          "constraints": []
+        }
+        """
+
+        let decoded = try JSONDecoder().decode(TaskContract.self, from: Data(json.utf8))
+
+        XCTAssertEqual(decoded.kind, .mailboxDelivery)
+        XCTAssertEqual(decoded.relatedTasks, [TaskID(rawValue: "task_causal")])
+        XCTAssertNil(decoded.mailboxMessageIDs)
     }
 
     func testAgentAdmissionTaskKindRoundTrips() throws {

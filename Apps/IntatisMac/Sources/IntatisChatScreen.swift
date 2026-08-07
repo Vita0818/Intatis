@@ -75,12 +75,17 @@ private struct IntatisChatSessionScreen: View {
     let sessionTitle: String
     @Environment(\.colorScheme) private var scheme
     @State private var historyWindowUpperBound: Int?
+    @State private var showAttachmentImporter = false
     private static let bottomAnchorID = "intatis-chat-thread-bottom"
 
     var body: some View {
         GeometryReader { proxy in
             content(layout: IntatisMacScreenLayout(rawWidth: proxy.size.width))
         }
+        .intatisComposerAttachmentImport(
+            isPresented: $showAttachmentImporter,
+            onImport: { model.importDraftAttachments($0) },
+            onFailure: { model.reportAttachmentImportFailure($0) })
     }
 
     private func content(layout: IntatisMacScreenLayout) -> some View {
@@ -101,6 +106,9 @@ private struct IntatisChatSessionScreen: View {
             IntatisComposer(model: model,
                             catalog: env.providerCatalog,
                             onSelectModel: env.selectProviderModel(providerID:modelID:variantID:),
+                            onAttach: {
+                                showAttachmentImporter = true
+                            },
                             onSend: {
                                 historyWindowUpperBound = nil
                                 model.send()
@@ -514,11 +522,26 @@ struct IntatisMessageBubble: View {
                         citations: message.citations)
                 }
             } else {
-                Text(displayText)
-                    .font(IntatisType.chat(15))
-                    .foregroundStyle(IntatisTheme.deepText(scheme))
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
+                if !displayText.isEmpty {
+                    Text(displayText)
+                        .font(IntatisType.chat(15))
+                        .foregroundStyle(IntatisTheme.deepText(scheme))
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if isUser, !message.attachments.isEmpty {
+                    Label(
+                        message.attachments.count == 1
+                            ? IntatisLocalization.format(
+                                "%lld attachment",
+                                Int64(message.attachments.count))
+                            : IntatisLocalization.format(
+                                "%lld attachments",
+                                Int64(message.attachments.count)),
+                        systemImage: "paperclip")
+                        .font(IntatisType.caption(12))
+                        .foregroundStyle(IntatisTheme.softText(scheme))
+                }
             }
         }
     }
@@ -548,13 +571,15 @@ struct IntatisComposer: View {
     @ObservedObject var model: ChatViewModel
     let catalog: AppProviderCatalog
     let onSelectModel: (String, String, String?) -> Void
+    let onAttach: () -> Void
     let onSend: () -> Void
     @Environment(\.colorScheme) private var scheme
 
     private var canSend: Bool {
         !model.isBusy
             && !model.voiceInput.isEngaged
-            && !model.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && (!model.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                || !model.draftAttachments.isEmpty)
     }
 
     var body: some View {
@@ -564,16 +589,20 @@ struct IntatisComposer: View {
             canSend: canSend,
             isInputDisabled: model.isBusy,
             style: .intatisMac(scheme),
-            secondaryAction: IntatisThreadComposerSecondaryAction(
-                systemImage: "photo",
-                help: IntatisLocalization.string("Generate image from prompt"),
-                isBusy: model.isGeneratingArtifact,
-                isDisabled: !canSend,
-                action: { model.generateImage() }),
             leadingAccessory: AnyView(IntatisComposerModelControl(
                 catalog: catalog,
                 isBusy: model.isBusy,
                 onSelectModel: onSelectModel)),
+            inputLeadingAccessory: AnyView(
+                IntatisMacComposerAttachmentAccessory(
+                    attachments: model.draftAttachments,
+                    accessibilityPrefix: "chat",
+                    isBusy: model.isImportingAttachments,
+                    isDisabled: model.isBusy,
+                    onAttach: onAttach,
+                    onRemove: {
+                        model.removeDraftAttachment($0)
+                    })),
             trailingAction: IntatisThreadComposerSecondaryAction(
                 systemImage: model.voiceInput.buttonSystemImage,
                 help: model.voiceInput.buttonHelp,

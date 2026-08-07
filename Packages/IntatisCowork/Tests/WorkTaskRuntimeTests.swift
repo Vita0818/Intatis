@@ -93,6 +93,32 @@ private struct UntrustedStaleWorkTaskManager: WorkTaskManager {
     }
 }
 
+private struct NamespaceWorkTaskManager: WorkTaskManager {
+    let detail: WorkTaskDetail
+
+    func createWorkTask(_ request: WorkTaskCreateRequest) async throws -> WorkTaskDetail {
+        detail
+    }
+
+    func updateWorkTask(_ request: WorkTaskUpdateRequest) async throws -> WorkTaskDetail {
+        guard request.taskID == detail.task.id else {
+            throw IntatisError.notFound("WorkTask \(request.taskID.rawValue)")
+        }
+        return detail
+    }
+
+    func getWorkTask(_ taskID: WorkTaskID) async throws -> WorkTaskDetail {
+        guard taskID == detail.task.id else {
+            throw IntatisError.notFound("WorkTask \(taskID.rawValue)")
+        }
+        return detail
+    }
+
+    func listWorkTasks(_ request: WorkTaskListRequest) async throws -> [WorkTaskDetail] {
+        [detail]
+    }
+}
+
 private enum WorkTaskRuntimeTestError: Error, Equatable {
     case lostAcknowledgementAfterAppend
 }
@@ -139,6 +165,100 @@ final class WorkTaskRuntimeTests: XCTestCase {
             coordinationDepth: workerCoordinationDepth))
         XCTAssertTrue(workerAttached)
         return (orchestrator, log)
+    }
+
+    func testWorkTaskPermissionPreviewsExposeBoundedSemanticFields() throws {
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+        let createArgs = ToolArgs(raw: """
+        {
+          "title": "Create \(secret)",
+          "description": "\(String(repeating: "x", count: 1_000))",
+          "acceptance_criteria": ["tests pass"],
+          "expected_artifacts": ["report"],
+          "depends_on": ["wt_dependency"],
+          "owner": "worker",
+          "priority": "high"
+        }
+        """)
+        let createPreview = try XCTUnwrap(
+            TaskCreateTool().permissionActionPreview(createArgs))
+
+        XCTAssertEqual(createPreview.kind, "task_create")
+        XCTAssertEqual(createPreview.fields["owner"], "worker")
+        XCTAssertEqual(createPreview.fields["depends_on"], "wt_dependency")
+        XCTAssertTrue(createPreview.redacted)
+        XCTAssertTrue(createPreview.truncated)
+        XCTAssertFalse(createPreview.fields.values.joined().contains(secret))
+
+        let updateArgs = ToolArgs(raw: """
+        {
+          "task_id": "wt_exact",
+          "expected_revision": 7,
+          "status": "completed",
+          "progress_note": "verified",
+          "result": "done",
+          "evidence": [{
+            "kind": "test",
+            "reference": "suite",
+            "summary": "passed"
+          }],
+          "retry": false
+        }
+        """)
+        let updatePreview = try XCTUnwrap(
+            TaskUpdateTool().permissionActionPreview(updateArgs))
+
+        XCTAssertEqual(updatePreview.kind, "task_update")
+        XCTAssertEqual(updatePreview.fields["task_id"], "wt_exact")
+        XCTAssertEqual(updatePreview.fields["expected_revision"], "7")
+        XCTAssertEqual(updatePreview.fields["status"], "completed")
+        XCTAssertEqual(updatePreview.fields["evidence_count"], "1")
+        XCTAssertTrue(updatePreview.fields["changed_fields"]?.contains("progress_note") == true)
+        XCTAssertTrue(updatePreview.fields["changed_fields"]?.contains("evidence") == true)
+    }
+
+    func testWorkTaskToolsAcceptLegacyIDsButExplainAgentInvocationNamespaceOnNotFound() async throws {
+        let workspace = try workTaskWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let legacyID = WorkTaskID(rawValue: "task_legacy_work_task")
+        let detail = WorkTaskDetail(task: WorkTask(
+            id: legacyID,
+            runID: ContinuationRunID(rawValue: "run_legacy"),
+            title: "Legacy task",
+            description: "Predates the wt_ naming convention",
+            status: .inProgress,
+            revision: 4))
+        let context = ToolContext(
+            workspaceRoot: workspace,
+            workTaskManager: NamespaceWorkTaskManager(detail: detail))
+
+        let legacyGet = try await TaskGetTool().execute(
+            ToolArgs(raw: #"{"task_id":"task_legacy_work_task"}"#),
+            in: context)
+        XCTAssertTrue(legacyGet.text.contains("task_legacy_work_task"))
+        _ = try await TaskUpdateTool().execute(
+            ToolArgs(raw: #"{"task_id":"task_legacy_work_task","expected_revision":4,"progress_note":"still supported"}"#),
+            in: context)
+
+        do {
+            _ = try await TaskGetTool().execute(
+                ToolArgs(raw: #"{"task_id":"task_invocation_only"}"#),
+                in: context)
+            XCTFail("A missing AgentInvocation ID must receive the namespace hint.")
+        } catch let rejection as ToolExecutionRejectedWithoutSideEffect {
+            XCTAssertEqual(rejection.code, "work_task_id_required")
+            XCTAssertTrue(rejection.message.contains("AgentInvocation TaskID"))
+            XCTAssertTrue(rejection.message.contains("wt_"))
+        }
+
+        do {
+            _ = try await TaskUpdateTool().execute(
+                ToolArgs(raw: #"{"task_id":"task_invocation_only","expected_revision":1,"status":"completed","result":"wrong namespace"}"#),
+                in: context)
+            XCTFail("A missing AgentInvocation ID update must be proven no-effect.")
+        } catch let rejection as ToolExecutionRejectedWithoutSideEffect {
+            XCTAssertEqual(rejection.code, "work_task_id_required")
+        }
     }
 
     func testTaskUpdateToolDoesNotInventNoEffectForArbitraryManager() async throws {

@@ -5,6 +5,7 @@ import IntatisCore
 import IntatisProtocol
 import IntatisProviders
 import IntatisConversation
+import IntatisArtifacts
 
 public enum ChatArtifactGenerationState: Equatable, Sendable {
     case idle
@@ -75,7 +76,9 @@ public final class ChatViewModel: ObservableObject {
     @Published public private(set) var artifactProgress: [ArtifactProgressSnapshot] = []
     @Published public private(set) var latestTurnStats: TurnStatsSnapshot?
     @Published public var input: String = ""
+    @Published public private(set) var draftAttachments: [IntatisComposerDraftAttachment] = []
     @Published public private(set) var isStreaming = false
+    @Published public private(set) var isImportingAttachments = false
     @Published public private(set) var imageGenerationState: ChatArtifactGenerationState = .idle
     @Published public var errorText: String?
 
@@ -84,14 +87,17 @@ public final class ChatViewModel: ObservableObject {
     private var voiceInputObservation: AnyCancellable?
     #endif
 
-    /// Wired by the app (v0.4): generate an image from a prompt. The resulting
-    /// `artifact_added` event flows back through the log subscription.
+    /// Retained for the iOS Chat tools menu and legacy callers. macOS Chat does
+    /// not wire or expose standalone prompt-to-image generation; its composer
+    /// uses session attachments instead.
     public var onGenerateImage: (@MainActor (String) async throws -> Void)?
 
     private let log: EventLog
     private var registry: ProviderRegistry
+    private let composerAttachmentStore: IntatisComposerAttachmentStore?
     private var subscription: Task<Void, Never>?
     private var runningOperation: Task<Void, Never>?
+    private var attachmentImportOperation: Task<Void, Never>?
     private var imageGenerationOperation: Task<Void, Never>?
     private var shutdownTask: Task<Void, Never>?
     private var isShutdown = false
@@ -99,9 +105,16 @@ public final class ChatViewModel: ObservableObject {
     private let historySnapshotLoader: ChatHistorySnapshotLoader
     private var historyReplayErrorText: String?
 
-    public init(log: EventLog, registry: ProviderRegistry) {
+    public init(
+        log: EventLog,
+        registry: ProviderRegistry,
+        artifactStore: ArtifactStore? = nil
+    ) {
         self.log = log
         self.registry = registry
+        self.composerAttachmentStore = artifactStore.map {
+            IntatisComposerAttachmentStore(store: $0)
+        }
         #if canImport(AVFoundation)
         self.voiceInput = ComposerVoiceInputController(registry: registry)
         #endif
@@ -115,11 +128,15 @@ public final class ChatViewModel: ObservableObject {
     init(
         log: EventLog,
         registry: ProviderRegistry,
+        artifactStore: ArtifactStore? = nil,
         historyProjectionBuilder: ChatHistoryProjectionBuilder,
         historySnapshotLoader: @escaping ChatHistorySnapshotLoader
     ) {
         self.log = log
         self.registry = registry
+        self.composerAttachmentStore = artifactStore.map {
+            IntatisComposerAttachmentStore(store: $0)
+        }
         #if canImport(AVFoundation)
         self.voiceInput = ComposerVoiceInputController(registry: registry)
         #endif
@@ -139,7 +156,9 @@ public final class ChatViewModel: ObservableObject {
 
     public var isGeneratingArtifact: Bool { imageGenerationState.isRunning }
 
-    public var isBusy: Bool { isStreaming || isGeneratingArtifact }
+    public var isBusy: Bool {
+        isStreaming || isGeneratingArtifact || isImportingAttachments
+    }
 
     /// Begin folding the log into `messages`. Call once (e.g. from `.task`).
     public func start() {
@@ -243,6 +262,7 @@ public final class ChatViewModel: ObservableObject {
     /// alive.
     public func cancelCurrentOperation() {
         runningOperation?.cancel()
+        attachmentImportOperation?.cancel()
         imageGenerationOperation?.cancel()
     }
 
@@ -259,26 +279,80 @@ public final class ChatViewModel: ObservableObject {
         subscription = nil
         runningSubscription?.cancel()
         let runningOperation = runningOperation
+        let attachmentImportOperation = attachmentImportOperation
         let imageGenerationOperation = imageGenerationOperation
         runningOperation?.cancel()
+        attachmentImportOperation?.cancel()
         imageGenerationOperation?.cancel()
         let task = Task<Void, Never> { @MainActor [weak self] in
             #if canImport(AVFoundation)
             if let self { await self.voiceInput.shutdown() }
             #endif
             if let runningOperation { await runningOperation.value }
+            if let attachmentImportOperation {
+                await attachmentImportOperation.value
+            }
             if let imageGenerationOperation { await imageGenerationOperation.value }
             if let runningSubscription { await runningSubscription.value }
         }
         shutdownTask = task
         await task.value
         self.runningOperation = nil
+        self.attachmentImportOperation = nil
         self.imageGenerationOperation = nil
         isStreaming = false
+        isImportingAttachments = false
         if imageGenerationState.isRunning {
             imageGenerationState = .idle
         }
         _ = reason
+    }
+
+    public func importDraftAttachments(_ urls: [URL]) {
+        guard !isShutdown,
+              !isBusy,
+              !urls.isEmpty,
+              let composerAttachmentStore else { return }
+        isImportingAttachments = true
+        errorText = nil
+        let operation = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                self.isImportingAttachments = false
+                self.attachmentImportOperation = nil
+            }
+            for url in urls {
+                guard !Task.isCancelled else { return }
+                do {
+                    let file = try IntatisComposerAttachmentFileReader.read(url)
+                    let attachment = try await composerAttachmentStore
+                        .preserve(file)
+                    guard !Task.isCancelled else { return }
+                    self.draftAttachments.append(attachment)
+                } catch {
+                    guard !IntatisCancellation.isCurrentTaskCancellation(error) else {
+                        return
+                    }
+                    self.errorText = IntatisLocalization.format(
+                        "Attachment %@ could not be preserved: %@",
+                        url.lastPathComponent,
+                        error.localizedDescription)
+                }
+            }
+        }
+        attachmentImportOperation = operation
+    }
+
+    public func removeDraftAttachment(_ id: ArtifactID) {
+        guard !isShutdown, !isImportingAttachments else { return }
+        draftAttachments.removeAll { $0.id == id }
+    }
+
+    public func reportAttachmentImportFailure(_ error: Error) {
+        guard !isShutdown else { return }
+        errorText = IntatisLocalization.format(
+            "Attachments could not be selected: %@",
+            error.localizedDescription)
     }
 
     /// Send the composed message. Streaming output arrives via the log subscription.
@@ -288,31 +362,70 @@ public final class ChatViewModel: ObservableObject {
         guard !voiceInput.isEngaged else { return }
         #endif
         let originalInput = input
+        let originalAttachments = draftAttachments
         let parsed: ParsedUserInput
-        switch GoalInputParser.parse(originalInput) {
-        case .success(let value):
-            parsed = value
-        case .failure(.empty):
-            return
-        case .failure(let error):
-            errorText = error.message
-            return
+        if originalInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           !originalAttachments.isEmpty {
+            parsed = ParsedUserInput(text: "")
+        } else {
+            switch GoalInputParser.parse(originalInput) {
+            case .success(let value):
+                parsed = value
+            case .failure(.empty):
+                return
+            case .failure(let error):
+                errorText = error.message
+                return
+            }
         }
-        input = ""
+        var userMessage = parsed.userMessagePayload
+        let attachmentIDs = originalAttachments.map(\.id)
+        userMessage.attachments = attachmentIDs.isEmpty ? nil : attachmentIDs
         isStreaming = true
         errorText = nil
         let operation = Task { @MainActor [weak self] in
             guard let self else { return }
             let startSeq = await self.log.replay().last?.seq ?? -1
             do {
+                let images: [ImageAttachment]
+                if attachmentIDs.isEmpty {
+                    images = []
+                } else if let composerAttachmentStore = self.composerAttachmentStore {
+                    images = try await composerAttachmentStore.imageAttachments(
+                        for: attachmentIDs,
+                        surface: "Chat")
+                } else {
+                    throw IntatisError.config(
+                        "Chat attachment storage is unavailable")
+                }
+
+                let attachmentResolver: ChatAttachmentResolver?
+                if let composerAttachmentStore = self.composerAttachmentStore {
+                    attachmentResolver = { ids in
+                        try await composerAttachmentStore.imageAttachments(
+                            for: ids,
+                            surface: "Chat")
+                    }
+                } else {
+                    attachmentResolver = nil
+                }
                 let route = try await self.registry
                     .chatRuntimeRoute()
                 let loop = ChatLoop(
                     log: self.log,
                     provider: route.provider,
                     model: route.model,
-                    webSearch: route.webSearch)
-                try await loop.send(parsed.text, userMessage: parsed.userMessagePayload)
+                    webSearch: route.webSearch,
+                    attachmentResolver: attachmentResolver)
+                try await loop.send(
+                    parsed.text,
+                    images: images,
+                    userMessage: userMessage,
+                    userMessageDidPersist: { [weak self] in
+                        await self?.clearSubmittedDraft(
+                            input: originalInput,
+                            attachmentIDs: attachmentIDs)
+                    })
             } catch {
                 if IntatisCancellation.isCurrentTaskCancellation(error) {
                     self.errorText = nil
@@ -327,6 +440,18 @@ public final class ChatViewModel: ObservableObject {
         runningOperation = operation
     }
 
+    private func clearSubmittedDraft(
+        input submittedInput: String,
+        attachmentIDs: [ArtifactID]
+    ) {
+        if input == submittedInput {
+            input = ""
+        }
+        if draftAttachments.map(\.id) == attachmentIDs {
+            draftAttachments = []
+        }
+    }
+
     private func hasLoggedError(after seq: Int) async -> Bool {
         await log.replay(from: seq).contains { envelope in
             guard envelope.seq > seq else { return false }
@@ -337,7 +462,8 @@ public final class ChatViewModel: ObservableObject {
         }
     }
 
-    /// Generate an image from the current composer text (wired by the app).
+    /// Generate an image from the current composer text for surfaces that
+    /// explicitly retain that capability (currently iOS Chat).
     public func generateImage() {
         let prompt = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !isShutdown, !prompt.isEmpty, !isBusy else { return }

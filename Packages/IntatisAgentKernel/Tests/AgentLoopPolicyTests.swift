@@ -1795,6 +1795,29 @@ final class AgentLoopPolicyTests: XCTestCase {
         XCTAssertEqual(approvalRequests.count, 1)
         XCTAssertFalse(FileManager.default.fileExists(
             atPath: workspace.appendingPathComponent("blocked.txt").path))
+        let events = await log.replay()
+        XCTAssertTrue(events.contains {
+            if case .messageDelta(let payload) = $0.event {
+                return payload.textDelta.contains("write remained blocked")
+            }
+            return false
+        })
+        XCTAssertFalse(events.contains {
+            if case .messageCompleted = $0.event { return true }
+            return false
+        })
+        let outcomes = events.compactMap { envelope -> TurnOutcomePayload? in
+            guard case .turnOutcome(let payload) = envelope.event else { return nil }
+            return payload
+        }
+        XCTAssertEqual(outcomes.map(\.outcome), [.failed])
+        XCTAssertEqual(outcomes.first?.taskID, taskID)
+        XCTAssertTrue(events.contains {
+            if case .error(let payload) = $0.event {
+                return payload.code == "unresolved_denied_side_effects"
+            }
+            return false
+        })
     }
 
     func testRepeatedIdenticalUnleasedToolCallTerminatesWithoutReviewer() async throws {

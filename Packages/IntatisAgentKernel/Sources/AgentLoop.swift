@@ -894,11 +894,6 @@ public struct AgentLoop: Sendable {
                                 registry: toolSnapshot.registry))))
                 }
             }
-            if !completedResponseEvents.isEmpty {
-                try Task.checkCancellation()
-                try await log.append(completedResponseEvents)
-            }
-
             if pendingToolCalls.isEmpty,
                context.runtimeEnvironment.mode == .cowork {
                 let unresolved = await sideEffectEvidence.unresolvedDescriptions()
@@ -910,15 +905,28 @@ public struct AgentLoop: Sendable {
             if pendingToolCalls.isEmpty {
                 await appendTurnStats(start: start, firstTokenAt: firstTokenAt, usage: usage)
                 turnStatsAppended = true
-                try await log.append(.agentStatus(AgentStatusPayload(agent: agent.name, state: .idle)))
-                try Task.checkCancellation()
-                try await log.append(.turnOutcome(TurnOutcomePayload(
+                completedResponseEvents.append(.agentStatus(AgentStatusPayload(
+                    agent: agent.name,
+                    state: .idle)))
+                completedResponseEvents.append(.turnOutcome(TurnOutcomePayload(
                     turnID: turnID,
                     outcome: .completed,
                     submissionID: effectiveSubmissionID,
                     taskID: context.taskContract?.id,
                     agentID: agent.name)))
+                try Task.checkCancellation()
+                // Final transcript/model-history publication and the
+                // authoritative successful turn terminal are one EventLog
+                // transaction. A Cowork turn that fails its host-derived
+                // side-effect evidence check above can therefore never leave
+                // a normal completed answer in front of a failed outcome.
+                try await log.append(completedResponseEvents)
                 return assistantText  // final answer
+            }
+
+            if !completedResponseEvents.isEmpty {
+                try Task.checkCancellation()
+                try await log.append(completedResponseEvents)
             }
 
             convo.append(.assistant(toolCalls: pendingToolCalls, content: assistantText.isEmpty ? nil : assistantText))

@@ -30,6 +30,73 @@ final class IntatisConversationCodeTests: XCTestCase {
         XCTAssertEqual(result?.isFailure, false)
     }
 
+    func testFailedTurnOutcomeInvalidatesOnlyItsCorrelatedCompletedAnswer() {
+        let session = SessionID(rawValue: "failed_turn_projection")
+        let agent = AgentID(rawValue: "main")
+        let other = AgentID(rawValue: "worker")
+        let taskID = TaskID(rawValue: "task_failed_turn")
+        let otherTaskID = TaskID(rawValue: "task_other_turn")
+        let submissionID = SubmissionID(rawValue: "sub_failed_turn")
+        let otherSubmissionID = SubmissionID(rawValue: "sub_other_turn")
+        func env(_ seq: Int, _ event: Event) -> Envelope {
+            Envelope(
+                seq: seq,
+                ts: Date(timeIntervalSince1970: Double(seq)),
+                session: session,
+                event: event)
+        }
+        let events: [Envelope] = [
+            env(1, .taskStarted(.init(taskID: taskID, agent: agent, attempt: 1))),
+            env(2, .messageDelta(.init(
+                messageId: MessageID(rawValue: "failed_answer"),
+                role: .agent,
+                agent: agent,
+                textDelta: "Looks complete",
+                submissionID: submissionID))),
+            env(3, .messageCompleted(.init(
+                messageId: MessageID(rawValue: "failed_answer"),
+                role: .agent,
+                agent: agent,
+                text: "Looks complete",
+                submissionID: submissionID))),
+            env(4, .taskStarted(.init(taskID: otherTaskID, agent: other, attempt: 1))),
+            env(5, .messageCompleted(.init(
+                messageId: MessageID(rawValue: "other_answer"),
+                role: .agent,
+                agent: other,
+                text: "Actually complete",
+                submissionID: otherSubmissionID))),
+            env(6, .error(.init(
+                code: "unresolved_denied_side_effects",
+                message: "A requested update never succeeded.",
+                submissionID: submissionID))),
+            env(7, .turnOutcome(.init(
+                turnID: TurnID(rawValue: "turn_failed_projection"),
+                outcome: .failed,
+                failureSource: .runtimeFailed,
+                reason: "unresolved side effect",
+                submissionID: submissionID,
+                taskID: taskID,
+                agentID: agent))),
+        ]
+
+        let projection = CodeProjection.build(from: events)
+        let invalidated = projection.items.first { $0.id == "failed_answer" }
+        let unaffected = projection.items.first { $0.id == "other_answer" }
+
+        XCTAssertEqual(invalidated?.complete, false)
+        XCTAssertEqual(invalidated?.isFailure, true)
+        XCTAssertEqual(
+            invalidated?.recoveryAdvice?.title,
+            "Response was not accepted as complete")
+        XCTAssertTrue(invalidated?.recoveryAdvice?.detail.contains("unresolved side effect") == true)
+        XCTAssertEqual(unaffected?.complete, true)
+        XCTAssertEqual(unaffected?.isFailure, false)
+        XCTAssertTrue(projection.items.contains {
+            $0.kind == .error && $0.body.contains("requested update never succeeded")
+        })
+    }
+
     func testCodeProjectionMarksMatchingTaskCompletionAsExecutionTraceForMainAndWorker() {
         let session = SessionID(rawValue: "task_completion_mirror")
         let main = AgentID(rawValue: "main")

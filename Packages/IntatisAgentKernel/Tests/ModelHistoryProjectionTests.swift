@@ -114,6 +114,56 @@ final class ModelHistoryProjectionTests: XCTestCase {
         XCTAssertFalse(messages.contains { $0.content == "must disappear" })
     }
 
+    func testFailedAndInterruptedTurnOutcomesDropOnlyFinalAssistantHistory() throws {
+        for outcome in [TurnOutcome.failed, .interrupted] {
+            let fixture = terminalOutcomeFixture(outcome: outcome)
+            let messages = try AgentModelHistoryProjector().project(
+                agentID: main,
+                currentTask: fixture.currentTask,
+                events: fixture.events)
+
+            XCTAssertTrue(messages.contains { $0.content == "prior user" })
+            XCTAssertTrue(messages.contains { $0.toolCalls?.first?.id == "read-call" })
+            XCTAssertTrue(messages.contains { $0.content == "tool output" })
+            XCTAssertFalse(messages.contains { $0.content == "invalid final answer" })
+        }
+    }
+
+    func testCompletedAndLegacyTurnsKeepFinalAssistantHistory() throws {
+        for outcome in [TurnOutcome.completed, nil] {
+            let fixture = terminalOutcomeFixture(outcome: outcome)
+            let messages = try AgentModelHistoryProjector().project(
+                agentID: main,
+                currentTask: fixture.currentTask,
+                events: fixture.events)
+
+            XCTAssertTrue(messages.contains { $0.content == "invalid final answer" })
+        }
+    }
+
+    func testConflictingTurnOutcomesFailHistoryProjectionClosed() throws {
+        var fixture = terminalOutcomeFixture(outcome: .failed)
+        fixture.events.insert(
+            envelope(8, .turnOutcome(TurnOutcomePayload(
+                turnID: TurnID(rawValue: "turn_terminal_fixture"),
+                outcome: .completed,
+                submissionID: SubmissionID(rawValue: "sub_terminal_prior"),
+                taskID: TaskID(rawValue: "task_terminal_prior"),
+                agentID: main))),
+            at: fixture.events.count - 2)
+
+        XCTAssertThrowsError(try AgentModelHistoryProjector().project(
+            agentID: main,
+            currentTask: fixture.currentTask,
+            events: fixture.events)) { error in
+                XCTAssertEqual(
+                    error as? AgentModelHistoryProjectionError,
+                    .invalidItem(
+                        "turn-outcome:turn_terminal_fixture",
+                        "one turn has conflicting terminal outcomes"))
+            }
+    }
+
     func testLatestAttemptReplacesEarlierInvocationForSameSubmission() throws {
         let priorID = SubmissionID(rawValue: "sub_retry")
         let currentID = SubmissionID(rawValue: "sub_after_retry")
@@ -1128,6 +1178,83 @@ final class ModelHistoryProjectionTests: XCTestCase {
                 role: .assistant,
                 content: answer))),
         ]
+    }
+
+    private func terminalOutcomeFixture(
+        outcome: TurnOutcome?
+    ) -> (events: [Envelope], currentTask: TaskContract) {
+        let priorSubmission = SubmissionID(rawValue: "sub_terminal_prior")
+        let currentSubmission = SubmissionID(rawValue: "sub_terminal_current")
+        let priorTask = rootTask(
+            "task_terminal_prior",
+            priorSubmission,
+            "prior user")
+        let currentTask = rootTask(
+            "task_terminal_current",
+            currentSubmission,
+            "current user")
+        let turnID = TurnID(rawValue: "turn_terminal_fixture")
+        var events: [Envelope] = [
+            envelope(1, .userMessage(UserMessagePayload(
+                text: "prior user",
+                to: main,
+                submissionID: priorSubmission))),
+            envelope(2, .taskCreated(TaskCreatedPayload(contract: priorTask))),
+            envelope(3, .modelHistoryItem(.message(
+                itemID: "terminal-user",
+                turnID: turnID,
+                agent: main,
+                taskID: priorTask.id,
+                submissionID: priorSubmission,
+                taskAttempt: 1,
+                role: .user,
+                content: "prior user"))),
+            envelope(4, .modelHistoryItem(.functionCallBatch(
+                itemID: "terminal-call",
+                turnID: turnID,
+                agent: main,
+                taskID: priorTask.id,
+                submissionID: priorSubmission,
+                taskAttempt: 1,
+                content: "checking",
+                calls: [ModelHistoryFunctionCall(
+                    callID: "read-call",
+                    name: "read_file",
+                    arguments: #"{"path":"README.md"}"#)]))),
+            envelope(5, .modelHistoryItem(.functionCallOutput(
+                itemID: "terminal-output",
+                turnID: turnID,
+                agent: main,
+                taskID: priorTask.id,
+                submissionID: priorSubmission,
+                taskAttempt: 1,
+                callID: "read-call",
+                output: "tool output"))),
+            envelope(6, .modelHistoryItem(.message(
+                itemID: "terminal-assistant",
+                turnID: turnID,
+                agent: main,
+                taskID: priorTask.id,
+                submissionID: priorSubmission,
+                taskAttempt: 1,
+                role: .assistant,
+                content: "invalid final answer"))),
+        ]
+        if let outcome {
+            events.append(envelope(7, .turnOutcome(TurnOutcomePayload(
+                turnID: turnID,
+                outcome: outcome,
+                submissionID: priorSubmission,
+                taskID: priorTask.id,
+                agentID: main))))
+        }
+        events.append(envelope(9, .userMessage(UserMessagePayload(
+            text: "current user",
+            to: main,
+            submissionID: currentSubmission))))
+        events.append(envelope(10, .taskCreated(TaskCreatedPayload(
+            contract: currentTask))))
+        return (events, currentTask)
     }
 
     private let initialWindowID =

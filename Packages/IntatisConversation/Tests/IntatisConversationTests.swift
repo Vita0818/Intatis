@@ -912,6 +912,59 @@ final class IntatisConversationTests: XCTestCase {
         XCTAssertEqual(projection.messages.map { $0.role }, [.user, .assistant, .user, .assistant])
     }
 
+    func testChatLoopPersistsAndRehydratesImageAttachmentsAcrossTurns() async throws {
+        let url = tmpFile()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let log = try EventLog(
+            session: SessionID(rawValue: "sess_attachment_history"),
+            fileURL: url)
+        let recorder = ChatRequestRecorder()
+        let firstID = ArtifactID(rawValue: "art_first_image")
+        let secondID = ArtifactID(rawValue: "art_second_image")
+        let firstImage = ImageAttachment.base64(
+            mime: "image/png",
+            base64: "RklSU1Q=")
+        let secondImage = ImageAttachment.base64(
+            mime: "image/jpeg",
+            base64: "U0VDT05E")
+        let loop = ChatLoop(
+            log: log,
+            provider: SearchCitationProvider(recorder: recorder),
+            model: ModelID(rawValue: "m"),
+            attachmentResolver: { ids in
+                guard ids == [firstID] else {
+                    throw IntatisError.notFound("unexpected attachment set")
+                }
+                return [firstImage]
+            })
+
+        try await loop.send(
+            "first",
+            images: [firstImage],
+            userMessage: UserMessagePayload(
+                text: "first",
+                attachments: [firstID]))
+        try await loop.send(
+            "second",
+            images: [secondImage],
+            userMessage: UserMessagePayload(
+                text: "second",
+                attachments: [secondID]))
+
+        let recordedRequest = await recorder.recorded()
+        let request = try XCTUnwrap(recordedRequest)
+        XCTAssertEqual(request.messages.map(\.role), [.user, .assistant, .user])
+        XCTAssertEqual(request.messages[0].images, [firstImage])
+        XCTAssertEqual(request.messages[1].images, [])
+        XCTAssertEqual(request.messages[2].images, [secondImage])
+
+        let userMessages = ConversationProjection
+            .build(from: await log.replay())
+            .messages
+            .filter { $0.role == .user }
+        XCTAssertEqual(userMessages.map(\.attachments), [[firstID], [secondID]])
+    }
+
     func testConversationProjectionUsesStableSyntheticMessageIDsAcrossReplay() {
         let session = SessionID(rawValue: "sess_stable_chat")
         func env(_ seq: Int, _ event: Event) -> Envelope {

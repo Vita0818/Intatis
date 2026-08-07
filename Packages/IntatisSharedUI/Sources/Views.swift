@@ -250,9 +250,24 @@ struct MessageRow: View {
                     IntatisMessageCitationsView(citations: message.citations)
                 }
             } else {
-                Text(displayText)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                if !displayText.isEmpty {
+                    Text(displayText)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                if message.role == .user, !message.attachments.isEmpty {
+                    Label(
+                        message.attachments.count == 1
+                            ? IntatisLocalization.format(
+                                "%lld attachment",
+                                Int64(message.attachments.count))
+                            : IntatisLocalization.format(
+                                "%lld attachments",
+                                Int64(message.attachments.count)),
+                        systemImage: "paperclip")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
             if let advice = message.recoveryAdvice {
                 IntatisRecoveryAdviceView(advice: advice, tint: .red, style: style)
@@ -364,7 +379,6 @@ struct ComposerView: View {
             canSend: canSend,
             isInputDisabled: model.isBusy,
             style: .standard(scheme),
-            secondaryAction: secondaryAction,
             leadingAccessory: leadingAccessory,
             inputLeadingAccessory: inputLeadingAccessory,
             trailingAction: voiceAction,
@@ -381,19 +395,6 @@ struct ComposerView: View {
                 : nil,
             onSend: { model.send() })
         .padding(10)
-    }
-
-    private var secondaryAction: IntatisThreadComposerSecondaryAction? {
-        #if os(iOS)
-        return nil
-        #else
-        return IntatisThreadComposerSecondaryAction(
-            systemImage: "photo",
-            help: IntatisLocalization.string("Generate image from prompt"),
-            isBusy: model.isGeneratingArtifact,
-            isDisabled: !canSend,
-            action: { model.generateImage() })
-        #endif
     }
 
     private var voiceAllowsSubmission: Bool {

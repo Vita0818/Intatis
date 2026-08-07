@@ -2,7 +2,7 @@
 
 文档状态：当前 Cowork/AgentKernel 原则
 最近核对：2026-08-05
-产品基线：v0.36（build 36）
+产品基线：v0.38（build 38）
 
 本文提炼自仓内 v0.10 历史 Cowork 设计文档、`PER_AGENT_INFERENCE_PROFILES.md` 及
 项目操作规则。旧设计文档只保留迁移 provenance；本文件是当前原则基准，**不是**完成度
@@ -146,6 +146,8 @@ Task lifecycle 是 durable state machine：
 created -> assigned -> queued -> running -> completed | failed | cancelled
 failed | cancelled -> queued  only through an explicit bounded retry attempt
 ```
+一次 Cowork turn 的自然语言 final 不是独立 authority。AgentLoop 必须先完成 host-derived side-effect evidence 校验；只有通过后，final message/model-history、idle 与 `turn_outcome(completed)` 才能在一个 EventLog batch 发布。failed/interrupted outcome 必须让 presentation 和下一轮 provider history 都拒绝旧日志里先写出的 final assistant，同时保留真实 user/tool 协议历史；同一 TurnID 的冲突 terminal fail closed。
+
 恢复时不能默认把所有 running 任务整段重放。每个实际 tool executor 调用前必须先持久化 execution ticket，结果持久化后再 settle；只有明确 eligible 的 non-root/CLI recovery task 内的普通 read-only 调用可自动重放；GUI restored root 不适用。write/exec/network/destructive 与通信、委派、spawn/remove 等协作副作用处于“prepared 但未 settled”时，任务必须进入人工对账失败态，不能自动增加 attempt。只有明确 eligible 的 non-root/CLI read-only running task 才可在新 attempt 的 queue 事件成功落盘后重排；Phase A GUI restored root submission 始终 paused/interrupted，必须 exact Retry；半完成 admission、耗尽 attempts 或缺失关键 lease 也必须明确失败。执行应有 bounded timeout/cancel、attempt 和明确标为 soft 的 session token budget；模型缺完成标记、迭代耗尽或不完整 finish reason 都是失败。
 
 这里的判断单位是“这一次具体调用是否可能已经产生副作用”，不是只看工具静态类别。write 类工具继续默认 non-replayable；只有拥有 mutation boundary 的受信实现或 prepare 前 durable state 能证明该边界未被跨越时，才能追加可选 `effectDisposition=not_started` 的失败/取消 settlement。typed ordinary failure 可作为 observation 回灌同一 Agent turn；pre-executor cancellation 结算后仍中断 turn；legacy repair 只对账 EventLog，不存在当前 turn。新成功 settlement 必须显式标为 `committed`；legacy nil+succeeded 仅兼容成已完成效果并继续阻断 whole-task retry。生产 Orchestrator 的 `task_update` stale revision 是当前首个精确 no-effect case；公共 manager 的同名错误、普通 error、timeout、executor 内 cancellation、legacy failure nil/unknown 都不能套用。Projection 对 execution ID 坚持一次 prepare：第二个 prepare 即使相同也永久 ambiguous，冲突 terminal 同样保留首记录并永久 ambiguous；只有完全相同 terminal 可幂等，`succeeded + not_started` 是无效矛盾并进入 uncertain。旧日志修复必须先由 `replayForProjectionChecked()` + `hasCompleteKnownHistory` 证明历史完整，并且只能发生在无 current Goal、exact 唯一 prepare、没有任何 settlement/ambiguity、JSON safe integer 与 prepare 前 monotonic revision proof 同时成立时，不得解析自由文本或用 prepare 后状态猜测。Goal startup/进程内 launch、Orchestrator restore 与 whole-task retry 都必须使用同一 complete-known-history gate；unknown future type 或 seq gap 不能支持 absence/order proof。任务级确定错误应局部终结，不应无条件升级成整个 session 不可输入；无 Goal 的隔离仍须证明 exact contract-before-prepare、正 attempt 与 exact-attempt terminal-after-prepare，无法归属、损坏/不完整历史、非终态任务与任何 current Goal 的 uncertain 副作用保持 fail closed。
@@ -158,7 +160,7 @@ Goal Verifier 是另一条独立控制面，职责仅是判定 Goal 是否已有
 
 Goal 生命周期必须由 host 串行化：start、ordinary turn、Goal mutation 与 stop/shutdown 分别有 single-flight/mutation/stop gate；pending durable stop 未结算前不得启动新 run，start 取消后若已创建 continuation，必须先 scoped cancel、等待退出并 checkpoint 才返回失败。restore 必须持续暂停 scheduler，直到 roster/reviewer/main 与 Goal recovery/reconcile 完成。GUI 随后只释放新工作并继续围栏 restored roots；CLI 才执行显式 data-plane resume。Cowork `/goal` 是明确 host action；普通自然语言只有在窄、确定性的中英文持续目标分类器命中时才可为本轮提供 create intent，复杂请求、Goal 提及、一次性目标、引用示例或附件内容不得提升权限。
 
-模型可见的 agent/task/message/goal/session 操作与文件、网络、文档工具遵循同一个 ToolCall 协议。WorkTask CRUD、Goal create/update 与 session rename 都必须先过 schema、lease（Cowork）与 PermissionEngine；`rename_session` 的 exact current-session/no-path/no-network/no-data-effect intent 可由 deterministic gate 低风险放行，但 near-miss 与 locked 状态不能借此绕过。worker 默认只能读取 Goal/相关 WorkTask，并更新自己当前绑定的 WorkTask，不能改 DAG/owner/priority/retry/cancel、提交 Goal verdict或改 session 名称。一个外部 ToolCall 只能有一个权限决定；`spawn_agent` / 原子 `delegate_task` 获准后，内部 roster、lease、mailbox、task graph 与 scheduler admission 必须作为 executor 的 durable transaction 完成，不能再次递归进入 PermissionEngine。Code 与 Cowork agent 共用 headless `AgentRuntime`；首个 system message 必须稳定声明 Intatis 模式、API tools 权威性、严格 JSON Schema 与 ToolResult 完成语义，动态 workspace/task/lease/goal/run 数据仍放在 user-role untrusted context。
+模型可见的 agent/task/message/goal/session 操作与文件、网络、文档工具遵循同一个 ToolCall 协议。WorkTask CRUD、Goal create/update 与 session rename 都必须先过 schema、lease（Cowork）与 PermissionEngine；`task_get/update` 使用 durable WorkTask ID（正常为 `wt_…`）和最新 authoritative revision，不能把 AgentInvocation `task_…` ID 或旧 revision 当成 WorkTask authority，也不能重复 settle 已 terminal 的 WorkTask。WorkTask permission preview 只提供 bounded、脱敏的语义字段，完整执行参数继续由 digest/count 和 immutable authorization 绑定。`rename_session` 的 exact current-session/no-path/no-network/no-data-effect intent 可由 deterministic gate 低风险放行，但 near-miss 与 locked 状态不能借此绕过。worker 默认只能读取 Goal/相关 WorkTask，并更新自己当前绑定的 WorkTask，不能改 DAG/owner/priority/retry/cancel、提交 Goal verdict或改 session 名称。一个外部 ToolCall 只能有一个权限决定；`spawn_agent` / 原子 `delegate_task` 获准后，内部 roster、lease、mailbox、task graph 与 scheduler admission 必须作为 executor 的 durable transaction 完成，不能再次递归进入 PermissionEngine。Code 与 Cowork agent 共用 headless `AgentRuntime`；首个 system message 必须稳定声明 Intatis 模式、API tools 权威性、严格 JSON Schema 与 ToolResult 完成语义，动态 workspace/task/lease/goal/run 数据仍放在 user-role untrusted context。
 
 ### 2.3b Coordinator routing Skill
 
@@ -220,7 +222,7 @@ reply_message
 
 **不要**长期用一个模糊的 `ask_agent` 操作覆盖所有用途。
 
-MessageBus 投递采用持久化的至少一次语义：先通过 Mediator，再持久化 typed message，然后进入 mailbox。只有确实投影给 agent 且该轮成功完成的 message ID 才能写 consumed event；消费确认必须先持久化再从运行时 mailbox 移除。若 owning Goal/run 在成功呈现前取消，迟到 durable message 必须以专用 discarded event durable 结算后再 ack，不能伪装成 consumed。恢复后既未 consumed 也未 discarded 的消息必须重新触发 wake task，单轮批量应有上限；旧 run discarded message 不得复活或阻塞新 run。
+MessageBus 投递采用持久化的至少一次语义：先通过 Mediator，再持久化 typed message，然后进入 mailbox。每个 new delivery invocation 必须在 `TaskContract.mailboxMessageIDs` 冻结 1–8 个 exact ID；同 batch 保持 sender/recipient/Goal-run/authority class 一致，ContextProjector 只能呈现这些 ID。ordinary delivery 只有 read-only workspace、reply-only communication 和必要读取工具；无 WorkTask/Goal mutation、spawn、delegation、shell、Git、patch、browser 或 MCP。`request_delegation` 另行收窄为最多一次、深度 1 的 delegation。只有确实投影且该轮成功完成的 ID 才能 consumed，并与 task completion 在同一 EventLog batch 落盘后再从 runtime mailbox ack。失败只重试同一 TaskID 到 `maxAttempts`；poison ID 耗尽后保持 pending、不换 TaskID，也不阻塞后来新 ID。若 owning Goal/run 在成功呈现前取消，迟到 durable message 必须以专用 discarded event durable 结算后再 ack，不能伪装成 consumed。legacy nil binding 只能按 exact causal/scope lineage 保守恢复，歧义或耗尽 fail closed；旧 run discarded message 不得复活或阻塞新 run。
 
 ## 4. 递归与循环规则
 
@@ -429,6 +431,9 @@ Goal completes only after a non-empty all-proven audit; the same normalized bloc
 Goal/Tasks UI is derived from CoworkProjection, including revision/result/evidence/dependencies/invocation links, rather than TaskContract objective or transcript text
 only actually presented mailbox messages are consumed; cancelled-run messages are durably discarded, and remaining batches survive replay
 late scoped mailbox sends after cancellation are durably discarded rather than consumed, including across restore and a later run
+new mailbox tasks freeze 1-8 exact MessageIDs; success commits task completion plus consumed IDs atomically before in-memory ack
+mailbox retries preserve one TaskID and bounded attempts; an exhausted poison ID never receives a replacement TaskID and never blocks a later unbound ID
+ordinary mailbox leases are read-only/reply-only with no coordinator, mutation, terminal, Git, browser, or MCP authority; delegation requests receive at most one depth-1 delegation
 task-scoped capability/workspace leases are enforced, revoked, and safely renewed on retry
 dynamic task/message/event text stays in a bounded, escaped user-role context block
 inference catalog reuses semantically equal revisions, appends on semantic change, retains old revisions, and rejects unsafe/corrupt/insecure definitions without overwriting the store

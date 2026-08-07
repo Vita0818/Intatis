@@ -9,9 +9,7 @@ import IntatisConversation
 import IntatisAgentKernel
 import IntatisArtifacts
 import IntatisMCP
-import IntatisMultimodal
 import IntatisSharedUI
-import UniformTypeIdentifiers
 #if canImport(AppKit)
 import AppKit
 #endif
@@ -1060,42 +1058,16 @@ struct CoworkSessionView: View {
                                     vm.cancelPendingMCPExternalContexts()
                                 })
                         }),
-                        composerInputAccessory: AnyView(HStack(
-                            alignment: .center,
-                            spacing: IntatisComposerControlMetrics.rowSpacing
-                        ) {
-                            Button {
-                                showAttachmentImporter = true
-                            } label: {
-                                Label(
-                                    IntatisLocalization.string("Attach files"),
-                                    systemImage: "paperclip")
-                                    .intatisComposerIconLabel()
-                            }
-                            .intatisCompactIconButton()
-                            .help(IntatisLocalization.string("Attach files"))
-                            .accessibilityLabel(IntatisLocalization.string("Attach files"))
-                            .accessibilityIdentifier("cowork.composer.attach")
-                            if !vm.draftAttachments.isEmpty {
-                                Menu(IntatisLocalization.format(
-                                    "%lld attached",
-                                    Int64(vm.draftAttachments.count))) {
-                                    ForEach(vm.draftAttachments) { attachment in
-                                        Button(IntatisLocalization.format(
-                                            "Remove %@",
-                                            attachment.name)) {
-                                            vm.removeDraftAttachment(attachment.id)
-                                        }
-                                    }
-                                }
-                                .controlSize(.regular)
-                                .menuStyle(.borderlessButton)
-                                .accessibilityIdentifier("cowork.composer.attachments")
-                            }
-                        }
-                        .frame(
-                            minHeight: IntatisComposerControlMetrics.controlHeight,
-                            alignment: .center)),
+                        composerInputAccessory: AnyView(
+                            IntatisMacComposerAttachmentAccessory(
+                                attachments: vm.draftAttachments,
+                                accessibilityPrefix: "cowork",
+                                onAttach: {
+                                    showAttachmentImporter = true
+                                },
+                                onRemove: {
+                                    vm.removeDraftAttachment($0)
+                                })),
                         composerTrailingAction:
                             IntatisThreadComposerSecondaryAction(
                                 systemImage:
@@ -1168,23 +1140,10 @@ struct CoworkSessionView: View {
         }
         .sheet(isPresented: $showProjectSettings) { projectSettingsSheet }
         .sheet(isPresented: $showGoalEditor) { goalEditorSheet }
-        .fileImporter(
+        .intatisComposerAttachmentImport(
             isPresented: $showAttachmentImporter,
-            allowedContentTypes: [.data, .content],
-            allowsMultipleSelection: true
-        ) { result in
-            switch result {
-            case .success(let urls):
-                vm.importDraftAttachments(urls)
-            case .failure(let error):
-                vm.reportAttachmentImportFailure(error)
-            }
-        }
-        .dropDestination(for: URL.self) { urls, _ in
-            guard !urls.isEmpty else { return false }
-            vm.importDraftAttachments(urls)
-            return true
-        }
+            onImport: { vm.importDraftAttachments($0) },
+            onFailure: { vm.reportAttachmentImportFailure($0) })
         .alert("Clear this Goal?", isPresented: $showGoalClearConfirmation) {
             Button("Clear", role: .destructive) { vm.clearGoal() }
             Button("Cancel", role: .cancel) {}

@@ -676,6 +676,82 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
         XCTAssertFalse(requested.normalizedArgs.contains(secret))
     }
 
+    func testReviewerPromptUsesTaskCreatePreviewWithoutPersistingRawArguments() async throws {
+        let (log, workspace) = try makeLogAndWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let provider = ReviewControlPlaneProvider()
+        let responder = makeResponder(log: log, workspace: workspace, provider: provider)
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+        let args = """
+        {"title":"Audit mailbox","description":"Authorization: Bearer \(secret)","owner":"worker","depends_on":["wt_parent"]}
+        """
+        let intent = PermissionIntent(
+            action: "task.create",
+            resources: [PermissionResource(kind: .task, value: "current-run")],
+            dataEffects: [.none],
+            controlEffects: [.createTask],
+            risks: [.controlPlaneMutation],
+            replayPolicy: .requiresManualReconciliation)
+        let capabilityLease = CapabilityLease(
+            id: CapabilityLeaseID(rawValue: "clease_task_create_preview"),
+            tools: [.manageWorkTasks])
+        let context = PermissionRequestContext(
+            normalizedArgs: args,
+            risksNetwork: false,
+            sideEffect: .write,
+            intent: intent,
+            gate: PermissionReviewGateSnapshot(
+                decision: .ask,
+                risk: .medium,
+                reason: "create one durable WorkTask"),
+            capabilityLease: capabilityLease)
+        let preview = try XCTUnwrap(TaskCreateTool().permissionActionPreview(
+            ToolArgs(raw: args)))
+        var request = permissionRequest(
+            id: "req_task_create_preview",
+            context: context,
+            requiredCapabilities: [.manageWorkTasks],
+            tool: "task_create",
+            actionPreview: preview)
+        let originalAuthorization = try XCTUnwrap(request.context?.authorization)
+        let boundedArguments = "digest=\(originalAuthorization.normalizedArgumentsDigest); characters=\(originalAuthorization.normalizedArgumentsCharacterCount)"
+        request.args = boundedArguments
+        request.context?.normalizedArgs = boundedArguments
+
+        let resolution = await responder.requestResolution(request)
+
+        XCTAssertEqual(resolution.decision, .allow)
+        let prompt = try XCTUnwrap(provider.requests.first)
+            .messages.compactMap(\.content).joined(separator: "\n")
+        XCTAssertTrue(prompt.contains("tool: task_create"))
+        XCTAssertTrue(prompt.contains("action_preview: kind=task_create"))
+        XCTAssertTrue(prompt.contains("owner=worker"))
+        XCTAssertTrue(prompt.contains("depends_on=wt_parent"))
+        XCTAssertFalse(prompt.contains(secret))
+        XCTAssertFalse(prompt.contains(args))
+
+        let events = await log.replay()
+        let requested = try XCTUnwrap(events.compactMap { envelope -> PermissionReviewTask? in
+            guard case .permissionReviewRequested(let payload) = envelope.event else { return nil }
+            return payload.task
+        }.last)
+        let durableAuthorization = try XCTUnwrap(requested.authorization)
+        XCTAssertEqual(
+            durableAuthorization.normalizedArgumentsDigest,
+            originalAuthorization.normalizedArgumentsDigest)
+        XCTAssertEqual(
+            durableAuthorization.normalizedArgumentsCharacterCount,
+            originalAuthorization.normalizedArgumentsCharacterCount)
+        XCTAssertEqual(durableAuthorization.actionPreview?.kind, "task_create")
+        XCTAssertFalse(durableAuthorization.actionPreview?.fields.values.joined().contains(secret) == true)
+        let encoder = Envelope.makeEncoder()
+        let durableText = try events.map {
+            String(decoding: try encoder.encode($0), as: UTF8.self)
+        }.joined(separator: "\n")
+        XCTAssertFalse(durableText.contains(secret))
+        XCTAssertFalse(durableText.contains(args))
+    }
+
     func testReviewerControlPlaneDoesNotConsumeOnlyDataPlaneSchedulerSlot() async throws {
         let (log, workspace) = try makeLogAndWorkspace()
         defer { try? FileManager.default.removeItem(at: workspace) }
@@ -1847,7 +1923,9 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
     private func permissionRequest(id: String,
                                    context: PermissionRequestContext? = nil,
                                    agent: AgentID? = nil,
-                                   requiredCapabilities: [ToolCapability] = []) -> PermissionRequestPayload {
+                                   requiredCapabilities: [ToolCapability] = [],
+                                   tool: String = "write_file",
+                                   actionPreview: PermissionActionPreview? = nil) -> PermissionRequestPayload {
         let requestingAgent = agent ?? main
         let args = #"{"content":"ok","path":"Sources/App.swift"}"#
         let defaultIntent = PermissionIntent(
@@ -1881,12 +1959,12 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
             resolvedContext.authorization = ResolvedToolAuthorization(
                 authorizationID: "tool-authorization-\(id)",
                 registryVersion: "test.permission-review.v1",
-                concreteToolID: "test.permission-review.v1/write_file",
-                descriptorFingerprint: ToolRegistry.authorizationDigest("write_file|v1"),
-                toolName: "write_file",
+                concreteToolID: "test.permission-review.v1/\(tool)",
+                descriptorFingerprint: ToolRegistry.authorizationDigest("\(tool)|v1"),
+                toolName: tool,
                 canonicalAction: intent.action,
-                canonicalPermission: "filesystem.edit",
-                actionPreview: WriteFileTool().permissionActionPreview(
+                canonicalPermission: tool == "write_file" ? "filesystem.edit" : nil,
+                actionPreview: actionPreview ?? WriteFileTool().permissionActionPreview(
                     ToolArgs(raw: normalizedArgs)),
                 requiredCapabilities: requiredCapabilities,
                 membership: requiredCapabilities.isEmpty ? .notRequired : .granted,
@@ -1922,7 +2000,7 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
         return PermissionRequestPayload(
             requestId: RequestID(rawValue: id),
             agent: requestingAgent,
-            tool: "write_file",
+            tool: tool,
             args: normalizedArgs,
             risk: .medium,
             reason: "write to workspace",

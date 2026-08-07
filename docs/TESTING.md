@@ -1,8 +1,8 @@
 # TESTING
 
 文档状态：当前验证矩阵
-最近核对：2026-08-05
-产品基线：v0.36（build 36）
+最近核对：2026-08-07
+产品基线：v0.38（build 38）
 
 历史测试数量、性能数字和事故复验保留在 Git 历史及 dated reports；它们不能替代当前
 working tree 的验证。这里只记录现行命令、release gate 和最近一次真实结果。
@@ -27,11 +27,11 @@ scripts/check-version-consistency.sh
 
 必须同时满足：
 
-- `project.yml`：`MARKETING_VERSION=0.36`，`CURRENT_PROJECT_VERSION=36`；
-- macOS/iOS 参考 Info.plist：`0.36 (36)`；
+- `project.yml`：`MARKETING_VERSION=0.38`，`CURRENT_PROJECT_VERSION=38`；
+- macOS/iOS 参考 Info.plist：`0.38 (38)`；
 - 生成的 `Intatis.xcodeproj`：相同版本；
 - README、文档索引、CURRENT_STATE 和 PROJECT_MAP：相同当前基线；
-- 最终 App bundle：`CFBundleShortVersionString=0.36`、`CFBundleVersion=36`。
+- 最终 App bundle：`CFBundleShortVersionString=0.38`、`CFBundleVersion=38`。
 
 旧设计文档、依赖版本、协议 schema 和 dated reports 中的其他 v0.x 不属于该一致性检查。
 
@@ -248,6 +248,31 @@ adapter/capability 矩阵。2026-08-05 已新增并通过 provider focused tests
 routing options、结构化 unsupported 同路由一次降级、裸 404 拒绝降级、partial payload 后禁止重放
 及 citation 安全解析。macOS/iOS app build 与完整回归结果以本文件“最近一次真实结果”为准。
 
+## macOS Chat/Cowork composer 图片附件验收矩阵
+
+涉及 macOS Chat 或 Cowork composer 附件时，至少验证：
+
+- 两者实际组合同一个 paperclip accessory 与 file-import/drop modifier；按钮、导入进度、附件数量
+  菜单、逐项移除和 accessibility 文案只允许产品面名称不同，不复制两套交互实现；macOS Chat 不再
+  出现独立的提示词生图 action；
+- 系统文件选择和 URL drop 支持多选；security-scoped access 成对开启/关闭，文件先保存到当前
+  session ArtifactStore，再按 ID、MIME、字节读回一致后才进入 draft；导入失败不污染已有草稿；
+- Send 在按钮边界冻结文本和附件 ID；纯附件消息可发送。只有对应 `user_message` 已 durable append
+  后才能清除同一份冻结草稿，route/附件解析失败或 append 前取消必须保留草稿；
+- `UserMessagePayload.attachments` 只保存 ArtifactID；EventLog、projection、错误和 UI 不得保存或
+  显示 base64、bookmark、文件路径。当前轮与后续历史轮都从同一 session ArtifactStore 解析图片，
+  不能只在第一次 provider request 传图；
+- provider 输入只接受 `image/*`。缺失、不可读或不支持的 artifact 必须产生 typed、可行动且不泄密的
+  错误，并在新 `user_message` append 前 fail closed；非图片文件仍可 durable 保存和移除，但不能
+  被静默当作图片发送；
+- Chat 投影和 macOS/shared user bubble 至少显示附件数量；旧 artifact event、旧缺少 `attachments`
+  字段的 JSONL 和纯文本消息继续解码/回放；
+- Code 的既有 image action、Agent `generate_image` / `edit_image` 权限链与 iOS Chat tools menu 不得
+  被改写；iOS 不得因共享 VM 或 ArtifactStore 注入而出现本地文件/照片附件入口；
+- 至少运行共享附件 store/resolver tests、ChatLoop 当前轮+历史轮 rehydration test、完整 SwiftPM
+  tests、`IntatisMac` macOS Debug 与 `IntatisiOS` generic Simulator Debug unsigned build。文件选择、
+  拖放和真实视觉命中仍需 macOS 手动 smoke 单独记录，不能从单元测试或编译外推。
+
 ## 图片工具与 `image_model` 配置验收矩阵
 
 涉及 macOS/modern CLI 图片路由时，至少验证：
@@ -278,7 +303,9 @@ routing options、结构化 unsupported 同路由一次降级、裸 404 拒绝�
 - 显式 transcription-only provider 可使用空 `models`，连接和 credential reference 仍保留，但不
   进入模型菜单；macOS 高级 JSON/JSONC 和 iOS Files import 均保留同一个 exact route，不新增设置页；
 - Chat/Code/Cowork/iOS Chat 的 mic 位于唯一 Send/Stop 左侧：第一次点击开始录音，第二次点击停止
-  并转写；结果追加而不是覆盖完成时的当前草稿，空结果不改变草稿且永不自动 Send；
+  并转写；其 compact control 必须以显式 40pt 外层 frame + 圆形 `contentShape` 命中屏幕上完整
+  圆形按钮，不能退化成只有内部字形可点；结果追加而不是覆盖完成时的当前草稿，空结果不改变
+  草稿且永不自动 Send；
 - 录音开始前验证 recorded-file runtime 并冻结 registry/route，credential 只在转写边界懒加载；
   compatible/legacy/OpenAI adapter 使用 disk-backed multipart `/audio/transcriptions`，exact OpenRouter
   adapter 使用 JSON-base64 `input_audio` 同 endpoint；不得按 provider 名称或 URL 猜测方言；
@@ -295,6 +322,80 @@ routing options、结构化 unsupported 同路由一次降级、裸 404 拒绝�
   线上 provider smoke 必须单独记录，不能从离线测试或编译外推。
 
 ## 最近一次真实结果
+
+2026-08-07 `v0.38 (38)` 版本推进的直接证据：
+
+- `xcodegen generate` 通过；`scripts/check-version-consistency.sh` 通过并输出
+  `Intatis version is consistent: 0.38 (build 38)`；
+- `IntatisMac` unsigned universal Release 构建退出码为 0，最终 bundle 为 `0.38 (38)`，
+  可执行文件包含 `x86_64 arm64`；
+- `IntatisiOS` generic Simulator Debug unsigned build 退出码为 0，最终 bundle 为
+  `0.38 (38)`；两个构建只报告仓库既有的 unused-result / deprecated `onChange` warning；
+- 本轮是版本元数据与当前文档变更，未运行 SwiftPM 单元测试；未安装 v0.38 App，
+  `/Applications/Intatis.app` 读回仍为 `0.36 (36)`。也未运行 Developer ID 正式签名、
+  公证、staple、Gatekeeper 或 DMG/ZIP 打包。
+
+2026-08-07 Cowork terminal/mailbox reconciliation 修复的直接证据：
+
+- 报告要求的 TaskContract、AgentLoop policy、model history、context projection、CodeProjection、
+  MessageBus/delegation、orchestration reliability、WorkTask runtime 与 permission reviewer focused
+  tests 均通过；完整 `swift test --skip-build` 最终退出 0，其中 `IntatisCoworkTests` 327 tests、
+  `IntatisSharedUITests` 141 tests、`IntatisAgentKernelTests` 175 tests，均为 0 failures。真实
+  Git/browser/Keychain 等显式 opt-in host smoke 仍按设计 skipped；
+- `xcodegen generate` 与 `scripts/check-version-consistency.sh` 通过，版本一致为 `0.36 (36)`；
+  `IntatisMac` macOS Debug、`IntatisiOS` generic Simulator Debug unsigned build 均退出 0；
+- `IntatisMac` unsigned universal Release 通过；最终 bundle identifier 为
+  `com.Vita0818.IntatisMac`，可执行文件包含 `x86_64 arm64`。临时 staging App 使用仓库
+  Developer ID entitlements 完成 ad-hoc Hardened Runtime 签名，embedded entitlements 为
+  audio input=true、JIT=false、library validation 未关闭，`codesign --verify --deep --strict`
+  通过；
+- `/Applications/Intatis.app` 已替换为该构建，版本、bundle identifier、架构和可执行文件
+  SHA-256 均与 staging 产物一致，且没有 `com.apple.quarantine` xattr。旧安装保存在废纸篓
+  `Intatis-before-install-20260807-1627.app`，可恢复；新进程的实际可执行路径已核对为
+  `/Applications/Intatis.app/Contents/MacOS/IntatisMac`；
+- 对截图对应的 `cowork_rqx6cgvb` 事故日志做了只读回放审计：仍为连续 `seq 0...4564`
+  （4565 行），冷启动后 mtime 仍为 `2026-08-07 13:09:04 +0800`，没有自动 provider 重跑或
+  追加事件。事故链保留 `seq 2873 message_completed`、`2874 model_history_item`、
+  `2878 failed turn_outcome`、`2879 task_failed`；新增 projection/history 回归证明前两项会被
+  后续 authoritative failure 分别标为未完成和从 provider history 排除；
+- 推荐的 Computer Use 已按 skill 通过 `node_repl + @oai/sky` 多次尝试（含 kernel reset 和
+  app path/bundle ID 两种目标），均在 Computer Use service startup 阶段失败。fallback
+  `screencapture` 被 Screen Recording 拒绝，System Events 也被 Apple Events 权限拒绝，因此本轮
+  **没有把失败卡片的真实窗口像素/AX 文本冒充为已验证**；只确认安装包成功启动、进程路径正确、
+  冷启动未改写事故日志。此限制不影响上述单元、全量、构建、签名与持久化证据，但运行时视觉
+  卡片仍需在具备 Computer Use/Screen Recording 权限的环境补做。
+
+本轮没有运行 Developer ID 正式签名、公证、staple、Gatekeeper 或 DMG/ZIP 打包；以上是本机
+开发安装证据，不是正式 release 证据。遗留 `IntatisMacAppStore` 未构建。
+
+2026-08-07 v0.36 阶段未提交工作树 macOS 本机开发安装的直接证据：
+
+- `xcodegen generate` 与 `scripts/check-version-consistency.sh`：通过，版本一致为 `0.36 (36)`；
+- `IntatisMac` unsigned universal Release：通过；最终 bundle identifier 为
+  `com.Vita0818.IntatisMac`，可执行文件包含 `x86_64 arm64`；
+- 使用仓库 Developer ID entitlements 对临时 App 完成 ad-hoc Hardened Runtime 签名；embedded
+  entitlements 已读回 microphone input=true、JIT=false、library validation 未关闭，
+  `codesign --verify --deep --strict` 通过；
+- `/Applications/Intatis.app` 已替换为上述当前工作树构建，版本仍为 `0.36 (36)`，无 quarantine
+  xattr；安装后可执行文件与临时验证产物的 SHA-256 一致。旧的同版本 App 已以 timestamped
+  `Intatis-before-install-*.app` 移入废纸篓作为可恢复备份；
+- 本轮没有运行 Developer ID 正式签名、公证、staple、Gatekeeper 或 DMG/ZIP 打包，也没有自动启动
+  App；因此这是本机开发安装证据，不是正式 release 或运行时 UI smoke 证据。
+
+2026-08-07 macOS Chat/Cowork composer 图片附件复用的直接证据：
+
+- `ComposerAttachmentTests`：2 tests / 0 failures；覆盖 security-scoped URL reader、ArtifactStore
+  保存/精确 bytes 读回、image provider input 解析，以及非图片文件“本地保留但发送前 typed 拒绝”；
+- `testChatLoopPersistsAndRehydratesImageAttachmentsAcrossTurns`：1 test / 0 failures；验证
+  `UserMessagePayload.attachments` 只持久化 ArtifactID，并在下一轮把历史图片和当前图片分别恢复到
+  provider request；
+- 完整 `swift test`：通过（exit 0）；真实 Git/browser/Keychain 等显式 opt-in host smoke 仍按设计
+  skipped，构建只报告仓库既有的 unused-result / deprecated `onChange` warning；
+- `xcodegen generate`：通过；`IntatisMac` macOS Debug unsigned build：通过；`IntatisiOS` generic
+  Simulator Debug unsigned build：通过；
+- 未执行 macOS 文件选择/拖放/视觉命中手动 smoke，也未执行真实 provider/credential/network 图片
+  对话，因此这里只证明共享 UI/runtime 编译、durable attachment/replay 单元回归与 iOS linkage 边界，
+  不外推真实 provider 对全部 image MIME 的线上支持。
 
 2026-08-05 `v0.36 (36)` 版本、shipping target 构建与本机安装的直接证据：
 
@@ -456,7 +557,7 @@ routing options、结构化 unsupported 同路由一次降级、裸 404 拒绝�
 只有以下条件同时满足才能写 release GO：
 
 - 当前 working tree 相关 tests/builds 通过，已知失败有明确处置；
-- 最终 App/ZIP/DMG 元数据为 `0.36 (36)`；
+- 最终 App/ZIP/DMG 元数据为 `0.38 (38)`；
 - Developer ID、notarization、staple、codesign、Gatekeeper 全部通过；
 - NOTICE/ThirdPartyNotices 和最终 bundle resource/link inventory 一致；
 - 关键真实环境矩阵完成，未完成项以明确的风险接受记录处理。

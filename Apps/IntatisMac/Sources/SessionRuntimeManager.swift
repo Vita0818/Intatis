@@ -5,7 +5,6 @@ import IntatisCore
 import IntatisProviders
 import IntatisConversation
 import IntatisArtifacts
-import IntatisMultimodal
 import IntatisSharedUI
 import IntatisMCP
 import IntatisAgentKernel
@@ -85,7 +84,6 @@ enum AppSessionRuntimeManagerError: Error, LocalizedError {
 final class AppChatSessionRuntime {
     let sessionID: SessionID
     let log: EventLog
-    let multimodal: MultimodalService
     let viewModel: ChatViewModel
 
     init(sessionID: SessionID, registry: ProviderRegistry) throws {
@@ -94,8 +92,10 @@ final class AppChatSessionRuntime {
             session: sessionID,
             fileURL: AppConfig.sessionFile(sessionID))
         let store = try ArtifactStore(root: AppConfig.artifactsDir(sessionID))
-        self.multimodal = MultimodalService(log: log, store: store)
-        self.viewModel = ChatViewModel(log: log, registry: registry)
+        self.viewModel = ChatViewModel(
+            log: log,
+            registry: registry,
+            artifactStore: store)
         updateProviderRegistry(registry)
     }
 
@@ -107,17 +107,6 @@ final class AppChatSessionRuntime {
 
     func updateProviderRegistry(_ registry: ProviderRegistry) {
         viewModel.updateProviderRegistry(registry)
-        let multimodal = multimodal
-        viewModel.onGenerateImage = { prompt in
-            guard let provider = try await registry.defaultImageProvider(),
-                  let model = await registry.imageModel() else {
-                throw IntatisError.config("image generation is not configured")
-            }
-            _ = try await multimodal.generateImage(
-                using: provider,
-                model: model,
-                prompt: prompt)
-        }
     }
 
     func shutdown(reason: String) async {
@@ -216,11 +205,14 @@ final class AppSessionRuntimeManager: ObservableObject {
             isBusy: { runtime.isBusy },
             shutdown: { reason in await runtime.shutdown(reason: reason) })
         observeActivity(
-            Publishers.CombineLatest(
+            Publishers.CombineLatest3(
                 runtime.viewModel.$isStreaming,
-                runtime.viewModel.$imageGenerationState)
-                .map { isStreaming, generationState in
-                    isStreaming || generationState.isRunning
+                runtime.viewModel.$imageGenerationState,
+                runtime.viewModel.$isImportingAttachments)
+                .map { isStreaming, generationState, isImportingAttachments in
+                    isStreaming
+                        || generationState.isRunning
+                        || isImportingAttachments
                 },
             key: key)
         runtime.start()

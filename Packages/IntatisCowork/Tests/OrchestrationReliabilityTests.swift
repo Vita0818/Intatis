@@ -152,6 +152,35 @@ private final class ReliabilityFailingProvider: ToolCallingProvider, @unchecked 
     }
 }
 
+private final class ReliabilityThreeFailuresThenSuccessProvider:
+    ToolCallingProvider, @unchecked Sendable
+{
+    private let lock = NSLock()
+    private var capturedRequestCount = 0
+
+    var requestCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return capturedRequestCount
+    }
+
+    func stream(_ request: AgentRequest) -> AsyncThrowingStream<AgentChunk, Error> {
+        lock.lock()
+        capturedRequestCount += 1
+        let requestNumber = capturedRequestCount
+        lock.unlock()
+        return AsyncThrowingStream { continuation in
+            if requestNumber <= 3 {
+                continuation.finish(throwing: ReliabilityForcedError.providerFailure)
+            } else {
+                continuation.yield(.textDelta("completed after poison delivery"))
+                continuation.yield(.done(finishReason: "stop"))
+                continuation.finish()
+            }
+        }
+    }
+}
+
 private struct ReliabilitySelfCancellingProvider: ToolCallingProvider {
     func stream(_ request: AgentRequest) -> AsyncThrowingStream<AgentChunk, Error> {
         AsyncThrowingStream { continuation in
@@ -194,6 +223,7 @@ private final class ReliabilityWriteThenFinalProvider: ToolCallingProvider, @unc
 private final class ReliabilityMailboxSideEffectThenFailProvider: ToolCallingProvider, @unchecked Sendable {
     private let lock = NSLock()
     private var capturedRequestCount = 0
+    private var capturedOriginalMailboxRequestCount = 0
 
     var requestCount: Int {
         lock.lock()
@@ -201,21 +231,39 @@ private final class ReliabilityMailboxSideEffectThenFailProvider: ToolCallingPro
         return capturedRequestCount
     }
 
+    var originalMailboxRequestCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return capturedOriginalMailboxRequestCount
+    }
+
     func stream(_ request: AgentRequest) -> AsyncThrowingStream<AgentChunk, Error> {
+        let isOriginalMailboxRequest = request.messages.contains {
+            $0.content?.contains("handle once") == true
+        }
+        let hasOriginalToolCall = request.messages.contains {
+            $0.toolCalls?.contains(where: { $0.id == "mailbox-reply-side-effect" }) == true
+        }
         lock.lock()
         capturedRequestCount += 1
-        let requestNumber = capturedRequestCount
+        if isOriginalMailboxRequest {
+            capturedOriginalMailboxRequestCount += 1
+        }
         lock.unlock()
         return AsyncThrowingStream { continuation in
-            if requestNumber == 1 {
+            if isOriginalMailboxRequest, !hasOriginalToolCall {
                 continuation.yield(.toolCalls([ToolCall(
                     id: "mailbox-reply-side-effect",
-                    name: "write_file",
-                    arguments: #"{"path":"mailbox-side-effect.txt","content":"already attempted"}"#)]))
+                    name: "reply_message",
+                    arguments: #"{"to":"main","content":"already attempted"}"#)]))
                 continuation.yield(.done(finishReason: "tool_calls"))
                 continuation.finish()
-            } else {
+            } else if isOriginalMailboxRequest {
                 continuation.finish(throwing: ReliabilityForcedError.providerFailure)
+            } else {
+                continuation.yield(.textDelta("unrelated mailbox completed"))
+                continuation.yield(.done(finishReason: "stop"))
+                continuation.finish()
             }
         }
     }
@@ -1203,6 +1251,90 @@ final class OrchestrationReliabilityTests: XCTestCase {
         XCTAssertTrue(remainingQueuedTasks.isEmpty)
     }
 
+    func testExhaustedMailboxMessageIsNotReplacedButNewMessageGetsIndependentTask() async throws {
+        let log = try reliabilityLog()
+        let workspace = try reliabilityWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let worker = AgentID(rawValue: "worker")
+        let provider = ReliabilityThreeFailuresThenSuccessProvider()
+        let orchestrator = Orchestrator(
+            log: log,
+            allowsShell: true,
+            responder: FixedResponder(.allow),
+            executionPolicy: CoworkExecutionPolicy(maxAttempts: 3)) { _ in provider }
+        let mainAttached = await orchestrator.attach(Agent(
+            name: main,
+            workspaceRoot: workspace,
+            model: ModelID(rawValue: "m"),
+            profile: .reviewed,
+            coordinationDepth: Agent.defaultCoordinationDepth))
+        let workerAttached = await orchestrator.attach(Agent(
+            name: worker,
+            workspaceRoot: workspace,
+            model: ModelID(rawValue: "m"),
+            profile: .reviewed))
+        XCTAssertTrue(mainAttached)
+        XCTAssertTrue(workerAttached)
+
+        let poisonSend = await orchestrator.sendMessage(
+            from: main,
+            to: worker.rawValue,
+            content: "poison message")
+        XCTAssertEqual(poisonSend, "sent message to @worker")
+        await orchestrator.runSchedulerUntilIdle()
+        XCTAssertEqual(provider.requestCount, 3)
+        let afterPoison = await log.replay()
+        let poisonMessageID = try XCTUnwrap(afterPoison.compactMap { envelope -> MessageID? in
+            guard case .agentMessage(let payload) = envelope.event,
+                  payload.content == "poison message" else { return nil }
+            return payload.messageId
+        }.first)
+        let poisonTaskID = try XCTUnwrap(afterPoison.compactMap { envelope -> TaskID? in
+            guard case .taskCreated(let payload) = envelope.event,
+                  payload.contract.mailboxMessageIDs == [poisonMessageID] else { return nil }
+            return payload.contract.id
+        }.first)
+
+        // Draining the scheduler again must not manufacture a replacement
+        // delivery task for the already exhausted MessageID.
+        await orchestrator.runSchedulerUntilIdle()
+        XCTAssertEqual(
+            provider.requestCount,
+            3,
+            "an exhausted delivery must remain quiescent")
+        let afterUnrelated = await log.replay()
+        XCTAssertEqual(afterUnrelated.compactMap { envelope -> TaskID? in
+            guard case .taskCreated(let payload) = envelope.event,
+                  payload.contract.kind == .mailboxDelivery else { return nil }
+            return payload.contract.id
+        }, [poisonTaskID])
+
+        let freshSend = await orchestrator.sendMessage(
+            from: main,
+            to: worker.rawValue,
+            content: "fresh message")
+        XCTAssertEqual(freshSend, "sent message to @worker")
+        await orchestrator.runSchedulerUntilIdle()
+        XCTAssertEqual(provider.requestCount, 4)
+        let finalEvents = await log.replay()
+        let freshMessageID = try XCTUnwrap(finalEvents.compactMap { envelope -> MessageID? in
+            guard case .agentMessage(let payload) = envelope.event,
+                  payload.content == "fresh message" else { return nil }
+            return payload.messageId
+        }.first)
+        let mailboxContracts = finalEvents.compactMap { envelope -> TaskContract? in
+            guard case .taskCreated(let payload) = envelope.event,
+                  payload.contract.kind == .mailboxDelivery else { return nil }
+            return payload.contract
+        }
+        XCTAssertEqual(mailboxContracts.count, 2)
+        XCTAssertEqual(mailboxContracts[0].id, poisonTaskID)
+        XCTAssertEqual(mailboxContracts[0].mailboxMessageIDs, [poisonMessageID])
+        XCTAssertEqual(mailboxContracts[1].mailboxMessageIDs, [freshMessageID])
+        let pendingMessages = await orchestrator.mailbox(for: worker).pendingMessages
+        XCTAssertEqual(pendingMessages, [poisonMessageID])
+    }
+
     func testMailboxAutomaticRetryStopsAfterSettledNonReplayableExecution() async throws {
         let log = try reliabilityLog()
         let mainWorkspace = try reliabilityWorkspace()
@@ -1241,19 +1373,37 @@ final class OrchestrationReliabilityTests: XCTestCase {
         await orchestrator.runSchedulerUntilIdle()
 
         let events = await log.replay()
+        let originalMessageID = try XCTUnwrap(events.compactMap { envelope -> MessageID? in
+            guard case .agentMessage(let payload) = envelope.event,
+                  payload.from == main,
+                  payload.to == worker,
+                  payload.content == "handle once" else { return nil }
+            return payload.messageId
+        }.first)
+        let originalTaskID = try XCTUnwrap(events.compactMap { envelope -> TaskID? in
+            guard case .taskQueued(let payload) = envelope.event,
+                  payload.contract.kind == .mailboxDelivery,
+                  payload.contract.mailboxMessageIDs?.contains(originalMessageID) == true else {
+                return nil
+            }
+            return payload.contract.id
+        }.first)
         let mailboxQueues = events.compactMap { envelope -> (TaskID, Int)? in
             guard case .taskQueued(let payload) = envelope.event,
                   payload.contract.kind == .mailboxDelivery,
+                  payload.contract.id == originalTaskID,
                   let attempt = payload.attempt else { return nil }
             return (payload.contract.id, attempt)
         }
         let settledSideEffect = events.compactMap { envelope -> ToolExecutionSettledPayload? in
             guard case .toolExecutionSettled(let payload) = envelope.event,
+                  payload.taskID == originalTaskID,
                   payload.toolCallID == "mailbox-reply-side-effect" else { return nil }
             return payload
         }
 
-        XCTAssertEqual(provider.requestCount, 2)
+        XCTAssertEqual(provider.originalMailboxRequestCount, 2)
+        XCTAssertGreaterThanOrEqual(provider.requestCount, 2)
         XCTAssertEqual(mailboxQueues.map(\.1), [1])
         XCTAssertEqual(settledSideEffect.map(\.outcome), [.succeeded])
         let pendingMessageCount = await orchestrator.mailbox(for: worker).pendingMessages.count
@@ -3432,6 +3582,291 @@ final class OrchestrationReliabilityTests: XCTestCase {
         XCTAssertEqual(projection.tasks[taskID]?.attempt, 2)
     }
 
+    func testRestoreRetriesFailedExactMailboxDeliveryOnTheSameTaskID() async throws {
+        let log = try reliabilityLog()
+        let workspace = try reliabilityWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let sender = AgentID(rawValue: "sender")
+        let messageID = MessageID(rawValue: "mail_exact_retry")
+        let taskID = TaskID(rawValue: "task_exact_retry")
+        let capabilityLease = CapabilityLease(
+            id: CapabilityLeaseID(rawValue: "clease_exact_retry"),
+            taskID: taskID,
+            tools: [],
+            communication: .none,
+            delegation: .none,
+            expiresAtTaskCompletion: true)
+        let workspaceLease = WorkspaceLease(
+            id: WorkspaceLeaseID(rawValue: "wlease_exact_retry"),
+            workspaceID: WorkspaceID(rawValue: "workspace_exact_retry"),
+            taskID: taskID,
+            rootPath: workspace.path,
+            access: .readOnly,
+            expiresAtTaskCompletion: true)
+        try await log.append(.agentAttached(AgentAttachedPayload(
+            agent: main,
+            path: workspace.path,
+            model: ModelID(rawValue: "m"),
+            profile: PermissionProfile.reviewed.rawValue)))
+        try await log.append(.agentAttached(AgentAttachedPayload(
+            agent: sender,
+            path: workspace.path,
+            model: ModelID(rawValue: "m"),
+            profile: PermissionProfile.reviewed.rawValue)))
+        try await log.append(.agentMessage(AgentMessagePayload(
+            from: sender,
+            to: main,
+            content: "retry this exact delivery",
+            kind: .sendMessage,
+            messageId: messageID)))
+        let contract = TaskContract(
+            id: taskID,
+            kind: .mailboxDelivery,
+            issuer: sender,
+            assignee: main,
+            objective: "Handle exact message.",
+            roleHint: "mailbox responder",
+            expectedDeliverable: "communication outcome",
+            workspaceID: workspaceLease.workspaceID,
+            workspaceLeaseID: workspaceLease.id,
+            capabilityLeaseID: capabilityLease.id,
+            mailboxMessageIDs: [messageID],
+            replyMode: TaskReplyMode.none,
+            maxAttempts: 3)
+        try await log.append(.capabilityLeaseCreated(CapabilityLeaseCreatedPayload(
+            agent: main,
+            lease: capabilityLease)))
+        try await log.append(.workspaceLeaseGranted(WorkspaceLeaseGrantedPayload(
+            agent: main,
+            lease: workspaceLease)))
+        try await log.append(.taskCreated(TaskCreatedPayload(contract: contract)))
+        try await log.append(.taskAssigned(TaskAssignedPayload(contract: contract)))
+        try await log.append(.taskQueued(TaskQueuedPayload(
+            contract: contract,
+            rootTaskID: taskID,
+            issuer: sender,
+            assignee: main,
+            hopCount: 0,
+            visitedAgents: [main],
+            attempt: 2,
+            reason: "mailbox delivery")))
+        try await log.append(.taskStarted(TaskStartedPayload(
+            taskID: taskID,
+            agent: main,
+            attempt: 2)))
+        try await log.append(.taskFailed(TaskFailedPayload(
+            taskID: taskID,
+            agent: main,
+            error: "forced second-attempt failure",
+            attempt: 2)))
+        try await log.append(.capabilityLeaseRevoked(CapabilityLeaseRevokedPayload(
+            agent: main,
+            leaseID: capabilityLease.id,
+            reason: "task failed")))
+        try await log.append(.workspaceLeaseRevoked(WorkspaceLeaseRevokedPayload(
+            agent: main,
+            leaseID: workspaceLease.id,
+            reason: "task failed")))
+
+        let provider = ReliabilityCapturingProvider()
+        let restored = Orchestrator(
+            log: log,
+            allowsShell: true,
+            responder: FixedResponder(.allow)) { _ in provider }
+        await restored.restore(from: CoworkProjection.build(from: await log.replay()))
+        let resumed = await restored.resumePendingTasks()
+        XCTAssertTrue(resumed)
+        await restored.runSchedulerUntilIdle()
+
+        XCTAssertEqual(provider.requests.count, 1)
+        let events = await log.replay()
+        let mailboxTaskIDs = events.compactMap { envelope -> TaskID? in
+            guard case .taskCreated(let payload) = envelope.event,
+                  payload.contract.kind == .mailboxDelivery else { return nil }
+            return payload.contract.id
+        }
+        let queuedAttempts = events.compactMap { envelope -> Int? in
+            guard case .taskQueued(let payload) = envelope.event,
+                  payload.contract.id == taskID else { return nil }
+            return payload.attempt
+        }
+        let consumed = events.compactMap { envelope -> AgentMessageConsumedPayload? in
+            guard case .agentMessageConsumed(let payload) = envelope.event else { return nil }
+            return payload
+        }
+        XCTAssertEqual(mailboxTaskIDs, [taskID])
+        XCTAssertEqual(queuedAttempts, [2, 3])
+        XCTAssertEqual(consumed.map(\.messageID), [messageID])
+        XCTAssertEqual(consumed.map(\.taskID), [taskID])
+        let pendingMessages = await restored.mailbox(for: main).pendingMessages
+        XCTAssertTrue(pendingMessages.isEmpty)
+    }
+
+    func testRestoreDoesNotDuplicateQueuedExactMailboxDelivery() async throws {
+        let log = try reliabilityLog()
+        let workspace = try reliabilityWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let sender = AgentID(rawValue: "sender")
+        let messageID = MessageID(rawValue: "mail_exact_active")
+        let taskID = TaskID(rawValue: "task_exact_active")
+        try await log.append(.agentAttached(AgentAttachedPayload(
+            agent: main,
+            path: workspace.path,
+            model: ModelID(rawValue: "m"),
+            profile: PermissionProfile.reviewed.rawValue)))
+        try await log.append(.agentAttached(AgentAttachedPayload(
+            agent: sender,
+            path: workspace.path,
+            model: ModelID(rawValue: "m"),
+            profile: PermissionProfile.reviewed.rawValue)))
+        try await log.append(.agentMessage(AgentMessagePayload(
+            from: sender,
+            to: main,
+            content: "already bound",
+            kind: .sendMessage,
+            messageId: messageID)))
+        let contract = TaskContract(
+            id: taskID,
+            kind: .mailboxDelivery,
+            issuer: sender,
+            assignee: main,
+            objective: "Handle exact message.",
+            roleHint: "mailbox responder",
+            expectedDeliverable: "communication outcome",
+            mailboxMessageIDs: [messageID],
+            replyMode: TaskReplyMode.none,
+            maxAttempts: 3)
+        try await log.append(.taskCreated(TaskCreatedPayload(contract: contract)))
+        try await log.append(.taskAssigned(TaskAssignedPayload(contract: contract)))
+        try await log.append(.taskQueued(TaskQueuedPayload(
+            contract: contract,
+            rootTaskID: taskID,
+            issuer: sender,
+            assignee: main,
+            hopCount: 0,
+            visitedAgents: [main],
+            attempt: 1,
+            reason: "mailbox delivery")))
+
+        let provider = ReliabilityCapturingProvider()
+        let restored = Orchestrator(
+            log: log,
+            allowsShell: true,
+            responder: FixedResponder(.allow)) { _ in provider }
+        await restored.restore(from: CoworkProjection.build(from: await log.replay()))
+
+        let queued = await restored.queuedTasks().filter {
+            $0.contract.kind == .mailboxDelivery
+        }
+        XCTAssertEqual(queued.map { $0.contract.id }, [taskID])
+        let mailboxCreated = await log.replay().compactMap { envelope -> TaskID? in
+            guard case .taskCreated(let payload) = envelope.event,
+                  payload.contract.kind == .mailboxDelivery else { return nil }
+            return payload.contract.id
+        }
+        XCTAssertEqual(mailboxCreated, [taskID])
+        XCTAssertTrue(provider.requests.isEmpty)
+    }
+
+    func testRestoreTreatsExhaustedLegacyMailboxLineageAsOnePoisonDelivery() async throws {
+        let log = try reliabilityLog()
+        let workspace = try reliabilityWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let sender = AgentID(rawValue: "sender")
+        let messageID = MessageID(rawValue: "mail_legacy_poison")
+        let causalTaskID = TaskID(rawValue: "task_legacy_causal")
+        try await log.append(.agentAttached(AgentAttachedPayload(
+            agent: main,
+            path: workspace.path,
+            model: ModelID(rawValue: "m"),
+            profile: PermissionProfile.reviewed.rawValue)))
+        try await log.append(.agentAttached(AgentAttachedPayload(
+            agent: sender,
+            path: workspace.path,
+            model: ModelID(rawValue: "m"),
+            profile: PermissionProfile.reviewed.rawValue)))
+        let causal = TaskContract(
+            id: causalTaskID,
+            kind: .root,
+            issuer: nil,
+            assignee: sender,
+            objective: "Produce a report.",
+            roleHint: "worker",
+            expectedDeliverable: "report")
+        try await log.append(.taskCreated(TaskCreatedPayload(contract: causal)))
+        try await log.append(.taskCompleted(TaskCompletedPayload(
+            taskID: causalTaskID,
+            agent: sender,
+            result: "report")))
+        try await log.append(.agentMessage(AgentMessagePayload(
+            from: sender,
+            to: main,
+            content: "legacy completion report",
+            kind: .sendMessage,
+            messageId: messageID,
+            taskID: causalTaskID)))
+
+        let legacyTasks = [
+            (TaskID(rawValue: "task_legacy_exhausted"), 3),
+            (TaskID(rawValue: "task_legacy_replacement"), 1),
+        ]
+        for (legacyTaskID, attempt) in legacyTasks {
+            let contract = TaskContract(
+                id: legacyTaskID,
+                kind: .mailboxDelivery,
+                issuer: sender,
+                assignee: main,
+                objective: "Review and respond to pending mailbox messages.",
+                roleHint: "mailbox responder",
+                expectedDeliverable: "Handle the pending message.",
+                relatedTasks: [causalTaskID],
+                replyMode: TaskReplyMode.none,
+                maxAttempts: 3)
+            try await log.append(.taskCreated(TaskCreatedPayload(contract: contract)))
+            try await log.append(.taskAssigned(TaskAssignedPayload(contract: contract)))
+            try await log.append(.taskQueued(TaskQueuedPayload(
+                contract: contract,
+                rootTaskID: legacyTaskID,
+                issuer: sender,
+                assignee: main,
+                causalParentID: causalTaskID,
+                hopCount: 0,
+                visitedAgents: [main],
+                attempt: attempt,
+                reason: "mailbox delivery")))
+            try await log.append(.taskStarted(TaskStartedPayload(
+                taskID: legacyTaskID,
+                agent: main,
+                attempt: attempt)))
+            try await log.append(.taskFailed(TaskFailedPayload(
+                taskID: legacyTaskID,
+                agent: main,
+                error: "forced legacy failure",
+                attempt: attempt)))
+        }
+
+        let provider = ReliabilityCapturingProvider()
+        let restored = Orchestrator(
+            log: log,
+            allowsShell: true,
+            responder: FixedResponder(.allow)) { _ in provider }
+        await restored.restore(from: CoworkProjection.build(from: await log.replay()))
+        await restored.resumePendingTasks()
+        await restored.runSchedulerUntilIdle()
+
+        XCTAssertTrue(provider.requests.isEmpty)
+        let remainingQueue = await restored.queuedTasks()
+        let pendingMessages = await restored.mailbox(for: main).pendingMessages
+        XCTAssertTrue(remainingQueue.isEmpty)
+        XCTAssertEqual(pendingMessages, [messageID])
+        let mailboxTaskIDs = await log.replay().compactMap { envelope -> TaskID? in
+            guard case .taskCreated(let payload) = envelope.event,
+                  payload.contract.kind == .mailboxDelivery else { return nil }
+            return payload.contract.id
+        }
+        XCTAssertEqual(mailboxTaskIDs, legacyTasks.map(\.0))
+    }
+
     func testRestoreSynthesizesMailboxWakeAndConsumesOnlyProjectedBatches() async throws {
         let log = try reliabilityLog()
         let workspace = try reliabilityWorkspace()
@@ -3478,6 +3913,15 @@ final class OrchestrationReliabilityTests: XCTestCase {
         }
         XCTAssertEqual(Set(consumed), Set(messageIDs))
         XCTAssertEqual(consumed.count, messageIDs.count)
+        let deliveryContracts = finalEvents.compactMap { envelope -> TaskContract? in
+            guard case .taskCreated(let payload) = envelope.event,
+                  payload.contract.kind == .mailboxDelivery else { return nil }
+            return payload.contract
+        }
+        XCTAssertEqual(deliveryContracts.count, 2)
+        let deliverySets = deliveryContracts.map { Set($0.mailboxMessageIDs ?? []) }
+        XCTAssertTrue(deliverySets[0].isDisjoint(with: deliverySets[1]))
+        XCTAssertEqual(deliverySets[0].union(deliverySets[1]), Set(messageIDs))
         XCTAssertTrue(CoworkProjection.build(from: finalEvents).mailboxes[main]?.pendingMessages.isEmpty == true)
     }
 }
