@@ -54,6 +54,10 @@ final class IntatisSkillsTests: XCTestCase {
         XCTAssertTrue(activation.contains("Mandatory multimodal companion"))
         XCTAssertTrue(activation.contains("prefer a more recently released"))
         XCTAssertTrue(activation.contains("capabilities unspecified"))
+        XCTAssertTrue(activation.contains("When `finish_run` is advertised"))
+        XCTAssertTrue(activation.contains("Keep mailbox conversations live"))
+        XCTAssertTrue(activation.contains("fresh request correlation"))
+        XCTAssertTrue(activation.contains("requires no acknowledgment"))
 
         let registry = snapshot.augmenting(
             ToolRegistry([], registryVersion: "test.bundled"))

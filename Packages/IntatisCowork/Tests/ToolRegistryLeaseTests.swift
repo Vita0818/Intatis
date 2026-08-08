@@ -52,6 +52,41 @@ private func leaseTaskCreatedContracts(_ events: [Envelope]) -> [TaskContract] {
 }
 
 final class ToolRegistryLeaseTests: XCTestCase {
+    func testRunControlRegistryRequiresExactMainRootInvocationAndCapability() throws {
+        let granted = CapabilityLease(tools: [.controlRun])
+        let exactMainRoot = Orchestrator.toolRegistry(
+            for: granted,
+            agentID: Orchestrator.mainAgentID,
+            canControlRun: true)
+        XCTAssertNotNil(exactMainRoot.tool(named: "finish_run"))
+        XCTAssertNotNil(exactMainRoot.tool(named: "stop_run"))
+        XCTAssertEqual(
+            exactMainRoot.registration(named: "finish_run")?.grantingCapabilities,
+            [.controlRun])
+
+        XCTAssertNil(Orchestrator.toolRegistry(
+            for: granted,
+            agentID: Orchestrator.mainAgentID).tool(named: "finish_run"))
+        XCTAssertNil(Orchestrator.toolRegistry(
+            for: granted,
+            agentID: AgentID(rawValue: "worker"),
+            canControlRun: true).tool(named: "finish_run"))
+        XCTAssertNil(Orchestrator.toolRegistry(
+            for: CapabilityLease(tools: []),
+            agentID: Orchestrator.mainAgentID,
+            canControlRun: true).tool(named: "finish_run"))
+
+        for descriptor in [FinishRunTool.descriptor, StopRunTool.descriptor] {
+            let data = try JSONEncoder().encode(descriptor.parameters)
+            let schema = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: data) as? [String: Any])
+            let properties = try XCTUnwrap(schema["properties"] as? [String: Any])
+            XCTAssertEqual(Set(properties.keys), ["reason"])
+            XCTAssertEqual(schema["required"] as? [String], ["reason"])
+            XCTAssertEqual(schema["additionalProperties"] as? Bool, false)
+        }
+    }
+
     func testRenameSessionRegistryRequiresBothMainIdentityAndDedicatedCapability() {
         let granted = CapabilityLease(tools: [.renameSession])
         let mainRegistry = Orchestrator.toolRegistry(
@@ -114,6 +149,8 @@ final class ToolRegistryLeaseTests: XCTestCase {
         XCTAssertEqual(upgraded.count, 1)
         let upgradedLease = try XCTUnwrap(upgraded.first)
         XCTAssertTrue(upgradedLease.tools.contains(.renameSession))
+        XCTAssertTrue(upgradedLease.tools.contains(.submitGoalVerdict))
+        XCTAssertTrue(upgradedLease.tools.contains(.controlRun))
         let firstEvents = await log.replay()
         let firstCreatedCount = firstEvents.filter {
             if case .capabilityLeaseCreated(let payload) = $0.event,
@@ -130,6 +167,69 @@ final class ToolRegistryLeaseTests: XCTestCase {
         let secondCreatedCount = secondEvents.filter {
             if case .capabilityLeaseCreated(let payload) = $0.event,
                payload.agent == main { return true }
+            return false
+        }.count
+        XCTAssertEqual(secondCreatedCount, firstCreatedCount)
+    }
+
+    func testRestoreDurablyUpgradesLegacyWorkerForCorrelationSafeFollowupOnce() async throws {
+        let log = try leaseTempLog()
+        let workspace = try leaseTempWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let worker = AgentID(rawValue: "legacy-worker")
+        var legacyCapability = CapabilityLease.worker()
+        legacyCapability.tools.remove(.requestInformation)
+        legacyCapability.expiresAtTaskCompletion = false
+        let workspaceLease = WorkspaceLease(
+            rootPath: workspace.path,
+            access: .readOnly,
+            expiresAtTaskCompletion: false)
+        try await log.append([
+            .workspaceLeaseGranted(WorkspaceLeaseGrantedPayload(
+                agent: worker,
+                lease: workspaceLease)),
+            .capabilityLeaseCreated(CapabilityLeaseCreatedPayload(
+                agent: worker,
+                lease: legacyCapability)),
+            .agentAttached(AgentAttachedPayload(
+                agent: worker,
+                path: workspace.path,
+                model: ModelID(rawValue: "m"),
+                profile: PermissionProfile.reviewed.rawValue)),
+        ])
+
+        let first = Orchestrator(
+            log: log,
+            allowsShell: false,
+            responder: FixedResponder(.deny)) { _ in LeaseCapturingProvider() }
+        await first.restore(from: CoworkProjection.build(from: await log.replay()))
+
+        let afterFirst = CoworkProjection.build(from: await log.replay())
+        XCTAssertNil(afterFirst.capabilityLeases[legacyCapability.id])
+        let upgraded = afterFirst.capabilityLeaseAgents.compactMap { leaseID, agent in
+            agent == worker ? afterFirst.capabilityLeases[leaseID] : nil
+        }
+        XCTAssertEqual(upgraded.count, 1)
+        let upgradedLease = try XCTUnwrap(upgraded.first)
+        XCTAssertEqual(upgradedLease.communication, .replyOnly)
+        XCTAssertTrue(upgradedLease.tools.contains(.requestInformation))
+        XCTAssertNil(Orchestrator.toolRegistry(
+            for: upgradedLease,
+            agentID: worker).tool(named: "request_information"))
+        let firstCreatedCount = (await log.replay()).filter {
+            if case .capabilityLeaseCreated(let payload) = $0.event,
+               payload.agent == worker { return true }
+            return false
+        }.count
+
+        let second = Orchestrator(
+            log: log,
+            allowsShell: false,
+            responder: FixedResponder(.deny)) { _ in LeaseCapturingProvider() }
+        await second.restore(from: afterFirst)
+        let secondCreatedCount = (await log.replay()).filter {
+            if case .capabilityLeaseCreated(let payload) = $0.event,
+               payload.agent == worker { return true }
             return false
         }.count
         XCTAssertEqual(secondCreatedCount, firstCreatedCount)

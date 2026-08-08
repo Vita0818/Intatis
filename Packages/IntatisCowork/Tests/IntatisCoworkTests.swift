@@ -700,7 +700,7 @@ final class IntatisCoworkTests: XCTestCase {
         XCTAssertTrue(systemPrompt.contains("only after receiving its ToolResult"))
         XCTAssertTrue(systemPrompt.contains("You are executing the assigned task as a worker agent."))
         XCTAssertTrue(systemPrompt.contains("Do not create, remove, or coordinate other agents."))
-        XCTAssertTrue(systemPrompt.contains("Only reply to task-related messages when reply_message is available."))
+        XCTAssertTrue(systemPrompt.contains("Use reply_message only once for the exact frozen information"))
         XCTAssertTrue(systemPrompt.contains("Do not re-run the global task decomposition."))
         XCTAssertFalse(systemPrompt.contains("spawn_agent"))
         XCTAssertFalse(systemPrompt.contains("ask_agent"))

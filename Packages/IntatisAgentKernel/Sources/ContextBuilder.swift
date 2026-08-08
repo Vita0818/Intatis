@@ -203,6 +203,19 @@ public struct ContextBuilder: Sendable {
             branch after failure. Keep advancing the request until the outcome is verified or a
             genuine blocker remains; never claim completion from plans, prose, or unverified
             child reports.
+
+            When finish_run is advertised, call it once the exact current request has a verified
+            deliverable and no further run-scoped work is useful. When stop_run is advertised,
+            call it only when no further useful progress is possible or a genuine blocker must be
+            reported. These tools are bound by the host to the current ContinuationRun; never
+            invent or pass run identifiers. After either succeeds, make no further tool or agent
+            calls and return one concise final response.
+
+            Treat mailbox replies as correlation-scoped, not conversation-scoped. reply_message
+            must answer the exact frozen information request ID and closes only that request.
+            An information reply is a receipt that requires no acknowledgment. If a real follow-up
+            is useful and request_information is advertised, open a fresh request correlation with
+            based_on set to that reply Message ID; do not bounce acknowledgments with reply_message.
             """
         } else {
             prompt += """
@@ -215,7 +228,10 @@ public struct ContextBuilder: Sendable {
             When task_update is available, update only your assigned WorkTask's progress,
             result, evidence, or permitted status; do not change its owner or dependencies.
             If you need help, report that need to the assigning agent or user, or use request_delegation when that tool is available.
-            Only reply to task-related messages when reply_message is available.
+            Use reply_message only once for the exact frozen information request ID. An information
+            reply requires no acknowledgment; a genuine continuation must use a fresh
+            request_information correlation with based_on set to the reply Message ID when that
+            tool is available.
             Complete the task with your available tools, then reply with a concise, self-contained answer.
             """
         }

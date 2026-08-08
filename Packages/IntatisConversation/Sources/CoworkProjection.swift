@@ -136,6 +136,16 @@ public struct CoworkProjection: Equatable, Sendable {
     public private(set) var workTasks: [WorkTaskID: WorkTask] = [:]
     public private(set) var goals: [GoalID: Goal] = [:]
     public private(set) var continuationRuns: [ContinuationRunID: ContinuationRun] = [:]
+    /// First durable close claim per exact run. Conflicting later records are
+    /// ignored by this rebuildable view; mutation paths use EventLog's locked
+    /// compare-and-append and fail closed on ambiguous durable history.
+    public private(set) var continuationRunCloseClaims:
+        [ContinuationRunID: ContinuationRunCloseRequestedPayload] = [:]
+    /// A second non-identical claim for one RunID makes the close history
+    /// ambiguous. Presentation can retain the first fact, but any runtime
+    /// restore/admission decision must fail closed.
+    public private(set) var ambiguousContinuationRunCloseClaimIDs:
+        Set<ContinuationRunID> = []
     public private(set) var currentGoalID: GoalID?
     /// Agents that are currently attached and may participate in runtime
     /// operations. Detach keeps the existing live-roster semantics so callers
@@ -519,6 +529,14 @@ public struct CoworkProjection: Equatable, Sendable {
             applyContinuationRunSnapshot(payload.run, requiredStatus: .running)
         case .continuationRunCheckpointed(let payload):
             applyContinuationRunSnapshot(payload.run, requiredStatus: .checkpointed)
+        case .continuationRunCloseRequested(let payload):
+            if let first = continuationRunCloseClaims[payload.runID] {
+                if first != payload {
+                    ambiguousContinuationRunCloseClaimIDs.insert(payload.runID)
+                }
+            } else {
+                continuationRunCloseClaims[payload.runID] = payload
+            }
         case .continuationRunCompleted(let payload):
             applyContinuationRunSnapshot(payload.run, requiredStatus: .completed)
         case .continuationRunCancelled(let payload):

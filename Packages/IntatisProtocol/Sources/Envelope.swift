@@ -268,6 +268,8 @@ public struct Envelope: Codable, Equatable, Sendable {
             return .continuationRunStarted(try c.decode(ContinuationRunStartedPayload.self, forKey: .payload))
         case .continuationRunCheckpointed:
             return .continuationRunCheckpointed(try c.decode(ContinuationRunCheckpointedPayload.self, forKey: .payload))
+        case .continuationRunCloseRequested:
+            return .continuationRunCloseRequested(try c.decode(ContinuationRunCloseRequestedPayload.self, forKey: .payload))
         case .continuationRunCompleted:
             return .continuationRunCompleted(try c.decode(ContinuationRunCompletedPayload.self, forKey: .payload))
         case .continuationRunCancelled:
@@ -440,6 +442,7 @@ public struct Envelope: Codable, Equatable, Sendable {
         case .continuationRunCreated(let p): try c.encode(p, forKey: .payload)
         case .continuationRunStarted(let p): try c.encode(p, forKey: .payload)
         case .continuationRunCheckpointed(let p): try c.encode(p, forKey: .payload)
+        case .continuationRunCloseRequested(let p): try c.encode(p, forKey: .payload)
         case .continuationRunCompleted(let p): try c.encode(p, forKey: .payload)
         case .continuationRunCancelled(let p): try c.encode(p, forKey: .payload)
         case .continuationRunRecovered(let p): try c.encode(p, forKey: .payload)

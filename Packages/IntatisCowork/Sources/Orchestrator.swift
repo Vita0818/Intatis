@@ -351,11 +351,26 @@ public actor Orchestrator {
     private var idleWaiters: [CheckedContinuation<Void, Never>]
     private var rootInvocations: [TaskID: RootInvocationContext]
     private var cancellationReasons: [TaskID: String]
+    /// Preserves who requested cancellation while a running provider/tool
+    /// cooperatively unwinds. Without this, every cancelled root would be
+    /// mislabeled as a runtime-originated run close.
+    private var cancellationRunCloseSources:
+        [TaskID: ContinuationRunCloseSource]
     /// In-process admission tombstones close the race between a Goal-scoped
     /// cancel snapshot and a root invocation that is still awaiting durable
     /// queue admission. ContinuationRun IDs are never reused, so tombstones can
     /// safely live for the session lifetime.
     private var cancelledGoalRunScopes: Set<GoalRunCancellationScope>
+    /// First durable admission fence per exact ContinuationRun. Unlike the
+    /// legacy Goal-only tombstone this also covers ordinary turns whose
+    /// `goalID` is nil.
+    private var continuationRunCloseClaims:
+        [ContinuationRunID: ContinuationRunCloseRequestedPayload]
+    /// A close request becomes an in-process admission tombstone before its
+    /// EventLog CAS awaits. This lets the durable close fact be written before
+    /// waiting for already-admitted communication/delegation to drain, while
+    /// still preventing actor-reentrant work from crossing that boundary.
+    private var continuationRunCloseInstallations: [ContinuationRunID: Int]
     private var providerUsageLimitFailures: [ContinuationRunID: (GoalID, String)]
     private var restoredPendingTaskIDs: Set<TaskID>
     private var consumedTokenCount: Int
@@ -571,7 +586,10 @@ public actor Orchestrator {
         self.idleWaiters = []
         self.rootInvocations = [:]
         self.cancellationReasons = [:]
+        self.cancellationRunCloseSources = [:]
         self.cancelledGoalRunScopes = []
+        self.continuationRunCloseClaims = [:]
+        self.continuationRunCloseInstallations = [:]
         self.providerUsageLimitFailures = [:]
         self.restoredPendingTaskIDs = []
         self.consumedTokenCount = 0
@@ -2256,6 +2274,15 @@ public actor Orchestrator {
         return .disabled(reviewerID)
     }
 
+    private static func validatedContinuationRunCloseClaims(
+        from projection: CoworkProjection
+    ) throws -> [ContinuationRunID: ContinuationRunCloseRequestedPayload] {
+        guard projection.ambiguousContinuationRunCloseClaimIDs.isEmpty else {
+            throw EventLogError.conflictingContinuationRunCloseClaim
+        }
+        return projection.continuationRunCloseClaims
+    }
+
     public func restore(from _: CoworkProjection) async {
         if startupSchedulerSuspension == nil {
             startupSchedulerSuspension = suspendScheduler()
@@ -2267,7 +2294,11 @@ public actor Orchestrator {
         await acquireAdmissionLock()
         terminalPersistenceFailures.removeAll()
         terminalCommitTaskIDs.removeAll()
+        cancellationReasons.removeAll()
+        cancellationRunCloseSources.removeAll()
         cancelledGoalRunScopes.removeAll()
+        continuationRunCloseClaims.removeAll()
+        continuationRunCloseInstallations.removeAll()
         automaticDelegationReservations.removeAll()
         providerUsageLimitFailures.removeAll()
         automaticPermissionReviewRecoveryFailure = nil
@@ -2288,6 +2319,17 @@ public actor Orchestrator {
             return
         }
         var projection = CoworkProjection.build(from: events)
+        do {
+            continuationRunCloseClaims = try Self.validatedContinuationRunCloseClaims(
+                from: projection)
+        } catch {
+            let message = "Cowork restore found ambiguous ContinuationRun close history: \(error.localizedDescription)"
+            automaticPermissionReviewRecoveryFailure = message
+            workTaskRecoveryFailure = message
+            releaseAdmissionLock()
+            resumeScheduler(suspension: restoreSuspension, ensureRunning: false)
+            return
+        }
         // Older AgentLoop builds left every failed non-replayable tool ticket
         // unresolved, including task_update requests that the built-in Cowork
         // executor deterministically rejected before its first EventLog
@@ -2307,6 +2349,8 @@ public actor Orchestrator {
                 }
                 events = replay.envelopes
                 projection = CoworkProjection.build(from: events)
+                continuationRunCloseClaims = try Self.validatedContinuationRunCloseClaims(
+                    from: projection)
             } catch {
                 workTaskRecoveryFailure =
                     "proven no-effect task_update recovery could not be persisted: \(error.localizedDescription)"
@@ -2385,6 +2429,8 @@ public actor Orchestrator {
                 }
                 events = replay.envelopes
                 projection = CoworkProjection.build(from: events)
+                continuationRunCloseClaims = try Self.validatedContinuationRunCloseClaims(
+                    from: projection)
                 switch validatedRestoredWorkTaskGraph(from: projection) {
                 case .success(let restored):
                     workTaskGraph = restored
@@ -2531,6 +2577,8 @@ public actor Orchestrator {
             }
         }
         await upgradeMainControlCapabilitiesIfNeeded(
+            referencedLeaseIDs: allReferencedCapabilityLeaseIDs)
+        await upgradeMailboxFollowupCapabilitiesIfNeeded(
             referencedLeaseIDs: allReferencedCapabilityLeaseIDs)
         spawnedAgentOwners = projection.agentOwners.filter { registry.agent($0.key) != nil }
 
@@ -2697,6 +2745,18 @@ public actor Orchestrator {
             knownTasks: known,
             records: records,
             mailboxes: recoveredMailboxes))
+
+        // A close claim is a permanent admission fence for its exact RunID.
+        // Reconcile remaining recovered work before considering any mailbox
+        // wake so a restart cannot resurrect the run.
+        for claim in continuationRunCloseClaims.values.sorted(by: {
+            $0.runID.rawValue < $1.runID.rawValue
+        }) {
+            _ = await drainClosedContinuationRun(
+                claim,
+                excludingTaskID: nil,
+                resumeUnrelatedWork: false)
+        }
 
         consumedTokenCount = Self.consumedTokenCount(in: events)
         await tokenBudgetMeter.reconfigure(
@@ -3567,24 +3627,64 @@ public actor Orchestrator {
 
     @discardableResult
     public func cancel(taskID: TaskID, reason: String = "cancelled by user") async -> Bool {
+        await cancel(
+            taskID: taskID,
+            reason: reason,
+            runCloseSource: .user)
+    }
+
+    @discardableResult
+    private func cancel(
+        taskID: TaskID,
+        reason: String,
+        runCloseSource: ContinuationRunCloseSource
+    ) async -> Bool {
         let normalizedReason = reason.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
             ?? "cancelled by user"
         if let queued = scheduler.queuedTask(taskID: taskID) {
-            return await cancelBeforeExecution(queued, reason: normalizedReason, wasClaimed: false)
+            return await cancelBeforeExecution(
+                queued,
+                reason: normalizedReason,
+                runCloseSource: runCloseSource,
+                wasClaimed: false)
         }
         if let claimed = scheduler.claimedTask(taskID: taskID),
            scheduler.record(for: taskID)?.status == .queued {
-            return await cancelBeforeExecution(claimed, reason: normalizedReason, wasClaimed: true)
+            return await cancelBeforeExecution(
+                claimed,
+                reason: normalizedReason,
+                runCloseSource: runCloseSource,
+                wasClaimed: true)
         }
 
         guard scheduler.record(for: taskID)?.status == .running else { return false }
         cancellationReasons[taskID] = normalizedReason
+        cancellationRunCloseSources[taskID] = runCloseSource
+        if let runningTask = scheduler.knownTask(taskID: taskID) {
+            do {
+                // Fence the exact RunID before asking the provider/tool stack
+                // to unwind. This is the running-task counterpart of the
+                // queued cancellation path and prevents a slow cleanup from
+                // leaving mailbox/delegation admission open.
+                _ = try await closeRootRunIfNeeded(
+                    for: runningTask,
+                    outcome: .cancelled,
+                    source: runCloseSource,
+                    reason: normalizedReason)
+            } catch {
+                terminalPersistenceFailures[taskID] =
+                    "Run closure could not be persisted before task cancellation: \(error.localizedDescription)"
+                runningExecutions[taskID]?.cancel()
+                return false
+            }
+        }
         runningExecutions[taskID]?.cancel()
         return true
     }
 
     private func cancelBeforeExecution(_ task: ScheduledTask,
                                        reason: String,
+                                       runCloseSource: ContinuationRunCloseSource,
                                        wasClaimed: Bool) async -> Bool {
         let taskID = task.contract.id
         guard !terminalCommitTaskIDs.contains(taskID) else { return false }
@@ -3593,6 +3693,22 @@ public actor Orchestrator {
             terminalCommitTaskIDs.remove(taskID)
             ensureSchedulerRunning()
             notifyIdleIfNeeded()
+        }
+
+        do {
+            _ = try await closeRootRunIfNeeded(
+                for: task,
+                outcome: .cancelled,
+                source: runCloseSource,
+                reason: reason)
+        } catch {
+            terminalPersistenceFailures[taskID] =
+                "Run closure could not be persisted before task cancellation: \(error.localizedDescription)"
+            if wasClaimed {
+                _ = scheduler.requeueClaimedTask(taskID: taskID)
+            }
+            completeResultWaiters(taskID)
+            return false
         }
 
         let metadata = taskMetadata(
@@ -3649,14 +3765,295 @@ public actor Orchestrator {
         return true
     }
 
+    /// Model-facing close boundary. The caller supplies no identity; the
+    /// current invocation must be the exact @main root of a live run.
+    func requestContinuationRunClose(
+        currentTaskID: TaskID?,
+        outcome: ContinuationRunCloseOutcome,
+        reason: String
+    ) async -> String {
+        guard let currentTaskID,
+              let node = taskGraph.node(currentTaskID),
+              node.contract.kind == .root,
+              node.contract.issuer == nil,
+              node.contract.assignee == Self.mainAgentID,
+              let runID = node.contract.continuationRunID else {
+            return "error: run control is available only to the exact @main root invocation"
+        }
+        guard outcome == .completed || outcome == .stopped else {
+            return "error: the model may request only completed or stopped run closure"
+        }
+        let normalizedReason = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedReason.isEmpty else {
+            return "error: run close reason must not be empty"
+        }
+        let durableReason = Self.durableRunCloseReason(normalizedReason)
+
+        let request = ContinuationRunCloseRequestedPayload(
+            sessionID: await log.sessionID,
+            runID: runID,
+            goalID: node.contract.goalID,
+            submissionID: node.contract.submissionID,
+            rootTaskID: currentTaskID,
+            requestedOutcome: outcome,
+            source: .mainAgent,
+            reason: durableReason)
+        do {
+            let claim = try await installContinuationRunCloseClaim(request)
+            guard claim.requestedOutcome == outcome,
+                  claim.source == .mainAgent else {
+                return "error: this run was already closed as \(claim.requestedOutcome.rawValue): \(claim.reason)"
+            }
+            let drained = await drainClosedContinuationRun(
+                claim,
+                excludingTaskID: currentTaskID,
+                resumeUnrelatedWork: true)
+            guard drained else {
+                return "error: run admission is closed, but one or more run-scoped tasks or messages could not be durably drained"
+            }
+            return outcome == .completed
+                ? "current run is durably closed as completed"
+                : "current run is durably closed as stopped"
+        } catch {
+            return "error: run close could not be persisted: \(error.localizedDescription)"
+        }
+    }
+
+    /// Installs the cross-process first-write claim before waiting for any
+    /// already-entered admission path. The in-flight counter is itself an
+    /// actor-local tombstone, so reentrant admission fails closed while the
+    /// EventLog CAS is pending. Once durable, the claim replaces that temporary
+    /// fence; only then do we wait for the old admission holder to leave.
+    private func installContinuationRunCloseClaim(
+        _ request: ContinuationRunCloseRequestedPayload
+    ) async throws -> ContinuationRunCloseRequestedPayload {
+        if let existing = continuationRunCloseClaims[request.runID] {
+            return existing
+        }
+
+        continuationRunCloseInstallations[request.runID, default: 0] += 1
+        defer {
+            let remaining = (continuationRunCloseInstallations[request.runID] ?? 1) - 1
+            if remaining > 0 {
+                continuationRunCloseInstallations[request.runID] = remaining
+            } else {
+                continuationRunCloseInstallations.removeValue(forKey: request.runID)
+            }
+        }
+
+        do {
+            let result = try await log.claimContinuationRunClose(request)
+            continuationRunCloseClaims[request.runID] = result.claim
+            // The durable claim now fences all future admission. Wait for the
+            // holder that predates it to observe that fence and settle before
+            // the caller begins exact-run drain.
+            await acquireAdmissionLock()
+            releaseAdmissionLock()
+            return result.claim
+        } catch {
+            throw error
+        }
+    }
+
+    private func closeRootRunIfNeeded(
+        for task: ScheduledTask,
+        outcome: ContinuationRunCloseOutcome,
+        source: ContinuationRunCloseSource,
+        reason: String
+    ) async throws -> ContinuationRunCloseRequestedPayload? {
+        guard task.contract.kind == .root,
+              task.contract.issuer == nil,
+              let runID = task.contract.continuationRunID else { return nil }
+        // A caller draining an already-closed run may cancel another queued
+        // root in that same run. Reuse the installed fence without recursively
+        // starting a second drain that could cancel the root currently
+        // returning from finish_run/stop_run.
+        if let existing = continuationRunCloseClaims[runID] {
+            return existing
+        }
+        let request = ContinuationRunCloseRequestedPayload(
+            sessionID: await log.sessionID,
+            runID: runID,
+            goalID: task.contract.goalID,
+            submissionID: task.contract.submissionID,
+            rootTaskID: task.contract.id,
+            requestedOutcome: outcome,
+            source: source,
+            reason: Self.durableRunCloseReason(reason))
+        let claim = try await installContinuationRunCloseClaim(request)
+        let drained = await drainClosedContinuationRun(
+            claim,
+            excludingTaskID: task.contract.id,
+            resumeUnrelatedWork: true)
+        guard drained else {
+            throw IntatisError.io(
+                "run admission was closed, but exact-scope drain did not settle durably")
+        }
+        return claim
+    }
+
+    private static func durableRunCloseReason(_ raw: String) -> String {
+        let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let safe = PermissionReviewTextSanitizer.sanitizeDiagnostic(
+            normalized,
+            maxCharacters: 1_000).text
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return safe.isEmpty ? "ContinuationRun closed" : safe
+    }
+
+    private func scheduledTaskIDs(
+        continuationRunID: ContinuationRunID,
+        excludingTaskID: TaskID?
+    ) -> [TaskID] {
+        let snapshot = scheduler.snapshot()
+        var seen = Set<TaskID>()
+        var ordered: [TaskID] = []
+        for task in snapshot.queuedTasks + snapshot.claimedTasks
+        where task.contract.continuationRunID == continuationRunID
+            && task.contract.id != excludingTaskID {
+            if seen.insert(task.contract.id).inserted {
+                ordered.append(task.contract.id)
+            }
+        }
+        for taskID in runningExecutions.keys.sorted(by: { $0.rawValue < $1.rawValue }) {
+            guard taskID != excludingTaskID,
+                  let task = snapshot.knownTasks[taskID],
+                  task.contract.continuationRunID == continuationRunID,
+                  seen.insert(taskID).inserted else { continue }
+            ordered.append(taskID)
+        }
+        return ordered
+    }
+
+    private func discardPendingMessages(
+        continuationRunID: ContinuationRunID,
+        goalID: GoalID?,
+        reason: String
+    ) async -> Bool {
+        var seen = Set<MessageID>()
+        let messages = scheduler.snapshot().mailboxes.values
+            .flatMap(\.pendingMessageDetails)
+            .filter { message in
+                guard seen.insert(message.id).inserted,
+                      let causalTaskID = message.causalParentID ?? message.taskID,
+                      let contract = taskGraph.node(causalTaskID)?.contract
+                        ?? scheduler.knownTask(taskID: causalTaskID)?.contract else {
+                    return false
+                }
+                return contract.continuationRunID == continuationRunID
+            }
+            .sorted {
+                if $0.createdAt == $1.createdAt {
+                    return $0.id.rawValue < $1.id.rawValue
+                }
+                return $0.createdAt < $1.createdAt
+            }
+        return await persistDiscardedMessages(
+            messages,
+            goalID: goalID,
+            continuationRunID: continuationRunID,
+            reason: reason)
+    }
+
+    /// Drains only one exact RunID. The current root may be excluded so a
+    /// successful finish_run/stop_run call can return to AgentLoop and allow a
+    /// single final assistant response; all other run work is terminalized.
+    private func drainClosedContinuationRun(
+        _ claim: ContinuationRunCloseRequestedPayload,
+        excludingTaskID: TaskID?,
+        resumeUnrelatedWork: Bool
+    ) async -> Bool {
+        let suspension = suspendScheduler()
+        await acquireAdmissionLock()
+        releaseAdmissionLock()
+
+        var succeeded = true
+        var previousRemainder: [TaskID]?
+        while true {
+            let scoped = scheduledTaskIDs(
+                continuationRunID: claim.runID,
+                excludingTaskID: excludingTaskID)
+            guard !scoped.isEmpty else { break }
+            let executions = scoped.compactMap { runningExecutions[$0] }
+            for taskID in scoped {
+                let cancelled = await cancel(
+                    taskID: taskID,
+                    reason: "ContinuationRun closed: \(claim.reason)")
+                succeeded = succeeded && cancelled
+            }
+            for execution in executions { await execution.value }
+            let remainder = scheduledTaskIDs(
+                continuationRunID: claim.runID,
+                excludingTaskID: excludingTaskID)
+            guard !remainder.isEmpty else { break }
+            if remainder == previousRemainder, executions.isEmpty {
+                succeeded = false
+                break
+            }
+            previousRemainder = remainder
+        }
+
+        let scheduledIDs = Set(scheduledTaskIDs(
+            continuationRunID: claim.runID,
+            excludingTaskID: excludingTaskID))
+        let graphOnlyNodes = taskGraph.nodes.values
+            .filter {
+                $0.id != excludingTaskID
+                    && $0.contract.continuationRunID == claim.runID
+                    && !$0.status.isTerminal
+                    && !scheduledIDs.contains($0.id)
+                    && runningExecutions[$0.id] == nil
+            }
+            .sorted { $0.id.rawValue < $1.id.rawValue }
+        for node in graphOnlyNodes {
+            let cancelled = await cancelUnqueuedRootTask(
+                scheduledTask(for: node),
+                reason: "ContinuationRun closed: \(claim.reason)",
+                runCloseSource: claim.source)
+            succeeded = succeeded && cancelled
+        }
+
+        let messagesDiscarded = await discardPendingMessages(
+            continuationRunID: claim.runID,
+            goalID: claim.goalID,
+            reason: "ContinuationRun closed: \(claim.reason)")
+        succeeded = succeeded && messagesDiscarded
+        if taskGraph.nodes.values.contains(where: {
+            $0.id != excludingTaskID
+                && $0.contract.continuationRunID == claim.runID
+                && !$0.status.isTerminal
+        }) {
+            succeeded = false
+        }
+        if !scheduledTaskIDs(
+            continuationRunID: claim.runID,
+            excludingTaskID: excludingTaskID).isEmpty {
+            succeeded = false
+        }
+        resumeScheduler(
+            suspension: suspension,
+            ensureRunning: succeeded && resumeUnrelatedWork)
+        notifyIdleIfNeeded()
+        return succeeded
+    }
+
     public func cancelAll(reason: String = "cowork session stopped") async {
-        await cancelAll(reason: reason, shutdownPermissionReviewer: true)
+        await cancelAll(
+            reason: reason,
+            shutdownPermissionReviewer: true,
+            runCloseSource: .hostLifecycle)
     }
 
     /// Cancels queued and running data-plane work while keeping the reserved
     /// automatic permission reviewer available for the next user request.
-    public func cancelActiveTasks(reason: String = "cowork task cancelled") async {
-        await cancelAll(reason: reason, shutdownPermissionReviewer: false)
+    public func cancelActiveTasks(
+        reason: String = "cowork task cancelled",
+        runCloseSource: ContinuationRunCloseSource = .user
+    ) async {
+        await cancelAll(
+            reason: reason,
+            shutdownPermissionReviewer: false,
+            runCloseSource: runCloseSource)
     }
 
     /// Cancels only data-plane work belonging to one Goal (and optionally one
@@ -3666,18 +4063,69 @@ public actor Orchestrator {
     public func cancelActiveTasks(goalID: GoalID,
                                   continuationRunID: ContinuationRunID? = nil,
                                   reason: String = "Goal continuation cancelled",
-                                  resumePendingTasksOnSuccess: Bool = true) async -> Bool {
+                                  resumePendingTasksOnSuccess: Bool = true,
+                                  runCloseSource: ContinuationRunCloseSource = .user) async -> Bool {
         let cancellationScope = GoalRunCancellationScope(
             goalID: goalID,
             runID: continuationRunID)
         cancelledGoalRunScopes.insert(cancellationScope)
         let schedulerSuspension = suspendScheduler()
-        // Wait for any root/delegation admission that was already inside its
-        // persistence transaction. New admissions for this exact run observe
-        // the tombstone above and settle cancelled before scheduler commit.
+        var cancellationSucceeded = true
+        var preBarrierCloseRootID: TaskID?
+        if let continuationRunID,
+           continuationRunCloseClaims[continuationRunID] == nil,
+           let rootNode = taskGraph.nodes.values
+            .filter({ node in
+                node.contract.kind == .root
+                    && node.contract.issuer == nil
+                    && node.contract.goalID == goalID
+                    && node.contract.continuationRunID == continuationRunID
+            })
+            .sorted(by: { $0.id.rawValue < $1.id.rawValue })
+            .first {
+            preBarrierCloseRootID = rootNode.id
+            do {
+                _ = try await closeRootRunIfNeeded(
+                    for: scheduledTask(for: rootNode),
+                    outcome: .cancelled,
+                    source: runCloseSource,
+                    reason: reason)
+            } catch {
+                cancellationSucceeded = false
+                terminalPersistenceFailures[rootNode.id] =
+                    "Run closure could not be persisted before scoped cancellation: \(error.localizedDescription)"
+            }
+        }
+        // The close path above writes its first-winner claim before waiting for
+        // an already-entered admission. If root admission was not yet visible,
+        // the Goal/run tombstone still stops it; wait for that transaction and
+        // install the claim from the now-durable root before draining tasks.
         await acquireAdmissionLock()
         releaseAdmissionLock()
-        var cancellationSucceeded = true
+        if preBarrierCloseRootID == nil,
+           let continuationRunID,
+           continuationRunCloseClaims[continuationRunID] == nil,
+           let rootNode = taskGraph.nodes.values
+            .filter({ node in
+                node.contract.kind == .root
+                    && node.contract.issuer == nil
+                    && node.contract.goalID == goalID
+                    && node.contract.continuationRunID == continuationRunID
+            })
+            .sorted(by: { $0.id.rawValue < $1.id.rawValue })
+            .first {
+            do {
+                _ = try await closeRootRunIfNeeded(
+                    for: scheduledTask(for: rootNode),
+                    outcome: .cancelled,
+                    source: runCloseSource,
+                    reason: reason)
+            } catch {
+                cancellationSucceeded = false
+                terminalPersistenceFailures[rootNode.id] =
+                    "Run closure could not be persisted before scoped cancellation: \(error.localizedDescription)"
+            }
+        }
         var attemptedTaskIDs = Set<TaskID>()
         var previousRemainder: [TaskID]?
         while true {
@@ -3688,7 +4136,10 @@ public actor Orchestrator {
             attemptedTaskIDs.formUnion(scoped)
             let executions = scoped.compactMap { runningExecutions[$0] }
             for taskID in scoped {
-                _ = await cancel(taskID: taskID, reason: reason)
+                _ = await cancel(
+                    taskID: taskID,
+                    reason: reason,
+                    runCloseSource: runCloseSource)
             }
             for execution in executions { await execution.value }
 
@@ -3731,7 +4182,8 @@ public actor Orchestrator {
             attemptedTaskIDs.insert(node.id)
             let cancelled = await cancelUnqueuedRootTask(
                 scheduledTask(for: node),
-                reason: reason)
+                reason: reason,
+                runCloseSource: runCloseSource)
             cancellationSucceeded = cancellationSucceeded && cancelled
         }
         let discardedScopedMessages = await discardPendingMessages(
@@ -3768,15 +4220,22 @@ public actor Orchestrator {
     }
 
     private func cancelAll(reason: String,
-                           shutdownPermissionReviewer: Bool) async {
+                           shutdownPermissionReviewer: Bool,
+                           runCloseSource: ContinuationRunCloseSource) async {
         let schedulerSuspension = suspendScheduler()
         let queuedIDs = scheduler.queuedTasks().map { $0.contract.id }
         let runningIDs = Array(runningExecutions.keys)
         for taskID in queuedIDs {
-            _ = await cancel(taskID: taskID, reason: reason)
+            _ = await cancel(
+                taskID: taskID,
+                reason: reason,
+                runCloseSource: runCloseSource)
         }
         for taskID in runningIDs {
-            _ = await cancel(taskID: taskID, reason: reason)
+            _ = await cancel(
+                taskID: taskID,
+                reason: reason,
+                runCloseSource: runCloseSource)
         }
         let executions = runningIDs.compactMap { runningExecutions[$0] }
         for execution in executions { await execution.value }
@@ -3981,7 +4440,11 @@ public actor Orchestrator {
         return "sent message to @\(to.rawValue)"
     }
 
-    func requestInformation(from: AgentID, to toName: String, question: String, taskID: TaskID? = nil) async -> String {
+    func requestInformation(from: AgentID,
+                            to toName: String,
+                            question: String,
+                            basedOn: String? = nil,
+                            taskID: TaskID? = nil) async -> String {
         let normalizedName = Self.normalizedAgentName(toName)
         let to = AgentID(rawValue: normalizedName)
         guard to != from else { return "error: agent cannot request information from itself" }
@@ -4013,11 +4476,52 @@ public actor Orchestrator {
             releaseAdmissionLock()
             return "error: \(failure)"
         }
+        let currentContract = taskContract(forCausalTaskID: taskID)
+        let basedOnID = basedOn.map(MessageID.init(rawValue:))
+        var conversationID: MessageID?
+        if currentContract?.kind == .mailboxDelivery {
+            guard let basedOnID,
+                  currentContract?.mailboxMessageIDs?.contains(basedOnID) == true else {
+                releaseAdmissionLock()
+                return "error: a mailbox follow-up must set based_on to one frozen reply Message ID"
+            }
+            let history: [Envelope]
+            do {
+                history = try await completeKnownCommunicationHistory()
+            } catch {
+                releaseAdmissionLock()
+                return "error: information follow-up could not verify durable history: \(error.localizedDescription)"
+            }
+            guard let previous = history.compactMap({ envelope -> InformationRepliedPayload? in
+                guard case .informationReplied(let payload) = envelope.event,
+                      payload.replyID == basedOnID else { return nil }
+                return payload
+            }).first,
+                  previous.to == from,
+                  previous.from == to,
+                  let currentContract,
+                  communicationScopeMatches(
+                    currentContract,
+                    causalTaskID: previous.taskID) else {
+                releaseAdmissionLock()
+                return "error: based_on is not an information reply from the exact target and run scope"
+            }
+            conversationID = previous.conversationID
+                ?? previous.inReplyTo
+                ?? previous.replyID
+        } else if basedOnID != nil {
+            releaseAdmissionLock()
+            return "error: based_on is accepted only from a frozen mailbox reply"
+        }
+        let requestID = MessageID.new()
         guard let payload = await bus.requestInformation(
             from: from,
             to: to,
             question: question,
-            taskID: taskID) else {
+            taskID: taskID,
+            requestID: requestID,
+            conversationID: conversationID ?? requestID,
+            basedOn: basedOnID) else {
             releaseAdmissionLock()
             return "your information request was blocked by the mediator"
         }
@@ -4028,7 +4532,9 @@ public actor Orchestrator {
             content: payload.question,
             kind: AgentCommunicationKind.requestInformation.rawValue,
             taskID: taskID,
-            causalParentID: taskID)
+            causalParentID: taskID,
+            conversationID: payload.conversationID,
+            basedOn: payload.basedOn)
         _ = scheduler.enqueueMessage(message)
         if let cancellationFailure = await settleLateCancelledCommunication(
             message,
@@ -4041,7 +4547,7 @@ public actor Orchestrator {
             sender: from,
             recipient: to,
             requestedMessageIDs: [message.id])
-        return "requested information from @\(to.rawValue)"
+        return "requested information from @\(to.rawValue) (request_id: \(payload.requestID.rawValue))"
     }
 
     func replyMessage(from: AgentID, to toName: String, content: String, inReplyTo: String?, taskID: TaskID? = nil) async -> String {
@@ -4068,12 +4574,62 @@ public actor Orchestrator {
             releaseAdmissionLock()
             return "error: \(failure)"
         }
-        let replyID = inReplyTo.map { MessageID(rawValue: $0) }
+        guard let rawReplyID = inReplyTo?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !rawReplyID.isEmpty else {
+            releaseAdmissionLock()
+            return "error: inReplyTo is required and must identify the frozen information request"
+        }
+        let requestID = MessageID(rawValue: rawReplyID)
+        guard let currentContract = taskContract(forCausalTaskID: taskID),
+              currentContract.kind == .mailboxDelivery,
+              currentContract.mailboxMessageIDs?.contains(requestID) == true else {
+            releaseAdmissionLock()
+            return "error: reply_message may answer only an information request frozen into this mailbox invocation"
+        }
+        let history: [Envelope]
+        do {
+            history = try await completeKnownCommunicationHistory()
+        } catch {
+            releaseAdmissionLock()
+            return "error: information reply could not verify durable history: \(error.localizedDescription)"
+        }
+        guard let request = history.compactMap({ envelope -> InformationRequestedPayload? in
+            guard case .informationRequested(let payload) = envelope.event,
+                  payload.requestID == requestID else { return nil }
+            return payload
+        }).first,
+              request.to == from,
+              request.from == to,
+              communicationScopeMatches(
+                currentContract,
+                causalTaskID: request.taskID) else {
+            releaseAdmissionLock()
+            return "error: inReplyTo is not an information request from the exact target and run scope"
+        }
+        let priorReplies = history.compactMap { envelope -> InformationRepliedPayload? in
+            guard case .informationReplied(let payload) = envelope.event,
+                  payload.inReplyTo == requestID else { return nil }
+            return payload
+        }
+        if let first = priorReplies.first {
+            let historyIsConsistent = priorReplies.allSatisfy { $0 == first }
+            guard historyIsConsistent else {
+                releaseAdmissionLock()
+                return "error: the information request has conflicting durable replies"
+            }
+            if first.from == from, first.to == to, first.content == content {
+                releaseAdmissionLock()
+                return "replied to @\(to.rawValue) (reply_id: \(first.replyID.rawValue), idempotent)"
+            }
+            releaseAdmissionLock()
+            return "error: the information request already has a terminal reply"
+        }
         guard let payload = await bus.replyMessage(
             from: from,
             to: to,
             content: content,
-            inReplyTo: replyID,
+            inReplyTo: requestID,
+            conversationID: request.conversationID ?? request.requestID,
             taskID: taskID) else {
             releaseAdmissionLock()
             return "your reply was blocked by the mediator"
@@ -4086,7 +4642,8 @@ public actor Orchestrator {
             kind: AgentCommunicationKind.replyMessage.rawValue,
             taskID: taskID,
             causalParentID: taskID,
-            inReplyTo: payload.inReplyTo)
+            inReplyTo: payload.inReplyTo,
+            conversationID: payload.conversationID)
         _ = scheduler.enqueueMessage(message)
         if let cancellationFailure = await settleLateCancelledCommunication(
             message,
@@ -4099,7 +4656,7 @@ public actor Orchestrator {
             sender: from,
             recipient: to,
             requestedMessageIDs: [message.id])
-        return "replied to @\(to.rawValue)"
+        return "replied to @\(to.rawValue) (reply_id: \(payload.replyID.rawValue))"
     }
 
     func requestDelegation(from: AgentID, objective: String, reason: String, parentTaskID: TaskID? = nil) async -> String {
@@ -4544,9 +5101,18 @@ public actor Orchestrator {
             recipient: message.recipient,
             goalID: causalContract?.goalID,
             continuationRunID: causalContract?.continuationRunID,
-            authorityClass: message.kind == "request_delegation"
-                ? .delegationRequest
-                : .ordinaryReply)
+            authorityClass: {
+                switch message.kind {
+                case "request_delegation":
+                    return .delegationRequest
+                case AgentCommunicationKind.requestInformation.rawValue:
+                    return .informationRequest
+                case AgentCommunicationKind.replyMessage.rawValue:
+                    return .informationReply
+                default:
+                    return .ordinaryMessage
+                }
+            }())
     }
 
     func createRootTask(assignee: AgentID,
@@ -6926,10 +7492,16 @@ public actor Orchestrator {
             // widen a workspace authority boundary.
             skillSnapshot = nil
         }
+        let canControlRun = agent.name == Self.mainAgentID
+            && taskContract?.kind == .root
+            && taskContract?.issuer == nil
+            && taskContract?.assignee == agent.name
+            && taskContract?.continuationRunID != nil
         let baseToolRegistry = Self.toolRegistry(
             for: capabilityLease,
             agentID: agent.name,
-            includesTerminal: allowsShell)
+            includesTerminal: allowsShell,
+            canControlRun: canControlRun)
         let toolRegistry =
             skillSnapshot?.augmenting(baseToolRegistry)
                 ?? baseToolRegistry
@@ -7012,6 +7584,11 @@ public actor Orchestrator {
             agentManager: manager,
             workTaskManager: workTaskManager,
             goalManager: goalManager,
+            runController: canControlRun
+                ? OrchestratorRunController(
+                    currentTaskID: taskContract?.id,
+                    orchestrator: self)
+                : nil,
             imageGenerator: imageGenerator,
             sessionNaming: agent.name == Self.mainAgentID ? sessionNaming : nil,
             capabilityLease: capabilityLease,
@@ -7323,6 +7900,15 @@ public actor Orchestrator {
         allowingDelegationReservationFor reservedTarget: AgentID? = nil,
         materializedDelegationTarget: MaterializedDelegationTarget? = nil
     ) -> String? {
+        if let taskID = authorization.taskID,
+           let runID = taskContract(forCausalTaskID: taskID)?.continuationRunID {
+            if let claim = continuationRunCloseClaims[runID] {
+                return "ContinuationRun is closed: \(claim.reason)"
+            }
+            if (continuationRunCloseInstallations[runID] ?? 0) > 0 {
+                return "ContinuationRun close is being durably installed"
+            }
+        }
         if let binding = authorization.targetAgentInferenceBinding {
             guard case .string(let reviewedFingerprint)? =
                     authorization.intent.metadata["targetInferenceFingerprint"],
@@ -7826,26 +8412,34 @@ public actor Orchestrator {
     ) -> [AgentID: CapabilityLeaseID] {
         var result: [AgentID: CapabilityLeaseID] = [:]
         let candidates = projection.capabilityLeaseAgents.compactMap {
-            leaseID, agent -> (agent: AgentID, leaseID: CapabilityLeaseID, mainControlScore: Int)? in
+            leaseID, agent -> (agent: AgentID, leaseID: CapabilityLeaseID, currentSurfaceScore: Int)? in
             guard agent != Self.automaticPermissionReviewerID,
                   let lease = projection.capabilityLeases[leaseID],
                   lease.taskID == nil,
                   !taskLeaseIDs.contains(leaseID),
                   capabilityLeases[leaseID] != nil else { return nil }
+            var currentSurfaceScore = 0
+            if lease.tools.contains(.replyMessage),
+               lease.tools.contains(.requestInformation) {
+                currentSurfaceScore += 1
+            }
+            if agent == Self.mainAgentID {
+                currentSurfaceScore += [
+                    ToolCapability.renameSession,
+                    ToolCapability.submitGoalVerdict,
+                    ToolCapability.controlRun,
+                ].reduce(into: 0) { score, capability in
+                    if lease.tools.contains(capability) { score += 1 }
+                }
+            }
             return (
                 agent: agent,
                 leaseID: leaseID,
-                mainControlScore: [
-                    ToolCapability.renameSession,
-                    ToolCapability.submitGoalVerdict,
-                ].reduce(into: 0) { score, capability in
-                    if lease.tools.contains(capability) { score += 1 }
-                })
+                currentSurfaceScore: currentSurfaceScore)
         }.sorted {
             if $0.agent == $1.agent {
-                if $0.agent == Self.mainAgentID,
-                   $0.mainControlScore != $1.mainControlScore {
-                    return $0.mainControlScore > $1.mainControlScore
+                if $0.currentSurfaceScore != $1.currentSurfaceScore {
+                    return $0.currentSurfaceScore > $1.currentSurfaceScore
                 }
                 return $0.leaseID.rawValue < $1.leaseID.rawValue
             }
@@ -7868,6 +8462,7 @@ public actor Orchestrator {
         let requiredCapabilities: Set<ToolCapability> = [
             .renameSession,
             .submitGoalVerdict,
+            .controlRun,
         ]
         guard registry.agent(Self.mainAgentID) != nil,
               let oldID = defaultCapabilityLeaseIDs[Self.mainAgentID],
@@ -7913,6 +8508,72 @@ public actor Orchestrator {
         }
         capabilityLeases[upgraded.id] = upgraded
         defaultCapabilityLeaseIDs[Self.mainAgentID] = upgraded.id
+    }
+
+    /// Legacy worker defaults predate correlation-safe information follow-ups.
+    /// Adding requestInformation to a reply-only default does not itself grant
+    /// initiation: normal worker invocations remain reply-only. It lets the
+    /// host derive an exact-sender selectedAgents lease only for an information
+    /// reply receipt, where based_on is also durably validated.
+    private func upgradeMailboxFollowupCapabilitiesIfNeeded(
+        referencedLeaseIDs: Set<CapabilityLeaseID>
+    ) async {
+        let candidates = defaultCapabilityLeaseIDs.keys.sorted {
+            $0.rawValue < $1.rawValue
+        }
+        for agentID in candidates {
+            guard agentID != Self.automaticPermissionReviewerID,
+                  let oldID = defaultCapabilityLeaseIDs[agentID],
+                  let oldLease = capabilityLeases[oldID],
+                  oldLease.taskID == nil,
+                  oldLease.tools.contains(.replyMessage),
+                  !oldLease.tools.contains(.requestInformation) else { continue }
+            switch oldLease.communication {
+            case .none:
+                continue
+            case .replyOnly, .selectedAgents, .taskGroup, .anyAgentInThread:
+                break
+            }
+
+            var upgraded = oldLease
+            upgraded.id = CapabilityLeaseID.new()
+            upgraded.taskID = nil
+            upgraded.tools.insert(.requestInformation)
+            upgraded.expiresAtTaskCompletion = false
+            let revokeOld = !referencedLeaseIDs.contains(oldID)
+            var events: [Event] = []
+            if revokeOld {
+                events.append(.capabilityLeaseRevoked(CapabilityLeaseRevokedPayload(
+                    agent: agentID,
+                    leaseID: oldID,
+                    reason: "replace legacy default with correlation-safe mailbox follow-up capability",
+                    metadata: CoworkEventMetadata(
+                        agentID: agentID,
+                        capabilityLeaseID: oldID,
+                        scope: .capability))))
+            }
+            events.append(.capabilityLeaseCreated(CapabilityLeaseCreatedPayload(
+                agent: agentID,
+                lease: upgraded,
+                metadata: CoworkEventMetadata(
+                    agentID: agentID,
+                    capabilityLeaseID: upgraded.id,
+                    scope: .capability))))
+
+            do {
+                try await appendAdmissionEvents(events)
+            } catch {
+                try? await log.append(.error(ErrorPayload(
+                    code: "restore_mailbox_followup_capability_upgrade_failed",
+                    message: "@\(agentID.rawValue): \(error.localizedDescription)")))
+                continue
+            }
+            if revokeOld {
+                capabilityLeases[oldID] = nil
+            }
+            capabilityLeases[upgraded.id] = upgraded
+            defaultCapabilityLeaseIDs[agentID] = upgraded.id
+        }
     }
 
     private func deterministicDefaultWorkspaceLeases(
@@ -7965,6 +8626,8 @@ public actor Orchestrator {
                     kind: AgentCommunicationKind.requestInformation.rawValue,
                     taskID: payload.taskID,
                     causalParentID: payload.metadata?.causalParentID,
+                    conversationID: payload.conversationID,
+                    basedOn: payload.basedOn,
                     createdAt: payload.metadata?.createdAt ?? envelope.ts)
             case .informationReplied(let payload):
                 guard payload.to == agent, pendingIDs.contains(payload.replyID) else { continue }
@@ -7977,6 +8640,7 @@ public actor Orchestrator {
                     taskID: payload.taskID,
                     causalParentID: payload.metadata?.causalParentID,
                     inReplyTo: payload.inReplyTo,
+                    conversationID: payload.conversationID,
                     createdAt: payload.metadata?.createdAt ?? envelope.ts)
             case .delegationRequested(let payload):
                 let messageID = MessageID(rawValue: payload.requestID.rawValue)
@@ -8033,18 +8697,26 @@ public actor Orchestrator {
             .readPDF,
             .readWorkTasks,
             .readGoal,
-            .replyMessage,
         ]
-        if authorityClass == .delegationRequest {
+        switch authorityClass {
+        case .informationRequest:
+            allowedTools.insert(.replyMessage)
+        case .informationReply:
+            allowedTools.insert(.requestInformation)
+        case .delegationRequest:
             allowedTools.insert(.delegateTask)
+        case .ordinaryMessage:
+            break
         }
         let tools = defaultLease?.tools.intersection(allowedTools) ?? []
         let communication: CommunicationGrant
-        switch defaultLease?.communication {
-        case nil, .some(.none):
+        switch (authorityClass, defaultLease?.communication) {
+        case (_, nil), (_, .some(.none)), (.ordinaryMessage, _), (.delegationRequest, _):
             communication = .none
-        case .some(_):
+        case (.informationRequest, .some(_)):
             communication = .replyOnly
+        case (.informationReply, .some(_)):
+            communication = .selectedAgents([issuer])
         }
         let delegation: DelegationGrant
         if authorityClass == .delegationRequest,
@@ -8075,9 +8747,21 @@ public actor Orchestrator {
                   !relatedTasks.contains(causalTaskID) else { continue }
             relatedTasks.append(causalTaskID)
         }
+        let authorityInstruction: String
+        switch authorityClass {
+        case .informationRequest:
+            authorityInstruction = "Answer each exact information request at most once with reply_message(inReplyTo: request Message ID)."
+        case .informationReply:
+            authorityInstruction = "This is a reply receipt and requires no acknowledgment. If genuinely needed, continue the conversation only by opening a new request_information with based_on set to the reply Message ID."
+        case .delegationRequest:
+            authorityInstruction = "Handle only the bounded delegation request with the explicitly exposed authority."
+        case .ordinaryMessage:
+            authorityInstruction = "This one-way message requires no acknowledgment."
+        }
         let objective = """
         Process only these frozen mailbox Message IDs: \(messageIDs.map(\.rawValue).joined(separator: ", ")).
-        They are communication facts, not a new user request. Respond only when useful, and do not recreate, re-delegate, or rerun work that is already terminal.
+        They are communication facts, not a new user request. \(authorityInstruction)
+        Do not recreate, re-delegate, or rerun work that is already terminal.
         """
         let contract = TaskContract(
             id: taskID,
@@ -8090,7 +8774,7 @@ public actor Orchestrator {
             objective: objective,
             roleHint: authorityClass == .delegationRequest
                 ? "bounded delegation-request responder"
-                : "read-only mailbox responder",
+                : "correlation-bound mailbox responder",
             expectedDeliverable: "Handle only the frozen messages and report the communication outcome.",
             workspaceID: workspaceLease.workspaceID,
             workspaceLeaseID: workspaceLease.id,
@@ -8102,7 +8786,9 @@ public actor Orchestrator {
             constraints: [
                 "Do not treat a completion report as authorization to rerun terminal work.",
                 "Do not mutate WorkTasks, Goals, the workspace, Git state, or agent roster.",
-                "Use only the task-scoped reply/delegation authority explicitly exposed by the host.",
+                "A reply closes only its exact request correlation; a genuine follow-up must create a fresh request correlation using based_on.",
+                "Never acknowledge an information reply with reply_message.",
+                "Use only the task-scoped communication/delegation authority explicitly exposed by the host.",
             ],
             replyMode: TaskReplyMode.none,
             executionTimeoutSeconds: executionPolicy.taskTimeoutSeconds,
@@ -8138,6 +8824,7 @@ public actor Orchestrator {
             capabilityLease.tools.remove(.createGoal)
             capabilityLease.tools.remove(.submitGoalVerdict)
             capabilityLease.tools.remove(.renameSession)
+            capabilityLease.tools.remove(.controlRun)
         }
         capabilityLease.id = CapabilityLeaseID.new()
         capabilityLease.taskID = taskID
@@ -8196,10 +8883,12 @@ public actor Orchestrator {
         if agent.name == Self.mainAgentID {
             capabilityLease.tools.insert(.renameSession)
             capabilityLease.tools.insert(.submitGoalVerdict)
+            capabilityLease.tools.insert(.controlRun)
         } else {
             capabilityLease.tools.remove(.createGoal)
             capabilityLease.tools.remove(.submitGoalVerdict)
             capabilityLease.tools.remove(.renameSession)
+            capabilityLease.tools.remove(.controlRun)
         }
         capabilityLease.expiresAtTaskCompletion = false
         return (capabilityLease, workspaceLease)
@@ -8231,6 +8920,7 @@ public actor Orchestrator {
         tools.remove(.createGoal)
         tools.remove(.submitGoalVerdict)
         tools.remove(.renameSession)
+        tools.remove(.controlRun)
 
         let communication: CommunicationGrant
         if canCoordinate {
@@ -8350,6 +9040,7 @@ public actor Orchestrator {
         scoped.tools.remove(.createGoal)
         scoped.tools.remove(.submitGoalVerdict)
         scoped.tools.remove(.renameSession)
+        scoped.tools.remove(.controlRun)
         return scoped
     }
 
@@ -8594,9 +9285,13 @@ public actor Orchestrator {
         if isGoalRunCancellationRequested(
             goalID: task.contract.goalID,
             continuationRunID: task.contract.continuationRunID) {
+            let closeSource = task.contract.continuationRunID
+                .flatMap { continuationRunCloseClaims[$0]?.source }
+                ?? .user
             _ = await cancelBeforeExecution(
                 task,
                 reason: "Goal continuation cancellation is pending",
+                runCloseSource: closeSource,
                 wasClaimed: true)
             executionDidFinish(taskID)
             return
@@ -8720,11 +9415,19 @@ public actor Orchestrator {
             } else {
                 let usageLimit = error as? ProviderUsageLimitError
                 let durableMessage = RuntimeErrorPresentation.message(for: error)
+                let runCloseOutcome: ContinuationRunCloseOutcome
+                switch error as? CoworkTaskExecutionError {
+                case .timedOut?:
+                    runCloseOutcome = .timedOut
+                default:
+                    runCloseOutcome = .failed
+                }
                 let failurePersisted = await finishFailedTask(
                     task,
                     message: durableMessage,
                     metadata: metadata,
-                    failureCode: usageLimit == nil ? nil : .providerUsageLimit)
+                    failureCode: usageLimit == nil ? nil : .providerUsageLimit,
+                    runCloseOutcome: runCloseOutcome)
                 if failurePersisted,
                    usageLimit != nil,
                    let goalID = task.contract.goalID,
@@ -8931,7 +9634,18 @@ public actor Orchestrator {
     private func finishFailedTask(_ task: ScheduledTask,
                                   message: String,
                                   metadata: CoworkEventMetadata,
-                                  failureCode: TaskFailureCode? = nil) async -> Bool {
+                                  failureCode: TaskFailureCode? = nil,
+                                  runCloseOutcome: ContinuationRunCloseOutcome = .failed) async -> Bool {
+        do {
+            _ = try await closeRootRunIfNeeded(
+                for: task,
+                outcome: runCloseOutcome,
+                source: .runtime,
+                reason: message)
+        } catch {
+            await recordTerminalPersistenceFailure(task: task, error: error)
+            return false
+        }
         await terminal.terminate(
             taskID: task.contract.id,
             reason: "task failed")
@@ -8989,6 +9703,16 @@ public actor Orchestrator {
     private func finishCancelledTask(_ task: ScheduledTask,
                                      reason: String,
                                      metadata: CoworkEventMetadata) async -> Bool {
+        do {
+            _ = try await closeRootRunIfNeeded(
+                for: task,
+                outcome: .cancelled,
+                source: cancellationRunCloseSources[task.contract.id] ?? .runtime,
+                reason: reason)
+        } catch {
+            await recordTerminalPersistenceFailure(task: task, error: error)
+            return false
+        }
         await terminal.terminate(
             taskID: task.contract.id,
             reason: reason)
@@ -9209,7 +9933,22 @@ public actor Orchestrator {
 
     @discardableResult
     private func cancelUnqueuedRootTask(_ task: ScheduledTask,
-                                        reason: String) async -> Bool {
+                                        reason: String,
+                                        runCloseSource: ContinuationRunCloseSource? = nil) async -> Bool {
+        if let runCloseSource {
+            do {
+                _ = try await closeRootRunIfNeeded(
+                    for: task,
+                    outcome: .cancelled,
+                    source: runCloseSource,
+                    reason: reason)
+            } catch {
+                terminalPersistenceFailures[task.contract.id] =
+                    "Run closure could not be persisted before root task cancellation: \(error.localizedDescription)"
+                completeResultWaiters(task.contract.id)
+                return false
+            }
+        }
         let metadata = taskMetadata(
             contract: task.contract,
             rootTaskID: task.rootTaskID,
@@ -9262,6 +10001,11 @@ public actor Orchestrator {
         goalID: GoalID?,
         continuationRunID: ContinuationRunID?
     ) -> Bool {
+        if let continuationRunID,
+           continuationRunCloseClaims[continuationRunID] != nil
+            || (continuationRunCloseInstallations[continuationRunID] ?? 0) > 0 {
+            return true
+        }
         guard let goalID else { return false }
         if cancelledGoalRunScopes.contains(GoalRunCancellationScope(
             goalID: goalID,
@@ -9385,6 +10129,7 @@ public actor Orchestrator {
         runningExecutions.removeValue(forKey: taskID)
         rootInvocations.removeValue(forKey: taskID)
         cancellationReasons.removeValue(forKey: taskID)
+        cancellationRunCloseSources.removeValue(forKey: taskID)
         restoredPendingTaskIDs.remove(taskID)
         if resumeScheduler {
             ensureSchedulerRunning()
@@ -9550,6 +10295,39 @@ public actor Orchestrator {
             ?? scheduler.knownTask(taskID: taskID)?.contract
     }
 
+    private func completeKnownCommunicationHistory() async throws -> [Envelope] {
+        let replay = try await log.replayForProjectionChecked()
+        guard replay.hasCompleteKnownHistory else {
+            throw EventLogError.incompleteEventHistory
+        }
+        return replay.envelopes
+    }
+
+    private static func sameCommunicationScope(
+        _ lhs: TaskContract,
+        _ rhs: TaskContract
+    ) -> Bool {
+        lhs.goalID == rhs.goalID
+            && lhs.continuationRunID == rhs.continuationRunID
+            && lhs.submissionID == rhs.submissionID
+    }
+
+    private func communicationScopeMatches(
+        _ current: TaskContract,
+        causalTaskID: TaskID?
+    ) -> Bool {
+        if let origin = taskContract(forCausalTaskID: causalTaskID) {
+            return Self.sameCommunicationScope(current, origin)
+        }
+        // Legacy and host-direct information requests may have no causal task.
+        // Accept only that exact nil shape into an equally unscoped mailbox
+        // delivery. A nonnil but unknown task ID must remain fail closed.
+        return causalTaskID == nil
+            && current.goalID == nil
+            && current.continuationRunID == nil
+            && current.submissionID == nil
+    }
+
     private func communicationCancellationFailure(taskID: TaskID?) -> String? {
         if Task.isCancelled {
             return "communication was cancelled"
@@ -9559,6 +10337,10 @@ public actor Orchestrator {
             goalID: contract?.goalID,
             continuationRunID: contract?.continuationRunID) else {
             return nil
+        }
+        if let runID = contract?.continuationRunID,
+           let claim = continuationRunCloseClaims[runID] {
+            return "ContinuationRun is closed: \(claim.reason)"
         }
         return "Goal continuation cancellation is pending"
     }
@@ -9975,7 +10757,8 @@ public actor Orchestrator {
 
     static func toolRegistry(for lease: CapabilityLease,
                              agentID: AgentID? = nil,
-                             includesTerminal: Bool = true) -> ToolRegistry {
+                             includesTerminal: Bool = true,
+                             canControlRun: Bool = false) -> ToolRegistry {
         var registrations: [ToolRegistration] = []
         func register(
             _ tools: [any Tool],
@@ -10093,6 +10876,13 @@ public actor Orchestrator {
         }
         if agentID == mainAgentID, lease.tools.contains(.renameSession) {
             register([RenameSessionTool()], granting: [.renameSession])
+        }
+        if canControlRun,
+           agentID == mainAgentID,
+           lease.tools.contains(.controlRun) {
+            register(
+                [FinishRunTool(), StopRunTool()],
+                granting: [.controlRun])
         }
         let canInitiateCommunication: Bool
         switch lease.communication {
@@ -10226,7 +11016,9 @@ public actor Orchestrator {
 }
 
 private enum MailboxDeliveryAuthorityClass: Sendable, Hashable {
-    case ordinaryReply
+    case ordinaryMessage
+    case informationRequest
+    case informationReply
     case delegationRequest
 }
 
@@ -10355,11 +11147,18 @@ struct BusMessenger: AgentMessenger {
         await orchestrator.sendMessage(from: from, to: agent, content: content, taskID: currentTaskID)
     }
 
-    func requestInformation(to agent: String, question: String) async -> String {
-        await orchestrator.requestInformation(from: from, to: agent, question: question, taskID: currentTaskID)
+    func requestInformation(to agent: String,
+                            question: String,
+                            basedOn: String?) async -> String {
+        await orchestrator.requestInformation(
+            from: from,
+            to: agent,
+            question: question,
+            basedOn: basedOn,
+            taskID: currentTaskID)
     }
 
-    func replyMessage(to agent: String, content: String, inReplyTo: String?) async -> String {
+    func replyMessage(to agent: String, content: String, inReplyTo: String) async -> String {
         await orchestrator.replyMessage(from: from, to: agent, content: content, inReplyTo: inReplyTo, taskID: currentTaskID)
     }
 
@@ -10385,6 +11184,21 @@ struct BusMessenger: AgentMessenger {
             roleHint: roleHint,
             expectedDeliverable: expectedDeliverable,
             parentTaskID: currentTaskID)
+    }
+}
+
+/// Invocation-bound adapter used only when the tool registry has already
+/// proven this is the exact @main root of a ContinuationRun.
+struct OrchestratorRunController: RunController {
+    let currentTaskID: TaskID?
+    let orchestrator: Orchestrator
+
+    func requestClose(outcome: ContinuationRunCloseOutcome,
+                      reason: String) async -> String {
+        await orchestrator.requestContinuationRunClose(
+            currentTaskID: currentTaskID,
+            outcome: outcome,
+            reason: reason)
     }
 }
 

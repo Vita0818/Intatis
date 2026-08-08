@@ -161,6 +161,10 @@ final class ContextProjectionTests: XCTestCase {
         XCTAssertTrue(coordinator.contains("instead of waiting idly"))
         XCTAssertTrue(coordinator.contains("effective team and least authority"))
         XCTAssertTrue(coordinator.contains("Keep advancing the request until the outcome is verified"))
+        XCTAssertTrue(coordinator.contains("When finish_run is advertised"))
+        XCTAssertTrue(coordinator.contains("host to the current ContinuationRun"))
+        XCTAssertTrue(coordinator.contains("mailbox replies as correlation-scoped"))
+        XCTAssertTrue(coordinator.contains("based_on set to that reply Message ID"))
 
         let worker = ContextBuilder.coworkSystemPrompt(
             name: "worker",
@@ -171,6 +175,8 @@ final class ContextProjectionTests: XCTestCase {
             IntatisBundledSkills.coworkAgentOrchestrationName))
         XCTAssertFalse(worker.contains("system:bundle-"))
         XCTAssertFalse(worker.contains("Proactively drive the user's requested outcome"))
+        XCTAssertTrue(worker.contains("reply requires no acknowledgment"))
+        XCTAssertTrue(worker.contains("request_information correlation"))
     }
 
     func testCoordinatorPromptRoutesExternalDirectoryWorkThroughSpawnedAgent() {

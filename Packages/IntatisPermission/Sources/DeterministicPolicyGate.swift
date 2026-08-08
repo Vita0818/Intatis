@@ -166,6 +166,9 @@ public struct DeterministicPolicyGate: Sendable {
         if controls.contains(.submitGoalVerdict) {
             return .pass(reason: "submit goal verification verdict", risk: .low)
         }
+        if controls.contains(.closeRun) {
+            return .pass(reason: "close the current continuation run", risk: .low)
+        }
         if controls.contains(.grantCapability) {
             return .pass(reason: "grant agent capability", risk: .high)
         }

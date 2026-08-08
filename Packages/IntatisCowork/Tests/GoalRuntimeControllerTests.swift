@@ -555,7 +555,7 @@ final class GoalRuntimeControllerTests: XCTestCase {
                 await sendCalls.increment()
                 return .sent
             },
-            cancelGoalInvocations: { goalID, runID, _ in
+            cancelGoalInvocations: { goalID, runID, _, _ in
                 XCTAssertEqual(goalID, activeGoal.id)
                 XCTAssertEqual(runID, createdRun.id)
                 await cancellationCalls.increment()
@@ -609,7 +609,7 @@ final class GoalRuntimeControllerTests: XCTestCase {
                 await sendCalls.increment()
                 return .sent
             },
-            cancelGoalInvocations: { goalID, runID, _ in
+            cancelGoalInvocations: { goalID, runID, _, _ in
                 XCTAssertEqual(goalID, activeGoal.id)
                 XCTAssertEqual(runID, createdRun.id)
                 await cancellationCalls.increment()
@@ -665,7 +665,7 @@ final class GoalRuntimeControllerTests: XCTestCase {
             verifierProvider: { verifier },
             verifierModel: { ModelID(rawValue: "verifier") },
             sendOperation: { _, _, _, _, _, _, _, _ in .sent },
-            cancelGoalInvocations: { _, _, _ in
+            cancelGoalInvocations: { _, _, _, _ in
                 await cancellationCalls.increment()
                 await schedulerBarrier.wait()
                 return true
@@ -1175,7 +1175,7 @@ final class GoalRuntimeControllerTests: XCTestCase {
             resumePendingInvocations: {
                 await resumeCalls.increment()
             },
-            cancelGoalInvocations: { _, _, _ in
+            cancelGoalInvocations: { _, _, _, _ in
                 await cancellationBarrier.wait()
                 return true
             })
@@ -1325,7 +1325,7 @@ final class GoalRuntimeControllerTests: XCTestCase {
             waitForGoalSchedulerIdle: { goalID, runID in
                 await hookRecorder.record(.wait(goalID, runID))
             },
-            cancelGoalInvocations: { goalID, runID, _ in
+            cancelGoalInvocations: { goalID, runID, _, _ in
                 XCTAssertEqual(goalID, goal.id)
                 XCTAssertEqual(runID, createdRun.id)
                 await cancellationCalls.increment()
@@ -1382,7 +1382,7 @@ final class GoalRuntimeControllerTests: XCTestCase {
                 await sendCalls.increment()
                 return .sent
             },
-            cancelGoalInvocations: { cancelledGoalID, _, _ in
+            cancelGoalInvocations: { cancelledGoalID, _, _, _ in
                 XCTAssertEqual(cancelledGoalID, goal.id)
                 await cancellationCalls.increment()
                 return true
@@ -1957,7 +1957,7 @@ final class GoalRuntimeControllerTests: XCTestCase {
                     return .failed("cancelled by host control")
                 }
             },
-            cancelActiveInvocations: { reason in
+            cancelActiveInvocations: { reason, _ in
                 await cancellations.record(reason)
             })
 

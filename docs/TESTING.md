@@ -1,7 +1,7 @@
 # TESTING
 
 文档状态：当前验证矩阵
-最近核对：2026-08-07
+最近核对：2026-08-08
 产品基线：v0.38（build 38）
 
 历史测试数量、性能数字和事故复验保留在 Git 历史及 dated reports；它们不能替代当前
@@ -154,6 +154,11 @@ recovery App metadata/architecture/signature/entitlements 重新验证；超时�
 - 旧 JSONL 仍可解码，`seq` 单调，append/batch first-write/first-terminal 语义不变；
 - permission RequestID/FIFO/correlation、manual decline 与 cancel-turn 语义不混淆；
 - tool authorization、durable ticket、executor result 和 turn outcome 关联完整；
+- current-run close 只向 exact `@main` root 暴露，模型不得提供 identity；in-flight tombstone 必须先挡住
+  重入 admission/authorization，RunID first-write claim 必须早于旧 admission wait 与 cleanup/drain 落盘，
+  只 drain 同 run、保留 typed source，恢复不得复活 closed run，普通 final 不伪造 claim；
+- mailbox ordinary message 不 ACK；information request 只接受一个 exact `inReplyTo` terminal reply；
+  information reply receipt 只能用 fresh RequestID + `based_on` 延续同 conversation，不能形成 ACK 环；
 - path escape、symlink/hardlink、secret、credential path、workspace lease fail closed；
 - 只有持有 coordinator lease 的 Cowork prompt 才主动建立 execution objective、检查并激活明确相关的
   exact Skills、为非简单工作维护最小 WorkTask DAG、在收益成立时尽早委派并继续自己的关键路径，
@@ -322,6 +327,27 @@ routing options、结构化 unsupported 同路由一次降级、裸 404 拒绝�
   线上 provider smoke 必须单独记录，不能从离线测试或编译外推。
 
 ## 最近一次真实结果
+
+2026-08-08 Cowork current-run 终态控制与 correlation-scoped mailbox 修复的直接证据：
+
+- 新增 `finish_run` / `stop_run`、host-bound RunController、`continuation_run_close_requested`
+  first-write claim、in-flight admission/authorization tombstone、restore/drain fence，以及 information
+  request/reply 的 `conversationID` / `basedOn` 协议和 authority-class 窄租约；普通 message/reply
+  receipt 均不 ACK，实质追问使用 fresh RequestID；
+- run control、mailbox correlation、协议 round-trip、EventLog CAS/projection、tool registry/legacy lease
+  migration、prompt、bundled Skill、permission 与 non-replayable mailbox side-effect focused tests 均通过；
+  完整 `IntatisCoworkTests` 为 341 tests / 0 failures；完整 `swift test` 退出 0，其中
+  `IntatisAgentKernelTests` 175 tests、`IntatisSharedUITests` 141 tests，所有已运行 target 均为
+  0 failures；
+- `cowork-agent-orchestration` 通过仓内 `quick_validate.py`；`xcodegen generate` 通过；
+  `scripts/check-version-consistency.sh` 输出 `Intatis version is consistent: 0.38 (build 38)`；
+- `IntatisMac` macOS Debug unsigned build 与 `IntatisiOS` generic Simulator Debug unsigned build
+  均退出 0；读回两个最终 bundle 均为 `0.38 (38)`。构建只报告仓库既有的 unused-result /
+  deprecated `onChange` warning；
+- 按 `computer-use` Skill 通过 Sky 分别尝试按刚构建 App 的绝对路径、bundle ID 启动，并尝试列举
+  apps；所有调用都在服务启动层返回 `Sky Computer Use service startup request failed`，因此本轮没有把 UI 启动、真实 provider
+  自主调用工具或长时多 agent 会话标为已验证。未安装 App，未运行 Developer ID 正式签名、
+  公证、staple、Gatekeeper 或 DMG/ZIP 打包。
 
 2026-08-07 `v0.38 (38)` 版本推进的直接证据：
 

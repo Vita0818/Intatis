@@ -433,6 +433,7 @@ public struct AgentLoop: Sendable {
     private let agentManager: AgentManager?
     private let workTaskManager: WorkTaskManager?
     private let goalManager: GoalManager?
+    private let runController: RunController?
     private let imageGenerator: ImageGenerationToolService?
     private let sessionNaming: SessionNamingService?
     private let reasoningEffort: ReasoningEffort?
@@ -464,6 +465,7 @@ public struct AgentLoop: Sendable {
                 agentManager: AgentManager? = nil,
                 workTaskManager: WorkTaskManager? = nil,
                 goalManager: GoalManager? = nil,
+                runController: RunController? = nil,
                 imageGenerator: ImageGenerationToolService? = nil,
                 sessionNaming: SessionNamingService? = nil,
                 reasoningEffort: ReasoningEffort? = nil,
@@ -494,6 +496,7 @@ public struct AgentLoop: Sendable {
         self.agentManager = agentManager
         self.workTaskManager = workTaskManager
         self.goalManager = goalManager
+        self.runController = runController
         self.imageGenerator = imageGenerator
         self.sessionNaming = sessionNaming
         self.reasoningEffort = reasoningEffort
@@ -2244,6 +2247,7 @@ public struct AgentLoop: Sendable {
                                       agentManager: agentManager,
                                       workTaskManager: workTaskManager,
                                       goalManager: goalManager,
+                                      runController: runController,
                                       imageGenerator: imageGenerator,
                                       sessionNaming: sessionNaming,
                                       executionID: executionID,

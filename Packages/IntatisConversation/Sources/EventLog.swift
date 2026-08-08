@@ -36,6 +36,7 @@ public enum EventLogError: Error, Equatable, LocalizedError, Sendable {
     case permissionRequestNotFound
     case conflictingPermissionRequest
     case conflictingPermissionSettlement
+    case conflictingContinuationRunCloseClaim
 
     public var errorDescription: String? {
         switch self {
@@ -85,6 +86,8 @@ public enum EventLogError: Error, Equatable, LocalizedError, Sendable {
             return "The session contains conflicting records for the same permission request."
         case .conflictingPermissionSettlement:
             return "The permission request already has a different terminal response."
+        case .conflictingContinuationRunCloseClaim:
+            return "The continuation run contains conflicting durable close claims."
         }
     }
 
@@ -115,6 +118,8 @@ public enum EventLogError: Error, Equatable, LocalizedError, Sendable {
         case .permissionRequestNotFound,
              .conflictingPermissionRequest, .conflictingPermissionSettlement:
             return "Reload the session from its canonical event log and inspect the permission history before retrying."
+        case .conflictingContinuationRunCloseClaim:
+            return "Reload the session from its canonical event log and inspect the continuation-run close history before retrying."
         }
     }
 }
@@ -305,6 +310,26 @@ public struct PermissionRequestRegistrationResult: Equatable, Sendable {
         self.envelope = envelope
         self.request = request
         self.didAppend = didAppend
+    }
+}
+
+/// Result of the ContinuationRunID-scoped first-write close claim. A caller
+/// that loses a race receives the canonical first claim with `matchesRequest`
+/// false and must honor that winner rather than appending another outcome.
+public struct ContinuationRunCloseClaimResult: Equatable, Sendable {
+    public let envelope: Envelope
+    public let claim: ContinuationRunCloseRequestedPayload
+    public let didAppend: Bool
+    public let matchesRequest: Bool
+
+    public init(envelope: Envelope,
+                claim: ContinuationRunCloseRequestedPayload,
+                didAppend: Bool,
+                matchesRequest: Bool) {
+        self.envelope = envelope
+        self.claim = claim
+        self.didAppend = didAppend
+        self.matchesRequest = matchesRequest
     }
 }
 
@@ -1053,6 +1078,86 @@ public actor EventLog {
             envelope: envelope,
             request: canonicalRequest,
             didAppend: true)
+    }
+
+    /// Atomically installs the first admission-closing claim for one exact
+    /// ContinuationRunID. The complete-known-history proof and append share the
+    /// event-log lock, so separate runtime instances cannot both win. An exact
+    /// replay is idempotent; a different request observes the canonical winner.
+    public func claimContinuationRunClose(
+        _ request: ContinuationRunCloseRequestedPayload,
+        ts: Date = Date()
+    ) throws -> ContinuationRunCloseClaimResult {
+        guard request.sessionID == session else {
+            throw EventLogError.sessionMismatch
+        }
+
+        let lock = try EventLogFileLock.acquire(at: lockURL, mode: .exclusive)
+        defer { lock.release() }
+
+        try Self.recoverJournalIfNeeded(
+            fileURL: fileURL,
+            journalURL: journalURL,
+            temporaryURL: journalTemporaryURL,
+            session: session,
+            decoder: decoder)
+        let data = try Self.readLogData(at: fileURL)
+        let scan = try Self.checkedScan(
+            data: data,
+            expectedSession: session,
+            decoder: decoder,
+            from: 0)
+        guard !scan.containsUnknownEventTypes else {
+            throw EventLogError.unsupportedEventTypes
+        }
+        guard scan.envelopes.enumerated().allSatisfy({ offset, envelope in
+            envelope.seq == offset
+        }) else {
+            throw EventLogError.incompleteEventHistory
+        }
+
+        var first: (Envelope, ContinuationRunCloseRequestedPayload)?
+        for envelope in scan.envelopes {
+            guard case .continuationRunCloseRequested(let existing) = envelope.event,
+                  existing.runID == request.runID else { continue }
+            if let first {
+                guard first.1 == existing else {
+                    throw EventLogError.conflictingContinuationRunCloseClaim
+                }
+            } else {
+                first = (envelope, existing)
+            }
+        }
+        if let first {
+            nextSeq = max(nextSeq, scan.nextSeq)
+            return ContinuationRunCloseClaimResult(
+                envelope: first.0,
+                claim: first.1,
+                didAppend: false,
+                matchesRequest: first.1 == request)
+        }
+
+        let state = try Self.tailSequenceState(
+            at: fileURL,
+            expectedSession: session,
+            decoder: decoder)
+        guard state.nextSeq >= nextSeq else {
+            throw EventLogError.sequenceRegressed(
+                expectedAtLeast: nextSeq,
+                found: state.nextSeq)
+        }
+        guard let envelope = try persistLocked(
+            [.continuationRunCloseRequested(request)],
+            ts: ts,
+            state: state).first,
+              case .continuationRunCloseRequested(let canonical) = envelope.event else {
+            preconditionFailure("a run close claim append must persist one claim")
+        }
+        return ContinuationRunCloseClaimResult(
+            envelope: envelope,
+            claim: canonical,
+            didAppend: true,
+            matchesRequest: true)
     }
 
     /// Appends a fresh-session bootstrap only if no durable Envelope header is

@@ -339,8 +339,12 @@ public enum AgentMessengerReply: Equatable, Sendable {
 public protocol AgentMessenger: Sendable {
     func ask(to agent: String, question: String) async -> AgentMessengerReply
     func sendMessage(to agent: String, content: String) async -> String
-    func requestInformation(to agent: String, question: String) async -> String
-    func replyMessage(to agent: String, content: String, inReplyTo: String?) async -> String
+    func requestInformation(to agent: String,
+                            question: String,
+                            basedOn: String?) async -> String
+    func replyMessage(to agent: String,
+                      content: String,
+                      inReplyTo: String) async -> String
     func requestDelegation(objective: String, reason: String) async -> String
     func delegateTask(authorization: ResolvedToolAuthorization,
                       to agent: String?,
@@ -348,6 +352,14 @@ public protocol AgentMessenger: Sendable {
                       objective: String?,
                       roleHint: String?,
                       expectedDeliverable: String?) async -> String
+}
+
+/// Host-bound control-plane seam for the exact ContinuationRun that owns an
+/// invocation. Tools never accept a session/run/task identifier from the
+/// model; the Cowork host resolves those identities before exposing them.
+public protocol RunController: Sendable {
+    func requestClose(outcome: ContinuationRunCloseOutcome,
+                      reason: String) async -> String
 }
 
 /// Seam for agent lifecycle management (v0.3 coordinator). Cowork provides an
@@ -398,6 +410,7 @@ public struct ToolContext: Sendable {
     public let agentManager: AgentManager?
     public let workTaskManager: WorkTaskManager?
     public let goalManager: GoalManager?
+    public let runController: RunController?
     public let imageGenerator: ImageGenerationToolService?
     /// Host service bound to the session that owns this exact invocation.
     /// The model never supplies a session identifier.
@@ -427,6 +440,7 @@ public struct ToolContext: Sendable {
                 agentManager: AgentManager? = nil,
                 workTaskManager: WorkTaskManager? = nil,
                 goalManager: GoalManager? = nil,
+                runController: RunController? = nil,
                 imageGenerator: ImageGenerationToolService? = nil,
                 sessionNaming: SessionNamingService? = nil,
                 executionID: String? = nil,
@@ -505,6 +519,7 @@ public struct ToolContext: Sendable {
         self.agentManager = agentManager
         self.workTaskManager = workTaskManager
         self.goalManager = goalManager
+        self.runController = runController
         self.imageGenerator = imageGenerator
         self.sessionNaming = sessionNaming
         self.executionID = executionID

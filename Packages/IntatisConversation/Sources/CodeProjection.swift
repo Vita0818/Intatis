@@ -642,6 +642,7 @@ public struct CodeProjection: Equatable, Sendable {
              .goalContinuationScheduled, .goalProgressed, .goalBlocked,
              .goalBudgetLimited, .goalUsageLimited, .goalCompleted, .goalCleared,
              .continuationRunCreated, .continuationRunStarted, .continuationRunCheckpointed,
+             .continuationRunCloseRequested,
              .continuationRunCompleted, .continuationRunCancelled, .continuationRunRecovered,
              .artifactProgress, .turnStats,
              .mcpServerAttached, .mcpServerDetached, .mcpAttachmentPolicyUpdated,

@@ -1,7 +1,7 @@
 # COWORK_PRINCIPLES
 
 文档状态：当前 Cowork/AgentKernel 原则
-最近核对：2026-08-05
+最近核对：2026-08-08
 产品基线：v0.38（build 38）
 
 本文提炼自仓内 v0.10 历史 Cowork 设计文档、`PER_AGENT_INFERENCE_PROFILES.md` 及
@@ -160,7 +160,9 @@ Goal Verifier 是另一条独立控制面，职责仅是判定 Goal 是否已有
 
 Goal 生命周期必须由 host 串行化：start、ordinary turn、Goal mutation 与 stop/shutdown 分别有 single-flight/mutation/stop gate；pending durable stop 未结算前不得启动新 run，start 取消后若已创建 continuation，必须先 scoped cancel、等待退出并 checkpoint 才返回失败。restore 必须持续暂停 scheduler，直到 roster/reviewer/main 与 Goal recovery/reconcile 完成。GUI 随后只释放新工作并继续围栏 restored roots；CLI 才执行显式 data-plane resume。Cowork `/goal` 是明确 host action；普通自然语言只有在窄、确定性的中英文持续目标分类器命中时才可为本轮提供 create intent，复杂请求、Goal 提及、一次性目标、引用示例或附件内容不得提升权限。
 
-模型可见的 agent/task/message/goal/session 操作与文件、网络、文档工具遵循同一个 ToolCall 协议。WorkTask CRUD、Goal create/update 与 session rename 都必须先过 schema、lease（Cowork）与 PermissionEngine；`task_get/update` 使用 durable WorkTask ID（正常为 `wt_…`）和最新 authoritative revision，不能把 AgentInvocation `task_…` ID 或旧 revision 当成 WorkTask authority，也不能重复 settle 已 terminal 的 WorkTask。WorkTask permission preview 只提供 bounded、脱敏的语义字段，完整执行参数继续由 digest/count 和 immutable authorization 绑定。`rename_session` 的 exact current-session/no-path/no-network/no-data-effect intent 可由 deterministic gate 低风险放行，但 near-miss 与 locked 状态不能借此绕过。worker 默认只能读取 Goal/相关 WorkTask，并更新自己当前绑定的 WorkTask，不能改 DAG/owner/priority/retry/cancel、提交 Goal verdict或改 session 名称。一个外部 ToolCall 只能有一个权限决定；`spawn_agent` / 原子 `delegate_task` 获准后，内部 roster、lease、mailbox、task graph 与 scheduler admission 必须作为 executor 的 durable transaction 完成，不能再次递归进入 PermissionEngine。Code 与 Cowork agent 共用 headless `AgentRuntime`；首个 system message 必须稳定声明 Intatis 模式、API tools 权威性、严格 JSON Schema 与 ToolResult 完成语义，动态 workspace/task/lease/goal/run 数据仍放在 user-role untrusted context。
+ContinuationRun 还必须有模型可表达、宿主可强制执行的终止边界。只有 exact `@main` root 可见 `finish_run` / `stop_run`，且模型只能提供 completed/stopped 意图与有界 reason；所有 session/run/Goal/submission/root identity 和 source 必须从当前 invocation 注入。close installation 在 EventLog await 前先形成 actor-local admission/authorization tombstone；EventLog 再在完整已知历史与跨进程锁内对 exact RunID 安装 first-write durable close claim，且 claim 必须先于等待既有 admission、provider/tool cleanup 与 exact-run drain 落盘。Orchestrator 随后只 drain 同 run 的其余 task/message，恢复也不得复活。该 claim 不替代 run checkpoint/completed/cancelled 状态机，也不影响其他 run。普通 final 文本不能被 host 猜测成显式 claim；root failure/timeout 使用 runtime source，用户取消使用 user source，session lifecycle shutdown 使用 hostLifecycle source。
+
+模型可见的 agent/task/message/goal/run/session 操作与文件、网络、文档工具遵循同一个 ToolCall 协议。WorkTask CRUD、Goal create/update、run close 与 session rename 都必须先过 schema、lease（Cowork）与 PermissionEngine；`task_get/update` 使用 durable WorkTask ID（正常为 `wt_…`）和最新 authoritative revision，不能把 AgentInvocation `task_…` ID 或旧 revision 当成 WorkTask authority，也不能重复 settle 已 terminal 的 WorkTask。WorkTask permission preview 只提供 bounded、脱敏的语义字段，完整执行参数继续由 digest/count 和 immutable authorization 绑定。`rename_session` 与 exact host-bound run close 的低风险 intent 可由 deterministic gate 放行，但 near-miss、错误 invocation scope 与 locked 状态不能借此绕过。worker 默认只能读取 Goal/相关 WorkTask，并更新自己当前绑定的 WorkTask，不能改 DAG/owner/priority/retry/cancel、提交 Goal verdict、关闭 run 或改 session 名称。一个外部 ToolCall 只能有一个权限决定；`spawn_agent` / 原子 `delegate_task` 获准后，内部 roster、lease、mailbox、task graph 与 scheduler admission 必须作为 executor 的 durable transaction 完成，不能再次递归进入 PermissionEngine。Code 与 Cowork agent 共用 headless `AgentRuntime`；首个 system message 必须稳定声明 Intatis 模式、API tools 权威性、严格 JSON Schema 与 ToolResult 完成语义，动态 workspace/task/lease/goal/run 数据仍放在 user-role untrusted context。
 
 ### 2.3b Coordinator routing Skill
 
@@ -222,7 +224,7 @@ reply_message
 
 **不要**长期用一个模糊的 `ask_agent` 操作覆盖所有用途。
 
-MessageBus 投递采用持久化的至少一次语义：先通过 Mediator，再持久化 typed message，然后进入 mailbox。每个 new delivery invocation 必须在 `TaskContract.mailboxMessageIDs` 冻结 1–8 个 exact ID；同 batch 保持 sender/recipient/Goal-run/authority class 一致，ContextProjector 只能呈现这些 ID。ordinary delivery 只有 read-only workspace、reply-only communication 和必要读取工具；无 WorkTask/Goal mutation、spawn、delegation、shell、Git、patch、browser 或 MCP。`request_delegation` 另行收窄为最多一次、深度 1 的 delegation。只有确实投影且该轮成功完成的 ID 才能 consumed，并与 task completion 在同一 EventLog batch 落盘后再从 runtime mailbox ack。失败只重试同一 TaskID 到 `maxAttempts`；poison ID 耗尽后保持 pending、不换 TaskID，也不阻塞后来新 ID。若 owning Goal/run 在成功呈现前取消，迟到 durable message 必须以专用 discarded event durable 结算后再 ack，不能伪装成 consumed。legacy nil binding 只能按 exact causal/scope lineage 保守恢复，歧义或耗尽 fail closed；旧 run discarded message 不得复活或阻塞新 run。
+MessageBus 投递采用持久化的至少一次语义：先通过 Mediator，再持久化 typed message，然后进入 mailbox。每个 new delivery invocation 必须在 `TaskContract.mailboxMessageIDs` 冻结 1–8 个 exact ID；同 batch 保持 sender/recipient/Goal-run/authority class 一致，ContextProjector 只能呈现这些 ID。authority 必须按消息类型收窄：ordinary message 是 one-way、read-only、communication `.none`；information request 只获得 `reply_message` + `.replyOnly`，并以 `inReplyTo` 精确终结 frozen RequestID；information reply receipt 不获得 `reply_message`，也不发送礼貌 ACK，只能在确有实质追问时向原 sender 调用 `request_information(based_on: reply MessageID)`；delegation request 才可在原 ceiling 内获得最多一次、深度 1 的 delegation。一次 request 只接受一个 terminal reply；exact duplicate 幂等，冲突 reply 拒绝。实质追问必须建立 fresh RequestID，同时沿用 stable `conversationID` 并记录 `basedOn`，所以 `information_replied` 只关闭当前 correlation，不关闭长期协作或整个 conversation。所有 mailbox lease 均无无关 WorkTask/Goal mutation、spawn、shell、Git、patch、browser 或 MCP。只有确实投影且该轮成功完成的 ID 才能 consumed，并与 task completion 在同一 EventLog batch 落盘后再从 runtime mailbox ack。失败只重试同一 TaskID 到 `maxAttempts`；poison ID 耗尽后保持 pending、不换 TaskID，也不阻塞后来新 ID。若 owning Goal/run 在成功呈现前取消，迟到 durable message 必须以专用 discarded event durable 结算后再 ack，不能伪装成 consumed。legacy nil binding/correlation 只能按 exact causal/scope lineage 保守恢复，歧义或耗尽 fail closed，不能扩大 live follow-up authority；旧 run discarded message 不得复活或阻塞新 run。
 
 ## 4. 递归与循环规则
 
@@ -415,6 +417,7 @@ legacy stale task_update repair requires no current Goal, one exact unambiguous 
 no-Goal uncertain-ticket isolation requires exact contract/positive-attempt/terminal ordering; any current Goal requires an empty uncertain set
 cancel, timeout, maxIterations, missing completion marker, and incomplete finish reason never complete
 Goal / WorkTask / ContinuationRun IDs remain stable and all new events round-trip/replay without breaking legacy TaskContract JSON
+exact @main root alone sees finish_run/stop_run; model supplies no identity, the in-flight close tombstone blocks reentrant admission/authorization, the first durable close claim precedes old-admission wait and fences only that RunID, restore drains it before dispatch, and an ordinary final does not forge a claim
 WorkTask DAG rejects missing/cross-run/self/cyclic dependencies, stale revisions, invalid transitions, and completion without required result/evidence
 dependency replanning recomputes host-derived readiness atomically, and projection never trusts a DAG-inconsistent ready transition
 concurrent delegate_task(to:auto) reserves distinct eligible workers before any await and releases every reservation on every exit path
@@ -433,7 +436,9 @@ only actually presented mailbox messages are consumed; cancelled-run messages ar
 late scoped mailbox sends after cancellation are durably discarded rather than consumed, including across restore and a later run
 new mailbox tasks freeze 1-8 exact MessageIDs; success commits task completion plus consumed IDs atomically before in-memory ack
 mailbox retries preserve one TaskID and bounded attempts; an exhausted poison ID never receives a replacement TaskID and never blocks a later unbound ID
-ordinary mailbox leases are read-only/reply-only with no coordinator, mutation, terminal, Git, browser, or MCP authority; delegation requests receive at most one depth-1 delegation
+ordinary mailbox messages are read-only one-way receipts with no communication tool; information requests are reply-only for one exact RequestID; information reply receipts expose only fresh request_information back to the sender, never reply/ACK
+one information request accepts one terminal reply; substantive follow-up uses a fresh RequestID with basedOn=reply ID and the same conversation root, so information_replied does not globally suppress later coordination
+all mailbox authority classes retain no unrelated coordinator, mutation, terminal, Git, browser, or MCP authority; delegation requests receive at most one depth-1 delegation
 task-scoped capability/workspace leases are enforced, revoked, and safely renewed on retry
 dynamic task/message/event text stays in a bounded, escaped user-role context block
 inference catalog reuses semantically equal revisions, appends on semantic change, retains old revisions, and rejects unsafe/corrupt/insecure definitions without overwriting the store

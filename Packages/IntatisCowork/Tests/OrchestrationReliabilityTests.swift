@@ -237,6 +237,27 @@ private final class ReliabilityMailboxSideEffectThenFailProvider: ToolCallingPro
         return capturedOriginalMailboxRequestCount
     }
 
+    private static func frozenMessageID(in request: AgentRequest) -> String? {
+        let markers = [
+            "Message ID:\n| ",
+            "Process only these frozen mailbox Message IDs: ",
+        ]
+        for message in request.messages {
+            guard let content = message.content else { continue }
+            for marker in markers {
+                guard let markerRange = content.range(of: marker) else { continue }
+                let suffix = content[markerRange.upperBound...]
+                let value = suffix.prefix {
+                    !$0.isWhitespace && $0 != "," && $0 != "."
+                }
+                if !value.isEmpty {
+                    return String(value)
+                }
+            }
+        }
+        return nil
+    }
+
     func stream(_ request: AgentRequest) -> AsyncThrowingStream<AgentChunk, Error> {
         let isOriginalMailboxRequest = request.messages.contains {
             $0.content?.contains("handle once") == true
@@ -244,6 +265,7 @@ private final class ReliabilityMailboxSideEffectThenFailProvider: ToolCallingPro
         let hasOriginalToolCall = request.messages.contains {
             $0.toolCalls?.contains(where: { $0.id == "mailbox-reply-side-effect" }) == true
         }
+        let frozenMessageID = Self.frozenMessageID(in: request)
         lock.lock()
         capturedRequestCount += 1
         if isOriginalMailboxRequest {
@@ -251,11 +273,12 @@ private final class ReliabilityMailboxSideEffectThenFailProvider: ToolCallingPro
         }
         lock.unlock()
         return AsyncThrowingStream { continuation in
-            if isOriginalMailboxRequest, !hasOriginalToolCall {
+            if isOriginalMailboxRequest, !hasOriginalToolCall, let frozenMessageID {
+                let arguments = #"{"to":"main","content":"already attempted","inReplyTo":"\#(frozenMessageID)"}"#
                 continuation.yield(.toolCalls([ToolCall(
                     id: "mailbox-reply-side-effect",
                     name: "reply_message",
-                    arguments: #"{"to":"main","content":"already attempted"}"#)]))
+                    arguments: arguments)]))
                 continuation.yield(.done(finishReason: "tool_calls"))
                 continuation.finish()
             } else if isOriginalMailboxRequest {
@@ -1365,20 +1388,20 @@ final class OrchestrationReliabilityTests: XCTestCase {
         XCTAssertTrue(mainAttached)
         XCTAssertTrue(workerAttached)
 
-        let sendResult = await orchestrator.sendMessage(
+        let sendResult = await orchestrator.requestInformation(
             from: main,
             to: worker.rawValue,
-            content: "handle once")
-        XCTAssertEqual(sendResult, "sent message to @worker")
+            question: "handle once")
+        XCTAssertTrue(sendResult.hasPrefix("requested information from @worker (request_id: "))
         await orchestrator.runSchedulerUntilIdle()
 
         let events = await log.replay()
         let originalMessageID = try XCTUnwrap(events.compactMap { envelope -> MessageID? in
-            guard case .agentMessage(let payload) = envelope.event,
+            guard case .informationRequested(let payload) = envelope.event,
                   payload.from == main,
                   payload.to == worker,
-                  payload.content == "handle once" else { return nil }
-            return payload.messageId
+                  payload.question == "handle once" else { return nil }
+            return payload.requestID
         }.first)
         let originalTaskID = try XCTUnwrap(events.compactMap { envelope -> TaskID? in
             guard case .taskQueued(let payload) = envelope.event,
@@ -1779,11 +1802,33 @@ final class OrchestrationReliabilityTests: XCTestCase {
         let cancellationSucceeded = await cancellation.value
 
         XCTAssertTrue(cancellationSucceeded)
-        XCTAssertTrue(sendResult.contains("Goal continuation cancellation is pending"))
+        XCTAssertTrue(sendResult.contains("ContinuationRun is closed"), sendResult)
         XCTAssertTrue(provider.requests.isEmpty)
         let pendingMessages = await orchestrator.mailbox(for: worker).pendingMessages
         XCTAssertTrue(pendingMessages.isEmpty)
         let events = await log.replay()
+        let closeIndex = try XCTUnwrap(events.firstIndex { envelope in
+            guard case .continuationRunCloseRequested(let payload) = envelope.event else {
+                return false
+            }
+            return payload.runID == runID
+                && payload.requestedOutcome == .cancelled
+                && payload.source == .user
+        })
+        let discardedIndex = try XCTUnwrap(events.firstIndex { envelope in
+            guard case .agentMessageDiscarded(let payload) = envelope.event else { return false }
+            return payload.agent == worker
+                && payload.taskID == causalTaskID
+                && payload.goalID == goalID
+                && payload.continuationRunID == runID
+        })
+        XCTAssertLessThan(closeIndex, discardedIndex)
+        XCTAssertEqual(events.filter { envelope in
+            guard case .continuationRunCloseRequested(let payload) = envelope.event else {
+                return false
+            }
+            return payload.runID == runID
+        }.count, 1)
         XCTAssertTrue(events.contains { envelope in
             guard case .agentMessageDiscarded(let payload) = envelope.event else { return false }
             return payload.agent == worker

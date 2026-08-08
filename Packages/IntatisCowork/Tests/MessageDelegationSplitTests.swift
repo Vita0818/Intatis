@@ -144,7 +144,7 @@ final class MessageDelegationSplitTests: XCTestCase {
             return payload.lease
         }.first)
         XCTAssertEqual(workspaceLease.access, .readOnly)
-        XCTAssertEqual(capabilityLease.communication, .replyOnly)
+        XCTAssertEqual(capabilityLease.communication, .none)
         XCTAssertEqual(capabilityLease.delegation, .none)
         XCTAssertTrue(capabilityLease.mcpGrants.isEmpty)
         XCTAssertFalse(capabilityLease.tools.contains(.manageWorkTasks))
@@ -161,6 +161,7 @@ final class MessageDelegationSplitTests: XCTestCase {
         XCTAssertFalse(mailboxToolNames.contains("task_update"))
         XCTAssertFalse(mailboxToolNames.contains("delegate_task"))
         XCTAssertFalse(mailboxToolNames.contains("ask_agent"))
+        XCTAssertFalse(mailboxToolNames.contains("reply_message"))
         XCTAssertFalse(mailboxToolNames.contains("exec_command"))
         XCTAssertFalse(mailboxToolNames.contains("write_stdin"))
         XCTAssertFalse(mailboxToolNames.contains("apply_patch"))
@@ -277,7 +278,7 @@ final class MessageDelegationSplitTests: XCTestCase {
 
         let result = await orch.requestInformation(from: main, to: worker.rawValue, question: "Which folder is active?")
 
-        XCTAssertEqual(result, "requested information from @worker")
+        XCTAssertTrue(result.hasPrefix("requested information from @worker (request_id: "))
         await orch.runSchedulerUntilIdle()
         let events = await log.replay()
         let request = try XCTUnwrap(events.compactMap { envelope -> InformationRequestedPayload? in
@@ -304,7 +305,7 @@ final class MessageDelegationSplitTests: XCTestCase {
         XCTAssertFalse(events.contains { if case .taskDelegated = $0.event { return true } else { return false } })
     }
 
-    func testReplyMessageCreatesDurableMailboxWakeTaskAndConsumesReply() async throws {
+    func testReplyMessageRejectsUnfrozenCorrelation() async throws {
         let log = try splitLog()
         let (orch, wsMain, wsWorker) = try await makeOrchestrator(log: log)
         defer {
@@ -325,35 +326,25 @@ final class MessageDelegationSplitTests: XCTestCase {
             inReplyTo: "msg_info",
             taskID: currentTaskID)
 
-        XCTAssertEqual(result, "replied to @main")
+        XCTAssertEqual(
+            result,
+            "error: reply_message may answer only an information request frozen into this mailbox invocation")
         await orch.runSchedulerUntilIdle()
         let events = await log.replay()
-        let reply = try XCTUnwrap(events.compactMap { envelope -> InformationRepliedPayload? in
-            if case .informationReplied(let payload) = envelope.event,
-               payload.from == worker
-                    && payload.to == main
-                    && payload.inReplyTo == MessageID(rawValue: "msg_info")
-                    && payload.content.contains("ready")
-                    && payload.taskID == currentTaskID {
-                return payload
-            }
-            return nil
-        }.first)
-        let wakeTask = try XCTUnwrap(splitTaskContracts(events).first {
-            $0.kind == .mailboxDelivery && $0.assignee == main
-        })
-        XCTAssertEqual(wakeTask.relatedTasks, [currentTaskID])
-        XCTAssertEqual(wakeTask.mailboxMessageIDs, [reply.replyID])
-        XCTAssertTrue(events.contains {
-            if case .agentMessageConsumed(let payload) = $0.event {
-                return payload.messageID == reply.replyID
-                    && payload.agent == main
-                    && payload.taskID == wakeTask.id
-            }
+        XCTAssertFalse(events.contains {
+            if case .informationReplied = $0.event { return true }
             return false
         })
-        let mainMailbox = await orch.mailbox(for: main)
-        XCTAssertTrue(mainMailbox.pendingMessages.isEmpty)
+    }
+
+    func testReplyMessageSchemaRequiresExactCorrelationAndRejectsExtraFields() throws {
+        let data = try JSONEncoder().encode(ReplyMessageTool.descriptor.parameters)
+        let schema = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(
+            Set((schema["required"] as? [String]) ?? []),
+            ["to", "content", "inReplyTo"])
+        XCTAssertEqual(schema["additionalProperties"] as? Bool, false)
     }
 
     func testDelegateTaskCreatesTaskContractAndTaskDelegatedEvent() async throws {
@@ -433,7 +424,7 @@ final class MessageDelegationSplitTests: XCTestCase {
                   payload.lease.taskID == wakeTask.id else { return nil }
             return payload.lease
         }.first)
-        XCTAssertEqual(wakeLease.communication, .replyOnly)
+        XCTAssertEqual(wakeLease.communication, .none)
         XCTAssertEqual(
             wakeLease.delegation,
             .granted(DelegationBudget(maxTasks: 1, maxDepth: 1)))
@@ -556,12 +547,15 @@ final class MessageDelegationSplitTests: XCTestCase {
             objective: "Prepare a reply for the current task.",
             replyMode: .none)
         let currentTaskID = try XCTUnwrap(current.taskID)
-        _ = await orch.replyMessage(
+        let invalidReply = await orch.replyMessage(
             from: worker,
             to: main.rawValue,
             content: "answer",
             inReplyTo: nil,
             taskID: currentTaskID)
+        XCTAssertEqual(
+            invalidReply,
+            "error: inReplyTo is required and must identify the frozen information request")
         _ = await orch.sendMessage(from: main, to: worker.rawValue, content: "hello")
         _ = await orch.requestInformation(from: main, to: worker.rawValue, question: "question")
         _ = await orch.delegateTask(from: main, to: worker.rawValue, objective: "Do one task.")
@@ -571,7 +565,7 @@ final class MessageDelegationSplitTests: XCTestCase {
         let types = events.map { $0.event.type }
         XCTAssertTrue(types.contains(.agentMessage))
         XCTAssertTrue(types.contains(.informationRequested))
-        XCTAssertTrue(types.contains(.informationReplied))
+        XCTAssertFalse(types.contains(.informationReplied))
         XCTAssertTrue(types.contains(.agentToAgentMessage))
         XCTAssertTrue(types.contains(.taskDelegated))
         XCTAssertTrue(types.contains(.taskCreated))

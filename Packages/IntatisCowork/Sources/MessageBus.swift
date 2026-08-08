@@ -74,11 +74,15 @@ public struct MessageBus: Sendable {
                                    to: AgentID,
                                    question: String,
                                    taskID: TaskID? = nil,
-                                   requestID: MessageID = MessageID.new()) async -> InformationRequestedPayload? {
+                                   requestID: MessageID = MessageID.new(),
+                                   conversationID: MessageID? = nil,
+                                   basedOn: MessageID? = nil) async -> InformationRequestedPayload? {
         switch await mediator.mediate(from: from, to: to, content: question) {
         case .forward(let forwarded):
             let payload = InformationRequestedPayload(
                 requestID: requestID,
+                conversationID: conversationID ?? requestID,
+                basedOn: basedOn,
                 from: from,
                 to: to,
                 question: forwarded,
@@ -104,7 +108,8 @@ public struct MessageBus: Sendable {
     public func replyMessage(from: AgentID,
                              to: AgentID,
                              content: String,
-                             inReplyTo: MessageID?,
+                             inReplyTo: MessageID,
+                             conversationID: MessageID?,
                              taskID: TaskID? = nil,
                              replyID: MessageID = MessageID.new()) async -> InformationRepliedPayload? {
         switch await mediator.mediate(from: from, to: to, content: content) {
@@ -112,6 +117,7 @@ public struct MessageBus: Sendable {
             let payload = InformationRepliedPayload(
                 replyID: replyID,
                 inReplyTo: inReplyTo,
+                conversationID: conversationID,
                 from: from,
                 to: to,
                 content: forwarded,

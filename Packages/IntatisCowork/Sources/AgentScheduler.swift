@@ -84,6 +84,8 @@ public struct PendingAgentMessage: Codable, Sendable, Hashable {
     public var taskID: TaskID?
     public var causalParentID: TaskID?
     public var inReplyTo: MessageID?
+    public var conversationID: MessageID?
+    public var basedOn: MessageID?
     public var createdAt: Date
 
     public init(id: MessageID = MessageID.new(),
@@ -94,6 +96,8 @@ public struct PendingAgentMessage: Codable, Sendable, Hashable {
                 taskID: TaskID? = nil,
                 causalParentID: TaskID? = nil,
                 inReplyTo: MessageID? = nil,
+                conversationID: MessageID? = nil,
+                basedOn: MessageID? = nil,
                 createdAt: Date = Date()) {
         self.id = id
         self.sender = sender
@@ -103,6 +107,8 @@ public struct PendingAgentMessage: Codable, Sendable, Hashable {
         self.taskID = taskID
         self.causalParentID = causalParentID
         self.inReplyTo = inReplyTo
+        self.conversationID = conversationID
+        self.basedOn = basedOn
         self.createdAt = createdAt
     }
 }

@@ -66,6 +66,7 @@ public actor GoalRuntimeController {
     private struct StopRequest: Sendable {
         var reason: String
         var checkpoint: Bool
+        var runCloseSource: ContinuationRunCloseSource
     }
 
     private struct PendingStop: Sendable {
@@ -114,10 +115,17 @@ public actor GoalRuntimeController {
     private let verifierModel: @Sendable () async -> ModelID
     private let sendOperation: SendOperation
     private let waitForSchedulerIdle: @Sendable () async -> Void
-    private let cancelActiveInvocations: @Sendable (String) async -> Void
+    private let cancelActiveInvocations:
+        @Sendable (String, ContinuationRunCloseSource) async -> Void
     private let resumePendingInvocations: @Sendable () async -> Void
     private let waitForGoalSchedulerIdle: @Sendable (GoalID, ContinuationRunID?) async -> Void
-    private let cancelGoalInvocations: @Sendable (GoalID, ContinuationRunID?, String) async -> Bool
+    private let cancelGoalInvocations:
+        @Sendable (
+            GoalID,
+            ContinuationRunID?,
+            String,
+            ContinuationRunCloseSource
+        ) async -> Bool
     private let carryForwardWorkTasks: @Sendable (GoalID, ContinuationRunID) async throws -> [WorkTask]
     private let consumeProviderUsageLimit: @Sendable (GoalID, ContinuationRunID) async -> String?
     /// Internal-only deterministic seam for the post-launch startup
@@ -172,8 +180,10 @@ public actor GoalRuntimeController {
         self.waitForSchedulerIdle = {
             await orchestrator.runSchedulerUntilIdle()
         }
-        self.cancelActiveInvocations = { reason in
-            await orchestrator.cancelActiveTasks(reason: reason)
+        self.cancelActiveInvocations = { reason, source in
+            await orchestrator.cancelActiveTasks(
+                reason: reason,
+                runCloseSource: source)
         }
         self.resumePendingInvocations = {
             await orchestrator.resumePendingTasks()
@@ -183,12 +193,13 @@ public actor GoalRuntimeController {
                 goalID: goalID,
                 continuationRunID: runID)
         }
-        self.cancelGoalInvocations = { goalID, runID, reason in
+        self.cancelGoalInvocations = { goalID, runID, reason, source in
             await orchestrator.cancelActiveTasks(
                 goalID: goalID,
                 continuationRunID: runID,
                 reason: reason,
-                resumePendingTasksOnSuccess: false)
+                resumePendingTasksOnSuccess: false,
+                runCloseSource: source)
         }
         self.carryForwardWorkTasks = { goalID, runID in
             try await orchestrator.carryForwardNonterminalWorkTasks(
@@ -212,10 +223,16 @@ public actor GoalRuntimeController {
          verifierModel: @escaping @Sendable () async -> ModelID,
          sendOperation: @escaping SendOperation,
          waitForSchedulerIdle: @escaping @Sendable () async -> Void = {},
-         cancelActiveInvocations: @escaping @Sendable (String) async -> Void = { _ in },
+         cancelActiveInvocations:
+            @escaping @Sendable (String, ContinuationRunCloseSource) async -> Void = { _, _ in },
          resumePendingInvocations: @escaping @Sendable () async -> Void = {},
          waitForGoalSchedulerIdle: (@Sendable (GoalID, ContinuationRunID?) async -> Void)? = nil,
-         cancelGoalInvocations: (@Sendable (GoalID, ContinuationRunID?, String) async -> Bool)? = nil,
+         cancelGoalInvocations: (@Sendable (
+            GoalID,
+            ContinuationRunID?,
+            String,
+            ContinuationRunCloseSource
+         ) async -> Bool)? = nil,
          carryForwardWorkTasks: @escaping @Sendable (GoalID, ContinuationRunID) async throws -> [WorkTask] = { _, _ in [] },
          consumeProviderUsageLimit: @escaping @Sendable (GoalID, ContinuationRunID) async -> String? = { _, _ in nil },
          startupPostRecoveryHook: (@Sendable () async -> Void)? = nil,
@@ -234,8 +251,8 @@ public actor GoalRuntimeController {
         self.waitForGoalSchedulerIdle = waitForGoalSchedulerIdle ?? { _, _ in
             await waitForSchedulerIdle()
         }
-        self.cancelGoalInvocations = cancelGoalInvocations ?? { _, _, reason in
-            await cancelActiveInvocations(reason)
+        self.cancelGoalInvocations = cancelGoalInvocations ?? { _, _, reason, source in
+            await cancelActiveInvocations(reason, source)
             return true
         }
         self.carryForwardWorkTasks = carryForwardWorkTasks
@@ -338,7 +355,8 @@ public actor GoalRuntimeController {
                 let cancelled = await cancelGoalInvocations(
                     recoveredGoal.id,
                     runID,
-                    "Recovering \(recoveredGoal.status.rawValue) Goal; cancelling interrupted invocations before checkpoint")
+                    "Recovering \(recoveredGoal.status.rawValue) Goal; cancelling interrupted invocations before checkpoint",
+                    .runtime)
                 interruptedScopeSafe = interruptedScopeSafe && cancelled
             }
             let hasUnscopedGoalWork = replayedProjection.tasks.values.contains { task in
@@ -350,7 +368,8 @@ public actor GoalRuntimeController {
                 interruptedScopeSafe = await cancelGoalInvocations(
                     recoveredGoal.id,
                     nil,
-                    "Recovering \(recoveredGoal.status.rawValue) Goal; cancelling unscoped invocations before checkpoint")
+                    "Recovering \(recoveredGoal.status.rawValue) Goal; cancelling unscoped invocations before checkpoint",
+                    .runtime)
                     && interruptedScopeSafe
             }
         }
@@ -425,7 +444,8 @@ public actor GoalRuntimeController {
                 reason: "Goal runtime startup was cancelled",
                 checkpoint: true,
                 cancelInvocations: true,
-                resumeDataPlaneOnSuccess: false)
+                resumeDataPlaneOnSuccess: false,
+                runCloseSource: shutdownRequested ? .hostLifecycle : .runtime)
         }
         return finishStartupAttempt(false)
     }
@@ -441,7 +461,8 @@ public actor GoalRuntimeController {
             reason: "Goal runtime stopped",
             checkpoint: true,
             cancelInvocations: true,
-            resumeDataPlaneOnSuccess: false)
+            resumeDataPlaneOnSuccess: false,
+            runCloseSource: .hostLifecycle)
     }
 
     public func currentGoal() async -> Goal? {
@@ -756,11 +777,31 @@ public actor GoalRuntimeController {
                 recordUserMessage,
                 explicitGoalIntent)
             await waitForSchedulerIdle()
+            let closeReplay = try await log.replayForProjectionChecked()
+            guard closeReplay.hasCompleteKnownHistory else {
+                throw EventLogError.incompleteEventHistory
+            }
+            let closeProjection = CoworkProjection.build(from: closeReplay.envelopes)
+            guard closeProjection.ambiguousContinuationRunCloseClaimIDs.isEmpty else {
+                throw EventLogError.conflictingContinuationRunCloseClaim
+            }
+            let closeClaim = closeProjection.continuationRunCloseClaims[run.id]
             switch result {
             case .sent:
-                let completed = try started.transitioning(to: .completed).get()
-                try await append(.continuationRunCompleted(
-                    ContinuationRunCompletedPayload(run: completed)))
+                if let closeClaim,
+                   closeClaim.requestedOutcome != .completed {
+                    let cancelled = try started.transitioning(
+                        to: .cancelled,
+                        progressSummary: closeClaim.reason).get()
+                    try await append(.continuationRunCancelled(
+                        ContinuationRunCancelledPayload(
+                            run: cancelled,
+                            reason: closeClaim.reason)))
+                } else {
+                    let completed = try started.transitioning(to: .completed).get()
+                    try await append(.continuationRunCompleted(
+                        ContinuationRunCompletedPayload(run: completed)))
+                }
             case .failed(let message):
                 let cancelled = try started.transitioning(
                     to: .cancelled,
@@ -814,7 +855,8 @@ public actor GoalRuntimeController {
             await stopAutomaticContinuation(
                 reason: "Goal entered \(payload.goal.status.rawValue)",
                 checkpoint: true,
-                cancelInvocations: true)
+                cancelInvocations: true,
+                runCloseSource: .runtime)
         case .goalBlocked(let payload):
             guard payload.goal.sessionID == sessionID,
                   runningGoalID == payload.goal.id,
@@ -822,7 +864,8 @@ public actor GoalRuntimeController {
             await stopAutomaticContinuation(
                 reason: "Goal entered \(payload.goal.status.rawValue)",
                 checkpoint: true,
-                cancelInvocations: true)
+                cancelInvocations: true,
+                runCloseSource: .runtime)
         case .goalBudgetLimited(let payload):
             guard payload.goal.sessionID == sessionID,
                   runningGoalID == payload.goal.id,
@@ -830,7 +873,8 @@ public actor GoalRuntimeController {
             await stopAutomaticContinuation(
                 reason: "Goal entered \(payload.goal.status.rawValue)",
                 checkpoint: true,
-                cancelInvocations: true)
+                cancelInvocations: true,
+                runCloseSource: .runtime)
         case .goalUsageLimited(let payload):
             guard payload.goal.sessionID == sessionID,
                   runningGoalID == payload.goal.id,
@@ -838,7 +882,8 @@ public actor GoalRuntimeController {
             await stopAutomaticContinuation(
                 reason: payload.reason ?? "Goal provider usage is limited",
                 checkpoint: true,
-                cancelInvocations: true)
+                cancelInvocations: true,
+                runCloseSource: .runtime)
         case .goalCompleted(let payload):
             guard payload.goal.sessionID == sessionID,
                   runningGoalID == payload.goal.id,
@@ -846,7 +891,8 @@ public actor GoalRuntimeController {
             await stopAutomaticContinuation(
                 reason: "Goal entered \(payload.goal.status.rawValue)",
                 checkpoint: true,
-                cancelInvocations: false)
+                cancelInvocations: false,
+                runCloseSource: .runtime)
         case .goalCleared(let payload):
             guard payload.goal.sessionID == sessionID,
                   runningGoalID == payload.goal.id,
@@ -854,7 +900,8 @@ public actor GoalRuntimeController {
             await stopAutomaticContinuation(
                 reason: "Goal cleared",
                 checkpoint: true,
-                cancelInvocations: false)
+                cancelInvocations: false,
+                runCloseSource: .runtime)
         default:
             break
         }
@@ -1224,15 +1271,20 @@ public actor GoalRuntimeController {
     private func stopAutomaticContinuation(reason: String,
                                            checkpoint: Bool,
                                            cancelInvocations: Bool,
-                                           resumeDataPlaneOnSuccess: Bool = true) async -> Bool {
+                                           resumeDataPlaneOnSuccess: Bool = true,
+                                           runCloseSource: ContinuationRunCloseSource = .user) async -> Bool {
         await acquireStopLock()
         defer { releaseStopLock() }
 
         if var pending = pendingStop {
             // A shutdown retry must never inherit an earlier UI action's
-            // request to wake unrelated pending work.
+            // request to wake unrelated pending work or mislabel a newly
+            // successful host-lifecycle close as the earlier requester.
             pending.resumeDataPlaneOnSuccess =
                 pending.resumeDataPlaneOnSuccess && resumeDataPlaneOnSuccess
+            if runCloseSource == .hostLifecycle {
+                pending.request.runCloseSource = .hostLifecycle
+            }
             pendingStop = pending
             return await retryPendingStop(pending)
         }
@@ -1242,7 +1294,8 @@ public actor GoalRuntimeController {
                 reason: reason,
                 checkpoint: checkpoint,
                 cancelInvocations: cancelInvocations,
-                resumeDataPlaneOnSuccess: resumeDataPlaneOnSuccess) {
+                resumeDataPlaneOnSuccess: resumeDataPlaneOnSuccess,
+                runCloseSource: runCloseSource) {
                 pendingStop = discovered
                 return await retryPendingStop(discovered)
             }
@@ -1251,15 +1304,22 @@ public actor GoalRuntimeController {
         let generation = continuationGeneration
         let goalID = runningGoalID
         let runID = runningContinuationRunID
-        let request = StopRequest(reason: reason, checkpoint: checkpoint)
+        let request = StopRequest(
+            reason: reason,
+            checkpoint: checkpoint,
+            runCloseSource: runCloseSource)
         stopRequests[generation] = request
         task.cancel()
         var cancellationSucceeded = true
         if cancelInvocations {
             if let goalID {
-                cancellationSucceeded = await cancelGoalInvocations(goalID, runID, reason)
+                cancellationSucceeded = await cancelGoalInvocations(
+                    goalID,
+                    runID,
+                    reason,
+                    runCloseSource)
             } else {
-                await cancelActiveInvocations(reason)
+                await cancelActiveInvocations(reason, runCloseSource)
             }
         }
         await task.value
@@ -1361,7 +1421,8 @@ public actor GoalRuntimeController {
     private func discoverPendingStop(reason: String,
                                      checkpoint: Bool,
                                      cancelInvocations: Bool,
-                                     resumeDataPlaneOnSuccess: Bool) async -> PendingStop? {
+                                     resumeDataPlaneOnSuccess: Bool,
+                                     runCloseSource: ContinuationRunCloseSource) async -> PendingStop? {
         let projection = CoworkProjection.build(from: await log.replay())
         guard let goal = projection.currentGoal else { return nil }
         let interrupted = projection.continuationRuns.values.filter {
@@ -1387,7 +1448,10 @@ public actor GoalRuntimeController {
             runID: !hasUnscopedNonterminalTask && scopedRunIDs.count == 1
                 ? scopedRunIDs.first
                 : nil,
-            request: StopRequest(reason: reason, checkpoint: checkpoint),
+            request: StopRequest(
+                reason: reason,
+                checkpoint: checkpoint,
+                runCloseSource: runCloseSource),
             cancelInvocations: cancelInvocations,
             resumeDataPlaneOnSuccess: resumeDataPlaneOnSuccess)
     }
@@ -1397,7 +1461,8 @@ public actor GoalRuntimeController {
             let cancelled = await cancelGoalInvocations(
                 pending.goalID,
                 pending.runID,
-                pending.request.reason)
+                pending.request.reason,
+                pending.request.runCloseSource)
             guard cancelled else {
                 pendingStop = pending
                 return false
@@ -1790,7 +1855,10 @@ public actor GoalRuntimeController {
     @discardableResult
     private func settleStoppedRun(_ run: ContinuationRun, generation: Int) async -> Bool {
         let request = stopRequests[generation]
-            ?? StopRequest(reason: "Goal continuation cancelled", checkpoint: true)
+            ?? StopRequest(
+                reason: "Goal continuation cancelled",
+                checkpoint: true,
+                runCloseSource: .runtime)
         do {
             if request.checkpoint {
                 let checkpointed = try run.transitioning(

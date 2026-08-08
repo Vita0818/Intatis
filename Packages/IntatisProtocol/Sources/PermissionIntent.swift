@@ -30,6 +30,7 @@ public enum PermissionControlEffect: String, Codable, Equatable, Sendable, Hasha
     case resumeGoal = "resume_goal"
     case clearGoal = "clear_goal"
     case submitGoalVerdict = "submit_goal_verdict"
+    case closeRun = "close_run"
 }
 
 public enum PermissionRisk: String, Codable, Equatable, Sendable, Hashable {

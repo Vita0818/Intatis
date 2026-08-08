@@ -27,6 +27,8 @@ public enum ToolExecutionReplayPolicy: String, Codable, Equatable, Sendable {
         "delegate_task",
         "spawn_agent",
         "remove_agent",
+        "finish_run",
+        "stop_run",
     ]
 }
 

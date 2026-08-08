@@ -262,6 +262,7 @@ final class IntatisPermissionTests: XCTestCase {
             ("goal.resume", .resumeGoal, PermissionResource(kind: .goal, value: "goal_test")),
             ("goal.clear", .clearGoal, PermissionResource(kind: .goal, value: "goal_test")),
             ("goal.submit_verdict", .submitGoalVerdict, PermissionResource(kind: .goal, value: "goal_test")),
+            ("run.close.completed", .closeRun, PermissionResource(kind: .task, value: "current_run")),
         ]
 
         for (action, controlEffect, resource) in cases {

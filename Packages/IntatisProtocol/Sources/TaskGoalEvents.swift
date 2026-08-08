@@ -236,6 +236,58 @@ public struct ContinuationRunCheckpointedPayload: Codable, Equatable, Sendable {
     public init(run: ContinuationRun) { self.run = run }
 }
 
+/// The durable admission fence for one exact ContinuationRun. This event does
+/// not replace the existing completed/cancelled settlement events: it closes
+/// the run to new task/message work first so the control plane can drain the
+/// exact scope before publishing its final run snapshot.
+public enum ContinuationRunCloseOutcome: String, Codable, Equatable, Sendable {
+    case completed
+    case stopped
+    case cancelled
+    case timedOut = "timed_out"
+    case failed
+    case interrupted
+}
+
+public enum ContinuationRunCloseSource: String, Codable, Equatable, Sendable {
+    case mainAgent = "main_agent"
+    case user
+    case runtime
+    case hostLifecycle = "host_lifecycle"
+}
+
+public struct ContinuationRunCloseRequestedPayload: Codable, Equatable, Sendable {
+    public var sessionID: SessionID
+    public var runID: ContinuationRunID
+    public var goalID: GoalID?
+    public var submissionID: SubmissionID?
+    public var rootTaskID: TaskID?
+    public var requestedOutcome: ContinuationRunCloseOutcome
+    public var source: ContinuationRunCloseSource
+    public var reason: String
+    public var requestedAt: Date
+
+    public init(sessionID: SessionID,
+                runID: ContinuationRunID,
+                goalID: GoalID? = nil,
+                submissionID: SubmissionID? = nil,
+                rootTaskID: TaskID? = nil,
+                requestedOutcome: ContinuationRunCloseOutcome,
+                source: ContinuationRunCloseSource,
+                reason: String,
+                requestedAt: Date = Date()) {
+        self.sessionID = sessionID
+        self.runID = runID
+        self.goalID = goalID
+        self.submissionID = submissionID
+        self.rootTaskID = rootTaskID
+        self.requestedOutcome = requestedOutcome
+        self.source = source
+        self.reason = reason
+        self.requestedAt = requestedAt
+    }
+}
+
 public struct ContinuationRunCompletedPayload: Codable, Equatable, Sendable {
     public var run: ContinuationRun
     public init(run: ContinuationRun) { self.run = run }

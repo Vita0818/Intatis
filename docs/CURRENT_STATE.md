@@ -1,7 +1,7 @@
 # CURRENT_STATE
 
 文档状态：当前源码摘要
-最近核对：2026-08-07
+最近核对：2026-08-08
 产品基线：v0.38（build 38）
 
 ## 版本与发行状态
@@ -69,11 +69,21 @@ macOS 是完整产品：Chat、Code、Cowork、Settings 和本地诊断导出。
   `@permission-reviewer` 等控制面 identity 仍为不可选择的状态项。
 - Cowork final turn 现在先校验 side-effect evidence，再原子发布 final message/model-history、idle
   与 completed outcome；旧日志中 failed/interrupted turn 的先行完成气泡会被展示投影纠正，失效的
-  final assistant 也不再进入下一次 provider history。mailbox wake contract 冻结 1–8 个 exact
-  MessageID，ordinary delivery 使用 read-only/reply-only 窄 lease，失败只在同一 TaskID 上有界重试；
-  task completion、candidate progress 与 consumed IDs 同批落盘后才 ack。legacy nil binding 的歧义或
-  耗尽 lineage 保持 pending/fail closed，新消息仍可独立投递。WorkTask 工具的 reviewer preview 已
-  补齐 bounded semantic fields，并明确 `wt_…`、AgentInvocation `task_…` 与 latest revision 的边界。
+  final assistant 也不再进入下一次 provider history。exact `@main` root 另可见模型主动调用的
+  `finish_run` / `stop_run`：参数只有有界 reason，session/run/Goal/submission/root TaskID 全由宿主绑定；
+  close installation 先形成 actor-local admission/authorization tombstone，EventLog 对每个 RunID 安装
+  first-write durable claim 后才等待既有 admission 并 drain 同 run 的其余 task/message，恢复也先兑现该
+  fence。普通自然语言 final 不伪造显式 claim；root failure/timeout、用户取消与 session shutdown 分别
+  保留 runtime/user/hostLifecycle source，并在 provider/tool cleanup 前关闭精确 run。
+- mailbox wake contract 冻结 1–8 个 exact MessageID，并按 ordinary message、information request、
+  information reply receipt 与 delegation request 分配不同窄 authority。ordinary message 是 one-way、
+  无通信工具；information request 只允许对 frozen RequestID 做一次 `reply_message(inReplyTo:)`；
+  reply receipt 不允许 ACK，但允许在确有新问题时用 `request_information(based_on:)` 建立 fresh
+  RequestID，并保留同一 conversation root。这样 `information_replied` 只终结一个 correlation，
+  不终结长期协作。失败只在同一 TaskID 上有界重试；task completion、candidate progress 与 consumed
+  IDs 同批落盘后才 ack。legacy nil binding 的歧义或耗尽 lineage 保持 pending/fail closed，新消息仍
+  可独立投递。WorkTask 工具的 reviewer preview 已补齐 bounded semantic fields，并明确 `wt_…`、
+  AgentInvocation `task_…` 与 latest revision 的边界。
 - Cowork 中每个 agent 的文件、Git、文档、浏览器文件与 terminal 工具仍只作用于自己的单一
   `workspaceRoot`。具有 `spawn_agent` 的 coordinator 提示词会在预知目标位于根外或收到
   out-of-workspace denial 后停止直接重试，改为按目标绝对目录创建默认只读的子 agent，再用

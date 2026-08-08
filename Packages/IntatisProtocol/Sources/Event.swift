@@ -666,6 +666,7 @@ public enum Event: Equatable, Sendable {
     case continuationRunCreated(ContinuationRunCreatedPayload)
     case continuationRunStarted(ContinuationRunStartedPayload)
     case continuationRunCheckpointed(ContinuationRunCheckpointedPayload)
+    case continuationRunCloseRequested(ContinuationRunCloseRequestedPayload)
     case continuationRunCompleted(ContinuationRunCompletedPayload)
     case continuationRunCancelled(ContinuationRunCancelledPayload)
     case continuationRunRecovered(ContinuationRunRecoveredPayload)
@@ -791,6 +792,7 @@ public enum Event: Equatable, Sendable {
         case continuationRunCreated = "continuation_run_created"
         case continuationRunStarted = "continuation_run_started"
         case continuationRunCheckpointed = "continuation_run_checkpointed"
+        case continuationRunCloseRequested = "continuation_run_close_requested"
         case continuationRunCompleted = "continuation_run_completed"
         case continuationRunCancelled = "continuation_run_cancelled"
         case continuationRunRecovered = "continuation_run_recovered"
@@ -913,6 +915,7 @@ public enum Event: Equatable, Sendable {
         case .continuationRunCreated: return .continuationRunCreated
         case .continuationRunStarted: return .continuationRunStarted
         case .continuationRunCheckpointed: return .continuationRunCheckpointed
+        case .continuationRunCloseRequested: return .continuationRunCloseRequested
         case .continuationRunCompleted: return .continuationRunCompleted
         case .continuationRunCancelled: return .continuationRunCancelled
         case .continuationRunRecovered: return .continuationRunRecovered

@@ -58,20 +58,36 @@ public struct RequestInformationTool: Tool {
             "properties": .object([
                 "to": .object(["type": .string("string"), "description": .string("target agent name")]),
                 "question": .object(["type": .string("string")]),
+                "based_on": .object([
+                    "type": .string("string"),
+                    "description": .string("required reply Message ID when this is an explicit follow-up from a mailbox receipt"),
+                ]),
             ]),
             "required": .array([.string("to"), .string("question")]),
             "additionalProperties": .bool(false),
         ])
     )
 
-    struct Args: Decodable { let to: String; let question: String }
+    struct Args: Decodable {
+        let to: String
+        let question: String
+        let basedOn: String?
+
+        enum CodingKeys: String, CodingKey {
+            case to, question
+            case basedOn = "based_on"
+        }
+    }
 
     public func permissionIntent(_ args: ToolArgs, workspaceRoot: URL) -> PermissionIntent {
         let value = try? args.decode(Args.self)
         return PermissionIntent(
             action: "information.request",
             resources: [PermissionResource(kind: .agent, value: value?.to ?? "unknown")],
-            metadata: ["questionLength": .number(Double(value?.question.count ?? 0))],
+            metadata: [
+                "questionLength": .number(Double(value?.question.count ?? 0)),
+                "basedOn": value?.basedOn.map(JSONValue.string) ?? .null,
+            ],
             dataEffects: [.none],
             controlEffects: [.message],
             risks: [.controlPlaneMutation],
@@ -84,7 +100,10 @@ public struct RequestInformationTool: Tool {
             throw IntatisError.io("agent messaging is not available in this session")
         }
         return try Self.checked(
-            await messenger.requestInformation(to: a.to, question: a.question),
+            await messenger.requestInformation(
+                to: a.to,
+                question: a.question,
+                basedOn: a.basedOn),
             successPrefix: "requested information from @")
     }
 }
@@ -94,21 +113,21 @@ public struct ReplyMessageTool: Tool {
 
     public static let descriptor = ToolDescriptor(
         name: "reply_message",
-        description: "Reply to another agent's message or information request without creating a task.",
+        description: "Answer one exact frozen information request without creating a task. This closes only that request correlation; it is not an acknowledgment tool.",
         sideEffect: .readOnly,
         parameters: .object([
             "type": .string("object"),
             "properties": .object([
                 "to": .object(["type": .string("string"), "description": .string("target agent name")]),
                 "content": .object(["type": .string("string")]),
-                "inReplyTo": .object(["type": .string("string"), "description": .string("optional message id")]),
+                "inReplyTo": .object(["type": .string("string"), "description": .string("exact information request Message ID")]),
             ]),
-            "required": .array([.string("to"), .string("content")]),
+            "required": .array([.string("to"), .string("content"), .string("inReplyTo")]),
             "additionalProperties": .bool(false),
         ])
     )
 
-    struct Args: Decodable { let to: String; let content: String; let inReplyTo: String? }
+    struct Args: Decodable { let to: String; let content: String; let inReplyTo: String }
 
     public func permissionIntent(_ args: ToolArgs, workspaceRoot: URL) -> PermissionIntent {
         let value = try? args.decode(Args.self)

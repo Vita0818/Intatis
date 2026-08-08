@@ -30,6 +30,7 @@ public enum ToolCapability: String, Codable, Sendable, Hashable {
     case createGoal = "create_goal"
     case submitGoalVerdict = "submit_goal_verdict"
     case renameSession = "rename_session"
+    case controlRun = "control_run"
 }
 
 public struct DelegationBudget: Codable, Sendable, Hashable {
@@ -123,6 +124,7 @@ public struct CapabilityLease: Codable, Sendable, Hashable {
             .listWorkspace,
             .searchWorkspace,
             .readPDF,
+            .requestInformation,
             .replyMessage,
             .requestDelegation,
             .readWorkTasks,

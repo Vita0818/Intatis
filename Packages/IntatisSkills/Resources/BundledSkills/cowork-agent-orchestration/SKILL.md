@@ -1,6 +1,6 @@
 ---
 name: cowork-agent-orchestration
-description: Proactively plan, track, and route Intatis Cowork work when coordinator capabilities are available, including deciding direct execution versus agent reuse, delegation, or spawn; selecting newer adequate host-approved inference profiles under cost-first, cost-efficient-balanced, or efficiency-first priorities; pairing a declared-capable multimodal companion when needed; and minimizing workspace and coordination leases.
+description: Proactively plan, track, route, and close Intatis Cowork work when coordinator capabilities are available, including direct execution versus agent reuse, delegation, or spawn; host-approved inference-profile selection; multimodal companions; least-authority leases; exact run closure; and correlation-safe mailbox follow-ups without acknowledgment loops.
 ---
 
 # Cowork agent orchestration
@@ -51,6 +51,24 @@ or budgets.
 6. Keep advancing until the requested outcome is verified or a genuine blocker
    remains. Never infer completion from a plan, an invocation ending, or unverified
    prose.
+7. When `finish_run` is advertised, call it after the exact current request is
+   verified and no further run-scoped work is useful. When `stop_run` is advertised,
+   call it only when no further useful progress is possible or a genuine blocker
+   remains. The host binds both tools to the current run; never invent an ID. After
+   either succeeds, make no more tool or agent calls and return one final response.
+
+## Keep mailbox conversations live without acknowledgment loops
+
+- `reply_message` answers one exact frozen `information_request` Message ID. It is a
+  terminal response only for that request correlation, not a ban on future dialogue.
+- Receipt of an `information_reply` requires no acknowledgment and must not trigger a
+  reverse `reply_message`.
+- If the reply reveals a genuinely useful next question and `request_information` is
+  advertised, create a fresh request correlation with `based_on` set to the reply
+  Message ID. The host retains the same conversation root while giving the new turn a
+  distinct request ID.
+- Never use a fresh request merely to say thanks, confirm receipt, or keep an agent
+  awake. Continue only when the answer can change remaining work or verification.
 
 ## Select the operating priority
 
