@@ -776,6 +776,7 @@ public enum PermissionApprovalFailureKind: String, Codable, Equatable, Sendable 
     case requestPersistenceFailure = "request_persistence_failure"
     case settlementPersistenceFailure = "settlement_persistence_failure"
     case authorizationSnapshotInvalid = "authorization_snapshot_invalid"
+    case authorizationContextUnavailable = "authorization_context_unavailable"
 }
 
 /// Explicit user/control-plane response to one permission request. `decline`

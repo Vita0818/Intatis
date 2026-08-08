@@ -2,26 +2,27 @@
 
 文档状态：当前源码摘要
 最近核对：2026-08-08
-产品基线：v0.38（build 38）
+产品基线：v0.40（build 40）
 
 ## 版本与发行状态
 
 - `HEAD` 与 `origin/main` 当前均为标题为 `v0.34` 的提交 `c4727c1`。仓库没有 Git tag；该
-  commit 标题不是产品版本事实源，`project.yml` 把当前产品基线定义为 `0.38 (38)`。
-- `MARKETING_VERSION` / `CURRENT_PROJECT_VERSION` 已推进为 `0.38 (38)`。两个仓库参考
+  commit 标题不是产品版本事实源，`project.yml` 把当前产品基线定义为 `0.40 (40)`。
+- `MARKETING_VERSION` / `CURRENT_PROJECT_VERSION` 已推进为 `0.40 (40)`。两个仓库参考
   Info.plist、README、文档入口和发行脚本使用同一基线。
-- 2026-08-07 已重新生成 Xcode 工程并通过版本一致性门；`IntatisMac` unsigned
-  universal Release 与 `IntatisiOS` generic Simulator Debug 均构建通过，最终 bundle
-  均为 `0.38 (38)`，macOS 可执行文件包含 `x86_64 arm64`。本轮未安装 v0.38 App。
-- 2026-08-07 版本推进前已从当时的未提交工作树完成 macOS universal Release 构建；本机
-  `/Applications/Intatis.app` 已安装包含最新 Chat/Cowork composer 附件改动和 Cowork
-  terminal/mailbox reconciliation 修复的 `0.36 (36)` ad-hoc Hardened Runtime 开发构建。
-  安装前的同版本 App 已以 timestamped `Intatis-before-install-*.app` 移入废纸篓，可恢复。
-  该本机安装不是 Developer ID 公证发行产物。
+- 2026-08-08 已重新生成 Xcode 工程并通过 v0.40 版本一致性门；`IntatisMac` unsigned
+  universal Release 与 `IntatisiOS` generic Simulator Debug 均构建通过，最终 bundle 均为
+  `0.40 (40)`，macOS 可执行文件包含 `x86_64 arm64`。
+- 本机 `/Applications/Intatis.app` 已安装上述当前工作树的 `0.40 (40)` ad-hoc Hardened
+  Runtime 开发构建；bundle identifier 为 `com.Vita0818.IntatisMac`，严格 codesign 校验通过，
+  安装副本与已验证 staging 副本的可执行文件 SHA-256 一致，且无 quarantine xattr。安装前的
+  `0.36 (36)` 已移至
+  `/Users/vita/.Trash/Intatis-before-install-20260808-163949.app`，可恢复。该本机安装不是
+  Developer ID 公证发行产物。
 - macOS 只发行 `IntatisMac` Developer ID/direct-distribution 产品；不做 Mac App Store。
   `IntatisMacAppStore` 仍是 legacy source target，不进入默认构建、测试或 release gate。
 - 用户宿主终端已报告两个有效 codesigning identity，其中 Developer ID Application 可被发行
-  脚本选取；`Intatis-Notary` Keychain profile 也已配置。v0.38 最终 App/DMG 尚未完成 Apple
+  脚本选取；`Intatis-Notary` Keychain profile 也已配置。v0.40 最终 App/DMG 尚未完成 Apple
   notarization、staple 与 Gatekeeper 全链路，因此仍不得描述为正式 release。
 
 ## 当前产品面
@@ -67,6 +68,16 @@ macOS 是完整产品：Chat、Code、Cowork、Settings 和本地诊断导出。
   当前窗口的只读对话选择；列表保留 session 历史上所有 durable agent，detached identity 继续
   可点击并由原状态图标显示已移除，当前选择不会跳回 `@main`。新窗口默认显示 `@main`，
   `@permission-reviewer` 等控制面 identity 仍为不可选择的状态项。
+- Cowork automatic ask-class 权限请求现已带 host-validated authorization context。请求工具的
+  acting agent 复用刚才的 exact provider/model 与 provider-facing conversation snapshot，另发一次
+  `tools: []` 的 request-owned 报告请求；模型只返回五项语义报告和临时 user handles。宿主把 handles
+  映射到同 session canonical `user_message` sequence，无条件加入当前 submission，并从最早引用到
+  当前消息闭包覆盖所有可见用户指令，防止跳过中途撤销或缩窄。`PermissionReviewControlPlane` 再独立
+  验证 complete-known history、main/worker projection、current submission、report secret/shape 与 exact
+  authorization binding，最后把 untrusted report、canonical latest instruction 和 supporting evidence
+  分栏交给 reviewer。任何缺失、超预算、unknown future event、malformed/secret output、timeout 或 cancel
+  均在 reviewer provider 前以 `authorization_context_unavailable` durable deny；hard deny、manual flow、
+  host `agentAdmission`、CapabilityLease/WorkspaceLease 和 durable-first settlement 语义没有改变。
 - Cowork final turn 现在先校验 side-effect evidence，再原子发布 final message/model-history、idle
   与 completed outcome；旧日志中 failed/interrupted turn 的先行完成气泡会被展示投影纠正，失效的
   final assistant 也不再进入下一次 provider history。exact `@main` root 另可见模型主动调用的

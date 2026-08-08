@@ -2,7 +2,7 @@
 
 文档状态：当前回归禁区
 最近核对：2026-08-08
-产品基线：v0.38（build 38）
+产品基线：v0.40（build 40）
 
 ## macOS 分发不变量
 
@@ -585,7 +585,7 @@
 - `session.json` 不得成为第二事实源：EventLog full fold 永远获胜，same-watermark/lagging cache corruption、未知未来事件、跨进程 refresh race 均必须 fail closed 或重建；rename/settings/migration 必须 EventLog-first。
 - `workspace-access.plist` 不得进入日志或普通设置：bookmark bytes 必须保持 session-owned、binary、`0600`、锁/写 no-follow、原子替换及 RAII security-scope 生命周期；legacy migration marker 后不得 resurrect 全局 fallback。
 - 未知未来 event 即使当前版本无法解码，也不得导致下次 append 复用它已占用的 `seq`；EventLog 初始化至少要从合法 JSON envelope 探测序号。任何合法 header 的 `session` 必须等于当前 `EventLog.sessionID`，known/unknown wrong-session 都要 fail closed。
-- fresh Cowork bootstrap、automatic reviewer reconcile/process、Cowork AgentLoop 副作用证据恢复与 durable token usage refresh 必须使用 `replayChecked` / `isEmptyChecked` 或复用同一已验证 snapshot；不得用兼容 replay 的空数组掩盖 lock/read/known-payload/session corruption。未知 future type 即使可跳过 payload，也必须占用 seq、算 durable nonempty state。凡是要证明某事件不存在或比较全历史顺序的 Cowork restore、Goal startup/进程内 launch、legacy no-effect repair 与 whole-task non-replayable retry，必须改用 `replayForProjectionChecked()` 并要求 `hasCompleteKnownHistory`；unknown future type 或 seq gap 时不得继续推断。
+- fresh Cowork bootstrap、Cowork AgentLoop 副作用证据恢复与 durable token usage refresh 必须使用 `replayChecked` / `isEmptyChecked` 或复用同一已验证 snapshot；不得用兼容 replay 的空数组掩盖 lock/read/known-payload/session corruption。automatic reviewer reconcile，以及任何 authorization user-evidence mapping/closure/process，必须使用 `replayForProjectionChecked()` 并要求 `hasCompleteKnownHistory`。未知 future type 即使可跳过 payload，也必须占用 seq、算 durable nonempty state；凡是要证明某事件不存在或比较全历史顺序的 Cowork restore、Goal startup/进程内 launch、legacy no-effect repair 与 whole-task non-replayable retry，同样不得在 unknown future type 或 seq gap 时继续推断。
 - per-agent inference exact binding 不得降级成 `agent.model`、session-global provider 或 catalog current pointer。现有 agent/default、data plane/control plane、inference binding/permission/tool/workspace lease 的边界必须保持分离；任何无法精确解析的 live binding 都不得调用 provider。
 - `Mediator` 默认转发摘要、不转发原始字节：不得退化成透传完整内容。
 - `SecretScanner` 标记集不得删减。
@@ -594,6 +594,10 @@
 - Cowork 不得实现为硬编码递归 agent 树（见 `docs/COWORK_PRINCIPLES.md`）。
 - `AgentLoop` 不得直接同步递归调用另一个 `AgentLoop`。
 - 自动权限审查不得通过嵌套 `AgentLoop` 实现；审查者只能收到无工具 provider 请求并返回结构化 JSON 决策。
+- automatic ask-class exact call 的 authorization reporter 必须复用 requesting agent 当前 exact provider/model 与刚才的 provider-facing conversation snapshot，只能发 `tools: []` 的 request-owned 调用；不得借 reviewer provider、回退 current/default binding、进入普通 AgentLoop/scheduler/TaskGraph/UI/model history，或跨 tool call/cache 复用报告。
+- 模型生成的 `PermissionAuthorizationReport` 只是未信任语义解释。模型不得提交/覆盖 report author、EventLog sequence、latest-user 原文副本、authorization identity、binding digest、gate、lease 或 permission decision；这些事实只能取自既有 `requestingAgent`、canonical EventLog、review task 和 `ResolvedToolAuthorization`。
+- host 必须把 temporary user handles 限定在 requesting agent 实际可见的同 session user projection，无条件加入 current submission，并从最早引用到当前消息闭包加入所有可见真实用户轮次。未知/重复/跨 scope handle、缺 current、截断/歧义 projection、超预算、unknown future event、seq gap 或遗漏中间撤销/缩窄都必须 fail closed。
+- live model-authored automatic review 缺少完整 `authorizationContext`，或报告 generation/strict decode/secret scan/timeout/cancel/usage settlement 失败时，必须保留既有 durable permission lifecycle，并在 reviewer provider 前以 typed `authorization_context_unavailable` deny；不得切 GUI 人工 fallback。host `agentAdmission`、manual permission、deterministic allow 与 hard deny 不得因此新增 reporter 调用或改变原语义。
 - Goal continuation 与 GoalVerifier 也不得通过嵌套 `AgentLoop` 实现；verifier 无工具且不能直接写 EventLog，只有宿主可提交最终 Goal state transition。
 
 ## 验证要求

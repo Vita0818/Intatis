@@ -542,6 +542,7 @@ public struct AgentLoop: Sendable {
         var firstTokenAt: Date?
         var usage: Usage?
         var turnStatsAppended = false
+        let permissionAuthorizationUsage = PermissionAuthorizationUsageLedger()
 
         do {
         let modelHistoryScope = try modelHistoryRecordingScope(
@@ -906,6 +907,9 @@ public struct AgentLoop: Sendable {
             }
 
             if pendingToolCalls.isEmpty {
+                usage = Usage.adding(
+                    usage,
+                    await permissionAuthorizationUsage.drain())
                 await appendTurnStats(start: start, firstTokenAt: firstTokenAt, usage: usage)
                 turnStatsAppended = true
                 completedResponseEvents.append(.agentStatus(AgentStatusPayload(
@@ -932,6 +936,17 @@ public struct AgentLoop: Sendable {
                 try await log.append(completedResponseEvents)
             }
 
+            let authorizationReportingTurn = PermissionAuthorizationReportingTurn(
+                providerMessages: request.messages,
+                assistantText: assistantText,
+                toolCalls: pendingToolCalls,
+                visibleUserMessages: permissionAuthorizationVisibleUserMessages(
+                    projection: modelHistoryProjection,
+                    currentSubmissionID: effectiveSubmissionID,
+                    currentUserText: userText),
+                currentSubmissionID:
+                    context.taskContract?.submissionID
+                    ?? effectiveSubmissionID)
             convo.append(.assistant(toolCalls: pendingToolCalls, content: assistantText.isEmpty ? nil : assistantText))
             let observations = try await runToolCalls(
                 pendingToolCalls,
@@ -941,7 +956,9 @@ public struct AgentLoop: Sendable {
                 modelHistoryScope: modelHistoryScope,
                 registry: toolSnapshot.registry,
                 mcpAvailability:
-                    toolSnapshot.mcpAvailability)
+                    toolSnapshot.mcpAvailability,
+                authorizationReportingTurn: authorizationReportingTurn,
+                permissionAuthorizationUsage: permissionAuthorizationUsage)
             for (toolCall, observation) in zip(pendingToolCalls, observations) {
                 try Task.checkCancellation()
                 if toolCall.kind == .toolSearch {
@@ -1014,6 +1031,9 @@ public struct AgentLoop: Sendable {
         }
 
         try Task.checkCancellation()
+        usage = Usage.adding(
+            usage,
+            await permissionAuthorizationUsage.drain())
         await appendTurnStats(start: start, firstTokenAt: firstTokenAt, usage: usage)
         turnStatsAppended = true
         throw AgentLoopError.maxIterationsExceeded(limit: maxIterations)
@@ -1022,6 +1042,9 @@ public struct AgentLoop: Sendable {
             // occur after entering the loop. Callers should propagate/classify
             // the thrown error, not append a second copy of the same event.
             if !turnStatsAppended {
+                usage = Usage.adding(
+                    usage,
+                    await permissionAuthorizationUsage.drain())
                 await appendTurnStats(start: start, firstTokenAt: firstTokenAt, usage: usage)
             }
             let interruption = Self.turnInterruption(for: error)
@@ -1549,7 +1572,11 @@ public struct AgentLoop: Sendable {
                               modelHistoryScope: ModelHistoryRecordingScope?,
                               registry: ToolRegistry,
                               mcpAvailability:
-                                MCPToolAvailabilitySnapshot) async throws
+                                MCPToolAvailabilitySnapshot,
+                              authorizationReportingTurn:
+                                PermissionAuthorizationReportingTurn,
+                              permissionAuthorizationUsage:
+                                PermissionAuthorizationUsageLedger) async throws
         -> [ToolObservation] {
         let parallelCollaborationTools = Set(["ask_agent", "delegate_task"])
         guard toolCalls.count > 1,
@@ -1566,7 +1593,9 @@ public struct AgentLoop: Sendable {
                     modelHistoryScope: modelHistoryScope,
                     registry: registry,
                     mcpAvailability:
-                        mcpAvailability)
+                        mcpAvailability,
+                    authorizationReportingTurn: authorizationReportingTurn,
+                    permissionAuthorizationUsage: permissionAuthorizationUsage)
                 results.append(observation)
             }
             return results
@@ -1586,7 +1615,9 @@ public struct AgentLoop: Sendable {
                         modelHistoryScope: modelHistoryScope,
                         registry: registry,
                         mcpAvailability:
-                            mcpAvailability)
+                            mcpAvailability,
+                        authorizationReportingTurn: authorizationReportingTurn,
+                        permissionAuthorizationUsage: permissionAuthorizationUsage)
                     return (index, observation)
                 }
             }
@@ -1659,7 +1690,11 @@ public struct AgentLoop: Sendable {
                          modelHistoryScope: ModelHistoryRecordingScope?,
                          registry: ToolRegistry,
                          mcpAvailability:
-                            MCPToolAvailabilitySnapshot) async throws
+                            MCPToolAvailabilitySnapshot,
+                         authorizationReportingTurn:
+                            PermissionAuthorizationReportingTurn,
+                         permissionAuthorizationUsage:
+                            PermissionAuthorizationUsageLedger) async throws
         -> ToolObservation {
         try Task.checkCancellation()
 
@@ -2030,7 +2065,11 @@ public struct AgentLoop: Sendable {
                                        callContext: callContext,
                                        authorization: authorization,
                                        executionID: executionID,
-                                       replayPolicy: replayPolicy)
+                                       replayPolicy: replayPolicy,
+                                       authorizationReportingTurn:
+                                        authorizationReportingTurn,
+                                       permissionAuthorizationUsage:
+                                        permissionAuthorizationUsage)
         try Task.checkCancellation()
 
         guard settled.decision == .allow else {
@@ -3012,7 +3051,11 @@ public struct AgentLoop: Sendable {
                         callContext: ToolCallContext,
                         authorization: ResolvedToolAuthorization,
                         executionID: String,
-                        replayPolicy: ToolExecutionReplayPolicy) async throws -> SettledPermission {
+                        replayPolicy: ToolExecutionReplayPolicy,
+                        authorizationReportingTurn:
+                            PermissionAuthorizationReportingTurn,
+                        permissionAuthorizationUsage:
+                            PermissionAuthorizationUsageLedger) async throws -> SettledPermission {
         switch outcome.decision {
         case .allow, .deny:
             try await log.append(.permissionResolved(PermissionResolvedPayload(
@@ -3034,6 +3077,32 @@ public struct AgentLoop: Sendable {
         case .askUser:
             let requestID = RequestID.new()
             let boundedArguments = "digest=\(authorization.normalizedArgumentsDigest); characters=\(authorization.normalizedArgumentsCharacterCount)"
+            var requestContext = permissionRequestContext(
+                outcome: outcome,
+                callContext: callContext,
+                toolCall: toolCall,
+                turnID: turnID,
+                authorization: authorization,
+                executionID: executionID,
+                replayPolicy: replayPolicy)
+            if context.runtimeEnvironment.mode == .cowork,
+               responder.approvalMode == .automaticReviewer {
+                let reportResult = await PermissionAuthorizationContextReporter(
+                    log: log,
+                    provider: provider,
+                    model: agent.model,
+                    reasoningEffort: reasoningEffort,
+                    tokenBudgetMeter: tokenBudgetMeter)
+                    .report(
+                        turn: authorizationReportingTurn,
+                        authorization: authorization)
+                await permissionAuthorizationUsage.record(reportResult.usage)
+                try Task.checkCancellation()
+                if var causalContext = requestContext.causalContext {
+                    causalContext.authorizationContext = reportResult.context
+                    requestContext.causalContext = causalContext
+                }
+            }
             let request = PermissionRequestPayload(
                 requestId: requestID, agent: agent.name, tool: descriptor.name,
                 args: context.runtimeEnvironment.mode == .cowork
@@ -3041,14 +3110,7 @@ public struct AgentLoop: Sendable {
                     ? boundedArguments
                     : toolCall.arguments,
                 risk: outcome.risk, reason: outcome.reason,
-                context: permissionRequestContext(
-                    outcome: outcome,
-                    callContext: callContext,
-                    toolCall: toolCall,
-                    turnID: turnID,
-                    authorization: authorization,
-                    executionID: executionID,
-                    replayPolicy: replayPolicy),
+                context: requestContext,
                 approvalMode: responder.approvalMode)
             try await log.append([
                 .permissionRequest(request),
@@ -3232,6 +3294,58 @@ public struct AgentLoop: Sendable {
         }, onCancel: {
             gate.cancel()
         })
+    }
+
+    /// Freezes only genuine user messages that were visible to the acting
+    /// agent's exact request. Stable main-thread history retains its canonical
+    /// submission identities; task-scoped workers receive only the root
+    /// submission propagated by their TaskContract and never inherit private
+    /// main-thread turns.
+    private func permissionAuthorizationVisibleUserMessages(
+        projection: AgentModelHistoryProjection?,
+        currentSubmissionID: SubmissionID?,
+        currentUserText: String
+    ) -> [PermissionAuthorizationVisibleUserMessage] {
+        let current = context.taskContract?.submissionID
+            ?? currentSubmissionID
+        switch context.conversationHistoryPolicy {
+        case .coworkMainThread:
+            guard let projection,
+                  projection.realUserMessages.allSatisfy({
+                      $0.submissionID != nil
+                  }) else {
+                return []
+            }
+            var seen = Set<SubmissionID>()
+            var visible: [PermissionAuthorizationVisibleUserMessage] = []
+            for message in projection.realUserMessages {
+                guard let submissionID = message.submissionID,
+                      seen.insert(submissionID).inserted else {
+                    return []
+                }
+                visible.append(PermissionAuthorizationVisibleUserMessage(
+                    submissionID: submissionID,
+                    expectedContent: message.content,
+                    contentTruncated: message.contentTruncated))
+            }
+            if let current, !seen.contains(current) {
+                visible.append(PermissionAuthorizationVisibleUserMessage(
+                    submissionID: current,
+                    expectedContent: currentUserText))
+            }
+            return visible
+
+        case .taskScoped:
+            guard let current else { return [] }
+            return [PermissionAuthorizationVisibleUserMessage(
+                submissionID: current)]
+
+        case .conversation:
+            guard let current else { return [] }
+            return [PermissionAuthorizationVisibleUserMessage(
+                submissionID: current,
+                expectedContent: currentUserText)]
+        }
     }
 
     private func projectedHistory(

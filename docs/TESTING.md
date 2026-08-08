@@ -2,7 +2,7 @@
 
 文档状态：当前验证矩阵
 最近核对：2026-08-08
-产品基线：v0.38（build 38）
+产品基线：v0.40（build 40）
 
 历史测试数量、性能数字和事故复验保留在 Git 历史及 dated reports；它们不能替代当前
 working tree 的验证。这里只记录现行命令、release gate 和最近一次真实结果。
@@ -27,11 +27,11 @@ scripts/check-version-consistency.sh
 
 必须同时满足：
 
-- `project.yml`：`MARKETING_VERSION=0.38`，`CURRENT_PROJECT_VERSION=38`；
-- macOS/iOS 参考 Info.plist：`0.38 (38)`；
+- `project.yml`：`MARKETING_VERSION=0.40`，`CURRENT_PROJECT_VERSION=40`；
+- macOS/iOS 参考 Info.plist：`0.40 (40)`；
 - 生成的 `Intatis.xcodeproj`：相同版本；
 - README、文档索引、CURRENT_STATE 和 PROJECT_MAP：相同当前基线；
-- 最终 App bundle：`CFBundleShortVersionString=0.38`、`CFBundleVersion=38`。
+- 最终 App bundle：`CFBundleShortVersionString=0.40`、`CFBundleVersion=40`。
 
 旧设计文档、依赖版本、协议 schema 和 dated reports 中的其他 v0.x 不属于该一致性检查。
 
@@ -56,6 +56,22 @@ swift test --filter IntatisAgentKernelTests
 swift test --filter IntatisCoworkTests
 swift test --filter IntatisSharedUITests
 ```
+
+修改 Cowork automatic permission authorization context 时，至少运行：
+
+```sh
+swift test --filter PermissionReviewProtocolTests
+swift test --filter PermissionAuthorizationContextReporterTests
+swift test --filter PermissionReviewControlPlaneTests
+swift test --filter AutomaticPermissionReviewTests
+```
+
+必须覆盖 legitimate `continue`/省略指令映射、acting-provider request snapshot 与 `tools: []`、
+canonical current user message、earliest-cited→current evidence closure、intervening revoke/scope change、
+main/worker projection 隔离、同 assistant batch 多 call 独立报告、usage/no-history、legacy optional decode，
+以及 malformed/secret/unknown handle/timeout/cancel/unknown future event/缺 context 的 durable typed deny。
+另须证明 hard deny 与 manual flow 不触发 reporter，report 不能改变 exact authorization、gate、capability/
+workspace ceiling，reviewer provider 只在完整 host validation 后被调用。
 
 MCP、browser、managed terminal、OAuth、real provider 和设备测试中明确标为 opt-in 的项目，
 必须在具备相应 runtime/credential/网络的环境单独执行。
@@ -136,7 +152,7 @@ recovery App metadata/architecture/signature/entitlements 重新验证；超时�
 
 发行脚本必须在输出 `dist/` 前完成：
 
-1. v0.32/build 32 一致性检查；
+1. v0.40/build 40 一致性检查；
 2. `IntatisMac` universal Release；
 3. Developer ID Application + secure timestamp + Hardened Runtime；
 4. signed entitlements 不含 App Sandbox；
@@ -327,6 +343,49 @@ routing options、结构化 unsupported 同路由一次降级、裸 404 拒绝�
   线上 provider smoke 必须单独记录，不能从离线测试或编译外推。
 
 ## 最近一次真实结果
+
+2026-08-08 `v0.40 (40)` 版本推进、shipping target 构建与本机开发安装的直接证据：
+
+- `xcodegen generate` 通过；`scripts/check-version-consistency.sh` 通过并输出
+  `Intatis version is consistent: 0.40 (build 40)`；
+- `IntatisMac` unsigned universal Release 构建退出 0，最终 bundle 为 `0.40 (40)`，bundle
+  identifier 为 `com.Vita0818.IntatisMac`，可执行文件包含 `x86_64 arm64`；
+- `IntatisiOS` generic Simulator Debug unsigned build 退出 0，最终 bundle 为 `0.40 (40)`；
+  两个构建只报告仓库既有的 unused-result / deprecated `onChange` warning；
+- 安装前使用 `IntatisMac.DeveloperID.entitlements` 对 staging App 完成 ad-hoc Hardened Runtime
+  签名；读回 microphone input=true、JIT=false、library validation 未关闭且无 App Sandbox，
+  `codesign --verify --deep --strict` 通过；
+- `/Applications/Intatis.app` 已安装上述 `0.40 (40)` 开发构建，无 quarantine xattr；安装后
+  可执行文件与 staging 副本的 SHA-256 均为
+  `617c5b50a5e20e580c0a5a7d2059bc2337b19e92de66dd0779f8ada2d5a44cbe`。安装前的
+  `0.36 (36)` 已移至
+  `/Users/vita/.Trash/Intatis-before-install-20260808-163949.app`，可恢复；
+- 本轮没有重跑 SwiftPM 单元测试，也没有启动 App 做 UI/真实 provider smoke；紧随其后的
+  Cowork permission authorization context 完整测试证据覆盖同一业务源码。未运行 Developer ID
+  正式签名、公证、staple、Gatekeeper 或 DMG/ZIP 打包，因此这是本机开发安装证据，不是正式
+  release 证据。
+
+2026-08-08 Cowork automatic permission authorization context 修复的直接证据：
+
+- `PermissionReviewProtocolTests`：11 tests / 0 failures；验证 additive optional wrapper、旧事件
+  缺字段解码，以及协议没有增加 model-supplied author/latest-user/digest；
+- `PermissionAuthorizationContextReporterTests`：7 tests / 0 failures；覆盖 `continue` 语义、同一
+  acting provider/model 的 exact request prefix、`tools: []`、canonical evidence closure、worker
+  scope 隔离、unknown handle、secret-bearing output、completion marker、timeout、caller cancel 与
+  request-owned stream termination；
+- `AutomaticPermissionReviewTests`：31 tests / 0 failures；`PermissionReviewControlPlaneTests`：
+  40 tests / 0 failures；覆盖合法 report 与 canonical EventLog 原文分栏、缺失/malformed context、
+  omitted intervening revocation、unknown future event、每个 tool call 独立 report、hard deny 不调用
+  reporter，以及 reviewer provider 前的 typed durable deny；
+- `testCancelAllDrainsDataPlaneBeforeShuttingDownPermissionReviewer`：1 test / 0 failures；确认 session
+  cancel 会 drain 原始 inference、request-owned report 与 reviewer，不会释放 denial 后继续第三次
+  inference 或执行文件写入；完整 `IntatisCoworkTests`：346 tests / 0 failures；
+- managed sandbox 中第一次完整 `swift test --disable-sandbox` 因外层 Seatbelt 拒绝既有 browser/
+  LaTeX/Git/process 子进程启动而失败；在允许真实子进程边界的宿主环境用同一 working tree 重跑后，
+  14 个 XCTest target 合计 1727 tests / 19 conditional skips / 0 failures。`swift build
+  --disable-sandbox` 与 `git diff --check` 均通过；
+- 本次未修改 App/UI、Xcode 工程或平台 target，因此未另跑 macOS/iOS App build；未执行真实
+  provider/credential/network smoke，不能从 scripted provider 测试外推线上模型质量。
 
 2026-08-08 Cowork current-run 终态控制与 correlation-scoped mailbox 修复的直接证据：
 
@@ -583,7 +642,7 @@ routing options、结构化 unsupported 同路由一次降级、裸 404 拒绝�
 只有以下条件同时满足才能写 release GO：
 
 - 当前 working tree 相关 tests/builds 通过，已知失败有明确处置；
-- 最终 App/ZIP/DMG 元数据为 `0.38 (38)`；
+- 最终 App/ZIP/DMG 元数据为 `0.40 (40)`；
 - Developer ID、notarization、staple、codesign、Gatekeeper 全部通过；
 - NOTICE/ThirdPartyNotices 和最终 bundle resource/link inventory 一致；
 - 关键真实环境矩阵完成，未完成项以明确的风险接受记录处理。

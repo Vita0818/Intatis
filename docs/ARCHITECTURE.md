@@ -2,7 +2,7 @@
 
 文档状态：当前架构规范
 最近核对：2026-08-08
-产品基线：v0.38（build 38）
+产品基线：v0.40（build 40）
 
 文中较早的 v0.x 只表示能力最初引入或兼容格式冻结的里程碑；除明确标为历史的段落外，
 当前架构判断以本文件、源码和 `project.yml` 为准。
@@ -20,6 +20,45 @@ terminal、Git、global Skills、stdio MCP、浏览器 helper 或其他 Code/Cow
 Capability/WorkspaceLease、PathConfinement、SecretScanner、durable execution、
 managed terminal 的 workspace-scoped Seatbelt/default-network-deny、
 Hardened Runtime、签名/公证与 iOS target 边界仍是当前架构。
+
+## 2026-08-08 Cowork 自动权限审查授权上下文
+
+automatic ask-class exact tool call 不再只把当前 `TaskContract.objective` 当作完整授权语义。
+在 ToolRegistry 已解析 exact registration/normalized arguments/intent/action preview/lease membership、
+deterministic gate 不是 hard deny，且 execution revalidation 通过后，`AgentLoop` 为该单一 tool call
+执行一次 request-owned 的授权上下文报告：
+
+```text
+acting agent exact provider-facing request snapshot
+  + current assistant tool-call batch
+  + host-resolved exact action facts
+  + temporary handles for genuinely visible canonical user messages
+  -> same acting provider/model, tools=[]
+  -> five-field untrusted PermissionAuthorizationReport + user handles
+  -> host maps handles to same-session user_message EventLog seq
+  -> always include current submission and close every visible user turn
+     from the earliest cited instruction through the current instruction
+  -> PermissionReviewCausalContext.authorizationContext
+  -> PermissionReviewControlPlane independently replays/validates evidence
+  -> reviewer sees separate report / canonical latest instruction /
+     supporting-user-evidence blocks
+```
+
+`PermissionAuthorizationReport` 只由 requesting agent 的同一模型生成，字段为 authorization goal、
+current progress、latest-instruction interpretation、exact-action justification 和 scope assessment；它是
+未经信任的解释，不是授权。用户原文和 durable sequence 只来自 complete-known EventLog，模型只能返回
+本次请求的临时 handle；report author 使用既有 `requestingAgent`，exact action/session/task/turn/toolCall/
+arguments digest/gate/lease 使用既有 `ResolvedToolAuthorization` 与 review task 结构，协议不复制
+`latestUserInstruction`、`reportAuthor` 或 `bindingDigest`。
+
+报告请求不进入普通 `AgentLoop`、TaskGraph、scheduler、MessageBus、UI bubble 或后续 model history，也
+不跨 tool call 缓存；同一 assistant batch 的每个 automatic ask-class call 各自生成并绑定报告。manual
+permission、deterministic allow/deny 和 host-originated `agentAdmission` 不运行该 reporter。报告 generation、
+严格 JSON、secret scan、handle mapping、complete-known replay、evidence closure、budget、timeout 或 cancel
+任一步失败时，permission request 仍按既有 durable lifecycle 登记，但 control plane 在调用 reviewer provider
+前以 typed `authorization_context_unavailable` deny；不得切换人工 fallback，也不得放宽 gate/capability/
+workspace ceiling。旧 JSONL 缺少 additive optional wrapper 时继续解码；新的 live model-authored automatic
+request 缺少完整 wrapper 必须 fail closed。
 
 ## 2026-08-02 本地诊断导出架构
 
@@ -1001,7 +1040,7 @@ MessageBus.deliver -> Mediator.mediate
 - Cowork session 可绑定一个或多个用户选择的工作目录；EventLog settings 只保存 secret-free path/agent/primary/future-profile/permission/token-budget metadata，bookmark bytes 只进入 session-owned capability plist。brand-new session 中，用户明确选择 primary workspace 后，固定七事件 bootstrap 同时记录 settings、`@main` 与 reviewer 的独立 leases/identities，不再让 reviewer 重复审批同一次选择；任何后续目录新增、普通 agent attach 或 spawn 仍依赖 workspace bookmark 与既有权限流，历史缺 main/reviewer 只能走上文专用 host recovery，不得复用 fresh bootstrap。
 - `@main` agent 不可被 remove。
 - Project Settings 新增目录只更新 project metadata；当前工具执行仍以 agent 单 `workspaceRoot` 为真实文件访问根。右侧 inspector 不提供 agent 删除或详情管理，按权限审查、未清理 agent 状态图标、Goal、Tasks 的顺序显示且不提供 Git UI；`@main` 与 `@permission-reviewer` 不可删除。
-- `@permission-reviewer` 是自动权限审查保留身份和独立控制面：GUI/CLI 默认启用；CLI `/auto` 只用于重新启用，只有用户明确 `/default` 才进入人工模式；不能作为普通 send/delegate/message/ask 目标，也不会暴露给 `list_agents`。review queue 不占普通 scheduler 槽，采用 64 项上限的 FIFO/single-flight，deadline 从 submit 计时；request/task/root/parent/attempt/toolCall、参数 digest/count、bounded redacted `PermissionActionPreview`、paths/network/side-effect/gate/lease/TaskContract/causal context 通过结构化任务传递，automatic-review payload/prompt 不含 raw args。reviewer 只返回 `allow` / `deny` 和非空有界 reason，risk 不能低于 deterministic gate；单次 deadline 默认为 120 秒。模型请求默认不注入 `temperature`、output-token 或字符上限；只有显式 host policy 才传递对应控制，optional completion estimate 只用于 soft usage accounting。pre-submit caller cancel 直接返回 typed deny且不创建 review lifecycle；timeout、truncated、malformed、tool call、provider error、persistence failure、self-review、hard deny 与已登记 review 在 terminal-claim 前被观察到的 cancel 均产生 typed failure 并 durable deny 当前调用，不转 GUI 人工等待；claim 后 cancel 保留唯一 settlement 但 authorization delivery deny。provider error 的 durable reason 使用共享 diagnostic sanitizer 限长并移除 secret/完整 URL。review request/settled 必须 durable-first，`allow` 只有 settled 成功后才可生效。每次 provider dispatch 都创建 exact generation，production provider factory 冻结 reviewer identity/binding 而逐代重新 resolve wrapper；provider/timeout 竞争同代首 terminal，caller cancel 由同步 request token、actor path 与 settlement/delivery/admission 围栏共同处理，late/duplicate result 被丢弃。timeout/cancel 只影响当前 call；若已有 active generation 就只 retire 该代，后续 request 可 fresh review；legacy `provider_still_stopping` 只解码旧日志。Phase A 后 reviewer 未就绪由 unavailable responder deny 真实 ask-class tool，但不禁用 composer 或阻止普通主请求；Cowork 对话页不再常驻 reviewer 状态横幅，workspace reauthorization 与 automatic-review retry 只在异常时出现在 Project Settings 的 Recovery 区。Cancel task 只取消数据面任务并保留 reviewer，session stop/显式 disable 才 quiesce/shutdown 控制面。disable quiesce 后若 durable detach 失败，resume 也必须使用 fresh generation，旧 allow 无效。
+- `@permission-reviewer` 是自动权限审查保留身份和独立控制面：GUI/CLI 默认启用；CLI `/auto` 只用于重新启用，只有用户明确 `/default` 才进入人工模式；不能作为普通 send/delegate/message/ask 目标，也不会暴露给 `list_agents`。review queue 不占普通 scheduler 槽，采用 64 项上限的 FIFO/single-flight，deadline 从 submit 计时；request/task/root/parent/attempt/toolCall、参数 digest/count、bounded redacted `PermissionActionPreview`、paths/network/side-effect/gate/lease/TaskContract/causal context 通过结构化任务传递，automatic-review payload/prompt 不含 raw args。exact model-authored automatic ask-class call 还必须携带完整 `authorizationContext`：acting agent 的同模型/no-tools 报告是 untrusted interpretation，canonical latest/supporting user evidence 由宿主从 complete-known EventLog 解析并闭包覆盖中间用户指令；二者在 reviewer prompt 中分栏，缺失、冲突、secret-bearing 或不可证明时以 `authorization_context_unavailable` 在 reviewer provider 前 durable deny。reviewer 只返回 `allow` / `deny` 和非空有界 reason，risk 不能低于 deterministic gate；单次 deadline 默认为 120 秒。模型请求默认不注入 `temperature`、output-token 或字符上限；只有显式 host policy 才传递对应控制，optional completion estimate 只用于 soft usage accounting。pre-submit caller cancel 直接返回 typed deny且不创建 review lifecycle；timeout、truncated、malformed、tool call、provider error、persistence failure、self-review、hard deny 与已登记 review 在 terminal-claim 前被观察到的 cancel 均产生 typed failure 并 durable deny 当前调用，不转 GUI 人工等待；claim 后 cancel 保留唯一 settlement 但 authorization delivery deny。provider error 的 durable reason 使用共享 diagnostic sanitizer 限长并移除 secret/完整 URL。review request/settled 必须 durable-first，`allow` 只有 settled 成功后才可生效。每次 provider dispatch 都创建 exact generation，production provider factory 冻结 reviewer identity/binding 而逐代重新 resolve wrapper；provider/timeout 竞争同代首 terminal，caller cancel 由同步 request token、actor path 与 settlement/delivery/admission 围栏共同处理，late/duplicate result 被丢弃。timeout/cancel 只影响当前 call；若已有 active generation 就只 retire 该代，后续 request 可 fresh review；legacy `provider_still_stopping` 只解码旧日志。Phase A 后 reviewer 未就绪由 unavailable responder deny 真实 ask-class tool，但不禁用 composer 或阻止普通主请求；Cowork 对话页不再常驻 reviewer 状态横幅，workspace reauthorization 与 automatic-review retry 只在异常时出现在 Project Settings 的 Recovery 区。Cancel task 只取消数据面任务并保留 reviewer，session stop/显式 disable 才 quiesce/shutdown 控制面。disable quiesce 后若 durable detach 失败，resume 也必须使用 fresh generation，旧 allow 无效。
 - `AgentLoop` 对 exact denial signature 的 fuse 区分 authoritative denial 与 typed transient reviewer infrastructure failure。前者继续只送审一次并缓存拒绝；后者只允许第一个 exact retry 生成 fresh RequestID/generation。首个失败调用没有执行权，fresh retry 也必须从 gate/authorization 重新开始；第二次失败不重新装填 fresh-review 额度。
 - MessageBus 是唯一投递路径；Mediator 默认转发摘要不转发原始字节。
 - typed message 只有在 Mediator 允许且事件持久化成功后才进入 mailbox。新 mailbox delivery 的 `TaskContract.mailboxMessageIDs` 冻结 1–8 个 exact ID；ContextProjector 只呈现该集合，batch 还必须保持同 sender/recipient/Goal-run/authority class。ordinary message 是 one-way，使用 read-only workspace 且 communication `.none`，不暴露 ACK 工具；information request 只获得 `reply_message` + `.replyOnly`，并且必须以 `inReplyTo` 精确终结 frozen RequestID，同一请求只接受一个 terminal reply（exact duplicate 幂等、冲突 reply 拒绝）；information reply receipt 不暴露 `reply_message`，而只允许向原 sender 发起 `request_information`。若内容需要继续讨论，receipt 必须把 reply MessageID 作为 `based_on`，创建 fresh RequestID、保留原 `conversationID`，因此一次 `information_replied` 只关闭当前 correlation，不关闭长期对话。receipt/ordinary message 不发送礼貌 ACK。`request_delegation` 另只可在原 default ceiling 内获得最多一次、深度 1 的 delegation。未呈现或未成功完成的消息保持 pending；失败只能在同一 TaskID 上按 `maxAttempts` 有界重试，已耗尽的 poison ID 不得换新 TaskID 重置次数，也不得阻塞后来未绑定的 ID。成功时 `task_completed`、可选 candidate WorkTask progress 与 exact `agent_message_consumed` 在一个 EventLog batch 中提交，随后才 ack 内存 mailbox；Goal/run cancellation 只能 durable `agent_message_discarded` 后 ack。legacy nil correlation/binding 继续可解码，只按 exact causal/scope/时间 lineage 保守匹配，不能据此扩大 live follow-up 权限。

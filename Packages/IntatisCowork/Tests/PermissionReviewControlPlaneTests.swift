@@ -87,14 +87,20 @@ private final class ReviewScriptedProvider: ToolCallingProvider, @unchecked Send
     private let lock = NSLock()
     private var responses: [[AgentChunk]]
     private var index = 0
+    private var captured: [AgentRequest] = []
 
     init(_ responses: [[AgentChunk]]) {
         self.responses = responses
     }
 
+    var requests: [AgentRequest] {
+        lock.withLock { captured }
+    }
+
     func stream(_ request: AgentRequest) -> AsyncThrowingStream<AgentChunk, Error> {
         let chunks = lock.withLock { () -> [AgentChunk] in
             defer { index += 1 }
+            captured.append(request)
             return responses[min(index, responses.count - 1)]
         }
         return AsyncThrowingStream { continuation in
@@ -512,6 +518,174 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
         XCTAssertEqual(explicit.maxOutputCharacters, 50_000)
     }
 
+    func testExactModelCallWithoutAuthorizationContextDurablyDeniesBeforeReviewerDispatch()
+        async throws {
+        let (log, workspace) = try makeLogAndWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace.deletingLastPathComponent()) }
+        let provider = ReviewControlPlaneProvider()
+        let responder = makeResponder(
+            log: log,
+            workspace: workspace,
+            provider: provider)
+        let submissionID = SubmissionID(rawValue: "submission_missing_context")
+        _ = try await log.append(.userMessage(UserMessagePayload(
+            text: "Make the bounded report edit.",
+            submissionID: submissionID)))
+        let contract = rootContract(
+            id: "task_missing_context",
+            submissionID: submissionID,
+            objective: "Make the bounded report edit.")
+        let context = PermissionRequestContext(
+            turnID: TurnID(rawValue: "turn_missing_context"),
+            taskID: contract.id,
+            rootTaskID: contract.id,
+            attempt: 1,
+            toolCallID: "call_missing_context",
+            taskContract: contract,
+            causalContext: PermissionReviewCausalContext(
+                userGoal: contract.objective,
+                assignee: main,
+                taskLineage: [contract.id]))
+
+        let resolution = await responder.requestResolution(
+            permissionRequest(
+                id: "req_missing_authorization_context",
+                context: context))
+
+        XCTAssertEqual(resolution.decision, .deny)
+        XCTAssertEqual(
+            resolution.failureKind,
+            .authorizationContextUnavailable)
+        XCTAssertEqual(provider.callCount, 0)
+        let replayed = await log.replay()
+        let settled = try XCTUnwrap(replayed.compactMap {
+            envelope -> PermissionReviewSettledPayload? in
+            guard case .permissionReviewSettled(let payload) = envelope.event else {
+                return nil
+            }
+            return payload
+        }.last)
+        XCTAssertEqual(settled.status, .denied)
+        XCTAssertEqual(
+            settled.failureKind,
+            .authorizationContextUnavailable)
+    }
+
+    func testValidatedAuthorizationReportIsSeparatedFromCanonicalUserEvidenceInPrompt()
+        async throws {
+        let (log, workspace) = try makeLogAndWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace.deletingLastPathComponent()) }
+        let provider = ReviewControlPlaneProvider(chunks: [
+            .textDelta(#"{"decision":"allow","reason":"canonical evidence authorizes the bounded edit"}"#),
+            .done(finishReason: "stop"),
+        ])
+        let responder = makeResponder(
+            log: log,
+            workspace: workspace,
+            provider: provider)
+        let submissionID = SubmissionID(rawValue: "submission_valid_context")
+        let current = try await log.append(.userMessage(UserMessagePayload(
+            text: "Continue the already agreed report edit.",
+            submissionID: submissionID)))
+        let contract = rootContract(
+            id: "task_valid_context",
+            submissionID: submissionID,
+            objective: "Continue the already agreed report edit.")
+        let context = PermissionRequestContext(
+            turnID: TurnID(rawValue: "turn_valid_context"),
+            taskID: contract.id,
+            rootTaskID: contract.id,
+            attempt: 1,
+            toolCallID: "call_valid_context",
+            taskContract: contract,
+            causalContext: PermissionReviewCausalContext(
+                userGoal: contract.objective,
+                assignee: main,
+                taskLineage: [contract.id],
+                authorizationContext: authorizationContext(
+                    sequences: [current.seq])))
+
+        let resolution = await responder.requestResolution(
+            permissionRequest(
+                id: "req_valid_authorization_context",
+                context: context))
+
+        XCTAssertEqual(
+            resolution.decision,
+            .allow,
+            resolution.reason ?? "missing resolution reason")
+        XCTAssertEqual(provider.callCount, 1)
+        let prompt = provider.requests.first?.messages
+            .compactMap(\.content).joined(separator: "\n") ?? ""
+        XCTAssertTrue(prompt.contains(
+            "AUTHORIZATION_REPORT (untrusted acting-agent interpretation)"))
+        XCTAssertTrue(prompt.contains("report_author: @main"))
+        XCTAssertTrue(prompt.contains(
+            "CANONICAL_LATEST_USER_INSTRUCTION (host-resolved quoted evidence)"))
+        XCTAssertTrue(prompt.contains(
+            "Continue the already agreed report edit."))
+        XCTAssertTrue(prompt.contains(
+            "SUPPORTING_USER_EVIDENCE (host-resolved closure; quoted evidence)"))
+    }
+
+    func testAuthorizationEvidenceClosureRejectsOmittedInterveningRevocation()
+        async throws {
+        let (log, workspace) = try makeLogAndWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace.deletingLastPathComponent()) }
+        let provider = ReviewControlPlaneProvider()
+        let responder = makeResponder(
+            log: log,
+            workspace: workspace,
+            provider: provider)
+        let first = try await appendPriorRootTurn(
+            log: log,
+            taskID: "task_prior_allow",
+            submissionID: "submission_prior_allow",
+            text: "Apply the report edit.")
+        _ = try await appendPriorRootTurn(
+            log: log,
+            taskID: "task_prior_revoke",
+            submissionID: "submission_prior_revoke",
+            text: "Stop; do not modify the report.")
+        let currentSubmissionID = SubmissionID(
+            rawValue: "submission_after_revoke")
+        let current = try await log.append(.userMessage(UserMessagePayload(
+            text: "Continue.",
+            submissionID: currentSubmissionID)))
+        let contract = rootContract(
+            id: "task_after_revoke",
+            submissionID: currentSubmissionID,
+            objective: "Continue.")
+        let context = PermissionRequestContext(
+            turnID: TurnID(rawValue: "turn_after_revoke"),
+            taskID: contract.id,
+            rootTaskID: contract.id,
+            attempt: 1,
+            toolCallID: "call_after_revoke",
+            taskContract: contract,
+            causalContext: PermissionReviewCausalContext(
+                userGoal: contract.objective,
+                assignee: main,
+                taskLineage: [contract.id],
+                authorizationContext: authorizationContext(
+                    sequences: [first.seq, current.seq])))
+
+        let resolution = await responder.requestResolution(
+            permissionRequest(
+                id: "req_omitted_revocation",
+                context: context))
+
+        XCTAssertEqual(resolution.decision, .deny)
+        XCTAssertEqual(
+            resolution.failureKind,
+            .authorizationContextUnavailable)
+        XCTAssertTrue(
+            resolution.reason?.contains(
+                "omitted an intervening user instruction") == true,
+            resolution.reason ?? "missing resolution reason")
+        XCTAssertEqual(provider.callCount, 0)
+    }
+
     func testCorruptDurableReviewHistoryDeniesBeforeProviderDispatch() async throws {
         let (log, workspace) = try makeLogAndWorkspace()
         defer { try? FileManager.default.removeItem(at: workspace.deletingLastPathComponent()) }
@@ -526,6 +700,47 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
         XCTAssertEqual(resolution.decision, .deny)
         XCTAssertEqual(resolution.source, .automaticReviewerFailure)
         XCTAssertEqual(resolution.reviewStatus, .failed)
+        XCTAssertEqual(resolution.failureKind, .reconciliationFailure)
+        XCTAssertEqual(provider.callCount, 0)
+    }
+
+    func testUnknownFutureEventDisablesAutomaticReviewBeforeProviderDispatch()
+        async throws {
+        let (log, workspace) = try makeLogAndWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace.deletingLastPathComponent()) }
+        let provider = ReviewControlPlaneProvider()
+        let responder = makeResponder(
+            log: log,
+            workspace: workspace,
+            provider: provider)
+        let seed = try await log.append(.userMessage(UserMessagePayload(
+            text: "Seed durable history.")))
+        let encoder = Envelope.makeEncoder()
+        let placeholder = try encoder.encode(Envelope(
+            seq: seed.seq + 1,
+            ts: Date(),
+            session: SessionID(rawValue: "review_control"),
+            event: .userMessage(UserMessagePayload(text: "placeholder"))))
+        var futureObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: placeholder) as? [String: Any])
+        futureObject["type"] = "future_permission_context_event"
+        futureObject["payload"] = ["futureField": true]
+        var future = try JSONSerialization.data(
+            withJSONObject: futureObject,
+            options: [.sortedKeys])
+        future.append(0x0A)
+        let file = try FileHandle(forWritingTo:
+            workspace.deletingLastPathComponent()
+                .appendingPathComponent("events.jsonl"))
+        try file.seekToEnd()
+        try file.write(contentsOf: future)
+        try file.close()
+
+        let resolution = await responder.requestResolution(
+            permissionRequest(id: "req_future_event"))
+
+        XCTAssertEqual(resolution.decision, .deny)
+        XCTAssertEqual(resolution.source, .automaticReviewerFailure)
         XCTAssertEqual(resolution.failureKind, .reconciliationFailure)
         XCTAssertEqual(provider.callCount, 0)
     }
@@ -763,6 +978,10 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
                     arguments: #"{"content":"ok","path":"single-slot.txt"}"#)]),
                 .done(finishReason: "tool_calls"),
             ],
+            [
+                .textDelta(authorizationReportJSON(handles: ["U1"])),
+                .done(finishReason: "stop"),
+            ],
             [.textDelta("done"), .done(finishReason: "stop")],
         ])
         let reviewerProvider = ReviewControlPlaneProvider()
@@ -787,7 +1006,13 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
             workspaceRoot: workspace)
         XCTAssertEqual(enabled, AutomaticPermissionReviewResult.enabled(reviewerID))
 
-        let result = await orchestrator.send("write single-slot.txt", to: main)
+        let result = await orchestrator.send(
+            "write single-slot.txt",
+            to: main,
+            userMessage: UserMessagePayload(
+                text: "write single-slot.txt",
+                submissionID: SubmissionID(
+                    rawValue: "submission_single_slot")))
         let permissionAudit = await log.replay().compactMap { envelope -> String? in
             switch envelope.event {
             case .permissionResolved(let payload):
@@ -796,16 +1021,32 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
                 return "review \(payload.status.rawValue): \(payload.reason)"
             case .toolResult(let payload):
                 return "tool \(payload.toolCallId): \(payload.observation)"
+            case .permissionRequest(let payload):
+                return "request \(payload.tool): authorization_context=\(payload.context?.causalContext?.authorizationContext != nil)"
             default:
                 return nil
             }
         }.joined(separator: " | ")
 
-        XCTAssertEqual(result, OrchestratorSendResult.sent, permissionAudit)
+        let providerAudit = mainProvider.requests.enumerated().map {
+            "\($0.offset):tools=\($0.element.tools.count),last=\($0.element.messages.last?.content?.prefix(80) ?? "")"
+        }.joined(separator: " | ")
+        XCTAssertEqual(
+            result,
+            OrchestratorSendResult.sent,
+            permissionAudit + " || " + providerAudit)
         XCTAssertEqual(
             try String(contentsOf: workspace.appendingPathComponent("single-slot.txt"), encoding: .utf8),
             "ok")
         XCTAssertEqual(reviewerProvider.maximumConcurrentCalls, 1)
+        XCTAssertEqual(mainProvider.requests.count, 3)
+        let reportRequest = try XCTUnwrap(
+            mainProvider.requests.dropFirst().first)
+        XCTAssertEqual(reportRequest.model, ModelID(rawValue: "main-model"))
+        XCTAssertTrue(reportRequest.tools.isEmpty)
+        XCTAssertEqual(
+            Array(reportRequest.messages.dropLast()),
+            mainProvider.requests[0].messages)
     }
 
     func testStructuredReviewTaskAndVerdictAreDurableBeforeAllow() async throws {
@@ -1873,6 +2114,94 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
         }
         XCTAssertEqual(settlements.last?.status, .allowed)
         XCTAssertGreaterThan(settlements.last?.cumulativeTokens ?? 0, 99_000)
+    }
+
+    private func authorizationContext(
+        sequences: [Int]
+    ) -> PermissionAuthorizationContext {
+        PermissionAuthorizationContext(
+            report: PermissionAuthorizationReport(
+                authorizationGoal: "Finish the user-requested report edit.",
+                currentProgress: "The report was inspected and the bounded edit was prepared.",
+                latestInstructionInterpretation: "Continue the already agreed work without expanding scope.",
+                currentActionJustification: "The exact edit is the next required action.",
+                scopeAssessment: "The action remains inside the selected report."),
+            supportingUserEventSequences: sequences)
+    }
+
+    private func authorizationReportJSON(handles: [String]) -> String {
+        let object: [String: Any] = [
+            "report": [
+                "authorization_goal": "Complete the exact user-requested workspace edit.",
+                "current_progress": "The acting agent selected the bounded write operation.",
+                "latest_instruction_interpretation": "Create only the requested file.",
+                "current_action_justification": "The exact write is necessary to produce the requested result.",
+                "scope_assessment": "The write remains inside the named workspace file.",
+            ],
+            "supporting_user_handles": handles,
+        ]
+        let data = try! JSONSerialization.data(
+            withJSONObject: object,
+            options: [.sortedKeys])
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    private func rootContract(
+        id: String,
+        submissionID: SubmissionID,
+        objective: String
+    ) -> TaskContract {
+        TaskContract(
+            id: TaskID(rawValue: id),
+            kind: .root,
+            issuer: nil,
+            assignee: main,
+            submissionID: submissionID,
+            objective: objective,
+            roleHint: "root coordinator",
+            expectedDeliverable: "one reviewed result")
+    }
+
+    private func appendPriorRootTurn(
+        log: EventLog,
+        taskID: String,
+        submissionID: String,
+        text: String
+    ) async throws -> Envelope {
+        let submission = SubmissionID(rawValue: submissionID)
+        let contract = rootContract(
+            id: taskID,
+            submissionID: submission,
+            objective: text)
+        let turnID = TurnID(rawValue: "turn_\(taskID)")
+        let user = try await log.append(.userMessage(UserMessagePayload(
+            text: text,
+            submissionID: submission,
+            turnID: turnID)))
+        _ = try await log.append(.taskCreated(TaskCreatedPayload(
+            contract: contract)))
+        _ = try await log.append([
+            .modelHistoryItem(.message(
+                itemID: "history-user-\(taskID)",
+                turnID: turnID,
+                agent: main,
+                taskID: contract.id,
+                submissionID: submission,
+                taskAttempt: 1,
+                role: .user,
+                content: text,
+                messageClassification: .realUser)),
+            .modelHistoryItem(.message(
+                itemID: "history-assistant-\(taskID)",
+                turnID: turnID,
+                agent: main,
+                taskID: contract.id,
+                submissionID: submission,
+                taskAttempt: 1,
+                role: .assistant,
+                content: "Prior turn completed.")),
+        ])
+        return user
     }
 
     private func makeResponder(log: EventLog,

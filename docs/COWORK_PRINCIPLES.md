@@ -2,7 +2,7 @@
 
 文档状态：当前 Cowork/AgentKernel 原则
 最近核对：2026-08-08
-产品基线：v0.38（build 38）
+产品基线：v0.40（build 40）
 
 本文提炼自仓内 v0.10 历史 Cowork 设计文档、`PER_AGENT_INFERENCE_PROFILES.md` 及
 项目操作规则。旧设计文档只保留迁移 provenance；本文件是当前原则基准，**不是**完成度
@@ -293,7 +293,12 @@ created automatically on GUI/CLI Cowork session startup when possible
 reserved identity, not a normal task/message/delegation target
 read-only profile and no tool capability lease
 no nested AgentLoop; reviewer receives no-tool provider judgement request
-reviewer sees global context plus requesting-agent scoped context
+automatic ask-class exact call first receives one same-acting-model tools=[] report request
+model report is untrusted interpretation; it cannot supply author, EventLog seq, binding, or permission decision
+host maps temporary user handles to canonical same-session EventLog messages and closes every visible user turn from earliest cited through current
+reviewer sees report, canonical latest instruction, and supporting user evidence as separate quoted blocks
+missing/malformed/secret/unbound/incomplete context durably denies before reviewer provider dispatch
+reporter is request-owned, per tool call, uncached, and absent from UI/model history/TaskGraph
 hard deny remains final before the reviewer can see anything
 ```
 
@@ -400,6 +405,10 @@ session rename appends the EventLog settings transition before refreshing sessio
 agent-to-agent event records caller, target, task, and causal chain
 automatic permission reviewer cannot override hard deny
 automatic permission reviewer can be enabled/disabled without becoming a normal worker
+automatic model-authored ask-class review requires a complete host-validated authorizationContext; legacy decode does not authorize a new live call
+authorization report provenance, canonical user evidence, requestingAgent, and ResolvedToolAuthorization remain separate trust sources
+supporting user evidence always contains current submission and the full visible earliest-cited-to-current closure, including intervening revocation/scope changes
+one assistant batch with multiple ask-class calls receives one independently bound no-tools report per call; report output is never reused across calls
 permission request identity is first-write-wins and conflicting RequestID reuse fails closed
 permission settlement is first-terminal-wins under concurrency; exact duplicates are idempotent and conflicting terminals cannot overwrite the first
 legacy outcome/action/mode/correlation fields decode conservatively, while each new Chat/Code/Cowork turn records one semantic terminal turn outcome

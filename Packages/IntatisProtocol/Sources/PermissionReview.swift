@@ -40,6 +40,44 @@ public struct PermissionReviewGateSnapshot: Codable, Equatable, Sendable {
     }
 }
 
+/// Agent-authored explanation of why one exact ask-class action follows from
+/// the model-visible task context. These fields are interpretation, never
+/// authority: the host binds the author, exact action, and canonical user
+/// evidence independently.
+public struct PermissionAuthorizationReport: Codable, Equatable, Sendable {
+    public var authorizationGoal: String
+    public var currentProgress: String
+    public var latestInstructionInterpretation: String
+    public var currentActionJustification: String
+    public var scopeAssessment: String
+
+    public init(authorizationGoal: String,
+                currentProgress: String,
+                latestInstructionInterpretation: String,
+                currentActionJustification: String,
+                scopeAssessment: String) {
+        self.authorizationGoal = authorizationGoal
+        self.currentProgress = currentProgress
+        self.latestInstructionInterpretation = latestInstructionInterpretation
+        self.currentActionJustification = currentActionJustification
+        self.scopeAssessment = scopeAssessment
+    }
+}
+
+/// Host-bound authorization context for one exact automatic permission call.
+/// The model selects temporary handles; AgentKernel maps them to canonical
+/// same-session user events and persists only those verified sequence numbers.
+public struct PermissionAuthorizationContext: Codable, Equatable, Sendable {
+    public var report: PermissionAuthorizationReport
+    public var supportingUserEventSequences: [Int]
+
+    public init(report: PermissionAuthorizationReport,
+                supportingUserEventSequences: [Int]) {
+        self.report = report
+        self.supportingUserEventSequences = supportingUserEventSequences
+    }
+}
+
 /// Bounded causal evidence attached to the current execution. The sequence
 /// numbers refer back to the append-only EventLog instead of duplicating raw
 /// transcript or tool output in the review task.
@@ -50,19 +88,24 @@ public struct PermissionReviewCausalContext: Codable, Equatable, Sendable {
     public var taskLineage: [TaskID]
     public var relatedAgents: [AgentID]
     public var eventSequenceNumbers: [Int]
+    /// Present for exact model-authored automatic ask-class calls. Legacy
+    /// events and host-originated admission reviews decode with `nil`.
+    public var authorizationContext: PermissionAuthorizationContext?
 
     public init(userGoal: String? = nil,
                 issuer: AgentID? = nil,
                 assignee: AgentID? = nil,
                 taskLineage: [TaskID] = [],
                 relatedAgents: [AgentID] = [],
-                eventSequenceNumbers: [Int] = []) {
+                eventSequenceNumbers: [Int] = [],
+                authorizationContext: PermissionAuthorizationContext? = nil) {
         self.userGoal = userGoal
         self.issuer = issuer
         self.assignee = assignee
         self.taskLineage = taskLineage
         self.relatedAgents = relatedAgents
         self.eventSequenceNumbers = eventSequenceNumbers
+        self.authorizationContext = authorizationContext
     }
 }
 

@@ -2,7 +2,7 @@
 
 文档状态：当前 durable inference binding 契约
 最后核对：2026-08-03
-产品基线：v0.38（build 38）
+产品基线：v0.40（build 40）
 
 ## 1. 状态与范围
 

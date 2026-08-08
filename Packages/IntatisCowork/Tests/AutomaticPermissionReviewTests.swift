@@ -259,6 +259,38 @@ private func autoReviewWriteArgs(path: String, content: String) -> String {
     return String(decoding: data, as: UTF8.self)
 }
 
+private func autoReviewUserMessage(
+    _ text: String,
+    id: String
+) -> UserMessagePayload {
+    UserMessagePayload(
+        text: text,
+        submissionID: SubmissionID(rawValue: id))
+}
+
+private func autoReviewAuthorizationReport(
+    handles: [String] = ["U1"],
+    justification: String = "The exact bounded action is the next required step."
+) -> [AgentChunk] {
+    let object: [String: Any] = [
+        "report": [
+            "authorization_goal": "Complete the exact user-requested Cowork task.",
+            "current_progress": "The acting agent resolved the next bounded action.",
+            "latest_instruction_interpretation": "Perform only the requested action within the current task scope.",
+            "current_action_justification": justification,
+            "scope_assessment": "The action remains within the named workspace and task contract.",
+        ],
+        "supporting_user_handles": handles,
+    ]
+    let data = try! JSONSerialization.data(
+        withJSONObject: object,
+        options: [.sortedKeys])
+    return [
+        .textDelta(String(decoding: data, as: UTF8.self)),
+        .done(finishReason: "stop"),
+    ]
+}
+
 final class AutomaticPermissionReviewTests: XCTestCase {
     private let main = AgentID(rawValue: "main")
     private let reviewer = Orchestrator.automaticPermissionReviewerID
@@ -1587,6 +1619,8 @@ final class AutomaticPermissionReviewTests: XCTestCase {
         let mainProvider = AutoReviewScriptedProvider([
             [.toolCalls([ToolCall(id: "spawn-once", name: "spawn_agent", arguments: spawnArgs)]),
              .done(finishReason: "tool_calls")],
+            autoReviewAuthorizationReport(
+                justification: "Creating this one bounded coordinator is the requested next step."),
             [.textDelta("coordinator created"), .done(finishReason: "stop")],
         ])
         let reviewerProvider = AutoReviewCapturingProvider([
@@ -1612,7 +1646,12 @@ final class AutomaticPermissionReviewTests: XCTestCase {
             workspaceRoot: mainWorkspace)
         XCTAssertEqual(enabled, .enabled(reviewer))
 
-        let sent = await orch.send("create one coordinator for child", to: main)
+        let sent = await orch.send(
+            "create one coordinator for child",
+            to: main,
+            userMessage: autoReviewUserMessage(
+                "create one coordinator for child",
+                id: "submission_spawn_coordinator"))
         XCTAssertEqual(sent, .sent)
 
         let childID = AgentID(rawValue: "coordinator-admission")
@@ -1674,6 +1713,8 @@ final class AutomaticPermissionReviewTests: XCTestCase {
             [.toolCalls([ToolCall(id: "write", name: "write_file",
                                   arguments: autoReviewWriteArgs(path: "auto.txt", content: "approved"))]),
              .done(finishReason: "tool_calls")],
+            autoReviewAuthorizationReport(
+                justification: "Writing auto.txt is exactly what the user requested."),
             [.textDelta("done"), .done(finishReason: "stop")],
         ])
         let reviewerProvider = AutoReviewCapturingProvider([
@@ -1699,7 +1740,12 @@ final class AutomaticPermissionReviewTests: XCTestCase {
             workspaceRoot: ws)
         XCTAssertEqual(enableResult, .enabled(reviewer))
 
-        let result = await orch.send("create auto.txt with approved", to: main)
+        let result = await orch.send(
+            "create auto.txt with approved",
+            to: main,
+            userMessage: autoReviewUserMessage(
+                "create auto.txt with approved",
+                id: "submission_create_auto"))
 
         XCTAssertEqual(result, OrchestratorSendResult.sent)
         XCTAssertEqual(try String(contentsOf: ws.appendingPathComponent("auto.txt"), encoding: .utf8),
@@ -1767,6 +1813,86 @@ final class AutomaticPermissionReviewTests: XCTestCase {
         XCTAssertEqual(resolved.reviewStatus, .allowed)
     }
 
+    func testMalformedAuthorizationReportDurablyDeniesBeforeReviewerProvider()
+        async throws {
+        let log = try autoReviewTempLog()
+        let ws = try autoReviewWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let mainProvider = AutoReviewScriptedProvider([
+            [
+                .toolCalls([ToolCall(
+                    id: "write-malformed-report",
+                    name: "write_file",
+                    arguments: autoReviewWriteArgs(
+                        path: "malformed-report.txt",
+                        content: "must not be written"))]),
+                .done(finishReason: "tool_calls"),
+            ],
+            [
+                .textDelta("not valid report JSON"),
+                .done(finishReason: "stop"),
+            ],
+            [
+                .textDelta("The write was denied."),
+                .done(finishReason: "stop"),
+            ],
+        ])
+        let reviewerProvider = AutoReviewCapturingProvider([
+            .textDelta(#"{"decision":"allow","reason":"must not be reached"}"#),
+            .done(finishReason: "stop"),
+        ])
+        let reviewerID = reviewer
+        let orch = Orchestrator(
+            log: log,
+            allowsShell: true,
+            responder: AttachOnlyResponder()) { agent -> any ToolCallingProvider in
+                agent.name == reviewerID ? reviewerProvider : mainProvider
+            }
+        let attached = await orch.attach(Agent(
+            name: main,
+            workspaceRoot: ws,
+            model: ModelID(rawValue: "main-model"),
+            profile: .reviewed,
+            coordinationDepth: Agent.defaultCoordinationDepth))
+        let enabled = await orch.enableAutomaticPermissionReview(
+            model: ModelID(rawValue: "reviewer-model"),
+            workspaceRoot: ws)
+        XCTAssertTrue(attached)
+        XCTAssertEqual(enabled, .enabled(reviewer))
+
+        let result = await orch.send(
+            "write malformed-report.txt",
+            to: main,
+            userMessage: autoReviewUserMessage(
+                "write malformed-report.txt",
+                id: "submission_malformed_report"))
+
+        guard case .failed = result else {
+            return XCTFail("missing report context must fail the required write")
+        }
+        XCTAssertTrue(reviewerProvider.requests.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: ws.appendingPathComponent("malformed-report.txt").path))
+        let events = await log.replay()
+        let requested = try XCTUnwrap(events.compactMap {
+            envelope -> PermissionReviewTask? in
+            guard case .permissionReviewRequested(let payload) = envelope.event,
+                  payload.task.tool == "write_file" else { return nil }
+            return payload.task
+        }.last)
+        let settled = try XCTUnwrap(events.compactMap {
+            envelope -> PermissionReviewSettledPayload? in
+            guard case .permissionReviewSettled(let payload) = envelope.event,
+                  payload.tool == "write_file" else { return nil }
+            return payload
+        }.last)
+        XCTAssertNil(requested.causalContext.authorizationContext)
+        XCTAssertEqual(
+            settled.failureKind,
+            .authorizationContextUnavailable)
+        XCTAssertEqual(settled.decision, .deny)
+    }
+
     func testTimedOutReviewDeniesOnlyItsToolAndFreshGenerationCanExecuteNextTool() async throws {
         let log = try autoReviewTempLog()
         let ws = try autoReviewWorkspace()
@@ -1779,6 +1905,8 @@ final class AutomaticPermissionReviewTests: XCTestCase {
                     path: "timed-out.txt",
                     content: "must not be written"))]),
              .done(finishReason: "tool_calls")],
+            autoReviewAuthorizationReport(
+                justification: "The first exact file write follows the first user request."),
             [.textDelta("first write was denied"), .done(finishReason: "stop")],
             [.toolCalls([ToolCall(
                 id: "write-fresh-generation",
@@ -1787,6 +1915,9 @@ final class AutomaticPermissionReviewTests: XCTestCase {
                     path: "fresh.txt",
                     content: "fresh generation approved"))]),
              .done(finishReason: "tool_calls")],
+            autoReviewAuthorizationReport(
+                handles: ["U2"],
+                justification: "The fresh file write follows the second user request."),
             [.textDelta("second write completed"), .done(finishReason: "stop")],
         ])
         let lateGate = AutoReviewPendingAllowGate()
@@ -1828,7 +1959,12 @@ final class AutomaticPermissionReviewTests: XCTestCase {
                 maxRecentEvents: 12))
         XCTAssertEqual(enabled, .enabled(reviewer))
 
-        let first = await orch.send("write timed-out.txt", to: main)
+        let first = await orch.send(
+            "write timed-out.txt",
+            to: main,
+            userMessage: autoReviewUserMessage(
+                "write timed-out.txt",
+                id: "submission_timed_out_write"))
         let firstPath = ws.appendingPathComponent("timed-out.txt")
         guard case .failed(let firstFailure) = first else {
             return XCTFail("the invocation whose required write timed out must fail")
@@ -1836,7 +1972,12 @@ final class AutomaticPermissionReviewTests: XCTestCase {
         XCTAssertTrue(firstFailure.contains("required side effects remain denied or failed"))
         XCTAssertFalse(FileManager.default.fileExists(atPath: firstPath.path))
 
-        let second = await orch.send("write fresh.txt", to: main)
+        let second = await orch.send(
+            "write fresh.txt",
+            to: main,
+            userMessage: autoReviewUserMessage(
+                "write fresh.txt",
+                id: "submission_fresh_write"))
         let secondPath = ws.appendingPathComponent("fresh.txt")
         XCTAssertEqual(second, .sent)
         XCTAssertEqual(
@@ -1892,6 +2033,8 @@ final class AutomaticPermissionReviewTests: XCTestCase {
                 name: "write_file",
                 arguments: autoReviewWriteArgs(path: "after-cancel.txt", content: "reviewed"))]),
              .done(finishReason: "tool_calls")],
+            autoReviewAuthorizationReport(
+                justification: "The bounded after-cancel write is the current user request."),
             [.textDelta("done"), .done(finishReason: "stop")],
         ])
         let reviewerProvider = AutoReviewCapturingProvider([
@@ -1922,7 +2065,12 @@ final class AutomaticPermissionReviewTests: XCTestCase {
 
         let stillEnabled = await orch.automaticPermissionReviewEnabled()
         let health = await orch.automaticPermissionReviewHealth()
-        let sent = await orch.send("write after-cancel.txt", to: main)
+        let sent = await orch.send(
+            "write after-cancel.txt",
+            to: main,
+            userMessage: autoReviewUserMessage(
+                "write after-cancel.txt",
+                id: "submission_after_cancel"))
         XCTAssertTrue(stillEnabled)
         XCTAssertEqual(health, .healthy)
         XCTAssertEqual(sent, .sent)
@@ -1942,6 +2090,8 @@ final class AutomaticPermissionReviewTests: XCTestCase {
             [.toolCalls([ToolCall(id: "write", name: "write_file",
                                   arguments: autoReviewWriteArgs(path: "fallback.txt", content: "blocked"))]),
              .done(finishReason: "tool_calls")],
+            autoReviewAuthorizationReport(
+                justification: "The exact fallback.txt write is the proposed action."),
             [.textDelta("not written"), .done(finishReason: "stop")],
         ])
         let reviewerProvider = AutoReviewCapturingProvider([
@@ -1964,7 +2114,12 @@ final class AutomaticPermissionReviewTests: XCTestCase {
         XCTAssertTrue(mainAttached)
         _ = await orch.enableAutomaticPermissionReview(model: ModelID(rawValue: "reviewer-model"), workspaceRoot: ws)
 
-        let sendResult = await orch.send("write fallback.txt", to: main)
+        let sendResult = await orch.send(
+            "write fallback.txt",
+            to: main,
+            userMessage: autoReviewUserMessage(
+                "write fallback.txt",
+                id: "submission_fallback_write"))
         guard case .failed(let failure) = sendResult else {
             return XCTFail("a denied required write must fail the invocation")
         }
@@ -1991,6 +2146,8 @@ final class AutomaticPermissionReviewTests: XCTestCase {
                 name: "write_file",
                 arguments: autoReviewWriteArgs(path: "denied.txt", content: "not allowed"))]),
              .done(finishReason: "tool_calls")],
+            autoReviewAuthorizationReport(
+                justification: "The exact denied.txt write is the proposed action for review."),
             [.textDelta("Created denied.txt successfully."), .done(finishReason: "stop")],
         ])
         let reviewerProvider = AutoReviewCapturingProvider([
@@ -2015,7 +2172,12 @@ final class AutomaticPermissionReviewTests: XCTestCase {
             model: ModelID(rawValue: "reviewer-model"),
             workspaceRoot: ws)
 
-        let sent = await orch.send("create denied.txt", to: main)
+        let sent = await orch.send(
+            "create denied.txt",
+            to: main,
+            userMessage: autoReviewUserMessage(
+                "create denied.txt",
+                id: "submission_denied_write"))
         XCTAssertTrue(attached)
         XCTAssertEqual(enabled, AutomaticPermissionReviewResult.enabled(reviewer))
         guard case .failed(let failure) = sent else {
@@ -2048,7 +2210,7 @@ final class AutomaticPermissionReviewTests: XCTestCase {
         XCTAssertEqual(resolved.reviewStatus, .denied)
         XCTAssertEqual(observation, "permission denied: \(exactReason)")
         XCTAssertFalse(observation.contains("permission denied: permission denied:"))
-        XCTAssertTrue(mainProvider.requests.dropFirst().first?.messages.contains {
+        XCTAssertTrue(mainProvider.requests.last?.messages.contains {
             $0.content == observation
         } == true)
         XCTAssertFalse(events.contains { envelope in
@@ -2088,11 +2250,15 @@ final class AutomaticPermissionReviewTests: XCTestCase {
                 name: "write_file",
                 arguments: autoReviewWriteArgs(path: "document.txt", content: "new\n"))]),
              .done(finishReason: "tool_calls")],
+            autoReviewAuthorizationReport(
+                justification: "The broad overwrite is the first proposed way to make the requested edit."),
             [.toolCalls([ToolCall(
                 id: "approved-patch",
                 name: "apply_patch",
                 arguments: patchArgs)]),
              .done(finishReason: "tool_calls")],
+            autoReviewAuthorizationReport(
+                justification: "The minimal patch is the corrected bounded way to make the requested edit."),
             [.textDelta("Updated document.txt through the approved patch."),
              .done(finishReason: "stop")],
         ])
@@ -2121,7 +2287,12 @@ final class AutomaticPermissionReviewTests: XCTestCase {
             workspaceRoot: ws)
         XCTAssertEqual(enabled, .enabled(reviewer))
 
-        let result = await orch.send("change document.txt from old to new", to: main)
+        let result = await orch.send(
+            "change document.txt from old to new",
+            to: main,
+            userMessage: autoReviewUserMessage(
+                "change document.txt from old to new",
+                id: "submission_equivalent_edit"))
 
         XCTAssertEqual(result, .sent)
         XCTAssertEqual(try String(contentsOf: file, encoding: .utf8), "new\n")
@@ -2133,6 +2304,31 @@ final class AutomaticPermissionReviewTests: XCTestCase {
         XCTAssertTrue(settlements.contains {
             $0.tool == "apply_patch" && $0.outcome == .succeeded
         })
+        let reviewTasks = await log.replay().compactMap {
+            envelope -> PermissionReviewTask? in
+            guard case .permissionReviewRequested(let payload) = envelope.event,
+                  payload.task.tool == "write_file"
+                    || payload.task.tool == "apply_patch" else {
+                return nil
+            }
+            return payload.task
+        }
+        XCTAssertEqual(reviewTasks.count, 2)
+        XCTAssertEqual(
+            reviewTasks.map {
+                $0.causalContext.authorizationContext?.report
+                    .currentActionJustification
+            },
+            [
+                "The broad overwrite is the first proposed way to make the requested edit.",
+                "The minimal patch is the corrected bounded way to make the requested edit.",
+            ])
+        let reportRequests = mainProvider.requests.filter { $0.tools.isEmpty }
+        XCTAssertEqual(reportRequests.count, 2)
+        XCTAssertTrue(reportRequests[0].messages.last?.content?.contains(
+            "target_tool_call_id: denied-write") == true)
+        XCTAssertTrue(reportRequests[1].messages.last?.content?.contains(
+            "target_tool_call_id: approved-patch") == true)
     }
 
     func testHardDenyNeverReachesAutomaticReviewer() async throws {
@@ -2165,7 +2361,12 @@ final class AutomaticPermissionReviewTests: XCTestCase {
         XCTAssertTrue(mainAttached)
         _ = await orch.enableAutomaticPermissionReview(model: ModelID(rawValue: "reviewer-model"), workspaceRoot: ws)
 
-        let sendResult = await orch.send("write .env", to: main)
+        let sendResult = await orch.send(
+            "write .env",
+            to: main,
+            userMessage: autoReviewUserMessage(
+                "write .env",
+                id: "submission_hard_deny"))
         guard case .failed(let failure) = sendResult else {
             return XCTFail("a hard-denied required write must fail the invocation")
         }

@@ -47,6 +47,7 @@ final class PermissionReviewProtocolTests: XCTestCase {
         XCTAssertNil(context.intent)
         XCTAssertNil(context.authorization)
         XCTAssertNil(context.executionID)
+        XCTAssertNil(context.causalContext?.authorizationContext)
     }
 
     func testLegacyReviewTaskAndSettlementWithoutAuthorizationStillDecode() throws {
@@ -87,6 +88,7 @@ final class PermissionReviewProtocolTests: XCTestCase {
 
         XCTAssertEqual(task.id.rawValue, "review_legacy")
         XCTAssertNil(task.authorization)
+        XCTAssertNil(task.causalContext.authorizationContext)
         XCTAssertEqual(settled.reason, "legacy reason")
         XCTAssertNil(settled.authorization)
         XCTAssertNil(settled.failureKind)
@@ -100,6 +102,41 @@ final class PermissionReviewProtocolTests: XCTestCase {
             from: data)
 
         XCTAssertEqual(failureKind, .providerStillStopping)
+    }
+
+    func testAuthorizationContextRoundTripsWithoutModelSuppliedBindingFields() throws {
+        let causal = PermissionReviewCausalContext(
+            userGoal: "Update the report",
+            taskLineage: [TaskID(rawValue: "task_report")],
+            authorizationContext: PermissionAuthorizationContext(
+                report: PermissionAuthorizationReport(
+                    authorizationGoal: "Finish the user-requested report revision.",
+                    currentProgress: "The source report has been read and the target section is located.",
+                    latestInstructionInterpretation: "Continue means apply the already agreed revision.",
+                    currentActionJustification: "Writing the bounded patch is the next required step.",
+                    scopeAssessment: "The patch remains inside the named report."),
+                supportingUserEventSequences: [3, 8, 11]))
+
+        let data = try JSONEncoder().encode(causal)
+        let decoded = try JSONDecoder().decode(
+            PermissionReviewCausalContext.self,
+            from: data)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let authorization = try XCTUnwrap(
+            object["authorizationContext"] as? [String: Any])
+
+        XCTAssertEqual(decoded, causal)
+        XCTAssertEqual(
+            decoded.authorizationContext?.supportingUserEventSequences,
+            [3, 8, 11])
+        XCTAssertEqual(Set(authorization.keys), Set([
+            "report",
+            "supportingUserEventSequences",
+        ]))
+        XCTAssertNil(authorization["reportAuthor"])
+        XCTAssertNil(authorization["latestUserInstruction"])
+        XCTAssertNil(authorization["bindingDigest"])
     }
 
     func testResolvedToolAuthorizationRoundTripsAllPinnedFacts() throws {

@@ -26,8 +26,8 @@ packages:
 settings:
   base:
     SWIFT_VERSION: "5.9"
-    MARKETING_VERSION: "0.38"
-    CURRENT_PROJECT_VERSION: "38"
+    MARKETING_VERSION: "0.40"
+    CURRENT_PROJECT_VERSION: "40"
     CODE_SIGN_STYLE: Automatic
     GENERATE_INFOPLIST_FILE: "NO"
     # To run on a device or archive for distribution, set your team:
