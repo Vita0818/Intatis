@@ -22,8 +22,9 @@
   Simulator Debug 均构建通过，最终 bundle 均为 `0.40 (40)`，macOS 可执行文件包含
   `x86_64 arm64`。
 - 本机 `/Applications/Intatis.app` 已安装 `0.40 (40)` ad-hoc Hardened Runtime 开发构建，
-  严格 codesign 校验通过；安装前的 `0.36 (36)` 已移入时间戳废纸篓备份。该开发安装不能
-  作为 v0.40 Developer ID 公证发行证据。
+  严格 codesign 校验通过；安装前的 `0.36 (36)` 曾移入时间戳废纸篓备份，随后已按用户要求
+  永久删除，当前不保留 Intatis 旧版 App 备份。该开发安装不能作为 v0.40 Developer ID
+  公证发行证据。
 - AgentKernel soft-token-budget stale fixture 已在不改生产预算保护的前提下收口；focused
   用例、169 项 AgentKernel suite 与完整 `swift test` 均通过。
 - 用户宿主环境已具备有效 Developer ID Application identity，并已保存 `Intatis-Notary`

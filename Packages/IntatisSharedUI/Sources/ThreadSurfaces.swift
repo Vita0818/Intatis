@@ -1681,6 +1681,32 @@ public extension View {
             .intatisGlassButton(prominent: prominent)
     }
 
+    /// Composer-only sizing keeps the native circular button artwork inside
+    /// the same 40-point row geometry as the input capsule. iOS's regular
+    /// glass control size renders visibly taller than that contract, while the
+    /// macOS regular size already matches it.
+    @ViewBuilder func intatisComposerIconButton(
+        prominent: Bool = false
+    ) -> some View {
+        #if os(iOS)
+        labelStyle(.iconOnly)
+            .controlSize(IntatisComposerControlMetrics.iconControlSize(
+                for: .iOS))
+            .buttonBorderShape(.circle)
+            .intatisGlassButton(prominent: prominent)
+            .frame(
+                width: IntatisComposerControlMetrics.controlHeight,
+                height: IntatisComposerControlMetrics.controlHeight)
+            .contentShape(Circle())
+        #else
+        intatisCompactIconButton(prominent: prominent)
+            .frame(
+                width: IntatisComposerControlMetrics.controlHeight,
+                height: IntatisComposerControlMetrics.controlHeight)
+            .contentShape(Circle())
+        #endif
+    }
+
     /// A native Menu owns selection and keyboard behavior while its label
     /// supplies the same interactive Liquid Glass surface as the composer.
     func intatisComposerSelectionMenu() -> some View {
@@ -2192,6 +2218,69 @@ public enum IntatisComposerControlMetrics {
     public static let inputHorizontalPadding: CGFloat = 14
     public static let inputVerticalPadding: CGFloat = 9
     public static let inputCornerRadius: CGFloat = controlHeight / 2
+
+    /// `GlassEffectContainer.spacing` is the distance at which neighboring
+    /// glass shapes begin to merge, not the visual HStack spacing. Keep the
+    /// iOS value below the 8-point row gap so the input, voice and primary
+    /// action remain physically independent; preserve the existing macOS
+    /// grouping behavior.
+    static func glassEffectSpacing(
+        for platform: IntatisComposerGlassPlatform
+    ) -> CGFloat {
+        switch platform {
+        case .iOS:
+            return 0
+        case .macOS:
+            return 10
+        }
+    }
+
+    /// Native glass buttons use different chrome metrics on iOS and macOS.
+    /// Keep iOS on the compact native size so its artwork remains centered in
+    /// the shared 40-point composer frame; macOS regular already fits it.
+    static func iconControlSize(
+        for platform: IntatisComposerGlassPlatform
+    ) -> ControlSize {
+        switch platform {
+        case .iOS:
+            return .small
+        case .macOS:
+            return .regular
+        }
+    }
+}
+
+enum IntatisComposerGlassPlatform: Sendable {
+    case iOS
+    case macOS
+}
+
+public enum IntatisSidebarGesturePolicy {
+    public static let minimumDistance: CGFloat = 12
+    public static let leadingEdgeWidth: CGFloat = 24
+    public static let minimumOpenTranslation: CGFloat = 52
+    public static let minimumCloseTranslation: CGFloat = 44
+    public static let horizontalDominance: CGFloat = 1.25
+
+    public static func shouldOpen(
+        startX: CGFloat,
+        translation: CGSize
+    ) -> Bool {
+        startX >= 0
+            && startX <= leadingEdgeWidth
+            && translation.width >= minimumOpenTranslation
+            && isHorizontallyDominant(translation)
+    }
+
+    public static func shouldClose(translation: CGSize) -> Bool {
+        translation.width <= -minimumCloseTranslation
+            && isHorizontallyDominant(translation)
+    }
+
+    private static func isHorizontallyDominant(_ translation: CGSize) -> Bool {
+        abs(translation.width)
+            >= abs(translation.height) * horizontalDominance
+    }
 }
 
 public struct IntatisThreadComposer: View {
@@ -2208,13 +2297,11 @@ public struct IntatisThreadComposer: View {
     private let inputLeadingAccessory: AnyView?
     private let onSend: () -> Void
     @FocusState private var focused: Bool
+    @ScaledMetric(relativeTo: .body)
+    private var inputPointSize: CGFloat = IntatisTypography.spec(for: .chat).nominalPointSize
 
     private var inputFont: Font {
-        #if os(iOS)
-        return .body
-        #else
-        return .system(size: 15)
-        #endif
+        IntatisTypography.chat(inputPointSize)
     }
 
     public init(placeholder: String,
@@ -2273,10 +2360,18 @@ public struct IntatisThreadComposer: View {
         VStack(alignment: .leading, spacing: 8) {
             topAccessoryRow
 
-            IntatisGlassEffectGroup(spacing: 10) {
+            IntatisGlassEffectGroup(spacing: composerGlassEffectSpacing) {
                 composerControls
             }
         }
+    }
+
+    private var composerGlassEffectSpacing: CGFloat {
+        #if os(iOS)
+        IntatisComposerControlMetrics.glassEffectSpacing(for: .iOS)
+        #else
+        IntatisComposerControlMetrics.glassEffectSpacing(for: .macOS)
+        #endif
     }
 
     @ViewBuilder private var topAccessoryRow: some View {
@@ -2377,11 +2472,7 @@ public struct IntatisThreadComposer: View {
                     }
                 }
         }
-        .intatisCompactIconButton()
-        .frame(
-            width: IntatisComposerControlMetrics.controlHeight,
-            height: IntatisComposerControlMetrics.controlHeight)
-        .contentShape(Circle())
+        .intatisComposerIconButton()
         .help(action.help)
         .accessibilityLabel(action.help)
         .disabled(action.isDisabled)
@@ -2392,7 +2483,7 @@ public struct IntatisThreadComposer: View {
             Label(IntatisLocalization.string("Send"), systemImage: "arrow.up")
                 .intatisComposerIconLabel()
         }
-        .intatisCompactIconButton(prominent: true)
+        .intatisComposerIconButton(prominent: true)
         .disabled(!canSend)
         .accessibilityLabel(IntatisLocalization.string("Send"))
         .accessibilityIdentifier("thread.composer.send")
@@ -2414,7 +2505,7 @@ public struct IntatisThreadComposer: View {
                     }
                 }
         }
-        .intatisCompactIconButton(prominent: true)
+        .intatisComposerIconButton(prominent: true)
         .tint(.red)
         .help(action.help)
         .disabled(action.isDisabled)
@@ -2709,11 +2800,11 @@ struct IntatisWorkspaceThreadHeader: View {
     private var titleBlock: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(title)
-                .font(.system(size: 30, weight: .semibold, design: .serif))
+                .font(IntatisTypography.largeTitle())
                 .foregroundStyle(style.primaryText)
             if let subtitle, !subtitle.isEmpty {
                 Text(subtitle)
-                    .font(.system(size: 13, weight: .medium))
+                    .font(IntatisTypography.caption(13, .medium))
                     .foregroundStyle(style.secondaryText)
                     .lineLimit(2)
             }
@@ -2761,12 +2852,12 @@ struct IntatisWorkspaceThreadHeader: View {
     ) -> some View {
         if action.isIconOnly {
             Image(systemName: action.systemImage)
-                .font(.system(size: 13, weight: .semibold))
+                .font(IntatisTypography.body(13, .semibold))
                 .frame(width: 16, height: 16)
                 .accessibilityLabel(action.title)
         } else {
             Label(action.title, systemImage: action.systemImage)
-                .font(.system(size: 13, weight: .semibold))
+                .font(IntatisTypography.body(13, .semibold))
         }
     }
 }

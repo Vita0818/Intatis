@@ -358,8 +358,9 @@ routing options、结构化 unsupported 同路由一次降级、裸 404 拒绝�
 - `/Applications/Intatis.app` 已安装上述 `0.40 (40)` 开发构建，无 quarantine xattr；安装后
   可执行文件与 staging 副本的 SHA-256 均为
   `617c5b50a5e20e580c0a5a7d2059bc2337b19e92de66dd0779f8ada2d5a44cbe`。安装前的
-  `0.36 (36)` 已移至
-  `/Users/vita/.Trash/Intatis-before-install-20260808-163949.app`，可恢复；
+  `0.36 (36)` 曾移至
+  `/Users/vita/.Trash/Intatis-before-install-20260808-163949.app`，随后已按用户要求永久删除；
+  精确路径检查为 absent，Finder 复核废纸篓中名称含 `Intatis` 的项目数为 0；
 - 本轮没有重跑 SwiftPM 单元测试，也没有启动 App 做 UI/真实 provider smoke；紧随其后的
   Cowork permission authorization context 完整测试证据覆盖同一业务源码。未运行 Developer ID
   正式签名、公证、staple、Gatekeeper 或 DMG/ZIP 打包，因此这是本机开发安装证据，不是正式

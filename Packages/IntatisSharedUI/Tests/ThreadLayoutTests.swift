@@ -108,6 +108,58 @@ private struct WorkspaceChromeStressHarness: View {
 }
 
 final class ThreadLayoutTests: XCTestCase {
+    func testIOSComposerGlassMergeThresholdStaysBelowRowGap() {
+        XCTAssertEqual(IntatisComposerControlMetrics.rowSpacing, 8)
+        XCTAssertEqual(
+            IntatisComposerControlMetrics.glassEffectSpacing(for: .iOS),
+            0)
+        XCTAssertEqual(
+            IntatisComposerControlMetrics.glassEffectSpacing(for: .macOS),
+            10)
+        XCTAssertLessThan(
+            IntatisComposerControlMetrics.glassEffectSpacing(for: .iOS),
+            IntatisComposerControlMetrics.rowSpacing)
+    }
+
+    func testComposerUsesPlatformControlSizeWithinSharedFortyPointGeometry() {
+        XCTAssertEqual(IntatisComposerControlMetrics.controlHeight, 40)
+        XCTAssertEqual(
+            IntatisComposerControlMetrics.iconControlSize(for: .iOS),
+            .small)
+        XCTAssertEqual(
+            IntatisComposerControlMetrics.iconControlSize(for: .macOS),
+            .regular)
+    }
+
+    func testSidebarOpenGestureRequiresLeadingEdgeHorizontalIntent() {
+        XCTAssertTrue(IntatisSidebarGesturePolicy.shouldOpen(
+            startX: 8,
+            translation: CGSize(width: 72, height: 8)))
+        XCTAssertFalse(IntatisSidebarGesturePolicy.shouldOpen(
+            startX: 40,
+            translation: CGSize(width: 72, height: 8)))
+        XCTAssertFalse(IntatisSidebarGesturePolicy.shouldOpen(
+            startX: 8,
+            translation: CGSize(width: 48, height: 4)))
+        XCTAssertFalse(IntatisSidebarGesturePolicy.shouldOpen(
+            startX: 8,
+            translation: CGSize(width: 72, height: 64)))
+        XCTAssertFalse(IntatisSidebarGesturePolicy.shouldOpen(
+            startX: 8,
+            translation: CGSize(width: -72, height: 4)))
+    }
+
+    func testSidebarCloseGestureRequiresHorizontalLeftIntent() {
+        XCTAssertTrue(IntatisSidebarGesturePolicy.shouldClose(
+            translation: CGSize(width: -60, height: 8)))
+        XCTAssertFalse(IntatisSidebarGesturePolicy.shouldClose(
+            translation: CGSize(width: -40, height: 4)))
+        XCTAssertFalse(IntatisSidebarGesturePolicy.shouldClose(
+            translation: CGSize(width: -60, height: 56)))
+        XCTAssertFalse(IntatisSidebarGesturePolicy.shouldClose(
+            translation: CGSize(width: 60, height: 4)))
+    }
+
     func testLeadingAssistantAndAgentRowsUseTheFullAvailableWidth() {
         XCTAssertEqual(
             IntatisThreadBubbleWidthPolicy.resolve(

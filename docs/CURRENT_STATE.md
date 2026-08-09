@@ -16,8 +16,9 @@
 - 本机 `/Applications/Intatis.app` 已安装上述当前工作树的 `0.40 (40)` ad-hoc Hardened
   Runtime 开发构建；bundle identifier 为 `com.Vita0818.IntatisMac`，严格 codesign 校验通过，
   安装副本与已验证 staging 副本的可执行文件 SHA-256 一致，且无 quarantine xattr。安装前的
-  `0.36 (36)` 已移至
-  `/Users/vita/.Trash/Intatis-before-install-20260808-163949.app`，可恢复。该本机安装不是
+  `0.36 (36)` 曾移至
+  `/Users/vita/.Trash/Intatis-before-install-20260808-163949.app`，随后已按用户要求永久删除；
+  Finder 复核废纸篓中名称含 `Intatis` 的项目数为 0，不再保留旧版备份。该本机安装不是
   Developer ID 公证发行产物。
 - macOS 只发行 `IntatisMac` Developer ID/direct-distribution 产品；不做 Mac App Store。
   `IntatisMacAppStore` 仍是 legacy source target，不进入默认构建、测试或 release gate。

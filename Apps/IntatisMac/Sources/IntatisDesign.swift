@@ -72,21 +72,11 @@ private struct IntatisLegacyWindowBackground: NSViewRepresentable {
 #endif
 
 // MARK: - Typography
-//
-// English brand & titles take a serif voice (an editorial nod shared with the
-// Vela family); body / Chinese stay on the system font; code, paths and other
-// technical tokens use a monospaced voice.
 
-enum IntatisType {
-    static func brand(_ size: CGFloat = 30, _ w: Font.Weight = .semibold) -> Font { .system(size: size, weight: w, design: .serif) }
-    static func largeTitle(_ size: CGFloat = 30, _ w: Font.Weight = .semibold) -> Font { .system(size: size, weight: w, design: .serif) }
-    static func title(_ size: CGFloat = 20, _ w: Font.Weight = .semibold) -> Font { .system(size: size, weight: w, design: .serif) }
-    static func headline(_ size: CGFloat = 16, _ w: Font.Weight = .semibold) -> Font { .system(size: size, weight: w) }
-    static func body(_ size: CGFloat = 14, _ w: Font.Weight = .regular) -> Font { .system(size: size, weight: w) }
-    static func caption(_ size: CGFloat = 12, _ w: Font.Weight = .medium) -> Font { .system(size: size, weight: w) }
-    static func mono(_ size: CGFloat = 13, _ w: Font.Weight = .regular) -> Font { .system(size: size, weight: w, design: .monospaced) }
-    static func chat(_ size: CGFloat = 15, _ w: Font.Weight = .regular) -> Font { .system(size: size, weight: w) }
-}
+/// Compatibility name for existing macOS call sites. The role definitions
+/// live in SharedUI so iOS Chat uses the same nominal sizes, weights and font
+/// designs while applying its own Dynamic Type scaling.
+typealias IntatisType = IntatisTypography
 
 extension IntatisThreadStyle {
     static func intatisMac(_ scheme: ColorScheme) -> IntatisThreadStyle {

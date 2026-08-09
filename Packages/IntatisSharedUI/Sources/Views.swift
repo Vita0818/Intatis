@@ -190,6 +190,12 @@ struct ThreadView: View {
 struct MessageRow: View {
     let message: ChatMessageView
     @Environment(\.colorScheme) private var scheme
+    @ScaledMetric(relativeTo: .body)
+    private var chatTextSize: CGFloat = IntatisTypography.spec(for: .chat).nominalPointSize
+    @ScaledMetric(relativeTo: .caption)
+    private var captionSize: CGFloat = IntatisTypography.spec(for: .caption).nominalPointSize
+    @ScaledMetric(relativeTo: .caption2)
+    private var metadataSize: CGFloat = IntatisTypography.spec(for: .metadata).nominalPointSize
 
     private var style: IntatisThreadStyle {
         .standard(scheme)
@@ -224,13 +230,14 @@ struct MessageRow: View {
                 HStack(spacing: 6) {
                     if let roleLabel {
                         Text(roleLabel)
-                            .font(.caption)
+                            .font(IntatisTypography.metadata(metadataSize, .semibold))
+                            .tracking(0.6)
                             .foregroundStyle(.secondary)
                     }
                     if (message.role == .assistant || message.role == .agent),
                        let timestamp = message.timestamp {
                         Text(IntatisMessageTimestampPresentation.string(for: timestamp))
-                            .font(.caption2)
+                            .font(IntatisTypography.metadata(metadataSize))
                             .monospacedDigit()
                             .foregroundStyle(.tertiary)
                     }
@@ -252,6 +259,7 @@ struct MessageRow: View {
             } else {
                 if !displayText.isEmpty {
                     Text(displayText)
+                        .font(IntatisTypography.chat(chatTextSize))
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
@@ -265,7 +273,7 @@ struct MessageRow: View {
                                 "%lld attachments",
                                 Int64(message.attachments.count)),
                         systemImage: "paperclip")
-                        .font(.caption)
+                        .font(IntatisTypography.caption(captionSize))
                         .foregroundStyle(.secondary)
                 }
             }
@@ -291,7 +299,7 @@ struct MessageRow: View {
 
     private func tagBadge(_ tag: String) -> some View {
         Text(tag.uppercased())
-            .font(.caption2.bold())
+            .font(IntatisTypography.metadata(metadataSize, .semibold))
             .foregroundStyle(Color.primary)
             .padding(.horizontal, 6)
             .padding(.vertical, 2)
@@ -438,7 +446,7 @@ struct ComposerView: View {
                 Label(label, systemImage: "paperclip")
                     .intatisComposerIconLabel()
             }
-            .intatisCompactIconButton()
+            .intatisComposerIconButton()
             .help(label)
             .accessibilityLabel(label)
             .accessibilityIdentifier("thread.composer.actions")

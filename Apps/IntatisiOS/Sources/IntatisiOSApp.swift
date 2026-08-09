@@ -214,9 +214,16 @@ struct IOSRootView: View {
     @EnvironmentObject var env: IOSAppEnvironment
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.colorScheme) private var colorScheme
-    @ScaledMetric(relativeTo: .title) private var brandTitleSize: CGFloat = 28
-    @ScaledMetric(relativeTo: .title2) private var sessionTitleSize: CGFloat = 22
-    @ScaledMetric(relativeTo: .largeTitle) private var settingsTitleSize: CGFloat = 30
+    @ScaledMetric(relativeTo: .title)
+    private var brandTitleSize: CGFloat = IntatisTypography.spec(for: .brand).nominalPointSize
+    @ScaledMetric(relativeTo: .largeTitle)
+    private var sessionTitleSize: CGFloat = IntatisTypography.spec(for: .largeTitle).nominalPointSize
+    @ScaledMetric(relativeTo: .largeTitle)
+    private var settingsTitleSize: CGFloat = IntatisTypography.spec(for: .largeTitle).nominalPointSize
+    @ScaledMetric(relativeTo: .body)
+    private var settingsRowSize: CGFloat = 13
+    @ScaledMetric(relativeTo: .caption)
+    private var captionSize: CGFloat = IntatisTypography.spec(for: .caption).nominalPointSize
     @State private var showSettings = false
     @State private var showSidebar = false
     @State private var showConfigImporter = false
@@ -243,6 +250,7 @@ struct IOSRootView: View {
 
                     chatSurface
                         .frame(width: proxy.size.width, height: proxy.size.height)
+                        .simultaneousGesture(openSidebarEdgeGesture)
                         .clipShape(RoundedRectangle(
                             cornerRadius: showSidebar ? 30 : 0,
                             style: .continuous))
@@ -313,8 +321,7 @@ struct IOSRootView: View {
     private var chatHeader: some View {
         HStack(spacing: 12) {
             Button {
-                refreshSessions()
-                setSidebarVisible(true)
+                openSidebar()
             } label: {
                 Label(
                     IntatisLocalization.string("Open sidebar"),
@@ -326,10 +333,7 @@ struct IOSRootView: View {
             .frame(width: 48)
 
             Text(activeSessionTitle)
-                .font(.system(
-                    size: sessionTitleSize,
-                    weight: .semibold,
-                    design: .serif))
+                .font(IntatisTypography.largeTitle(sessionTitleSize))
                 .foregroundStyle(.primary)
                 .lineLimit(1)
                 .truncationMode(.middle)
@@ -357,10 +361,7 @@ struct IOSRootView: View {
     private func sidebar(width: CGFloat) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             Text("Intatis")
-                .font(.system(
-                    size: brandTitleSize,
-                    weight: .semibold,
-                    design: .serif))
+                .font(IntatisTypography.brand(brandTitleSize))
                 .foregroundStyle(.primary)
                 .padding(.horizontal, 6)
                 .padding(.top, 10)
@@ -390,11 +391,11 @@ struct IOSRootView: View {
             } label: {
                 HStack(spacing: 9) {
                     Image(systemName: "gearshape")
-                        .font(.system(size: 13, weight: .medium))
+                        .font(IntatisTypography.body(settingsRowSize, .medium))
                         .foregroundStyle(.secondary)
                         .frame(width: 20)
                     Text(IntatisLocalization.string("Settings"))
-                        .font(.system(size: 13, weight: .medium))
+                        .font(IntatisTypography.body(settingsRowSize, .medium))
                         .foregroundStyle(.secondary)
                     Spacer(minLength: 0)
                 }
@@ -414,10 +415,12 @@ struct IOSRootView: View {
         .frame(maxHeight: .infinity, alignment: .leading)
         .background(.background)
         .contentShape(Rectangle())
-        .gesture(
-            DragGesture(minimumDistance: 12)
+        .simultaneousGesture(
+            DragGesture(
+                minimumDistance: IntatisSidebarGesturePolicy.minimumDistance)
                 .onEnded { value in
-                    if value.translation.width < -44 {
+                    if IntatisSidebarGesturePolicy.shouldClose(
+                        translation: value.translation) {
                         setSidebarVisible(false)
                     }
                 })
@@ -428,7 +431,7 @@ struct IOSRootView: View {
     @ViewBuilder private var sessionErrorBanner: some View {
         if let error = env.chatSessionError {
             Text(error)
-                .font(.caption)
+                .font(captionFont)
                 .foregroundStyle(.red)
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
@@ -441,6 +444,24 @@ struct IOSRootView: View {
 
     private func refreshSessions() {
         recentSessions = env.recentChatSessions()
+    }
+
+    private var openSidebarEdgeGesture: some Gesture {
+        DragGesture(
+            minimumDistance: IntatisSidebarGesturePolicy.minimumDistance,
+            coordinateSpace: .local)
+            .onEnded { value in
+                guard !showSidebar,
+                      IntatisSidebarGesturePolicy.shouldOpen(
+                        startX: value.startLocation.x,
+                        translation: value.translation) else { return }
+                openSidebar()
+            }
+    }
+
+    private func openSidebar() {
+        refreshSessions()
+        setSidebarVisible(true)
     }
 
     private func sessionMenuTitle(_ session: IOSSessionSummary) -> String {
@@ -515,10 +536,7 @@ struct IOSRootView: View {
         NavigationStack {
             VStack(alignment: .leading, spacing: 0) {
                 Text(IntatisLocalization.string("Settings"))
-                    .font(.system(
-                        size: settingsTitleSize,
-                        weight: .semibold,
-                        design: .serif))
+                    .font(IntatisTypography.largeTitle(settingsTitleSize))
                     .foregroundStyle(.primary)
                     .padding(.horizontal, 20)
                     .padding(.top, 8)
@@ -538,7 +556,7 @@ struct IOSRootView: View {
                     }
 
                     Text("Import an Intatis JSON or JSONC file from Files. Provider and model settings are stored in this app; literal credentials are migrated to the protected auth file.")
-                        .font(.caption)
+                        .font(captionFont)
                         .foregroundStyle(.secondary)
 
                     if let configImportMessage {
@@ -547,13 +565,13 @@ struct IOSRootView: View {
                             systemImage: configImportWarnings.isEmpty
                                 ? "checkmark.circle.fill"
                                 : "exclamationmark.triangle.fill")
-                            .font(.caption)
+                            .font(captionFont)
                             .foregroundStyle(configImportWarnings.isEmpty ? .green : .orange)
                     }
 
                     ForEach(Array(configImportWarnings.enumerated()), id: \.offset) { _, warning in
                         Text(warning)
-                            .font(.caption)
+                            .font(captionFont)
                             .foregroundStyle(.orange)
                     }
                 }
@@ -629,10 +647,10 @@ struct IOSRootView: View {
                                       systemImage: report.isOK ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
                                     .foregroundStyle(report.isOK ? .green : .red)
                                 Text(IntatisLocalization.providerHealthSummary(report))
-                                    .font(.caption)
+                                    .font(captionFont)
                                     .foregroundStyle(.secondary)
                                 Text(IntatisLocalization.providerHealthDetail(report))
-                                    .font(.caption)
+                                    .font(captionFont)
                                     .foregroundStyle(.secondary)
                             }
                         }
@@ -645,7 +663,7 @@ struct IOSRootView: View {
                         Text("Plain text safe mode").tag(IntatisMessageRendererMode.plainSafe.rawValue)
                     }
                     Text(messageRendererHelpText)
-                        .font(.caption)
+                        .font(captionFont)
                         .foregroundStyle(.secondary)
                 }
 
@@ -659,7 +677,7 @@ struct IOSRootView: View {
 
                 if let settingsError {
                     Section {
-                        Text(settingsError).font(.caption).foregroundStyle(.red)
+                        Text(settingsError).font(captionFont).foregroundStyle(.red)
                     }
                 }
                 }
@@ -694,6 +712,10 @@ struct IOSRootView: View {
 
     private static var jsoncType: UTType {
         UTType(filenameExtension: "jsonc") ?? .plainText
+    }
+
+    private var captionFont: Font {
+        IntatisTypography.caption(captionSize, .regular)
     }
 
     private func importConfiguration(_ result: Result<[URL], Error>) {
@@ -919,14 +941,17 @@ struct IOSRootView: View {
 }
 
 private struct IOSSidebarModeRow: View {
+    @ScaledMetric(relativeTo: .body)
+    private var bodySize: CGFloat = IntatisTypography.spec(for: .body).nominalPointSize
+
     var body: some View {
         HStack(spacing: 10) {
             Image(systemName: "bubble.left.and.bubble.right")
-                .font(.system(size: 14, weight: .semibold))
+                .font(IntatisTypography.body(bodySize, .semibold))
                 .foregroundStyle(Color.accentColor)
                 .frame(width: 22)
             Text(IntatisLocalization.string("Chat"))
-                .font(.system(size: 14, weight: .semibold))
+                .font(IntatisTypography.body(bodySize, .semibold))
                 .foregroundStyle(.primary)
             Spacer(minLength: 0)
         }
@@ -943,6 +968,9 @@ private struct IOSChatModelMenu: View {
     let catalog: IOSProviderCatalog
     let isBusy: Bool
     let onSelect: (String, String) -> Void
+    @ScaledMetric(relativeTo: .body) private var modelLabelSize: CGFloat = 13
+    @ScaledMetric(relativeTo: .caption)
+    private var metadataSize: CGFloat = IntatisTypography.spec(for: .metadata).nominalPointSize
 
     private var selectedProvider: IOSProviderSettings? { catalog.selectedProvider }
     private var selectedModel: IOSProviderModel? { catalog.selectedModel }
@@ -964,12 +992,12 @@ private struct IOSChatModelMenu: View {
             onSelect: onSelect) {
                 HStack(spacing: 8) {
                     Text(selectedModel?.title ?? IOSConfig.defaultModel)
-                        .font(.system(size: 13, weight: .semibold))
+                        .font(IntatisTypography.body(modelLabelSize, .semibold))
                         .foregroundStyle(.primary)
                         .lineLimit(1)
                         .truncationMode(.middle)
                     Image(systemName: "chevron.down")
-                        .font(.system(size: 10, weight: .semibold))
+                        .font(IntatisTypography.metadata(metadataSize, .semibold))
                         .foregroundStyle(.secondary)
                 }
                 .intatisComposerSelectionLabel()

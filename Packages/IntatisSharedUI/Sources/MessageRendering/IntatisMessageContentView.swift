@@ -224,7 +224,9 @@ public struct IntatisMessageContentView: View {
                     .accessibilityIdentifier("intatis.message.microsoft.\(messageID)")
             } else {
                 Text(verbatim: rawState.text(for: rawProjectionRevision))
-                    .font(.system(size: 15 * typographyRevision.scale))
+                    .font(IntatisTypography.chat(
+                        IntatisTypography.spec(for: .chat).nominalPointSize
+                            * typographyRevision.scale))
                     .foregroundStyle(style.primaryText)
                     .textSelection(.enabled)
                     .accessibilityIdentifier("intatis.message.plain.\(messageID)")
