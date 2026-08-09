@@ -132,6 +132,19 @@ public actor AppleNaturalLanguageSentenceEmbeddingProvider: KnowledgeEmbeddingPr
 #endif
 
 public enum KnowledgeVectorMath {
+    public static func isUnitNormalized(
+        _ values: [Float],
+        tolerance: Double = 0.002
+    ) -> Bool {
+        guard tolerance >= 0,
+              !values.isEmpty,
+              values.allSatisfy(\.isFinite) else { return false }
+        let squared = values.reduce(0.0) {
+            $0 + Double($1) * Double($1)
+        }
+        return squared.isFinite && abs(squared - 1) <= tolerance
+    }
+
     public static func normalized(_ values: [Float]) throws -> [Float] {
         guard !values.isEmpty, values.allSatisfy(\.isFinite) else {
             throw KnowledgeDomainError(.embeddingIncompatible, "Embedding vector is empty or non-finite.")
@@ -153,12 +166,21 @@ public enum KnowledgeVectorMath {
             throw KnowledgeDomainError(.embeddingIncompatible, "Embedding vectors are incompatible.")
         }
         var dot: Double = 0
+        var lhsSquared: Double = 0
+        var rhsSquared: Double = 0
         for index in lhs.indices {
-            dot += Double(lhs[index]) * Double(rhs[index])
+            let left = Double(lhs[index])
+            let right = Double(rhs[index])
+            dot += left * right
+            lhsSquared += left * left
+            rhsSquared += right * right
         }
-        guard dot.isFinite else {
+        let denominator = sqrt(lhsSquared) * sqrt(rhsSquared)
+        guard dot.isFinite,
+              denominator.isFinite,
+              denominator > 0 else {
             throw KnowledgeDomainError(.embeddingIncompatible, "Embedding similarity is non-finite.")
         }
-        return dot
+        return dot / denominator
     }
 }

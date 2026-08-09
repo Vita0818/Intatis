@@ -2176,7 +2176,8 @@ public actor GoalRuntimeController {
         "read_file", "list_files", "search_text",
         "git_status", "git_diff", "git_diff_staged", "git_info",
         "git_recent_commits", "git_diff_base", "git_apply_patch_check",
-        "read_pdf", "compile_latex", "web_fetch", "browser_diagnostics",
+        "read_pdf", "document_read", "document_ocr",
+        "compile_latex", "web_fetch", "browser_diagnostics",
         "browser_snapshot", "browser_screenshot", "browser_downloads",
         "browser_search",
     ]

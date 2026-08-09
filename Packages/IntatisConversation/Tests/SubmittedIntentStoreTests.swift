@@ -230,6 +230,26 @@ final class SubmittedIntentStoreTests: XCTestCase {
         XCTAssertEqual(visible.entries[0].lastCanonicalError, error)
     }
 
+    func testRetryOutboxCanonicalizesTheExactPayloadAtAttemptOne() async throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let user = payload("sub_outbox_retry")
+        _ = try SubmittedIntentOutboxStore.upsert(
+            SubmittedIntentOutboxEntry(payload: user),
+            sessionDirectoryURL: fixture.root,
+            sessionID: fixture.session)
+
+        let result = try await SubmittedIntentStore(log: fixture.log)
+            .retryOutbox(id: try XCTUnwrap(user.submissionID))
+        guard case .canonical(let entry, _) = result else {
+            return XCTFail("a writable EventLog must canonicalize the outbox entry")
+        }
+        XCTAssertEqual(entry.payload, user)
+        let projection = CoworkProjection.build(from: try await fixture.log.replayChecked())
+        XCTAssertEqual(projection.submittedIntents.first?.attempt, 1)
+        XCTAssertEqual(projection.submittedIntents.first?.status, .queued)
+    }
+
     func testOutboxFailureThrowsBeforeCanonicalAdmission() async throws {
         let fixture = try makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -362,6 +382,68 @@ final class SubmittedIntentStoreTests: XCTestCase {
             status: .queued,
             attempt: 2))
         XCTAssertNotNil(retry)
+    }
+
+    func testRetryPlannerResumesRestoredAttemptsAndOnlyIncrementsWholeTaskRetry() {
+        func task(_ status: TaskStatus, attempt: Int) -> CoworkTaskView {
+            CoworkTaskView(
+                id: TaskID(rawValue: "task_\(status.rawValue)_\(attempt)"),
+                status: status,
+                attempt: attempt)
+        }
+
+        XCTAssertEqual(
+            SubmittedIntentRetryPlanner.plan(
+                currentAttempt: 1,
+                task: task(.queued, attempt: 1),
+                isRestoredSubmission: true),
+            .resumeRestoredTask(
+                attempt: 1,
+                appendsQueuedStatus: false))
+        XCTAssertEqual(
+            SubmittedIntentRetryPlanner.plan(
+                currentAttempt: 1,
+                task: task(.queued, attempt: 2),
+                isRestoredSubmission: true),
+            .resumeRestoredTask(
+                attempt: 2,
+                appendsQueuedStatus: true))
+
+        for status in [TaskStatus.failed, .cancelled] {
+            XCTAssertEqual(
+                SubmittedIntentRetryPlanner.plan(
+                    currentAttempt: 1,
+                    task: task(status, attempt: 1),
+                    isRestoredSubmission: false),
+                .retryTerminalTask(attempt: 2))
+        }
+        XCTAssertEqual(
+            SubmittedIntentRetryPlanner.plan(
+                currentAttempt: 1,
+                task: nil,
+                isRestoredSubmission: false),
+            .retrySubmissionWithoutTask(attempt: 2))
+
+        for status in [TaskStatus.created, .assigned, .running] {
+            XCTAssertEqual(
+                SubmittedIntentRetryPlanner.plan(
+                    currentAttempt: 1,
+                    task: task(status, attempt: 1),
+                    isRestoredSubmission: true),
+                .reject)
+        }
+        XCTAssertEqual(
+            SubmittedIntentRetryPlanner.plan(
+                currentAttempt: 1,
+                task: task(.queued, attempt: 1),
+                isRestoredSubmission: false),
+            .reject)
+        XCTAssertEqual(
+            SubmittedIntentRetryPlanner.plan(
+                currentAttempt: 1,
+                task: task(.queued, attempt: 3),
+                isRestoredSubmission: true),
+            .reject)
     }
 }
 

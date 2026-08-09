@@ -119,6 +119,154 @@ final class ModelHistoryProtocolTests: XCTestCase {
         XCTAssertNil(decoded.messageClassification)
     }
 
+    func testMediaAwareDirectHistoryRoundTripsWithVerifiedImageReferences()
+        throws
+    {
+        let reference = ModelHistoryImageReference(
+            artifactID: ArtifactID(rawValue: "artifact-image"),
+            mimeType: "image/png",
+            byteCount: 128,
+            sha256: String(repeating: "a", count: 64))
+        let user = ModelHistoryItemPayload.message(
+            itemID: "media-user",
+            turnID: TurnID(rawValue: "turn-media"),
+            agent: AgentID(rawValue: "main"),
+            taskID: nil,
+            submissionID: SubmissionID(rawValue: "sub-media"),
+            taskAttempt: 1,
+            role: .user,
+            content: "inspect",
+            attachmentIDs: [reference.artifactID],
+            imageReferences: [reference],
+            messageClassification: .realUser)
+        let output = ModelHistoryItemPayload.functionCallOutput(
+            itemID: "media-output",
+            turnID: user.turnID,
+            agent: user.agent,
+            taskID: nil,
+            submissionID: user.submissionID,
+            taskAttempt: 1,
+            callID: "call-image",
+            output: "",
+            imageReferences: [reference])
+
+        for payload in [user, output] {
+            XCTAssertEqual(
+                payload.schemaVersion,
+                ModelHistoryItemPayload.mediaSchemaVersion)
+            let data = try JSONEncoder().encode(payload)
+            XCTAssertEqual(
+                try JSONDecoder().decode(
+                    ModelHistoryItemPayload.self,
+                    from: data),
+                payload)
+        }
+    }
+
+    func testFunctionCallOutputGoldenShapeRequiresTextOrMedia() throws {
+        let turnID = TurnID(rawValue: "turn-output-shape")
+        let agent = AgentID(rawValue: "main")
+        let textOutput = ModelHistoryItemPayload.functionCallOutput(
+            itemID: "text-output",
+            turnID: turnID,
+            agent: agent,
+            taskID: nil,
+            submissionID: nil,
+            taskAttempt: nil,
+            callID: "call-text",
+            output: "complete")
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(
+                with: JSONEncoder().encode(textOutput)) as? [String: Any])
+
+        XCTAssertEqual(Set(object.keys), [
+            "agent", "callID", "itemID", "kind", "output",
+            "schemaVersion", "turnID",
+        ])
+        XCTAssertEqual(object["schemaVersion"] as? Int, 1)
+        XCTAssertEqual(object["kind"] as? String, "function_call_output")
+        XCTAssertEqual(object["output"] as? String, "complete")
+
+        var emptyTextOutput = textOutput
+        emptyTextOutput.output = ""
+        XCTAssertThrowsError(try emptyTextOutput.validate()) {
+            XCTAssertEqual(
+                $0 as? ModelHistoryItemPayloadValidationError,
+                .invalidShape(
+                    "text-only function-call output cannot be empty"))
+        }
+
+        let reference = ModelHistoryImageReference(
+            artifactID: ArtifactID(rawValue: "artifact-output-shape"),
+            mimeType: "image/png",
+            byteCount: 1,
+            sha256: String(repeating: "c", count: 64))
+        let mediaOutput = ModelHistoryItemPayload.functionCallOutput(
+            itemID: "media-output",
+            turnID: turnID,
+            agent: agent,
+            taskID: nil,
+            submissionID: nil,
+            taskAttempt: nil,
+            callID: "call-media",
+            output: "",
+            imageReferences: [reference])
+        XCTAssertNoThrow(try mediaOutput.validate())
+        XCTAssertEqual(
+            mediaOutput.schemaVersion,
+            ModelHistoryItemPayload.mediaSchemaVersion)
+    }
+
+    func testMediaAwareHistoryRejectsInvalidVersionShapeAndDescriptor()
+        throws
+    {
+        let reference = ModelHistoryImageReference(
+            artifactID: ArtifactID(rawValue: "artifact-image"),
+            mimeType: "image/png",
+            byteCount: 128,
+            sha256: String(repeating: "b", count: 64))
+        var v1WithReference = ModelHistoryItemPayload.message(
+            itemID: "v1-with-media",
+            turnID: TurnID(rawValue: "turn-v1-media"),
+            agent: AgentID(rawValue: "main"),
+            taskID: nil,
+            submissionID: SubmissionID(rawValue: "sub-v1-media"),
+            taskAttempt: 1,
+            role: .user,
+            content: "inspect",
+            attachmentIDs: [reference.artifactID],
+            imageReferences: [reference],
+            messageClassification: .realUser)
+        v1WithReference.schemaVersion =
+            ModelHistoryItemPayload.currentSchemaVersion
+        XCTAssertThrowsError(try JSONEncoder().encode(v1WithReference))
+
+        var unsupportedMIME = reference
+        unsupportedMIME.mimeType = "image/webp"
+        XCTAssertThrowsError(try unsupportedMIME.validate()) {
+            XCTAssertEqual(
+                $0 as? ModelHistoryImageReferenceValidationError,
+                .unsupportedMIMEType("image/webp"))
+        }
+
+        var mediaCheckpoint = validCheckpoint()
+        mediaCheckpoint.schemaVersion =
+            ModelHistoryCompactedPayload.mediaSchemaVersion
+        mediaCheckpoint.replacementHistory.insert(
+            ModelHistoryReplacementItem(
+                itemID: "old-media-user",
+                sourceSubmissionID:
+                    SubmissionID(rawValue: "sub-old-media"),
+                kind: .message,
+                role: .user,
+                messageClassification: .realUser,
+                content: "old image request",
+                attachmentIDs: [reference.artifactID],
+                imageReferences: [reference]),
+            at: 0)
+        XCTAssertThrowsError(try mediaCheckpoint.validate())
+    }
+
     func testReplacementHistoryItemsPreserveProviderShapeWithoutInvocationCorrelation()
         throws
     {
@@ -241,10 +389,10 @@ final class ModelHistoryProtocolTests: XCTestCase {
     {
         var unsupportedSchema = validCheckpoint()
         unsupportedSchema.schemaVersion =
-            ModelHistoryCompactedPayload.currentSchemaVersion + 1
+            ModelHistoryCompactedPayload.mediaSchemaVersion + 1
         assertValidationError(
             unsupportedSchema,
-            equals: .unsupportedSchemaVersion(2))
+            equals: .unsupportedSchemaVersion(3))
 
         var emptySummary = validCheckpoint()
         emptySummary.message = " \n "

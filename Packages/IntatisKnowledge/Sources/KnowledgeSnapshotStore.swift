@@ -214,6 +214,7 @@ public struct KnowledgeSnapshotStore: Sendable {
     public let workspaceLeaseID: WorkspaceLeaseID
     public let workspaceRootIdentity: WorkspaceRootIdentity
     public let storeRootIdentity: WorkspaceRootIdentity
+    public let coordinationRootIdentity: WorkspaceRootIdentity
 
     let workspaceLease: WorkspaceLease
     let fileSystem: KnowledgeSecureFileSystem
@@ -316,12 +317,17 @@ public struct KnowledgeSnapshotStore: Sendable {
         }
         let validatedCoordination = try DurableOwnerOnlyFile
             .validateOwnedDirectory(at: coordination)
+        guard let coordinationIdentity = WorkspaceRootIdentity.capture(
+                rootPath: validatedCoordination.path) else {
+            throw KnowledgeDomainError(.unsafeStorage, "Knowledge coordination directory identity is unavailable.")
+        }
 
         self.root = authorized.canonical
         coordinationRoot = validatedCoordination
         workspaceLeaseID = workspaceLease.id
         workspaceRootIdentity = workspaceIdentity
         storeRootIdentity = authorized.identity
+        coordinationRootIdentity = coordinationIdentity
         self.workspaceLease = workspaceLease
         self.fileSystem = fileSystem
     }
@@ -331,7 +337,8 @@ public struct KnowledgeSnapshotStore: Sendable {
         guard let lock = try KnowledgeAdvisoryFileLock.acquire(
             at: storeLockURL,
             mode: .shared,
-            blocking: true) else {
+            blocking: true,
+            expectedParentIdentity: coordinationRootIdentity) else {
             throw KnowledgeDomainError(.unsafeStorage, "Knowledge store lock could not be acquired.")
         }
         defer { lock.release() }
@@ -388,7 +395,8 @@ public struct KnowledgeSnapshotStore: Sendable {
         guard let admissionLock = try KnowledgeAdvisoryFileLock.acquire(
             at: storeLockURL,
             mode: .shared,
-            blocking: true) else {
+            blocking: true,
+            expectedParentIdentity: coordinationRootIdentity) else {
             throw KnowledgeDomainError(.unsafeStorage, "Knowledge store admission lock could not be acquired.")
         }
         var shouldReleaseAdmissionLock = true
@@ -425,7 +433,8 @@ public struct KnowledgeSnapshotStore: Sendable {
         guard let readerLock = try KnowledgeAdvisoryFileLock.acquire(
             at: snapshotLockURL(snapshotID),
             mode: .shared,
-            blocking: true) else {
+            blocking: true,
+            expectedParentIdentity: coordinationRootIdentity) else {
             throw KnowledgeDomainError(.revisionChanged, retryable: true, "Knowledge snapshot could not be pinned.")
         }
         var shouldReleaseReaderLock = true
@@ -485,7 +494,8 @@ public struct KnowledgeSnapshotStore: Sendable {
         guard let lock = try KnowledgeAdvisoryFileLock.acquire(
             at: storeLockURL,
             mode: .exclusive,
-            blocking: true) else {
+            blocking: true,
+            expectedParentIdentity: coordinationRootIdentity) else {
             throw KnowledgeDomainError(.unsafeStorage, "Knowledge store writer lock could not be acquired.")
         }
         do {
@@ -505,7 +515,8 @@ public struct KnowledgeSnapshotStore: Sendable {
         guard let lock = try KnowledgeAdvisoryFileLock.acquire(
             at: storeLockURL,
             mode: .exclusive,
-            blocking: false) else {
+            blocking: false,
+            expectedParentIdentity: coordinationRootIdentity) else {
             return nil
         }
         do {
@@ -548,6 +559,51 @@ public struct KnowledgeSnapshotStore: Sendable {
         }
     }
 
+    /// Removes the only active-snapshot admission pointer while the caller
+    /// holds the exclusive store writer lock. This is the persistent urgent
+    /// purge tombstone: a crash after this boundary leaves the store with no
+    /// queryable current snapshot, never with the deleted snapshot reactivated.
+    fileprivate func removePointerWithoutLock(
+        expectedStoreID: String
+    ) throws -> KnowledgeStorePointer? {
+        guard let pointer = try readPointerWithoutLock() else { return nil }
+        guard pointer.storeID == expectedStoreID else {
+            throw KnowledgeDomainError(
+                .revisionChanged,
+                retryable: true,
+                "Knowledge store identity changed before deactivation.")
+        }
+        let descriptor = open(pointerURL.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        guard descriptor >= 0 else {
+            throw KnowledgeDomainError(
+                .unsafeStorage,
+                "Knowledge store pointer could not be opened for deactivation.")
+        }
+        defer { _ = close(descriptor) }
+        var opened = stat()
+        var installed = stat()
+        guard fstat(descriptor, &opened) == 0,
+              lstat(pointerURL.path, &installed) == 0,
+              (opened.st_mode & S_IFMT) == S_IFREG,
+              opened.st_uid == geteuid(),
+              opened.st_nlink == 1,
+              (opened.st_mode & (S_IRWXU | S_IRWXG | S_IRWXO))
+                == (S_IRUSR | S_IWUSR),
+              opened.st_dev == installed.st_dev,
+              opened.st_ino == installed.st_ino else {
+            throw KnowledgeDomainError(
+                .unsafeStorage,
+                "Knowledge store pointer identity changed before deactivation.")
+        }
+        guard unlink(pointerURL.path) == 0 else {
+            throw KnowledgeDomainError(
+                .unsafeStorage,
+                "Knowledge store pointer could not be deactivated safely.")
+        }
+        try KnowledgeSnapshotDurability.synchronizeDirectory(root)
+        return pointer
+    }
+
     fileprivate func exactSnapshotRoot(_ snapshotID: String) throws -> URL {
         guard KnowledgeStoreIdentifier.isValidSnapshotID(snapshotID) else {
             throw KnowledgeDomainError(.profileInvalid, "Knowledge store pointer contains an invalid snapshot identifier.")
@@ -581,6 +637,8 @@ public struct KnowledgeSnapshotStore: Sendable {
         guard workspaceLease.id == workspaceLeaseID,
               workspaceRootIdentity.matchesCurrentDirectory(rootPath: workspaceLease.rootPath),
               WorkspaceRootIdentity.capture(rootPath: root.path) == storeRootIdentity,
+              WorkspaceRootIdentity.capture(rootPath: coordinationRoot.path)
+                == coordinationRootIdentity,
               PathConfinement.isWithin(root.path, root: URL(
                 fileURLWithPath: workspaceRootIdentity.canonicalPath,
                 isDirectory: true)) else {
@@ -656,6 +714,18 @@ public final class KnowledgeStoreWriterLease: @unchecked Sendable {
         return try store.readPointerWithoutLock()
     }
 
+    /// Persistently closes current-snapshot admission for an urgent purge.
+    /// The snapshot bytes are removed separately only after reader locks drain.
+    @discardableResult
+    public func deactivateStorePointer(
+        expectedStoreID: String
+    ) throws -> KnowledgeStorePointer? {
+        try requireActive()
+        try store.revalidateStoreAuthority()
+        return try store.removePointerWithoutLock(
+            expectedStoreID: expectedStoreID)
+    }
+
     public func abortStagingSnapshot(_ staging: KnowledgeStagingSnapshot) throws {
         try requireOwned(staging)
         try KnowledgeSnapshotDeletion.removeTree(
@@ -694,7 +764,13 @@ public final class KnowledgeStoreWriterLease: @unchecked Sendable {
                 .integrityFailed,
                 "Knowledge snapshot belongs to a different store identity.")
         }
-        try KnowledgeSnapshotDurability.freezeAndSynchronizeTree(staging.root)
+        // macOS requires write permission on a directory being renamed. Freeze
+        // every child now, keep only the staging root owner-writable through
+        // rename, then freeze that exact inode before pointer activation.
+        try KnowledgeSnapshotDurability.freezeAndSynchronizeTree(
+            staging.root,
+            keepRootWritableForRename: true)
+        try verifyContentSeal(validatedSnapshot, at: staging.root)
 
         let finalRoot = store.root
             .appendingPathComponent("snapshots", isDirectory: true)
@@ -704,9 +780,15 @@ public final class KnowledgeStoreWriterLease: @unchecked Sendable {
         }
         let stagingIdentity = try requiredIdentity(staging.root)
         guard rename(staging.root.path, finalRoot.path) == 0 else {
-            throw KnowledgeDomainError(.unsafeStorage, "Knowledge snapshot could not be atomically installed.")
+            let code = errno
+            throw KnowledgeDomainError(
+                .unsafeStorage,
+                "Knowledge snapshot could not be atomically installed (system code \(code)).")
         }
-        guard WorkspaceRootIdentity.capture(rootPath: finalRoot.path) == stagingIdentity else {
+        guard let installedIdentity = WorkspaceRootIdentity.capture(
+                rootPath: finalRoot.path),
+              installedIdentity.deviceID == stagingIdentity.deviceID,
+              installedIdentity.fileID == stagingIdentity.fileID else {
             throw KnowledgeDomainError(
                 .revisionChanged,
                 retryable: true,
@@ -740,10 +822,20 @@ public final class KnowledgeStoreWriterLease: @unchecked Sendable {
         } else {
             root = try store.exactSnapshotRoot(snapshotID)
         }
+        let exactInstalledRoot = try store.exactSnapshotRoot(snapshotID)
+        guard root.standardizedFileURL.path == exactInstalledRoot.standardizedFileURL.path,
+              WorkspaceRootIdentity.capture(rootPath: root.path)
+                == WorkspaceRootIdentity.capture(rootPath: exactInstalledRoot.path) else {
+            throw KnowledgeDomainError(
+                .unsafeStorage,
+                "Knowledge snapshot activation target is not the exact installed snapshot directory.")
+        }
+        try KnowledgeSnapshotDurability.freezeAndSynchronizeTree(root)
         try validateBinding(
             validatedSnapshot,
             snapshotID: snapshotID,
             expectedRoot: root)
+        try verifyContentSeal(validatedSnapshot, at: root)
         let previous = try store.readPointerWithoutLock()
         if let expectedPointerRevision,
            previous?.revision != expectedPointerRevision {
@@ -818,7 +910,8 @@ public final class KnowledgeStoreWriterLease: @unchecked Sendable {
             guard let snapshotLock = try KnowledgeAdvisoryFileLock.acquire(
                 at: store.snapshotLockURL(record.id),
                 mode: .exclusive,
-                blocking: false) else {
+                blocking: false,
+                expectedParentIdentity: store.coordinationRootIdentity) else {
                 skippedReaders.append(record.id)
                 continue
             }
@@ -864,7 +957,8 @@ public final class KnowledgeStoreWriterLease: @unchecked Sendable {
             guard let snapshotLock = try KnowledgeAdvisoryFileLock.acquire(
                 at: store.snapshotLockURL(id),
                 mode: .exclusive,
-                blocking: false) else {
+                blocking: false,
+                expectedParentIdentity: store.coordinationRootIdentity) else {
                 throw KnowledgeDomainError(
                     .revisionChanged,
                     retryable: true,
@@ -897,9 +991,22 @@ public final class KnowledgeStoreWriterLease: @unchecked Sendable {
               KnowledgeDigest.isValid(snapshot.profile.bundle.revision),
               KnowledgeDigest.isValid(snapshot.profile.retrievalSnapshot.revision),
               snapshot.profile.retrievalSnapshot.bundleRevision == snapshot.profile.bundle.revision,
-              snapshot.rootIdentity == expectedIdentity,
+              KnowledgeDigest.isValid(snapshot.contentSealDigest),
+              snapshot.rootIdentity.deviceID == expectedIdentity.deviceID,
+              snapshot.rootIdentity.fileID == expectedIdentity.fileID,
               snapshot.report.semanticVerdict else {
             throw KnowledgeDomainError(.integrityFailed, "Validated snapshot binding is inconsistent.")
+        }
+    }
+
+    private func verifyContentSeal(_ snapshot: KnowledgeValidatedSnapshot,
+                                   at root: URL) throws {
+        guard try store.fileSystem.snapshotSealDigest(root: root)
+                == snapshot.contentSealDigest else {
+            throw KnowledgeDomainError(
+                .revisionChanged,
+                retryable: true,
+                "Knowledge snapshot bytes changed between validation and publication.")
         }
     }
 
@@ -1000,20 +1107,19 @@ private enum KnowledgeStorePointerCodec {
                 "current_snapshot_revision",
               ]),
               object["schema"] as? String == KnowledgeContract.storeSchema,
-              object["store_id"] is String,
+              let storeID = object["store_id"] as? String,
               let revision = object["revision"] as? NSNumber,
               String(cString: revision.objCType) != "c",
               revision.doubleValue == Double(revision.intValue),
-              object["current_snapshot"] is String,
-              object["current_snapshot_revision"] is String else {
+              let currentSnapshot = object["current_snapshot"] as? String,
+              let currentSnapshotRevision = object["current_snapshot_revision"] as? String else {
             throw KnowledgeDomainError(.profileInvalid, "Knowledge store pointer shape is invalid.")
         }
-        let pointer: KnowledgeStorePointer
-        do {
-            pointer = try KnowledgeJSON.decode(KnowledgeStorePointer.self, from: data)
-        } catch {
-            throw KnowledgeDomainError(.profileInvalid, "Knowledge store pointer fields are invalid.")
-        }
+        let pointer = KnowledgeStorePointer(
+            storeID: storeID,
+            revision: revision.intValue,
+            currentSnapshot: currentSnapshot,
+            currentSnapshotRevision: currentSnapshotRevision)
         try validate(pointer)
         return pointer
     }
@@ -1044,17 +1150,48 @@ private final class KnowledgeAdvisoryFileLock: @unchecked Sendable {
 
     static func acquire(at url: URL,
                         mode: Mode,
-                        blocking: Bool) throws -> KnowledgeAdvisoryFileLock? {
-        try KnowledgeSnapshotStore.createOwnedDirectory(url.deletingLastPathComponent())
+                        blocking: Bool,
+                        expectedParentIdentity: WorkspaceRootIdentity) throws
+        -> KnowledgeAdvisoryFileLock? {
+        let parent = url.deletingLastPathComponent()
+        guard WorkspaceRootIdentity.capture(rootPath: parent.path)
+                == expectedParentIdentity else {
+            throw KnowledgeDomainError(.unsafeStorage, "Knowledge lease directory identity changed.")
+        }
+        let parentDescriptor = open(
+            parent.path,
+            O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        guard parentDescriptor >= 0 else {
+            throw KnowledgeDomainError(.unsafeStorage, "Knowledge lease directory could not be opened safely.")
+        }
+        defer { _ = close(parentDescriptor) }
+        var parentStatus = stat()
+        guard fstat(parentDescriptor, &parentStatus) == 0,
+              (parentStatus.st_mode & S_IFMT) == S_IFDIR,
+              parentStatus.st_uid == geteuid(),
+              UInt64(parentStatus.st_dev) == expectedParentIdentity.deviceID,
+              UInt64(parentStatus.st_ino) == expectedParentIdentity.fileID,
+              (parentStatus.st_mode & (S_IWGRP | S_IWOTH)) == 0 else {
+            throw KnowledgeDomainError(.unsafeStorage, "Knowledge lease directory is unsafe.")
+        }
         var created = false
-        var descriptor = open(
-            url.path,
-            O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
-            S_IRUSR | S_IWUSR)
+        let leafName = url.lastPathComponent
+        var descriptor = leafName.withCString {
+            openat(
+                parentDescriptor,
+                $0,
+                O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                S_IRUSR | S_IWUSR)
+        }
         if descriptor >= 0 {
             created = true
         } else if errno == EEXIST {
-            descriptor = open(url.path, O_RDWR | O_CLOEXEC | O_NOFOLLOW)
+            descriptor = leafName.withCString {
+                openat(
+                    parentDescriptor,
+                    $0,
+                    O_RDWR | O_CLOEXEC | O_NOFOLLOW)
+            }
         }
         guard descriptor >= 0 else {
             throw KnowledgeDomainError(.unsafeStorage, "Knowledge lease lock could not be opened safely.")
@@ -1065,10 +1202,10 @@ private final class KnowledgeAdvisoryFileLock: @unchecked Sendable {
         }
         if created {
             guard fchmod(descriptor, S_IRUSR | S_IWUSR) == 0,
-                  fsync(descriptor) == 0 else {
+                  fsync(descriptor) == 0,
+                  fsync(parentDescriptor) == 0 else {
                 throw KnowledgeDomainError(.unsafeStorage, "Knowledge lease lock could not be initialized safely.")
             }
-            try KnowledgeSnapshotDurability.synchronizeDirectory(url.deletingLastPathComponent())
         }
         guard safeLockStatus(descriptor) != nil else {
             throw KnowledgeDomainError(.unsafeStorage, "Knowledge lease lock is unsafe.")
@@ -1086,7 +1223,9 @@ private final class KnowledgeAdvisoryFileLock: @unchecked Sendable {
             _ = flock(descriptor, LOCK_UN)
             throw KnowledgeDomainError(.unsafeStorage, "Knowledge lease lock changed while acquired.")
         }
-        let installed = open(url.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        let installed = leafName.withCString {
+            openat(parentDescriptor, $0, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        }
         guard installed >= 0 else {
             _ = flock(descriptor, LOCK_UN)
             throw KnowledgeDomainError(.unsafeStorage, "Knowledge lease lock path is unsafe.")
@@ -1094,7 +1233,9 @@ private final class KnowledgeAdvisoryFileLock: @unchecked Sendable {
         defer { _ = close(installed) }
         guard let pathStatus = safeLockStatus(installed),
               held.st_dev == pathStatus.st_dev,
-              held.st_ino == pathStatus.st_ino else {
+              held.st_ino == pathStatus.st_ino,
+              WorkspaceRootIdentity.capture(rootPath: parent.path)
+                == expectedParentIdentity else {
             _ = flock(descriptor, LOCK_UN)
             throw KnowledgeDomainError(.unsafeStorage, "Knowledge lease lock identity changed.")
         }
@@ -1131,7 +1272,10 @@ private final class KnowledgeAdvisoryFileLock: @unchecked Sendable {
 }
 
 private enum KnowledgeSnapshotDurability {
-    static func freezeAndSynchronizeTree(_ root: URL) throws {
+    static func freezeAndSynchronizeTree(
+        _ root: URL,
+        keepRootWritableForRename: Bool = false
+    ) throws {
         var directories: [URL] = [root]
         var files: [URL] = []
         var pending: [URL] = [root]
@@ -1179,7 +1323,12 @@ private enum KnowledgeSnapshotDurability {
         for directory in directories.sorted(by: {
             $0.path.split(separator: "/").count > $1.path.split(separator: "/").count
         }) {
-            guard chmod(directory.path, S_IRUSR | S_IXUSR) == 0 else {
+            let permissions: mode_t =
+                keepRootWritableForRename && directory.standardizedFileURL.path
+                    == root.standardizedFileURL.path
+                ? S_IRWXU
+                : (S_IRUSR | S_IXUSR)
+            guard chmod(directory.path, permissions) == 0 else {
                 throw KnowledgeDomainError(.unsafeStorage, "Knowledge snapshot directory could not be frozen.")
             }
             try synchronizeDirectory(directory)

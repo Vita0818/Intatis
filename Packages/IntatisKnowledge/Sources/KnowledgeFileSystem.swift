@@ -44,13 +44,24 @@ public struct KnowledgeSecureFileSystem: Sendable {
         canonical: URL,
         identity: WorkspaceRootIdentity
     ) {
-        guard PathConfinement.isWithin(root.path, root: URL(fileURLWithPath: workspaceLease.rootPath)),
-              let leaseIdentity = workspaceLease.rootIdentity,
+        guard let leaseIdentity = workspaceLease.rootIdentity,
               leaseIdentity.matchesCurrentDirectory(rootPath: workspaceLease.rootPath),
               let identity = WorkspaceRootIdentity.capture(rootPath: root.path) else {
             throw KnowledgeDomainError(.accessDenied, "Knowledge store is outside the active workspace lease or its root identity changed.")
         }
+        let workspace = URL(
+            fileURLWithPath: leaseIdentity.canonicalPath,
+            isDirectory: true)
         let canonical = URL(fileURLWithPath: identity.canonicalPath, isDirectory: true)
+        guard PathConfinement.isWithin(canonical.path, root: workspace),
+              Self.workspaceLeaseAllows(
+                  canonical,
+                  workspaceRoot: workspace,
+                  lease: workspaceLease) else {
+            throw KnowledgeDomainError(
+                .accessDenied,
+                "Knowledge store is outside the active workspace lease or its path policy.")
+        }
         try validateDirectory(canonical)
         return (canonical, identity)
     }
@@ -203,10 +214,7 @@ public struct KnowledgeSecureFileSystem: Sendable {
 
     public static func canonicalBundleDigest(_ entries: [KnowledgeChecksumEntry]) throws -> String {
         let selected = entries.filter {
-            $0.path == "index.md"
-                || $0.path == "log.md"
-                || $0.path.hasPrefix("concepts/")
-                || $0.path.hasPrefix("references/")
+            !$0.path.hasPrefix(".intatis-rag/")
         }.sorted { $0.path < $1.path }
         guard !selected.isEmpty else {
             throw KnowledgeDomainError(.okfInvalid, "Knowledge bundle contains no OKF knowledge files.")
@@ -217,6 +225,22 @@ public struct KnowledgeSecureFileSystem: Sendable {
         }
         return try KnowledgeDigest.canonical(
             Projection(version: "intatis-okf-bundle-digest/1", files: selected))
+    }
+
+    /// Commits every leaf byte in one snapshot, including the checksum
+    /// inventory itself. This host seal is separate from the Profile's
+    /// self-excluding checksum list, so it closes validate/publish TOCTOU
+    /// without introducing a self-referential bundle field.
+    public func snapshotSealDigest(root: URL) throws -> String {
+        struct Projection: Codable {
+            let version: String
+            let files: [KnowledgeChecksumEntry]
+        }
+        let files = try leafInventory(root: root, excluding: [])
+            .sorted { $0.path < $1.path }
+        return try KnowledgeDigest.canonical(Projection(
+            version: "intatis-knowledge-snapshot-content-seal/1",
+            files: files))
     }
 
     public func validateRelativePath(_ path: String) throws {
@@ -294,8 +318,82 @@ public struct KnowledgeSecureFileSystem: Sendable {
         if path.hasPrefix(".intatis-rag/dense/") { return "dense_index" }
         if path.hasPrefix(".intatis-rag/lexical/") { return "lexical_index" }
         if path.hasPrefix(".intatis-rag/auxiliary/") { return "auxiliary" }
-        if path.hasPrefix("concepts/") { return "concept" }
-        if path.hasPrefix("references/") { return "reference" }
+        if OKFBundleLayout.isConcept(path) { return "concept" }
+        if path.split(separator: "/").contains("references") {
+            return "reference"
+        }
         return "okf"
+    }
+
+    private static func workspaceLeaseAllows(
+        _ url: URL,
+        workspaceRoot: URL,
+        lease: WorkspaceLease
+    ) -> Bool {
+        let relative = PathConfinement.relativePath(
+            of: url,
+            root: workspaceRoot)
+        if lease.deniedPatterns.contains(where: {
+            workspaceLeasePath(relative, matches: $0)
+        }) {
+            return false
+        }
+        return lease.allowedPathRules.contains { rule in
+            rule.pattern == "."
+                || workspaceLeasePath(relative, matches: rule.pattern)
+        }
+    }
+
+    private static func workspaceLeasePath(
+        _ path: String,
+        matches pattern: String
+    ) -> Bool {
+        let normalizedPath = path.replacingOccurrences(of: "\\", with: "/")
+        let normalizedPattern = pattern.replacingOccurrences(of: "\\", with: "/")
+        if !normalizedPattern.contains("/") {
+            return normalizedPath.split(separator: "/").contains {
+                workspaceLeaseGlob(String($0), matches: normalizedPattern)
+            }
+        }
+        return workspaceLeaseGlob(normalizedPath, matches: normalizedPattern)
+    }
+
+    private static func workspaceLeaseGlob(
+        _ value: String,
+        matches pattern: String
+    ) -> Bool {
+        var expression = "^"
+        var index = pattern.startIndex
+        while index < pattern.endIndex {
+            let character = pattern[index]
+            if character == "*" {
+                let next = pattern.index(after: index)
+                if next < pattern.endIndex, pattern[next] == "*" {
+                    let afterStars = pattern.index(after: next)
+                    if afterStars < pattern.endIndex,
+                       pattern[afterStars] == "/" {
+                        expression += "(?:.*/)?"
+                        index = pattern.index(after: afterStars)
+                    } else {
+                        expression += ".*"
+                        index = afterStars
+                    }
+                    continue
+                }
+                expression += "[^/]*"
+            } else if character == "?" {
+                expression += "[^/]"
+            } else {
+                expression += NSRegularExpression.escapedPattern(
+                    for: String(character))
+            }
+            index = pattern.index(after: index)
+        }
+        expression += "$"
+        guard let regex = try? NSRegularExpression(pattern: expression) else {
+            return false
+        }
+        let range = NSRange(value.startIndex..<value.endIndex, in: value)
+        return regex.firstMatch(in: value, range: range) != nil
     }
 }

@@ -108,7 +108,8 @@ final class AgentModelHistoryCompactorTests: XCTestCase {
         XCTAssertEqual(retainedUser.messageClassification, .realUser)
         XCTAssertEqual(retainedUser.content, "the genuine user request")
         XCTAssertEqual(retainedUser.sourceSubmissionID, submissionID)
-        XCTAssertEqual(retainedUser.attachmentIDs, [attachmentID])
+        XCTAssertNil(retainedUser.attachmentIDs)
+        XCTAssertNil(retainedUser.imageReferences)
         XCTAssertNil(retainedUser.contentTruncated)
 
         let summary = try XCTUnwrap(result.replacementHistory.last)
@@ -132,6 +133,84 @@ final class AgentModelHistoryCompactorTests: XCTestCase {
         XCTAssertEqual(
             result.providerHistory,
             [.user("the genuine user request"), .user(result.message)])
+    }
+
+    func testCompactionSummarizesActiveImageButReplacementDropsOldMedia()
+        async throws
+    {
+        let image = ImageAttachment(
+            url: "data:image/png;base64,QUJD")
+        let reference = ModelHistoryImageReference(
+            artifactID: ArtifactID(rawValue: "artifact-active-image"),
+            mimeType: "image/png",
+            byteCount: 3,
+            sha256: String(repeating: "c", count: 64))
+        let provider = CompactorScriptedProvider([.chunks([
+            .textDelta("The image was inspected and its relevant result was preserved."),
+            .done(finishReason: "stop"),
+        ])])
+
+        let result = try await makeCompactor(provider).compact(
+            history: [.user("inspect", images: [image])],
+            realUserMessages: [
+                AgentModelHistoryRealUserMessage(
+                    content: "inspect",
+                    submissionID: SubmissionID(rawValue: "sub-active-image"),
+                    attachmentIDs: [reference.artifactID],
+                    imageReferences: [reference]),
+            ])
+
+        XCTAssertEqual(
+            provider.requests.first?.messages.first?.images,
+            [image])
+        XCTAssertEqual(
+            result.checkpointSchemaVersion,
+            ModelHistoryCompactedPayload.mediaSchemaVersion)
+        XCTAssertTrue(result.replacementHistory.allSatisfy {
+            $0.attachmentIDs == nil && $0.imageReferences == nil
+        })
+
+        let checkpoint = ModelHistoryCompactedPayload(
+            schemaVersion: result.checkpointSchemaVersion,
+            agent: AgentID(rawValue: "main"),
+            message: result.message,
+            replacementHistory: result.replacementHistory,
+            windowNumber: 1,
+            firstWindowID: "018f47a0-7b1c-7cc0-8e5f-7f0a3c91d111",
+            previousWindowID: "018f47a0-7b1c-7cc0-8e5f-7f0a3c91d111",
+            windowID: "018f47a0-7b1c-7cc0-8e5f-7f0a3c91d222")
+        let projection = try AgentModelHistoryProjector()
+            .projectReplacementState(checkpoint)
+        XCTAssertEqual(projection.messages.count, projection.imageBindings.count)
+        XCTAssertTrue(projection.imageBindings.allSatisfy { $0 == nil })
+
+        let inheritedProvider = CompactorScriptedProvider([.chunks([
+            .textDelta("new text-only summary"),
+            .done(finishReason: "stop"),
+        ])])
+        let inherited = try await makeCompactor(inheritedProvider).compact(
+            history: [.user("new text-only turn")],
+            realUserMessages: [],
+            mediaAwareCheckpointRequired: true)
+        XCTAssertEqual(
+            inherited.checkpointSchemaVersion,
+            ModelHistoryCompactedPayload.mediaSchemaVersion)
+    }
+
+    func testTokenEstimatorChargesFixedCostPerImage() {
+        let plain = AgentTokenEstimator.approximateInputTokens(
+            messages: [.user("inspect")])
+        let withTwoImages = AgentTokenEstimator.approximateInputTokens(
+            messages: [.user(
+                "inspect",
+                images: [
+                    ImageAttachment(url: "data:image/png;base64,QQ=="),
+                    ImageAttachment(url: "data:image/jpeg;base64,Qg=="),
+                ])])
+
+        XCTAssertEqual(
+            withTwoImages - plain,
+            2 * AgentTokenEstimator.imageTokenCost)
     }
 
     func testRetainsNewestRealUsersWithinTwentyThousandTokensAndTruncatesUTF8Boundary()
@@ -297,119 +376,24 @@ final class AgentModelHistoryCompactorTests: XCTestCase {
         }
     }
 
-    func testContextOverflowPermanentlyProtectsTrustedPrefixAcrossRetries()
-        async throws
-    {
-        let history: [AgentMessage] = [
-            .system("oldest"),
-            .developer("middle"),
-            .assistant("old assistant"),
-            .user("newest user"),
-        ]
-        let provider = CompactorScriptedProvider([
-            .contextWindowExceeded,
-            .contextWindowExceeded,
-            .chunks([
-                .textDelta("fits after removing request-copy history"),
-                .done(finishReason: "stop"),
-            ]),
-        ])
-
-        let result = try await makeCompactor(provider).compact(
-            history: history,
-            realUserMessages: [
-                AgentModelHistoryRealUserMessage(content: "newest"),
-            ])
-
-        XCTAssertTrue(
-            result.message.contains(
-                "fits after removing request-copy history"))
-        let requests = provider.requests
-        XCTAssertEqual(requests.count, 3)
-        let prompt = try XCTUnwrap(requests.first?.messages.last)
-        let protectedPrefix = Array(history.prefix(2))
-        for request in requests {
-            XCTAssertEqual(request.messages.last, prompt)
-            XCTAssertEqual(
-                Array(request.messages.dropLast().prefix(2)),
-                protectedPrefix)
-        }
-        XCTAssertEqual(
-            Array(requests[0].messages.dropLast()),
-            history)
-        XCTAssertEqual(
-            Array(requests[1].messages.dropLast()),
-            protectedPrefix + [.user("newest user")])
-        XCTAssertEqual(
-            Array(requests[2].messages.dropLast()),
-            protectedPrefix)
-    }
-
-    func testContextOverflowDropsToolCallBatchWithEveryMatchingOutput()
-        async throws
-    {
-        let firstCall = ToolCall(
-            id: "call-first",
-            name: "first_tool",
-            arguments: "{}")
-        let secondCall = ToolCall(
-            id: "call-second",
-            name: "second_tool",
-            arguments: "{}",
-            kind: .toolSearch,
-            execution: "client")
-        let history: [AgentMessage] = [
-            .system("old prefix"),
-            .assistant(toolCalls: [firstCall, secondCall]),
-            .tool(id: firstCall.id, content: "first output"),
-            .toolSearchOutput(
-                id: secondCall.id,
-                output: ModelToolSearchOutput(
-                    execution: "client",
-                    tools: [])),
-            .user("newest user"),
-        ]
-        let provider = CompactorScriptedProvider([
-            .contextWindowExceeded,
-            .chunks([
-                .textDelta("paired retry summary"),
-                .done(finishReason: "stop"),
-            ]),
-        ])
-
-        _ = try await makeCompactor(provider).compact(
-            history: history,
-            realUserMessages: [
-                AgentModelHistoryRealUserMessage(
-                    content: "newest user"),
-            ])
-
-        let requests = provider.requests
-        XCTAssertEqual(requests.count, 2)
-        XCTAssertEqual(requests[0].messages.count, 6)
-        XCTAssertEqual(
-            Array(requests[1].messages.dropLast()),
-            [.system("old prefix"), .user("newest user")])
-        XCTAssertFalse(requests[1].messages.contains {
-            $0.toolCalls != nil
-                || $0.toolCallId != nil
-                || $0.toolSearchOutput != nil
-        })
-    }
-
-    func testContextOverflowAfterMutableHistoryExhaustionPropagatesTypedErrorWithoutDroppingPrefix()
+    func testContextOverflowFailsWithoutClippingUnsummarizedHistory()
         async throws
     {
         let history: [AgentMessage] = [
             .system("trusted system"),
-            .developer("trusted developer"),
-            .user("only mutable item"),
+            .assistant(toolCalls: [ToolCall(
+                id: "call-that-must-remain",
+                name: "read_tool",
+                arguments: "{}")]),
+            .tool(
+                id: "call-that-must-remain",
+                content: "evidence that must be summarized"),
+            .user("latest request"),
         ]
         let provider = CompactorScriptedProvider([
             .contextWindowExceeded,
-            .contextWindowExceeded,
             .chunks([
-                .textDelta("must never be requested"),
+                .textDelta("must never summarize a clipped window"),
                 .done(finishReason: "stop"),
             ]),
         ])
@@ -419,9 +403,9 @@ final class AgentModelHistoryCompactorTests: XCTestCase {
                 history: history,
                 realUserMessages: [
                     AgentModelHistoryRealUserMessage(
-                        content: "only mutable item"),
+                        content: "latest request"),
                 ])
-            XCTFail("the protected prefix must not be removed to force a fit")
+            XCTFail("compaction must fail instead of hiding unsummarized history")
         } catch let error as ProviderContextWindowExceededError {
             XCTAssertEqual(error.signal, "context_length_exceeded")
             XCTAssertEqual(error.statusCode, 400)
@@ -429,115 +413,10 @@ final class AgentModelHistoryCompactorTests: XCTestCase {
             XCTFail("unexpected error: \(error)")
         }
 
-        let requests = provider.requests
-        XCTAssertEqual(requests.count, 2)
-        let protectedPrefix = Array(history.prefix(2))
+        XCTAssertEqual(provider.requests.count, 1)
         XCTAssertEqual(
-            Array(requests[0].messages.dropLast()),
+            Array(try XCTUnwrap(provider.requests.first).messages.dropLast()),
             history)
-        XCTAssertEqual(
-            Array(requests[1].messages.dropLast()),
-            protectedPrefix)
-        XCTAssertEqual(
-            requests[0].messages.last,
-            requests[1].messages.last)
-    }
-
-    func testContextOverflowDoesNotRemoveNewerOutputWhenCallIDIsReused()
-        async throws
-    {
-        let oldCall = ToolCall(
-            id: "reused-call-id",
-            name: "old_tool",
-            arguments: "{}")
-        let newCall = ToolCall(
-            id: "reused-call-id",
-            name: "new_tool",
-            arguments: "{}")
-        let history: [AgentMessage] = [
-            .system("trusted prefix"),
-            .assistant(toolCalls: [oldCall]),
-            .tool(id: oldCall.id, content: "old output"),
-            .user("turn boundary"),
-            .assistant(toolCalls: [newCall]),
-            .tool(id: newCall.id, content: "new output"),
-            .user("latest request"),
-        ]
-        let provider = CompactorScriptedProvider([
-            .contextWindowExceeded,
-            .chunks([
-                .textDelta("summary after one logical removal"),
-                .done(finishReason: "stop"),
-            ]),
-        ])
-
-        _ = try await makeCompactor(provider).compact(
-            history: history,
-            realUserMessages: [
-                AgentModelHistoryRealUserMessage(
-                    content: "latest request"),
-            ])
-
-        let retriedHistory = Array(
-            try XCTUnwrap(provider.requests.last)
-                .messages
-                .dropLast())
-        XCTAssertEqual(retriedHistory, [
-            .system("trusted prefix"),
-            .user("turn boundary"),
-            .assistant(toolCalls: [newCall]),
-            .tool(id: newCall.id, content: "new output"),
-            .user("latest request"),
-        ])
-    }
-
-    func testContextOverflowRemovesOnlyLeadingOrphanToolWhenLaterTurnReusesCallID()
-        async throws
-    {
-        let reusedCall = ToolCall(
-            id: "reused-orphan-id",
-            name: "new_tool",
-            arguments: "{}")
-        let history: [AgentMessage] = [
-            .developer("trusted prefix"),
-            .tool(
-                id: reusedCall.id,
-                content: "orphaned old output"),
-            .user("turn boundary"),
-            .assistant(toolCalls: [reusedCall]),
-            .tool(
-                id: reusedCall.id,
-                content: "new turn output"),
-            .user("latest request"),
-        ]
-        let provider = CompactorScriptedProvider([
-            .contextWindowExceeded,
-            .chunks([
-                .textDelta("summary after orphan removal"),
-                .done(finishReason: "stop"),
-            ]),
-        ])
-
-        _ = try await makeCompactor(provider).compact(
-            history: history,
-            realUserMessages: [
-                AgentModelHistoryRealUserMessage(
-                    content: "latest request"),
-            ])
-
-        let retriedHistory = Array(
-            try XCTUnwrap(provider.requests.last)
-                .messages
-                .dropLast())
-        XCTAssertEqual(retriedHistory, [
-            .developer("trusted prefix"),
-            .user("turn boundary"),
-            .assistant(toolCalls: [reusedCall]),
-            .tool(
-                id: reusedCall.id,
-                content: "new turn output"),
-            .user("latest request"),
-        ])
     }
 
     func testReplacementFitsExplicitUsableWindowAndBoundsSummaryOutput()

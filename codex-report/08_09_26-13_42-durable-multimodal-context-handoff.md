@@ -1,11 +1,12 @@
-# Intatis 持久多模态上下文：Codex CLI 参考实现、当前断点与实施交接报告
+# Intatis 持久多模态上下文：Codex CLI 参考实现、断点与最小闭环实施报告
 
 ## 报告元数据
 
 - 调研日期：2026-08-09
 - Intatis 仓库：`/Users/vita/Vitemis/Intatis`
-- 报告性质：源码审计、公开上游行为核对、事实修订与独立实施交接
-- 本轮状态：**仅新增并修订本报告，未修改任何业务源码、测试或项目架构文档**
+- 报告性质：源码审计、公开上游行为核对、事实修订、最小闭环实现与验证记录
+- 本轮状态：**已实现 durable Agent 用户图、原 call 工具图 FCO、active-history replay、
+  summary-only compaction、route/permission fail-closed，并同步测试与项目文档**
 - 上游基线：OpenAI Codex CLI `0.145.0` / tag `rust-v0.145.0`
 - 上游固定 commit：Intatis 现有 provenance 记录将该 release 固定到
   `25af12f7e61572b0bc18ddb1008be543b91519b0`
@@ -26,7 +27,7 @@ Codex CLI 已经证明两类图片都能进入后续模型上下文：
 1. 用户图片作为 user message 的原生 `input_image`；
 2. 工具图片作为原 `call_id` 对应的原生 `function_call_output` 多模态内容。
 
-Intatis 现在并非“完全不支持图片”，而是各层完成度不同：
+本轮实施前，Intatis并非“完全不支持图片”，而是各层完成度不同：
 
 - macOS Chat 与共享 Chat runtime 已能把用户图片保存进 `ArtifactStore`，在历史重建时
   重新加载；iOS 链接了同一底层能力，但当前 UI 尚没有等价的用户图片 picker；
@@ -56,6 +57,9 @@ durable typed artifact reference
 → provider-native multimodal wire
 ```
 
+本轮已按这条最小链路完成实现。后文第七、八节保留实施前基线与根因，便于审计改动动机；
+第九至十二节是已采用的合同，第十五节记录实际实现与验证结果。
+
 Chat、Code、Cowork 不应互相复用产品 runtime。正确依赖方向是把 ArtifactStore commit、
 durable image reference、request resolver 和 provider lowering 放在不依赖 AgentKernel 的共享层：
 Chat 继续使用独立、无工具的 `ChatLoop`；Code/Cowork 继续共同使用 `AgentRuntime`/`AgentLoop`，
@@ -71,7 +75,7 @@ turn、next turn及宿主现有session恢复后仍可见；Cowork ordinary-agent
 GUI Retry，不把task-scoped worker扩成新会话系统。MCP structured-result 图片及已经产出同一structured media
 contract的工具图片，以原 `call_id` 的原生 FCO进入下一次模型请求；
 live/replay 使用同一 canonical content；上下文压缩时 summarizer真实看见所选窗口内的图片，
-压缩成功后旧工具原图退出 model-facing history、由摘要替代，但原 blob 与审计记录仍保留；
+压缩成功后该窗口内所有旧用户/工具原图退出 model-facing history、由摘要替代，但原 blob 与审计记录仍保留；
 unsupported/missing/corrupt media在网络请求前或下一次模型继续前 typed fail；Chat/iOS现有行为不回归。
 P0的CLI正向图片验收限定macOS；Linux在无经测试的bounded解码backend时只要求typed unsupported，
 不把“能读magic bytes”冒充完整像素验证。
@@ -86,8 +90,10 @@ P0的CLI正向图片验收限定macOS；Linux在无经测试的bounded解码back
   不让 reviewer直接看图，也不顺手实现 Goal attachments或重做CLI session生命周期；
 - 不以生产代码行数为唯一指标；兼容 fixture、安全检查和端到端测试不能因“少代码”被删除。
 
-完成 Phase 0 的旧二进制 fixture 与协议验证后，本报告才可作为实施依据；实施必须拆成少量纵向
-changeset，不应把全文复制成一个无中间验证的巨型编码任务。
+本轮以当前reader/writer源码与fixtures完成协议验证并实施，并从`v0.41` exact commit
+`e5f64ed`临时编译旧reader，确认v2 direct、v1 checkpoint后的v2 suffix与v2 checkpoint均fail closed；正式release仍可再用当时实际
+分发的旧App制品补一层包装/签名等价性检查。实现继续拆成少量纵向changeset，不把全文复制成一个
+无中间验证的巨型编码任务。
 
 ## 二、范围与非目标
 
@@ -110,7 +116,7 @@ changeset，不应把全文复制成一个无中间验证的巨型编码任务�
 - 图片生成/编辑产品 UX；
 - 远程 URL 图片抓取；
 - 本轮直接实现音频，但数据合同不得堵死未来 audio content；
-- 让独立 reviewer直接看图；让旧工具原图跨 compaction checkpoint后仍自动进入每次请求；
+- 让独立 reviewer直接看图；让任何旧原图跨 compaction checkpoint后仍自动进入每次请求；
 - 为图片功能单独重做 CLI Chat/Code 的进程级 session恢复语义；
 - 复制 Codex Rust 实现、prompt、UI、品牌或测试快照。
 
@@ -358,7 +364,9 @@ messages。原始图片可随整条 user message 保留，直到预算淘汰该�
 这不是可靠的“父图片直接传给 reviewer”合同；纯 data/http 图片、失效路径或模型没有
 主动调用时都不成立。
 
-## 七、Intatis 当前状态矩阵
+## 七、Intatis 实施前状态矩阵
+
+本节记录本轮实现开始前的源码基线，用于解释后续改动为何必要；实现后的真实状态见第十五节。
 
 | 面 | 当前源码事实 | 结论 |
 | --- | --- | --- |
@@ -434,7 +442,7 @@ messages。原始图片可随整条 user message 保留，直到预算淘汰该�
 - 当前image token估算按ready URL字节计：
   `Packages/IntatisAgentKernel/Sources/AgentTokenEstimator.swift:26-28`。
 
-## 八、精确根因
+## 八、实施前的精确根因
 
 当前不是一个单点 bug，而是以下五个表示之间没有统一合同：
 
@@ -471,7 +479,7 @@ flowchart LR
     T["Structured-media tool / MCP result"] --> B
     B --> R["Durable typed media reference"]
     R --> E["EventLog + stable model history"]
-    E --> C["Compaction checkpoint / replay"]
+    E --> C["Summary-only checkpoint + active suffix"]
     E --> D["Request-time media resolver"]
     C --> D
     D --> G{"Exact route capability"}
@@ -505,8 +513,8 @@ struct ModelHistoryImageReference: Codable, Sendable, Equatable {
     let sha256: String
 }
 
-// 把同一个stored property直接加入下列现有struct；
-// 不是用Swift extension新增stored property。
+// direct item使用该字段；replacement保留同字段只为v1/v2显式解码与校验，
+// 新compactor writer在checkpoint中始终写nil，不把旧原图继续带入上下文。
 ModelHistoryItemPayload.imageReferences: [ModelHistoryImageReference]?
 ModelHistoryReplacementItem.imageReferences: [ModelHistoryImageReference]?
 ```
@@ -545,9 +553,9 @@ P0固定wire顺序为：非空canonical text若存在则在前，图片按source
   `.structuredJSON` 按canonical JSON只降低一次；`structuredContent`维持既有协议校验但永不作为
   provider source，P0不新增副本equality合同；
 - 当前 `ArtifactRef` 没有 byte count 或 digest，不能把随机 ArtifactID 当成内容完整性证明；
-- P0 不修改 ArtifactStore index。只有v2 model-history item/checkpoint保存上述descriptor；
-  legacy `attachmentIDs` 只允许本次ephemeral bounded resolve，不能声称具备历史digest证明；若
-  未来checkpoint采用当时bytes建立v2 ref，它只证明checkpoint-time snapshot；
+- P0 不修改 ArtifactStore index。只有v2 direct model-history item保存上述descriptor；v2 checkpoint
+  只继承media-aware lineage且不保存旧图ref。legacy `attachmentIDs` 只允许本次ephemeral bounded
+  resolve，不能声称具备历史digest证明；
 - 当前 `ArtifactRef` 还包含 store-relative path；`ArtifactAddedPayload` 更会把绝对 path
   写入 legacy EventLog。两者都不能直接充当 model-history ref，也不能进入 provider-visible
   content。彻底消除legacy absolute path属于独立迁移，不纳入P0；
@@ -558,12 +566,11 @@ P0固定wire顺序为：非空canonical text若存在则在前，图片按source
 shape validation必须冻结：model-history v1的`imageReferences == nil`；v2 refs非空且只允许real-user
 message或function-call output；user IDs/order必须exact一致；FCO refs必须与同批durable
 `tool_result.structuredResult.content`的ordered image blocks在ArtifactID/MIME/byteCount/SHA上逐字段
-相等。replacement refs只允许`.realUser`，并与来源v2 direct/replacement的完整descriptor数组相等；
-来源是legacy IDs时可在checkpoint构建当下生成descriptor，但它只证明checkpoint-time bytes，报告不
-声称schema内另有origin/adoption标记。context与
-compaction summary必须为nil；`byteCount > 0`、MIME为canonical白名单值、SHA-256为canonical
-lowercase hex。FCO的`output`只有在refs非空时才允许为空。不能把新字段挂到
-assistant/context/summary上再由projector忽略。
+相等。新v2 checkpoint只用来标记它覆盖/继承了media-aware历史，所有replacement item的
+`attachmentIDs`与`imageReferences`都必须为nil；旧v1 replacement attachment IDs仍可解码，但
+projector不得在压缩后重新插图。context与compaction summary同样不得携带媒体；`byteCount > 0`、
+MIME为canonical白名单值、SHA-256为canonical lowercase hex。FCO的`output`只有在refs非空时才允许
+为空。不能把新字段挂到assistant/context/summary上再由projector忽略。
 
 ### 9.3 EventLog 与 schema 纪律
 
@@ -583,33 +590,35 @@ Schema 演进不能只给已知 v1 payload 增加一个 optional `imageReference
 `schemaVersion = 1`。旧 Swift decoder 会忽略未知 key，然后把同一事件继续投影成 text-only；
 这不是兼容，而是静默语义降级。
 
-当前事实是：Code与Cowork exact `@main` stable active direct history都经`selectLatestInvocation`，
-现有projector会
-拒绝非 `currentSchemaVersion` 的 direct item；因此“显式 schema v2”并非天然不安全。另一个
-事实是，v1 checkpoint可能遮蔽checkpoint前的v2 direct item，而Chat的普通 replay本身是
+实施前`v0.41`的事实是：Code与Cowork exact `@main` stable active direct history都经
+`selectLatestInvocation`，旧projector会拒绝非`currentSchemaVersion`的direct item；因此“显式
+schema v2”并非天然不安全。另一个事实是，v1 checkpoint可能遮蔽checkpoint前的v2 direct item，而
+Chat的普通 replay本身是
 fail-soft。后者不要求Chat消费Agent events，但说明兼容证明必须按consumer和checkpoint边界写，
 不能只检查一次decode。
 
 为减少事件分流和投影代码，P0把现有`model_history_item`与`model_history_compacted`升级为显式
 schema v2，不另建平行model-history event。新projector同时读取并分别校验v1/v2；含
 `imageReferences`非空的direct item写v2；无图的message/FCO即使来自structured result也继续使用
-既有v1 String形状。只有覆盖任一v2/media语义、保留媒体ref，或继承media-aware
-checkpoint的checkpoint才写v2；从未含媒体语义的纯文本v1 history可继续写v1。checkpoint chain
-必须拒绝任何覆盖v2 direct item/checkpoint的v1 checkpoint，防止旧语义掩盖新语义。
+既有v1 String形状。覆盖任一v2/media语义或继承media-aware checkpoint的checkpoint必须继续写v2，
+即使它的summary-only replacement已不携带图片；从未含媒体语义的纯文本v1 history可继续写v1。
+EventLog专用checkpoint writer与projector replay都必须拒绝任何覆盖v2 direct item/checkpoint的v1
+checkpoint，防止先写入再由旧语义掩盖新语义。
 
 P0不承诺旧binary把尚未产生v2 model-history的accepted attachment IDs升级为新digest语义；该状态仍按
 legacy bounded resolve处理。真正驱动新provider语义的是dispatch前durable-first的v2 direct item。
-旧二进制fixture是实施前置门：必须逐consumer覆盖direct item、checkpoint前缀/suffix、provider、
-compaction、恢复和授权；任何能忽略v2后text-only继续的路径都阻塞发布。不要给known v1
-model-history只加optional key，也不要为尚未dispatch的accepted user event新增平行围栏系统。
+旧reader兼容矩阵必须覆盖direct item、checkpoint前缀/suffix、provider、compaction、恢复和授权；任何
+能忽略v2后text-only继续的路径都阻塞发布。本轮从`v0.41` exact source snapshot编译验证旧projector
+拒绝v2 direct及v1 checkpoint后的v2 direct suffix、旧protocol拒绝v2 checkpoint；当前
+writer/projector与AgentLoop suites再覆盖masking、provider、compaction、恢复和授权入口。不要给known v1 model-history只加optional key，也不要
+为尚未dispatch的accepted user event新增平行围栏系统。
 
 采用该schema v2方案时：
 
 - 保留当前 `content`、`output`、`attachmentIDs` 的 legacy decoder；
 - legacy `output: String` 显式映射成一个 `.text(output)`；
 - legacy user `attachmentIDs` 没有ingestion时的digest事实；只能从exact session ArtifactStore做
-  本次ephemeral bounded resolve，或在v2 checkpoint绑定明确的checkpoint-time bytes；不能把现算
-  hash冒充ingestion历史证明；
+  本次ephemeral bounded resolve，不能把现算hash冒充ingestion历史证明；压缩后也不再插入旧图；
 - 不改变旧 enum case和旧 JSONL的原始编码含义；
 - unknown future event、seq gap或不支持的 media schema不能支持 absence/order proof。
 
@@ -640,17 +649,17 @@ Chat/Provider/Artifact子集，不能因此引入AgentKernel、Tools或Cowork。
 
 P0在`ToolCallingProviderCapabilities`最低增加`supportsUserImageInput`与
 `supportsFunctionOutputImageInput`。为避免给schema-v1 provider catalog的`[Capability]`新增未知enum
-值，P0不新增持久化catalog case：两者都以exact profile现有`.visionInput`为模型条件，再分别与
-“该exact route支持user image”及“该exact audited Responses route支持FCO image”的代码metadata
-合取。也就是
-`supportsFunctionOutputImageInput = profile.visionInput && route.supportsFCOImageWire`，不能只复用
-user-image route predicate。
+值，P0不新增持久化catalog case：两个flag独立承载和检查，但首版使用同一个最窄代码allowlist——
+exact profile声明`.visionInput`，且exact request adapter为
+`ProviderRequestAdapter.openAI`。这个adapter就是对Intatis已实现OpenAI Responses lowering的显式
+wire opt-in，不再增加第二个“native route”schema字段。
 
-P0正向映射只对Intatis代码allowlist中的exact inference route成立：`wire == .openai`、
-`requestAdapter == ProviderRequestAdapter.openAI`、profile声明`.visionInput`，且该profile/connection
-被标为reviewed native OpenAI Responses route；此时user/FCO两个flag均为true。`.legacyOpenAIWire`、
-`.openAICompatible`、`.openRouter`、未知adapter及未allowlist的custom connection全部为false，不从
-base URL或model slug猜测。未来custom opt-in再走明确的catalog schema演进。
+因此P0正向映射为`wire == .openai`、effective
+`requestAdapter == ProviderRequestAdapter.openAI`且profile声明`.visionInput`；此时user/FCO两个flag
+均为true。`.legacyOpenAIWire`、`.openAICompatible`、`.openRouter`与未知adapter均为false。自定义
+connection只有显式选择`.openAI` adapter并声明`.visionInput`才进入同一已审核wire；不能从base URL、
+provider ID或model slug猜测。未来若要支持其他compatible adapter，仍须新增明确的代码route predicate
+与wire测试，而不是扩大当前allowlist。
 
 含user或FCO图片的`AgentRequest.requiresResponsesAPI`都返回true；这是必要条件，因为现有`.openAI`
 Chat Completions adapter尚未实现。OpenAI provider在请求tools中存在任一
@@ -721,8 +730,9 @@ append所得canonical Envelopes：stable分支把canonical model-history item交
 分支把canonical `tool_result`交给调用方；live continuation只从相应返回值物化，不能append后继续
 使用原observation或pre-append对象。成功batch后，再由同一resolver
 对已提交binding做blob readback、digest/MIME/尺寸复验和exact-route capability preflight。
-EventLog append失败时保留可能的orphan artifact等待既有reconciliation；不得把不确定的blob commit
-伪装成可安全rollback。
+EventLog append失败时保留可能的orphan artifact，不自动回滚、删除或扫描；P0不实现reconciliation，
+不得把不确定的blob commit伪装成可安全rollback。未来若增加reconciliation，再以durable index/EventLog
+证据处理这些orphan。
 
 媒体交付失败不得改写工具执行事实：如果有副作用的工具已经committed，随后才发现图片损坏或route
 不支持，stable分支带exact `callID`的v2 FCO binding与`succeeded/committed` settlement仍如实保留；
@@ -750,42 +760,42 @@ checkpoint拼接与增量append必须同步更新两数组，不能分步暴露�
 resolve，不能在同步projector内伪造descriptor。
 旧的只返回`.messages`的public projection入口必须改成返回完整state，或在存在任一binding时fail
 closed，不能静默丢sidecar。AgentLoop据此复制对应message并填入`AgentMessage.images`。同理，
-`AgentModelHistoryRealUserMessage`必须增加`imageReferences`，否则compactor只能把IDs写进replacement，
-会丢掉digest binding。
+`AgentModelHistoryRealUserMessage`增加`imageReferences`，用于压缩前的完整窗口验证、媒体感知schema继承
+与逻辑组预算；成功checkpoint会主动剥离这些refs，不再将其写进后续model-facing replacement。
 
 这里的compaction指模型上下文压缩，不是图片文件压缩。它只发生在Code与Cowork exact `@main`
 stable Agent history接近上下文阈值时；ordinary-agent task-scoped直投不被本任务扩成跨轮history。
 原EventLog和ArtifactStore blob不删除。P0冻结为：
 
-1. retained real-user message与其selected user-image refs作为一个逻辑组保留/淘汰；image-bearing
-   user message不得只截断文字而留下失去语境的图片；
+1. 压缩前，real-user message与其selected user-image refs作为一个逻辑组参与summarizer与预算；
+   不得只丢文字或只丢图片后声称summarizer看过完整输入；
 2. 本次`active compaction window`精确定义为latest valid replacement（若有）加其后全部active
    direct suffix，直到新checkpoint声称覆盖的exact latest sequence；不得在构造summarizer request
    前另做隐藏的prefix clipping。summarizer输入必须经过同一resolver，真实看见该窗口内的
    user/tool images；缺失、route不支持或整个窗口无法安全送入summarizer时compaction typed fail；
    不能删除最老逻辑项再把未看过的内容宣称已进入摘要；
-3. checkpoint成功后，旧 raw tool-output images和其旧 call/output groups退出 model-facing
-   replacement，只由 continuation summary表示；报告/UI audit中的artifact仍保留；
-4. retained user refs继续指向同一 ArtifactID，不复制blob/base64；
-5. checkpoint中的retained refs，其ArtifactIDs必须与canonical accepted
-   `user_message.attachments` exact/order一致，完整descriptors还必须与来源v2 direct/replacement逐字段
-   相等；来源若是legacy IDs，只能按checkpoint-time bytes规则验证且不得冒充ingestion事实，不能只
-   校验文本或ID；
+3. checkpoint成功后，窗口内旧user images、raw tool-output images及相关旧call/output媒体组全部
+   退出model-facing replacement，只由continuation summary表示；报告/UI audit中的artifact仍保留；
+4. checkpoint不复制blob/base64，也不保留任何旧`attachmentIDs`/`imageReferences`；retained
+   real-user只保留文本与submission provenance；
+5. checkpoint schema v2表示“该lineage已经覆盖/继承media-aware语义”，不是“图片仍在replacement”；
+   writer和projector都必须拒绝后继v1降级；
 6. live history中的 function call/output仍必须完整成对；不能在 checkpoint提交前提前删除；
-7. P0在固定bytes/pixels上限后，对每张图片统一收取`4_096` estimated-token charge；同一常数同时
-   用于normal dispatch预算、compaction trigger与retained-user fitting。它是host保守预算，不是provider
-   计费承诺；不能按base64 URL字节数除以4，也不能把image-only message算零token；
+7. P0在固定bytes/pixels上限后，对active request中的每张图片统一收取`4_096` estimated-token charge；
+   同一常数用于normal dispatch、compaction trigger与summarizer request预算。成功checkpoint已剥离图片，
+   因而summary-only replacement fitting只计算实际保留的文本。该常数是host保守预算，不是provider
+   计费承诺；不能按base64 URL字节数除以4，也不能把image-only active message算零token；
 8. 只要被替换窗口包含/继承v2 media语义，checkpoint就使用媒体感知schema v2；即使旧tool图片
    已被摘要移除，也必须继承其reader capability。纯文本v1窗口可继续写v1。提交仍必须
    EventLog-first，并使用与summarizer dispatch相同的物化快照；成功后才替换live history；
 9. resume只从latest valid checkpoint + suffix恢复，不扫描checkpoint前旧事件偷回图片；
-10. legacy replacement `attachmentIDs` 必须在下一provider request真正resolve；
-11. checkpoint append成功后，provider history必须从replacement refs重新materialize，不能继续使用
-    compactor当前返回的纯文本`providerHistory`捷径。
+10. legacy v1 replacement `attachmentIDs`只为旧JSONL解码保留；压缩边界后不得再次resolve并插图；
+11. checkpoint append成功后，provider history必须从实际append返回的checkpoint重新投影；其
+    imageBindings必须全nil，不能继续使用compactor的pre-append `providerHistory`副本。
 
-若产品未来要求raw tool-output image跨checkpoint继续自动进入每次模型请求，则不属于上述P0：
-必须增加callID/provenance、完整group retention、媒体预算与真实视觉成本的postcondition。
-本报告已确认的基本语义是：summarizer真实看图后，旧工具原图可由摘要替代；blob仍留作UI/audit。
+若产品未来要求任何raw user/tool image跨checkpoint继续自动进入每次模型请求，则不属于上述P0：
+必须增加完整group retention、媒体预算与真实视觉成本的postcondition。本报告已确认的基本语义是：
+summarizer真实看图后，旧原图由摘要替代；blob仍留作UI/audit。
 
 ### 9.8 Permission reviewer 的正确边界
 
@@ -861,13 +871,13 @@ Core/Protocol/Providers/Conversation/Artifacts/Multimodal/SharedUI，不链接To
 新协议可以让iOS为日志兼容解码不适用的tool-media ref，但iOS不得据其中任何path打开workspace
 文件或暴露document tools。实施必须增加linkage/build regression，并保留现有Chat附件行为。
 
-## 十、建议实施阶段
+## 十、实际实施切片与剩余发布门
 
-原来的八阶段计划把基础闭环、产品增强和未来存储系统混在一起。P0改为一个协议门、两个纵向
-slice和一个共同release gate；每个slice都必须从durable write走到真实provider request，不能
-留下只写不读的半成品。
+本轮把原来的八阶段计划收敛成一个协议门、两个纵向slice和一个共同release gate；两个slice均已
+从durable write闭合到可捕获的provider request，没有留下只写不读的字段。真实endpoint仍属于下述
+release-only外部验证；旧reader则另以`v0.41` exact source snapshot编译fixture验证。
 
-### Phase 0：最小协议门与兼容 fixture
+### Phase 0：最小协议门与当前 reader fixture
 
 - 冻结`String + ModelHistoryImageReference[]`、dispatch前durable binding、legacy text映射，以及
   复用既有`error + turn_outcome`的失败合同；
@@ -928,8 +938,8 @@ metadata；
 - capability不支持或图片损坏时，在下一次网络请求前typed fail；若工具副作用已committed，stable
   settlement与expected v2 FCO binding、或task-scoped settlement与canonical tool result仍如实落盘，
   再用既有typed error/failed turn outcome终止；
-- compaction summarizer使用同一resolver看见active window图片；retained user image保留；成功后旧
-  tool call/FCO/raw image整组退出model-facing replacement、由summary替代，blob仍保留；
+- compaction summarizer使用同一resolver看见完整active window及其中用户/工具图片；成功后窗口内
+  所有旧raw images与相关媒体组退出model-facing replacement、由summary替代，blob仍保留；
 - media-aware checkpoint v2 durable-first；纯文本checkpoint可保持v1；restart只使用latest valid
   checkpoint + suffix。
 - 已进入history的FCO media若出现在**后续**ask-class请求的authorization snapshot中，同样触发
@@ -958,7 +968,7 @@ metadata；
 | macOS CLI Cowork | exact `@main` next/restart恢复同一图片；ordinary target只承诺current |
 | Linux CLI | Phase 0若未冻结至少一种安全bounded解码格式，则图片route稳定typed unsupported，不列入正向完成矩阵 |
 | Cowork retry | 同一SubmissionID与附件IDs、不重复user event；outbox retry/queued resume保持attempt 1与既有TurnID语义，只有whole-task execution retry递增taskAttempt并用新TurnID |
-| User image after compaction | 按冻结策略保留或整组淘汰；不得checkpoint有ID但provider无图 |
+| User image after compaction | summarizer真实看见后由summary接替；checkpoint不保留ID/ref，也不把旧原图重新插入provider history |
 | MCP image tool output | 下一模型请求收到同一 `call_id` 的原生 FCO image |
 | Text + structured JSON + image | JSON只canonicalize一次进output；非空text若有则在前、图片source-order；纯图片不造placeholder，不因副本去重丢media |
 | Stable tool output after restart | Code与Cowork exact `@main` replay保持call/output pairing与artifact digest |
@@ -967,7 +977,7 @@ metadata；
 | Corrupt/missing artifact | resolver fail closed；不访问相邻路径或远程URL |
 | Digest/MIME mismatch | 既有error/failed turn outcome记录稳定media code；不把未知bytes送provider |
 | Cancellation | request停止、临时data URL释放；durable refs不被误删 |
-| Compaction | summarizer实际看到latest valid replacement +完整active suffix及其中图片；retained user refs可用；旧raw tool media在model history只留summary、blob仍在；checkpoint durable-first |
+| Compaction | summarizer实际看到latest valid replacement +完整active suffix及其中图片；成功后全部旧raw user/tool media在model history只留summary、blob仍在；checkpoint durable-first |
 | Resume checkpoint | 只用latest valid replacement + suffix，不扫描旧事件偷回已淘汰图片 |
 | Automatic review + media | exact snapshot一旦含user/FCO image即typed `.mediaAuthorizationUnsupported` durable deny；不把图片描述交给allow-capable reviewer，不隐式人工fallback |
 | Text-only reviewer | allow只由canonical text、实际tool request与可信结构化证据支持 |
@@ -977,18 +987,22 @@ metadata；
 | iOS | 既有Chat ArtifactStore/replay不回归，不新增picker，且不链接Tools/Permission/AgentKernel/Cowork |
 | Legacy JSONL / rollback | v1 text/output/attachmentIDs继续被新binary解码；v2 direct/media-aware checkpoint不能被旧Agent静默降级；accepted但尚无v2 item的IDs按legacy规则处理，不承诺旧binary升级语义 |
 
-最低自动测试集合还应覆盖：
+最小业务闭环的自动测试集合覆盖：
 
 - protocol encode/decode golden fixtures；
 - resolver hash/MIME/size/pixel/no-follow tests；
 - AgentLoop current-turn FCO request capture；
 - projector replay与compaction replacement capture；
 - OpenAI Responses request JSON snapshot；
-- cancellation/append failure/commitUncertain竞态；
 - old-reader v2 direct/checkpoint/suffix fail-closed兼容矩阵；失败即阻塞本方案；
 - media-present automatic durable-deny与text-only reviewer allow/deny矩阵；
-- macOS CLI Code next-turn与CLI Cowork exact `@main` process-restart integration；CLI Chat保持既有行为；
+- macOS CLI Code next-turn与CLI Cowork exact `@main` runtime/log/store重建；CLI Chat保持既有行为；
 - Chat iOS linkage audit。
+
+`commitUncertain`、blob已提交后EventLog append失败、进程级subprocess与取消竞争的确定性故障注入，
+属于发布前hardening矩阵：当前生产合同已要求不删blob、不推进伪造history并传播typed失败，但为了遵循
+“最小代码覆盖全部基本功能”，P0不为这些低层系统调用新增全局fault-injection framework，也不为CLI
+新增stdio/provider subprocess seam。未运行的hardening项必须在验证状态中明确列出，不能冒充已通过。
 
 Fake provider可以证明 request shape、事件顺序和恢复合同，但不能证明真实 endpoint接受多模态
 FCO。真实 provider测试必须单列，不能用 scripted provider的通过结果外推。
@@ -1027,13 +1041,14 @@ CLI Chat/Code进程级session恢复、reviewer直接看图、audio、GC/reachabi
 
 ## 十三、风险与未决策项
 
-### P0 决策
+### 已冻结的 P0 决策
 
-1. 旧二进制fixture能否证明拟议的model-history/checkpoint v2全路径fail closed；若不能，本方案
-   阻塞并另行设计；known v1 model-history optional字段方案已排除；
-2. P0图片格式白名单，以及Linux CLI采用何种bounded magic/dimension验证；没有可信backend的格式
-   必须typed unsupported；
-3. user image与tool image的单项/总请求大小、像素和媒体数量上限。
+1. 使用现有event type的显式model-history/checkpoint schema v2；当前writer/projector对v2→v1
+   降级fail closed。另从`v0.41` exact commit编译旧reader fixture，证明旧projector拒绝v2 direct、
+   旧protocol拒绝v2 checkpoint；实际已分发App制品仍可在正式release前补做包装等价性复验；
+2. P0只接受PNG/JPEG；Apple平台用ImageIO在有界读取后验证尺寸、像素并完整解码，缺少等价安全
+   decoder的平台typed unsupported；
+3. 默认限制为每图20 MiB、每批40 MiB、最多8图、单边8192、25 MP；模型预算每图固定4,096 token。
 
 ### P1 决策
 
@@ -1044,7 +1059,7 @@ CLI Chat/Code进程级session恢复、reviewer直接看图、audio、GC/reachabi
 4. 独立reviewer是否必须直接看图；若需要，是只接收用户图片还是也允许相关tool-output image；
 5. raw tool images是否跨checkpoint自动保留、audio何时启用及哪些route支持tool-output audio；
 6. CLI Chat/Code何时获得明确的进程级session选择/恢复产品合同；
-7. OpenAI-compatible custom route如何显式opt in user/FCO image；P0默认false，不设计配置合同。
+7. 除显式`.openAI` adapter外，其他OpenAI-compatible adapter如何opt in user/FCO image；P0默认false。
 
 ### UNKNOWN
 
@@ -1056,25 +1071,27 @@ CLI Chat/Code进程级session恢复、reviewer直接看图、audio、GC/reachabi
 - 当前所有ArtifactStore实例/导出路径未来是否存在跨session共享所有权；
 - 图片token的provider精确计量与remote compaction摘要质量。
 
-## 十四、给下一个 Codex 任务的直接任务定义
+## 十四、本轮采用的直接实现合同
 
-可复制以下内容作为新任务目标：
+以下是本轮实际采用的合同，可继续用于代码复核或后续增量任务：
 
 > 在 Intatis 中实现 durable multimodal context 主链。使用 session ArtifactStore 支撑的
 > immutable typed image references，关闭AgentKernel的durable user-image replay与MCP
 > structured-result image FCO缺口。最少代码原则是“保留现有
-> String/attachmentIDs/AgentMessage.images，让一份image reference贯穿model history与checkpoint，
+> String/attachmentIDs/AgentMessage.images，让一份image reference贯穿active direct model history，
+> checkpoint只继承media-aware schema而不保留旧原图，
 > 再增加一个共享底层resolver和一个FCO lowering”，复用既有Chat ArtifactStore
 > commit/read、Cowork submitted-intent/Retry、
 > `MCPStructuredToolResult.content`和`appendToolCompletion`；不得重写已工作的Chat/Cowork入口。
 > 上述structured-media工具图片必须作为exact `call_id` 的function output，禁止伪造user message。
 > current turn也必须从已durable提交的ref物化；stable policy与next/restart同路，task-scoped只复用
-> resolver而不制造跨轮history。用旧fixture证明拟议的model-history/checkpoint schema v2安全，
-> 失败即阻塞。reviewed `.openAI` route的user/FCO image都选择Responses；只有请求
+> resolver而不制造跨轮history。用当前reader/legacy fixtures证明model-history/checkpoint schema
+> v2 fail-closed，并从`v0.41` exact source snapshot编译旧reader fixture。reviewed `.openAI` route的
+> user/FCO image都选择Responses；只有请求
 > 存在non-function Responses tool或tool-search call/output时才检查tool-search capability。上下文
-> 压缩保留retained user images；summarizer真实看见“latest valid replacement + 完整active
-> suffix”的压缩窗口及其中tool images后，旧tool
-> call/FCO/raw image从model-facing replacement整组退出并由summary替代，原blob保留。
+> 压缩时summarizer真实看见“latest valid replacement + 完整active suffix”的完整窗口及其中
+> user/tool images；成功后全部旧raw images与相关媒体组从model-facing replacement退出并由summary
+> 替代，原blob保留。
 > Code GUI只接入现有attachment accessory；Cowork所有Retry保持同一SubmissionID/附件IDs，但只有
 > failed/cancelled whole-task execution retry才递增taskAttempt并使用新TurnID；outbox retry与queued
 > resume保持attempt 1/既有frozen TurnID语义。macOS CLI Code只承诺同进程next-turn，macOS CLI Cowork只有exact
@@ -1103,24 +1120,67 @@ CLI Chat/Code进程级session恢复、reviewer直接看图、audio、GC/reachabi
    Cowork exact `@main` stable main-thread；
 2. Cowork Retry复用同一SubmissionID/附件IDs、不重复user event，并分别满足outbox retry、queued
    resume与whole-task execution retry的既有attempt/TurnID合同；
-3. macOS CLI Code同进程next-turn、CLI Cowork exact `@main` restart通过；Linux无安全backend时
-   typed unsupported；CLI Chat既有行为不回归；
+3. macOS CLI Code同进程next-turn、CLI Cowork exact `@main` restart接线闭合；Linux无安全backend时
+   typed unsupported；CLI Chat既有行为不回归。宿主级自动测试必须实际重建runtime/log/store，不能由
+   loader单测或静态审计冒充；
 4. MCP structured-result图片（及同contract工具图片）作为原call的原生FCO通过，canonical JSON
    只发送一次；非空text若有则在前、图片source-order，纯图片不造placeholder；
-5. current/replay/compaction使用同一resolver；压缩后retained user image可见，旧tool image只有
-   summary进入模型但blob仍在；
+5. current/replay/compaction使用同一resolver；压缩前summarizer能看见窗口内用户/工具图片，压缩后
+   全部旧原图只有summary进入模型但blob仍在；
 6. 新image refs无base64/path；legacy path不被当作model ref；旧reader对v2 direct及media-aware
    checkpoint不能静默text-only继续；
-7. Responses routing、user/FCO image与tool-search独立gate、unsupported/corrupt/missing、
-   committed-tool typed error/turn outcome与cancellation矩阵通过；
+7. Responses routing、user/FCO image与tool-search独立gate、unsupported/corrupt/missing及
+   committed-tool typed error/turn outcome核心矩阵通过；取消继续复用既有turn取消与“无图片缓存/无删除”
+   合同，低层竞态故障注入列为release hardening；
 8. media-present automatic durable-deny与text-only reviewer合同通过；iOS不新增AgentKernel链接；
-9. 真实OpenAI Responses smoke、文档更新完成；剩余UNKNOWN与后移项显式保留。
+9. 离线实现、项目文档、Apple产品构建和`v0.41`旧reader fixture完成；真实OpenAI Responses smoke
+   明确保留为需凭据/费用授权的release-only外部门，不把scripted provider冒充线上证明。
 
 ## 十五、本轮验证状态
 
-- 本报告完成了只读源码复核、事实修订与最小实施交接，不包含业务实现；
-- 未运行构建或测试；
-- 修订后运行Markdown结构、Git whitespace与工作树状态检查；
-- 因没有引入依赖或复制上游源码，`NOTICE.md` 无需更新；
-- 因没有改变当前产品实现或已冻结项目架构，只修正本报告的事实/建议，
-  `docs/CURRENT_STATE.md`、`docs/ARCHITECTURE.md` 与 `docs/PROJECT_MAP.md` 本轮无需更新。
+本轮已完成最小业务闭环，而不只是交接设计：
+
+- 协议与历史：增加path/base64-free的`ModelHistoryImageReference`、显式v2 direct/checkpoint规则、
+  等长projector image sidecar、v2→v1 checkpoint围栏，以及summarizer看见完整active window后
+  checkpoint剥离全部旧图片的summary-only compaction；
+- 解析与请求：PNG/JPEG使用session-scoped bounded resolver校验MIME/magic、完整解码、bytes、尺寸、
+  像素与SHA-256；AgentLoop对current/replay/compaction使用同一路径，并在stable history中坚持
+  append-returned canonical payload后再物化；
+- 工具与provider：`structuredResult.content`唯一降低为bounded canonical text + ordered image refs；
+  图片以原`call_id`的FCO进入OpenAI Responses，user/FCO capability与tool-search分别检查；已committed
+  工具事实不会因后续媒体交付失败被改写；
+- 产品与权限：macOS共享composer reader对PNG/JPEG扩展使用确定性canonical MIME映射，Code/Cowork和
+  macOS CLI附件走exact-session ArtifactStore；Code与Cowork exact
+  `@main`覆盖stable next/restart，ordinary Cowork保持task-scoped current；automatic review遇media
+  snapshot durable typed deny；Chat继续独立使用`ChatLoop`，iOS仍为Chat子集。
+
+实际验证结果：
+
+- `DurableOwnerOnlyFileTests` 2/2、`ArtifactImageResolverTests` 10/10、
+  `IntatisProvidersToolCallingTests` 36/36、`AgentToolOutputLoweringTests` 6/6、
+  `DurableMultimodalAgentLoopTests` 8/8、`CLIAttachmentTests` 4/4，均为0 failures；
+- `swift test --filter ModelHistory`：Protocol 13、Conversation 16、AgentKernel 49，共78 tests / 0 failures；
+- `ComposerAttachmentTests` 2/2，验证PNG/JPEG deterministic canonical MIME、exact bytes读回与非图片
+  typed拒绝；Chat跨轮图片持久化/rehydration定向用例1/1，确认既有Chat链路未回归；
+- 从`v0.41` commit `e5f64ed`归档源码并临时编译`LegacyMediaSchemaFixtureTests`：3 tests / 0 failures，
+  旧projector拒绝schema-v2 direct item及v1 checkpoint后的schema-v2 direct suffix，旧protocol拒绝
+  schema-v2 checkpoint；
+- `swift build --disable-sandbox --target IntatisCLI`退出0；`IntatisMac` macOS Debug与`IntatisiOS`
+  generic Simulator Debug无签名构建均退出0，只有仓库既有warning；
+- 真实端点smoke的opt-in测试壳已在隔离的`v0.42`源码快照用`swift build --target IntatisCLITests`
+  编译通过；未设置开关时不发请求，真实credential/network调用仍未执行；
+- 此前完整`swift test --disable-sandbox`运行没有全绿：当时唯一失败为并发中的文档工具能力改动所涉及的
+  `MessageDelegationSplitTests.testSendMessageCreatesDurableMailboxWakeTaskAndConsumesMessage`
+  （4个断言）。隔离复现证明`CapabilityLease.worker()`/测试已要求`documentRead`、`documentOCR`，但
+  mailbox `allowedTools`尚未同步。此后并发Document resource-limit改动又在`ShellGit.swift`/
+  `TerminalTools.swift`留下未穷尽switch等编译错误，当前树会在测试启动前被阻断；这些都与durable
+  multimodal路径无关，本轮未越界修改该组用户改动；
+- `CLIAttachmentTests`含2个loader用例及2个宿主用例：CLI Code复用同一session log/ArtifactStore完成
+  next-turn replay；CLI Cowork销毁并重建shipping `Orchestrator.runtime`、EventLog与ArtifactStore后，
+  exact `@main`仍恢复历史图片。4/4结果来自仅叠加多模态差异的clean snapshot中构建
+  `IntatisCLITests`并直接运行XCTest bundle，因为当前共享树被无关Knowledge编译错误阻断；
+- 未执行真实OpenAI credential/network smoke，因此线上endpoint接受多模态FCO仍是release-only
+  `UNKNOWN`，不能从fake provider外推；未重放当时实际分发的旧App制品，但exact旧源码编译fixture
+  已覆盖reader语义；
+- 没有新增依赖或复制上游源码，`NOTICE.md`无需更新；当前状态、架构、禁区、项目地图与测试文档均已
+  同步本轮持久图片合同；`git diff --check`通过。

@@ -66,7 +66,9 @@ final class DocumentInfrastructureTests: XCTestCase {
         expectedSourceSHA256: String? = nil,
         replaceExisting: Bool = false,
         expectedDestinationSHA256: String? = nil,
-        maximumBytes: UInt64 = 32 * 1_024 * 1_024
+        maximumBytes: UInt64 = 32 * 1_024 * 1_024,
+        readOnlyInputSnapshots: [DocumentInputSnapshot] = [],
+        produceMutation: @escaping @Sendable () throws -> Void = {}
     ) async throws -> DocumentCommitReceipt {
         try await DocumentStagedOutput.writeFile(
             DocumentStagedFileRequest(
@@ -76,10 +78,12 @@ final class DocumentInfrastructureTests: XCTestCase {
                 replaceExisting: replaceExisting,
                 expectedDestinationSHA256: expectedDestinationSHA256,
                 fileExtension: "docx",
-                maximumBytes: maximumBytes),
+                maximumBytes: maximumBytes,
+                readOnlyInputSnapshots: readOnlyInputSnapshots),
             workspace: workspace,
             produce: { url in
                 try data.write(to: url)
+                try produceMutation()
             },
             validate: { url in
                 guard try Data(contentsOf: url) == data else {
@@ -520,5 +524,146 @@ final class DocumentInfrastructureTests: XCTestCase {
         XCTAssertFalse(docsContents.contains {
             $0.lastPathComponent.hasPrefix(".intatis-document-stage-")
         })
+    }
+
+    func testAuxiliaryInputSameBytesReplacementFailsExactIdentityCAS() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? fileManager.removeItem(at: workspace) }
+        try makeParent("docs", workspace: workspace)
+        try makeParent("assets", workspace: workspace)
+        let asset = workspace.appendingPathComponent("assets/logo.png")
+        let original = Data("reviewed image bytes".utf8)
+        try original.write(to: asset)
+        let snapshot = try DocumentInputFile.freezeReadOnly(
+            path: "assets/logo.png",
+            workspace: workspace)
+        let replacementBackup = workspace.appendingPathComponent("assets/logo.original.png")
+        let destination = workspace.appendingPathComponent("docs/output.docx")
+
+        await assertDocumentError(.outputConflict) {
+            _ = try await self.writeFile(
+                Data("generated document".utf8),
+                destinationPath: "docs/output.docx",
+                workspace: workspace,
+                readOnlyInputSnapshots: [snapshot],
+                produceMutation: {
+                    try self.fileManager.moveItem(at: asset, to: replacementBackup)
+                    // Restore the exact reviewed bytes at the reviewed path, but
+                    // on a different inode. Digest-only CAS would accept this.
+                    try original.write(to: asset)
+                })
+        }
+
+        XCTAssertFalse(fileManager.fileExists(atPath: destination.path))
+        XCTAssertEqual(try Data(contentsOf: asset), original)
+    }
+
+    func testAuxiliaryInputHardlinkIsRejectedBeforeBackendInvocation() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? fileManager.removeItem(at: workspace) }
+        try makeParent("docs", workspace: workspace)
+        try makeParent("assets", workspace: workspace)
+        let asset = workspace.appendingPathComponent("assets/logo.png")
+        try Data("reviewed image bytes".utf8).write(to: asset)
+        let snapshot = try DocumentInputFile.freezeReadOnly(
+            path: "assets/logo.png",
+            workspace: workspace)
+        try fileManager.linkItem(
+            at: asset,
+            to: workspace.appendingPathComponent("assets/logo-hardlink.png"))
+        let counter = DocumentInvocationCounter()
+
+        await assertDocumentError(.outputConflict) {
+            _ = try await DocumentStagedOutput.writeFile(
+                DocumentStagedFileRequest(
+                    sourcePath: nil,
+                    expectedSourceSHA256: nil,
+                    destinationPath: "docs/output.docx",
+                    replaceExisting: false,
+                    expectedDestinationSHA256: nil,
+                    fileExtension: "docx",
+                    maximumBytes: 1_024,
+                    readOnlyInputSnapshots: [snapshot]),
+                workspace: workspace,
+                produce: { payload in
+                    await counter.record()
+                    try Data("must not run".utf8).write(to: payload)
+                },
+                validate: { _ in })
+        }
+
+        let invocationCount = await counter.value()
+        XCTAssertEqual(invocationCount, 0)
+        XCTAssertFalse(fileManager.fileExists(
+            atPath: workspace.appendingPathComponent("docs/output.docx").path))
+    }
+
+    func testAuxiliaryInputSymlinkCannotBeFrozen() throws {
+        let workspace = try makeWorkspace()
+        defer { try? fileManager.removeItem(at: workspace) }
+        try makeParent("assets", workspace: workspace)
+        let target = workspace.appendingPathComponent("assets/target.png")
+        try Data("reviewed image bytes".utf8).write(to: target)
+        try fileManager.createSymbolicLink(
+            at: workspace.appendingPathComponent("assets/logo.png"),
+            withDestinationURL: target)
+
+        XCTAssertThrowsError(try DocumentInputFile.freezeReadOnly(
+            path: "assets/logo.png",
+            workspace: workspace)) { error in
+            XCTAssertEqual((error as? DocumentToolError)?.code, .validationFailed)
+        }
+    }
+
+    func testDestinationParentRenameAndSymlinkCannotRedirectCommit() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? fileManager.removeItem(at: workspace) }
+        try makeParent("docs", workspace: workspace)
+        try makeParent("attacker", workspace: workspace)
+        let originalParent = workspace.appendingPathComponent("docs", isDirectory: true)
+        let movedParent = workspace.appendingPathComponent("docs-moved", isDirectory: true)
+        let attackerParent = workspace.appendingPathComponent("attacker", isDirectory: true)
+        let generated = Data("generated document".utf8)
+
+        await assertDocumentError(.outputConflict) {
+            _ = try await DocumentStagedOutput.writeFile(
+                DocumentStagedFileRequest(
+                    sourcePath: nil,
+                    expectedSourceSHA256: nil,
+                    destinationPath: "docs/output.docx",
+                    replaceExisting: false,
+                    expectedDestinationSHA256: nil,
+                    fileExtension: "docx",
+                    maximumBytes: 1_024),
+                workspace: workspace,
+                produce: { payload in
+                    // Populate the pinned stage first, then redirect the textual
+                    // parent path and mirror a plausible stage under the symlink
+                    // target so path-only validation still succeeds.
+                    try generated.write(to: payload)
+                    let stageName = payload.deletingLastPathComponent().lastPathComponent
+                    try self.fileManager.moveItem(at: originalParent, to: movedParent)
+                    try self.fileManager.createSymbolicLink(
+                        at: originalParent,
+                        withDestinationURL: attackerParent)
+                    let decoyStage = attackerParent.appendingPathComponent(
+                        stageName,
+                        isDirectory: true)
+                    try self.fileManager.createDirectory(
+                        at: decoyStage,
+                        withIntermediateDirectories: false)
+                    try generated.write(to: decoyStage.appendingPathComponent(payload.lastPathComponent))
+                },
+                validate: { payload in
+                    guard try Data(contentsOf: payload) == generated else {
+                        throw DocumentToolError(.validationFailed, "fixture read-back mismatch")
+                    }
+                })
+        }
+
+        XCTAssertFalse(fileManager.fileExists(
+            atPath: attackerParent.appendingPathComponent("output.docx").path))
+        XCTAssertFalse(fileManager.fileExists(
+            atPath: movedParent.appendingPathComponent("output.docx").path))
     }
 }

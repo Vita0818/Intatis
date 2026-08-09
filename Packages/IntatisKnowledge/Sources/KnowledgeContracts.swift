@@ -31,18 +31,36 @@ public enum KnowledgeContract {
     public static let lexicalBackendIdentity = "org.vita.intatis.bm25"
     public static let lexicalFormatVersion = "json/1"
     public static let lexicalRuntimeVersion = "1"
+    public static let utf8SourceLocatorAdapterIdentity =
+        "org.vita.intatis.utf8-byte-range"
+    public static let utf8SourceLocatorAdapterVersion = "1"
+    public static let utf8SourceLocatorAdapterKey =
+        utf8SourceLocatorAdapterIdentity + "@" + utf8SourceLocatorAdapterVersion
 }
 
 public enum KnowledgeJSON {
     public static func decoder() -> JSONDecoder {
         let decoder = JSONDecoder()
-        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        // Foundation's convertFromSnakeCase maps `chunk_id` to `chunkId`,
+        // which does not match Swift contracts whose compatibility acronym is
+        // intentionally spelled `chunkID` (similarly IDs/URI/UTF8). Keep the
+        // on-disk snake_case contract while making the reverse mapping exact.
+        decoder.keyDecodingStrategy = .custom { codingPath in
+            let raw = codingPath.last?.stringValue ?? ""
+            return KnowledgeCodingKey(Self.decodeSnakeCaseKey(raw))
+        }
         return decoder
     }
 
     public static func encoder(pretty: Bool = false) -> JSONEncoder {
         let encoder = JSONEncoder()
-        encoder.keyEncodingStrategy = .convertToSnakeCase
+        // Foundation's inverse strategy has the same acronym ambiguity as its
+        // decoder: `sourceIDs` becomes `source_i_ds`, which violates the frozen
+        // OKF/RAG schemas. Use the exact inverse of the compatibility mapping.
+        encoder.keyEncodingStrategy = .custom { codingPath in
+            let raw = codingPath.last?.stringValue ?? ""
+            return KnowledgeCodingKey(Self.encodeSnakeCaseKey(raw))
+        }
         encoder.outputFormatting = pretty ? [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes] : [.sortedKeys, .withoutEscapingSlashes]
         return encoder
     }
@@ -57,6 +75,83 @@ public enum KnowledgeJSON {
 
     public static func value<T: Encodable>(_ value: T) throws -> JSONValue {
         try JSONDecoder().decode(JSONValue.self, from: encode(value))
+    }
+
+    private static func decodeSnakeCaseKey(_ raw: String) -> String {
+        guard raw.contains("_") else { return raw }
+        let parts = raw.split(separator: "_", omittingEmptySubsequences: false)
+        guard let first = parts.first else { return raw }
+        return String(first) + parts.dropFirst().map { part in
+            switch part {
+            case "id": return "ID"
+            case "ids": return "IDs"
+            case "uri": return "URI"
+            case "url": return "URL"
+            case "utf8": return "UTF8"
+            default:
+                guard let head = part.first else { return "" }
+                return String(head).uppercased() + part.dropFirst()
+            }
+        }.joined()
+    }
+
+    private static func encodeSnakeCaseKey(_ raw: String) -> String {
+        // Normalize the compatibility acronyms to title-case words before
+        // splitting camel case. Order matters because IDs contains ID.
+        var normalized = raw
+        for (acronym, word) in [
+            ("UTF8", "Utf8"),
+            ("IDs", "Ids"),
+            ("URI", "Uri"),
+            ("URL", "Url"),
+            ("KNN", "Knn"),
+            ("ID", "Id"),
+        ] {
+            normalized = normalized.replacingOccurrences(of: acronym, with: word)
+        }
+
+        let characters = Array(normalized)
+        var result = ""
+        result.reserveCapacity(characters.count + 8)
+        for index in characters.indices {
+            let character = characters[index]
+            let isUppercase = character.isUppercase
+            if isUppercase, index > characters.startIndex {
+                let previous = characters[characters.index(before: index)]
+                let nextIsLowercase: Bool
+                if index < characters.index(before: characters.endIndex) {
+                    let next = characters[characters.index(after: index)]
+                    nextIsLowercase = next.isLowercase
+                } else {
+                    nextIsLowercase = false
+                }
+                if previous.isLowercase || previous.isNumber
+                    || (previous.isUppercase && nextIsLowercase) {
+                    result.append("_")
+                }
+            }
+            result.append(contentsOf: character.lowercased())
+        }
+        return result
+    }
+
+    private struct KnowledgeCodingKey: CodingKey {
+        let stringValue: String
+        let intValue: Int?
+
+        init(_ stringValue: String) {
+            self.stringValue = stringValue
+            intValue = nil
+        }
+
+        init?(stringValue: String) {
+            self.init(stringValue)
+        }
+
+        init?(intValue: Int) {
+            stringValue = String(intValue)
+            self.intValue = intValue
+        }
     }
 }
 
@@ -75,6 +170,24 @@ public enum KnowledgeDigest {
 
     public static func isValid(_ value: String) -> Bool {
         value.range(of: #"^sha256:[0-9a-f]{64}$"#, options: .regularExpression) != nil
+    }
+}
+
+/// Portable, model-facing identity for an OKF source. Source IDs are opaque
+/// labels, never paths or credentials; human-readable bundle paths belong in
+/// host-confined source metadata and are not echoed as identifiers.
+public enum KnowledgeSourceIdentity {
+    public static let pattern =
+        #"^(?!(?i:(?:(?:sk-|rk-)[a-z0-9_-]{8,}|ghp_[a-z0-9_]{8,}|github_pat_[a-z0-9_]{8,}|xox[baprs]-[a-z0-9-]{8,}|(?:akia|asia)[a-z0-9]{8,}|aiza[a-z0-9_-]{8,}|eyj[a-z0-9_-]{8,}\.[a-z0-9_-]{8,}(?:\.[a-z0-9_-]{8,})?)$))[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$"#
+
+    public static func isPortable(_ value: String) -> Bool {
+        value.range(of: pattern, options: .regularExpression) != nil
+            && !value.unicodeScalars.contains(where: {
+                CharacterSet.controlCharacters.contains($0)
+            })
+            && !value.contains("/")
+            && !value.contains("\\")
+            && !PermissionReviewTextSanitizer.containsSensitiveMaterial(value)
     }
 }
 
@@ -352,6 +465,22 @@ public struct KnowledgeSourceLocator: Codable, Equatable, Hashable, Sendable {
     public let adapterVersion: String
     public let kind: String
     public let value: String
+
+    public init(schema: String = "intatis-source-locator/1",
+                sourceID: String,
+                sourceRevision: String,
+                adapterIdentity: String,
+                adapterVersion: String,
+                kind: String,
+                value: String) {
+        self.schema = schema
+        self.sourceID = sourceID
+        self.sourceRevision = sourceRevision
+        self.adapterIdentity = adapterIdentity
+        self.adapterVersion = adapterVersion
+        self.kind = kind
+        self.value = value
+    }
 }
 
 public struct KnowledgeProducer: Codable, Equatable, Hashable, Sendable {
@@ -578,6 +707,24 @@ public struct KnowledgeDiagnostic: Codable, Equatable, Sendable {
                 .text
                 .prefix(1_024))
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case severity
+        case code
+        case subject
+        case message
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            severity: try container.decode(
+                KnowledgeDiagnosticSeverity.self,
+                forKey: .severity),
+            code: try container.decode(String.self, forKey: .code),
+            subject: try container.decode(String.self, forKey: .subject),
+            message: try container.decode(String.self, forKey: .message))
+    }
 }
 
 public struct KnowledgeValidationReport: Equatable, Sendable {
@@ -624,6 +771,7 @@ public struct KnowledgeValidationReceipt: Codable, Equatable, Sendable {
     public let validator: Validator
     public let backendRegistryDigest: String
     public let rootIdentity: RootIdentity
+    public let contentSealDigest: String
     public let semanticVerdict: String
     public let diagnosticsDigest: String
     public let validatedAt: String

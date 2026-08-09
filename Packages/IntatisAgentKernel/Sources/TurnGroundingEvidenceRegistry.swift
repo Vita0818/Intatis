@@ -25,6 +25,7 @@ struct TurnGroundingEvidenceRegistry: Sendable {
         case malformedSearchResult(String)
         case malformedCitation
         case unknownCitation(String)
+        case evidenceChanged(String)
 
         var errorDescription: String? {
             switch self {
@@ -34,14 +35,22 @@ struct TurnGroundingEvidenceRegistry: Sendable {
                 return "The final answer contains a malformed evidence citation."
             case .unknownCitation(let evidenceID):
                 return "The final answer cites evidence that was not returned successfully in this turn: \(evidenceID)"
+            case .evidenceChanged(let evidenceID):
+                return "The final answer cites evidence that is no longer mechanically valid: \(evidenceID)"
             }
         }
     }
 
     private(set) var bindings: [String: Binding] = [:]
+    private struct Entry: Sendable {
+        let evidence: ToolGroundingEvidence
+        let revalidator: ToolGroundingEvidenceRevalidator
+    }
+    private var entries: [String: Entry] = [:]
 
     mutating func record(toolName: String,
-                         observation: ToolObservation) throws {
+                         observation: ToolObservation,
+                         revalidator: ToolGroundingEvidenceRevalidator? = nil) throws {
         guard toolName == "search_knowledge",
               observation.structuredResult?.isError == false,
               let value = observation.structuredResult?.structuredContent else {
@@ -59,8 +68,13 @@ struct TurnGroundingEvidenceRegistry: Sendable {
               !evidence.isEmpty else {
             throw ValidationError.malformedSearchResult("required snapshot identity or evidence is missing")
         }
+        guard let revalidator else {
+            throw ValidationError.malformedSearchResult(
+                "the exact tool registration has no final grounding revalidator")
+        }
 
         var result: [String: Binding] = [:]
+        var replay: [String: Entry] = [:]
         for (offset, item) in evidence.enumerated() {
             guard case .object(let object) = item,
                   let evidenceID = object.string("evidence_id"),
@@ -77,11 +91,10 @@ struct TurnGroundingEvidenceRegistry: Sendable {
                   case .array(let sourceIDs)? = object["source_ids"],
                   !sourceIDs.isEmpty,
                   sourceIDs.allSatisfy({ $0.nonEmptyString != nil }),
-                  result[evidenceID] == nil,
-                  bindings[evidenceID] == nil else {
+                  result[evidenceID] == nil else {
                 throw ValidationError.malformedSearchResult("evidence ordering, digest, URI, source binding, or identity is invalid")
             }
-            result[evidenceID] = Binding(
+            let binding = Binding(
                 evidenceID: evidenceID,
                 knowledgeBase: knowledgeBase,
                 knowledgeBaseRevision: knowledgeBaseRevision,
@@ -89,13 +102,32 @@ struct TurnGroundingEvidenceRegistry: Sendable {
                 retrievalSnapshotRevision: retrievalSnapshotRevision,
                 textSHA256: textSHA256,
                 evidenceURI: evidenceURI)
+            if let existing = bindings[evidenceID], existing != binding {
+                throw ValidationError.malformedSearchResult(
+                    "a stable evidence ID changed its snapshot, digest, or URI binding")
+            }
+            result[evidenceID] = binding
+            replay[evidenceID] = Entry(
+                evidence: ToolGroundingEvidence(
+                    toolName: toolName,
+                    evidenceID: evidenceID,
+                    knowledgeBase: knowledgeBase,
+                    knowledgeBaseRevision: knowledgeBaseRevision,
+                    retrievalSnapshot: retrievalSnapshot,
+                    retrievalSnapshotRevision: retrievalSnapshotRevision,
+                    textSHA256: textSHA256,
+                    evidenceURI: evidenceURI,
+                    structuredEvidence: item),
+                revalidator: revalidator)
         }
-        bindings.merge(result) { _, _ in
-            preconditionFailure("duplicate evidence ID was checked above")
-        }
+        // Stable evidence IDs may legitimately recur across multiple searches
+        // in one turn. Exact bindings are idempotent; the most recent exact
+        // registration supplies the replay payload and revalidator.
+        bindings.merge(result) { existing, _ in existing }
+        entries.merge(replay) { _, latest in latest }
     }
 
-    func validateCitations(in text: String) throws {
+    func validateCitations(in text: String) async throws {
         let marker = "[[evidence:"
         guard text.contains(marker) else { return }
         let pattern = #"\[\[evidence:(ev_[A-Za-z0-9._-]{1,128})\]\]"#
@@ -107,6 +139,7 @@ struct TurnGroundingEvidenceRegistry: Sendable {
         }
 
         var covered = IndexSet()
+        var citedEvidenceIDs = Set<String>()
         for match in matches {
             covered.insert(integersIn: match.range.location..<(match.range.location + match.range.length))
             guard let idRange = Range(match.range(at: 1), in: text) else {
@@ -116,6 +149,7 @@ struct TurnGroundingEvidenceRegistry: Sendable {
             guard bindings[evidenceID] != nil else {
                 throw ValidationError.unknownCitation(evidenceID)
             }
+            citedEvidenceIDs.insert(evidenceID)
         }
 
         let utf16 = Array(text.utf16)
@@ -130,6 +164,17 @@ struct TurnGroundingEvidenceRegistry: Sendable {
                 throw ValidationError.malformedCitation
             }
             searchStart = offset + markerUnits.count
+        }
+
+        for evidenceID in citedEvidenceIDs.sorted() {
+            guard let entry = entries[evidenceID] else {
+                throw ValidationError.unknownCitation(evidenceID)
+            }
+            do {
+                try await entry.revalidator(entry.evidence)
+            } catch {
+                throw ValidationError.evidenceChanged(evidenceID)
+            }
         }
     }
 

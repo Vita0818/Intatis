@@ -58,6 +58,33 @@ public struct KnowledgeJSONSchemaValidator: Sendable {
         try load(schema)
     }
 
+    /// Evaluates a host-constructed dynamic schema (for example the exact
+    /// snapshot-bound search input schema) with the same fail-closed 2020-12
+    /// subset as frozen resources. The schema itself is byte-bounded and every
+    /// unsupported assertion keyword is rejected by `evaluate`.
+    public func validate(_ value: JSONValue,
+                         againstDynamicSchema schema: JSONValue) throws {
+        let schemaData = try KnowledgeJSON.encode(schema)
+        guard schemaData.count <= 2 * 1_024 * 1_024 else {
+            throw Failure(path: "$", reason: "dynamic schema exceeds the byte limit")
+        }
+        try evaluate(value, schema: schema, root: schema, path: "$", depth: 0)
+    }
+
+    public func validate(data: Data,
+                         againstDynamicSchema schema: JSONValue) throws {
+        guard data.count <= 64 * 1_024 * 1_024 else {
+            throw Failure(path: "$", reason: "instance exceeds the schema validation byte limit")
+        }
+        let value: JSONValue
+        do {
+            value = try JSONDecoder().decode(JSONValue.self, from: data)
+        } catch {
+            throw Failure(path: "$", reason: "instance is not valid JSON")
+        }
+        try validate(value, againstDynamicSchema: schema)
+    }
+
     private func load(_ schema: Schema) throws -> JSONValue {
         guard let url = Bundle.module.url(
             forResource: schema.rawValue,

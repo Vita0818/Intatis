@@ -99,7 +99,8 @@ enum EPUBCheckValidationBackend {
             ],
             readableWorkspacePaths: [],
             writableWorkspacePaths: [reviewedOutputPath],
-            internalWritableWorkspacePaths: [stageRoot.path])
+            internalWritableWorkspacePaths: [stageRoot.path],
+            internalReadOnlyWorkspacePaths: [stagedEPUB.path])
         let result = try await run(invocation, in: context)
         guard result.exitCode == 0 else {
             throw DocumentToolError(.validationFailed, "EPUBCheck rejected the staged EPUB")

@@ -119,6 +119,39 @@ private struct ModelHistoryRecordingScope: Sendable {
     var taskAttempt: Int
 }
 
+private struct AgentMaterializedImages: Sendable {
+    var references: [ModelHistoryImageReference]
+    var attachments: [ImageAttachment]
+}
+
+/// Request-local handoff between durable tool completion and the next provider
+/// request. Keys include the TurnID so concurrent or retried invocations can
+/// never consume another turn's function-call output.
+private actor AgentToolOutputDeliveryLedger {
+    private var messages: [String: [String: AgentMessage]] = [:]
+
+    func record(
+        _ message: AgentMessage,
+        turnID: TurnID,
+        callID: String
+    ) {
+        messages[turnID.rawValue, default: [:]][callID] = message
+    }
+
+    func take(turnID: TurnID, callID: String) -> AgentMessage? {
+        let message = messages[turnID.rawValue]?[callID]
+        messages[turnID.rawValue]?[callID] = nil
+        if messages[turnID.rawValue]?.isEmpty == true {
+            messages[turnID.rawValue] = nil
+        }
+        return message
+    }
+
+    func remove(turnID: TurnID) {
+        messages[turnID.rawValue] = nil
+    }
+}
+
 /// Per-AgentLoop circuit breaker. Policy/user/reviewer denials keep the normal
 /// cached-denial behavior. A typed transient automatic-review infrastructure
 /// failure may spend exactly one fresh review before the cache closes again.
@@ -460,6 +493,7 @@ public struct AgentLoop: Sendable {
     private let authorizationPreparer: ToolAuthorizationPreparer?
     private let authorizationRevalidator: ToolAuthorizationRevalidator?
     private let toolSnapshotProvider: AgentRequestToolSnapshotProvider?
+    private let toolOutputDeliveryLedger = AgentToolOutputDeliveryLedger()
 
     public init(log: EventLog,
                 provider: ToolCallingProvider,
@@ -535,6 +569,10 @@ public struct AgentLoop: Sendable {
                      userMessage: UserMessagePayload? = nil,
                      recordUserMessage: Bool = true,
                      submissionID: SubmissionID? = nil) async throws -> String {
+        guard images.isEmpty else {
+            throw AgentLoopError.mediaOutputInvalid(
+                "Code and Cowork user images require exact-session artifact IDs")
+        }
         // A first attempt uses the identity frozen at the user submission
         // boundary. Whole-task Retry is a distinct turn and must not create a
         // second terminal outcome under the prior TurnID.
@@ -551,6 +589,7 @@ public struct AgentLoop: Sendable {
                     ? SubmissionID.new()
                     : nil
             )
+        await toolOutputDeliveryLedger.remove(turnID: turnID)
         let start = Date()
         var firstTokenAt: Date?
         var usage: Usage?
@@ -597,14 +636,18 @@ public struct AgentLoop: Sendable {
             currentSubmissionID: effectiveSubmissionID,
             recoveredEvents: recoveredModelHistoryEvents)
         var history: [AgentMessage]
-        if let modelHistoryProjection {
-            history = modelHistoryProjection.messages
+        if let projected = modelHistoryProjection {
+            let materialized = try await materializeModelHistory(projected)
+            modelHistoryProjection = materialized
+            history = materialized.messages
         } else {
             history = try await projectedHistory(
                 recoveredEvents: recoveredModelHistoryEvents,
                 excludingCurrentAndLaterSubmissionsFrom:
                     effectiveSubmissionID)
         }
+        var currentUserImages: [ImageAttachment] = []
+        var currentUserImageReferences: [ModelHistoryImageReference]?
         let mcpTurnResultBudget =
             MCPToolResultAggregateBudget(
                 scope: .turn,
@@ -678,6 +721,18 @@ public struct AgentLoop: Sendable {
                 expectedText: userText,
                 preferredPayload: acceptedCurrentUserMessage,
                 events: recoveredEvents)
+            let acceptedAttachmentIDs =
+                acceptedCurrentUserMessage?.attachments ?? []
+            if acceptedAttachmentIDs.isEmpty {
+                currentUserImages = []
+                currentUserImageReferences = nil
+            } else {
+                let resolved = try await materializeImages(
+                    artifactIDs: acceptedAttachmentIDs,
+                    expectedReferences: nil,
+                    purpose: "current user input")
+                currentUserImageReferences = resolved.references
+            }
             var durableItems: [Event] = []
             if let explicitSkillContext =
                 resolvedSkillActivation.prompt
@@ -701,12 +756,43 @@ public struct AgentLoop: Sendable {
                 taskID: modelHistoryScope.taskID,
                 submissionID: modelHistoryScope.submissionID,
                 taskAttempt: modelHistoryScope.taskAttempt,
-                role: .user,
-                content: userText,
-                attachmentIDs: acceptedCurrentUserMessage?.attachments,
-                messageClassification: .realUser)))
+                    role: .user,
+                    content: userText,
+                    attachmentIDs: acceptedCurrentUserMessage?.attachments,
+                    imageReferences: currentUserImageReferences,
+                    messageClassification: .realUser)))
             let appendedItems = try await log.append(durableItems)
             recoveredModelHistoryEvents?.append(contentsOf: appendedItems)
+            let userItemID = "model-history-user:\(turnID.rawValue)"
+            guard let canonicalUserItem = appendedItems.compactMap({ envelope
+                -> ModelHistoryItemPayload? in
+                guard case .modelHistoryItem(let payload) = envelope.event,
+                      payload.itemID == userItemID else {
+                    return nil
+                }
+                return payload
+            }).first,
+            canonicalUserItem.attachmentIDs
+                == acceptedCurrentUserMessage?.attachments,
+            canonicalUserItem.imageReferences
+                == currentUserImageReferences else {
+                throw AgentModelHistoryProjectionError.invalidItem(
+                    userItemID,
+                    "committed user media binding differs from the admitted artifact set")
+            }
+            let canonicalAttachmentIDs =
+                canonicalUserItem.attachmentIDs ?? []
+            if canonicalAttachmentIDs.isEmpty {
+                currentUserImages = []
+                currentUserImageReferences = nil
+            } else {
+                let readback = try await materializeImages(
+                    artifactIDs: canonicalAttachmentIDs,
+                    expectedReferences: canonicalUserItem.imageReferences,
+                    purpose: "committed current user input")
+                currentUserImages = readback.attachments
+                currentUserImageReferences = readback.references
+            }
             if var projection = modelHistoryProjection {
                 projection.latestAgentHistorySequence =
                     appendedItems.last?.seq
@@ -715,17 +801,28 @@ public struct AgentLoop: Sendable {
                     AgentModelHistoryRealUserMessage(
                         content: userText,
                         submissionID: modelHistoryScope.submissionID,
-                        attachmentIDs:
-                            acceptedCurrentUserMessage?.attachments))
+                        attachmentIDs: canonicalUserItem.attachmentIDs,
+                        imageReferences:
+                            canonicalUserItem.imageReferences))
                 modelHistoryProjection = projection
             }
+        }
+        if modelHistoryScope == nil,
+           let attachmentIDs = acceptedCurrentUserMessage?.attachments,
+           !attachmentIDs.isEmpty {
+            let resolved = try await materializeImages(
+                artifactIDs: attachmentIDs,
+                expectedReferences: nil,
+                purpose: "current user input")
+            currentUserImages = resolved.attachments
+            currentUserImageReferences = resolved.references
         }
         try await log.append(.agentStatus(AgentStatusPayload(agent: agent.name, state: .thinking)))
 
         var convo = context.initialMessages(
             history: history,
             userText: userText,
-            userImages: images,
+            userImages: currentUserImages,
             externalContexts:
                 acceptedCurrentUserMessage?
                     .untrustedExternalContexts
@@ -763,6 +860,7 @@ public struct AgentLoop: Sendable {
             var finishReason: String?
             let assistantID = MessageID.new()
 
+            try validateRequestImageLimits(messages: convo)
             var request = AgentRequest(model: agent.model, messages: convo, tools: specs,
                                        reasoningEffort: reasoningEffort, includeUsage: includeUsage,
                                        parallelToolCalls:
@@ -878,7 +976,8 @@ public struct AgentLoop: Sendable {
                 throw AgentLoopError.incompleteFinishReason(finishReason)
             }
             do {
-                try groundingEvidence.validateCitations(in: assistantText)
+                try await groundingEvidence.validateCitations(
+                    in: assistantText)
             } catch {
                 throw AgentLoopError.invalidEvidenceCitation(
                     RuntimeErrorPresentation.message(for: error))
@@ -951,6 +1050,7 @@ public struct AgentLoop: Sendable {
                 // side-effect evidence check above can therefore never leave
                 // a normal completed answer in front of a failed outcome.
                 try await log.append(completedResponseEvents)
+                await toolOutputDeliveryLedger.remove(turnID: turnID)
                 return assistantText  // final answer
             }
 
@@ -987,24 +1087,23 @@ public struct AgentLoop: Sendable {
                 do {
                     try groundingEvidence.record(
                         toolName: toolCall.name,
-                        observation: observation)
+                        observation: observation,
+                        revalidator: toolSnapshot.registry
+                            .registration(named: toolCall.name)?
+                            .groundingEvidenceRevalidator)
                 } catch {
                     throw AgentLoopError.invalidEvidenceCitation(
                         RuntimeErrorPresentation.message(for: error))
                 }
-                if toolCall.kind == .toolSearch {
-                    convo.append(.toolSearchOutput(
-                        id: toolCall.id,
-                        output: observation.toolSearchOutput
-                            ?? ModelToolSearchOutput(
-                                execution:
-                                    toolCall.execution ?? "client",
-                                tools: [])))
-                } else {
-                    convo.append(.tool(
-                        id: toolCall.id,
-                        content: observation.text))
+                guard let delivered = await toolOutputDeliveryLedger.take(
+                    turnID: turnID,
+                    callID: toolCall.id),
+                delivered.role == .tool,
+                delivered.toolCallId == toolCall.id else {
+                    throw AgentLoopError.mediaOutputInvalid(
+                        "committed tool output was not materialized for call \(toolCall.id)")
                 }
+                convo.append(delivered)
             }
             // Resolve the exact tool surface for the next ordinary provider
             // request before deciding whether its input requires compaction.
@@ -1069,6 +1168,7 @@ public struct AgentLoop: Sendable {
         turnStatsAppended = true
         throw AgentLoopError.maxIterationsExceeded(limit: maxIterations)
         } catch {
+            await toolOutputDeliveryLedger.remove(turnID: turnID)
             // AgentLoop owns the single terminal error event for failures that
             // occur after entering the loop. Callers should propagate/classify
             // the thrown error, not append a second copy of the same event.
@@ -1161,6 +1261,213 @@ public struct AgentLoop: Sendable {
             taskAttempt: attempt)
     }
 
+    private func materializeImages(
+        artifactIDs: [ArtifactID],
+        expectedReferences: [ModelHistoryImageReference]?,
+        purpose: String
+    ) async throws -> AgentMaterializedImages {
+        guard !artifactIDs.isEmpty else {
+            guard expectedReferences?.isEmpty != false else {
+                throw AgentLoopError.mediaOutputInvalid(
+                    "\(purpose) has descriptors but no artifact IDs")
+            }
+            return AgentMaterializedImages(
+                references: [],
+                attachments: [])
+        }
+        guard let imageResolver else {
+            throw AgentLoopError.mediaOutputInvalid(
+                "\(purpose) requires the exact-session artifact resolver")
+        }
+        let resolved = try await imageResolver(artifactIDs)
+        guard resolved.count == artifactIDs.count,
+              zip(resolved, artifactIDs).allSatisfy({
+                  $0.artifactID == $1
+              }) else {
+            throw AgentLoopError.mediaOutputInvalid(
+                "\(purpose) resolved a different artifact set or order")
+        }
+        let references = resolved.map { image in
+            ModelHistoryImageReference(
+                artifactID: image.artifactID,
+                mimeType: image.mimeType,
+                byteCount: image.byteCount,
+                sha256: image.sha256)
+        }
+        for reference in references {
+            do {
+                try reference.validate()
+            } catch {
+                throw AgentLoopError.mediaOutputInvalid(
+                    "\(purpose) produced a non-canonical image descriptor")
+            }
+        }
+        if let expectedReferences,
+           references != expectedReferences {
+            throw AgentLoopError.mediaOutputInvalid(
+                "\(purpose) bytes no longer match the durable image descriptor")
+        }
+        return AgentMaterializedImages(
+            references: references,
+            attachments: resolved.map(\.attachment))
+    }
+
+    private func materializeModelHistory(
+        _ projection: AgentModelHistoryProjection
+    ) async throws -> AgentModelHistoryProjection {
+        guard projection.messages.count == projection.imageBindings.count else {
+            throw AgentModelHistoryProjectionError.invalidItem(
+                "model-history-media",
+                "projected image bindings are not aligned with provider messages")
+        }
+
+        var flattenedIDs: [ArtifactID] = []
+        for binding in projection.imageBindings {
+            switch binding {
+            case .userVerified(let references),
+                 .toolVerified(_, let references):
+                flattenedIDs.append(contentsOf: references.map(\.artifactID))
+            case .userLegacy(let artifactIDs):
+                flattenedIDs.append(contentsOf: artifactIDs)
+            case nil:
+                continue
+            }
+        }
+        guard !flattenedIDs.isEmpty else { return projection }
+
+        let allImages = try await materializeImages(
+            artifactIDs: flattenedIDs,
+            expectedReferences: nil,
+            purpose: "projected model history")
+        var result = projection
+        var offset = 0
+        for index in result.messages.indices {
+            guard let binding = result.imageBindings[index] else { continue }
+            let count: Int
+            let expected: [ModelHistoryImageReference]?
+            switch binding {
+            case .userVerified(let references):
+                count = references.count
+                expected = references
+                guard result.messages[index].role == .user else {
+                    throw AgentModelHistoryProjectionError.invalidItem(
+                        "model-history-media-\(index)",
+                        "user image binding is attached to a non-user message")
+                }
+            case .userLegacy(let artifactIDs):
+                count = artifactIDs.count
+                expected = nil
+                guard result.messages[index].role == .user else {
+                    throw AgentModelHistoryProjectionError.invalidItem(
+                        "model-history-media-\(index)",
+                        "legacy image binding is attached to a non-user message")
+                }
+            case .toolVerified(let callID, let references):
+                count = references.count
+                expected = references
+                guard result.messages[index].role == .tool,
+                      result.messages[index].toolCallId == callID else {
+                    throw AgentModelHistoryProjectionError.invalidItem(
+                        "model-history-media-\(index)",
+                        "tool image binding does not match its function call")
+                }
+            }
+            let end = offset + count
+            guard end <= allImages.references.count else {
+                throw AgentModelHistoryProjectionError.invalidItem(
+                    "model-history-media-\(index)",
+                    "projected image binding exceeds the resolved artifact set")
+            }
+            let references = Array(allImages.references[offset..<end])
+            if let expected, references != expected {
+                throw AgentLoopError.mediaOutputInvalid(
+                    "projected history bytes no longer match their durable descriptors")
+            }
+            guard result.messages[index].images.isEmpty else {
+                throw AgentModelHistoryProjectionError.invalidItem(
+                    "model-history-media-\(index)",
+                    "projected provider message already contains image wire data")
+            }
+            result.messages[index].images =
+                Array(allImages.attachments[offset..<end])
+            if case .userLegacy(let artifactIDs) = binding {
+                result.imageBindings[index] = .userVerified(references)
+                for userIndex in result.realUserMessages.indices
+                where result.realUserMessages[userIndex].imageReferences == nil
+                    && result.realUserMessages[userIndex].attachmentIDs
+                        == artifactIDs
+                {
+                    result.realUserMessages[userIndex].imageReferences =
+                        references
+                }
+            }
+            offset = end
+        }
+        guard offset == allImages.references.count else {
+            throw AgentModelHistoryProjectionError.invalidItem(
+                "model-history-media",
+                "resolved image set was not consumed exactly once")
+        }
+        return result
+    }
+
+    private func validateRequestImageLimits(
+        messages: [AgentMessage]
+    ) throws {
+        let policy = ArtifactImageValidationPolicy()
+        let capabilities = provider.toolCallingCapabilities
+        if messages.contains(where: {
+            $0.role != .tool && !$0.images.isEmpty
+        }), !capabilities.supportsUserImageInput {
+            throw AgentLoopError.mediaOutputUnsupported(
+                "the exact provider route does not accept user images")
+        }
+        if messages.contains(where: {
+            $0.role == .tool && !$0.images.isEmpty
+        }), !capabilities.supportsFunctionOutputImageInput {
+            throw AgentLoopError.mediaOutputUnsupported(
+                "the exact provider route does not accept function-output images")
+        }
+        let images = messages.flatMap(\.images)
+        guard images.count <= policy.maximumImageCount else {
+            throw ArtifactImageResolutionError.tooManyImages(
+                maximum: policy.maximumImageCount,
+                actual: images.count)
+        }
+        var totalBytes = 0
+        for image in images {
+            guard image.url.hasPrefix("data:"),
+                  let comma = image.url.firstIndex(of: ","),
+                  image.url[..<comma].hasSuffix(";base64") else {
+                throw AgentLoopError.mediaOutputInvalid(
+                    "request images must use base64 data URLs")
+            }
+            let payload = image.url[image.url.index(after: comma)...]
+            let maximumEncodedBytes =
+                ((policy.maximumImageBytes + 2) / 3) * 4 + 2
+            guard payload.utf8.count <= maximumEncodedBytes else {
+                throw ArtifactImageResolutionError.imageByteLimitExceeded(
+                    ArtifactID(rawValue: "request-image"),
+                    maximumBytes: policy.maximumImageBytes)
+            }
+            guard let decoded = Data(base64Encoded: String(payload)) else {
+                throw AgentLoopError.mediaOutputInvalid(
+                    "request image data URL contains invalid base64")
+            }
+            let decodedBytes = decoded.count
+            guard decodedBytes <= policy.maximumImageBytes else {
+                throw ArtifactImageResolutionError.imageByteLimitExceeded(
+                    ArtifactID(rawValue: "request-image"),
+                    maximumBytes: policy.maximumImageBytes)
+            }
+            totalBytes += decodedBytes
+            guard totalBytes <= policy.maximumTotalBytes else {
+                throw ArtifactImageResolutionError.totalByteLimitExceeded(
+                    maximumBytes: policy.maximumTotalBytes)
+            }
+        }
+    }
+
     private func shouldCompact(
         messages: [AgentMessage],
         tools: [ToolSpec]
@@ -1186,6 +1493,7 @@ public struct AgentLoop: Sendable {
         usage: Usage?,
         envelope: Envelope
     ) {
+        try validateRequestImageLimits(messages: summaryHistory)
         let maximumReplacementInputTokens: Int?
         if let hardLimit =
             modelContextPolicy.hardUsableContextWindowTokens {
@@ -1219,6 +1527,9 @@ public struct AgentLoop: Sendable {
             .compact(
                 history: summaryHistory,
                 realUserMessages: projection.realUserMessages,
+                mediaAwareCheckpointRequired:
+                    projection.latestCheckpoint?.payload.schemaVersion
+                        == ModelHistoryCompactedPayload.mediaSchemaVersion,
                 maximumReplacementInputTokens:
                     maximumReplacementInputTokens)
 
@@ -1302,6 +1613,7 @@ public struct AgentLoop: Sendable {
             windowID = AgentModelHistoryWindowID.new()
         }
         let checkpoint = ModelHistoryCompactedPayload(
+            schemaVersion: result.checkpointSchemaVersion,
             agent: agent.name,
             message: result.message,
             replacementHistory: replacement,
@@ -1313,28 +1625,24 @@ public struct AgentLoop: Sendable {
             checkpoint,
             expectedLatestAgentHistorySeq:
                 projection.latestAgentHistorySequence)
+        guard case .modelHistoryCompacted(let committedCheckpoint) =
+                envelope.event else {
+            throw AgentModelHistoryProjectionError.invalidItem(
+                "model-history-compacted:\(envelope.seq)",
+                "compaction append did not return its canonical checkpoint")
+        }
         let cursor = AgentModelHistoryCheckpointCursor(
             sequence: envelope.seq,
-            payload: checkpoint)
-        let realUsers = replacement.compactMap {
-            item -> AgentModelHistoryRealUserMessage? in
-            guard item.messageClassification == .realUser,
-                  let content = item.content else {
-                return nil
-            }
-            return AgentModelHistoryRealUserMessage(
-                content: content,
-                submissionID: item.sourceSubmissionID,
-                attachmentIDs: item.attachmentIDs,
-                contentTruncated: item.contentTruncated == true)
-        }
+            payload: committedCheckpoint)
+        var replacementProjection = try AgentModelHistoryProjector()
+            .projectReplacementState(committedCheckpoint)
+        replacementProjection.baseCheckpoint = cursor
+        replacementProjection.latestCheckpoint = cursor
+        replacementProjection.latestAgentHistorySequence = envelope.seq
+        replacementProjection = try await materializeModelHistory(
+            replacementProjection)
         return (
-            AgentModelHistoryProjection(
-                messages: providerHistory,
-                realUserMessages: realUsers,
-                baseCheckpoint: cursor,
-                latestCheckpoint: cursor,
-                latestAgentHistorySequence: envelope.seq),
+            replacementProjection,
             result.usage,
             envelope)
     }
@@ -1691,7 +1999,7 @@ public struct AgentLoop: Sendable {
     private func appendingModelHistoryToolOutput(
         to events: [Event],
         toolCall: ToolCall,
-        observation: String,
+        canonicalOutput: AgentCanonicalToolOutput,
         toolSearchOutput: ModelToolSearchOutput?,
         scope: ModelHistoryRecordingScope?
     ) -> [Event] {
@@ -1714,9 +2022,6 @@ public struct AgentLoop: Sendable {
                 execution: output.execution,
                 tools: output.tools))]
         }
-        let sanitized = PermissionReviewTextSanitizer.sanitize(
-            observation,
-            maxCharacters: 65_536)
         return events + [.modelHistoryItem(.functionCallOutput(
             itemID: "model-history-output:\(scope.turnID.rawValue):\(toolCall.id)",
             turnID: scope.turnID,
@@ -1725,7 +2030,11 @@ public struct AgentLoop: Sendable {
             submissionID: scope.submissionID,
             taskAttempt: scope.taskAttempt,
             callID: toolCall.id,
-            output: sanitized.text))]
+            output: canonicalOutput.output,
+            imageReferences:
+                canonicalOutput.imageReferences.isEmpty
+                    ? nil
+                    : canonicalOutput.imageReferences))]
     }
 
     private func appendToolCompletion(
@@ -1735,12 +2044,198 @@ public struct AgentLoop: Sendable {
         toolSearchOutput: ModelToolSearchOutput? = nil,
         modelHistoryScope: ModelHistoryRecordingScope?
     ) async throws {
-        try await log.append(appendingModelHistoryToolOutput(
-            to: events,
-            toolCall: toolCall,
-            observation: observation,
-            toolSearchOutput: toolSearchOutput,
-            scope: modelHistoryScope))
+        let turnID = events.compactMap { event -> TurnID? in
+            guard case .toolResult(let payload) = event,
+                  payload.toolCallId == toolCall.id else {
+                return nil
+            }
+            return payload.turnID
+        }.first ?? modelHistoryScope?.turnID
+
+        if toolCall.kind == .toolSearch {
+            let output = toolSearchOutput
+                ?? ModelToolSearchOutput(
+                    execution: toolCall.execution ?? "client",
+                    tools: [])
+            let canonical = AgentCanonicalToolOutput(
+                output: "",
+                imageReferences: [])
+            let appended = try await log.append(
+                appendingModelHistoryToolOutput(
+                    to: events,
+                    toolCall: toolCall,
+                    canonicalOutput: canonical,
+                    toolSearchOutput: output,
+                    scope: modelHistoryScope))
+            let committedOutput: ModelToolSearchOutput
+            if modelHistoryScope != nil {
+                guard let payload = appended.compactMap({ envelope
+                    -> ModelHistoryItemPayload? in
+                    guard case .modelHistoryItem(let payload) =
+                            envelope.event,
+                          payload.kind == .toolSearchOutput,
+                          payload.callID == toolCall.id else {
+                        return nil
+                    }
+                    return payload
+                }).first,
+                let durableOutput = payload.toolSearchOutput else {
+                    throw AgentLoopError.mediaOutputInvalid(
+                        "committed tool-search output is missing")
+                }
+                committedOutput = durableOutput
+            } else {
+                committedOutput = output
+            }
+            guard let turnID else {
+                throw AgentLoopError.mediaOutputInvalid(
+                    "committed tool-search output has no TurnID")
+            }
+            await toolOutputDeliveryLedger.record(
+                .toolSearchOutput(
+                    id: toolCall.id,
+                    output: committedOutput),
+                turnID: turnID,
+                callID: toolCall.id)
+            return
+        }
+
+        let proposedResults = events.compactMap { event
+            -> ToolResultPayload? in
+            guard case .toolResult(let payload) = event,
+                  payload.toolCallId == toolCall.id else {
+                return nil
+            }
+            return payload
+        }
+        guard proposedResults.count == 1,
+              let proposedResult = proposedResults.first,
+              proposedResult.observation == observation else {
+            throw AgentLoopError.mediaOutputInvalid(
+                "tool completion must contain one exact matching tool result")
+        }
+
+        let proposedOutput: AgentCanonicalToolOutput
+        do {
+            proposedOutput = try AgentCanonicalToolOutput.lower(
+                structuredResult: proposedResult.structuredResult,
+                legacyObservation: proposedResult.observation)
+        } catch let loweringError as AgentToolOutputLoweringError {
+            let fallback = AgentCanonicalToolOutput(
+                output:
+                    "[media delivery unavailable: \(loweringError.stableCode)]",
+                imageReferences: [])
+            _ = try await log.append(appendingModelHistoryToolOutput(
+                to: events,
+                toolCall: toolCall,
+                canonicalOutput: fallback,
+                toolSearchOutput: nil,
+                scope: modelHistoryScope))
+            switch loweringError {
+            case .unsupportedMedia:
+                throw AgentLoopError.mediaOutputUnsupported(
+                    loweringError.localizedDescription)
+            case .invalidBlock, .canonicalJSON:
+                throw AgentLoopError.mediaOutputInvalid(
+                    loweringError.localizedDescription)
+            }
+        }
+
+        let appended = try await log.append(
+            appendingModelHistoryToolOutput(
+                to: events,
+                toolCall: toolCall,
+                canonicalOutput: proposedOutput,
+                toolSearchOutput: nil,
+                scope: modelHistoryScope))
+        let committedResults = appended.compactMap { envelope
+            -> ToolResultPayload? in
+            guard case .toolResult(let payload) = envelope.event,
+                  payload.toolCallId == toolCall.id else {
+                return nil
+            }
+            return payload
+        }
+        guard committedResults.count == 1,
+              let committedResult = committedResults.first else {
+            throw AgentLoopError.mediaOutputInvalid(
+                "committed completion lost its exact tool result")
+        }
+        guard committedResult.observation == proposedResult.observation,
+              committedResult.structuredResult
+                == proposedResult.structuredResult else {
+            throw AgentLoopError.mediaOutputInvalid(
+                "committed tool output differs from its completion batch")
+        }
+        let committedOutput: AgentCanonicalToolOutput
+        do {
+            committedOutput = try AgentCanonicalToolOutput.lower(
+                structuredResult: committedResult.structuredResult,
+                legacyObservation: committedResult.observation)
+        } catch let loweringError as AgentToolOutputLoweringError {
+            throw AgentLoopError.mediaOutputInvalid(
+                "committed tool output cannot be lowered: \(loweringError.stableCode)")
+        }
+        var deliveryOutput = committedOutput
+        if modelHistoryScope != nil {
+            let durableOutputs = appended.compactMap { envelope
+                -> ModelHistoryItemPayload? in
+                guard case .modelHistoryItem(let payload) = envelope.event,
+                      payload.kind == .functionCallOutput,
+                      payload.callID == toolCall.id else {
+                    return nil
+                }
+                return payload
+            }
+            guard durableOutputs.count == 1,
+                  durableOutputs[0].output == committedOutput.output,
+                  (durableOutputs[0].imageReferences ?? [])
+                    == committedOutput.imageReferences,
+                  let durableText = durableOutputs[0].output else {
+                throw AgentLoopError.mediaOutputInvalid(
+                    "durable function output is not bound to the canonical tool result")
+            }
+            deliveryOutput = AgentCanonicalToolOutput(
+                output: durableText,
+                imageReferences:
+                    durableOutputs[0].imageReferences ?? [])
+        }
+
+        let attachments: [ImageAttachment]
+        if deliveryOutput.imageReferences.isEmpty {
+            attachments = []
+        } else {
+            guard provider.toolCallingCapabilities
+                    .supportsFunctionOutputImageInput else {
+                throw AgentLoopError.mediaOutputUnsupported(
+                    "the exact provider route does not accept function-output images")
+            }
+            do {
+                attachments = try await materializeImages(
+                    artifactIDs:
+                        deliveryOutput.imageReferences.map(\.artifactID),
+                    expectedReferences:
+                        deliveryOutput.imageReferences,
+                    purpose: "tool output \(toolCall.id)")
+                    .attachments
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw AgentLoopError.mediaOutputInvalid(
+                    RuntimeErrorPresentation.message(for: error))
+            }
+        }
+        guard let turnID else {
+            throw AgentLoopError.mediaOutputInvalid(
+                "committed tool output has no TurnID")
+        }
+        await toolOutputDeliveryLedger.record(
+            .tool(
+                id: toolCall.id,
+                content: deliveryOutput.output,
+                images: attachments),
+            turnID: turnID,
+            callID: toolCall.id)
     }
 
     private func runTool(_ toolCall: ToolCall,

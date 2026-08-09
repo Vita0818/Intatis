@@ -43,6 +43,29 @@ public struct OKFConcept: Equatable, Sendable {
     }
 }
 
+public struct OKFIndexDocument: Equatable, Sendable {
+    public let relativePath: String
+    public let normalizedText: String
+    public let body: String
+    public let declaredVersion: String?
+}
+
+public struct OKFLogDocument: Equatable, Sendable {
+    public let relativePath: String
+    public let normalizedText: String
+}
+
+enum OKFBundleLayout {
+    static func isReservedMarkdown(_ relativePath: String) -> Bool {
+        let name = URL(fileURLWithPath: relativePath).lastPathComponent
+        return name == "index.md" || name == "log.md"
+    }
+
+    static func isConcept(_ relativePath: String) -> Bool {
+        relativePath.hasSuffix(".md") && !isReservedMarkdown(relativePath)
+    }
+}
+
 public struct OKFReaderLimits: Equatable, Sendable {
     public var maximumConceptBytes = 4 * 1_024 * 1_024
     public var maximumFrontmatterBytes = 256 * 1_024
@@ -76,7 +99,7 @@ public struct OKFReader: Sendable {
 
         let root: Node
         do {
-            guard let parsed = try compose(yaml: split.yaml) else {
+            guard let parsed = try composeAndValidateSafety(yaml: split.yaml) else {
                 throw KnowledgeDomainError(.okfInvalid, "OKF frontmatter is empty.")
             }
             root = parsed
@@ -85,8 +108,6 @@ public struct OKFReader: Sendable {
         } catch {
             throw KnowledgeDomainError(.okfInvalid, "OKF frontmatter is not valid YAML.")
         }
-        try validateNodeTree(root)
-
         guard case .mapping(let mapping) = root else {
             throw KnowledgeDomainError(.okfInvalid, "OKF frontmatter must be a mapping.")
         }
@@ -105,6 +126,7 @@ public struct OKFReader: Sendable {
             throw KnowledgeDomainError(.okfInvalid, "OKF concept contains duplicate source IDs.")
         }
         let verifications = try parseVerifications(object["verified"])
+        let generatedAt = try parseGenerated(object["generated"])
         let conceptID = try Self.conceptID(relativePath)
         return OKFConcept(
             conceptID: conceptID,
@@ -120,25 +142,251 @@ public struct OKFReader: Sendable {
             verifications: verifications,
             status: object["status"]?.stringValue ?? "stable",
             staleAfter: object["stale_after"]?.stringValue,
-            generatedAt: object["generated"]?.objectValue?["at"]?.stringValue,
+            generatedAt: generatedAt,
             legacyTimestamp: object["timestamp"]?.stringValue,
             frontmatter: object)
     }
 
+    /// Intatis Profile's strict mechanical join for OKF §5.1 per-claim
+    /// attribution. It deliberately validates only explicit Markdown
+    /// footnotes; concepts remain allowed to declare sources without citing
+    /// every paragraph.
+    func validateFootnoteAttribution(_ concept: OKFConcept) throws {
+        let attribution = try Self.scanFootnotes(concept.body)
+        let declared = Set(concept.sources.compactMap(\.id))
+        guard attribution.claims == attribution.definitions,
+              attribution.claims.isSubset(of: declared) else {
+            throw KnowledgeDomainError(
+                .okfInvalid,
+                "OKF footnote attribution must bind each claim and definition to one declared source ID.")
+        }
+    }
+
+    /// Deterministic Profile attribution for one candidate chunk. Explicit
+    /// footnotes win. A concept-level fallback is safe only when exactly one
+    /// source exists; multi-source prose without a join key is ambiguous and
+    /// is not emitted as grounded evidence.
+    static func attributedSourceIDs(
+        in markdown: String,
+        declaredSourceIDs: [String]
+    ) throws -> [String] {
+        let attribution = try scanFootnotes(markdown)
+        let explicit = attribution.claims.union(attribution.definitions)
+        if !explicit.isEmpty { return explicit.sorted() }
+        let declared = Array(Set(declaredSourceIDs)).sorted()
+        return declared.count == 1 ? declared : []
+    }
+
+    private static func scanFootnotes(
+        _ markdown: String
+    ) throws -> (claims: Set<String>, definitions: Set<String>) {
+        let definitionPattern = try NSRegularExpression(
+            pattern: #"^[ ]{0,3}\[\^([^\]\r\n]+)\]:"#)
+        let markerPattern = try NSRegularExpression(
+            pattern: #"\[\^([^\]\r\n]+)\]"#)
+        var definitions = Set<String>()
+        var claims = Set<String>()
+        var activeFence: String?
+
+        for rawLine in markdown.split(
+            separator: "\n",
+            omittingEmptySubsequences: false
+        ).map(String.init) {
+            let trimmed = rawLine.trimmingCharacters(in: .whitespaces)
+            if let fence = activeFence {
+                if trimmed.hasPrefix(fence) { activeFence = nil }
+                continue
+            }
+            if trimmed.hasPrefix("```") {
+                activeFence = "```"
+                continue
+            }
+            if trimmed.hasPrefix("~~~") {
+                activeFence = "~~~"
+                continue
+            }
+            if rawLine.hasPrefix("    ") || rawLine.hasPrefix("\t") {
+                continue
+            }
+
+            var claimText = rawLine
+            let fullRange = NSRange(rawLine.startIndex..., in: rawLine)
+            if let definition = definitionPattern.firstMatch(
+                in: rawLine,
+                range: fullRange),
+               let labelRange = Range(definition.range(at: 1), in: rawLine),
+               let prefixRange = Range(definition.range(at: 0), in: rawLine) {
+                let label = String(rawLine[labelRange])
+                guard definitions.insert(label).inserted else {
+                    throw KnowledgeDomainError(
+                        .okfInvalid,
+                        "OKF footnote attribution contains a duplicate definition.")
+                }
+                claimText = String(rawLine[prefixRange.upperBound...])
+            }
+            claimText = claimText.replacingOccurrences(
+                of: #"`+[^`\r\n]*`+"#,
+                with: "",
+                options: .regularExpression)
+            let claimRange = NSRange(
+                claimText.startIndex...,
+                in: claimText)
+            for marker in markerPattern.matches(
+                in: claimText,
+                range: claimRange
+            ) {
+                guard let labelRange = Range(
+                    marker.range(at: 1),
+                    in: claimText) else { continue }
+                claims.insert(String(claimText[labelRange]))
+            }
+        }
+        return (claims, definitions)
+    }
+
     public func readRootIndexVersion(data: Data) throws -> String? {
+        try readIndexDocument(
+            data: data,
+            relativePath: "index.md").declaredVersion
+    }
+
+    public func readIndexDocument(
+        data: Data,
+        relativePath: String,
+        allowLegacyRootFrontmatter: Bool = false
+    ) throws -> OKFIndexDocument {
         guard data.count <= limits.maximumConceptBytes,
               let raw = String(data: data, encoding: .utf8) else {
-            throw KnowledgeDomainError(.okfInvalid, "OKF root index is not valid bounded UTF-8.")
+            throw KnowledgeDomainError(
+                .okfInvalid,
+                "OKF index is not valid bounded UTF-8.")
         }
         let normalized = Self.normalize(raw)
-        guard normalized.hasPrefix("---\n") else { return nil }
-        let split = try splitFrontmatter(normalized)
-        guard let node = try compose(yaml: split.yaml) else { return nil }
-        try validateNodeTree(node)
-        guard case .mapping(let mapping) = node else {
-            throw KnowledgeDomainError(.okfInvalid, "OKF root index frontmatter must be a mapping.")
+        let isRoot = relativePath == "index.md"
+        let body: String
+        let version: String?
+        if normalized.hasPrefix("---\n") {
+            guard isRoot else {
+                throw KnowledgeDomainError(
+                    .okfInvalid,
+                    "Only the bundle-root index may contain frontmatter.")
+            }
+            let split = try splitFrontmatter(normalized)
+            guard let node = try composeAndValidateSafety(yaml: split.yaml) else {
+                throw KnowledgeDomainError(
+                    .okfInvalid,
+                    "OKF root index frontmatter is empty.")
+            }
+            guard case .mapping(let mapping) = node else {
+                throw KnowledgeDomainError(
+                    .okfInvalid,
+                    "OKF root index frontmatter must be a mapping.")
+            }
+            let object = try objectValue(mapping)
+            if !allowLegacyRootFrontmatter {
+                guard Set(object.keys).isSubset(of: ["okf_version"]) else {
+                    throw KnowledgeDomainError(
+                        .okfInvalid,
+                        "OKF root index frontmatter may contain only okf_version.")
+                }
+            }
+            if let declared = object["okf_version"] {
+                guard case .string(let value) = declared,
+                      !value.isEmpty else {
+                    throw KnowledgeDomainError(
+                        .okfInvalid,
+                        "OKF root index version must be a non-empty string.")
+                }
+                version = value
+            } else {
+                version = nil
+            }
+            body = split.body
+        } else {
+            body = normalized
+            version = nil
         }
-        return try objectValue(mapping)["okf_version"]?.stringValue
+
+        guard body.split(separator: "\n", omittingEmptySubsequences: false)
+            .contains(where: { line in
+                let value = line.trimmingCharacters(in: .whitespaces)
+                return value.hasPrefix("# ") && value.count > 2
+            }) else {
+            throw KnowledgeDomainError(
+                .okfInvalid,
+                "OKF index must contain at least one section heading.")
+        }
+        return OKFIndexDocument(
+            relativePath: relativePath,
+            normalizedText: normalized,
+            body: body,
+            declaredVersion: version)
+    }
+
+    public func readLogDocument(
+        data: Data,
+        relativePath: String
+    ) throws -> OKFLogDocument {
+        guard data.count <= limits.maximumConceptBytes,
+              let raw = String(data: data, encoding: .utf8) else {
+            throw KnowledgeDomainError(
+                .okfInvalid,
+                "OKF log is not valid bounded UTF-8.")
+        }
+        let normalized = Self.normalize(raw)
+        guard !normalized.hasPrefix("---\n") else {
+            throw KnowledgeDomainError(
+                .okfInvalid,
+                "OKF log files must not contain frontmatter.")
+        }
+
+        var dates: [String] = []
+        var currentEntryCount = 0
+        var sawDate = false
+        for rawLine in normalized.split(
+            separator: "\n",
+            omittingEmptySubsequences: false
+        ) {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            if line.hasPrefix("## ") {
+                if sawDate, currentEntryCount == 0 {
+                    throw KnowledgeDomainError(
+                        .okfInvalid,
+                        "Every OKF log date group must contain an entry.")
+                }
+                let date = String(line.dropFirst(3))
+                guard Self.parseISODateOnly(date) != nil else {
+                    throw KnowledgeDomainError(
+                        .okfInvalid,
+                        "OKF log date headings must use YYYY-MM-DD.")
+                }
+                if let previous = dates.last, previous <= date {
+                    throw KnowledgeDomainError(
+                        .okfInvalid,
+                        "OKF log date groups must be unique and newest first.")
+                }
+                dates.append(date)
+                currentEntryCount = 0
+                sawDate = true
+                continue
+            }
+            if line.hasPrefix("#") && !line.hasPrefix("# ") {
+                throw KnowledgeDomainError(
+                    .okfInvalid,
+                    "OKF log contains an unsupported heading shape.")
+            }
+            if sawDate, line.hasPrefix("* ") || line.hasPrefix("- ") {
+                currentEntryCount += 1
+            }
+        }
+        guard sawDate, currentEntryCount > 0 else {
+            throw KnowledgeDomainError(
+                .okfInvalid,
+                "OKF log must contain at least one dated entry group.")
+        }
+        return OKFLogDocument(
+            relativePath: relativePath,
+            normalizedText: normalized)
     }
 
     public static func normalize(_ value: String) -> String {
@@ -208,6 +456,19 @@ public struct OKFReader: Sendable {
                 }
             }
         }
+    }
+
+    /// Yams resolves an alias to the anchored node and stores anchors weakly
+    /// on that node. Keep the parser (and therefore its strong anchor table)
+    /// alive until the safety walk completes, otherwise a convenience
+    /// `compose` call can erase the evidence that the input used an anchor.
+    private func composeAndValidateSafety(yaml: String) throws -> Node? {
+        let parser = try Parser(yaml: yaml)
+        guard let root = try parser.singleRoot() else { return nil }
+        try withExtendedLifetime(parser) {
+            try validateNodeTree(root)
+        }
+        return root
     }
 
     private func objectValue(_ mapping: Node.Mapping) throws -> [String: JSONValue] {
@@ -333,6 +594,21 @@ public struct OKFReader: Sendable {
         }
     }
 
+    private func parseGenerated(_ value: JSONValue?) throws -> String? {
+        guard let value else { return nil }
+        guard case .object(let object) = value,
+              let by = object["by"]?.stringValue,
+              !by.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let at = object["at"]?.stringValue,
+              !at.isEmpty,
+              ISO8601DateFormatter().date(from: at) != nil else {
+            throw KnowledgeDomainError(
+                .okfInvalid,
+                "OKF generated must be a mapping with non-empty by and a valid ISO 8601 at datetime.")
+        }
+        return at
+    }
+
     private static func conceptID(_ relativePath: String) throws -> String {
         guard relativePath.hasSuffix(".md"),
               !relativePath.hasPrefix("/"),
@@ -340,6 +616,27 @@ public struct OKFReader: Sendable {
             throw KnowledgeDomainError(.okfInvalid, "OKF concept path is invalid.")
         }
         return String(relativePath.dropLast(3))
+    }
+
+    static func parseISODateOnly(_ value: String) -> Date? {
+        guard value.range(
+            of: #"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"#,
+            options: .regularExpression) != nil else { return nil }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let components = value.split(separator: "-").compactMap {
+            Int($0)
+        }
+        guard components.count == 3,
+              let date = calendar.date(from: DateComponents(
+                year: components[0],
+                month: components[1],
+                day: components[2])) else { return nil }
+        let resolved = calendar.dateComponents([.year, .month, .day], from: date)
+        guard resolved.year == components[0]
+            && resolved.month == components[1]
+            && resolved.day == components[2] else { return nil }
+        return date
     }
 }
 

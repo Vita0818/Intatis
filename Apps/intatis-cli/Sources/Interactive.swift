@@ -306,7 +306,6 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
         var sendText = text
         for file in pending.textFiles { sendText += "\n\n[attached file: \(file.name)]\n\(file.content)" }
         let sendImages = pending.images
-        pending.clear()
 
         spinner.start()
         do {
@@ -481,6 +480,7 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
             case .cowork:
                 break
             }
+            pending.clear()
         } catch {
             errOut("error: \(error.localizedDescription)\n")
         }
@@ -1305,17 +1305,6 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
             .classify(message)
             .isExplicit
         for file in pending.textFiles { message += "\n\n[attached file: \(file.name)]\n\(file.content)" }
-        let images = pending.images
-        let attachmentIDs: [ArtifactID]
-        do {
-            attachmentIDs = try await preserveAgentImages(
-                images,
-                in: artifactStore)
-        } catch {
-            errOut(
-                "attachments could not be preserved: \(error.localizedDescription)\n")
-            continue
-        }
         let mainInferenceBinding: AgentInferenceBinding?
         if target == Orchestrator.mainAgentID {
             guard let binding = await resolvableMainBinding() else {
@@ -1327,9 +1316,19 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
         } else {
             mainInferenceBinding = nil
         }
-        pending.clear()
+        let images = pending.images
+        let attachmentIDs: [ArtifactID]
+        do {
+            attachmentIDs = try await preserveAgentImages(
+                images,
+                in: artifactStore)
+        } catch {
+            errOut(
+                "attachments could not be preserved: \(error.localizedDescription)\n")
+            continue
+        }
         spinner.start()
-        _ = await goalRuntime.sendUserTurn(
+        let sendResult = await goalRuntime.sendUserTurn(
             message,
             to: target,
             userMessage: UserMessagePayload(
@@ -1345,5 +1344,10 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
                 turnID: TurnID.new()),
             explicitGoalIntent: explicitGoalIntent)
         spinner.stop()
+        if let error = sendResult.errorMessage {
+            errOut("error: \(error)\n")
+        } else {
+            pending.clear()
+        }
     }
 }

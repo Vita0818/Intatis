@@ -74,17 +74,21 @@ public struct AgentModelHistoryCompactionResult: Equatable, Sendable {
     public var message: String
     public var replacementHistory: [ModelHistoryReplacementItem]
     public var providerHistory: [AgentMessage]
+    public var checkpointSchemaVersion: Int
     public var usage: Usage?
 
     public init(
         message: String,
         replacementHistory: [ModelHistoryReplacementItem],
         providerHistory: [AgentMessage],
+        checkpointSchemaVersion: Int =
+            ModelHistoryCompactedPayload.currentSchemaVersion,
         usage: Usage?
     ) {
         self.message = message
         self.replacementHistory = replacementHistory
         self.providerHistory = providerHistory
+        self.checkpointSchemaVersion = checkpointSchemaVersion
         self.usage = usage
     }
 }
@@ -120,36 +124,22 @@ public struct AgentModelHistoryCompactor: Sendable {
     public func compact(
         history: [AgentMessage],
         realUserMessages: [AgentModelHistoryRealUserMessage],
+        mediaAwareCheckpointRequired: Bool = false,
         maximumReplacementInputTokens: Int? = nil
     ) async throws -> AgentModelHistoryCompactionResult {
-        let protectedPrefixCount = history.prefix {
-            $0.role == .system || $0.role == .developer
-        }.count
-        let protectedPrefix = Array(history.prefix(protectedPrefixCount))
-        var mutableHistory = Array(history.dropFirst(protectedPrefixCount))
-        while true {
-            do {
-                return try await compactOnce(
-                    history: protectedPrefix + mutableHistory,
-                    realUserMessages: realUserMessages,
-                    maximumReplacementInputTokens:
-                        maximumReplacementInputTokens)
-            } catch let contextError as
-                ProviderContextWindowExceededError
-            {
-                try Task.checkCancellation()
-                guard !mutableHistory.isEmpty else {
-                    throw contextError
-                }
-                Self.removeOldestLogicalHistoryItem(
-                    from: &mutableHistory)
-            }
-        }
+        try await compactOnce(
+            history: history,
+            realUserMessages: realUserMessages,
+            mediaAwareCheckpointRequired:
+                mediaAwareCheckpointRequired,
+            maximumReplacementInputTokens:
+                maximumReplacementInputTokens)
     }
 
     private func compactOnce(
         history: [AgentMessage],
         realUserMessages: [AgentModelHistoryRealUserMessage],
+        mediaAwareCheckpointRequired: Bool,
         maximumReplacementInputTokens: Int?
     ) async throws -> AgentModelHistoryCompactionResult {
         try Task.checkCancellation()
@@ -303,8 +293,7 @@ public struct AgentModelHistoryCompactor: Sendable {
                 messageClassification: .realUser,
                 content: user.content,
                 contentTruncated:
-                    user.contentTruncated ? true : nil,
-                attachmentIDs: user.attachmentIDs)
+                    user.contentTruncated ? true : nil)
         }
         replacement.append(ModelHistoryReplacementItem(
             itemID: "model-history-compaction-summary:\(UUID().uuidString.lowercased())",
@@ -319,6 +308,14 @@ public struct AgentModelHistoryCompactor: Sendable {
             providerHistory:
                 retainedUsers.map { .user($0.content) }
                 + [.user(continuationMessage)],
+            checkpointSchemaVersion:
+                mediaAwareCheckpointRequired
+                    || history.contains(where: { !$0.images.isEmpty })
+                    || realUserMessages.contains(where: {
+                        $0.imageReferences?.isEmpty == false
+                    })
+                    ? ModelHistoryCompactedPayload.mediaSchemaVersion
+                    : ModelHistoryCompactedPayload.currentSchemaVersion,
             usage: responseUsage
                 ?? Usage(totalTokens: Self.estimatedTotalTokens(
                     request: request,
@@ -421,29 +418,6 @@ public struct AgentModelHistoryCompactor: Sendable {
             }
         }
         return best.users
-    }
-
-    /// Codex removes the corresponding call/output item together with the
-    /// oldest history item. Intatis groups parallel calls into one assistant
-    /// message, so dropping that message also drops its immediately following
-    /// matching outputs. The search must stop at that adjacent group because a
-    /// later turn may legally reuse the same provider call ID.
-    private static func removeOldestLogicalHistoryItem(
-        from history: inout [AgentMessage]
-    ) {
-        guard !history.isEmpty else { return }
-        let removed = history.removeFirst()
-        if let calls = removed.toolCalls, !calls.isEmpty {
-            let callIDs = Set(calls.map(\.id))
-            while let adjacent = history.first,
-                  adjacent.role == .tool,
-                  adjacent.toolCallId.map(callIDs.contains) == true {
-                history.removeFirst()
-            }
-        }
-        // A leading tool message has no preceding call in this mutable slice.
-        // Remove only that orphan; searching later history by call ID could
-        // erase an unrelated newer turn that legally reused the same ID.
     }
 
     private static func retainedRealUsers(

@@ -13,6 +13,8 @@ public struct KnowledgeSearchPolicy: Equatable, Sendable {
     public var maximumEvidencePerSource: Int
     public var allowedStatuses: Set<String>
     public var allowedTrustTiers: Set<String>
+    public var allowedConceptIDs: Set<String>?
+    public var allowedSourceIDs: Set<String>?
     public var includeStale: Bool
     public var evaluationDate: String
     public var maximumDurationMilliseconds: Int
@@ -29,6 +31,8 @@ public struct KnowledgeSearchPolicy: Equatable, Sendable {
                 allowedTrustTiers: Set<String> = [
                     "human-reviewed", "machine-confirmed", "unverified",
                 ],
+                allowedConceptIDs: Set<String>? = nil,
+                allowedSourceIDs: Set<String>? = nil,
                 includeStale: Bool = false,
                 evaluationDate: String,
                 maximumDurationMilliseconds: Int = 15_000,
@@ -42,6 +46,8 @@ public struct KnowledgeSearchPolicy: Equatable, Sendable {
         self.maximumEvidencePerSource = maximumEvidencePerSource
         self.allowedStatuses = allowedStatuses
         self.allowedTrustTiers = allowedTrustTiers
+        self.allowedConceptIDs = allowedConceptIDs
+        self.allowedSourceIDs = allowedSourceIDs
         self.includeStale = includeStale
         self.evaluationDate = evaluationDate
         self.maximumDurationMilliseconds = maximumDurationMilliseconds
@@ -104,6 +110,7 @@ public struct KnowledgeSnapshotSearchReader: Sendable {
     private let rerankerProvider: (any KnowledgeRerankerProvider)?
     private let denseIndex: KnowledgeDenseIndex?
     private let lexicalIndex: KnowledgeBM25Index?
+    private let retrievalRoute: KnowledgeRetrievalExecutionRoute
     private let eligibleChunks: [String: EligibleChunk]
     private let validator: KnowledgeValidator
 
@@ -120,6 +127,17 @@ public struct KnowledgeSnapshotSearchReader: Sendable {
                 retryable: true,
                 "The knowledge snapshot is not semantically valid.")
         }
+        guard snapshot.evidenceValidationContext.backendRegistry.digest
+                == snapshot.backendRegistryDigest else {
+            throw KnowledgeDomainError(
+                .integrityFailed,
+                "The mounted snapshot evidence registry binding is inconsistent.")
+        }
+        guard snapshot.profile.retrieval.dense == "required" else {
+            throw KnowledgeDomainError(
+                .integrityFailed,
+                "The snapshot contains an unsupported dense retrieval policy.")
+        }
         guard let denseProfile = snapshot.profile.embeddingIndexes.first(where: {
             $0.id == snapshot.profile.retrievalSnapshot.dense.id
                 && $0.componentRevision
@@ -135,6 +153,52 @@ public struct KnowledgeSnapshotSearchReader: Sendable {
             throw KnowledgeDomainError(
                 .accessDenied,
                 "A remote embedding route was not included in the authorized execution semantics.")
+        }
+
+        let selectedLexicalFile: KnowledgeLexicalIndexFile?
+        switch snapshot.profile.retrieval.lexical {
+        case "disabled":
+            // A retained or otherwise stray lexical artifact is not authority
+            // to widen the frozen retrieval route.
+            selectedLexicalFile = nil
+        case "optional", "required":
+            if let selected = snapshot.profile.retrievalSnapshot.lexical {
+                guard snapshot.profile.lexicalIndexes.contains(where: {
+                    $0.id == selected.id
+                        && $0.componentRevision == selected.componentRevision
+                }), let lexicalFile = snapshot.lexicalFile else {
+                    throw KnowledgeDomainError(
+                        .indexNotReady,
+                        retryable: true,
+                        "The selected lexical retrieval component is unavailable.")
+                }
+                selectedLexicalFile = lexicalFile
+            } else if snapshot.profile.retrieval.lexical == "required" {
+                throw KnowledgeDomainError(
+                    .indexNotReady,
+                    retryable: true,
+                    "The snapshot requires an exact lexical retrieval component.")
+            } else {
+                // Optional means absent is an explicit dense-only route. A
+                // lexical file that is not selected by the snapshot is ignored.
+                selectedLexicalFile = nil
+            }
+        default:
+            throw KnowledgeDomainError(
+                .integrityFailed,
+                "The snapshot contains an unsupported lexical retrieval policy.")
+        }
+
+        let route: KnowledgeRetrievalExecutionRoute
+        switch snapshot.profile.retrieval.fusion {
+        case "dense_only":
+            route = .denseOnly
+        case "rrf":
+            route = selectedLexicalFile == nil ? .denseOnly : .hybridRRF
+        default:
+            throw KnowledgeDomainError(
+                .integrityFailed,
+                "The snapshot contains an unsupported retrieval fusion route.")
         }
         let reranker: (any KnowledgeRerankerProvider)?
         switch snapshot.profile.retrieval.reranker.mode {
@@ -181,7 +245,17 @@ public struct KnowledgeSnapshotSearchReader: Sendable {
             guard let metadata = Self.metadata(
                 for: chunk,
                 concepts: snapshot.concepts,
-                evaluationDate: policy.evaluationDate),
+                evaluationDate: policy.evaluationDate) else {
+                continue
+            }
+            let conceptAllowed = policy.allowedConceptIDs.map { allowed in
+                metadata.conceptIDs.isSubset(of: allowed)
+            } ?? true
+            let sourcesAllowed = policy.allowedSourceIDs.map { allowed in
+                Set(chunk.sourceIDs).isSubset(of: allowed)
+            } ?? true
+            guard conceptAllowed,
+                  sourcesAllowed,
                   policy.allowedStatuses.contains(metadata.status),
                   policy.allowedTrustTiers.contains(metadata.trust),
                   policy.includeStale || !metadata.stale else {
@@ -220,7 +294,7 @@ public struct KnowledgeSnapshotSearchReader: Sendable {
         }
 
         let lexical: KnowledgeBM25Index?
-        if let lexicalFile = snapshot.lexicalFile {
+        if route == .hybridRRF, let lexicalFile = selectedLexicalFile {
             let documents = lexicalFile.documents.filter {
                 eligible[$0.chunkID] != nil
             }
@@ -239,8 +313,17 @@ public struct KnowledgeSnapshotSearchReader: Sendable {
         rerankerProvider = reranker
         denseIndex = dense
         lexicalIndex = lexical
+        retrievalRoute = route
         eligibleChunks = eligible
-        self.validator = try validator ?? KnowledgeValidator()
+        let exactValidator = try validator
+            ?? snapshot.evidenceValidationContext.makeValidator()
+        guard exactValidator.backendRegistry.digest
+                == snapshot.backendRegistryDigest else {
+            throw KnowledgeDomainError(
+                .integrityFailed,
+                "Search evidence validation does not match the mounted backend registry.")
+        }
+        self.validator = exactValidator
     }
 
     /// Runs deterministic hybrid retrieval against this exact reader snapshot.
@@ -277,7 +360,9 @@ public struct KnowledgeSnapshotSearchReader: Sendable {
 
         let queryVector: [Float]
         do {
-            queryVector = try await embeddingProvider.embedQuery(normalizedQuery)
+            queryVector = try await withDeadline(started: started) {
+                try await embeddingProvider.embedQuery(normalizedQuery)
+            }
         } catch is CancellationError {
             throw KnowledgeDomainError(
                 .searchCancelled,
@@ -290,9 +375,16 @@ public struct KnowledgeSnapshotSearchReader: Sendable {
             limit: policy.denseCandidateLimit).filter {
                 $0.score >= policy.minimumDenseSimilarity
             }
-        let lexical = lexicalIndex?.search(
-            query: normalizedQuery,
-            limit: policy.lexicalCandidateLimit) ?? []
+        let lexical: [KnowledgeScoredChunk]
+        if retrievalRoute == .hybridRRF,
+           policy.lexicalCandidateLimit > 0,
+           let lexicalIndex {
+            lexical = lexicalIndex.search(
+                query: normalizedQuery,
+                limit: policy.lexicalCandidateLimit)
+        } else {
+            lexical = []
+        }
         guard dense.count + lexical.count <= policy.resultBudget.maximumCandidates else {
             throw KnowledgeDomainError(
                 .searchBudgetExceeded,
@@ -300,12 +392,20 @@ public struct KnowledgeSnapshotSearchReader: Sendable {
         }
         try checkExecutionState(started: started)
 
-        let fused = KnowledgeRRF.fuse(
-            [dense, lexical].filter { !$0.isEmpty },
-            k: policy.rrfConstant,
-            limit: min(
-                policy.resultBudget.maximumCandidates,
-                max(policy.denseCandidateLimit, policy.lexicalCandidateLimit)))
+        let fused: [KnowledgeScoredChunk]
+        switch retrievalRoute {
+        case .denseOnly:
+            fused = dense
+        case .hybridRRF:
+            fused = KnowledgeRRF.fuse(
+                [dense, lexical].filter { !$0.isEmpty },
+                k: policy.rrfConstant,
+                limit: min(
+                    policy.resultBudget.maximumCandidates,
+                    max(
+                        policy.denseCandidateLimit,
+                        policy.lexicalCandidateLimit)))
+        }
         let ordered: [KnowledgeScoredChunk]
         let rerankApplied: Bool
         if let rerankerProvider, !fused.isEmpty {
@@ -320,9 +420,11 @@ public struct KnowledgeSnapshotSearchReader: Sendable {
             }
             let reranked: [KnowledgeRerankedCandidate]
             do {
-                reranked = try await rerankerProvider.rerank(
-                    query: normalizedQuery,
-                    candidates: rerankInput)
+                reranked = try await withDeadline(started: started) {
+                    try await rerankerProvider.rerank(
+                        query: normalizedQuery,
+                        candidates: rerankInput)
+                }
             } catch is CancellationError {
                 throw KnowledgeDomainError(
                     .searchCancelled,
@@ -503,8 +605,9 @@ public struct KnowledgeSnapshotSearchReader: Sendable {
         let chunk = eligible.chunk
         let evidenceDigest = KnowledgeDigest.sha256([
             "intatis-evidence-id/1",
-            knowledgeBase,
+            snapshot.profile.bundle.id,
             snapshot.profile.bundle.revision,
+            snapshot.profile.retrievalSnapshot.id,
             snapshot.profile.retrievalSnapshot.revision,
             chunk.chunkID,
             chunk.textSha256,
@@ -568,6 +671,66 @@ public struct KnowledgeSnapshotSearchReader: Sendable {
         }
     }
 
+    /// Races one request-owned provider child against the remaining deadline.
+    /// Both children are cancelled and fully joined before this function
+    /// returns or throws; no detached or orphaned backend work is retained.
+    private func withDeadline<Value: Sendable>(
+        started: UInt64,
+        operation: @escaping @Sendable () async throws -> Value
+    ) async throws -> Value {
+        try checkExecutionState(started: started)
+        let now = DispatchTime.now().uptimeNanoseconds
+        let elapsed = now >= started ? now - started : UInt64.max
+        let maximum = UInt64(policy.maximumDurationMilliseconds) * 1_000_000
+        guard elapsed < maximum else {
+            throw KnowledgeDomainError(
+                .searchTimeout,
+                retryable: true,
+                "The knowledge search exceeded its bounded duration.")
+        }
+        let remaining = maximum - elapsed
+        return try await withThrowingTaskGroup(
+            of: KnowledgeDeadlineResult<Value>.self,
+            returning: Value.self
+        ) { group in
+            group.addTask {
+                .value(try await operation())
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: remaining)
+                return .timedOut
+            }
+            do {
+                guard let first = try await group.next() else {
+                    throw KnowledgeDomainError(
+                        .internalError,
+                        "The knowledge provider race produced no result.")
+                }
+                group.cancelAll()
+                while true {
+                    do {
+                        guard try await group.next() != nil else { break }
+                    } catch {
+                        // A cancelled sibling is expected; `next()` consumed it.
+                        continue
+                    }
+                }
+                switch first {
+                case .value(let value):
+                    return value
+                case .timedOut:
+                    throw KnowledgeDomainError(
+                        .searchTimeout,
+                        retryable: true,
+                        "The knowledge search exceeded its bounded duration.")
+                }
+            } catch {
+                group.cancelAll()
+                throw error
+            }
+        }
+    }
+
     private static func isValidHandle(_ value: String) -> Bool {
         value.range(
             of: #"^[A-Za-z0-9._-]{1,128}$"#,
@@ -578,7 +741,8 @@ public struct KnowledgeSnapshotSearchReader: Sendable {
         for chunk: KnowledgeChunk,
         concepts: [String: OKFConcept],
         evaluationDate: String
-    ) -> (trust: String, status: String, stale: Bool, diversityConcept: String)? {
+    ) -> (trust: String, status: String, stale: Bool,
+          diversityConcept: String, conceptIDs: Set<String>)? {
         switch chunk.evidenceClass {
         case .exactConceptSlice:
             guard let conceptID = chunk.conceptID,
@@ -590,7 +754,8 @@ public struct KnowledgeSnapshotSearchReader: Sendable {
                 concept.trustTier,
                 concept.status,
                 isStale(concept.staleAfter, evaluationDate: evaluationDate),
-                conceptID)
+                conceptID,
+                [conceptID])
         case .generatedDerivative:
             guard let supports = chunk.supportingConcepts, !supports.isEmpty else {
                 return nil
@@ -623,7 +788,12 @@ public struct KnowledgeSnapshotSearchReader: Sendable {
                 isStale($0.staleAfter, evaluationDate: evaluationDate)
             }
             let identity = supports.map(\.conceptID).sorted().joined(separator: "\u{1f}")
-            return (trust, status, stale, "generated:\(identity)")
+            return (
+                trust,
+                status,
+                stale,
+                "generated:\(identity)",
+                Set(supports.map(\.conceptID)))
         }
     }
 
@@ -633,7 +803,7 @@ public struct KnowledgeSnapshotSearchReader: Sendable {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let fallback = ISO8601DateFormatter()
-        let stale = formatter.date(from: staleAfter) ?? fallback.date(from: staleAfter)
+        let stale = OKFReader.parseISODateOnly(staleAfter)
         let evaluation = formatter.date(from: evaluationDate)
             ?? fallback.date(from: evaluationDate)
         guard let stale, let evaluation else {
@@ -643,4 +813,14 @@ public struct KnowledgeSnapshotSearchReader: Sendable {
         }
         return stale <= evaluation
     }
+}
+
+private enum KnowledgeDeadlineResult<Value: Sendable>: Sendable {
+    case value(Value)
+    case timedOut
+}
+
+private enum KnowledgeRetrievalExecutionRoute: Sendable {
+    case denseOnly
+    case hybridRRF
 }

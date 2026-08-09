@@ -2910,35 +2910,57 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                         "This submission payload is no longer available for retry.")
                     return
                 }
-                if let task = try await self.canonicalSubmissionTask(for: submissionID) {
-                    if task.status == .completed {
-                        let currentAttempt = max(
-                            1,
-                            self.submissionAttempts[submissionID] ?? 1)
-                        try await self.submittedIntentStore.appendStatus(
-                            SubmissionStatusChangedPayload(
-                                submissionID: submissionID,
-                                status: .completed,
-                                attempt: currentAttempt))
-                        self.restoredSubmissionIDs.remove(submissionID)
-                        self.composerError = nil
-                        self.publishSubmissionThreadChange(submissionID)
-                        return
-                    }
-                    if task.status == .queued
-                        || task.status == .running
-                        || task.status == .failed
-                        || task.status == .cancelled {
-                        self.submissionRetryTasks[submissionID] = task
-                    }
+                let currentAttempt = max(
+                    1,
+                    self.submissionAttempts[submissionID] ?? 1)
+                let task = try await self.canonicalSubmissionTask(
+                    for: submissionID)
+                let retryPlan = SubmittedIntentRetryPlanner.plan(
+                    currentAttempt: currentAttempt,
+                    task: task,
+                    isRestoredSubmission:
+                        self.restoredSubmissionIDs.contains(submissionID))
+                let retryAttempt: Int
+                let appendsQueuedStatus: Bool
+                switch retryPlan {
+                case .completed(let attempt):
+                    try await self.submittedIntentStore.appendStatus(
+                        SubmissionStatusChangedPayload(
+                            submissionID: submissionID,
+                            status: .completed,
+                            attempt: attempt))
+                    self.restoredSubmissionIDs.remove(submissionID)
+                    self.composerError = nil
+                    self.publishSubmissionThreadChange(submissionID)
+                    return
+                case .resumeRestoredTask(
+                    let attempt,
+                    let shouldAppendQueuedStatus):
+                    guard let task else { return }
+                    self.submissionRetryTasks[submissionID] = task
+                    retryAttempt = attempt
+                    appendsQueuedStatus = shouldAppendQueuedStatus
+                case .retryTerminalTask(let attempt):
+                    guard let task else { return }
+                    self.submissionRetryTasks[submissionID] = task
+                    retryAttempt = attempt
+                    appendsQueuedStatus = true
+                case .retrySubmissionWithoutTask(let attempt):
+                    retryAttempt = attempt
+                    appendsQueuedStatus = true
+                case .reject:
+                    self.composerError = IntatisLocalization.string(
+                        "This submission already has active or inconsistent task state and cannot be retried.")
+                    return
                 }
-                let nextAttempt = max(1, self.submissionAttempts[submissionID] ?? 1) + 1
-                try await self.submittedIntentStore.appendStatus(
-                    SubmissionStatusChangedPayload(
-                        submissionID: submissionID,
-                        status: .queued,
-                        attempt: nextAttempt))
-                self.submissionAttempts[submissionID] = nextAttempt
+                if appendsQueuedStatus {
+                    try await self.submittedIntentStore.appendStatus(
+                        SubmissionStatusChangedPayload(
+                            submissionID: submissionID,
+                            status: .queued,
+                            attempt: retryAttempt))
+                }
+                self.submissionAttempts[submissionID] = retryAttempt
                 self.restoredSubmissionIDs.remove(submissionID)
                 self.submittedPayloads[submissionID] = payload
                 if !self.submissionQueue.contains(submissionID) {

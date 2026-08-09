@@ -218,6 +218,32 @@ final class DocumentToolContractTests: XCTestCase {
         }
     }
 
+    func testHTMLWriteBindsOnlyExplicitLocalAssets() throws {
+        let write = try DocumentWriteArguments.decodeValidated(ToolArgs(raw: #"""
+        {
+          "format":"html","mode":"create","output_path":"site/index.html",
+          "local_asset_paths":["site/logo.png"],
+          "operations":[
+            {"kind":"xpath.append","parameters":{
+              "xpath":"//body","expected_match_count":1,
+              "html":"<img src=\"logo.png\" alt=\"logo\">"
+            }}
+          ]
+        }
+        """#))
+        XCTAssertEqual(write.localAssetPaths, ["site/logo.png"])
+
+        assertDocumentError(.validationFailed) {
+            _ = try DocumentWriteArguments.decodeValidated(ToolArgs(raw: #"""
+            {
+              "format":"docx","mode":"create","output_path":"report.docx",
+              "local_asset_paths":["assets/logo.png"],
+              "operations":[{"kind":"paragraph.add","parameters":{"text":"Hello"}}]
+            }
+            """#))
+        }
+    }
+
     func testExportPDFRejectsPDFInputAndRequiresExactExtensions() throws {
         _ = try DocumentExportPDFArguments.decodeValidated(ToolArgs(raw: """
         {"input_format":"docx","input_path":"reports/a.docx",
@@ -240,6 +266,19 @@ final class DocumentToolContractTests: XCTestCase {
             _ = try DocumentExportPDFArguments.decodeValidated(ToolArgs(raw: """
             {"input_format":"docx","input_path":"same.pdf","expected_source_sha256":"\(digestA)",
              "output_path":"same.pdf"}
+            """))
+        }
+
+        assertDocumentError(.unsupportedOperation) {
+            _ = try DocumentExportPDFArguments.decodeValidated(ToolArgs(raw: """
+            {"input_format":"epub","input_path":"book.epub",
+             "expected_source_sha256":"\(digestA)","output_path":"book.pdf"}
+            """))
+        }
+        assertDocumentError(.unsupportedOperation) {
+            _ = try DocumentRenderArguments.decodeValidated(ToolArgs(raw: """
+            {"input_format":"epub","input_path":"book.epub",
+             "expected_source_sha256":"\(digestA)","output_dir":"book-pages"}
             """))
         }
     }
@@ -558,4 +597,3 @@ final class DocumentToolContractTests: XCTestCase {
         }
     }
 }
-

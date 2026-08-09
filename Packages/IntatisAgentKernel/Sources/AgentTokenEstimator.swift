@@ -10,6 +10,8 @@ import IntatisProviders
 /// grapheme count. Matching that rule avoids badly under-counting CJK text and
 /// emoji while keeping this layer independent from any one model tokenizer.
 enum AgentTokenEstimator {
+    static let imageTokenCost = 4_096
+
     static func approximateTokens(in text: String) -> Int {
         guard !text.isEmpty else { return 0 }
         return max(1, (text.utf8.count + 3) / 4)
@@ -23,9 +25,6 @@ enum AgentTokenEstimator {
             partial
                 + message.role.rawValue.utf8.count
                 + (message.content?.utf8.count ?? 0)
-                + message.images.reduce(0) {
-                    $0 + $1.url.utf8.count
-                }
                 + (message.toolCallId?.utf8.count ?? 0)
                 + (message.toolCalls?.reduce(0) {
                     $0
@@ -48,7 +47,21 @@ enum AgentTokenEstimator {
         let toolBytes = tools.reduce(0) { partial, tool in
             partial + toolByteCount(tool)
         }
-        return max(1, (messageBytes + toolBytes + 3) / 4)
+        let imageCount = messages.reduce(0) {
+            $0 + $1.images.count
+        }
+        let textTokens = (messageBytes + toolBytes + 3) / 4
+        let imageTokens = approximateImageTokens(count: imageCount)
+        let (total, overflow) = textTokens.addingReportingOverflow(
+            imageTokens)
+        return overflow ? Int.max : max(1, total)
+    }
+
+    static func approximateImageTokens(count: Int) -> Int {
+        guard count > 0 else { return 0 }
+        let (tokens, overflow) = count.multipliedReportingOverflow(
+            by: imageTokenCost)
+        return overflow ? Int.max : tokens
     }
 
     static func approximateTotalTokens(

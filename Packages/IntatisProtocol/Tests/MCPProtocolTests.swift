@@ -668,4 +668,27 @@ final class MCPProtocolTests: XCTestCase {
         inspect(object)
         XCTAssertTrue(diagnostic.redacted)
     }
+
+    func testStructuredToolResultEncodesCompleteDiscriminator() throws {
+        let value = structuredResult()
+        let data = try JSONEncoder().encode(value)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any])
+
+        XCTAssertEqual(object["resultType"] as? String, "complete")
+        XCTAssertEqual(
+            try JSONDecoder().decode(MCPStructuredToolResult.self, from: data),
+            value)
+    }
+
+    func testLegacyStructuredToolResultWithoutDiscriminatorDecodesAsComplete() throws {
+        let legacy = #"{"content":[],"isError":false,"truncated":false}"#
+        let decoded = try JSONDecoder().decode(
+            MCPStructuredToolResult.self,
+            from: Data(legacy.utf8))
+
+        XCTAssertEqual(decoded.resultType, .complete)
+        XCTAssertEqual(decoded.content, [])
+        XCTAssertFalse(decoded.isError)
+    }
 }

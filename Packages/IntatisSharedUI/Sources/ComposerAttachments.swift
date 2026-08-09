@@ -46,8 +46,16 @@ public enum IntatisComposerAttachmentFileReader {
 
         let data = try Data(contentsOf: url, options: [.mappedIfSafe])
         #if canImport(UniformTypeIdentifiers)
-        let type = UTType(filenameExtension: url.pathExtension)
-        let mime = type?.preferredMIMEType ?? "application/octet-stream"
+        let mime: String
+        switch url.pathExtension.lowercased() {
+        case "png":
+            mime = "image/png"
+        case "jpg", "jpeg":
+            mime = "image/jpeg"
+        default:
+            let type = UTType(filenameExtension: url.pathExtension)
+            mime = type?.preferredMIMEType ?? "application/octet-stream"
+        }
         #else
         let mime = "application/octet-stream"
         #endif

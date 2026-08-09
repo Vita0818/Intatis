@@ -10,39 +10,54 @@ final class TurnGroundingEvidenceRegistryTests: XCTestCase {
     private let revision = "sha256:" + String(repeating: "a", count: 64)
     private let textDigest = "sha256:e67c6d223f7cc6495f0c65e9adb1aefc235742969c4f537449b2583c2fc71f14"
 
-    func testAcceptsOnlyEvidenceReturnedBySuccessfulCurrentTurnSearch() throws {
+    func testAcceptsOnlyEvidenceReturnedBySuccessfulCurrentTurnSearch() async throws {
         var registry = TurnGroundingEvidenceRegistry()
         try registry.record(
             toolName: "search_knowledge",
-            observation: successfulObservation())
+            observation: successfulObservation(),
+            revalidator: acceptingRevalidator)
 
-        XCTAssertNoThrow(try registry.validateCitations(
-            in: "Grounded answer [[evidence:\(evidenceID)]]"))
-        XCTAssertThrowsError(try registry.validateCitations(
-            in: "Invented [[evidence:ev_not_returned]]")) { error in
+        try await registry.validateCitations(
+            in: "Grounded answer [[evidence:\(evidenceID)]]")
+        do {
+            try await registry.validateCitations(
+                in: "Invented [[evidence:ev_not_returned]]")
+            XCTFail("invented citation unexpectedly passed")
+        } catch {
             XCTAssertEqual(
                 error as? TurnGroundingEvidenceRegistry.ValidationError,
                 .unknownCitation("ev_not_returned"))
         }
     }
 
-    func testNewTurnCannotReusePriorTurnEvidence() throws {
+    func testNewTurnCannotReusePriorTurnEvidence() async throws {
         var firstTurn = TurnGroundingEvidenceRegistry()
         try firstTurn.record(
             toolName: "search_knowledge",
-            observation: successfulObservation())
-        XCTAssertNoThrow(try firstTurn.validateCitations(
-            in: "First [[evidence:\(evidenceID)]]"))
+            observation: successfulObservation(),
+            revalidator: acceptingRevalidator)
+        try await firstTurn.validateCitations(
+            in: "First [[evidence:\(evidenceID)]]")
 
         let nextTurn = TurnGroundingEvidenceRegistry()
-        XCTAssertThrowsError(try nextTurn.validateCitations(
-            in: "Second [[evidence:\(evidenceID)]]"))
+        do {
+            try await nextTurn.validateCitations(
+                in: "Second [[evidence:\(evidenceID)]]")
+            XCTFail("old-turn citation unexpectedly passed")
+        } catch {
+            XCTAssertEqual(
+                error as? TurnGroundingEvidenceRegistry.ValidationError,
+                .unknownCitation(evidenceID))
+        }
     }
 
-    func testRejectsMalformedCitationAndTamperedEvidenceDigest() throws {
+    func testRejectsMalformedCitationAndTamperedEvidenceDigest() async throws {
         let empty = TurnGroundingEvidenceRegistry()
-        XCTAssertThrowsError(try empty.validateCitations(
-            in: "Broken [[evidence:ev_fixture")) { error in
+        do {
+            try await empty.validateCitations(
+                in: "Broken [[evidence:ev_fixture")
+            XCTFail("malformed citation unexpectedly passed")
+        } catch {
             XCTAssertEqual(
                 error as? TurnGroundingEvidenceRegistry.ValidationError,
                 .malformedCitation)
@@ -51,7 +66,8 @@ final class TurnGroundingEvidenceRegistryTests: XCTestCase {
         var registry = TurnGroundingEvidenceRegistry()
         XCTAssertThrowsError(try registry.record(
             toolName: "search_knowledge",
-            observation: successfulObservation(textDigest: revision))) { error in
+            observation: successfulObservation(textDigest: revision),
+            revalidator: acceptingRevalidator)) { error in
             guard case .malformedSearchResult? =
                     error as? TurnGroundingEvidenceRegistry.ValidationError else {
                 return XCTFail("expected malformed search result, got \(error)")
@@ -84,10 +100,63 @@ final class TurnGroundingEvidenceRegistryTests: XCTestCase {
         XCTAssertTrue(registry.bindings.isEmpty)
     }
 
+    func testFinalCitationFailsWhenMechanicalRevalidationDetectsDrift() async throws {
+        var registry = TurnGroundingEvidenceRegistry()
+        try registry.record(
+            toolName: "search_knowledge",
+            observation: successfulObservation(),
+            revalidator: { _ in
+                throw NSError(domain: "fixture-drift", code: 1)
+            })
+
+        do {
+            try await registry.validateCitations(
+                in: "Changed [[evidence:\(evidenceID)]]")
+            XCTFail("drifted evidence unexpectedly passed final validation")
+        } catch {
+            XCTAssertEqual(
+                error as? TurnGroundingEvidenceRegistry.ValidationError,
+                .evidenceChanged(evidenceID))
+        }
+    }
+
+    func testRepeatedStableEvidenceIsIdempotentButChangedBindingIsRejected() async throws {
+        var registry = TurnGroundingEvidenceRegistry()
+        try registry.record(
+            toolName: "search_knowledge",
+            observation: successfulObservation(),
+            revalidator: acceptingRevalidator)
+        try registry.record(
+            toolName: "search_knowledge",
+            observation: successfulObservation(),
+            revalidator: acceptingRevalidator)
+        XCTAssertEqual(registry.bindings.count, 1)
+        try await registry.validateCitations(
+            in: "Repeated [[evidence:\(evidenceID)]]")
+
+        let changedRevision = "sha256:" + String(repeating: "b", count: 64)
+        XCTAssertThrowsError(try registry.record(
+            toolName: "search_knowledge",
+            observation: successfulObservation(
+                retrievalSnapshotRevision: changedRevision),
+            revalidator: acceptingRevalidator)) { error in
+            guard case .malformedSearchResult? =
+                    error as? TurnGroundingEvidenceRegistry.ValidationError else {
+                return XCTFail("expected changed stable binding, got \(error)")
+            }
+        }
+    }
+
+    private var acceptingRevalidator: ToolGroundingEvidenceRevalidator {
+        { _ in }
+    }
+
     private func successfulObservation(
-        textDigest: String? = nil
+        textDigest: String? = nil,
+        retrievalSnapshotRevision: String? = nil
     ) -> ToolObservation {
         let digest = textDigest ?? self.textDigest
+        let snapshotRevision = retrievalSnapshotRevision ?? revision
         let evidenceURI =
             "knowledge://\(knowledgeBase)/\(snapshot)/\(evidenceID)"
         let response: JSONValue = .object([
@@ -95,7 +164,7 @@ final class TurnGroundingEvidenceRegistryTests: XCTestCase {
             "knowledge_base": .string(knowledgeBase),
             "knowledge_base_revision": .string(revision),
             "retrieval_snapshot": .string(snapshot),
-            "retrieval_snapshot_revision": .string(revision),
+            "retrieval_snapshot_revision": .string(snapshotRevision),
             "rerank_applied": .bool(false),
             "truncated": .bool(false),
             "evidence": .array([

@@ -10,15 +10,32 @@ enum HTMLDocumentPDFRenderer {
 
     static func render(
         input: URL,
-        workspaceRoot: URL,
+        stageRoot: URL,
         stagedPDF: URL,
         timeoutSeconds: TimeInterval = 30
     ) async throws -> [String: String] {
-        guard input.isFileURL,
+        let canonicalStageRoot = try? PathConfinement.canonicalExistingDirectory(stageRoot)
+        let stageValues = try? stageRoot.resourceValues(forKeys: [
+            .isDirectoryKey,
+            .isSymbolicLinkKey,
+        ])
+        let inputValues = try? input.resourceValues(forKeys: [
+            .isRegularFileKey,
+            .isSymbolicLinkKey,
+            .fileSizeKey,
+        ])
+        guard let canonicalStageRoot,
+              stageRoot.isFileURL,
+              stageValues?.isDirectory == true,
+              stageValues?.isSymbolicLink != true,
+              input.isFileURL,
               stagedPDF.isFileURL,
-              FileManager.default.fileExists(atPath: input.path),
-              PathConfinement.isWithin(input.path, root: workspaceRoot),
-              PathConfinement.isWithin(stagedPDF.path, root: workspaceRoot),
+              inputValues?.isRegularFile == true,
+              inputValues?.isSymbolicLink != true,
+              (inputValues?.fileSize ?? 0) > 0,
+              (inputValues?.fileSize ?? 0) <= 96 * 1_024 * 1_024,
+              PathConfinement.isWithin(input.path, root: canonicalStageRoot),
+              PathConfinement.isWithin(stagedPDF.path, root: canonicalStageRoot),
               FileManager.default.fileExists(atPath: stagedPDF.path) == false else {
             throw DocumentToolError(.validationFailed, "HTML render paths are invalid")
         }
@@ -42,7 +59,7 @@ enum HTMLDocumentPDFRenderer {
         let stream = navigation.events
         guard webView.loadFileURL(
             input,
-            allowingReadAccessTo: workspaceRoot) != nil else {
+            allowingReadAccessTo: canonicalStageRoot) != nil else {
             throw DocumentToolError(.renderFailed, "WKWebView rejected the local HTML load")
         }
         try await waitForNavigation(stream, timeoutSeconds: timeoutSeconds)
@@ -57,7 +74,7 @@ enum HTMLDocumentPDFRenderer {
             throw DocumentToolError(.renderFailed, "WKWebView returned an invalid PDF payload")
         }
         do {
-            try data.write(to: stagedPDF, options: [.atomic, .withoutOverwriting])
+            try data.write(to: stagedPDF, options: .withoutOverwriting)
         } catch {
             throw DocumentToolError(.renderFailed, "WKWebView PDF could not be staged")
         }
@@ -65,10 +82,10 @@ enum HTMLDocumentPDFRenderer {
     }
 
     private static func networkBlocker() async throws -> WKContentRuleList {
-        let rules = #"[{"trigger":{"url-filter":"^(https?|wss?)://"},"action":{"type":"block"}}]"#
+        let rules = #"[{"trigger":{"url-filter":"^http://"},"action":{"type":"block"}},{"trigger":{"url-filter":"^https://"},"action":{"type":"block"}},{"trigger":{"url-filter":"^ws://"},"action":{"type":"block"}},{"trigger":{"url-filter":"^wss://"},"action":{"type":"block"}}]"#
         return try await withCheckedThrowingContinuation { continuation in
             WKContentRuleListStore.default().compileContentRuleList(
-                forIdentifier: "intatis-document-network-deny-v1",
+                forIdentifier: "intatis-document-network-deny-v2",
                 encodedContentRuleList: rules
             ) { list, error in
                 if let list {
@@ -161,7 +178,7 @@ private final class HTMLNavigationGuard: NSObject, WKNavigationDelegate {
 enum HTMLDocumentPDFRenderer {
     static func render(
         input: URL,
-        workspaceRoot: URL,
+        stageRoot: URL,
         stagedPDF: URL,
         timeoutSeconds: TimeInterval = 30
     ) async throws -> [String: String] {

@@ -21,12 +21,66 @@ public struct KnowledgeBuildBudget: Equatable, Sendable {
     public var maximumChunks = 100_000
     public var maximumEmbeddingInputBytes = 256 * 1_024 * 1_024
     public var maximumVectorScalars = 100_000_000
+    public var maximumLexicalTokens = 5_000_000
     public var maximumDerivedBytes = 768 * 1_024 * 1_024
     public var embeddingBatchSize = 64
     public var maximumWallTimeSeconds = 30 * 60
     public var maximumWriterWaitSeconds = 30
 
     public init() {}
+}
+
+/// Canonical non-secret identity that the future `build_knowledge`
+/// ToolRegistration must use as its `authorizationArgumentIdentity`. Keeping
+/// the projection here lets the executor prove that reviewed paths, store
+/// generation, trust policy and exact embedding route are the ones it runs.
+public enum KnowledgeBuildAuthorizationIdentity {
+    public static func canonical(
+        draftRoot: URL,
+        storeRoot: URL,
+        expectedStoreID: String?,
+        workspaceLease: WorkspaceLease,
+        embeddingModel: KnowledgeEmbeddingModelIdentity,
+        trustedVerificationActors: Set<String>
+    ) throws -> String {
+        guard let workspaceIdentity = workspaceLease.rootIdentity,
+              workspaceIdentity.matchesCurrentDirectory(
+                rootPath: workspaceLease.rootPath) else {
+            throw KnowledgeDomainError(
+                .accessDenied,
+                "Knowledge build authorization workspace identity changed.")
+        }
+        let workspace = URL(
+            fileURLWithPath: workspaceIdentity.canonicalPath,
+            isDirectory: true)
+        let draft = try PathConfinement.resolve(draftRoot.path, within: workspace)
+        let store = try PathConfinement.resolve(storeRoot.path, within: workspace)
+        struct Projection: Codable {
+            let version: String
+            let draftPath: String
+            let storePath: String
+            let expectedStoreID: String?
+            let embeddingModel: KnowledgeEmbeddingModelIdentity
+            let trustedVerificationActors: [String]
+        }
+        let data = try KnowledgeJSON.encode(Projection(
+            version: "intatis-knowledge-build-authorization/1",
+            draftPath: PathConfinement.relativePath(of: draft, root: workspace),
+            storePath: PathConfinement.relativePath(of: store, root: workspace),
+            expectedStoreID: expectedStoreID,
+            embeddingModel: embeddingModel,
+            trustedVerificationActors: trustedVerificationActors.sorted()))
+        guard let value = String(data: data, encoding: .utf8) else {
+            throw KnowledgeDomainError(
+                .internalError,
+                "Knowledge build authorization identity could not be encoded.")
+        }
+        return value
+    }
+
+    public static func digest(_ canonicalIdentity: String) -> String {
+        String(KnowledgeDigest.sha256(canonicalIdentity).dropFirst("sha256:".count))
+    }
 }
 
 /// Exact, already-reviewed build request. `authorization` is not a substitute
@@ -207,6 +261,7 @@ public struct KnowledgeBundleBuildService: Sendable {
             from: roots.draft,
             to: stagingRoot,
             rootIdentity: roots.draftIdentity,
+            workspaceLease: request.workspaceLease,
             budget: budget,
             storage: storage,
             deadline: deadline)
@@ -215,6 +270,10 @@ public struct KnowledgeBundleBuildService: Sendable {
         }
 
         let knowledgeInventory = try fileSystem.leafInventory(root: stagingRoot)
+        try rejectSensitiveDraftMaterial(
+            root: stagingRoot,
+            inventory: knowledgeInventory,
+            deadline: deadline)
         let bundleRevision = try KnowledgeSecureFileSystem.canonicalBundleDigest(
             knowledgeInventory)
         let concepts = try readConcepts(
@@ -270,7 +329,10 @@ public struct KnowledgeBundleBuildService: Sendable {
         let denseFile = KnowledgeDenseIndexFile(
             dimensions: embeddingProvider.modelIdentity.dimensions,
             vectors: vectorBuild.records)
-        let lexicalFile = try buildLexicalIndex(chunks: chunking.chunks)
+        let lexicalFile = try buildLexicalIndex(
+            chunks: chunking.chunks,
+            budget: budget,
+            deadline: deadline)
         let denseData = try KnowledgeJSON.encode(denseFile)
         let lexicalData = try KnowledgeJSON.encode(lexicalFile)
         _ = try Self.boundedSum(
@@ -363,17 +425,44 @@ public struct KnowledgeBundleBuildService: Sendable {
     ) throws -> (
         draft: URL,
         draftIdentity: WorkspaceRootIdentity,
-        store: URL,
-        storeIdentity: WorkspaceRootIdentity
+        store: URL
     ) {
         let lease = request.workspaceLease
         let authorization = request.authorization
+        guard request.trustedVerificationActors.count <= 256,
+              request.trustedVerificationActors.allSatisfy({
+                  !$0.isEmpty && $0.count <= 256
+              }) else {
+            throw KnowledgeDomainError(
+                .accessDenied,
+                "Knowledge verification trust policy exceeds its host-owned bounds.")
+        }
+        let authorizationIdentity = try KnowledgeBuildAuthorizationIdentity.canonical(
+            draftRoot: request.draftRoot,
+            storeRoot: request.storeRoot,
+            expectedStoreID: request.expectedStoreID,
+            workspaceLease: lease,
+            embeddingModel: embeddingProvider.modelIdentity,
+            trustedVerificationActors: request.trustedVerificationActors)
+        let modelIdentityData = try KnowledgeJSON.encode(
+            embeddingProvider.modelIdentity)
+        guard let modelIdentityText = String(
+            data: modelIdentityData,
+            encoding: .utf8),
+              !PermissionReviewTextSanitizer.containsSensitiveMaterial(
+                  modelIdentityText) else {
+            throw KnowledgeDomainError(
+                .accessDenied,
+                "Knowledge embedding identity contains credential-like material.")
+        }
         guard lease.access == .readWrite,
               let leaseIdentity = lease.rootIdentity,
               leaseIdentity.matchesCurrentDirectory(rootPath: lease.rootPath),
               authorization.schemaVersion == 1,
               authorization.toolName == "build_knowledge",
               authorization.canonicalAction == "build_knowledge",
+              authorization.canonicalPermission == "build_knowledge",
+              authorization.intent.action == "build_knowledge",
               authorization.requiredCapabilities.contains(.buildKnowledge),
               authorization.membership == .granted,
               authorization.sideEffect == .write || authorization.sideEffect == .network,
@@ -385,6 +474,12 @@ public struct KnowledgeBundleBuildService: Sendable {
               authorization.workspaceRootIdentity == lease.rootIdentity,
               authorization.workspaceLeaseFingerprint
                 == ToolRegistry.authorizationFingerprint(lease),
+              authorization.normalizedArgumentsDigest
+                == KnowledgeBuildAuthorizationIdentity.digest(authorizationIdentity),
+              authorization.normalizedArgumentsCharacterCount
+                == authorizationIdentity.count,
+              authorization.replayPolicy == .requiresManualReconciliation,
+              authorization.intent.replayPolicy == .requiresManualReconciliation,
               authorization.deterministicGate?.decision != .deny,
               authorization.deterministicGate != nil else {
             throw KnowledgeDomainError(
@@ -398,33 +493,60 @@ public struct KnowledgeBundleBuildService: Sendable {
                 "Remote embedding was not included in the reviewed knowledge build risk.")
         }
 
+        let workspace = URL(fileURLWithPath: leaseIdentity.canonicalPath, isDirectory: true)
         let draft = try fileSystem.authorizeRoot(
             request.draftRoot,
             workspaceLease: lease)
-        let store = try fileSystem.authorizeRoot(
-            request.storeRoot,
-            workspaceLease: lease)
-        guard draft.canonical.path != store.canonical.path,
-              !PathConfinement.isWithin(draft.canonical.path, root: store.canonical),
-              !PathConfinement.isWithin(store.canonical.path, root: draft.canonical) else {
+        let requestedStore = try PathConfinement.resolve(
+            request.storeRoot.path,
+            within: workspace)
+        let store: URL
+        var isDirectory: ObjCBool = false
+        if FileManager.default.fileExists(
+            atPath: requestedStore.path,
+            isDirectory: &isDirectory) {
+            guard isDirectory.boolValue else {
+                throw KnowledgeDomainError(
+                    .unsafeStorage,
+                    "Knowledge store path is not a directory.")
+            }
+            store = try fileSystem.authorizeRoot(
+                requestedStore,
+                workspaceLease: lease).canonical
+        } else {
+            var ancestor = requestedStore.deletingLastPathComponent()
+            while !FileManager.default.fileExists(atPath: ancestor.path) {
+                let parent = ancestor.deletingLastPathComponent()
+                guard parent.path != ancestor.path else {
+                    throw KnowledgeDomainError(
+                        .accessDenied,
+                        "Knowledge store has no authorized existing ancestor.")
+                }
+                ancestor = parent
+            }
+            _ = try fileSystem.authorizeRoot(ancestor, workspaceLease: lease)
+            store = requestedStore
+        }
+        guard draft.canonical.path != store.path,
+              !PathConfinement.isWithin(draft.canonical.path, root: store),
+              !PathConfinement.isWithin(store.path, root: draft.canonical) else {
             throw KnowledgeDomainError(
                 .accessDenied,
                 "Knowledge draft and versioned store must be separate workspace directories.")
         }
-        let workspace = URL(fileURLWithPath: leaseIdentity.canonicalPath, isDirectory: true)
         try Self.validateLeasePath(draft.canonical, workspace: workspace, lease: lease)
-        try Self.validateLeasePath(store.canonical, workspace: workspace, lease: lease)
+        try Self.validateLeasePath(store, workspace: workspace, lease: lease)
         return (
             draft.canonical,
             draft.identity,
-            store.canonical,
-            store.identity)
+            store)
     }
 
     private func copyCanonicalDraft(
         from draft: URL,
         to staging: URL,
         rootIdentity: WorkspaceRootIdentity,
+        workspaceLease: WorkspaceLease,
         budget: KnowledgeBuildBudget,
         storage: KnowledgeBuildStorage,
         deadline: KnowledgeBuildDeadline
@@ -442,14 +564,29 @@ public struct KnowledgeBundleBuildService: Sendable {
 
         var copied = Set<String>()
         var normalizedBytes = 0
+        let knownPaths = Set(scanned.map(\.relativePath))
+        let canonicalWriter = OKFCanonicalWriter(reader: okfReader)
+        let workspace = URL(
+            fileURLWithPath: workspaceLease.rootIdentity?.canonicalPath
+                ?? workspaceLease.rootPath,
+            isDirectory: true)
         for file in scanned {
             try deadline.check()
             let path = file.relativePath
-            let isMarkdownKnowledge = path == "index.md"
-                || path == "log.md"
-                || (path.hasPrefix("concepts/") && path.hasSuffix(".md"))
-            let isReference = path.hasPrefix("references/")
-            guard isMarkdownKnowledge || isReference else {
+            try Self.validateLeasePath(
+                draft.appendingPathComponent(path),
+                workspace: workspace,
+                lease: workspaceLease)
+            let name = URL(fileURLWithPath: path).lastPathComponent
+            let isIndex = name == "index.md"
+            let isLog = name == "log.md"
+            let isConcept = OKFBundleLayout.isConcept(path)
+            let isMarkdownKnowledge = isIndex || isLog || isConcept
+            let isReference = path.split(separator: "/")
+                .contains("references")
+            guard !path.hasPrefix(".intatis-rag/"),
+                  path != ".intatis-rag",
+                  isMarkdownKnowledge || isReference else {
                 throw KnowledgeDomainError(
                     .okfInvalid,
                     "OKF draft contains a file outside the fixed knowledge snapshot layout.")
@@ -459,13 +596,20 @@ public struct KnowledgeBundleBuildService: Sendable {
                 relativePath: path,
                 maximumBytes: file.identity.size,
                 expectedRootIdentity: rootIdentity)
-            if isMarkdownKnowledge {
-                guard let text = String(data: data, encoding: .utf8) else {
-                    throw KnowledgeDomainError(
-                        .okfInvalid,
-                        "OKF Markdown knowledge must be valid UTF-8.")
-                }
-                data = Data(OKFReader.normalize(text).utf8)
+            if isIndex {
+                data = try canonicalWriter.canonicalIndex(
+                    data: data,
+                    relativePath: path)
+            } else if isLog {
+                data = try canonicalWriter.canonicalLog(
+                    data: data,
+                    relativePath: path)
+            } else if isConcept {
+                data = try canonicalWriter.canonicalConcept(
+                    data: data,
+                    relativePath: path,
+                    draftRoot: draft,
+                    knownPaths: knownPaths)
             }
             normalizedBytes = try Self.checkedAdding(normalizedBytes, data.count)
             guard normalizedBytes <= budget.maximumDraftBytes else {
@@ -486,8 +630,7 @@ public struct KnowledgeBundleBuildService: Sendable {
     ) throws -> [OKFConcept] {
         var concepts: [OKFConcept] = []
         var IDs = Set<String>()
-        for entry in inventory where entry.path.hasPrefix("concepts/")
-            && entry.path.hasSuffix(".md") {
+        for entry in inventory where OKFBundleLayout.isConcept(entry.path) {
             try deadline.check()
             let concept = try okfReader.readConcept(
                 data: fileSystem.readFile(
@@ -501,6 +644,31 @@ public struct KnowledgeBundleBuildService: Sendable {
             concepts.append(concept)
         }
         return concepts.sorted { $0.conceptID < $1.conceptID }
+    }
+
+    /// Secrets in canonical draft bytes must fail before any chunk text can be
+    /// sent to an embedding runtime. The final Validator repeats this check
+    /// across generated metadata and indexes immediately before publication.
+    private func rejectSensitiveDraftMaterial(
+        root: URL,
+        inventory: [KnowledgeChecksumEntry],
+        deadline: KnowledgeBuildDeadline
+    ) throws {
+        for entry in inventory {
+            try deadline.check()
+            let metadata = "\(entry.path)\n\(entry.role)"
+            let data = try fileSystem.readFile(
+                root: root,
+                relativePath: entry.path,
+                maximumBytes: entry.size)
+            guard !PermissionReviewTextSanitizer.containsSensitiveMaterial(metadata),
+                  !PermissionReviewTextSanitizer.containsSensitiveMaterial(
+                      String(decoding: data, as: UTF8.self)) else {
+                throw KnowledgeDomainError(
+                    .integrityFailed,
+                    "Knowledge draft contains credential-like material.")
+            }
+        }
     }
 
     private func validatedCurrentSnapshot(
@@ -555,6 +723,15 @@ public struct KnowledgeBundleBuildService: Sendable {
               chunks.count <= budget.maximumVectorScalars / dimensions else {
             throw Self.budgetExceeded("Knowledge vector scalar count exceeds the build budget.")
         }
+        let scalarCount = chunks.count * dimensions
+        // Bound JSON materialization before asking a provider for vectors. A
+        // float token plus separators can exceed its four-byte in-memory form;
+        // this conservative estimate prevents an otherwise bounded scalar
+        // count from allocating an unbounded serialized dense index.
+        guard scalarCount <= budget.maximumDerivedBytes / 24 else {
+            throw Self.budgetExceeded(
+                "Knowledge dense index serialization exceeds the build budget.")
+        }
 
         var reusableByTextDigest: [String: [Float]] = [:]
         if let previous,
@@ -573,7 +750,7 @@ public struct KnowledgeBundleBuildService: Sendable {
             for record in previous.denseFile.vectors {
                 guard let oldChunk = chunksByID[record.chunkID],
                       record.values.count == dimensions,
-                      Self.isUnitVector(record.values) else {
+                      KnowledgeVectorMath.isUnitNormalized(record.values) else {
                     throw KnowledgeDomainError(
                         .integrityFailed,
                         "Current knowledge snapshot contains a non-reusable embedding vector.")
@@ -624,7 +801,9 @@ public struct KnowledgeBundleBuildService: Sendable {
             }
             let vectors: [[Float]]
             do {
-                vectors = try await embeddingProvider.embedDocuments(texts)
+                vectors = try await withDeadline(deadline: deadline) {
+                    try await embeddingProvider.embedDocuments(texts)
+                }
             } catch is CancellationError {
                 throw KnowledgeDomainError(
                     .searchCancelled,
@@ -669,15 +848,74 @@ public struct KnowledgeBundleBuildService: Sendable {
             requestTextCount: requestTextCount)
     }
 
+    /// Races one request-owned embedding call against the remaining build
+    /// deadline, then cancels and joins both children before returning. This
+    /// keeps staging cleanup and writer-lease release ordered after provider
+    /// cleanup for cancellation-responsive runtimes.
+    private func withDeadline<Value: Sendable>(
+        deadline: KnowledgeBuildDeadline,
+        operation: @escaping @Sendable () async throws -> Value
+    ) async throws -> Value {
+        let remaining = try deadline.remainingNanoseconds()
+        return try await withThrowingTaskGroup(
+            of: KnowledgeBuildDeadlineResult<Value>.self,
+            returning: Value.self
+        ) { group in
+            group.addTask {
+                .value(try await operation())
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: remaining)
+                return .timedOut
+            }
+            do {
+                guard let first = try await group.next() else {
+                    throw KnowledgeDomainError(
+                        .internalError,
+                        "Knowledge build provider race produced no result.")
+                }
+                group.cancelAll()
+                while true {
+                    do {
+                        guard try await group.next() != nil else { break }
+                    } catch {
+                        continue
+                    }
+                }
+                switch first {
+                case .value(let value):
+                    return value
+                case .timedOut:
+                    throw KnowledgeDomainError(
+                        .searchTimeout,
+                        retryable: true,
+                        "Knowledge snapshot build exceeded its wall-time budget.")
+                }
+            } catch {
+                group.cancelAll()
+                throw error
+            }
+        }
+    }
+
     private func buildLexicalIndex(
-        chunks: [KnowledgeChunk]
+        chunks: [KnowledgeChunk],
+        budget: KnowledgeBuildBudget,
+        deadline: KnowledgeBuildDeadline
     ) throws -> KnowledgeLexicalIndexFile {
+        var totalTokens = 0
         let documents = try chunks.sorted { $0.chunkID < $1.chunkID }.map { chunk in
+            try deadline.check()
             let tokens = KnowledgeTextTokenizer.tokens(chunk.text)
             guard !tokens.isEmpty else {
                 throw KnowledgeDomainError(
                     .okfInvalid,
                     "A grounded chunk produced no tokens for the required lexical index.")
+            }
+            totalTokens = try Self.checkedAdding(totalTokens, tokens.count)
+            guard totalTokens <= budget.maximumLexicalTokens else {
+                throw Self.budgetExceeded(
+                    "Knowledge lexical token count exceeds the build budget.")
             }
             var terms: [String: Int] = [:]
             for token in tokens { terms[token, default: 0] += 1 }
@@ -845,6 +1083,7 @@ public struct KnowledgeBundleBuildService: Sendable {
               budget.maximumChunks > 0,
               budget.maximumEmbeddingInputBytes > 0,
               budget.maximumVectorScalars > 0,
+              budget.maximumLexicalTokens > 0,
               budget.maximumDerivedBytes > 0,
               budget.embeddingBatchSize > 0,
               budget.embeddingBatchSize <= 4_096,
@@ -896,12 +1135,6 @@ public struct KnowledgeBundleBuildService: Sendable {
             guard total <= maximum else { throw budgetExceeded(message) }
         }
         return total
-    }
-
-    private static func isUnitVector(_ values: [Float]) -> Bool {
-        guard !values.isEmpty, values.allSatisfy(\.isFinite) else { return false }
-        let squared = values.reduce(0.0) { $0 + Double($1) * Double($1) }
-        return squared.isFinite && abs(squared - 1) <= 0.002
     }
 
     private static func validateLeasePath(_ url: URL,
@@ -974,21 +1207,44 @@ public struct KnowledgeBundleBuildService: Sendable {
     }
 }
 
+private enum KnowledgeBuildDeadlineResult<Value: Sendable>: Sendable {
+    case value(Value)
+    case timedOut
+}
+
 private struct KnowledgeBuildDeadline: Sendable {
-    private let deadline: ContinuousClock.Instant
+    private let deadlineNanoseconds: UInt64
 
     init(seconds: Int) {
-        deadline = ContinuousClock.now.advanced(by: .seconds(seconds))
+        let now = DispatchTime.now().uptimeNanoseconds
+        let multiplied = UInt64(seconds).multipliedReportingOverflow(
+            by: 1_000_000_000)
+        let added = now.addingReportingOverflow(multiplied.partialValue)
+        deadlineNanoseconds = multiplied.overflow || added.overflow
+            ? UInt64.max
+            : added.partialValue
     }
 
     func check() throws {
         if Task.isCancelled { throw CancellationError() }
-        guard ContinuousClock.now < deadline else {
+        guard DispatchTime.now().uptimeNanoseconds < deadlineNanoseconds else {
             throw KnowledgeDomainError(
                 .searchTimeout,
                 retryable: true,
                 "Knowledge snapshot build exceeded its wall-time budget.")
         }
+    }
+
+    func remainingNanoseconds() throws -> UInt64 {
+        if Task.isCancelled { throw CancellationError() }
+        let now = DispatchTime.now().uptimeNanoseconds
+        guard now < deadlineNanoseconds else {
+            throw KnowledgeDomainError(
+                .searchTimeout,
+                retryable: true,
+                "Knowledge snapshot build exceeded its wall-time budget.")
+        }
+        return deadlineNanoseconds - now
     }
 }
 

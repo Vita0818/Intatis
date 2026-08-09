@@ -112,7 +112,7 @@ public struct KnowledgeDenseIndex: Sendable {
         for record in file.vectors {
             guard IDs.insert(record.chunkID).inserted,
                   record.values.count == file.dimensions,
-                  record.values.allSatisfy(\.isFinite) else {
+                  KnowledgeVectorMath.isUnitNormalized(record.values) else {
                 throw KnowledgeDomainError(.integrityFailed, "Dense index contains duplicate or incompatible vectors.")
             }
         }
@@ -121,13 +121,16 @@ public struct KnowledgeDenseIndex: Sendable {
     }
 
     public func search(query: [Float], limit: Int) throws -> [KnowledgeScoredChunk] {
-        guard query.count == dimensions, query.allSatisfy(\.isFinite) else {
+        guard query.count == dimensions else {
             throw KnowledgeDomainError(.embeddingIncompatible, "Query embedding does not match the dense index.")
         }
+        let normalizedQuery = try KnowledgeVectorMath.normalized(query)
         return try vectors.map {
             KnowledgeScoredChunk(
                 chunkID: $0.chunkID,
-                score: try KnowledgeVectorMath.cosine(query, $0.values))
+                score: try KnowledgeVectorMath.cosine(
+                    normalizedQuery,
+                    $0.values))
         }.sorted {
             if $0.score != $1.score { return $0.score > $1.score }
             return $0.chunkID < $1.chunkID

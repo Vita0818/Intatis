@@ -242,18 +242,13 @@ public struct AgentModelHistoryProjector: Sendable {
                     reason: "replacement message has no content")
             }
             messages.append(.user(content))
-            if let references = item.imageReferences {
-                imageBindings.append(.userVerified(references))
-            } else {
-                imageBindings.append(Self.legacyUserBinding(
-                    item.attachmentIDs))
-            }
+            imageBindings.append(nil)
             if item.messageClassification == .realUser {
                 realUsers.append(AgentModelHistoryRealUserMessage(
                     content: content,
                     submissionID: item.sourceSubmissionID,
-                    attachmentIDs: item.attachmentIDs,
-                    imageReferences: item.imageReferences,
+                    attachmentIDs: nil,
+                    imageReferences: nil,
                     contentTruncated: item.contentTruncated == true))
             }
         }
@@ -729,7 +724,9 @@ public struct AgentModelHistoryProjector: Sendable {
         for var checkpoint in rawCheckpoints {
             let payload = checkpoint.payload
             guard payload.schemaVersion
-                    == ModelHistoryCompactedPayload.currentSchemaVersion else {
+                    == ModelHistoryCompactedPayload.currentSchemaVersion
+                    || payload.schemaVersion
+                        == ModelHistoryCompactedPayload.mediaSchemaVersion else {
                 throw AgentModelHistoryProjectionError
                     .unsupportedCheckpointSchema(
                         sequence: checkpoint.sequence,
@@ -741,7 +738,28 @@ public struct AgentModelHistoryProjector: Sendable {
                 throw AgentModelHistoryProjectionError.invalidCheckpoint(
                     sequence: checkpoint.sequence,
                     reason:
-                        "checkpoint payload failed v1 structural validation")
+                        "checkpoint payload failed v1/v2 structural validation")
+            }
+            let lowerBound = previous?.sequence ?? Int.min
+            let coversV2DirectItem = events.contains { envelope in
+                guard envelope.seq > lowerBound,
+                      envelope.seq < checkpoint.sequence,
+                      case .modelHistoryItem(let item) = envelope.event,
+                      item.agent == agentID else {
+                    return false
+                }
+                return item.schemaVersion
+                    == ModelHistoryItemPayload.mediaSchemaVersion
+            }
+            let inheritsV2Checkpoint = previous?.payload.schemaVersion
+                == ModelHistoryCompactedPayload.mediaSchemaVersion
+            if payload.schemaVersion
+                    == ModelHistoryCompactedPayload.currentSchemaVersion,
+               coversV2DirectItem || inheritsV2Checkpoint
+            {
+                throw AgentModelHistoryProjectionError.invalidCheckpoint(
+                    sequence: checkpoint.sequence,
+                    reason: "a v1 checkpoint cannot cover or replace v2 media history")
             }
             for (field, value) in [
                 ("firstWindowID", payload.firstWindowID),
@@ -791,7 +809,6 @@ public struct AgentModelHistoryProjector: Sendable {
                 accepted: accepted,
                 bindings: nil)
             var covered = previous?.coveredSubmissions ?? []
-            let lowerBound = previous?.sequence ?? Int.min
             for envelope in events
                 where envelope.seq > lowerBound
                     && envelope.seq < checkpoint.sequence
@@ -900,7 +917,7 @@ public struct AgentModelHistoryProjector: Sendable {
                   item.encryptedReasoningContent == nil else {
                 throw AgentModelHistoryProjectionError.invalidCheckpoint(
                     sequence: checkpoint.sequence,
-                    reason: "replacement item \(item.itemID) has an unsupported v1 shape")
+                    reason: "replacement item \(item.itemID) has an unsupported v1/v2 shape")
             }
             if index == payload.replacementHistory.count - 1 {
                 guard item.messageClassification == .compactionSummary,
@@ -946,11 +963,6 @@ public struct AgentModelHistoryProjector: Sendable {
                                 reason: "retained real user text does not match its source")
                     }
                 }
-                guard item.attachmentIDs == source.payload.attachments else {
-                    throw AgentModelHistoryProjectionError.invalidCheckpoint(
-                        sequence: checkpoint.sequence,
-                        reason: "retained real user attachments do not match their source")
-                }
                 if let explicitTarget = source.payload.to,
                    explicitTarget != agentID {
                     throw AgentModelHistoryProjectionError.invalidCheckpoint(
@@ -974,8 +986,8 @@ public struct AgentModelHistoryProjector: Sendable {
                 realUsers.append(AgentModelHistoryRealUserMessage(
                     content: content,
                     submissionID: submissionID,
-                    attachmentIDs: item.attachmentIDs,
-                    imageReferences: item.imageReferences,
+                    attachmentIDs: nil,
+                    imageReferences: nil,
                     contentTruncated: item.contentTruncated == true))
                 realUserIndices.append(index)
             } else if item.messageClassification == .contextual {
@@ -992,14 +1004,7 @@ public struct AgentModelHistoryProjector: Sendable {
                     reason: "replacement item \(item.itemID) has an invalid classification")
             }
             messages.append(.user(content))
-            if let references = item.imageReferences {
-                imageBindings.append(.userVerified(references))
-            } else if item.messageClassification == .realUser {
-                imageBindings.append(Self.legacyUserBinding(
-                    item.attachmentIDs))
-            } else {
-                imageBindings.append(nil)
-            }
+            imageBindings.append(nil)
         }
         if !contextualIndices.isEmpty {
             guard let lastRealUserIndex = realUserIndices.last else {
@@ -1560,6 +1565,18 @@ public struct AgentModelHistoryProjector: Sendable {
                         payload: item.payload))
             case .message, .reasoning:
                 break
+            }
+        }
+        for (key, outputs) in outputsByKey
+            where outputs.contains(where: {
+                $0.payload.imageReferences?.isEmpty == false
+            })
+        {
+            guard let callSequence = callSequenceByKey[key],
+                  outputs.allSatisfy({ $0.sequence > callSequence }) else {
+                throw AgentModelHistoryProjectionError.invalidItem(
+                    outputs.first?.payload.itemID ?? key.callID,
+                    "media tool output has no preceding matching call")
             }
         }
 

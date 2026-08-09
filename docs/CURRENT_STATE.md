@@ -54,6 +54,23 @@ macOS 是完整产品：Chat、Code、Cowork、Settings 和本地诊断导出。
 - Code 使用共享 headless `AgentRuntime.code`，提供工作区文件、patch、Git、managed
   terminal、Skills、外部 MCP、文档/媒体及浏览器工具。工具可见性、lease、权限和 durable
   execution ticket 在执行前逐层核对。
+- Code/Cowork/CLI 的文档面已收敛为六个 exact 工具：`read_pdf`、`document_read`、
+  `document_ocr`、`document_render`、`document_export_pdf`、`document_write`。旧
+  `read_document` 自动 fallback、`edit_pdf_pages` 与 `reconstruct_document_image` 已从生产
+  registry/fresh lease 下架；PDF P0 仅原生文本/metadata 读取、显式 OCR、页面 PNG 和新生成
+  PDF 校验，不提供任何 PDF mutation。写入使用 source/destination snapshot、owner-only staging、
+  CAS、格式语义验证与 file/directory 原子提交；模型不能选择 executable/backend/command/env 或
+  fallback。DOCX/PPTX/XLSX/HTML 的 common-operation 子集由 python-docx/python-pptx/openpyxl/lxml
+  负责，XLSX 在 openpyxl staging 后经 LibreOffice UNO `calculateAll()`、显式另存、operation
+  postcondition 与 PDF preview 验证；EPUB read/write 绑定仓内可重复构建的 pinned rbook helper source
+  和正式 EPUBCheck，EPUB render/export 在 full-spine corpus gate 通过前不进入 model schema，并返回
+  `unsupported_operation`。文档辅助资产会先冻结 digest/identity，backend 运行与提交锁内再次核对；
+  staged commit 固定目标父目录 identity，生成物同时受单文件、总字节与 entry 数预算约束。当前用户
+  runtime 可导入固定 Python Office/HTML 组件并发现 LibreOffice/Tesseract，但缺少固定 Docling models、
+  已安装的 rbook helper、pdfcpu 与 EPUBCheck，因此对应路线 typed fail closed，不会自动降级；runtime
+  打包、双架构、签名/公证和其余发行许可闭包仍是独立工作。read-only Cowork worker 获得 in-process
+  `read_pdf` 以及固定、无持久写入的 `document_read` / `document_ocr`；render/export/write 只向
+  read-write worker/coordinator 显式签发。iOS Chat 不链接任何文档 runtime。
 - Code/Cowork/CLI 的 `generate_image` 与 `edit_image` 已接入 macOS/CLI 高级配置顶层
   `image_model`。主 agent 根据用户意图决定是否调用普通工具；model-facing schema 不接受
   provider/model，宿主统一从配置解析。缺少 `image_model` 时明确返回未配置，不再使用隐藏的
@@ -62,6 +79,18 @@ macOS 是完整产品：Chat、Code、Cowork、Settings 和本地诊断导出。
   接受工作区内单张 PNG/JPEG/WebP（最多 50 MiB）、prompt 与不同的 PNG 输出路径，经同一权限、
   WorkspaceLease、`PathConfinement` 和 durable tool execution 链调用 multipart `images/edits`，
   两者均只接受 `data[].b64_json` 输出。mask、多参考图与原地覆盖尚未支持。
+- Code 与 Cowork 的 Agent 图片输入已改为 durable active-history 链路。macOS共享composer reader对
+  `.png`/`.jpg`/`.jpeg`使用确定性canonical MIME映射（其他格式才查询系统type database），GUI/CLI
+  再把用户图片写入 exact-session `ArtifactStore`；AgentLoop 在 dispatch 前通过共享 resolver 有界读取并验证
+  PNG/JPEG、MIME、完整解码、尺寸/像素、byte count 与 SHA-256，再把无 base64/path 的 v2
+  descriptor 写入 stable model history。Code stable conversation 与 Cowork exact `@main` 支持
+  current/next/restart；ordinary task-scoped agent 只承诺 current，CLI Code 只承诺同进程 next。
+  MCP structured-result 图片会以原 `callID` 进入多模态 function output，live 与 restart replay使用同一
+  canonical binding；unsupported route、缺失/损坏 blob 或 descriptor不一致均在下一次provider请求前
+  typed fail closed。自动 Cowork ask-class授权快照若含图片则 durable
+  `media_authorization_unsupported` deny，不把图片描述交给可返回allow的文本reviewer。上下文压缩的
+  summarizer会看见完整active window中的用户/工具图片；checkpoint成功后所有旧原图只由摘要接替，
+  replacement不保留attachment/ref，但ArtifactStore blob与审计事实不删除。
 - macOS Chat/Code/Cowork 与 iOS Chat 的 composer 已在 Send/Stop 左侧接入同一个语音输入按钮。
   第一次点击开始录音，第二次点击停止并通过顶层 canonical `transcription_model` 指定的 exact
   provider/model 调用 `audio/transcriptions`；转写结果追加到完成时仍然可编辑的当前草稿，不自动
@@ -136,10 +165,58 @@ Swift-native `intatis` 提供 Chat/Code/Cowork REPL、managed execution、Skills
 profiles 与外部 MCP client。macOS/Linux 的 stdio、sandbox、bwrap/guard 和 PTY 能力按
 实际 host 支持情况 fail closed。
 
+## OKF / RAG knowledge bundle 当前状态
+
+- 仓库已固定 Open Knowledge Format v0.2 的 `SPEC.md` / `LICENSE.md` / SHA-256 inventory，
+  并新增非 iOS `IntatisKnowledge` product。该模块实现 Intatis OKF RAG Profile 0.1、九份冻结
+  JSON Schema、bounded Yams OKF reader、deterministic Validator、validation receipt、
+  `KnowledgeBundleBuildService`、immutable multi-version store、embedding/dense/BM25/RRF/reranker
+  runtime contracts、mount registry、source-locator replay 和 `search_knowledge`。
+- 建库与查询已分离。build service 只接收 workspace 内已授权的 OKF draft root 和已解析的 exact
+  authorization；它在任何 embedding 前做 secret scan，用 host chunker 生成 grounded chunks，
+  只在完整 Validator 通过后原子 publish。相同完整 embedding/chunker/normalization identity 可按
+  canonical text 复用 vector；修改、删除或任一支持的模型身份字段变化会精确重建，冻结不支持的
+  scalar/quantization/metric 等组合直接拒绝。
+- build boundary 现在由 host-owned canonical v0.2 writer 重写 Agent draft：任意层非保留
+  Markdown 都作为 concept，任意层 `index.md` / `log.md` 都按 OKF reserved shape
+  验证；legacy `timestamp` / `# Citations` 只读兼容后迁移为 v0.2；source ID 由
+  canonical resource 生成 opaque ID，bundle path 和 scope descriptor 分开处理，私有绝对路径
+  不进入 portable snapshot 或 model-facing evidence。exact-slice `chunks.jsonl` 不包含运行时
+  wall clock，相同 canonical bytes/config 跨时钟重建为 bit-stable。
+- multi-source concept 只把显式 footnote 对应的 source ID 归给该 chunk；仅 exactly-one source
+  concept 允许 concept-level fallback，歧义段不会被伪装成 grounded chunk。`generated` 若出现则
+  必须同时具有 valid `by` / `at`，footnote claim、definition 与 `sources[].id` 必须机械闭合。
+- 当前本地 dense route 是 Apple NaturalLanguage English sentence embedding revision 1 / 512-d
+  的 exact runtime binding，加 `Float32` L2/cosine exact KNN；lexical route 是 Intatis 多语言/代码
+  tokenizer + BM25，hybrid 使用 RRF。存在 embedding-cosine reranker seam，但它不是 cross-encoder；
+  required/optional 模式均无静默 fallback。当前宿主冻结中英/代码 corpus 的 Apple route 为
+  Recall@5 0.882、MRR 0.681、nDCG@5 0.698、citation precision 1.000；这些数字只代表当前宿主与
+  小型冻结 corpus，Intel 真机、最低支持 macOS 和大规模真实知识仍是 `UNKNOWN`。
+- host 可以用 `KnowledgeSearchToolHostAdapter.augmenter(storeRoot:)` 把一个 exact current snapshot
+  绑定为 Code/Cowork 的动态内部工具。model-facing input 只有 query 和可选 bounded
+  limit（单库绑定时 handle 由 host 固定），
+  看不到 path/provider/backend/ACL。默认 seam 为 `nil`，没有知识库 UI、默认 mount、Chat 或 iOS
+  接入；这与本轮明确范围一致。
+- local-only `search_knowledge` 虽然不写文件、不联网，仍把知识正文带入 answering model，因此
+  deterministic gate 对 exact instance intent 返回 `pass`，继续经过 reviewer、PermissionEngine、
+  authorization correlation 与 durable lifecycle；不会继承普通本地 read 的自动放行。
+- successful evidence 在返回前复核 concept/source/hash/可选 source locator；AgentLoop 又把它限制为
+  current-turn citation，并在 final commit 前通过 exact registration 重新打开 snapshot 做异步机械
+  重验。urgent purge 会关闭 admission、cancel/drain、使 current pointer 持久失活并清 receipt；不会
+  擦除既有 EventLog/tool history，也不宣称物理 secure erase。
+- build service 要求并复核外层提供的 exact resolved authorization，但本轮没有 model-facing
+  `build_knowledge` registration，也没有 Agent producer 的 durable caller；外部解析/清洗工作流接入时
+  必须补 prepared/result/settled，而不能把 service 单元测试写成该生命周期已接通。
+- `IntatisKnowledgeTests` 最终精确计数见 `docs/TESTING.md` 本轮验证记录，覆盖 schema、OKF safety、filesystem、
+  checksum/index corruption、secret/injection、build cancellation/timeout/reuse、snapshot/receipt/
+  purge、hybrid/rerank/budget/ACL/source locator/final grounding 和质量/性能代理。AgentKernel 的
+  current-turn citation registry 另有独立回归；真实 provider/remote embedding/reranker、Intel
+  NaturalLanguage runtime 和用户实际 corpus 仍需独立 smoke。
+
 ## 当前架构事实
 
-- 根 SwiftPM 图包含 14 个公共 library products、3 个内部 C/guard targets、CLI、开发期
-  MCP conformance executable 和 14 个 test targets。精确清单以 `Package.swift` 为准。
+- 根 SwiftPM 图包含 15 个公共 library products、3 个内部 C/guard targets、CLI、开发期
+  MCP conformance executable 和 15 个 test targets。精确清单以 `Package.swift` 为准。
 - `EventLog` 的 append-only JSONL 是 session canonical truth；`session.json` 是可重建的
   schema-v2 projection，artifact 使用独立 blob/index store。
 - Chat/Code/Cowork 都从稳定 `TurnID` 和结构化事件投影 UI。App 窗口只持有选择；macOS

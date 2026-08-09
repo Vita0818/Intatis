@@ -344,9 +344,9 @@ public struct ModelHistoryItemPayload: Codable, Equatable, Sendable {
             submissionID: submissionID,
             taskAttempt: taskAttempt,
             kind: .functionCallOutput,
+            imageReferences: imageReferences,
             callID: callID,
-            output: output,
-            imageReferences: imageReferences)
+            output: output)
     }
 
     public static func toolSearchOutput(
@@ -875,40 +875,19 @@ public struct ModelHistoryCompactedPayload: Codable, Equatable, Sendable {
                             .invalidRealUserProvenance(index: index)
                     }
                     if schemaVersion == Self.currentSchemaVersion {
+                        // Legacy v1 checkpoints could retain attachment IDs.
+                        // They remain decodable, but the projector no longer
+                        // promotes them back into post-compaction media.
                         guard item.imageReferences == nil else {
                             throw ModelHistoryCompactedPayloadValidationError
                                 .unsupportedReplacementItemShape(index: index)
                         }
                     } else {
-                        if let imageReferences = item.imageReferences {
-                            guard !imageReferences.isEmpty,
-                                  item.attachmentIDs
-                                    == imageReferences.map(\.artifactID) else {
-                                throw ModelHistoryCompactedPayloadValidationError
-                                    .unsupportedReplacementItemShape(index: index)
-                            }
-                            for (referenceIndex, reference) in
-                                imageReferences.enumerated()
-                            {
-                                do {
-                                    try reference.validate()
-                                } catch let error
-                                    as ModelHistoryImageReferenceValidationError
-                                {
-                                    throw ModelHistoryCompactedPayloadValidationError
-                                        .invalidImageReference(
-                                            itemIndex: index,
-                                            referenceIndex: referenceIndex,
-                                            reason: error)
-                                }
-                            }
-                        } else if item.attachmentIDs?.isEmpty == false {
-                            throw ModelHistoryCompactedPayloadValidationError
-                                .unsupportedReplacementItemShape(index: index)
-                        }
-                    }
-                    if item.attachmentIDs?.isEmpty == false {
-                        guard item.contentTruncated != true else {
+                        // New compaction deliberately turns all earlier images
+                        // into summary text. v2 marks coverage of media-aware
+                        // direct history without carrying old media forward.
+                        guard item.attachmentIDs == nil,
+                              item.imageReferences == nil else {
                             throw ModelHistoryCompactedPayloadValidationError
                                 .unsupportedReplacementItemShape(index: index)
                         }

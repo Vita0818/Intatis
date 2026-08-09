@@ -1,6 +1,7 @@
 import Foundation
 import IntatisCore
 import IntatisProtocol
+import IntatisTools
 
 public struct KnowledgeBaseHandle: RawRepresentable, Codable, Equatable, Hashable, Sendable {
     public let rawValue: String
@@ -88,6 +89,7 @@ public struct KnowledgeMountedSnapshotBinding: Equatable, Sendable {
     public let knowledgeBaseRevision: String
     public let snapshotID: String
     public let snapshotRevision: String
+    public let backendRegistryDigest: String
 
     public var knowledgeBaseHandle: String { handle.rawValue }
 }
@@ -383,6 +385,63 @@ public actor KnowledgeMountRegistry {
         }
     }
 
+    /// Final-answer grounding replay owned by the exact mounted registration.
+    /// It reopens the handle through the same host authority and pointer
+    /// generation, reconstructs the frozen evidence type, and runs the exact
+    /// Validator/backend registry again immediately before final commit.
+    public func revalidateGroundingEvidence(
+        _ grounding: ToolGroundingEvidence
+    ) async throws {
+        guard grounding.toolName == "search_knowledge",
+              let handle = KnowledgeBaseHandle(
+                rawValue: grounding.knowledgeBase),
+              let entry = entries[handle],
+              entry.admitting,
+              entry.binding.knowledgeBaseRevision
+                == grounding.knowledgeBaseRevision,
+              entry.binding.snapshotID == grounding.retrievalSnapshot,
+              entry.binding.snapshotRevision
+                == grounding.retrievalSnapshotRevision else {
+            throw KnowledgeDomainError(
+                .revisionChanged,
+                retryable: true,
+                "Grounding handle or snapshot binding changed before final validation.")
+        }
+        let access = try checkout(
+            handle: handle,
+            authority: entry.authority)
+        do {
+            guard access.binding == entry.binding,
+                  access.validatedSnapshot.backendRegistryDigest
+                    == entry.binding.backendRegistryDigest else {
+                throw KnowledgeDomainError(
+                    .integrityFailed,
+                    "Grounding backend registry binding changed before final validation.")
+            }
+            let evidence = try KnowledgeJSON.decode(
+                KnowledgeSearchEvidence.self,
+                from: KnowledgeJSON.encode(
+                    grounding.structuredEvidence))
+            guard evidence.evidenceID == grounding.evidenceID,
+                  evidence.textSha256 == grounding.textSHA256,
+                  evidence.evidenceURI == grounding.evidenceURI else {
+                throw KnowledgeDomainError(
+                    .integrityFailed,
+                    "Grounding evidence identity changed before final validation.")
+            }
+            let validator = try access.validatedSnapshot
+                .evidenceValidationContext.makeValidator()
+            try validator.validateEvidence(
+                evidence,
+                in: access.validatedSnapshot)
+            try access.verifyStable()
+            await access.close()
+        } catch {
+            await access.close()
+            throw error
+        }
+    }
+
     /// Convenience for model-authored raw handle strings. Invalid shape and
     /// unknown handles share the same non-enumerating access-denied result.
     public func checkout(
@@ -420,6 +479,31 @@ public actor KnowledgeMountRegistry {
         for handle in handles {
             revoke(handle, cancelActive: cancelActive)
         }
+    }
+
+    /// Revokes one opaque handle, signals every query admitted through that
+    /// handle, and waits for their query-owned reader leases to drain. Other
+    /// handles for the same store remain independent.
+    public func revokeAndDrain(
+        _ handle: KnowledgeBaseHandle,
+        timeoutNanoseconds: UInt64 = 5_000_000_000
+    ) async -> Bool {
+        revoke(handle, cancelActive: true)
+        let start = DispatchTime.now().uptimeNanoseconds
+        while activeAccess.values.contains(where: { $0.handle == handle }) {
+            let elapsed = DispatchTime.now().uptimeNanoseconds &- start
+            if elapsed >= timeoutNanoseconds { return false }
+            do {
+                try await Task.sleep(
+                    nanoseconds: min(
+                        10_000_000,
+                        timeoutNanoseconds - elapsed))
+            } catch {
+                return false
+            }
+        }
+        entries.removeValue(forKey: handle)
+        return true
     }
 
     /// Marks handles stale as soon as their exact pointer binding is no longer
@@ -467,8 +551,9 @@ public actor KnowledgeMountRegistry {
 
     /// Complete sensitive-content purge boundary for the active Intatis store:
     /// close admission, cancel and drain local queries, acquire the exact store
-    /// writer, invalidate concrete host receipts, then remove only non-current
-    /// snapshots whose cross-process reader locks have drained.
+    /// writer, persistently remove the current pointer when it is in scope,
+    /// invalidate concrete host receipts, then remove snapshots whose
+    /// cross-process reader locks have drained.
     public func urgentPurge(
         storeID: String,
         snapshotIDs: Set<String>,
@@ -524,16 +609,17 @@ public actor KnowledgeMountRegistry {
         }
         defer { writer.release() }
 
-        if let current = try writer.currentPointer()?.currentSnapshot,
+        let pointer = try writer.currentPointer()
+        if let current = pointer?.currentSnapshot,
            snapshotIDs.contains(current) {
-            throw KnowledgeDomainError(
-                .accessDenied,
-                "Urgent purge requires a validated replacement snapshot to be activated first.")
+            _ = try writer.deactivateStorePointer(
+                expectedStoreID: storeID)
         }
 
         let invalidated = try receiptStore.invalidate(
             storeID: storeID,
-            snapshotIDs: snapshotIDs)
+            snapshotIDs: snapshotIDs,
+            preventRepublication: true)
         let removed = try writer.purgeDrainedSnapshots(snapshotIDs)
         entries = entries.filter { _, entry in
             entry.binding.storeID != storeID
@@ -600,6 +686,7 @@ public actor KnowledgeMountRegistry {
             admissionKind: reader.admissionKind,
             knowledgeBaseRevision: snapshot.profile.bundle.revision,
             snapshotID: reader.admittedSnapshotID,
-            snapshotRevision: reader.admittedSnapshotRevision)
+            snapshotRevision: reader.admittedSnapshotRevision,
+            backendRegistryDigest: snapshot.backendRegistryDigest)
     }
 }

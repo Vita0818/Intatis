@@ -16,6 +16,12 @@ import Musl
 public struct KnowledgeValidationReceiptStore: Sendable {
     public let root: URL
 
+    private struct PurgeTombstone: Codable, Equatable {
+        let schema: String
+        let storeID: String
+        let snapshotID: String
+    }
+
     private var registryLockURL: URL {
         root.appendingPathComponent(".receipt-registry.lock", isDirectory: false)
     }
@@ -41,10 +47,15 @@ public struct KnowledgeValidationReceiptStore: Sendable {
         validatedAt: String,
         expiresAt: String? = nil
     ) throws -> KnowledgeValidationReceipt {
+        let validatedDate = ISO8601DateFormatter().date(from: validatedAt)
+        let expiryDate = expiresAt.flatMap {
+            ISO8601DateFormatter().date(from: $0)
+        }
         guard snapshot.report.semanticVerdict,
               snapshot.profile.bundle.id == storeID,
-              ISO8601DateFormatter().date(from: validatedAt) != nil,
-              expiresAt.map({ ISO8601DateFormatter().date(from: $0) != nil }) ?? true else {
+              validatedDate != nil,
+              expiresAt == nil || expiryDate != nil,
+              expiryDate.map({ $0 > validatedDate! }) ?? true else {
             throw KnowledgeDomainError(.integrityFailed, "A validation receipt can only represent an exact valid snapshot and bounded date-time.")
         }
         let diagnosticsDigest = try KnowledgeDigest.canonical(
@@ -59,13 +70,16 @@ public struct KnowledgeValidationReceiptStore: Sendable {
             validator: .init(
                 identity: KnowledgeContract.validatorIdentity,
                 version: KnowledgeContract.validatorVersion),
-            backendRegistryDigest: try KnowledgeBackendRegistry().digest,
+            backendRegistryDigest: snapshot.backendRegistryDigest,
             rootIdentity: .init(
                 deviceID: snapshot.rootIdentity.deviceID,
                 fileID: snapshot.rootIdentity.fileID,
                 canonicalPathDigest: KnowledgeDigest.sha256(
                     snapshot.rootIdentity.canonicalPath)),
-            semanticVerdict: "valid",
+            contentSealDigest: snapshot.contentSealDigest,
+            semanticVerdict: snapshot.report.diagnostics.contains(where: {
+                $0.severity == .warning
+            }) ? "valid_with_warnings" : "valid",
             diagnosticsDigest: diagnosticsDigest,
             validatedAt: validatedAt,
             expiresAt: expiresAt)
@@ -76,6 +90,13 @@ public struct KnowledgeValidationReceiptStore: Sendable {
         let data = try KnowledgeJSON.encode(receipt, pretty: true)
         do {
             try DurableOwnerOnlyFile.withExclusiveLock(at: registryLockURL) {
+                if try hasPurgeTombstone(
+                    storeID: receipt.storeID,
+                    snapshotID: receipt.snapshotID) {
+                    throw KnowledgeDomainError(
+                        .accessDenied,
+                        "Validation receipt scope was permanently revoked by urgent purge.")
+                }
                 try DurableOwnerOnlyFile.writeAtomically(
                     data,
                     to: root.appendingPathComponent(fileName(for: receipt)),
@@ -111,23 +132,33 @@ public struct KnowledgeValidationReceiptStore: Sendable {
             validator: .init(identity: KnowledgeContract.validatorIdentity, version: KnowledgeContract.validatorVersion),
             backendRegistryDigest: backendRegistry.digest,
             rootIdentity: .init(deviceID: 0, fileID: 0, canonicalPathDigest: KnowledgeDigest.sha256("placeholder")),
+            contentSealDigest: KnowledgeDigest.sha256("placeholder"),
             semanticVerdict: "valid",
             diagnosticsDigest: KnowledgeDigest.sha256(Data()),
             validatedAt: evaluationDate,
             expiresAt: nil)
         let url = root.appendingPathComponent(fileName(for: key))
         return try DurableOwnerOnlyFile.withExclusiveLock(at: registryLockURL) {
+            if try hasPurgeTombstone(
+                storeID: storeID,
+                snapshotID: snapshotID) {
+                return nil
+            }
             guard let data = try DurableOwnerOnlyFile.read(from: url) else { return nil }
             guard data.count <= 64 * 1_024 else {
                 throw KnowledgeDomainError(.unsafeStorage, "Validation receipt exceeds its byte limit.")
             }
             let receipt: KnowledgeValidationReceipt
             do {
-                receipt = try KnowledgeJSON.decode(KnowledgeValidationReceipt.self, from: data)
+                receipt = try decodeReceipt(data)
             } catch {
                 throw KnowledgeDomainError(.integrityFailed, "Validation receipt could not be decoded.")
             }
             try validateShape(receipt)
+            guard let currentContentSeal = try? KnowledgeSecureFileSystem()
+                .snapshotSealDigest(root: snapshotRoot) else {
+                return nil
+            }
             guard receipt.storeID == storeID,
                   receipt.snapshotID == snapshotID,
                   receipt.snapshotRevision == snapshotRevision,
@@ -136,7 +167,14 @@ public struct KnowledgeValidationReceiptStore: Sendable {
                   receipt.rootIdentity.fileID == identity.fileID,
                   receipt.rootIdentity.canonicalPathDigest
                     == KnowledgeDigest.sha256(identity.canonicalPath),
-                  receipt.semanticVerdict == "valid" else {
+                  receipt.contentSealDigest == currentContentSeal,
+                  ["valid", "valid_with_warnings"].contains(
+                      receipt.semanticVerdict) else {
+                return nil
+            }
+            guard let receiptValidatedDate = ISO8601DateFormatter().date(
+                from: receipt.validatedAt),
+                  date >= receiptValidatedDate else {
                 return nil
             }
             if let expires = receipt.expiresAt,
@@ -149,34 +187,77 @@ public struct KnowledgeValidationReceiptStore: Sendable {
     }
 
     /// Removes host-side receipts for an exact store, optionally narrowed to
-    /// explicit snapshot IDs. The registry-wide owner-only flock serializes
-    /// invalidation with all reads and writes so urgent purge cannot race a
-    /// receipt re-publication.
+    /// explicit snapshot IDs. Urgent purge sets `preventRepublication`; under
+    /// the same registry-wide owner-only flock it durably installs exact
+    /// snapshot tombstones before removing receipts. Later writes and reads
+    /// then fail closed instead of racing stale receipt re-publication.
     @discardableResult
     public func invalidate(
         storeID: String,
-        snapshotIDs: Set<String>? = nil
+        snapshotIDs: Set<String>? = nil,
+        preventRepublication: Bool = false
     ) throws -> Int {
         guard KnowledgeStoreIdentifier.isValidStoreID(storeID),
-              snapshotIDs?.allSatisfy(KnowledgeStoreIdentifier.isValidSnapshotID) ?? true else {
+              snapshotIDs?.allSatisfy(KnowledgeStoreIdentifier.isValidSnapshotID) ?? true,
+              !preventRepublication || snapshotIDs?.isEmpty == false else {
             throw KnowledgeDomainError(.profileInvalid, "Validation receipt invalidation scope is invalid.")
         }
         return try DurableOwnerOnlyFile.withExclusiveLock(at: registryLockURL) {
+            var changedRegistry = false
+            if preventRepublication, let snapshotIDs {
+                for snapshotID in snapshotIDs.sorted() {
+                    if try hasPurgeTombstone(
+                        storeID: storeID,
+                        snapshotID: snapshotID) {
+                        continue
+                    }
+                    let tombstone = PurgeTombstone(
+                        schema: "intatis-knowledge-receipt-purge/1",
+                        storeID: storeID,
+                        snapshotID: snapshotID)
+                    do {
+                        try DurableOwnerOnlyFile.writeAtomically(
+                            try KnowledgeJSON.encode(tombstone, pretty: true),
+                            to: purgeTombstoneURL(
+                                storeID: storeID,
+                                snapshotID: snapshotID),
+                            temporaryPrefix: ".knowledge-purge-tmp-")
+                    } catch let error as DurableOwnerOnlyFileError {
+                        throw KnowledgeDomainError(
+                            error == .commitUncertain
+                                ? .revisionChanged
+                                : .unsafeStorage,
+                            retryable: error == .commitUncertain,
+                            "Validation receipt purge tombstone could not be committed safely.")
+                    }
+                    changedRegistry = true
+                }
+            }
             let children = try FileManager.default.contentsOfDirectory(
                 at: root,
                 includingPropertiesForKeys: nil,
                 options: [])
             var removed = 0
-            var removedAnyLeaf = false
             for child in children.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
                 let name = child.lastPathComponent
                 if name == registryLockURL.lastPathComponent { continue }
+                if name.hasPrefix(".knowledge-purge-tmp-") {
+                    try removeOwnerOnlyLeaf(child)
+                    changedRegistry = true
+                    continue
+                }
+                if name.range(
+                    of: #"^\.knowledge-purge-[0-9a-f]{64}\.json$"#,
+                    options: .regularExpression) != nil {
+                    try validatePurgeTombstone(at: child)
+                    continue
+                }
                 if name.hasPrefix(".knowledge-receipt-"), name.hasSuffix(".tmp") {
                     // A crash-left temporary was never a committed receipt.
                     // It contains receipt metadata only, but urgent cleanup
                     // removes it under the same registry writer lock.
                     try removeOwnerOnlyLeaf(child)
-                    removedAnyLeaf = true
+                    changedRegistry = true
                     continue
                 }
                 guard name.range(
@@ -190,9 +271,7 @@ public struct KnowledgeValidationReceiptStore: Sendable {
                 }
                 let receipt: KnowledgeValidationReceipt
                 do {
-                    receipt = try KnowledgeJSON.decode(
-                        KnowledgeValidationReceipt.self,
-                        from: data)
+                    receipt = try decodeReceipt(data)
                     try validateShape(receipt)
                 } catch {
                     // A malformed receipt can never authorize a mount, but its
@@ -206,9 +285,9 @@ public struct KnowledgeValidationReceiptStore: Sendable {
                 }
                 try removeOwnerOnlyLeaf(child)
                 removed += 1
-                removedAnyLeaf = true
+                changedRegistry = true
             }
-            if removedAnyLeaf {
+            if changedRegistry {
                 try synchronizeRoot()
             }
             return removed
@@ -216,6 +295,11 @@ public struct KnowledgeValidationReceiptStore: Sendable {
     }
 
     private func validateShape(_ receipt: KnowledgeValidationReceipt) throws {
+        let validatedDate = ISO8601DateFormatter().date(
+            from: receipt.validatedAt)
+        let expiryDate = receipt.expiresAt.flatMap {
+            ISO8601DateFormatter().date(from: $0)
+        }
         guard receipt.schema == KnowledgeContract.validationSchema,
               receipt.storeID.range(of: #"^kb_[A-Za-z0-9._-]{1,125}$"#, options: .regularExpression) != nil,
               receipt.snapshotID.range(of: #"^snap_[A-Za-z0-9._-]{1,128}$"#, options: .regularExpression) != nil,
@@ -226,12 +310,94 @@ public struct KnowledgeValidationReceiptStore: Sendable {
               receipt.validator.version == KnowledgeContract.validatorVersion,
               KnowledgeDigest.isValid(receipt.backendRegistryDigest),
               KnowledgeDigest.isValid(receipt.rootIdentity.canonicalPathDigest),
-              receipt.semanticVerdict == "valid",
+              KnowledgeDigest.isValid(receipt.contentSealDigest),
+              ["valid", "valid_with_warnings"].contains(
+                  receipt.semanticVerdict),
               KnowledgeDigest.isValid(receipt.diagnosticsDigest),
-              ISO8601DateFormatter().date(from: receipt.validatedAt) != nil,
-              receipt.expiresAt.map({ ISO8601DateFormatter().date(from: $0) != nil }) ?? true else {
+              validatedDate != nil,
+              receipt.expiresAt == nil || expiryDate != nil,
+              expiryDate.map({ $0 > validatedDate! }) ?? true else {
             throw KnowledgeDomainError(.integrityFailed, "Validation receipt shape is invalid.")
         }
+    }
+
+    /// Acronym-bearing Swift properties such as `snapshotID` do not roundtrip
+    /// through Foundation's generic `convertFromSnakeCase` strategy
+    /// (`snapshot_id` becomes `snapshotId`). Receipt bytes therefore use this
+    /// small strict decoder rather than silently accepting a producer-specific
+    /// key transform.
+    private func decodeReceipt(_ data: Data) throws -> KnowledgeValidationReceipt {
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw KnowledgeDomainError(.integrityFailed, "Validation receipt root is invalid.")
+        }
+        let required: Set<String> = [
+            "schema", "store_id", "snapshot_id", "snapshot_revision",
+            "bundle_revision", "profile_version", "validator",
+            "backend_registry_digest", "root_identity", "semantic_verdict",
+            "content_seal_digest", "diagnostics_digest", "validated_at",
+        ]
+        let allowed = required.union(["expires_at"])
+        guard required.isSubset(of: Set(object.keys)),
+              Set(object.keys).isSubset(of: allowed),
+              let schema = object["schema"] as? String,
+              let storeID = object["store_id"] as? String,
+              let snapshotID = object["snapshot_id"] as? String,
+              let snapshotRevision = object["snapshot_revision"] as? String,
+              let bundleRevision = object["bundle_revision"] as? String,
+              let profileVersion = object["profile_version"] as? String,
+              let validatorObject = object["validator"] as? [String: Any],
+              Set(validatorObject.keys) == Set(["identity", "version"]),
+              let validatorIdentity = validatorObject["identity"] as? String,
+              let validatorVersion = validatorObject["version"] as? String,
+              let backendRegistryDigest = object["backend_registry_digest"] as? String,
+              let rootObject = object["root_identity"] as? [String: Any],
+              Set(rootObject.keys) == Set([
+                "device_id", "file_id", "canonical_path_digest",
+              ]),
+              let deviceID = rootObject["device_id"] as? NSNumber,
+              let fileID = rootObject["file_id"] as? NSNumber,
+              String(cString: deviceID.objCType) != "c",
+              String(cString: fileID.objCType) != "c",
+              deviceID.doubleValue >= 0,
+              fileID.doubleValue >= 0,
+              deviceID.doubleValue.rounded(.towardZero) == deviceID.doubleValue,
+              fileID.doubleValue.rounded(.towardZero) == fileID.doubleValue,
+              let canonicalPathDigest = rootObject["canonical_path_digest"] as? String,
+              let contentSealDigest = object["content_seal_digest"] as? String,
+              let semanticVerdict = object["semantic_verdict"] as? String,
+              let diagnosticsDigest = object["diagnostics_digest"] as? String,
+              let validatedAt = object["validated_at"] as? String else {
+            throw KnowledgeDomainError(.integrityFailed, "Validation receipt fields are invalid.")
+        }
+        let expiresAt: String?
+        if let value = object["expires_at"] {
+            guard let string = value as? String else {
+                throw KnowledgeDomainError(.integrityFailed, "Validation receipt expiry is invalid.")
+            }
+            expiresAt = string
+        } else {
+            expiresAt = nil
+        }
+        return KnowledgeValidationReceipt(
+            schema: schema,
+            storeID: storeID,
+            snapshotID: snapshotID,
+            snapshotRevision: snapshotRevision,
+            bundleRevision: bundleRevision,
+            profileVersion: profileVersion,
+            validator: .init(
+                identity: validatorIdentity,
+                version: validatorVersion),
+            backendRegistryDigest: backendRegistryDigest,
+            rootIdentity: .init(
+                deviceID: deviceID.uint64Value,
+                fileID: fileID.uint64Value,
+                canonicalPathDigest: canonicalPathDigest),
+            contentSealDigest: contentSealDigest,
+            semanticVerdict: semanticVerdict,
+            diagnosticsDigest: diagnosticsDigest,
+            validatedAt: validatedAt,
+            expiresAt: expiresAt)
     }
 
     private func fileName(for receipt: KnowledgeValidationReceipt) -> String {
@@ -243,6 +409,95 @@ public struct KnowledgeValidationReceiptStore: Sendable {
         ].joined(separator: "\n")
         return KnowledgeDigest.sha256(key)
             .replacingOccurrences(of: "sha256:", with: "") + ".json"
+    }
+
+    private func purgeTombstoneURL(
+        storeID: String,
+        snapshotID: String
+    ) -> URL {
+        let key = "intatis-knowledge-receipt-purge/1\n\(storeID)\n\(snapshotID)"
+        let digest = KnowledgeDigest.sha256(key)
+            .replacingOccurrences(of: "sha256:", with: "")
+        return root.appendingPathComponent(
+            ".knowledge-purge-\(digest).json",
+            isDirectory: false)
+    }
+
+    private func hasPurgeTombstone(
+        storeID: String,
+        snapshotID: String
+    ) throws -> Bool {
+        let url = purgeTombstoneURL(
+            storeID: storeID,
+            snapshotID: snapshotID)
+        guard let data = try DurableOwnerOnlyFile.read(from: url) else {
+            return false
+        }
+        try validatePurgeTombstone(
+            data,
+            expectedStoreID: storeID,
+            expectedSnapshotID: snapshotID,
+            fileName: url.lastPathComponent)
+        return true
+    }
+
+    private func validatePurgeTombstone(at url: URL) throws {
+        guard let data = try DurableOwnerOnlyFile.read(from: url) else {
+            throw KnowledgeDomainError(
+                .revisionChanged,
+                retryable: true,
+                "Validation receipt purge tombstone changed during registry validation.")
+        }
+        let tombstone: PurgeTombstone
+        do {
+            tombstone = try KnowledgeJSON.decode(
+                PurgeTombstone.self,
+                from: data)
+        } catch {
+            throw KnowledgeDomainError(
+                .integrityFailed,
+                "Validation receipt purge tombstone is invalid.")
+        }
+        try validatePurgeTombstone(
+            data,
+            expectedStoreID: tombstone.storeID,
+            expectedSnapshotID: tombstone.snapshotID,
+            fileName: url.lastPathComponent)
+    }
+
+    private func validatePurgeTombstone(
+        _ data: Data,
+        expectedStoreID: String,
+        expectedSnapshotID: String,
+        fileName: String
+    ) throws {
+        guard data.count <= 4 * 1_024,
+              KnowledgeStoreIdentifier.isValidStoreID(expectedStoreID),
+              KnowledgeStoreIdentifier.isValidSnapshotID(expectedSnapshotID) else {
+            throw KnowledgeDomainError(
+                .integrityFailed,
+                "Validation receipt purge tombstone is invalid.")
+        }
+        let expected = PurgeTombstone(
+            schema: "intatis-knowledge-receipt-purge/1",
+            storeID: expectedStoreID,
+            snapshotID: expectedSnapshotID)
+        let decoded: PurgeTombstone
+        do {
+            decoded = try KnowledgeJSON.decode(PurgeTombstone.self, from: data)
+        } catch {
+            throw KnowledgeDomainError(
+                .integrityFailed,
+                "Validation receipt purge tombstone is invalid.")
+        }
+        guard decoded == expected,
+              fileName == purgeTombstoneURL(
+                storeID: expectedStoreID,
+                snapshotID: expectedSnapshotID).lastPathComponent else {
+            throw KnowledgeDomainError(
+                .integrityFailed,
+                "Validation receipt purge tombstone identity is invalid.")
+        }
     }
 
     private func removeOwnerOnlyLeaf(_ url: URL) throws {

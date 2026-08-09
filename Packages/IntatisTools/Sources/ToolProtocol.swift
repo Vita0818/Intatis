@@ -167,19 +167,25 @@ public struct DocumentBackendInvocation: Equatable, Sendable {
     /// their binding to a reviewed destination before extending the process
     /// allow-list; these paths are never accepted from model arguments.
     public let internalWritableWorkspacePaths: [String]
+    /// Exact files inside an internal staging root that a validator or later
+    /// pipeline stage may read but must not modify. The surrounding stage can
+    /// remain writable for reports or sibling outputs.
+    public let internalReadOnlyWorkspacePaths: [String]
 
     init(executable: DocumentBackendExecutable,
          arguments: [String],
          environment: [String: String] = [:],
          readableWorkspacePaths: [String],
          writableWorkspacePaths: [String],
-         internalWritableWorkspacePaths: [String] = []) {
+         internalWritableWorkspacePaths: [String] = [],
+         internalReadOnlyWorkspacePaths: [String] = []) {
         self.executable = executable
         self.arguments = arguments
         self.environment = environment
         self.readableWorkspacePaths = readableWorkspacePaths
         self.writableWorkspacePaths = writableWorkspacePaths
         self.internalWritableWorkspacePaths = internalWritableWorkspacePaths
+        self.internalReadOnlyWorkspacePaths = internalReadOnlyWorkspacePaths
     }
 }
 
@@ -720,6 +726,46 @@ public extension Tool {
 /// One authoritative model-visible tool entry. The concrete tool supplies both
 /// its schema and executor; `grantingCapabilities` records which lease
 /// capability aliases may expose that concrete entry in a scoped registry.
+/// Tool-neutral evidence envelope used by AgentKernel immediately before a
+/// final answer is committed. Domain modules keep ownership of the mechanical
+/// replay implementation; AgentKernel only preserves current-turn identity
+/// and invokes this exact registration-owned closure.
+public struct ToolGroundingEvidence: Equatable, Sendable {
+    public let toolName: String
+    public let evidenceID: String
+    public let knowledgeBase: String
+    public let knowledgeBaseRevision: String
+    public let retrievalSnapshot: String
+    public let retrievalSnapshotRevision: String
+    public let textSHA256: String
+    public let evidenceURI: String
+    public let structuredEvidence: JSONValue
+
+    public init(toolName: String,
+                evidenceID: String,
+                knowledgeBase: String,
+                knowledgeBaseRevision: String,
+                retrievalSnapshot: String,
+                retrievalSnapshotRevision: String,
+                textSHA256: String,
+                evidenceURI: String,
+                structuredEvidence: JSONValue) {
+        self.toolName = toolName
+        self.evidenceID = evidenceID
+        self.knowledgeBase = knowledgeBase
+        self.knowledgeBaseRevision = knowledgeBaseRevision
+        self.retrievalSnapshot = retrievalSnapshot
+        self.retrievalSnapshotRevision = retrievalSnapshotRevision
+        self.textSHA256 = textSHA256
+        self.evidenceURI = evidenceURI
+        self.structuredEvidence = structuredEvidence
+    }
+}
+
+public typealias ToolGroundingEvidenceRevalidator = @Sendable (
+    ToolGroundingEvidence
+) async throws -> Void
+
 public struct ToolRegistration: Sendable {
     /// The exact instance-level descriptor advertised, authorized, and
     /// executed by this registration. Dynamic tools must supply this value
@@ -745,6 +791,8 @@ public struct ToolRegistration: Sendable {
         @Sendable (ToolArgs) throws -> Void
     private let argumentValidationFailureBuilder:
         (@Sendable (String) -> ToolObservation)?
+    public let groundingEvidenceRevalidator:
+        ToolGroundingEvidenceRevalidator?
 
     /// Compatibility initializer for the existing static tool surface.
     public init(tool: any Tool,
@@ -762,6 +810,7 @@ public struct ToolRegistration: Sendable {
             mcpResourceAuthorizationResolver: nil,
             argumentValidator: { try tool.validateArguments($0) },
             argumentValidationFailureBuilder: nil,
+            groundingEvidenceRevalidator: nil,
             usesStaticToolMetadata: true)
     }
 
@@ -784,7 +833,9 @@ public struct ToolRegistration: Sendable {
                 argumentValidator:
                     @escaping @Sendable (ToolArgs) throws -> Void = { _ in },
                 argumentValidationFailureBuilder:
-                    (@Sendable (String) -> ToolObservation)? = nil) {
+                    (@Sendable (String) -> ToolObservation)? = nil,
+                groundingEvidenceRevalidator:
+                    ToolGroundingEvidenceRevalidator? = nil) {
         self.init(
             descriptor: descriptor,
             tool: tool,
@@ -798,6 +849,8 @@ public struct ToolRegistration: Sendable {
             argumentValidator: argumentValidator,
             argumentValidationFailureBuilder:
                 argumentValidationFailureBuilder,
+            groundingEvidenceRevalidator:
+                groundingEvidenceRevalidator,
             usesStaticToolMetadata: false)
     }
 
@@ -816,6 +869,8 @@ public struct ToolRegistration: Sendable {
                     @escaping @Sendable (ToolArgs) throws -> Void,
                  argumentValidationFailureBuilder:
                     (@Sendable (String) -> ToolObservation)?,
+                 groundingEvidenceRevalidator:
+                    ToolGroundingEvidenceRevalidator?,
                  usesStaticToolMetadata: Bool) {
         self.descriptor = descriptor
         self.tool = tool
@@ -829,6 +884,8 @@ public struct ToolRegistration: Sendable {
         self.argumentValidator = argumentValidator
         self.argumentValidationFailureBuilder =
             argumentValidationFailureBuilder
+        self.groundingEvidenceRevalidator =
+            groundingEvidenceRevalidator
         self.usesStaticToolMetadata = usesStaticToolMetadata
     }
 
@@ -1696,10 +1753,10 @@ public struct ToolRegistry: Sendable {
             tools.append(ExecCommandTool())
             tools.append(WriteStdinTool())
         }
-        // The document surface changed incompatibly from the legacy
-        // read_document/edit_pdf_pages/reconstruct_document_image group. Keep
-        // the replacement identity explicit so a durable authorization issued
-        // for the old catalog can never validate against this one.
+        // The document surface changed incompatibly from the legacy aggregate
+        // group. Keep the replacement identity explicit so a durable
+        // authorization issued for the old catalog can never validate against
+        // this one.
         return ToolRegistry(tools, registryVersion: "intatis.standard.v2")
     }
 }

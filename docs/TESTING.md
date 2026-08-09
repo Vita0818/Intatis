@@ -76,6 +76,99 @@ workspace ceiling，reviewer provider 只在完整 host validation 后被调用�
 MCP、browser、managed terminal、OAuth、real provider 和设备测试中明确标为 opt-in 的项目，
 必须在具备相应 runtime/credential/网络的环境单独执行。
 
+### OKF / RAG knowledge bundle 专项
+
+修改 OKF/Profile 合同、Validator、build/publish、embedding/index、snapshot store、mount、
+`search_knowledge`、final grounding 或 Code/Cowork augmenter 时，至少运行：
+
+```sh
+swift build --target IntatisKnowledge --disable-automatic-resolution
+swift test --filter IntatisKnowledgeTests
+swift test --filter TurnGroundingEvidenceRegistryTests
+swift test --filter ToolRegistryLeaseTests
+```
+
+其中 Knowledge suite 必须覆盖：
+
+- 9 份 strict JSON Schema、bounded OKF YAML、alias/custom-tag safety classification；任意层非保留
+  `.md` concept 与任意层 `index.md` / `log.md` reserved shape；host-owned canonical v0.2
+  writer 对 legacy `timestamp` / `# Citations`、strict `generated.by/at`、footnote claim/definition/source-ID
+  join、multi-source per-chunk attribution、bundle-local path、scope descriptor和私有路径的迁移/拒绝；
+  source locator exact adapter/revision replay 与 custom registry digest
+  continuity；
+- WorkspaceLease/root identity、no-follow/owner-only/single-link、path/byte/count/depth bounds、checksum
+  inventory/completeness、content-seal/TOCTOU、staging/atomic pointer、reader isolation、retention/GC、
+  explicit A/B admission、receipt invalidation、exact purge tombstone 的 concurrent writer race 和
+  current/non-current urgent purge；staging、snapshot rename、
+  pointer replace 与 GC 四个 crash boundary 均只恢复为完整 old/new/no-current 状态；
+- embedding identity 任一支持的语义字段变化都全量 re-embed；不支持的 scalar/quantization/
+  normalization/similarity/truncation 明确拒绝。dense zero/non-unit/NaN/Inf/dimension/missing/orphan/
+  duplicate 和 lexical tokenizer/count/digest/missing/orphan/duplicate 都有负向验证；
+- canonical `chunks.jsonl` 与 manifest digest 在不同运行时钟下 bit-stable；Validator 对同一
+  snapshot/policy/registry 双跑报告一致且不调用 embedding/network；build cancel/timeout
+  不发布 pointer、不留 validation receipt；
+- frozen dense-only/lexical-disabled/optional-unbound/hybrid-required route 精确执行；dense exact +
+  BM25 + RRF、status/trust/OKF date-only `stale_after` 和 host ACL 在 Top-K 前过滤、
+  optional/required exact reranker、unanswerable、增量修改/删除、prompt-injection data-only、
+  secret fail-before-embedding、bounded/truncated result packing、hard deadline cancel+join；
+- dynamic bound/unbound inputSchema、typed `TOOL_INPUT_INVALID`、MCP-compatible complete envelope、
+  stable evidence ID、真实 direct success，以及 final 前 exact snapshot reopen/hash/locator revalidation；
+- Code/Cowork opt-in 走真实 AgentLoop 的 capability/permission/prepared/tool_result/settled 链，mailbox
+  窄 capability 时工具完全缺席，close/shutdown 会 cancel/drain mount；snapshot-bound dynamic
+  registration 必须保留 instance-owned local/remote intent，本地 `search_knowledge` 即使 read-only 也要
+  从 deterministic gate 的 `pass` 进入 reviewer/PermissionEngine，不能继承普通文件读取的 auto-allow。
+
+质量测试必须冻结 corpus 与阈值，至少记录 Recall@5、MRR、nDCG@5、unanswerable、citation
+coverage/precision、index bytes、memory proxy 和 deterministic latency proxy。Apple NaturalLanguage
+不可用时只能 `XCTSkip`；开发机 arm64 结果不能外推 Intel 真机。x86_64 编译、Intel 上 exact
+language/revision/dimension availability 和质量、真实 remote embedding/reranker credential/network smoke
+必须分开记录，缺一项就标 `UNKNOWN`，不得静默换模型或宣称 universal runtime 已验证。
+
+### 六工具文档链专项
+
+修改文档合同、固定 backend、staging/commit、registry、permission 或 lease 时，至少运行：
+
+```sh
+swift build --target IntatisTools --disable-automatic-resolution
+swift build --target IntatisToolsTests --disable-automatic-resolution
+swift test --filter DocumentToolContractTests
+swift test --filter DocumentInfrastructureTests
+swift test --filter PDFNativeDocumentServiceTests
+swift test --filter DocumentPythonWriteBackendTests
+swift test --filter DocumentToolsIntegrationTests
+swift test --filter CapabilityLeaseTests
+swift test --filter ToolRegistryLeaseTests
+```
+
+外层 managed sandbox 若阻止测试内的 Seatbelt/process spawn，可直接运行已构建的 XCTest bundle
+做聚焦验证，并在真实 host 环境补跑完整 suite；必须记录采用的方式，不能把环境性失败冒充通过。
+专项至少证明：
+
+- 生产 registry 只有 `read_pdf`、`document_read`、`document_ocr`、`document_render`、
+  `document_export_pdf`、`document_write`，旧自动读取/PDF mutation/reconstruct 工具不可见；
+- image-only PDF 返回 typed `ocr_required`；PDF 页面 PNG 的尺寸、SHA-256、字节数和 manifest
+  一致，真实渲染页经视觉检查；
+- source/destination/辅助资产 CAS、默认 no-clobber、precommit cancellation、backend/validator failure
+  均不改原目标；辅助资产 symlink/hardlink/授权后替换 fail closed，目标父目录身份在 terminal commit
+  前后固定，目录 bundle 不暴露 partial pages 或 staging 文件；
+- 缺失/版本不符 backend 明确返回 `backend_missing` / `backend_version_mismatch`，不触发 fallback；
+- DOCX/PPTX/XLSX/HTML 每个公开 operation 都有真实 runtime corpus；write 后重新打开并按声明
+  postcondition 验证。XLSX 的此项必须发生在 LibreOffice 重算与另存之后；
+- 生成 PDF 经 strict pdfcpu validation 和 PDFKit reopen/render smoke；validator 不能被描述为视觉保真、
+  任意无损往返或 secure redaction 证明；
+- EPUB read/write 的 Rust helper 必须通过 `cargo fmt -- --check`、`cargo check --locked`、
+  `cargo test --locked` 与 `cargo clippy --locked --all-targets -- -D warnings`；生产成功还要求正式
+  EPUBCheck artifact 与 round-trip corpus。EPUB render/export 在 full-spine gate 前必须从 schema 删除；
+- stdout/stderr 限制不得误作生成文件限制；单文件、聚合生成字节与 entry 数预算必须在进程运行期及
+  退出后都生效，不能只在 backend 完成后检查 staging；
+- read-only worker 只拿 `read_pdf`、`document_read`、`document_ocr`，且后两者只能通过 exact
+  `structured_read_only` 权限形状执行；read-write worker/coordinator 才拿 render/export/write。
+  iOS target 依赖图仍不含 Tools/Permission/AgentKernel/Cowork/文档 runtime。
+
+真实 runtime 验证报告必须记录 executable/package/model 的 exact version、artifact hash（若可用）、
+平台/架构与缺失项。开发机存在用户自建 runtime 只证明本机 smoke，不替代发行 closure、许可证/
+NOTICE、Developer ID 签名、公证或双架构验证。
+
 ### Chat 自动命名专项
 
 涉及 Chat 自动命名、session set-if-absent 或 ChatViewModel 自动标题接线时，至少运行：
@@ -305,21 +398,63 @@ routing options、结构化 unsupported 同路由一次降级、裸 404 拒绝�
   出现独立的提示词生图 action；
 - 系统文件选择和 URL drop 支持多选；security-scoped access 成对开启/关闭，文件先保存到当前
   session ArtifactStore，再按 ID、MIME、字节读回一致后才进入 draft；导入失败不污染已有草稿；
-- Send 在按钮边界冻结文本和附件 ID；纯附件消息可发送。只有对应 `user_message` 已 durable append
-  后才能清除同一份冻结草稿，route/附件解析失败或 append 前取消必须保留草稿；
+- Send 在按钮边界冻结文本和附件 ID；纯附件消息可发送。导入/读回或 durable admission 前失败必须
+  保留草稿；对应 user intent 已 durable accepted 后才清除同一份冻结草稿，随后 AgentLoop 的
+  resolver/capability typed failure 保留 accepted intent，不把它恢复成未发送草稿；
 - `UserMessagePayload.attachments` 只保存 ArtifactID；EventLog、projection、错误和 UI 不得保存或
   显示 base64、bookmark、文件路径。当前轮与后续历史轮都从同一 session ArtifactStore 解析图片，
   不能只在第一次 provider request 传图；
-- provider 输入只接受 `image/*`。缺失、不可读或不支持的 artifact 必须产生 typed、可行动且不泄密的
-  错误，并在新 `user_message` append 前 fail closed；非图片文件仍可 durable 保存和移除，但不能
-  被静默当作图片发送；
+- provider 输入只接受 `image/*`。缺失、不可读或不支持的 artifact 必须在网络前产生 typed、可行动且
+  不泄密的错误；若 user intent 已 durable accepted，错误不得回滚或复制该 intent。非图片文件仍可
+  durable 保存和移除，但不能被静默当作图片发送；
 - Chat 投影和 macOS/shared user bubble 至少显示附件数量；旧 artifact event、旧缺少 `attachments`
   字段的 JSONL 和纯文本消息继续解码/回放；
-- Code 的既有 image action、Agent `generate_image` / `edit_image` 权限链与 iOS Chat tools menu 不得
-  被改写；iOS 不得因共享 VM 或 ArtifactStore 注入而出现本地文件/照片附件入口；
+- Code 的新增 durable attachment accessory 必须继续复用共享导入/ArtifactStore 边界；Agent
+  `generate_image` / `edit_image` 权限链不得被改写，iOS 不得因共享 VM 或 ArtifactStore 注入而出现
+  本地文件/照片附件入口；
 - 至少运行共享附件 store/resolver tests、ChatLoop 当前轮+历史轮 rehydration test、完整 SwiftPM
   tests、`IntatisMac` macOS Debug 与 `IntatisiOS` generic Simulator Debug unsigned build。文件选择、
   拖放和真实视觉命中仍需 macOS 手动 smoke 单独记录，不能从单元测试或编译外推。
+
+## Agent durable 图片上下文专项
+
+涉及 Code/Cowork 用户图片、structured-result 图片、model history、provider FCO 或 compaction 时，
+至少运行：
+
+```sh
+swift test --filter ArtifactImageResolverTests
+swift test --filter IntatisProvidersToolCallingTests
+swift test --filter ModelHistory
+swift test --filter DurableMultimodalAgentLoopTests
+swift test --filter CLIAttachmentTests
+swift build --target IntatisCLI
+```
+
+具备用户明确授权的真实OpenAI凭据、网络和额度时，再显式运行一次同时携带user image与原call
+function-output image的付费smoke：
+
+```sh
+INTATIS_REAL_MULTIMODAL_SMOKE=1 swift test \
+  --filter RealProviderSmokeTests.testRealOpenAIMultimodalUserAndFunctionOutputWhenEnabled
+```
+
+该测试只发一个provider请求；不开启环境变量时必须skip，不得隐式消费凭据或额度。
+
+专项必须证明：
+
+- 用户图先进入 exact-session ArtifactStore；model-history ref 不含 bytes/base64/path，current、stable
+  next/restart 与 legacy ID 路径都使用同一 bounded resolver；
+- PNG/JPEG MIME/magic、完整解码、byte/aggregate/count/dimension/pixel、SHA-256 与 no-follow/owner-only
+  失败矩阵均 fail closed；缺少可信 decoder 的平台不列入正向图片矩阵；
+- MCP structured image以原call ID进入Responses function output，text/JSON只canonicalize一次，live与
+  replay使用同一append-return binding；不支持FCO图片的route在网络前typed失败但不改写工具settlement；
+- projector image sidecar与messages严格等长，v2 direct/checkpoint不能降级为v1；compaction
+  summarizer看见完整active window，成功checkpoint不保留任何旧图片ref，resume不偷回checkpoint前图片；
+- automatic Cowork authorization snapshot含user或FCO图片时durable media deny，文本reviewer没有allow
+  旁路；当前端到端回归分别直接覆盖user image与历史FCO image，并证明后者不启动reporter、reviewer或
+  executor；
+- macOS Code/Cowork GUI与CLI产品接线编译；iOS仍不链接AgentKernel/Tools/Cowork。fake provider只能证明
+  request shape与事件顺序，真实OpenAI Responses user/FCO image smoke必须另列且需要凭据/网络。
 
 ## 图片工具与 `image_model` 配置验收矩阵
 
@@ -370,6 +505,57 @@ routing options、结构化 unsupported 同路由一次降级、裸 404 拒绝�
   线上 provider smoke 必须单独记录，不能从离线测试或编译外推。
 
 ## 最近一次真实结果
+
+2026-08-09 OKF / RAG knowledge bundle 本地 core 的直接证据：
+
+- 最终 root run 的 `IntatisKnowledgeTests.xctest`：106 tests / 0 failures / 0 unexpected / 0 skips，
+  7.224 秒（wall 7.230 秒）；其中 focused Build/Search/SourceLocator 为 52/52，新增 diagnostic
+  init/decode 脱敏回归 1/1；
+- 冻结 corpus：Recall@1 0.529、Recall@5 0.882、MRR 0.681、nDCG@5 0.698、citation coverage
+  0.882、citation precision 1.000、unanswerable lexical TNR 3/3；deterministic dense+BM25 proxy
+  200 次总计 324.994 ms、平均 1.625 ms，serialized index 30,941 B、memory proxy 103,230 B；
+- `TurnGroundingEvidenceRegistryTests` 6/6；Cowork local `search_knowledge` durable probe 1/1，证明
+  permission request/resolved → prepared → bounded structured tool result → settled → current-turn final
+  citation revalidation → close/drain；narrow-mailbox negative 1/1；
+- host exact authority/current snapshot/cancel-drain 1/1，concrete search + source-locator + final-grounding
+  purge 1/1；本地 dynamic registration intent、DeterministicPolicyGate reviewer boundary 和
+  date-only stale UTC boundary各自定向通过；
+- `IntatisMac` unsigned Debug arm64 build 通过；`IntatisKnowledge` / `IntatisCLI` arm64 与 x86_64
+  cross-build 通过。x86_64 只证明编译；Intel 真机、最低支持 macOS、large corpus、真实 remote
+  embedding/reranker、hybrid/reranker comparative uplift、签名/公证仍为 `UNKNOWN`；
+- urgent purge 的 current-pointer removal 是持久 admission boundary，receipt tombstone 阻止旧回执并发
+  复活；它不是 pointer/receipt/physical delete 的跨组件 crash-atomic 事务，也不等于 secure erase。
+
+2026-08-09 Agent durable多模态上下文最小闭环的直接证据：
+
+- `DurableOwnerOnlyFileTests` 2 tests、`ArtifactImageResolverTests` 10 tests、
+  `IntatisProvidersToolCallingTests` 36 tests、`AgentToolOutputLoweringTests` 6 tests、
+  `DurableMultimodalAgentLoopTests` 8 tests、`CLIAttachmentTests` 4 tests，均为0 failures；
+- `swift test --filter ModelHistory`覆盖Protocol 13、Conversation 16、AgentKernel 49，共78 tests / 0
+  failures；验证v2 direct/checkpoint、append-return binding、原call FCO、active-window summarizer与
+  summary-only checkpoint；
+- `ComposerAttachmentTests` 2 tests / 0 failures；验证PNG/JPEG扩展到canonical MIME的确定性映射、
+  exact bytes读回与非图片typed拒绝。`testChatLoopPersistsAndRehydratesImageAttachmentsAcrossTurns`
+  1 test / 0 failures，验证既有Chat跨轮图片持久化未回归；
+- 从`v0.41` exact commit `e5f64ed`归档源码并临时编译旧reader fixture：3 tests / 0 failures；旧
+  projector拒绝schema-v2 direct item及v1 checkpoint后的schema-v2 direct suffix，旧protocol拒绝
+  schema-v2 checkpoint；
+- `swift build --disable-sandbox --target IntatisCLI`退出0；`IntatisMac` macOS Debug和`IntatisiOS`
+  generic Simulator Debug unsigned build均退出0，只有仓库既有unused-result/deprecation warning；
+- 真实端点smoke的opt-in测试壳已在隔离的`v0.42`源码快照用`swift build --target IntatisCLITests`
+  编译通过；未设置开关时不发请求，真实credential/network调用仍未执行；
+- 此前完整`swift test --disable-sandbox`运行时，多模态相关suite均通过，但全命令退出1：当时另一组
+  document capability改动已让worker/test要求`documentRead`和`documentOCR`，Cowork mailbox
+  `allowedTools`却尚未同步，导致`MessageDelegationSplitTests.testSendMessageCreatesDurableMailboxWakeTaskAndConsumesMessage`
+  稳定出现4个断言失败。此后并发Document resource-limit改动又在`ShellGit.swift`/`TerminalTools.swift`
+  留下未穷尽switch等编译错误，当前树会在测试启动前被阻断；两者均与图片链路无关，本轮未越界修复；
+- `CLIAttachmentTests`除2个附件loader用例外，还直接覆盖CLI Code复用同一session log/ArtifactStore的
+  next-turn，以及CLI Cowork销毁并重建shipping `Orchestrator.runtime`、EventLog与ArtifactStore后的exact
+  `@main`图片replay；4 tests / 0 failures。由于当前共享树被无关Knowledge编译错误阻断，这组结果来自
+  仅叠加多模态差异的clean snapshot中构建`IntatisCLITests`并直接运行其XCTest bundle；
+- 未执行真实OpenAI credential/network smoke；线上多模态FCO仍是release-only外部门，不能从scripted
+  provider外推。未重放当时实际分发的旧App制品，但已用exact旧源码编译fixture覆盖reader语义；
+  `git diff --check`通过。
 
 2026-08-08 `v0.40 (40)` 版本推进、shipping target 构建与本机开发安装的直接证据：
 

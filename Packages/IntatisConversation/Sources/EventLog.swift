@@ -33,6 +33,7 @@ public enum EventLogError: Error, Equatable, LocalizedError, Sendable {
     case invalidModelHistoryWindowLineage
     case reusedModelHistoryWindowID
     case modelHistoryCompactionRequiresValidatedAppend
+    case invalidModelHistoryMediaBatch
     case permissionRequestNotFound
     case conflictingPermissionRequest
     case conflictingPermissionSettlement
@@ -80,6 +81,8 @@ public enum EventLogError: Error, Equatable, LocalizedError, Sendable {
             return "The model history compaction reuses a window identifier from the agent's canonical checkpoint chain."
         case .modelHistoryCompactionRequiresValidatedAppend:
             return "Model history compaction checkpoints require the validated compare-and-append operation."
+        case .invalidModelHistoryMediaBatch:
+            return "A model history image output is not bound to one exact tool result and execution settlement in the same event batch."
         case .permissionRequestNotFound:
             return "The permission request is not durably registered in this session."
         case .conflictingPermissionRequest:
@@ -113,6 +116,8 @@ public enum EventLogError: Error, Equatable, LocalizedError, Sendable {
             return "Reload the agent's canonical checkpoint chain, create the next unique window, and retry."
         case .modelHistoryCompactionRequiresValidatedAppend:
             return "Use the model-history compaction append operation so revision and window lineage are checked atomically."
+        case .invalidModelHistoryMediaBatch:
+            return "Rebuild the tool completion batch from one canonical structured result, then retry."
         case .incompleteEventHistory:
             return "Stop writing to this session and inspect or restore its canonical event log before retrying."
         case .permissionRequestNotFound,
@@ -1217,6 +1222,7 @@ public actor EventLog {
             throw EventLogError
                 .modelHistoryCompactionRequiresValidatedAppend
         }
+        try Self.validateModelHistoryMediaBatch(events)
 
         var envelopes: [Envelope] = []
         envelopes.reserveCapacity(events.count)
@@ -1570,6 +1576,79 @@ public actor EventLog {
         return nil
     }
 
+    /// Binds every durable media-bearing function output to the canonical tool
+    /// result and execution settlement that produced it. This runs before
+    /// envelope/WAL bytes are created so an orphan, mismatch, or duplicate
+    /// rejects the whole batch.
+    private static func validateModelHistoryMediaBatch(
+        _ events: [Event]
+    ) throws {
+        var toolResultsByTurnAndCall:
+            [TurnID: [String: [ToolResultPayload]]] = [:]
+        var settlementCountsByCallID: [String: Int] = [:]
+        for event in events {
+            switch event {
+            case .toolResult(let payload):
+                guard let turnID = payload.turnID else { continue }
+                toolResultsByTurnAndCall[turnID, default: [:]][
+                    payload.toolCallId,
+                    default: []
+                ].append(payload)
+            case .toolExecutionSettled(let payload):
+                settlementCountsByCallID[payload.toolCallID, default: 0] += 1
+            default:
+                continue
+            }
+        }
+
+        var mediaOutputCallIDsByTurn: [TurnID: Set<String>] = [:]
+        var mediaOutputCountsByCallID: [String: Int] = [:]
+        for event in events {
+            guard case .modelHistoryItem(let payload) = event,
+                  payload.schemaVersion
+                    == ModelHistoryItemPayload.mediaSchemaVersion,
+                  payload.kind == .functionCallOutput,
+                  let references = payload.imageReferences,
+                  !references.isEmpty else {
+                continue
+            }
+            guard let callID = payload.callID,
+                  mediaOutputCallIDsByTurn[
+                    payload.turnID,
+                    default: []
+                  ].insert(callID).inserted,
+                  let matchingResults = toolResultsByTurnAndCall[
+                    payload.turnID
+                  ]?[callID],
+                  matchingResults.count == 1,
+                  let structuredResult = matchingResults[0].structuredResult
+            else {
+                throw EventLogError.invalidModelHistoryMediaBatch
+            }
+            mediaOutputCountsByCallID[callID, default: 0] += 1
+
+            let imageBlocks = structuredResult.content.filter {
+                $0.kind == .imageReference
+            }
+            guard imageBlocks.count == references.count else {
+                throw EventLogError.invalidModelHistoryMediaBatch
+            }
+            for (block, reference) in zip(imageBlocks, references) {
+                guard block.artifactID == reference.artifactID,
+                      block.mimeType == reference.mimeType,
+                      block.byteCount == reference.byteCount,
+                      block.sha256 == reference.sha256 else {
+                    throw EventLogError.invalidModelHistoryMediaBatch
+                }
+            }
+        }
+        for (callID, count) in mediaOutputCountsByCallID {
+            guard settlementCountsByCallID[callID] == count else {
+                throw EventLogError.invalidModelHistoryMediaBatch
+            }
+        }
+    }
+
     /// Validates the complete same-agent checkpoint chain while the EventLog
     /// lock is held. The candidate is checked after its source-history CAS and
     /// before any envelope or WAL bytes are created.
@@ -1577,6 +1656,36 @@ public actor EventLog {
         appending candidate: ModelHistoryCompactedPayload,
         in envelopes: [Envelope]
     ) throws {
+        var mediaAwareSchemaRequired = false
+        for envelope in envelopes {
+            switch envelope.event {
+            case .modelHistoryItem(let payload)
+                    where payload.agent == candidate.agent:
+                if payload.schemaVersion
+                    == ModelHistoryItemPayload.mediaSchemaVersion {
+                    mediaAwareSchemaRequired = true
+                }
+            case .modelHistoryCompacted(let payload)
+                    where payload.agent == candidate.agent:
+                if mediaAwareSchemaRequired,
+                   payload.schemaVersion
+                    != ModelHistoryCompactedPayload.mediaSchemaVersion {
+                    throw EventLogError.invalidModelHistoryWindowLineage
+                }
+                if payload.schemaVersion
+                    == ModelHistoryCompactedPayload.mediaSchemaVersion {
+                    mediaAwareSchemaRequired = true
+                }
+            default:
+                continue
+            }
+        }
+        if mediaAwareSchemaRequired,
+           candidate.schemaVersion
+            != ModelHistoryCompactedPayload.mediaSchemaVersion {
+            throw EventLogError.invalidModelHistoryWindowLineage
+        }
+
         var checkpoints = envelopes.compactMap {
             envelope -> ModelHistoryCompactedPayload? in
             guard case .modelHistoryCompacted(let payload) =

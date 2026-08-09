@@ -405,6 +405,10 @@ public actor Orchestrator {
     private let imageResolver: AgentImageResolver?
     private let toolSnapshotProvider:
         ToolSnapshotProvider?
+    /// Optional host-owned internal tools. IntatisCowork remains independent
+    /// of every concrete implementation (including IntatisKnowledge).
+    private let internalToolRegistryAugmenter:
+        HostToolRegistryAugmenter?
     private let sessionNaming: SessionNamingService?
     /// Test-only failure injection that runs before the production atomic
     /// task-completed/message-consumed EventLog batch. It never substitutes
@@ -446,6 +450,8 @@ public actor Orchestrator {
         imageResolver: AgentImageResolver? = nil,
         toolSnapshotProvider:
             ToolSnapshotProvider? = nil,
+        internalToolRegistryAugmenter:
+            HostToolRegistryAugmenter? = nil,
         sessionNaming: SessionNamingService? = nil,
         providerFor: @escaping @Sendable (Agent) async throws -> ToolCallingProvider
     ) throws -> Orchestrator {
@@ -473,6 +479,8 @@ public actor Orchestrator {
             imageResolver: imageResolver,
             toolSnapshotProvider:
                 toolSnapshotProvider,
+            internalToolRegistryAugmenter:
+                internalToolRegistryAugmenter,
             sessionNaming: sessionNaming,
             writerLease: writerLease,
             providerFor: providerFor)
@@ -501,6 +509,8 @@ public actor Orchestrator {
         imageResolver: AgentImageResolver? = nil,
         toolSnapshotProvider:
             ToolSnapshotProvider? = nil,
+        internalToolRegistryAugmenter:
+            HostToolRegistryAugmenter? = nil,
         sessionNaming: SessionNamingService? = nil,
         resolvedInferenceFor: @escaping @Sendable (Agent) async throws -> ResolvedInferenceProfile
     ) throws -> Orchestrator {
@@ -524,6 +534,8 @@ public actor Orchestrator {
             imageResolver: imageResolver,
             toolSnapshotProvider:
                 toolSnapshotProvider,
+            internalToolRegistryAugmenter:
+                internalToolRegistryAugmenter,
             sessionNaming: sessionNaming,
             writerLease: writerLease,
             resolvedInferenceFor: resolvedInferenceFor,
@@ -553,6 +565,8 @@ public actor Orchestrator {
                 imageResolver: AgentImageResolver? = nil,
                 toolSnapshotProvider:
                     ToolSnapshotProvider? = nil,
+                internalToolRegistryAugmenter:
+                    HostToolRegistryAugmenter? = nil,
                 sessionNaming: SessionNamingService? = nil,
                 writerLease: EventLogWriterLease? = nil,
                 resolvedInferenceFor: (@Sendable (Agent) async throws -> ResolvedInferenceProfile)? = nil,
@@ -627,6 +641,8 @@ public actor Orchestrator {
         self.imageResolver = imageResolver
         self.toolSnapshotProvider =
             toolSnapshotProvider
+        self.internalToolRegistryAugmenter =
+            internalToolRegistryAugmenter
         self.sessionNaming = sessionNaming
         self.messageConsumptionPreflightForTesting = nil
         self.taskLifecycleEventAppender = nil
@@ -7509,9 +7525,34 @@ public actor Orchestrator {
             agentID: agent.name,
             includesTerminal: allowsShell,
             canControlRun: canControlRun)
-        let toolRegistry =
+        let hostBaseRegistry =
             skillSnapshot?.augmenting(baseToolRegistry)
                 ?? baseToolRegistry
+        let internalToolLease:
+            HostToolRegistryAugmentationLease?
+        let toolRegistry: ToolRegistry
+        if let augmenter = internalToolRegistryAugmenter,
+           augmenter.additionalCapabilities.isSubset(
+               of: capabilityLease.tools)
+        {
+            guard let workspaceLease else {
+                throw CoworkTaskExecutionError.invalidLease(
+                    "internal tools require an exact workspace lease")
+            }
+            let mounted = try await augmenter.augment(
+                HostToolRegistryAugmentationInput(
+                    sessionID: await log.sessionID,
+                    agentID: agent.name,
+                    taskID: taskContract?.id,
+                    capabilityLease: capabilityLease,
+                    workspaceLease: workspaceLease,
+                    baseRegistry: hostBaseRegistry))
+            internalToolLease = mounted
+            toolRegistry = mounted.registry
+        } else {
+            internalToolLease = nil
+            toolRegistry = hostBaseRegistry
+        }
         let imageGenerator = await imageGeneratorFor(agent)
         let allowedToolNames = toolRegistry.descriptors().map(\.name).sorted()
         let canCoordinate = Self.canCoordinate(capabilityLease)
@@ -7619,15 +7660,25 @@ public actor Orchestrator {
             toolSnapshotProvider:
                 requestToolSnapshotProvider
         )
-        let output = try await loop.send(
-            input,
-            images: images,
-            userMessage: userMessage,
-            recordUserMessage: recordUserMessage,
-            submissionID: taskContract?.submissionID)
-        return AgentRunResult(
-            output: output,
-            presentedMessageIDs: contextBundle.directMessages.compactMap(\.messageID))
+        do {
+            let output = try await loop.send(
+                input,
+                images: images,
+                userMessage: userMessage,
+                recordUserMessage: recordUserMessage,
+                submissionID: taskContract?.submissionID)
+            if let internalToolLease {
+                _ = await internalToolLease.close()
+            }
+            return AgentRunResult(
+                output: output,
+                presentedMessageIDs: contextBundle.directMessages.compactMap(\.messageID))
+        } catch {
+            if let internalToolLease {
+                _ = await internalToolLease.close()
+            }
+            throw error
+        }
     }
 
     private func prepareAuthorization(
@@ -8703,6 +8754,8 @@ public actor Orchestrator {
             .listWorkspace,
             .searchWorkspace,
             .readPDF,
+            .documentRead,
+            .documentOCR,
             .readWorkTasks,
             .readGoal,
         ]
@@ -8888,6 +8941,10 @@ public actor Orchestrator {
         var capabilityLease: CapabilityLease = agent.coordinationDepth > 0
             ? .coordinator(workspaceAccess: workspaceAccess)
             : .worker(workspaceAccess: grantWorkerWriteCapabilities ? workspaceAccess : .readOnly)
+        if let augmenter = internalToolRegistryAugmenter {
+            capabilityLease.tools.formUnion(
+                augmenter.additionalCapabilities)
+        }
         if agent.name == Self.mainAgentID {
             capabilityLease.tools.insert(.renameSession)
             capabilityLease.tools.insert(.submitGoalVerdict)
@@ -8924,7 +8981,12 @@ public actor Orchestrator {
             ? CapabilityLease.coordinator(workspaceAccess: workspaceAccess)
             : CapabilityLease.worker(
                 workspaceAccess: workspaceAccess == .readWrite ? .readWrite : .readOnly)
-        var tools = baseline.tools.intersection(parentCapabilityLease.tools)
+        var baselineTools = baseline.tools
+        if let augmenter = internalToolRegistryAugmenter {
+            baselineTools.formUnion(
+                augmenter.additionalCapabilities)
+        }
+        var tools = baselineTools.intersection(parentCapabilityLease.tools)
         tools.remove(.createGoal)
         tools.remove(.submitGoalVerdict)
         tools.remove(.renameSession)
@@ -9035,6 +9097,10 @@ public actor Orchestrator {
             return Self.mainScopedCapabilityLease(lease, for: agent.name)
         }
         var lease = CapabilityLease.worker()
+        if let augmenter = internalToolRegistryAugmenter {
+            lease.tools.formUnion(
+                augmenter.additionalCapabilities)
+        }
         lease.expiresAtTaskCompletion = false
         capabilityLeases[lease.id] = lease
         defaultCapabilityLeaseIDs[agent.name] = lease.id
@@ -10997,16 +11063,11 @@ public actor Orchestrator {
         ])
     }
 
-    /// A document reader or OCR engine may need a managed helper process even
-    /// though it does not mutate user files. Keep that process-access decision
-    /// separate from writer conflict detection so read-only document work is
-    /// never treated as an active workspace writer.
+    /// A document reader or OCR engine may need a managed helper process, but
+    /// process execution does not itself require workspace mutation authority.
+    /// Only capabilities that can persist user-visible output require RW.
     static func requiresReadWriteWorkspaceAccess(_ lease: CapabilityLease) -> Bool {
         hasWorkspaceMutationCapability(lease)
-            || !lease.tools.isDisjoint(with: [
-                .documentRead,
-                .documentOCR,
-            ])
     }
 
     private static let defaultWorkerConstraints: [String] = [

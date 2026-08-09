@@ -73,6 +73,8 @@ public struct PermissionResource: Codable, Equatable, Sendable, Hashable {
 /// whether the tool is visible, WorkspaceLease is the maximum authority ceiling,
 /// and this value describes only the operation currently being authorized.
 public struct PermissionIntent: Codable, Equatable, Sendable {
+    public static let structuredReadOnlyExecutionClass = "structured_read_only"
+
     public var action: String
     public var resources: [PermissionResource]
     public var metadata: [String: JSONValue]
@@ -104,9 +106,32 @@ public struct PermissionIntent: Codable, Equatable, Sendable {
     /// WorkspaceLease. Control-plane changes are intentionally not considered
     /// workspace writes; they are reviewed through `controlEffects` and risks.
     public var isReadOnlyWorkspaceCompatible: Bool {
-        dataEffects.allSatisfy { effect in
-            effect == .none || effect == .read
+        dataEffects.allSatisfy { $0 == .none || $0 == .read }
+            || isStructuredReadOnlyExecution
+    }
+
+    /// A host-owned parser/OCR process can observe workspace data without
+    /// receiving arbitrary shell or mutation authority. The marker lives in
+    /// the host-built intent; model arguments cannot set it.
+    public var isStructuredReadOnlyExecution: Bool {
+        guard case .string(let executionClass)? = metadata["execution_class"],
+              executionClass == Self.structuredReadOnlyExecutionClass,
+              dataEffects.contains(.execute),
+              dataEffects.allSatisfy({
+                  $0 == .none || $0 == .read || $0 == .execute
+              }),
+              controlEffects.isEmpty,
+              resources.allSatisfy({ $0.access != .readWrite }),
+              risks.isDisjoint(with: [
+                  .workspaceMutation,
+                  .networkAccess,
+                  .destructive,
+                  .capabilityGrant,
+                  .workspaceExpansion,
+              ]) else {
+            return false
         }
+        return true
     }
 
     /// Compatibility adapter for tools that have not provided richer metadata.
@@ -155,8 +180,11 @@ public struct PermissionIntent: Codable, Equatable, Sendable {
         case "read_file", "list_files", "search_text": return "filesystem.read"
         case "write_file", "apply_patch": return "filesystem.edit"
         case "read_pdf": return "document.read"
-        case "edit_pdf_pages": return "document.edit"
-        case "reconstruct_document_image": return "document.reconstruct"
+        case "document_read": return "document.read"
+        case "document_ocr": return "document.ocr"
+        case "document_render": return "document.render"
+        case "document_export_pdf": return "document.export.pdf"
+        case "document_write": return "document.write"
         case "compile_latex": return "document.compile"
         case "generate_image": return "media.generate"
         case "edit_image": return "media.edit"

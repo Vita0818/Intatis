@@ -30,6 +30,7 @@ final class PDFNativeDocumentServiceTests: XCTestCase {
         let result = try PDFNativeDocumentService.readNativeText(from: textPDF)
 
         XCTAssertEqual(result.pageCount, 2)
+        XCTAssertEqual(result.metadata["title"], "Intatis native text fixture")
         XCTAssertEqual(result.pages.map(\.pageNumber), [1, 2])
         XCTAssertTrue(result.pages[0].text.contains("First native page"))
         XCTAssertTrue(result.pages[1].text.contains("Second native page"))
@@ -450,6 +451,20 @@ private extension PDFNativeDocumentServiceTests {
             context.endPDFPage()
         }
         context.closePDF()
+
+        guard let document = PDFDocument(url: url) else {
+            throw NSError(domain: "PDFNativeDocumentServiceTests", code: 5)
+        }
+        var attributes = document.documentAttributes ?? [:]
+        attributes[PDFDocumentAttribute.titleAttribute] = "Intatis native text fixture"
+        document.documentAttributes = attributes
+        let rewritten = url.deletingLastPathComponent().appendingPathComponent(
+            "metadata-\(UUID().uuidString).pdf")
+        guard document.write(to: rewritten) else {
+            throw NSError(domain: "PDFNativeDocumentServiceTests", code: 6)
+        }
+        try FileManager.default.removeItem(at: url)
+        try FileManager.default.moveItem(at: rewritten, to: url)
     }
 
     func makeGraphicsPDF(

@@ -35,6 +35,23 @@ runtime scope, parser-hardening boundaries, and the complete license are in
 `ThirdPartyNotices/KnowledgeRetrieval.md` and
 `ThirdPartyNotices/Licenses/Yams-6.2.2-MIT.txt`.
 
+## EPUB document helper dependency
+
+The macOS/Linux document-tool source tree contains a separately built,
+fixed-protocol Rust helper at `Packages/IntatisTools/Runtime/rbook-helper`.
+It uses **rbook 0.7.10** (`DevinSterling/rbook`) under the Apache License 2.0
+to implement the declared EPUB metadata/resource/spine/ToC read/write subset.
+The helper is an `external-runtime` component: it remains behind Intatis'
+typed invocation, workspace lease, sandbox, staging, validation, and atomic
+commit boundaries, and is not linked into iOS.
+
+The exact Cargo manifest, lockfile SHA-256 values, crates.io checksums,
+complete resolved dependency/license inventory, audit checkout identity,
+scope, and runtime-distribution gate are recorded in
+`ThirdPartyNotices/DocumentRBookHelper.md`. This implementation task adds the
+reproducible source/build closure; it does not claim that a universal signed
+helper binary or its release license bundle is already shipped in the App.
+
 ## OpenAI Codex Skill Creator derivative
 
 The project-local `.agents/skills/intatis-skill-creator/` Skill is a modified

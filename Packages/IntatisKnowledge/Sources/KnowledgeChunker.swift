@@ -21,6 +21,50 @@ public struct KnowledgeChunkingResult: Equatable, Sendable {
     public let manifestDigest: String
 }
 
+enum KnowledgeChunkManifestIdentity {
+    static func digest(
+        bundleRevision: String,
+        algorithm: String,
+        algorithmVersion: String,
+        parametersDigest: String,
+        chunks: [KnowledgeChunk]
+    ) throws -> String {
+        var identityLines = Data()
+        for chunk in chunks.sorted(by: { $0.chunkID < $1.chunkID }) {
+            // The deterministic writer already freezes exact-slice producer
+            // metadata, so manifest identity hashes the actual canonical leaf
+            // records rather than a second, weaker projection of them.
+            identityLines.append(try KnowledgeJSON.encode(chunk))
+            identityLines.append(0x0A)
+        }
+        struct Projection: Codable {
+            let version: String
+            let bundleRevision: String
+            let algorithm: String
+            let algorithmVersion: String
+            let parametersDigest: String
+            let identityLinesSha256: String
+        }
+        return try KnowledgeDigest.canonical(Projection(
+            version: "intatis-chunk-manifest-digest/2",
+            bundleRevision: bundleRevision,
+            algorithm: algorithm,
+            algorithmVersion: algorithmVersion,
+            parametersDigest: parametersDigest,
+            identityLinesSha256: KnowledgeDigest.sha256(identityLines)))
+    }
+
+    static func decode(_ jsonLines: Data) throws -> [KnowledgeChunk] {
+        try jsonLines.split(
+            separator: 0x0A,
+            omittingEmptySubsequences: true).map {
+                try KnowledgeJSON.decode(
+                    KnowledgeChunk.self,
+                    from: Data($0))
+            }
+    }
+}
+
 public struct DeterministicKnowledgeChunker: Sendable {
     public let configuration: KnowledgeChunkerConfiguration
 
@@ -40,11 +84,15 @@ public struct DeterministicKnowledgeChunker: Sendable {
         let producer = KnowledgeProducer(
             identity: KnowledgeContract.deterministicChunkerIdentity,
             version: KnowledgeContract.deterministicChunkerVersion,
-            at: producedAt)
+            // Exact-slice identity is entirely reconstructible from canonical
+            // concept bytes. Keep the required schema field bit-stable; the
+            // operational publication time belongs to profile.bundle.createdAt.
+            at: "1970-01-01T00:00:00Z")
+        _ = producedAt
         var chunks: [KnowledgeChunk] = []
         for concept in concepts.sorted(by: { $0.conceptID < $1.conceptID }) {
-            let sourceIDs = concept.sources.compactMap(\.id).sorted()
-            guard !sourceIDs.isEmpty else { continue }
+            let declaredSourceIDs = concept.sources.compactMap(\.id).sorted()
+            guard !declaredSourceIDs.isEmpty else { continue }
             for range in paragraphRanges(concept.body) {
                 let paragraph = String(concept.body[range])
                 let trimmed = trimmedRange(in: paragraph)
@@ -60,6 +108,10 @@ public struct DeterministicKnowledgeChunker: Sendable {
                     let text = String(exact[window])
                     let textBytes = Data(text.utf8)
                     guard textBytes.count >= configuration.minimumUTF8Bytes else { continue }
+                    let sourceIDs = try OKFReader.attributedSourceIDs(
+                        in: text,
+                        declaredSourceIDs: declaredSourceIDs)
+                    guard !sourceIDs.isEmpty else { continue }
                     let windowOffset = exact.utf8.distance(
                         from: exact.startIndex,
                         to: window.lowerBound)
@@ -99,21 +151,12 @@ public struct DeterministicKnowledgeChunker: Sendable {
             lines.append(0x0A)
         }
         let parametersDigest = try KnowledgeDigest.canonical(configuration)
-        struct Projection: Codable {
-            let version: String
-            let bundleRevision: String
-            let algorithm: String
-            let algorithmVersion: String
-            let parametersDigest: String
-            let jsonLinesSha256: String
-        }
-        let manifestDigest = try KnowledgeDigest.canonical(Projection(
-            version: "intatis-chunk-manifest-digest/1",
+        let manifestDigest = try KnowledgeChunkManifestIdentity.digest(
             bundleRevision: bundleRevision,
             algorithm: KnowledgeContract.deterministicChunkerIdentity,
             algorithmVersion: KnowledgeContract.deterministicChunkerVersion,
             parametersDigest: parametersDigest,
-            jsonLinesSha256: KnowledgeDigest.sha256(lines)))
+            chunks: sorted)
         return KnowledgeChunkingResult(
             chunks: sorted,
             jsonLines: lines,

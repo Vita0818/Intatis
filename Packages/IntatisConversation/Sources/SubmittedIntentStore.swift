@@ -492,6 +492,56 @@ public enum SubmittedIntentAcceptance: Equatable, Sendable {
     case outbox(SubmittedIntentOutboxEntry, error: String)
 }
 
+/// Host-side retry action for one canonical submitted intent. Task attempts
+/// recovered by the Orchestrator are authoritative: resuming an exact queued
+/// task is not a new whole-submission retry.
+public enum SubmittedIntentRetryPlan: Equatable, Sendable {
+    case completed(attempt: Int)
+    case resumeRestoredTask(attempt: Int, appendsQueuedStatus: Bool)
+    case retryTerminalTask(attempt: Int)
+    case retrySubmissionWithoutTask(attempt: Int)
+    case reject
+}
+
+public enum SubmittedIntentRetryPlanner {
+    public static func plan(
+        currentAttempt: Int,
+        task: CoworkTaskView?,
+        isRestoredSubmission: Bool
+    ) -> SubmittedIntentRetryPlan {
+        let currentAttempt = max(1, currentAttempt)
+        guard let task else {
+            guard currentAttempt < Int.max else { return .reject }
+            return .retrySubmissionWithoutTask(attempt: currentAttempt + 1)
+        }
+
+        switch task.status {
+        case .completed:
+            return .completed(attempt: currentAttempt)
+        case .queued:
+            guard isRestoredSubmission else { return .reject }
+            if task.attempt == currentAttempt {
+                return .resumeRestoredTask(
+                    attempt: currentAttempt,
+                    appendsQueuedStatus: false)
+            }
+            if currentAttempt < Int.max,
+               task.attempt == currentAttempt + 1 {
+                return .resumeRestoredTask(
+                    attempt: task.attempt,
+                    appendsQueuedStatus: true)
+            }
+            return .reject
+        case .failed, .cancelled:
+            guard task.attempt == currentAttempt,
+                  currentAttempt < Int.max else { return .reject }
+            return .retryTerminalTask(attempt: currentAttempt + 1)
+        case .created, .assigned, .running:
+            return .reject
+        }
+    }
+}
+
 /// Coordinates the local fallback with canonical EventLog admission. It never
 /// starts remote execution: callers may do so only after receiving `.canonical`.
 public actor SubmittedIntentStore {

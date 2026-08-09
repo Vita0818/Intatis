@@ -14,6 +14,7 @@
     "validator",
     "backend_registry_digest",
     "root_identity",
+    "content_seal_digest",
     "semantic_verdict",
     "diagnostics_digest",
     "validated_at"
@@ -86,9 +87,14 @@
         }
       }
     },
+    "content_seal_digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
     "semantic_verdict": {
       "enum": [
         "valid",
+        "valid_with_warnings",
         "invalid"
       ]
     },

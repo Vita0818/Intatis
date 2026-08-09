@@ -62,6 +62,30 @@ enum DocumentPageSelection {
     }
 }
 
+private actor DocumentExecutionAccumulator {
+    private var engineVersions: [String: String] = [:]
+    private var warnings: [String] = []
+    private var result: JSONValue?
+
+    func record(
+        versions: [String: String] = [:],
+        warnings newWarnings: [String] = [],
+        result newResult: JSONValue? = nil
+    ) {
+        engineVersions.merge(versions) { _, new in new }
+        warnings.append(contentsOf: newWarnings)
+        if let newResult { result = newResult }
+    }
+
+    func snapshot() -> (
+        versions: [String: String],
+        warnings: [String],
+        result: JSONValue?
+    ) {
+        (engineVersions, warnings, result)
+    }
+}
+
 private enum DocumentToolSupport {
     static func encode<T: Encodable>(_ value: T) throws -> JSONValue {
         let encoder = JSONEncoder()
@@ -123,6 +147,8 @@ private enum DocumentToolSupport {
             metadata: [
                 "operation": .string(operation),
                 "format": .string(format.rawValue),
+                "execution_class": .string(
+                    PermissionIntent.structuredReadOnlyExecutionClass),
             ],
             dataEffects: [.read, .execute],
             risks: [.processExecution],
@@ -155,28 +181,37 @@ private enum DocumentToolSupport {
             replayPolicy: .requiresManualReconciliation)
     }
 
-    static func resolvedAuxiliaryPaths(
+    struct FrozenAuxiliaryInputs: Sendable {
+        let urlsByReviewedPath: [String: URL]
+        let snapshots: [DocumentInputSnapshot]
+    }
+
+    static func freezeAuxiliaryInputs(
         _ paths: [String],
         workspace: URL
-    ) throws -> [String: URL] {
-        var result: [String: URL] = [:]
+    ) throws -> FrozenAuxiliaryInputs {
+        let maximumAssetBytes: UInt64 = 128 * 1_024 * 1_024
+        let maximumTotalBytes: UInt64 = 512 * 1_024 * 1_024
+        var urlsByReviewedPath: [String: URL] = [:]
+        var snapshots: [DocumentInputSnapshot] = []
+        var totalBytes: UInt64 = 0
         for path in paths {
-            let url = try PathConfinement.resolve(path, within: workspace)
-            let values = try url.resourceValues(forKeys: [
-                .isRegularFileKey,
-                .isSymbolicLinkKey,
-                .fileSizeKey,
-            ])
-            guard values.isRegularFile == true,
-                  values.isSymbolicLink != true,
-                  (values.fileSize ?? 0) <= 512 * 1_024 * 1_024 else {
+            let snapshot = try DocumentInputFile.freezeReadOnly(
+                path: path,
+                maximumBytes: maximumAssetBytes,
+                workspace: workspace)
+            guard snapshot.identity.byteCount <= maximumTotalBytes - totalBytes else {
                 throw DocumentToolError(
                     .validationFailed,
-                    "a document asset is missing, unsafe, or too large")
+                    "document assets exceed the aggregate input budget")
             }
-            result[path] = url
+            totalBytes += snapshot.identity.byteCount
+            urlsByReviewedPath[path] = snapshot.url
+            snapshots.append(snapshot)
         }
-        return result
+        return FrozenAuxiliaryInputs(
+            urlsByReviewedPath: urlsByReviewedPath,
+            snapshots: snapshots)
     }
 
     static func validateGeneratedPDF(
@@ -265,22 +300,13 @@ private enum DocumentToolSupport {
                 reviewedOutputPath: reviewedOutputPath,
                 in: context)
         case .html:
-            let payload: JSONValue = .object([
-                "format": .string("html"),
-                "input_path": .string(input.path),
-                "require_self_contained": .bool(true),
-                "allowed_asset_paths": .array(
-                    allowedHTMLAssets.values.map { .string($0.path) }.sorted(by: jsonStringLess)),
-            ])
-            _ = try await DocumentPythonBackend.run(
-                operation: "validate",
-                payload: payload,
-                readableWorkspacePaths: [reviewedInputPath] + allowedHTMLAssets.keys.sorted(),
-                in: context)
-            return try await HTMLDocumentPDFRenderer.render(
+            return try await prepareAndRenderHTML(
                 input: input,
-                workspaceRoot: context.workspaceRoot,
-                stagedPDF: stagedPDF)
+                reviewedInputPaths: [reviewedInputPath] + allowedHTMLAssets.keys.sorted(),
+                reviewedOutputPath: reviewedOutputPath,
+                allowedHTMLAssets: allowedHTMLAssets,
+                stagedPDF: stagedPDF,
+                context: context)
         case .epub:
             throw DocumentToolError(
                 .unsupportedFeature,
@@ -288,6 +314,73 @@ private enum DocumentToolSupport {
         case .pdf:
             throw DocumentToolError(.unsupportedOperation, "PDF input is not an export route")
         }
+    }
+
+    static func prepareAndRenderHTML(
+        input: URL,
+        reviewedInputPaths: [String],
+        reviewedOutputPath: String,
+        allowedHTMLAssets: [String: URL],
+        stagedPDF: URL,
+        context: ToolContext
+    ) async throws -> [String: String] {
+        let stageRoot = stagedPDF.deletingLastPathComponent()
+        let sanitizedHTML = stageRoot.appendingPathComponent(
+            ".sanitized-html-\(UUID().uuidString).html",
+            isDirectory: false)
+        var needsCleanup = true
+        defer {
+            if needsCleanup,
+               FileManager.default.fileExists(atPath: sanitizedHTML.path) {
+                try? FileManager.default.removeItem(at: sanitizedHTML)
+            }
+        }
+
+        let inputIsInternal = input.path != stageRoot.path
+            && PathConfinement.isWithin(input.path, root: stageRoot)
+        let envelope = try await DocumentPythonBackend.run(
+            operation: "prepare_html_render",
+            payload: .object([
+                "input_path": .string(input.path),
+                "output_path": .string(sanitizedHTML.path),
+                "allowed_asset_paths": .array(
+                    allowedHTMLAssets.values.map { .string($0.path) }.sorted(by: jsonStringLess)),
+            ]),
+            readableWorkspacePaths: reviewedInputPaths,
+            writableWorkspacePaths: [reviewedOutputPath],
+            internalWritableWorkspacePaths: [stageRoot.path],
+            internalReadOnlyWorkspacePaths: inputIsInternal ? [input.path] : [],
+            in: context)
+        guard case .object(let result)? = envelope.result,
+              result["format"] == .string("html"),
+              result["sanitized"] == .bool(true),
+              case .number(let count)? = result["inlined_asset_count"],
+              count.isFinite,
+              count.rounded(.towardZero) == count,
+              count >= 0,
+              count <= 256 else {
+            throw DocumentToolError(
+                .validationFailed,
+                "HTML sanitizer did not return its fixed success contract")
+        }
+        try Task.checkCancellation()
+        let rendererVersions = try await HTMLDocumentPDFRenderer.render(
+            input: sanitizedHTML,
+            stageRoot: stageRoot,
+            stagedPDF: stagedPDF)
+        do {
+            try FileManager.default.removeItem(at: sanitizedHTML)
+            needsCleanup = false
+        } catch {
+            throw DocumentToolError(
+                .validationFailed,
+                "sanitized HTML staging cleanup failed")
+        }
+        var versions = envelope.engineVersions
+        for (name, version) in rendererVersions {
+            versions[name] = version
+        }
+        return versions
     }
 
     static func moveRenderedBundle(from source: URL, to destination: URL) throws {
@@ -312,6 +405,7 @@ private enum DocumentToolSupport {
     static func writeOperationPaths(_ value: DocumentWriteArguments) -> [String] {
         var paths: [String] = []
         if let input = value.inputPath { paths.append(input) }
+        paths.append(contentsOf: value.localAssetPaths ?? [])
         for operation in value.operations {
             for key in ["path", "source_path"] {
                 if case .string(let path)? = operation.parameters[key] {
@@ -320,7 +414,8 @@ private enum DocumentToolSupport {
             }
         }
         paths.append(value.outputPath)
-        return Array(NSOrderedSet(array: paths)) as? [String] ?? paths
+        var seen = Set<String>()
+        return paths.filter { seen.insert($0).inserted }
     }
 
     static func resolvedWriteOperations(
@@ -340,6 +435,51 @@ private enum DocumentToolSupport {
                 "parameters": .object(parameters),
             ])
         })
+    }
+
+    static func verifyWrittenNativeDocument(
+        _ stagedOutput: URL,
+        format: DocumentFormat,
+        resolvedOperations: JSONValue,
+        expectedOperationCount: Int,
+        assets: [String: URL],
+        reviewedOutputPath: String,
+        stageRoot: URL,
+        context: ToolContext
+    ) async throws -> DocumentBackendEnvelope {
+        guard [.docx, .pptx, .xlsx, .html].contains(format) else {
+            throw DocumentToolError(
+                .unsupportedOperation,
+                "format has no fixed native write verifier")
+        }
+        let allowedAssets = assets.values
+            .map { JSONValue.string($0.path) }
+            .sorted(by: jsonStringLess)
+        let envelope = try await DocumentPythonBackend.run(
+            operation: "verify_write",
+            payload: .object([
+                "format": .string(format.rawValue),
+                "input_path": .string(stagedOutput.path),
+                "operations": resolvedOperations,
+                "allowed_asset_paths": .array(allowedAssets),
+            ]),
+            readableWorkspacePaths: [],
+            writableWorkspacePaths: [reviewedOutputPath],
+            internalWritableWorkspacePaths: [stageRoot.path],
+            internalReadOnlyWorkspacePaths: [stagedOutput.path],
+            in: context)
+        guard case .object(let result)? = envelope.result,
+              case .string(let verifiedFormat)? = result["format"],
+              verifiedFormat == format.rawValue,
+              case .number(let verifiedCount)? = result["verified_count"],
+              verifiedCount.isFinite,
+              verifiedCount.rounded(.towardZero) == verifiedCount,
+              Int(exactly: verifiedCount) == expectedOperationCount else {
+            throw DocumentToolError(
+                .validationFailed,
+                "document write verifier did not confirm every declared operation")
+        }
+        return envelope
     }
 
     private static func jsonStringLess(_ lhs: JSONValue, _ rhs: JSONValue) -> Bool {
@@ -586,7 +726,7 @@ public struct DocumentRenderTool: Tool {
             expectedFormat: value.inputFormat,
             expectedSHA256: value.expectedSourceSHA256,
             workspace: context.workspaceRoot)
-        let assets = try DocumentToolSupport.resolvedAuxiliaryPaths(
+        let frozenAssets = try DocumentToolSupport.freezeAuxiliaryInputs(
             value.localAssetPaths ?? [],
             workspace: context.workspaceRoot)
         let pages = try DocumentPageSelection.parse(value.pages, maximumCount: 200)
@@ -597,7 +737,9 @@ public struct DocumentRenderTool: Tool {
             replaceExisting: value.replaceExisting ?? false,
             expectedDestinationSHA256: value.expectedOutputSHA256,
             maximumFiles: 201,
-            maximumBytes: UInt64(value.resolvedMaximumOutputBytes))
+            maximumBytes: UInt64(value.resolvedMaximumOutputBytes),
+            readOnlyInputSnapshots: frozenAssets.snapshots)
+        let accumulator = DocumentExecutionAccumulator()
         let receipt = try await DocumentStagedOutput.writeDirectory(
             request,
             workspace: context.workspaceRoot,
@@ -617,29 +759,31 @@ public struct DocumentRenderTool: Tool {
                     return
                 }
 
-                let work = stage.appendingPathComponent(".work", isDirectory: true)
                 let rendered = stage.appendingPathComponent(".rendered", isDirectory: true)
-                try FileManager.default.createDirectory(
-                    at: work,
-                    withIntermediateDirectories: false,
-                    attributes: [.posixPermissions: NSNumber(value: Int16(0o700))])
                 try FileManager.default.createDirectory(
                     at: rendered,
                     withIntermediateDirectories: false,
                     attributes: [.posixPermissions: NSNumber(value: Int16(0o700))])
-                let temporaryPDF = work.appendingPathComponent("preview.pdf")
-                _ = try await DocumentToolSupport.renderablePDF(
+                // Keep backend payloads directly under the transaction root.
+                // The process boundary accepts only a same-parent
+                // `.intatis-document-stage-*` directory as its internal
+                // writable lease; a nested ad-hoc work directory would fail
+                // closed before the fixed backend could start.
+                let temporaryPDF = stage.appendingPathComponent("preview.pdf")
+                let rendererVersions = try await DocumentToolSupport.renderablePDF(
                     format: value.inputFormat,
                     input: snapshot.url,
                     reviewedInputPath: value.inputPath,
                     reviewedOutputPath: value.outputDirectory,
-                    allowedHTMLAssets: assets,
+                    allowedHTMLAssets: frozenAssets.urlsByReviewedPath,
                     stagedPDF: temporaryPDF,
                     context: context)
-                _ = try await DocumentToolSupport.validateGeneratedPDF(
+                let validatorVersions = try await DocumentToolSupport.validateGeneratedPDF(
                     temporaryPDF,
                     reviewedOutputPath: value.outputDirectory,
                     context: context)
+                await accumulator.record(versions: rendererVersions)
+                await accumulator.record(versions: validatorVersions)
                 _ = try PDFNativeDocumentService.renderPages(
                     from: temporaryPDF,
                     into: rendered,
@@ -653,13 +797,29 @@ public struct DocumentRenderTool: Tool {
                     maximumOutputBytes: value.resolvedMaximumOutputBytes)
                 try DocumentToolSupport.moveRenderedBundle(from: rendered, to: stage)
                 try FileManager.default.removeItem(at: rendered)
-                try FileManager.default.removeItem(at: work)
+                try FileManager.default.removeItem(at: temporaryPDF)
+                for backendDirectoryName in [
+                    "libreoffice-output",
+                    "libreoffice-profile",
+                ] {
+                    let backendDirectory = stage.appendingPathComponent(
+                        backendDirectoryName,
+                        isDirectory: true)
+                    if FileManager.default.fileExists(atPath: backendDirectory.path) {
+                        try FileManager.default.removeItem(at: backendDirectory)
+                    }
+                }
             },
-            validate: DocumentToolSupport.validateRenderBundle)
+            validate: { directory in
+                try DocumentToolSupport.validateRenderBundle(directory)
+            })
+        let execution = await accumulator.snapshot()
+        var versions = execution.versions
+        versions["page_renderer"] = "PDFKit-system"
         return try DocumentToolSupport.observation(
             operation: "document_render",
             format: value.inputFormat,
-            engineVersions: ["page_renderer": "PDFKit-system"],
+            engineVersions: versions,
             receipt: receipt,
             changedFiles: [value.outputDirectory])
     }
@@ -709,7 +869,7 @@ public struct DocumentExportPDFTool: Tool {
             expectedFormat: value.inputFormat,
             expectedSHA256: value.expectedSourceSHA256,
             workspace: context.workspaceRoot)
-        let assets = try DocumentToolSupport.resolvedAuxiliaryPaths(
+        let frozenAssets = try DocumentToolSupport.freezeAuxiliaryInputs(
             value.localAssetPaths ?? [],
             workspace: context.workspaceRoot)
         let request = DocumentStagedFileRequest(
@@ -719,8 +879,9 @@ public struct DocumentExportPDFTool: Tool {
             replaceExisting: value.replaceExisting ?? false,
             expectedDestinationSHA256: value.expectedOutputSHA256,
             fileExtension: "pdf",
-            maximumBytes: 1_024 * 1_024 * 1_024)
-        var versions: [String: String] = [:]
+            maximumBytes: 1_024 * 1_024 * 1_024,
+            readOnlyInputSnapshots: frozenAssets.snapshots)
+        let accumulator = DocumentExecutionAccumulator()
         let receipt = try await DocumentStagedOutput.writeFile(
             request,
             workspace: context.workspaceRoot,
@@ -730,21 +891,24 @@ public struct DocumentExportPDFTool: Tool {
                     input: snapshot.url,
                     reviewedInputPath: value.inputPath,
                     reviewedOutputPath: value.outputPath,
-                    allowedHTMLAssets: assets,
+                    allowedHTMLAssets: frozenAssets.urlsByReviewedPath,
                     stagedPDF: stagedPDF,
                     context: context)
                 let validatorVersions = try await DocumentToolSupport.validateGeneratedPDF(
                     stagedPDF,
                     reviewedOutputPath: value.outputPath,
                     context: context)
-                versions.merge(rendererVersions) { _, new in new }
-                versions.merge(validatorVersions) { _, new in new }
+                await accumulator.record(versions: rendererVersions)
+                await accumulator.record(versions: validatorVersions)
             },
-            validate: DocumentToolSupport.validatePDFFile)
+            validate: { pdf in
+                try DocumentToolSupport.validatePDFFile(pdf)
+            })
+        let execution = await accumulator.snapshot()
         return try DocumentToolSupport.observation(
             operation: "document_export_pdf",
             format: value.inputFormat,
-            engineVersions: versions,
+            engineVersions: execution.versions,
             receipt: receipt,
             changedFiles: [value.outputPath])
     }
@@ -780,6 +944,7 @@ public struct DocumentWriteTool: Tool {
                 risksNetwork: false)
         }
         let readPaths = (value.inputPath.map { [$0] } ?? [])
+            + (value.localAssetPaths ?? [])
             + value.operations.flatMap { operation in
                 ["path", "source_path"].compactMap { key -> String? in
                     guard case .string(let path)? = operation.parameters[key] else { return nil }
@@ -803,18 +968,18 @@ public struct DocumentWriteTool: Tool {
                 expectedSHA256: value.expectedSourceSHA256,
                 workspace: context.workspaceRoot)
         }
-        let assetPaths = value.operations.flatMap { operation in
+        let assetPaths = (value.localAssetPaths ?? []) + value.operations.flatMap { operation in
             ["path", "source_path"].compactMap { key -> String? in
                 guard case .string(let path)? = operation.parameters[key] else { return nil }
                 return path
             }
         }
-        let assets = try DocumentToolSupport.resolvedAuxiliaryPaths(
+        let frozenAssets = try DocumentToolSupport.freezeAuxiliaryInputs(
             Array(Set(assetPaths)).sorted(),
             workspace: context.workspaceRoot)
         let operations = DocumentToolSupport.resolvedWriteOperations(
             value.operations,
-            assets: assets)
+            assets: frozenAssets.urlsByReviewedPath)
         let request = DocumentStagedFileRequest(
             sourcePath: value.inputPath,
             expectedSourceSHA256: value.expectedSourceSHA256,
@@ -822,10 +987,9 @@ public struct DocumentWriteTool: Tool {
             replaceExisting: value.replaceExisting ?? false,
             expectedDestinationSHA256: value.expectedOutputSHA256,
             fileExtension: URL(fileURLWithPath: value.outputPath).pathExtension,
-            maximumBytes: 1_024 * 1_024 * 1_024)
-        var versions: [String: String] = [:]
-        var warnings: [String] = []
-        var writeResult: JSONValue?
+            maximumBytes: 1_024 * 1_024 * 1_024,
+            readOnlyInputSnapshots: frozenAssets.snapshots)
+        let accumulator = DocumentExecutionAccumulator()
         let receipt = try await DocumentStagedOutput.writeFile(
             request,
             workspace: context.workspaceRoot,
@@ -837,7 +1001,7 @@ public struct DocumentWriteTool: Tool {
                     "output_path": .string(stagedOutput.path),
                     "operations": operations,
                     "allowed_asset_paths": .array(
-                        assets.values.map { .string($0.path) }.sorted(by: { left, right in
+                        frozenAssets.urlsByReviewedPath.values.map { .string($0.path) }.sorted(by: { left, right in
                             guard case .string(let lhs) = left,
                                   case .string(let rhs) = right else { return false }
                             return lhs < rhs
@@ -849,18 +1013,20 @@ public struct DocumentWriteTool: Tool {
                     let envelope = try await RBookDocumentBackend.run(
                         operation: "write",
                         payload: .object(payload),
-                        reviewedInputPaths: (value.inputPath.map { [$0] } ?? []) + assets.keys.sorted(),
+                        reviewedInputPaths: (value.inputPath.map { [$0] } ?? [])
+                            + frozenAssets.urlsByReviewedPath.keys.sorted(),
                         reviewedOutputPaths: [value.outputPath],
                         internalStageRoot: stageRoot.path,
                         in: context)
-                    writeResult = envelope.result
-                    versions.merge(envelope.engineVersions) { _, new in new }
-                    warnings.append(contentsOf: envelope.warnings)
+                    await accumulator.record(
+                        versions: envelope.engineVersions,
+                        warnings: envelope.warnings,
+                        result: envelope.result)
                     let validation = try await EPUBCheckValidationBackend.validate(
                         stagedEPUB: stagedOutput,
                         reviewedOutputPath: value.outputPath,
                         in: context)
-                    versions.merge(validation) { _, new in new }
+                    await accumulator.record(versions: validation)
                     return
                 }
 
@@ -870,13 +1036,15 @@ public struct DocumentWriteTool: Tool {
                     let envelope = try await DocumentPythonBackend.run(
                         operation: "write",
                         payload: .object(payload),
-                        readableWorkspacePaths: (value.inputPath.map { [$0] } ?? []) + assets.keys.sorted(),
+                        readableWorkspacePaths: (value.inputPath.map { [$0] } ?? [])
+                            + frozenAssets.urlsByReviewedPath.keys.sorted(),
                         writableWorkspacePaths: [value.outputPath],
                         internalWritableWorkspacePaths: [stageRoot.path],
                         in: context)
-                    writeResult = envelope.result
-                    versions.merge(envelope.engineVersions) { _, new in new }
-                    warnings.append(contentsOf: envelope.warnings)
+                    await accumulator.record(
+                        versions: envelope.engineVersions,
+                        warnings: envelope.warnings,
+                        result: envelope.result)
                     let preview = stageRoot.appendingPathComponent("preview.pdf")
                     let calc = try await LibreOfficeDocumentBackend.recalculateAndSaveXLSX(
                         editedInput: intermediate,
@@ -885,57 +1053,62 @@ public struct DocumentWriteTool: Tool {
                         reviewedInputPath: value.inputPath ?? value.outputPath,
                         reviewedOutputPath: value.outputPath,
                         in: context)
-                    versions.merge(calc) { _, new in new }
-                    let validation = try await DocumentPythonBackend.run(
-                        operation: "validate",
-                        payload: .object([
-                            "format": .string("xlsx"),
-                            "input_path": .string(stagedOutput.path),
-                        ]),
-                        readableWorkspacePaths: [],
-                        writableWorkspacePaths: [value.outputPath],
-                        internalWritableWorkspacePaths: [stageRoot.path],
-                        in: context)
-                    versions.merge(validation.engineVersions) { _, new in new }
+                    await accumulator.record(versions: calc)
+                    let verification = try await DocumentToolSupport.verifyWrittenNativeDocument(
+                        stagedOutput,
+                        format: .xlsx,
+                        resolvedOperations: operations,
+                        expectedOperationCount: value.operations.count,
+                        assets: frozenAssets.urlsByReviewedPath,
+                        reviewedOutputPath: value.outputPath,
+                        stageRoot: stageRoot,
+                        context: context)
+                    await accumulator.record(
+                        versions: verification.engineVersions,
+                        warnings: verification.warnings)
                     let pdfVersions = try await DocumentToolSupport.validateGeneratedPDF(
                         preview,
                         reviewedOutputPath: value.outputPath,
                         context: context)
-                    versions.merge(pdfVersions) { _, new in new }
+                    await accumulator.record(versions: pdfVersions)
                     return
                 }
 
                 let envelope = try await DocumentPythonBackend.run(
                     operation: "write",
                     payload: .object(payload),
-                    readableWorkspacePaths: (value.inputPath.map { [$0] } ?? []) + assets.keys.sorted(),
+                    readableWorkspacePaths: (value.inputPath.map { [$0] } ?? [])
+                        + frozenAssets.urlsByReviewedPath.keys.sorted(),
                     writableWorkspacePaths: [value.outputPath],
                     internalWritableWorkspacePaths: [stageRoot.path],
                     in: context)
-                writeResult = envelope.result
-                versions.merge(envelope.engineVersions) { _, new in new }
-                warnings.append(contentsOf: envelope.warnings)
-                let validation = try await DocumentPythonBackend.run(
-                    operation: "validate",
-                    payload: .object([
-                        "format": .string(value.format.rawValue),
-                        "input_path": .string(stagedOutput.path),
-                        "require_self_contained": .bool(value.format == .html),
-                        "allowed_asset_paths": .array([]),
-                    ]),
-                    readableWorkspacePaths: [],
-                    writableWorkspacePaths: [value.outputPath],
-                    internalWritableWorkspacePaths: [stageRoot.path],
-                    in: context)
-                versions.merge(validation.engineVersions) { _, new in new }
+                await accumulator.record(
+                    versions: envelope.engineVersions,
+                    warnings: envelope.warnings,
+                    result: envelope.result)
+                let verification = try await DocumentToolSupport.verifyWrittenNativeDocument(
+                    stagedOutput,
+                    format: value.format,
+                    resolvedOperations: operations,
+                    expectedOperationCount: value.operations.count,
+                    assets: frozenAssets.urlsByReviewedPath,
+                    reviewedOutputPath: value.outputPath,
+                    stageRoot: stageRoot,
+                    context: context)
+                await accumulator.record(
+                    versions: verification.engineVersions,
+                    warnings: verification.warnings)
 
                 let preview = stageRoot.appendingPathComponent("preview.pdf")
                 let previewVersions: [String: String]
                 if value.format == .html {
-                    previewVersions = try await HTMLDocumentPDFRenderer.render(
+                    previewVersions = try await DocumentToolSupport.prepareAndRenderHTML(
                         input: stagedOutput,
-                        workspaceRoot: context.workspaceRoot,
-                        stagedPDF: preview)
+                        reviewedInputPaths: frozenAssets.urlsByReviewedPath.keys.sorted(),
+                        reviewedOutputPath: value.outputPath,
+                        allowedHTMLAssets: frozenAssets.urlsByReviewedPath,
+                        stagedPDF: preview,
+                        context: context)
                 } else {
                     previewVersions = try await LibreOfficeDocumentBackend.exportPDF(
                         actualInput: stagedOutput,
@@ -944,12 +1117,12 @@ public struct DocumentWriteTool: Tool {
                         reviewedOutputPath: value.outputPath,
                         in: context)
                 }
-                versions.merge(previewVersions) { _, new in new }
+                await accumulator.record(versions: previewVersions)
                 let pdfVersions = try await DocumentToolSupport.validateGeneratedPDF(
                     preview,
                     reviewedOutputPath: value.outputPath,
                     context: context)
-                versions.merge(pdfVersions) { _, new in new }
+                await accumulator.record(versions: pdfVersions)
             },
             validate: { output in
                 let values = try output.resourceValues(forKeys: [
@@ -963,12 +1136,13 @@ public struct DocumentWriteTool: Tool {
                     throw DocumentToolError(.validationFailed, "document writer produced no safe output")
                 }
             })
+        let execution = await accumulator.snapshot()
         return try DocumentToolSupport.observation(
             operation: "document_write",
             format: value.format,
-            result: writeResult,
-            engineVersions: versions,
-            warnings: warnings,
+            result: execution.result,
+            engineVersions: execution.versions,
+            warnings: execution.warnings,
             receipt: receipt,
             changedFiles: [value.outputPath])
     }

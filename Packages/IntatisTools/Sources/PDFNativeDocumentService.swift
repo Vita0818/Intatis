@@ -42,6 +42,7 @@ struct PDFNativeTextPage: Codable, Equatable, Sendable {
 
 struct PDFNativeTextReadResult: Codable, Equatable, Sendable {
     let pageCount: Int
+    let metadata: [String: String]
     let pages: [PDFNativeTextPage]
     let combinedText: String
 
@@ -265,6 +266,7 @@ enum PDFNativeDocumentService {
 
         return PDFNativeTextReadResult(
             pageCount: document.pageCount,
+            metadata: basicMetadata(from: document),
             pages: pages,
             combinedText: combinedText,
             requiresOCR: !selectedPages.isEmpty && !foundExtractableText,
@@ -274,6 +276,44 @@ enum PDFNativeDocumentService {
         throw PDFNativeDocumentServiceError.unavailable
         #endif
     }
+
+    #if canImport(PDFKit)
+    private static func basicMetadata(from document: PDFDocument) -> [String: String] {
+        let attributes = document.documentAttributes ?? [:]
+        var metadata: [String: String] = [:]
+        let stringFields: [(String, PDFDocumentAttribute)] = [
+            ("title", .titleAttribute),
+            ("author", .authorAttribute),
+            ("subject", .subjectAttribute),
+            ("creator", .creatorAttribute),
+            ("producer", .producerAttribute),
+        ]
+        for (name, key) in stringFields {
+            if let value = attributes[key] as? String,
+               !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                metadata[name] = value
+            }
+        }
+        let dateFields: [(String, PDFDocumentAttribute)] = [
+            ("creation_date", .creationDateAttribute),
+            ("modification_date", .modificationDateAttribute),
+        ]
+        let formatter = ISO8601DateFormatter()
+        for (name, key) in dateFields {
+            if let value = attributes[key] as? Date {
+                metadata[name] = formatter.string(from: value)
+            }
+        }
+        if let values = attributes[PDFDocumentAttribute.keywordsAttribute] as? [String],
+           !values.isEmpty {
+            metadata["keywords"] = values.joined(separator: ", ")
+        } else if let value = attributes[PDFDocumentAttribute.keywordsAttribute] as? String,
+                  !value.isEmpty {
+            metadata["keywords"] = value
+        }
+        return metadata
+    }
+    #endif
 
     /// Renders pages into an already-created, private staging directory. The
     /// caller owns committing or discarding that directory as one artifact.

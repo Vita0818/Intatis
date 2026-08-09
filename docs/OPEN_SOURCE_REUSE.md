@@ -67,6 +67,32 @@ external-runtime 以独立 helper/process/service 运行上游实现
 8. 添加与复用风险相称的测试，并对照上游测试覆盖输入校验、错误路径、取消、并发和安全边界。
 9. 最终报告明确区分“直接复制”“翻译/改写”“仅参考行为”和“独立实现”。
 
+## OKF / knowledge retrieval 当前准入结论
+
+- Intatis 已把 GoogleCloudPlatform `knowledge-catalog` 的 Open Knowledge Format v0.2
+  `okf/SPEC.md` 固定在 commit `3fcbb9f828c2f23d109c855ee403c3a4c81f3a96`，以
+  byte-exact `vendored standard documentation` 形式保存于
+  `ThirdPartyStandards/OpenKnowledgeFormat/0.2/`。规范 SHA-256 为
+  `5a3311d270bebb16d558010e75064f5b75323f284992641732b1c8097511f948`；许可证为
+  Apache-2.0，固定 license SHA-256 为
+  `8c6db340475136df3c1201d458fa5755698eace76e510471ecc9d857d6083dac`。
+  `UPSTREAM.md`、`SHA256SUMS`、`NOTICE.md` 和
+  `ThirdPartyNotices/OpenKnowledgeFormat.md` 是同一 adoption record，不得只更新其中一处。
+- 本次没有采用或执行上游 reference agent、Python package、prompt、sample bundle、viewer、
+  HTML/CSS/JavaScript 或品牌资产。Intatis 的 Profile、Validator、snapshot/index 和 tool contract
+  是独立 Swift 集成代码；OKF 本身不定义 embedding、vector store、rerank、ACL 或 RAG runtime。
+- non-iOS `IntatisKnowledge` target 通过 SwiftPM 使用 Yams 6.2.2，固定 commit
+  `a27b21e0c81c5bf42049b897a62aaf387e80f279`。复用类型为 `dependency`，许可证 MIT；运行闭包
+  是 Yams 及其同包 CYaml/libYAML，无外部 package dependency。完整记录与许可证位于
+  `ThirdPartyNotices/KnowledgeRetrieval.md` 和
+  `ThirdPartyNotices/Licenses/Yams-6.2.2-MIT.txt`。Yams 只负责 bounded YAML AST；alias、custom
+  tag、node/depth/scalar limits 和不执行输入仍由 Intatis host safety profile 强制。
+- Apple NaturalLanguage、Accelerate 和系统加密/文件 API 属系统框架，不新增第三方 NOTICE。
+  P0 dense exact KNN、BM25 tokenizer/scorer、RRF 与 embedding-cosine reranker 是仓内 Swift 实现；
+  没有复制或链接 SwiftIndex、MLXEmbedders、sqlite-vec、USearch、VecturaKit、Wax、llama.cpp 或
+  其它调查项目的源码、模型和 runtime。以后若采用其中任何实现，必须重新固定 commit、license、
+  transitive closure、universal macOS/iOS target 边界并更新 NOTICE。
+
 ## OpenCode 当前准入结论
 
 - 官方活跃仓库：`https://github.com/anomalyco/opencode`
@@ -387,6 +413,31 @@ external-runtime 以独立 helper/process/service 运行上游实现
 - OpenRouter JSON 请求/响应另外只按官方 Speech-to-Text 文档作协议核对；没有复制其 SDK 源码或示例。
   本批没有新增第三方分发物，因而 `NOTICE.md` 不增加 Flotis 第三方条目。若后续把 Flotis 作为独立
   第三方发布物或引入其其他文件，必须先补齐权利/许可证结论并重新评估 NOTICE。
+
+## rbook EPUB helper 当前准入结论
+
+- `Packages/IntatisTools/Runtime/rbook-helper` 是 Intatis 自有的窄 Rust
+  connector，以 `dependency` + `external-runtime` 形式使用 crates.io
+  `rbook 0.7.10`；实际 registry checksum 为
+  `663ec1a8b0a945c8bb9c9912b1f8b328ba698a05165a81072e16604be019f45d`，
+  许可证 Apache-2.0。只读审计 checkout 固定在
+  `d440c7cf35db2fd31e938c0555448dbaec5437d0`，但可重复构建身份以
+  `Cargo.lock` 与 registry checksum 为准。
+- helper 只暴露版本化 `json-v1` 的 EPUB read/write 子集；不接受模型
+  command、backend、环境变量或网络地址。它仍位于 Intatis 的
+  PermissionEngine、CapabilityLease、WorkspaceLease、sandbox、staging、
+  EPUBCheck 和原子提交之后，不进入 iOS target。
+- `Cargo.toml` 对 rbook/serde/serde_json/zip 使用 exact pins，lockfile v4
+  固定完整闭包及 crates.io checksum。当前解析闭包只有
+  Apache-2.0、MIT、Zlib、0BSD、Unlicense 与 Unicode-3.0 等兼容条款，
+  没有 GPL/AGPL/LGPL/MPL/SSPL/BSL/Commons Clause；完整版本和 license
+  expression 表位于 `ThirdPartyNotices/DocumentRBookHelper.md`，根
+  `NOTICE.md` 已登记实际采用项。
+- 本轮只完成可构建源码与 lockfile，不声称 App 已分发 helper binary。
+  runtime 分发前仍须从 exact crate 源收集完整 LICENSE/NOTICE/copyright、
+  生成 SBOM、固定 Rust toolchain 与双架构 binary hash，并完成 Developer ID
+  签名、公证和 clean-machine sandbox 验证；未完成时生产调用必须返回
+  `backend_missing`，不得下载或切换到另一个 EPUB backend。
 
 ## 上游升级规则
 

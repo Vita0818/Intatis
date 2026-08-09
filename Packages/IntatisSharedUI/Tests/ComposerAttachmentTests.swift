@@ -17,13 +17,20 @@ final class ComposerAttachmentTests: XCTestCase {
             at: root,
             withIntermediateDirectories: true)
         let sourceURL = root.appendingPathComponent("reference.png")
-        let bytes = Data("PNG fixture".utf8)
+        let bytes = try XCTUnwrap(Data(base64Encoded:
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="))
         try bytes.write(to: sourceURL)
 
         let file = try IntatisComposerAttachmentFileReader.read(sourceURL)
         XCTAssertEqual(file.name, "reference.png")
         XCTAssertEqual(file.mime, "image/png")
         XCTAssertEqual(file.data, bytes)
+
+        let jpegURL = root.appendingPathComponent("reference.JpEg")
+        try Data([0xFF, 0xD8, 0xFF, 0xD9]).write(to: jpegURL)
+        XCTAssertEqual(
+            try IntatisComposerAttachmentFileReader.read(jpegURL).mime,
+            "image/jpeg")
 
         let artifactStore = try ArtifactStore(
             root: root.appendingPathComponent("artifacts", isDirectory: true))

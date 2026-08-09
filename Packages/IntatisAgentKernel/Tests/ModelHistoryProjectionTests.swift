@@ -1148,7 +1148,218 @@ final class ModelHistoryProjectionTests: XCTestCase {
                     .invalidItem(
                         "accepted-submission:\(currentID.rawValue)",
                         "accepted user target does not match the current root assignee"))
+        }
+    }
+
+    func testMediaDirectHistoryProjectsAlignedBindingsAndMessagesOnlyFails()
+        throws
+    {
+        let artifactID = ArtifactID(rawValue: "artifact-projected-image")
+        let reference = ModelHistoryImageReference(
+            artifactID: artifactID,
+            mimeType: "image/jpeg",
+            byteCount: 256,
+            sha256: String(repeating: "d", count: 64))
+        let priorID = SubmissionID(rawValue: "sub-media-prior")
+        let currentID = SubmissionID(rawValue: "sub-media-current")
+        let priorTask = rootTask("task-media-prior", priorID, "inspect")
+        let currentTask = rootTask("task-media-current", currentID, "next")
+        let turnID = TurnID(rawValue: "turn-media-prior")
+        let events = [
+            envelope(1, .userMessage(UserMessagePayload(
+                text: "inspect",
+                attachments: [artifactID],
+                to: main,
+                submissionID: priorID))),
+            envelope(2, .taskCreated(TaskCreatedPayload(contract: priorTask))),
+            envelope(3, .modelHistoryItem(.message(
+                itemID: "media-user",
+                turnID: turnID,
+                agent: main,
+                taskID: priorTask.id,
+                submissionID: priorID,
+                taskAttempt: 1,
+                role: .user,
+                content: "inspect",
+                attachmentIDs: [artifactID],
+                imageReferences: [reference],
+                messageClassification: .realUser))),
+            envelope(4, .modelHistoryItem(.functionCallBatch(
+                itemID: "media-call",
+                turnID: turnID,
+                agent: main,
+                taskID: priorTask.id,
+                submissionID: priorID,
+                taskAttempt: 1,
+                content: nil,
+                calls: [ModelHistoryFunctionCall(
+                    callID: "call-media",
+                    name: "inspect_image",
+                    arguments: "{}")]))),
+            envelope(5, .modelHistoryItem(.functionCallOutput(
+                itemID: "media-output",
+                turnID: turnID,
+                agent: main,
+                taskID: priorTask.id,
+                submissionID: priorID,
+                taskAttempt: 1,
+                callID: "call-media",
+                output: "",
+                imageReferences: [reference]))),
+            envelope(6, .userMessage(UserMessagePayload(
+                text: "next", to: main, submissionID: currentID))),
+            envelope(7, .taskCreated(TaskCreatedPayload(contract: currentTask))),
+        ]
+
+        let projection = try AgentModelHistoryProjector().projectState(
+            agentID: main,
+            currentTask: currentTask,
+            events: events)
+        XCTAssertEqual(projection.messages.count, projection.imageBindings.count)
+        let expectedBindings: [ProjectedImageBinding?] = [
+            .userVerified([reference]),
+            nil,
+            .toolVerified(callID: "call-media", imageReferences: [reference]),
+        ]
+        XCTAssertEqual(projection.imageBindings, expectedBindings)
+        XCTAssertEqual(
+            projection.realUserMessages.first?.imageReferences,
+            [reference])
+        XCTAssertThrowsError(try AgentModelHistoryProjector().project(
+            agentID: main,
+            currentTask: currentTask,
+            events: events)) {
+                XCTAssertEqual(
+                    $0 as? AgentModelHistoryProjectionError,
+                    .mediaBindingsRequireProjectionState)
             }
+    }
+
+    func testV1CheckpointCannotMaskV2HistoryAndV2DropsOldImages()
+        throws
+    {
+        let artifactID = ArtifactID(rawValue: "artifact-checkpoint-image")
+        let reference = ModelHistoryImageReference(
+            artifactID: artifactID,
+            mimeType: "image/png",
+            byteCount: 128,
+            sha256: String(repeating: "e", count: 64))
+        let priorID = SubmissionID(rawValue: "sub-checkpoint-media")
+        let currentID = SubmissionID(rawValue: "sub-checkpoint-current")
+        let priorTask = rootTask("task-checkpoint-media", priorID, "inspect")
+        let currentTask = rootTask("task-checkpoint-current", currentID, "next")
+        let directEvents = [
+            envelope(1, .userMessage(UserMessagePayload(
+                text: "inspect",
+                attachments: [artifactID],
+                to: main,
+                submissionID: priorID))),
+            envelope(2, .taskCreated(TaskCreatedPayload(contract: priorTask))),
+            envelope(3, .modelHistoryItem(.message(
+                itemID: "checkpoint-media-user",
+                turnID: TurnID(rawValue: "turn-checkpoint-media"),
+                agent: main,
+                taskID: priorTask.id,
+                submissionID: priorID,
+                taskAttempt: 1,
+                role: .user,
+                content: "inspect",
+                attachmentIDs: [artifactID],
+                imageReferences: [reference],
+                messageClassification: .realUser))),
+        ]
+        let replacement = [
+            retainedUser(
+                "checkpoint-retained-user",
+                submissionID: priorID,
+                content: "inspect"),
+            summary("checkpoint-summary", "image summarized"),
+        ]
+        let currentEvents = [
+            envelope(5, .userMessage(UserMessagePayload(
+                text: "next", to: main, submissionID: currentID))),
+            envelope(6, .taskCreated(TaskCreatedPayload(contract: currentTask))),
+        ]
+
+        XCTAssertThrowsError(try AgentModelHistoryProjector().projectState(
+            agentID: main,
+            currentTask: currentTask,
+            events: directEvents + [
+                envelope(4, .modelHistoryCompacted(checkpoint(
+                    message: "image summarized",
+                    replacementHistory: replacement))),
+            ] + currentEvents))
+
+        let mediaCheckpoint = checkpoint(
+            schemaVersion: ModelHistoryCompactedPayload.mediaSchemaVersion,
+            message: "image summarized",
+            replacementHistory: replacement)
+        let projection = try AgentModelHistoryProjector().projectState(
+            agentID: main,
+            currentTask: currentTask,
+            events: directEvents + [
+                envelope(4, .modelHistoryCompacted(mediaCheckpoint)),
+            ] + currentEvents)
+        XCTAssertTrue(projection.imageBindings.allSatisfy { $0 == nil })
+        XCTAssertTrue(projection.realUserMessages.allSatisfy {
+            $0.attachmentIDs == nil && $0.imageReferences == nil
+        })
+    }
+
+    func testLegacyV1CheckpointAttachmentIDsDecodeButDoNotReinsertImages()
+        throws
+    {
+        let artifactID = ArtifactID(rawValue: "artifact-legacy-checkpoint")
+        let priorID = SubmissionID(rawValue: "sub-legacy-checkpoint")
+        let currentID = SubmissionID(rawValue: "sub-legacy-checkpoint-current")
+        let priorTask = rootTask(
+            "task-legacy-checkpoint",
+            priorID,
+            "legacy image request")
+        let currentTask = rootTask(
+            "task-legacy-checkpoint-current",
+            currentID,
+            "next")
+        let legacyCheckpoint = checkpoint(
+            message: "legacy image summarized",
+            replacementHistory: [
+                ModelHistoryReplacementItem(
+                    itemID: "legacy-retained-user",
+                    sourceSubmissionID: priorID,
+                    kind: .message,
+                    role: .user,
+                    messageClassification: .realUser,
+                    content: "legacy image request",
+                    attachmentIDs: [artifactID]),
+                summary(
+                    "legacy-checkpoint-summary",
+                    "legacy image summarized"),
+            ])
+        let events = [
+            envelope(1, .userMessage(UserMessagePayload(
+                text: "legacy image request",
+                attachments: [artifactID],
+                to: main,
+                submissionID: priorID))),
+            envelope(2, .taskCreated(TaskCreatedPayload(contract: priorTask))),
+            envelope(3, .modelHistoryCompacted(legacyCheckpoint)),
+            envelope(4, .userMessage(UserMessagePayload(
+                text: "next", to: main, submissionID: currentID))),
+            envelope(5, .taskCreated(TaskCreatedPayload(contract: currentTask))),
+        ]
+
+        let projection = try AgentModelHistoryProjector().projectState(
+            agentID: main,
+            currentTask: currentTask,
+            events: events)
+        XCTAssertTrue(projection.imageBindings.allSatisfy { $0 == nil })
+        XCTAssertTrue(projection.realUserMessages.allSatisfy {
+            $0.attachmentIDs == nil && $0.imageReferences == nil
+        })
+        XCTAssertNoThrow(try AgentModelHistoryProjector().project(
+            agentID: main,
+            currentTask: currentTask,
+            events: events))
     }
 
     private func invocationEvents(
@@ -1265,6 +1476,8 @@ final class ModelHistoryProjectionTests: XCTestCase {
         "018f47a0-7b1c-7000-8000-000000000003"
 
     private func checkpoint(
+        schemaVersion: Int =
+            ModelHistoryCompactedPayload.currentSchemaVersion,
         message: String,
         replacementHistory: [ModelHistoryReplacementItem],
         windowNumber: UInt64 = 1,
@@ -1272,6 +1485,7 @@ final class ModelHistoryProjectionTests: XCTestCase {
         windowID: String? = nil
     ) -> ModelHistoryCompactedPayload {
         ModelHistoryCompactedPayload(
+            schemaVersion: schemaVersion,
             agent: main,
             message: message,
             replacementHistory: replacementHistory,

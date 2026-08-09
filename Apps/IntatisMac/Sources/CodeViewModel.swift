@@ -117,6 +117,12 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
     private let mcpSnapshots:
         (@MainActor @Sendable () async throws
             -> MCPAgentRequestToolSnapshotSource)?
+    /// Optional host-owned internal tools. The default is nil; product UI and
+    /// ordinary Code sessions therefore retain their existing registry.
+    private let internalToolRegistryAugmenter:
+        HostToolRegistryAugmenter?
+    private var mcpInternalToolRegistryLease:
+        HostToolRegistryAugmentationLease?
 
     init(sessionID: SessionID,
          workspaceAccess: WorkspaceAccessLease,
@@ -127,7 +133,9 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
          mcpSnapshots:
             (@MainActor @Sendable () async throws
                 -> MCPAgentRequestToolSnapshotSource)?
-                = nil) {
+                = nil,
+         internalToolRegistryAugmenter:
+            HostToolRegistryAugmenter? = nil) {
         self.sessionID = sessionID
         self.workspaceAccess = workspaceAccess
         self.workspaceRoot = workspaceAccess.canonicalURL
@@ -143,6 +151,8 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
         self.voiceInput = ComposerVoiceInputController(registry: registry)
         #endif
         self.mcpSnapshots = mcpSnapshots
+        self.internalToolRegistryAugmenter =
+            internalToolRegistryAugmenter
         #if canImport(AVFoundation)
         observeVoiceInput()
         #endif
@@ -447,6 +457,12 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
             self.isWorking = false
             self.projectionPump = nil
             self.projectionCommitFence = nil
+            let internalLease =
+                self.mcpInternalToolRegistryLease
+            self.mcpInternalToolRegistryLease = nil
+            if let internalLease {
+                _ = await internalLease.close()
+            }
             self.workspaceAccess?.release()
             self.workspaceAccess = nil
         }
@@ -501,6 +517,8 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
         let operation = Task { @MainActor [weak self] in
             guard let self else { return }
             var didEnterAgentLoop = false
+            var internalToolLease:
+                HostToolRegistryAugmentationLease?
             do {
                 let route =
                     try await self.registry.defaultAgentRuntimeRoute()
@@ -516,6 +534,11 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
                         "clease_code_\(self.sessionID.rawValue)")
                 capabilityLease.expiresAtTaskCompletion =
                     false
+                if let augmenter =
+                    self.internalToolRegistryAugmenter {
+                    capabilityLease.tools.formUnion(
+                        augmenter.additionalCapabilities)
+                }
                 let durableMCP =
                     try await MCPDurableSessionState.load(
                         from: self.log)
@@ -542,9 +565,25 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
                         catalogBudget:
                             route.modelContextPolicy
                                 .skillCatalogMetadataBudget)
-                let baseRegistry = skillSnapshot.augmenting(
+                let unaugmentedRegistry = skillSnapshot.augmenting(
                     ToolRegistry.standard(
                         includesTerminal: allowsShell))
+                let baseRegistry: ToolRegistry
+                if let augmenter =
+                    self.internalToolRegistryAugmenter {
+                    let lease = try await augmenter.augment(
+                        HostToolRegistryAugmentationInput(
+                            sessionID: self.sessionID,
+                            agentID: agent.name,
+                            taskID: nil,
+                            capabilityLease: capabilityLease,
+                            workspaceLease: workspaceLease,
+                            baseRegistry: unaugmentedRegistry))
+                    internalToolLease = lease
+                    baseRegistry = lease.registry
+                } else {
+                    baseRegistry = unaugmentedRegistry
+                }
                 let runtime = AgentRuntime.code(
                     registry: baseRegistry,
                     allowsShell: allowsShell,
@@ -621,7 +660,15 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
                     recordUserMessage: false,
                     submissionID:
                         durableUserMessage.submissionID)
+                if let lease = internalToolLease {
+                    _ = await lease.close()
+                    internalToolLease = nil
+                }
             } catch {
+                if let lease = internalToolLease {
+                    _ = await lease.close()
+                    internalToolLease = nil
+                }
                 let isInterruption = error is AgentTurnInterruptedError
                     || IntatisCancellation.isCurrentTaskCancellation(error)
                 let message = error.localizedDescription
@@ -734,6 +781,11 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
             descriptor.capabilityLeaseID
         capabilityLease.expiresAtTaskCompletion =
             false
+        if let augmenter =
+            internalToolRegistryAugmenter {
+            capabilityLease.tools.formUnion(
+                augmenter.additionalCapabilities)
+        }
         let durable =
             try await MCPDurableSessionState.load(
                 from: log)
@@ -760,15 +812,35 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
                 configuration: .standard(
                     workspaceRoot: workspaceRoot,
                     access: AppConfig.skillRootAccess))
+        let unaugmentedRegistry = skillSnapshot.augmenting(
+            ToolRegistry.standard(
+                includesTerminal:
+                    allowsShell))
+        if let previous = mcpInternalToolRegistryLease {
+            mcpInternalToolRegistryLease = nil
+            _ = await previous.close()
+        }
+        let baseRegistry: ToolRegistry
+        if let augmenter = internalToolRegistryAugmenter {
+            let lease = try await augmenter.augment(
+                HostToolRegistryAugmentationInput(
+                    sessionID: sessionID,
+                    agentID: descriptor.agentID,
+                    taskID: descriptor.taskID,
+                    capabilityLease: capabilityLease,
+                    workspaceLease: workspaceLease,
+                    baseRegistry: unaugmentedRegistry))
+            mcpInternalToolRegistryLease = lease
+            baseRegistry = lease.registry
+        } else {
+            baseRegistry = unaugmentedRegistry
+        }
         return MCPAgentDispatchInput(
             agentID: descriptor.agentID,
             capabilityLease:
                 capabilityLease,
             workspaceLease: workspaceLease,
-            baseRegistry: skillSnapshot.augmenting(
-                ToolRegistry.standard(
-                    includesTerminal:
-                        allowsShell)),
+            baseRegistry: baseRegistry,
             activationReason: reason)
     }
 

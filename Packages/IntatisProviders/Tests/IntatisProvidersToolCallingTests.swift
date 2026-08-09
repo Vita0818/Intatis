@@ -1124,7 +1124,7 @@ final class IntatisProvidersToolCallingTests: XCTestCase {
         XCTAssertEqual(http.attemptCount, 0)
     }
 
-    func testRegistryEnablesImageInputOnlyForNativeOpenAIVisionRoute()
+    func testRegistryEnablesImageInputOnlyForReviewedOpenAIResponsesAdapterWithVision()
         async throws {
         let model = ModelID(rawValue: "vision-model")
         func makeEndpoint(
@@ -1148,16 +1148,34 @@ final class IntatisProvidersToolCallingTests: XCTestCase {
         }
         let endpoints = [
             makeEndpoint(
-                id: "native-vision",
+                id: "responses-vision",
                 adapter: .openAI,
                 capabilities: [.toolCalling, .visionInput]),
             makeEndpoint(
-                id: "native-text",
+                id: "responses-text",
                 adapter: .openAI,
                 capabilities: [.toolCalling]),
             makeEndpoint(
+                id: "model-overridden-responses-vision",
+                adapter: .openAICompatible,
+                capabilities: [.toolCalling, .visionInput],
+                modelOverride: .openAI),
+            makeEndpoint(
                 id: "compatible-vision",
                 adapter: .openAICompatible,
+                capabilities: [.toolCalling, .visionInput]),
+            makeEndpoint(
+                id: "legacy-vision",
+                adapter: .legacyOpenAIWire,
+                capabilities: [.toolCalling, .visionInput]),
+            makeEndpoint(
+                id: "openrouter-vision",
+                adapter: .openRouter,
+                capabilities: [.toolCalling, .visionInput]),
+            makeEndpoint(
+                id: "unknown-vision",
+                adapter: ProviderRequestAdapter(
+                    rawValue: "example:unknown-adapter"),
                 capabilities: [.toolCalling, .visionInput]),
             makeEndpoint(
                 id: "overridden-compatible-vision",
@@ -1170,12 +1188,15 @@ final class IntatisProvidersToolCallingTests: XCTestCase {
                 endpoints: endpoints,
                 models: ResolvedModels(
                     chat: ModelRef(
-                        endpoint: "native-vision",
+                        endpoint: "responses-vision",
                         model: model))),
             resolver: FixedToolSecretResolver(),
             http: FakeHTTP2(chunks: []))
 
-        for endpointID in ["native-vision"] {
+        for endpointID in [
+            "responses-vision",
+            "model-overridden-responses-vision",
+        ] {
             let provider = try await registry.agentProvider(
                 for: ModelRef(endpoint: endpointID, model: model))
             XCTAssertTrue(
@@ -1186,8 +1207,11 @@ final class IntatisProvidersToolCallingTests: XCTestCase {
                     .supportsFunctionOutputImageInput)
         }
         for endpointID in [
-            "native-text",
+            "responses-text",
             "compatible-vision",
+            "legacy-vision",
+            "openrouter-vision",
+            "unknown-vision",
             "overridden-compatible-vision",
         ] {
             let provider = try await registry.agentProvider(

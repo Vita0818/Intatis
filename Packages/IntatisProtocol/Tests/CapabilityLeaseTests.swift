@@ -12,6 +12,17 @@ final class CapabilityLeaseTests: XCTestCase {
         .documentWrite,
     ]
 
+    private static let documentObservationCapabilities: Set<ToolCapability> = [
+        .documentRead,
+        .documentOCR,
+    ]
+
+    private static let documentMutationCapabilities: Set<ToolCapability> = [
+        .documentRender,
+        .documentExportPDF,
+        .documentWrite,
+    ]
+
     private static let legacyDocumentCapabilities: Set<ToolCapability> = [
         .readDocument,
         .editPDF,
@@ -25,8 +36,9 @@ final class CapabilityLeaseTests: XCTestCase {
         XCTAssertTrue(lease.tools.contains(.listWorkspace))
         XCTAssertTrue(lease.tools.contains(.searchWorkspace))
         XCTAssertTrue(lease.tools.contains(.readPDF))
+        XCTAssertTrue(Self.documentObservationCapabilities.isSubset(of: lease.tools))
         XCTAssertTrue(lease.tools.contains(.requestDelegation))
-        XCTAssertTrue(lease.tools.isDisjoint(with: Self.documentCapabilities))
+        XCTAssertTrue(lease.tools.isDisjoint(with: Self.documentMutationCapabilities))
         XCTAssertTrue(lease.tools.isDisjoint(with: Self.legacyDocumentCapabilities))
         XCTAssertFalse(lease.tools.contains(.delegateTask))
         XCTAssertFalse(lease.tools.contains(.attachWorkspace))
@@ -64,7 +76,8 @@ final class CapabilityLeaseTests: XCTestCase {
 
         XCTAssertFalse(readOnly.tools.contains(.runShell))
         XCTAssertTrue(readWrite.tools.contains(.runShell))
-        XCTAssertTrue(readOnly.tools.isDisjoint(with: Self.documentCapabilities))
+        XCTAssertTrue(Self.documentObservationCapabilities.isSubset(of: readOnly.tools))
+        XCTAssertTrue(readOnly.tools.isDisjoint(with: Self.documentMutationCapabilities))
         XCTAssertTrue(Self.documentCapabilities.isSubset(of: readWrite.tools))
         XCTAssertTrue(readOnly.tools.isDisjoint(with: Self.legacyDocumentCapabilities))
         XCTAssertTrue(readWrite.tools.isDisjoint(with: Self.legacyDocumentCapabilities))

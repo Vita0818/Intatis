@@ -45,11 +45,10 @@ struct AgentCanonicalToolOutput: Equatable, Sendable {
         legacyObservation: String
     ) throws -> AgentCanonicalToolOutput {
         guard let structuredResult else {
-            let sanitized = PermissionReviewTextSanitizer.sanitize(
-                legacyObservation,
-                maxCharacters: maximumTextBytes).text
             return AgentCanonicalToolOutput(
-                output: utf8Prefix(sanitized, maximumBytes: maximumTextBytes),
+                output: utf8Prefix(
+                    sanitizedProviderText(legacyObservation),
+                    maximumBytes: maximumTextBytes),
                 imageReferences: [])
         }
 
@@ -63,7 +62,8 @@ struct AgentCanonicalToolOutput: Equatable, Sendable {
                         index: index,
                         reason: "text is missing")
                 }
-                if !text.isEmpty { textParts.append(text) }
+                let safeText = sanitizedProviderText(text)
+                if !safeText.isEmpty { textParts.append(safeText) }
 
             case .structuredJSON:
                 guard let value = block.structuredJSON,
@@ -73,7 +73,7 @@ struct AgentCanonicalToolOutput: Equatable, Sendable {
                     throw AgentToolOutputLoweringError.canonicalJSON(
                         index: index)
                 }
-                textParts.append(rendered)
+                textParts.append(sanitizedProviderText(rendered))
 
             case .imageReference:
                 guard let artifactID = block.artifactID,
@@ -103,7 +103,8 @@ struct AgentCanonicalToolOutput: Equatable, Sendable {
                         index: index,
                         reason: "resource URI is missing")
                 }
-                textParts.append("[MCP resource \(uri)]")
+                textParts.append(MCPToolResultPresentation.resource(
+                    uri: sanitizedProviderText(uri)))
 
             case .embeddedResourceReference:
                 guard let uri = block.uri, !uri.isEmpty else {
@@ -111,7 +112,8 @@ struct AgentCanonicalToolOutput: Equatable, Sendable {
                         index: index,
                         reason: "embedded resource URI is missing")
                 }
-                textParts.append("[MCP embedded resource \(uri)]")
+                textParts.append(MCPToolResultPresentation.embeddedResource(
+                    uri: sanitizedProviderText(uri)))
 
             case .artifactReference:
                 guard let artifactID = block.artifactID else {
@@ -119,7 +121,8 @@ struct AgentCanonicalToolOutput: Equatable, Sendable {
                         index: index,
                         reason: "artifact identity is missing")
                 }
-                textParts.append("[MCP artifact \(artifactID.rawValue)]")
+                textParts.append(MCPToolResultPresentation.textArtifact(
+                    artifactID: sanitizedProviderText(artifactID.rawValue)))
             }
         }
 
@@ -145,6 +148,12 @@ struct AgentCanonicalToolOutput: Equatable, Sendable {
                 (48...57).contains(scalar.value)
                     || (97...102).contains(scalar.value)
             }
+    }
+
+    private static func sanitizedProviderText(_ value: String) -> String {
+        PermissionReviewTextSanitizer.sanitize(
+            value,
+            maxCharacters: maximumTextBytes).text
     }
 
     private static func utf8Prefix(

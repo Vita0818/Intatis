@@ -42,14 +42,29 @@ public struct DeterministicPolicyGate: Sendable {
             return evaluateControlPlane(call, ctx)
         }
 
-        // 3. Shell-backed tools must be checked for shell availability before
+        // 3. Fixed structured readers may use a sandboxed parser/OCR process
+        // without gaining arbitrary shell or workspace mutation authority.
+        // They still pass through the reviewer route as process execution.
+        if call.sideEffect == .exec,
+           call.intent.isStructuredReadOnlyExecution {
+            guard call.risksNetwork == false else {
+                return .deny(
+                    reason: "structured read-only execution cannot access the network",
+                    risk: .high)
+            }
+            return .pass(
+                reason: "run fixed structured read-only document backend",
+                risk: .medium)
+        }
+
+        // 4. Shell-backed tools must be checked for shell availability before
         // generic network handling, otherwise an exec tool that also touches the
         // network could bypass App Store / read-only shell denial.
         if call.sideEffect == .exec {
             return evaluateShell(call, ctx)
         }
 
-        // 4. Network: never silently; denied in read-only.
+        // 5. Network: never silently; denied in read-only.
         if call.risksNetwork {
             if call.sideEffect == .destructive {
                 return ctx.profile == .readOnly
@@ -61,7 +76,7 @@ public struct DeterministicPolicyGate: Sendable {
                 : .pass(reason: "network access requested", risk: .medium)
         }
 
-        // 5. By concrete data-plane effect. Fall back to the legacy descriptor
+        // 6. By concrete data-plane effect. Fall back to the legacy descriptor
         // only for tools that have not yet supplied richer intent metadata.
         if call.intent.dataEffects.contains(.destructive) {
             return ctx.profile == .readOnly
@@ -75,6 +90,20 @@ public struct DeterministicPolicyGate: Sendable {
         }
         if call.intent.dataEffects.contains(.mutate) {
             return evaluateWrite(call, ctx)
+        }
+
+        // Mounted knowledge is read-only at the filesystem/data layer, but it
+        // can inject untrusted external assertions into the answering model.
+        // Keep that trust-boundary decision on the same reviewer/correlation
+        // path as the frozen RAG contract instead of inheriting the generic
+        // auto-allow used by ordinary local file reads.
+        if call.toolName == "search_knowledge",
+           call.sideEffect == .readOnly,
+           call.risksNetwork == false,
+           call.intent.action == "knowledge.search.local" {
+            return .pass(
+                reason: "search host-mounted untrusted knowledge evidence",
+                risk: .low)
         }
 
         switch call.sideEffect {

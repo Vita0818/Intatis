@@ -1001,8 +1001,10 @@ final class MCPToolResultConversionTests: XCTestCase {
             outputSchemaHash: nil,
             provenance: testProvenance())
 
-        XCTAssertTrue(
-            observation.text.contains("MCP text artifact"))
+        XCTAssertEqual(
+            observation.text,
+            MCPToolResultPresentation.textArtifact(
+                artifactID: "artifact-1"))
         XCTAssertEqual(
             observation.structuredResult?.content.first?.kind,
             .artifactReference)

@@ -1100,7 +1100,11 @@ public struct ContextProjector: Sendable {
         var directOutputKeys = Set<ModelHistoryToolKey>()
         for envelope in events {
             guard case .modelHistoryItem(let payload) = envelope.event,
-                  payload.schemaVersion == ModelHistoryItemPayload.currentSchemaVersion,
+                  payload.schemaVersion
+                    == ModelHistoryItemPayload.currentSchemaVersion
+                    || payload.schemaVersion
+                        == ModelHistoryItemPayload.mediaSchemaVersion,
+                  (try? payload.validate()) != nil,
                   payload.agent == agentID,
                   let taskID = payload.taskID else {
                 continue

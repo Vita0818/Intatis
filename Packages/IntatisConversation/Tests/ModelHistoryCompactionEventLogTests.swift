@@ -29,6 +29,8 @@ final class ModelHistoryCompactionEventLogTests: XCTestCase {
 
     private func checkpoint(
         agent: AgentID,
+        schemaVersion: Int =
+            ModelHistoryCompactedPayload.currentSchemaVersion,
         message: String = "compacted",
         windowNumber: UInt64 = 1,
         firstWindowID: String =
@@ -38,6 +40,7 @@ final class ModelHistoryCompactionEventLogTests: XCTestCase {
             "018f47a0-7b1c-7cc0-8e5f-7f0a3c91d222"
     ) -> ModelHistoryCompactedPayload {
         ModelHistoryCompactedPayload(
+            schemaVersion: schemaVersion,
             agent: agent,
             message: message,
             replacementHistory: [
@@ -253,6 +256,56 @@ final class ModelHistoryCompactionEventLogTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: url), before)
         let replayed = try await log.replayChecked()
         XCTAssertEqual(replayed.map(\.seq), [0, 1])
+    }
+
+    func testCompactionWriterRejectsV1AfterMediaAwareDirectHistory()
+        async throws
+    {
+        let url = temporaryLogURL()
+        defer {
+            try? FileManager.default.removeItem(
+                at: url.deletingLastPathComponent())
+        }
+        let main = AgentID(rawValue: "main")
+        let log = try EventLog(
+            session: SessionID(rawValue: "sess-media-schema-lineage"),
+            fileURL: url)
+        let artifactID = ArtifactID(rawValue: "artifact-media-lineage")
+        let source = try await log.append(.modelHistoryItem(.message(
+            itemID: "media-source",
+            turnID: TurnID(rawValue: "turn-media-source"),
+            agent: main,
+            taskID: nil,
+            submissionID: SubmissionID(rawValue: "submission-media-source"),
+            taskAttempt: 1,
+            role: .user,
+            content: "image",
+            attachmentIDs: [artifactID],
+            imageReferences: [ModelHistoryImageReference(
+                artifactID: artifactID,
+                mimeType: "image/png",
+                byteCount: 8,
+                sha256: String(repeating: "a", count: 64))],
+            messageClassification: .realUser)))
+        let before = try Data(contentsOf: url)
+
+        do {
+            _ = try await log.appendModelHistoryCompaction(
+                checkpoint(agent: main),
+                expectedLatestAgentHistorySeq: source.seq)
+            XCTFail("a v1 checkpoint must not mask v2 direct history")
+        } catch let error as EventLogError {
+            XCTAssertEqual(error, .invalidModelHistoryWindowLineage)
+        }
+        XCTAssertEqual(try Data(contentsOf: url), before)
+
+        let appended = try await log.appendModelHistoryCompaction(
+            checkpoint(
+                agent: main,
+                schemaVersion:
+                    ModelHistoryCompactedPayload.mediaSchemaVersion),
+            expectedLatestAgentHistorySeq: source.seq)
+        XCTAssertEqual(appended.seq, source.seq + 1)
     }
 
     func testCompactionRejectsReusedWindowIDBeforePersistence()

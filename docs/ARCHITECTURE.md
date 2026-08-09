@@ -21,6 +21,79 @@ Capability/WorkspaceLease、PathConfinement、SecretScanner、durable execution�
 managed terminal 的 workspace-scoped Seatbelt/default-network-deny、
 Hardened Runtime、签名/公证与 iOS target 边界仍是当前架构。
 
+## 2026-08-09 OKF / RAG knowledge bundle 架构
+
+第一版知识库保持四组件边界：仓内固定的 Open Knowledge Format v0.2 文档、
+`IntatisKnowledge` 的薄 Profile/build adapter、同 target 内不调用模型的
+deterministic Validator，以及唯一 model-facing `search_knowledge` 工具。外部知识连接器、
+PDF/Office/OCR 解析、建库 UI、Chat/iOS 接入和 MCP Server 都不属于该组件；它们不能被
+`search_knowledge` 在查询时隐式执行。
+
+```text
+workspace 内 OKF draft
+  -> KnowledgeBundleBuildService（exact authorization + read-write WorkspaceLease）
+  -> whole-tree concept/index/log conformance + host-owned canonical v0.2 writer
+  -> deterministic chunking + exact embedding + complete dense/BM25 components
+  -> staging snapshot -> KnowledgeValidator -> atomic current pointer
+  -> KnowledgeSearchToolHostAdapter（host-only store path）
+  -> opaque snapshot-bound handle + dynamic ToolRegistry registration
+  -> search_knowledge(query, optional bounded limit)
+       -> exact query embedding
+       -> ACL/status/trust/stale pre-filter
+       -> profile-selected exact cosine KNN only，或 KNN + BM25 -> RRF
+       -> optional/required exact reranker
+       -> bounded evidence + hash/source/locator replay
+  -> AgentLoop current-turn evidence registry
+  -> final answer 前重开 exact handle/snapshot 并机械重验 citation
+```
+
+知识正文仍是普通 OKF Markdown/YAML；`.intatis-rag/profile.json`、`chunks.jsonl`、
+dense/lexical index、checksums 和 store pointer 都是 Intatis 派生合同。Profile 冻结完整
+embedding compatibility identity（model/revision/tokenizer/runtime binding/dimension/scalar/
+quantization/pooling/L2/cosine/document+query instruction/max input/truncation）、component
+revision、chunk manifest、retrieval policy、reranker binding 和 composite snapshot revision。
+任一语义字段变化都不能复用旧 vector；current 不兼容时不得扫描 retained snapshot 回退。
+
+P0 local route 使用 Apple NaturalLanguage sentence embedding 的 exact language/revision/
+dimension/runtime binding，向量在写入与查询时按冻结 L2/cosine 合同验证；存储为 Swift
+`Float32` exact KNN JSON。lexical route 使用 Intatis 多语言/代码 tokenizer 与 BM25，融合使用
+deterministic RRF。`KnowledgeEmbeddingCosineRerankerProvider` 是可选的最小本地 reranker，
+明确不是 cross-encoder；required runtime 缺失时 fail closed，optional 缺失时结构化返回
+`rerank_applied=false`。remote embedding/reranker 只有 host 把 registration 标为 network-backed
+并经过网络权限链时才可运行，没有隐藏 fallback 或自动模型下载。
+
+store 只允许位于现有 WorkspaceLease 内。reader/writer 使用 host coordination locks；publish
+只安装完整、重新验证且 content-seal 未漂移的 staging snapshot，然后原子切换 pointer。旧 reader
+可在 lease 内完成，旧 handle 不接受新调用，drain 后才可 retention/GC。urgent purge 先关闭
+admission、cancel/drain，再使 current pointer 持久失活、清 validation receipt 并删除已 drain
+snapshot；它不承诺 APFS/SSD/backup 物理不可恢复，也不会自动擦除已写入 append-only EventLog 的
+bounded tool evidence。
+
+`search_knowledge` 的 model schema 只接受 query 和可选的 bounded limit，不接受
+path、provider、model、backend、credential 或 ACL；单库 knowledge handle 由 host 绑定。
+Code/Cowork 通过 generic `HostToolRegistryAugmenter` opt in；host 传 store path、exact session/
+agent/task/capability/workspace leases，并取得 query-owned mount lease。默认 augmenter 为 `nil`，
+因此普通 Code/Cowork 不暴露该工具；Chat 继续使用无工具 `ChatLoop`，iOS 依赖图继续不含
+`IntatisKnowledge`。CLI manifest 虽预链接 Knowledge target，当前 call site 仍不构造 adapter，
+也没有 mount command。工具调用仍经过 ToolRegistry、CapabilityLease、WorkspaceLease、三层权限门和
+durable prepared/result/settled 事件，不存在 Knowledge 私有执行旁路。
+
+`search_knowledge` 的动态 descriptor 会随 snapshot/schema/local-or-network semantics 一起进入
+registry identity；descriptor-aware permission intent/preview 必须继续使用同一 instance semantics。
+local-only route 也属于把外部断言注入模型的 trust boundary，因此 deterministic gate 返回 `pass`
+并继续走 reviewer/PermissionEngine，而不是套用普通 read-only 文件工具的自动 allow。
+
+`KnowledgeBundleBuildService` 是 host-owned build/publish seam，不是当前 model-facing tool。它要求
+调用者传入并复核 exact resolved authorization，但自身不生成 durable ticket；实际 Agent producer
+caller 尚未在本轮接线，未来 caller 必须复用既有 prepared/result/settled 执行链。
+
+evidence 是 untrusted tool-role data，带 stable evidence ID、internal `knowledge://` URI、text
+SHA-256、concept revision/locator、source IDs，并在存在可执行 source-locator adapter 时带 immutable
+source revision 与 exact adapter identity/version。当前内置 locator 只有 UTF-8 byte range；其它
+kind 未注册即拒绝。AgentLoop 只接受本轮成功工具结果的 citation，允许同一 stable evidence 在同轮
+幂等重复；fabricated/old-turn/cross-KB ID、hash/URI/snapshot 漂移或 final 前 purge 都拒绝。该机械
+Validator 不声称证明现实世界真伪或自然语言蕴含。
+
 ## 2026-08-08 Cowork 自动权限审查授权上下文
 
 automatic ask-class exact tool call 不再只把当前 `TaskContract.objective` 当作完整授权语义。
@@ -715,32 +788,43 @@ Provider HTTP transport 统一使用 `ProviderURLSession.noRedirect`：Foundatio
 - 工具的 backend/实现选择器为可选时，除非用户明确指定或前一个可靠 `ToolResult` 已确立兼容选项，否则省略字段或使用 tool 公告的 `auto/default`，不根据名称猜测本地 backend。
 - `ToolResult` 内的 hint 不具有系统提示词或 tool descriptor 的权威；失败后应重新核对用户意图、status/reason 和工具说明，不得机械重复同一调用。
 
-文档阅读相关的 model-facing 分工为：
+文档相关的 model-facing 分工为：
 
 | 用户意图 / 输入 | 应选工具 | 边界 |
 | --- | --- | --- |
-| 阅读已有可抽取文本层的 PDF | `read_pdf` | PDFKit 文本抽取，不执行 OCR |
-| 阅读/总结扫描或纯图像 PDF，或需要 OCR/版面解析 | `read_document` | 输入不超过 512 MiB，backend 省略或 `auto`；返回有界 Markdown，不创建输出产物 |
-| 用户明确要求把文档照片/扫描图像转换成新的可编辑文件 | `reconstruct_document_image` | 必须有 image input 与 output path；不用于普通阅读/总结，不应把 PDF 作为 `imagePath` |
+| 阅读已有可抽取文本层的 PDF | `read_pdf` | PDFKit 文本与 metadata 抽取，不执行 OCR；纯图像 PDF 返回 typed `ocr_required` |
+| 读取 DOCX/PPTX/XLSX/HTML/EPUB 的原生结构 | `document_read` | 固定格式后端；只读、有界输出；不接受 backend/命令/URL |
+| 对 PDF 做用户明确要求的 OCR | `document_ocr` | 固定 Docling + Tesseract CLI 配置；不修改输入 PDF，不自动换引擎 |
+| 把 PDF 或文档页面渲染成 PNG bundle | `document_render` | 显式 workspace `output_dir`；页面与 manifest 作为目录整体原子提交 |
+| 把非 PDF 文档导出为新 PDF | `document_export_pdf` | PDF 输入拒绝；生成物经 strict pdfcpu 与 PDFKit smoke 验证后提交 |
+| 创建或修改 DOCX/PPTX/XLSX/HTML/EPUB | `document_write` | 只开放锁定成熟组件公开 API 已覆盖的 operation；PDF mutation 永久不在 P0 |
 
-这一 slice 不是宿主路由器。它没有新增确定性 intent-to-tool 改写、extension/MIME/backend 执行前兼容性验证、输出 staging/原子 rename，也没有改动 durable tool ticket、`manual_reconciliation` 或 `effectDisposition` 语义。这些属于原计划第 3–5 点，仍需独立实现和验证。
+这仍不是宿主按自然语言改写工具调用的路由器。模型从 provider request 的 exact tools list 选择工具；每个 executor 再按严格 schema、extension、operation allowlist 与 capability 做确定性 preflight。所有写入经过 staging、source/destination CAS、验证和原子提交，durable tool ticket、`manual_reconciliation` 与 `effectDisposition` 语义不变。
 
-### Agent 文档/媒体工具链路（当前实现；初始于 v0.16，Code / Cowork / CLI）
+### Agent 文档工具链路（六工具固定合同；Code / Cowork / CLI）
 
 ```text
 provider tool_call -> AgentLoop schema validation
   -> PermissionEngine (DeterministicPolicyGate -> optional reviewer -> responder)
-  -> ToolContext(workspaceRoot, shell, imageGenerator)
-  -> DocumentMediaTools / FileTools / ShellGit
-  -> ToolObservation(output, changedFiles)
+  -> ToolRegistration canonical permission + CapabilityLease + WorkspaceLease
+  -> DocumentToolContracts strict decode / path and operation preflight
+  -> DocumentInfrastructure source/destination/auxiliary-input snapshot + staging
+  -> fixed backend argv/request + per-file/aggregate generated-output budgets
+  -> format-specific validator + commit-lock CAS + pinned-parent atomic commit
+  -> typed ToolObservation(output, changedFiles, engine versions)
   -> tool_result event -> CodeProjection / CoworkProjection / CLI
 ```
 
-新增标准工具：
-- `read_pdf`：用 PDFKit 抽取 PDF 文本和页数信息，支持 1-based 页码范围，不执行 OCR；扫描件若无可抽取文本，会提示改用 `read_document` 且保留 backend 为省略/`auto`。
-- `read_document`：把 workspace 内的 Office/OpenDocument/RTF/CSV/HTML/Markdown/text/EPUB/PDF 交给本地安装的 Docling 或 MarkItDown，返回有界 Markdown；legacy DOC/PPT/XLS 需要 LibreOffice。模型只提供 path、`auto|docling|markitdown` 与字符上限，不能提供命令、URL、remote service 或 plugin 开关。
-- `edit_pdf_pages`：PDF 页面级 `extract` / `split`，输出路径仍受 `PathConfinement` 限制。
-- `reconstruct_document_image`：只在用户明确要求转换/重建并创建新输出文件时，把文档照片或扫描图像交给已安装的外部成熟后端；当前 wrapper 支持 `docling`、`marker_single`、`tesseract`，输出 Markdown/HTML/text。PDF 阅读不走该工具。
+标准文档工具：
+- `read_pdf`：PDFKit 原生文本/metadata 抽取，支持 1-based 页选择与字符上限；不执行 OCR，纯图像 PDF 返回 `ocr_required`。
+- `document_read`：用固定 Python/rbook 后端读取 DOCX/PPTX/XLSX/HTML/EPUB；不接受 PDF，也不接受模型选择 backend。
+- `document_ocr`：只接受 PDF；固定 Docling pipeline、显式 Tesseract CLI、语言/PSM/tessdata/model artifact 配置，并强制禁用 remote services 与 external plugins。
+- `document_render`：PDF 直接由 PDFKit 按固定 box/DPI/背景导出 PNG；其他格式先用唯一 renderer 生成临时 PDF，再转页面 PNG。页面、SHA-256/尺寸/字节 metadata 与 manifest 作为单一目录 bundle 提交。
+- `document_export_pdf`：DOCX/PPTX/XLSX 走 LibreOffice，HTML 走固定 WKWebView renderer；生成 PDF 固定经过 `pdfcpu validate -mode strict` 与 PDFKit reopen/render smoke。EPUB 在 full-spine corpus gate 通过前不进入该工具 schema，显式请求返回 `unsupported_operation`。
+- `document_write`：DOCX/PPTX/XLSX/HTML 使用 python-docx/python-pptx/openpyxl/lxml 的明确 operation allowlist；EPUB 使用 rbook helper 并要求 EPUBCheck；XLSX 在 openpyxl 写 staging 后必须经 LibreOffice UNO `calculateAll()`、显式另存 XLSX、reopen/operation postcondition 校验与 PDF preview 验证，最终文件允许被 LibreOffice 重写。
+- `read_document`、`edit_pdf_pages`、`reconstruct_document_image` 已从生产 registry 与 fresh lease 下架；旧 capability raw value 只为历史日志解码保留，不能被模型发现或执行。P0 不包含任何 PDF mutation、annotation 或 secure redaction。
+
+相邻但不属于六工具合同的媒体/编译工具继续保留：
 - `compile_latex`：调用已安装的 `tectonic`、`latexmk`、`xelatex` 或 `pdflatex` 编译 `.tex`，并确认 PDF 产物存在。
 - `generate_image`：主 agent 从用户意图自主决定是否调用；model-facing schema 只包含 `prompt`、
   `outputPath`、可选 `size` 和 `count`，不暴露 provider/model 选择。宿主通过
@@ -755,12 +839,13 @@ provider tool_call -> AgentLoop schema validation
   原地覆盖。
 
 设计取舍：
-- 当前不把 Docling/Marker/Tesseract/Tectonic/qpdf/ComfyUI/Diffusers 复制进仓库，也不新增 SwiftPM 第三方依赖；它们是可安装后端或后续集成方向。
-- `read_document` / `reconstruct_document_image` / `compile_latex` 是 process-backed 工具，仍受
-  host shell 能力、WorkspaceLease 和权限门约束；shell-disabled/read-only
-  host 不得绕过 `DeterministicPolicyGate`。structured runner 默认断网、有界 timeout/output 并清理进程树；`read_document` 还禁用 Docling remote services/external plugins，并把 parser runtime 限定在受信系统路径或用户显式建立的 Intatis document runtime。
-- `read_document` 的 path/普通文件/512 MiB/extension/backend 检查是 executor 内、parser 进程边界前的可证明 no-effect preflight；它们使用 `ToolExecutionRejectedWithoutSideEffect` 返回，AgentLoop 必须写 failed + `not_started` settlement 并允许模型修正输入，不得留下假的 unresolved ticket。这不改变 parser 进程真正开始后的保守副作用证据语义。
-- Cowork read-write coordinator/worker lease 可获得 `read_document`；worker 默认 read-only 时只获得 `read_pdf`，不会默认获得文档 parser process、页面编辑、LaTeX 编译或生图能力。
+- “structured runner”只是 host-owned 固定连接器：Swift 选择已审计 executable/operation，发送 versioned JSON request 或固定 argv，并控制环境、工作目录、精确输入/输出根、断网、timeout/cancel、process-tree cleanup、stdout/stderr cap，以及生成文件的单项/聚合/entry 预算；模型不能提交命令、executable、environment、临时目录或 fallback 顺序。
+- 文档语义由成熟组件拥有；Intatis 只做 strict schema、权限/路径校验、staging、固定调用、错误映射、验证和提交，不自行实现 PDF content stream、OOXML/EPUB serializer、OCR/layout/formula engine。
+- 缺少锁定 runtime、模型、helper、validator 或 exact version 时返回 typed `backend_missing` / `backend_version_mismatch`，不得自动切换组件。当前 runtime 分发、签名、公证、双架构 closure 与第三方 NOTICE 仍是独立发行工作，不因开发机可执行而视为完成。
+- PDFKit/WKWebView 是 Apple-native renderer 例外，不称为开源后端；pdfcpu 在本合同中只做 strict validate/info，不做 PDF 编辑。
+- read-only worker 获得 `read_pdf`、`document_read` 与 `document_ocr`。后两项虽然启动固定本地进程，仍以 host-authored `structured_read_only` intent 标记，只能声明 read/execute、不能声明网络、工作区写入或通用 shell；DeterministicPolicyGate 只为该 exact 形状进入正常 reviewer/permission 流。`document_render`、`document_export_pdf`、`document_write` 只向 read-write worker/coordinator 签发。每个工具仍独立经过权限门，工具数量拆分不改变 durable execution 模型。
+- process 启动前可证明的 schema/path/format/operation/目标冲突失败使用 no-effect rejection；进程开始后继续采用保守的副作用证据与 reconciliation 语义。
+- `IntatisTools` 仍只进入 macOS/CLI workspace stack；iOS Chat target 不链接 Tools、Permission、AgentKernel、Cowork 或文档 runtime。
 
 ### Agent Git control 工具链路（Codex-aligned 本地 Git 控制面，Code / Cowork / CLI）
 
@@ -906,7 +991,7 @@ Cowork session open/new -> checked EventLog is canonical for settings, roster, l
        -> ProviderRegistry exact-resolves that agent's immutable profile/connection revision
        coordinator(canCoordinate=true) -> lease-based registry with workspace/doc/media/browser + coordination tools
        read-only worker -> lease-based registry with read/list/search/read_pdf + reply/request-delegation tools only
-       read-write worker/coordinator -> may additionally receive read_document process capability
+       read-write worker/coordinator -> may additionally receive the five split document process/write capabilities
   -> AgentLoop.send() 循环（Code 默认 maxIterations 50；Cowork 默认 64；host 显式配置可覆盖）
        ContextBuilder.initialMessages (RuntimeEnvironmentManifest + static system + history + scoped context + current user)
        stable Cowork @main:
@@ -1073,6 +1158,32 @@ MultimodalService.generateImage/transcribe/generateVideo(轮询 job)
 voice 不创建 artifact，也不在用户 Send 前写 EventLog；其 exact route、临时文件与生命周期合同见
 “Composer 语音输入链路”。
 
+Agent 用户图与工具图使用另一条 durable model-history 链：
+
+```text
+user attachment / MCP structured image
+  -> exact-session ArtifactStore
+  -> bounded ArtifactImageResolver
+  -> ModelHistoryImageReference(schema v2, no bytes/path)
+  -> ProjectedImageBinding sidecar
+  -> request-time AgentMessage.images
+  -> exact provider route (OpenAI Responses for reviewed image routes)
+```
+
+macOS共享composer reader先把`.png`与`.jpg`/`.jpeg`确定性映射为canonical `image/png`与
+`image/jpeg`，不依赖headless环境可能缺失的动态type database；实际bytes仍必须由后续resolver的
+magic与完整解码验证。resolver只接受PNG/JPEG；默认限制为每图20 MiB、每批40 MiB、最多8图、单边8192与25 MP，并在
+Apple平台完成ImageIO full decode后生成SHA-256。Projector保持同步且不读盘，`imageBindings`必须与
+messages逐项对齐；真正的blob读取和data URL只存在于当前dispatch。stable Code conversation与
+Cowork exact `@main`将含图direct item写为model-history schema v2，ordinary task-scoped history只在
+本轮物化。MCP structured result由唯一lowering生成canonical text和source-order refs，function output
+保留原call ID；settlement已提交而媒体交付失败时仍保留真实工具事实，再终结turn，不能伪造未执行。
+
+上下文压缩使用同一resolver把完整active window交给summarizer，不允许先隐藏裁剪未总结的prefix。
+成功checkpoint是summary-only：旧用户图与工具图都不再进入replacement，attachment/ref槽为空；
+schema v2只表示lineage已覆盖media-aware语义。EventLog checkpoint writer与projector都拒绝v2后继
+降级为v1，resume只从latest valid checkpoint + suffix恢复，不扫描checkpoint前事件偷回旧图。
+
 ## 数据模型
 
 | 类型 | 职责 | 持久化方式 | 关键字段约束 |
@@ -1080,7 +1191,7 @@ voice 不创建 artifact，也不在用户 Send 前写 EventLog；其 exact rout
 | `Envelope` | 事件信封 | JSONL 一行一个 | `seq` 单调递增且不可复用；`v:1`；`type` 只追加演进，未知未来事件可跳过但仍占用序号 |
 | `EventLog` / `EventLogWriterLease` | session append-only 单写协调 | JSONL + `.lock` / `.writer.lock` / `.wal` / `.wal.tmp` sidecar | append/batch 在跨进程 exclusive flock 内重读尾 seq；多事件 batch 先同步并 rename WAL、同步父目录，再写/sync JSONL 与父目录，恢复按 exact prefix/suffix 判定 untouched/partial/full；所有 replay 在读取前先处理 WAL，兼容 replay 失败返回空，`replayChecked` / `isEmptyChecked` 对锁/读/known corruption/session mismatch fail closed；`replayForProjectionChecked` 另返回 durable tail/unknown-type metadata，只有 `hasCompleteKnownHistory` 才能支撑从 seq 0 起的 absence/order proof；production Cowork runtime 全生命周期持有 writer lease，第二个 runtime fail closed |
 | `Event` | 事件 payload 联合 | 随 Envelope | 追加演进；兼容 replay 可跳过不可解码行，安全敏感调用必须用 checked API；合法未知未来 type 可跳过 payload 但仍占用 `seq`、算作非空，错误 session 不得进入当前日志 |
-| `ModelHistoryItemPayload` / `ModelHistoryCompactedPayload` / `AgentModelHistoryProjector` | 稳定 Code conversation（`taskID == nil` + SubmissionID）与 Cowork `@main` root submission 的模型输入事实链；独立于 UI 气泡、任务结果和审计预览 | `model_history_item` append-only 事件 + `model_history_compacted` 完整 v1 replacement checkpoint；每次 provider dispatch 前从最新有效 checkpoint + suffix 严格重建 prompt snapshot；UI projections 对两种事件 no-op | 保存 user / final assistant / assistant function-call batch / function output 的有序结构，以及 summary/window lineage/typed replacement。用户项在首次 dispatch 前写入，call batch 在任何工具执行前原子写入，output 与 `tool_result` / settlement 同 batch；checkpoint durable commit 后才 live swap。failed/interrupted `turn_outcome` 只使同 TurnID 的 final assistant message 失效，真实 user、reasoning、call/output 与 tool-search 历史继续保留；completed 或无 outcome 的 legacy turn 保持原行为，冲突 outcome fail closed。缺 output 的 call 只在请求副本中补 `aborted`，orphan output 丢弃，EventLog 不被合成项改写；重复冲突 ID、错误 provenance、坏 lineage、未知 schema/future event 或 seq gap 均 fail closed。task-scoped worker 不读取主 thread history；legacy session 只桥接可证明的 completed root U/A 文本 |
+| `ModelHistoryItemPayload` / `ModelHistoryCompactedPayload` / `AgentModelHistoryProjector` | 稳定 Code conversation（`taskID == nil` + SubmissionID）与 Cowork `@main` root submission 的模型输入事实链；独立于 UI 气泡、任务结果和审计预览 | `model_history_item` append-only 事件 + `model_history_compacted` 完整 v1/v2 replacement checkpoint；每次 provider dispatch 前从最新有效 checkpoint + suffix 严格重建 prompt snapshot；UI projections 对两种事件 no-op | 保存 user / final assistant / assistant function-call batch / function output 的有序结构，以及 summary/window lineage/typed replacement。含图 user/FCO direct item 使用 v2 descriptor 与等长投影 sidecar；checkpoint v2 继承 media-aware lineage但 replacement不保留旧图。用户项在首次 dispatch 前写入，call batch在任何工具执行前原子写入，output与`tool_result`/settlement同batch；checkpoint durable commit后才live swap。failed/interrupted `turn_outcome`只使同TurnID的final assistant message失效；缺output的call只在请求副本补`aborted`。重复冲突ID、错误provenance、坏lineage、未知schema/future event、seq gap或v2→v1降级均fail closed。task-scoped worker不读取主thread history；legacy session只桥接可证明的completed root U/A文本 |
 | `SessionSettingsUpdatedPayload` / `SessionStorageMigratedPayload` | versioned session settings 全快照、显式 rename 与幂等迁移完成事实 | `session_settings_updated` / `session_storage_migrated` append-only 事件 | revision/previousRevision、session/kind/schema 必须严格连续且 overflow-safe；rename source/operation ID 为 additive optional metadata，operation first-write-wins、冲突 fail closed；Cowork settings 不授予 lease，append return/stream 使用落盘反解 canonical Envelope；legacy name/settings 与 canonical alias 必须 settings-first，migration ID 非空稳定且只有 verified migration 才能落 marker |
 | `SessionProjectionDocument` / `SessionProjectionStore` | 可删除、可重建的 session 快速投影 | `<session>/session.json` schema v2，owner-only atomic replace + stable no-follow lock | `events.jsonl` 永远获胜；`projectedThroughSeq` 只表示已验证水位。refresh 用 full canonical fold 校验 incremental result，同水位/落后 cache corruption 不能覆盖 EventLog；unknown future event 时拒绝覆盖 |
 | `SessionWorkspaceAccessDocument` / `SessionWorkspaceAccessStore` | session-owned Apple security-scoped bookmark 能力材料 | `<session>/workspace-access.plist` schema v1 binary plist，`0600` + no-follow lock + atomic replace | bookmark bytes 不进入 EventLog/session.json/UserDefaults/UI；session/path/schema/单一 primary 必须验证；shared capability 仅在 settings+roster 零引用时删除，primary 默认拒删并只允许显式事务回滚；alias 只在 scope 后 canonicalize；marker 后不得从 global legacy map 回填 |
@@ -1131,7 +1242,7 @@ voice 不创建 artifact，也不在用户 Send 前写 EventLog；其 exact rout
 - **Agent 文档/媒体工具**：`ToolRegistry.standard()` 暴露 PDF 阅读、PDF 页面编辑、文档照片/扫描件版面重建、LaTeX 编译和生图写入工作区。PDFKit 路径在 macOS 可直接工作；Linux 或无 PDFKit 平台会返回配置错误并提示使用外部 CLI 后端。shell-backed 文档重建和 LaTeX 编译不内置模型或 TeX 发行版，只调用已安装的成熟工具；缺少命令时返回可行动的配置错误。生图工具不直接知道 provider secret，只通过注入的 `ImageGenerationToolService` 使用现有 provider registry。
 - **Chat 托管网络搜索**：macOS/iOS/CLI Chat 不展示搜索按钮、菜单项、开关、状态或 provider/model 路由提示。每次 Send 只冻结用户当前选择的 exact Chat provider/model/variant/request adapter；`ProviderRegistry.chatRuntimeRoute()` 先验证普通 Chat adapter，再同时要求 exact model 的 `hosted_web_search` 声明与受审 adapter dialect。满足时向当前模型提供对应能力并保持 `tool_choice: auto`，由当前模型自行决定是否搜索；明确不支持、未声明、无法确认或尚未适配时，在同一 route 上静默发送普通 Chat，不提示、不切换模型，也不调用通用 Intatis search tool、`web_fetch`、`browser_search`、本地浏览器、MCP 或第三方搜索后端。OpenAI Responses `web_search` 与 OpenRouter `openrouter:web_search` 分别编码；unknown/compatible/legacy/custom 接入点默认不声明搜索。该能力不进入 PermissionEngine/AgentLoop，也不扩大 iOS linkage。只有当前模型实际返回结构化 URL annotation 时才保存 optional additive citations，并在持久化与 SwiftUI `Link` 前执行既有双重校验。provider-specific structured unsupported 在首个有效 payload 前可触发一次同路由普通 Chat 重发；裸 404、自由文本和 partial payload 不可触发。精确合同见 `docs/CHAT_HOSTED_SEARCH.md`。
 - **Agent 网络/浏览器工具**：`ToolRegistry.standard()` 暴露轻量 `web_fetch` 和 Playwright/CDP-backed `browser_*` 工具。浏览器工具依赖用户环境里已安装的 Node.js，并优先使用 Playwright + Chromium/Chrome/Edge channel；若 Playwright 不可解析，则通过 Node.js 内置 `WebSocket` 使用 Chrome DevTools Protocol 启动已安装 Chrome/Edge/Chromium。缺少后端时返回配置错误或 `browser_diagnostics` 的可行动诊断。profile/state/history/downloads 全部通过 `PathConfinement` 限定在 workspace `.intatis/browser/` 下，刷新、历史前进/后退、表单点击/输入/提交/下拉选择/按键/滚动/等待交互通过 locator 或当前焦点执行；click/download 的 CDP 路径使用真实鼠标事件，打开新页面的交互会跟随到新 tab/window 并把最终页面写回 state/history；截图只能写入工作区 PNG 路径，上传只能引用 workspace 内文件，显式下载只能写入 `.intatis/browser/downloads/<profile>`；`browser_profiles` 可报告 active browser / profile lock runtime marker 是否存在，但不得列内部 marker 文件名或读取内容；`browser_profile_delete` 只在目标 profile 与 `confirmProfile` 匹配时删除 `.intatis/browser/profiles/<profile>`、`downloads/<profile>`、`state/<profile>.json` 并剪除对应 history metadata，删除前如果发现 marker 只给概括性提示；profile 可能包含 cookies 与登录态，不能当成普通日志、artifact 或 secret-free 文本处理。
-- **macOS UI information architecture**：`IntatisMacRootView` 是 macOS Chat/Code/Cowork 的 shell。左侧继续由 `NavigationSplitView` 提供系统 sidebar 材质，内部使用一个连贯的自定义结构：`Intatis` 标题、带 SF Symbol 的 Chat/Code/Cowork 竖向三行导航、当前 mode 的 `Recent` session history/New 与底部 Settings；仅选中模式行使用 interactive Liquid Glass。Cowork New session 仍先要求用户选择主 workspace 并初始化 per-session project settings。主 thread header 显示 session durable display name（无 display name 时回退 immutable `SessionID`），不写死 Chat/Code/Cowork，也不承载 New/session/model 控件；Code/Cowork 使用紧凑 12pt 顶部留白，Cowork 不再在标题之前常驻 permission-reviewer 横幅。共享 `IntatisThreadComposer` 固定两排：第一排 model/profile 在左、最近一轮 Context/Input/Cached/Output/Time usage 在右；Chat/Code/Cowork 的选择器共用原生 `Menu` 语义与 40pt 高 interactive Liquid Glass 胶囊，关闭态只显示模型名，不显示 CPU/芯片图标、provider 或 variant/reasoning detail；弹出菜单内部仍按 provider 分组并保留 variant detail。第二排为 action、原生多行 `TextField`、可选 Cowork stop 与 Send；macOS Chat 与 Cowork 的 action 是同一个 shared paperclip/file-import/drop/draft-menu surface，Chat 不再显示独立提示词生图 action；Code 保留其既有 image action，iOS paperclip 仍是 Chat tools menu 而不是通用本地附件。action/stop/Send 使用同一个 40×40 原生圆形控件合同，输入容器单行最小高度同为 40，同行 spacing 为 8，外层保持 bottom alignment，因此多行输入只向上增长。没有 top accessories 时不创建空白第一排。消息本体不使用 agent 头像或通用 Agent badge，缺失的 agent 展示名回退 `Intatis`；正常完成的 assistant/agent 回复无外层卡片，通用 Agent message、`information_requested`、`information_replied` 与其他 agent-to-agent 记录沿用同一普通回答版式并以 exact `sender->recipient` 标识，用户消息、失败回复与 tool/error/permission/task 等结构化项保留容器；既有字体 token 不随本次视觉架构更新。Thread content 使用共享 responsive layout 计算 horizontal padding、显式 `contentWidth`、message gutter 与 bubble max width；对话行通过 `IntatisThreadBubbleRow` 在整行层面按 user trailing、assistant/agent leading 对齐。Chat 默认无右 inspector；Code/Cowork 的显隐都只由同一个稳定外层 `GeometryReader` 提供的未压缩 outer available width 与用户请求状态决定，不使用已经压缩后的 thread width 反推自身可见性。Code 继续用有界 `HStack` 展示 structured plan/workspace/Git-status-only/recent failure。Cowork 则把 rail 作为 detail 同一 canvas 上的 trailing overlay：不使用 divider 或整栏 `.bar` 背景，主 thread 复用一个固定 `ScrollView` 根并延伸至 detail 最右端，visible rail 固定 348pt、section 固定 318pt，正文通过 trailing scroll-content margin 给 cards 留位，使原生滚动条位于整个内容区最右端。rail subtree 由只含 rail input 的 Equatable boundary 隔离；每个 passive section 独立使用系统 `Glass.clear` 的稳定 backdrop，不用 `GlassEffectContainer` 组织这些必须保持固定位置的 status cards。第一位显示 compact pending permission 或最近权限结果，其后为 `Agents`、真实 `Goal`、真实 `Tasks`，不显示 Git。compact permission 只展示状态、tool、安全摘要与必要 action，不渲染 raw args 或默认详情；pending 且 outer width 足以容纳 rail 时临时固定为可见，窄到无法安全容纳时只在 composer 上方保留同一请求的完整 Material 权限卡兜底，二者不得重复。无 pending 时用户仍可隐藏 Cowork rail；任何窄屏或隐藏状态都不在 thread 顶部复制 Goal/Tasks，也不保留对应高度。Code/Cowork 的 bottom-anchor 恢复使用系统 `onScrollVisibilityChange`，不建立 GeometryReader/PreferenceKey 坐标回写；session controls 位于内容 header，不向 window toolbar 动态增删 item，也不嵌套 SwiftUI `.inspector` preference。Cowork header 不提供独立 MCP Content 快捷按钮，内容浏览位于 `Project Settings → MCP → Browse Content`；header 只用系统 compact 圆形 glass/bordered icon control 切换 status rail。Goal/Tasks 继续来自 durable projections；Cowork 的 Git UI 已移除，但本地 Git controls 仍只通过 Agent Git tools + PermissionEngine 执行。
+- **macOS UI information architecture**：`IntatisMacRootView` 是 macOS Chat/Code/Cowork 的 shell。左侧继续由 `NavigationSplitView` 提供系统 sidebar 材质，内部使用一个连贯的自定义结构：`Intatis` 标题、带 SF Symbol 的 Chat/Code/Cowork 竖向三行导航、当前 mode 的 `Recent` session history/New 与底部 Settings；仅选中模式行使用 interactive Liquid Glass。Cowork New session 仍先要求用户选择主 workspace 并初始化 per-session project settings。主 thread header 显示 session durable display name（无 display name 时回退 immutable `SessionID`），不写死 Chat/Code/Cowork，也不承载 New/session/model 控件；Code/Cowork 使用紧凑 12pt 顶部留白，Cowork 不再在标题之前常驻 permission-reviewer 横幅。共享 `IntatisThreadComposer` 固定两排：第一排 model/profile 在左、最近一轮 Context/Input/Cached/Output/Time usage 在右；Chat/Code/Cowork 的选择器共用原生 `Menu` 语义与 40pt 高 interactive Liquid Glass 胶囊，关闭态只显示模型名，不显示 CPU/芯片图标、provider 或 variant/reasoning detail；弹出菜单内部仍按 provider 分组并保留 variant detail。第二排为 action、原生多行 `TextField`、可选 Cowork stop 与 Send；macOS Chat、Code 与 Cowork 复用同一个 shared paperclip/file-import/drop/draft-menu surface，Chat 不再显示独立提示词生图 action；iOS paperclip 仍是 Chat tools menu 而不是通用本地附件。action/stop/Send 使用同一个 40×40 原生圆形控件合同，输入容器单行最小高度同为 40，同行 spacing 为 8，外层保持 bottom alignment，因此多行输入只向上增长。没有 top accessories 时不创建空白第一排。消息本体不使用 agent 头像或通用 Agent badge，缺失的 agent 展示名回退 `Intatis`；正常完成的 assistant/agent 回复无外层卡片，通用 Agent message、`information_requested`、`information_replied` 与其他 agent-to-agent 记录沿用同一普通回答版式并以 exact `sender->recipient` 标识，用户消息、失败回复与 tool/error/permission/task 等结构化项保留容器；既有字体 token 不随本次视觉架构更新。Thread content 使用共享 responsive layout 计算 horizontal padding、显式 `contentWidth`、message gutter 与 bubble max width；对话行通过 `IntatisThreadBubbleRow` 在整行层面按 user trailing、assistant/agent leading 对齐。Chat 默认无右 inspector；Code/Cowork 的显隐都只由同一个稳定外层 `GeometryReader` 提供的未压缩 outer available width 与用户请求状态决定，不使用已经压缩后的 thread width 反推自身可见性。Code 继续用有界 `HStack` 展示 structured plan/workspace/Git-status-only/recent failure。Cowork 则把 rail 作为 detail 同一 canvas 上的 trailing overlay：不使用 divider 或整栏 `.bar` 背景，主 thread 复用一个固定 `ScrollView` 根并延伸至 detail 最右端，visible rail 固定 348pt、section 固定 318pt，正文通过 trailing scroll-content margin 给 cards 留位，使原生滚动条位于整个内容区最右端。rail subtree 由只含 rail input 的 Equatable boundary 隔离；每个 passive section 独立使用系统 `Glass.clear` 的稳定 backdrop，不用 `GlassEffectContainer` 组织这些必须保持固定位置的 status cards。第一位显示 compact pending permission 或最近权限结果，其后为 `Agents`、真实 `Goal`、真实 `Tasks`，不显示 Git。compact permission 只展示状态、tool、安全摘要与必要 action，不渲染 raw args 或默认详情；pending 且 outer width 足以容纳 rail 时临时固定为可见，窄到无法安全容纳时只在 composer 上方保留同一请求的完整 Material 权限卡兜底，二者不得重复。无 pending 时用户仍可隐藏 Cowork rail；任何窄屏或隐藏状态都不在 thread 顶部复制 Goal/Tasks，也不保留对应高度。Code/Cowork 的 bottom-anchor 恢复使用系统 `onScrollVisibilityChange`，不建立 GeometryReader/PreferenceKey 坐标回写；session controls 位于内容 header，不向 window toolbar 动态增删 item，也不嵌套 SwiftUI `.inspector` preference。Cowork header 不提供独立 MCP Content 快捷按钮，内容浏览位于 `Project Settings → MCP → Browse Content`；header 只用系统 compact 圆形 glass/bordered icon control 切换 status rail。Goal/Tasks 继续来自 durable projections；Cowork 的 Git UI 已移除，但本地 Git controls 仍只通过 Agent Git tools + PermissionEngine 执行。
 - **UI 配色与跨平台设计语言**：macOS detail 由 `IntatisSystemCanvas` 使用 SwiftUI `.windowBackground`（macOS 13 fallback 为 `NSVisualEffectView.Material.windowBackground`）提供动态系统 window surface，`NavigationSplitView` sidebar 不再被自定义底色覆盖。`IntatisThreadStyle.intatisMac` / `.standard` 注入系统 `.primary` / `.secondary`、separator、accent 与错误语义；正常完成的 assistant/agent 正文直接继承系统 canvas，不叠 Material 或描边；用户消息、失败回复、数据卡片、权限和 artifact 等结构化内容层默认使用 `.regularMaterial`。composer、模型菜单、主要操作及确实需要融合的紧凑 action group 在 macOS 26 / iOS 26 使用 `glassEffect`、`GlassEffectContainer` 与 `.glass` / `.glassProminent`，旧系统走 Material / bordered control fallback；用户明确指定的 Cowork 紧凑 trailing status rail 是唯一内容层玻璃例外，权限、Agents、Goal、Tasks 各自使用独立原生 `Glass.clear` backdrop，不绘制固定灰框或自制玻璃，也不由一个会重组 shape 的 container 包住。macOS 与 iOS Chat composer 现在都采用共享两排结构：首排为关闭态只显示模型名的 interactive glass `Menu` 与可用 usage，第二排为当前产品面已有 action、输入、紧邻主操作左侧的 voice 和唯一 Send/Stop；iOS 仍只提供 paperclip Chat 功能菜单，不能伪造通用附件。iOS 将该排 `GlassEffectContainer` 的 merge spacing 固定为 0，保留 8pt 布局间距但禁止输入胶囊、voice 与 Send/Stop 物理融合；四个 icon action 都从 composer 专用 modifier 获得同一 40×40 外框，iOS 使用 `.small` 原生 control size，避免 `.regular` glass chrome 超出 40pt 并抬高中心线，macOS 继续使用本来就与 40pt 合拍的 `.regular`。主排继续 bottom alignment，保证多行输入只向上增长。macOS sidebar `Recent` 旁 `+` 使用 30×30 原生小型圆形 glass control；iOS 左抽屉使用同一品牌/模式/history/Settings 层级，并支持从 24pt 屏幕左缘、具有水平优势的右滑打开，避免抢占 transcript/TextField 的纵向或编辑手势。`IntatisTypography` 是两平台字体角色的单一实现：品牌、session 与页面级标题使用相同名义字号/字重的系统 serif，Chat 正文、输入和控件使用系统 sans，技术值使用系统 monospaced；iOS 只在这些共享名义值之上应用 Dynamic Type 缩放。Markdown/代码/公式继续保持 renderer 的语义字体。Glass 不铺页面或长内容。iOS 根视图与约 82% 抽屉继续使用系统容器背景，不复制参考应用固定渐变或另建平台私有底色。当前规范见 `docs/CURRENT_UI_COLOR_SYSTEM.md`；上一版方案独立保存在 `docs/UI_COLOR_SYSTEM.md`。
 - **GUI token/turn stats**：ChatLoop 与 AgentLoop 每轮结束追加 `turn_stats`，包含 endpoint 返回的 prompt/completion/total token（若有）、可选 cached prompt tokens、可选 context window tokens、TTFT、总耗时和 model。OpenAI-compatible `prompt_tokens_details.cached_tokens` 会进入 `Usage.cachedPromptTokens`；未缓存 input 可由 prompt-cached 在 UI 层展示。ChatLoop、AgentLoop 与 ProviderHealthCheck 共用 `Usage` 规则：同一次响应内的 usage chunk 字段级合并，Agent 工具循环中多个模型请求再按请求累计。GUI 不解析消息文本计算 token，而是通过共享 `TurnStatsProjection` 折叠最近一轮统计；macOS Chat / Code / Cowork 与 iOS Chat 均复用 `IntatisComposerUsageStrip` 在 composer 第一排右侧显示低噪音 usage，第一排左侧保留 model/profile。endpoint 不返回 cached/context usage 时，只显示可证明字段，不虚构数值。
 - **Chat/Code/Cowork session/history**：macOS `IntatisMacRootView` 通过 root-owned view models 和 `SessionHistoryStore.recentSessions(kind:)` 将当前 mode 的最近 sessions 投影到同一 sidebar navigation/session center；Chat 启动时优先恢复最近 Chat session，无历史时才使用 `sess_default`，Code/Cowork 在首次进入时创建对应 session。iOS `IOSAppEnvironment` 仍只恢复 Chat session，无历史时才使用 `sess_ios`。新建会话生成新的 `SessionID.new()`，打开独立 `EventLog` 与 artifact store，停止旧 view model 并重建当前 view model。恢复历史会话只切换到对应 `events.jsonl`，不会把新消息继续追加到旧的固定默认日志。macOS session row 的原生右键菜单支持 Rename/Delete；Code 与 Cowork `@main` 另可通过 `rename_session` 改当前会话，model 不提供 SessionID/kind。两条 Rename 路径都先追加 EventLog settings rename 事件并刷新派生 `<session>/session.json`，再通过 exact-session、revision/seq 有序的低频 publisher 更新所有窗口；不改目录名、`SessionID` 或既有 envelope。Delete 在二次确认后删除目标 session 目录及其 session-owned bookmark/settings/projection，不触碰绑定工作区内容，当前运行中的 session 禁止删除。路径与元数据规则在 `IntatisCore` 复用，平台层只传不同 application-support root。

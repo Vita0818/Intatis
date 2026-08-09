@@ -180,6 +180,14 @@ struct StructuredProcessShellRunner: ShellRunner {
 /// backend arguments are passed as positional argv and are never evaluated as
 /// shell source.
 struct DocumentBackendProcessRunner: DocumentBackendRunner {
+    /// Independent from the bounded stdout/stderr capture. A legitimate
+    /// document may be much larger than its diagnostic output, while an
+    /// unbounded backend must not be able to grow one file until disk
+    /// exhaustion before staged-output validation runs.
+    static let maximumGeneratedFileBytes = 1_024 * 1_024 * 1_024
+    static let maximumGeneratedTotalBytes = 1_024 * 1_024 * 1_024
+    static let maximumGeneratedEntries = 100_000
+
     private let timeoutSeconds: TimeInterval
     private let terminationGraceSeconds: TimeInterval
     private let maximumOutputBytes: Int
@@ -208,8 +216,19 @@ struct DocumentBackendProcessRunner: DocumentBackendRunner {
         let processLease = try documentProcessLease(
             reviewedLease,
             workspace: workspace,
+            reviewedReadablePaths: invocation.readableWorkspacePaths,
             reviewedWritablePaths: invocation.writableWorkspacePaths,
             internalWritablePaths: invocation.internalWritableWorkspacePaths)
+        let reviewedReadOnlyRoots = try invocation.readableWorkspacePaths.map {
+            try PathConfinement.resolve($0, within: workspace)
+        }
+        let internalReadOnlyRoots = try documentInternalReadOnlyRoots(
+            invocation.internalReadOnlyWorkspacePaths,
+            internalWritablePaths: invocation.internalWritableWorkspacePaths,
+            workspace: workspace)
+        let generatedOutputRoots = try invocation.internalWritableWorkspacePaths.map {
+            try PathConfinement.resolve($0, within: workspace)
+        }
         try validateDocumentBackendArguments(invocation)
         return try await runWorkspaceProcess(
             executable: try trustedDocumentExecutable(invocation.executable),
@@ -219,11 +238,16 @@ struct DocumentBackendProcessRunner: DocumentBackendRunner {
             trustedReadRoots: structuredRuntimeReadRoots(),
             writableRoots: [],
             workspaceLease: processLease,
+            allowEmptyWorkspaceAccess: processLease.allowedPathRules.isEmpty,
+            forcedReadOnlyWorkspaceRoots: reviewedReadOnlyRoots + internalReadOnlyRoots,
             environment: invocation.environment,
             timeoutSeconds: timeoutSeconds,
             terminationGraceSeconds: terminationGraceSeconds,
-            maximumGeneratedFileBytes: nil,
-            maximumOutputBytes: maximumOutputBytes)
+            maximumGeneratedFileBytes: Self.maximumGeneratedFileBytes,
+            maximumOutputBytes: maximumOutputBytes,
+            generatedOutputRoots: generatedOutputRoots,
+            maximumGeneratedTotalBytes: Self.maximumGeneratedTotalBytes,
+            maximumGeneratedEntries: Self.maximumGeneratedEntries)
         #else
         throw IntatisError.config(
             "document backend execution is unavailable on this platform")
@@ -311,16 +335,19 @@ enum ManagedProcessOutcome: Sendable {
     case exited(Int32)
     case cancelled
     case timedOut
+    case resourceLimit
 }
 
 enum ManagedProcessStopReason: Sendable {
     case cancelled
     case timedOut
+    case resourceLimit
 
     var outcome: ManagedProcessOutcome {
         switch self {
         case .cancelled: return .cancelled
         case .timedOut: return .timedOut
+        case .resourceLimit: return .resourceLimit
         }
     }
 }
@@ -336,6 +363,7 @@ final class ManagedProcessState: @unchecked Sendable {
     private var outcome: ManagedProcessOutcome?
     private var continuation: CheckedContinuation<ManagedProcessOutcome, Never>?
     private var timeoutWorkItem: DispatchWorkItem?
+    private var resourceMonitorWorkItem: DispatchWorkItem?
 
     init(terminationGraceSeconds: TimeInterval) {
         self.terminationGraceSeconds = terminationGraceSeconds
@@ -362,6 +390,42 @@ final class ManagedProcessState: @unchecked Sendable {
         } else {
             lock.unlock()
         }
+    }
+
+    func scheduleGeneratedOutputLimit(
+        roots: [URL],
+        maximumBytes: UInt64,
+        maximumEntries: Int
+    ) {
+        guard roots.isEmpty == false, maximumBytes > 0, maximumEntries > 0 else {
+            return
+        }
+        let item = DispatchWorkItem { [weak self] in
+            while let self, self.shouldMonitorResources {
+                if documentGeneratedOutputExceedsBudget(
+                    roots: roots,
+                    maximumBytes: maximumBytes,
+                    maximumEntries: maximumEntries) {
+                    self.requestStop(.resourceLimit)
+                    return
+                }
+                usleep(20_000)
+            }
+        }
+        lock.lock()
+        if outcome == nil {
+            resourceMonitorWorkItem = item
+            lock.unlock()
+            DispatchQueue.global(qos: .utility).async(execute: item)
+        } else {
+            lock.unlock()
+        }
+    }
+
+    private var shouldMonitorResources: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return outcome == nil && trackingStopped == false
     }
 
     func requestStop(_ reason: ManagedProcessStopReason) {
@@ -454,6 +518,8 @@ final class ManagedProcessState: @unchecked Sendable {
         outcome = resolved
         timeoutWorkItem?.cancel()
         timeoutWorkItem = nil
+        resourceMonitorWorkItem?.cancel()
+        resourceMonitorWorkItem = nil
         let continuation = self.continuation
         self.continuation = nil
         lock.unlock()
@@ -505,7 +571,8 @@ func validatedWorkspace(_ cwd: URL) throws -> URL {
 
 func effectiveWorkspaceLease(_ candidate: WorkspaceLease?,
                              workspace: URL,
-                             mandatoryDeniedPatterns: [String] = []) throws -> WorkspaceLease {
+                             mandatoryDeniedPatterns: [String] = [],
+                             allowEmptyPathRules: Bool = false) throws -> WorkspaceLease {
     var lease = candidate ?? WorkspaceLease(rootPath: workspace.path, access: .readWrite)
     var seenDeniedPatterns = Set(lease.deniedPatterns)
     for pattern in mandatoryDeniedPatterns where seenDeniedPatterns.insert(pattern).inserted {
@@ -525,7 +592,7 @@ func effectiveWorkspaceLease(_ candidate: WorkspaceLease?,
           rootIdentity.matchesCurrentDirectory(rootPath: workspace.path) else {
         throw IntatisError.permissionDenied("workspace lease root identity changed after review")
     }
-    guard lease.allowedPathRules.isEmpty == false else {
+    guard allowEmptyPathRules || lease.allowedPathRules.isEmpty == false else {
         throw IntatisError.permissionDenied("workspace lease process allow-list is empty")
     }
     for pattern in lease.allowedPathRules.map(\.pattern) + lease.deniedPatterns {
@@ -593,14 +660,19 @@ func validateBrowserWorkspaceAccess(
         subject: "browser")
 }
 
-private func documentProcessLease(
+/// Derives an invocation-only lease from the already validated durable lease.
+/// The external parser receives only the reviewed input files plus a
+/// host-created staging directory. In particular, a durable read-write lease
+/// containing `.` is never handed unchanged to the document sandbox.
+func documentProcessLease(
     _ reviewedLease: WorkspaceLease,
     workspace: URL,
+    reviewedReadablePaths: [String],
     reviewedWritablePaths: [String],
     internalWritablePaths: [String]
 ) throws -> WorkspaceLease {
-    guard internalWritablePaths.isEmpty == false else { return reviewedLease }
-    guard reviewedLease.access == .readWrite else {
+    if internalWritablePaths.isEmpty == false,
+       reviewedLease.access != .readWrite {
         throw IntatisError.permissionDenied(
             "document staging requires a read-write workspace lease")
     }
@@ -609,13 +681,25 @@ private func documentProcessLease(
             .deletingLastPathComponent()
             .standardizedFileURL.path
     }
-    guard reviewedParents.isEmpty == false else {
+    guard internalWritablePaths.isEmpty || reviewedParents.isEmpty == false else {
         throw IntatisError.permissionDenied(
             "document staging is not bound to a reviewed destination")
     }
 
     var processLease = reviewedLease
-    var patterns = Set(processLease.allowedPathRules.map(\.pattern))
+    processLease.access = internalWritablePaths.isEmpty ? .readOnly : .readWrite
+    processLease.allowedPathRules = []
+    var patterns = Set<String>()
+
+    for rawPath in reviewedReadablePaths {
+        let resolved = try PathConfinement.resolve(rawPath, within: workspace)
+        let relative = try exactDocumentProcessPath(
+            resolved,
+            workspace: workspace)
+        if patterns.insert(relative).inserted {
+            processLease.allowedPathRules.append(PathRule(pattern: relative))
+        }
+    }
     for rawPath in internalWritablePaths {
         let resolved = try PathConfinement.resolve(rawPath, within: workspace)
         guard resolved.lastPathComponent.hasPrefix(".intatis-document-stage-") else {
@@ -627,7 +711,9 @@ private func documentProcessLease(
             throw IntatisError.permissionDenied(
                 "document staging path is not a sibling of a reviewed destination")
         }
-        let relative = PathConfinement.relativePath(of: resolved, root: workspace)
+        let relative = try exactDocumentProcessPath(
+            resolved,
+            workspace: workspace)
         if reviewedLease.deniedPatterns.contains(where: {
             workspaceLeasePath(relative, matches: $0, caseInsensitive: true)
         }) {
@@ -639,6 +725,52 @@ private func documentProcessLease(
         }
     }
     return processLease
+}
+
+private func exactDocumentProcessPath(
+    _ resolved: URL,
+    workspace: URL
+) throws -> String {
+    let relative = PathConfinement.relativePath(of: resolved, root: workspace)
+    // PathRule is a glob-shaped durable type. Document invocations need an
+    // exact path, so fail closed instead of accidentally widening a literal
+    // filename containing its two wildcard characters.
+    guard relative.isEmpty == false,
+          relative != ".",
+          relative.contains("*") == false,
+          relative.contains("?") == false else {
+        throw IntatisError.permissionDenied(
+            "document backend path cannot be represented as an exact process rule")
+    }
+    return relative
+}
+
+private func documentInternalReadOnlyRoots(
+    _ rawPaths: [String],
+    internalWritablePaths: [String],
+    workspace: URL
+) throws -> [URL] {
+    guard rawPaths.isEmpty == false else { return [] }
+    let stages = try internalWritablePaths.map {
+        try PathConfinement.resolve($0, within: workspace)
+            .standardizedFileURL
+    }
+    guard stages.isEmpty == false else {
+        throw IntatisError.permissionDenied(
+            "document internal read-only path is not bound to a staging root")
+    }
+    return try rawPaths.map { rawPath in
+        let resolved = try PathConfinement.resolve(rawPath, within: workspace)
+            .standardizedFileURL
+        guard stages.contains(where: { stage in
+            resolved.path != stage.path
+                && PathConfinement.isWithin(resolved.path, root: stage)
+        }) else {
+            throw IntatisError.permissionDenied(
+                "document internal read-only path is outside its staging root")
+        }
+        return resolved
+    }
 }
 
 private func validateDocumentBackendArguments(
@@ -763,13 +895,21 @@ private func runWorkspaceProcess(executable: URL,
                                  trustedReadRoots: [URL],
                                  writableRoots: [URL],
                                  workspaceLease: WorkspaceLease?,
+                                 allowEmptyWorkspaceAccess: Bool = false,
+                                 forcedReadOnlyWorkspaceRoots: [URL] = [],
                                  environment: [String: String],
                                  timeoutSeconds: TimeInterval,
                                  terminationGraceSeconds: TimeInterval,
                                  maximumGeneratedFileBytes: Int?,
-                                 maximumOutputBytes: Int) async throws -> ShellResult {
+                                 maximumOutputBytes: Int,
+                                 generatedOutputRoots: [URL] = [],
+                                 maximumGeneratedTotalBytes: Int? = nil,
+                                 maximumGeneratedEntries: Int = 100_000) async throws -> ShellResult {
     let workspace = try validatedWorkspace(cwd)
-    let lease = try effectiveWorkspaceLease(workspaceLease, workspace: workspace)
+    let lease = try effectiveWorkspaceLease(
+        workspaceLease,
+        workspace: workspace,
+        allowEmptyPathRules: allowEmptyWorkspaceAccess)
     let runtime = FileManager.default.temporaryDirectory
         .appendingPathComponent("intatis-process-\(UUID().uuidString)", isDirectory: true)
     let home = runtime.appendingPathComponent("home", isDirectory: true)
@@ -807,6 +947,7 @@ private func runWorkspaceProcess(executable: URL,
         trustedReadRoots: trustedReadRoots,
         writableRoots: writableRoots,
         workspaceLease: lease,
+        forcedReadOnlyWorkspaceRoots: forcedReadOnlyWorkspaceRoots,
         networkAccess: networkAccess)
     processSpec = ManagedProcessSpec(
         executable: URL(fileURLWithPath: "/usr/bin/sandbox-exec"),
@@ -821,15 +962,21 @@ private func runWorkspaceProcess(executable: URL,
     guard let bubblewrap = bubblewrapExecutable() else {
         throw IntatisError.config("process execution is disabled because Bubblewrap is unavailable; install bwrap")
     }
-    guard lease.allowedPathRules.count == 1,
-          lease.allowedPathRules[0].pattern == ".",
-          lease.deniedPatterns.isEmpty else {
+    let wholeWorkspacePolicy = lease.allowedPathRules.count == 1
+        && lease.allowedPathRules[0].pattern == "."
+        && lease.deniedPatterns.isEmpty
+    let exactPathPolicy = lease.allowedPathRules.allSatisfy {
+        $0.pattern != "."
+            && $0.pattern.contains("*") == false
+            && $0.pattern.contains("?") == false
+    }
+    guard wholeWorkspacePolicy || exactPathPolicy else {
         throw IntatisError.config(
-            "process execution is disabled on Linux because Bubblewrap cannot enforce this WorkspaceLease path policy without a race")
+            "process execution is disabled on Linux because Bubblewrap cannot enforce this WorkspaceLease glob policy without a race")
     }
     processSpec = ManagedProcessSpec(
         executable: bubblewrap,
-        arguments: bubblewrapArguments(
+        arguments: try bubblewrapArguments(
             workspace: workspace,
             runtime: runtime,
             executable: executable,
@@ -837,6 +984,7 @@ private func runWorkspaceProcess(executable: URL,
             trustedReadRoots: trustedReadRoots,
             writableRoots: writableRoots,
             workspaceLease: lease,
+            forcedReadOnlyWorkspaceRoots: forcedReadOnlyWorkspaceRoots,
             environment: sanitized,
             networkAccess: networkAccess,
             startupMarker: startupMarkerURL,
@@ -849,7 +997,10 @@ private func runWorkspaceProcess(executable: URL,
         cwd: workspace,
         timeoutSeconds: timeoutSeconds,
         terminationGraceSeconds: terminationGraceSeconds,
-        maximumOutputBytes: maximumOutputBytes)
+        maximumOutputBytes: maximumOutputBytes,
+        generatedOutputRoots: [runtime] + generatedOutputRoots,
+        maximumGeneratedTotalBytes: maximumGeneratedTotalBytes,
+        maximumGeneratedEntries: maximumGeneratedEntries)
     let managedCommandShimStarted: Bool
     do {
         try startupMarkerHandle.seek(toOffset: 0)
@@ -974,7 +1125,10 @@ private func runManagedProcess(spec: ManagedProcessSpec,
                                cwd: URL,
                                timeoutSeconds: TimeInterval,
                                terminationGraceSeconds: TimeInterval,
-                               maximumOutputBytes: Int) async throws -> ShellResult {
+                               maximumOutputBytes: Int,
+                               generatedOutputRoots: [URL] = [],
+                               maximumGeneratedTotalBytes: Int? = nil,
+                               maximumGeneratedEntries: Int = 100_000) async throws -> ShellResult {
     let stdoutPipe = try makeManagedOutputPipe(maximumBytes: maximumOutputBytes)
     let stderrPipe: ManagedOutputPipe
     do {
@@ -1007,6 +1161,12 @@ private func runManagedProcess(spec: ManagedProcessSpec,
             stderrWriteOpen = false
             state.register(pid: pid)
             state.scheduleTimeout(after: timeoutSeconds)
+            if let maximumGeneratedTotalBytes {
+                state.scheduleGeneratedOutputLimit(
+                    roots: generatedOutputRoots,
+                    maximumBytes: UInt64(maximumGeneratedTotalBytes),
+                    maximumEntries: maximumGeneratedEntries)
+            }
             DispatchQueue.global(qos: .utility).async {
                 state.processExited(waitAndReap(pid: pid))
             }
@@ -1041,6 +1201,14 @@ private func runManagedProcess(spec: ManagedProcessSpec,
 
     switch outcome {
     case .exited(let status):
+        if let maximumGeneratedTotalBytes,
+           documentGeneratedOutputExceedsBudget(
+               roots: generatedOutputRoots,
+               maximumBytes: UInt64(maximumGeneratedTotalBytes),
+               maximumEntries: maximumGeneratedEntries) {
+            throw IntatisError.io(
+                "document backend exceeded its generated output budget")
+        }
         return ShellResult(stdout: stdoutText,
                            stderr: stderrText,
                            exitCode: Int(status))
@@ -1048,6 +1216,8 @@ private func runManagedProcess(spec: ManagedProcessSpec,
         throw CancellationError()
     case .timedOut:
         throw IntatisError.io("shell command timed out after \(timeoutSeconds.formattedForError)s")
+    case .resourceLimit:
+        throw IntatisError.io("document backend exceeded its generated output budget")
     }
 }
 
@@ -1084,6 +1254,72 @@ private func waitForProcessGroupToEmpty(leader: Int32, descendants: Set<Int32>) 
         signalProcessGroupAndDescendants(root: leader, descendants: descendants, value: SIGKILL)
         usleep(10_000)
     }
+}
+
+/// Bounds aggregate logical/allocated output while a fixed document backend is
+/// running. It never follows symlinks and treats unreadable or single-link
+/// violations as over-budget so the process is stopped fail closed.
+func documentGeneratedOutputExceedsBudget(
+    roots: [URL],
+    maximumBytes: UInt64,
+    maximumEntries: Int
+) -> Bool {
+    var totalBytes: UInt64 = 0
+    var entryCount = 0
+    var seenRoots = Set<String>()
+
+    func account(_ url: URL, enumerator: FileManager.DirectoryEnumerator?) -> Bool {
+        var status = stat()
+        guard lstat(url.path, &status) == 0 else { return errno != ENOENT }
+        let kind = status.st_mode & S_IFMT
+        if kind == S_IFLNK {
+            enumerator?.skipDescendants()
+            return true
+        }
+        entryCount += 1
+        guard entryCount <= maximumEntries else { return true }
+        if kind == S_IFDIR { return false }
+        guard kind == S_IFREG, status.st_nlink == 1, status.st_size >= 0 else {
+            return true
+        }
+        let logical = UInt64(status.st_size)
+        let allocated = status.st_blocks > 0
+            ? UInt64(status.st_blocks) * 512
+            : 0
+        let contribution = max(logical, allocated)
+        guard contribution <= maximumBytes,
+              totalBytes <= maximumBytes - contribution else {
+            return true
+        }
+        totalBytes += contribution
+        return false
+    }
+
+    for rawRoot in roots {
+        let root = rawRoot.standardizedFileURL
+        guard seenRoots.insert(root.path).inserted else { continue }
+        var rootStatus = stat()
+        guard lstat(root.path, &rootStatus) == 0 else {
+            if errno == ENOENT { continue }
+            return true
+        }
+        let rootKind = rootStatus.st_mode & S_IFMT
+        if rootKind == S_IFLNK { return true }
+        if rootKind != S_IFDIR {
+            if account(root, enumerator: nil) { return true }
+            continue
+        }
+        guard let enumerator = FileManager.default.enumerator(
+            at: root,
+            includingPropertiesForKeys: nil,
+            options: []) else {
+            return true
+        }
+        while let value = enumerator.nextObject() as? URL {
+            if account(value, enumerator: enumerator) { return true }
+        }
+    }
+    return false
 }
 
 #if canImport(Darwin)
@@ -1206,6 +1442,7 @@ func macOSSandboxProfile(workspace: URL,
                          trustedReadRoots: [URL],
                          writableRoots: [URL],
                          workspaceLease: WorkspaceLease,
+                         forcedReadOnlyWorkspaceRoots: [URL] = [],
                          networkAccess: WorkspaceNetworkAccess) throws -> String {
     let baseReadRoots = [
         "/System", "/usr", "/bin", "/sbin",
@@ -1246,6 +1483,11 @@ func macOSSandboxProfile(workspace: URL,
     let outsideAllowRule: String
     if allowsWholeWorkspace {
         outsideAllowRule = ""
+    } else if allowedRegexes.isEmpty {
+        outsideAllowRule = """
+        (deny file-read-data file-map-executable file-write*
+          (subpath "\(sandboxLiteral(workspaceRoot))"))
+        """
     } else {
         let requireNotAllowed = allowedRegexes.map {
             "(require-not (regex \"\(sandboxLiteral($0))\"))"
@@ -1273,6 +1515,9 @@ func macOSSandboxProfile(workspace: URL,
     } else {
         readOnlyRules = ""
     }
+    let forcedReadOnlyRules = canonicalUniqueURLs(forcedReadOnlyWorkspaceRoots).map {
+        "(deny file-write* (subpath \"\(sandboxLiteral($0.path))\"))"
+    }.joined(separator: "\n")
     let networkRule = networkAccess == .allowed ? "(allow network*)" : "(deny network*)"
     return """
     (version 1)
@@ -1291,6 +1536,7 @@ func macOSSandboxProfile(workspace: URL,
     \(outsideAllowRule)
     \(deniedRules)
     \(readOnlyRules)
+    \(forcedReadOnlyRules)
     \(networkRule)
     """
 }
@@ -1411,21 +1657,41 @@ func bubblewrapArguments(workspace: URL,
                          trustedReadRoots: [URL],
                          writableRoots: [URL],
                          workspaceLease: WorkspaceLease,
+                         forcedReadOnlyWorkspaceRoots: [URL] = [],
                          environment: [String: String],
                          networkAccess: WorkspaceNetworkAccess,
                          startupMarker: URL,
-                         maximumGeneratedFileBytes: Int?) -> [String] {
+                         maximumGeneratedFileBytes: Int?) throws -> [String] {
     let baseRoots = ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc/ssl", "/etc/pki",
                      "/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf"]
         .filter { FileManager.default.fileExists(atPath: $0) }
         .map { URL(fileURLWithPath: $0) }
     var readRoots = canonicalUniqueURLs(baseRoots + trustedReadRoots)
     var writeRoots = canonicalUniqueURLs([runtime])
-    if workspaceLease.access == .readOnly {
-        readRoots = canonicalUniqueURLs(readRoots + [workspace] + writableRoots)
+    var exactReadRoots: [URL] = []
+    var exactWriteRoots: [URL] = []
+    let allowsWholeWorkspace = workspaceLease.allowedPathRules.count == 1
+        && workspaceLease.allowedPathRules[0].pattern == "."
+        && workspaceLease.deniedPatterns.isEmpty
+    if allowsWholeWorkspace {
+        if workspaceLease.access == .readOnly {
+            readRoots = canonicalUniqueURLs(readRoots + [workspace] + writableRoots)
+        } else {
+            writeRoots = canonicalUniqueURLs(writeRoots + [workspace] + writableRoots)
+        }
     } else {
-        writeRoots = canonicalUniqueURLs(writeRoots + [workspace] + writableRoots)
+        let exactRoots = try workspaceLease.allowedPathRules.map { rule in
+            try PathConfinement.resolve(rule.pattern, within: workspace)
+        }
+        if workspaceLease.access == .readOnly {
+            exactReadRoots = canonicalUniqueURLs(exactRoots)
+            readRoots = canonicalUniqueURLs(readRoots + writableRoots)
+        } else {
+            exactWriteRoots = canonicalUniqueURLs(exactRoots)
+            writeRoots = canonicalUniqueURLs(writeRoots + writableRoots)
+        }
     }
+    let forcedReadOnlyRoots = canonicalUniqueURLs(forcedReadOnlyWorkspaceRoots)
     var result = ["--die-with-parent", "--new-session", "--unshare-all"]
     result.append(networkAccess == .allowed ? "--share-net" : "--unshare-net")
     result.append(contentsOf: ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--clearenv"])
@@ -1441,6 +1707,12 @@ func bubblewrapArguments(workspace: URL,
             result.append(contentsOf: ["--dir", parent])
         }
     }
+    if allowsWholeWorkspace == false {
+        addParents(of: workspace.path + "/.intatis-placeholder")
+        if madeDirectories.insert(workspace.path).inserted {
+            result.append(contentsOf: ["--dir", workspace.path])
+        }
+    }
     for root in readRoots {
         addParents(of: root.path)
         result.append(contentsOf: ["--ro-bind", root.path, root.path])
@@ -1448,6 +1720,21 @@ func bubblewrapArguments(workspace: URL,
     for root in writeRoots {
         addParents(of: root.path)
         result.append(contentsOf: ["--bind", root.path, root.path])
+    }
+    for root in exactWriteRoots {
+        addParents(of: root.path)
+        result.append(contentsOf: ["--bind", root.path, root.path])
+    }
+    for root in exactReadRoots {
+        addParents(of: root.path)
+        result.append(contentsOf: ["--ro-bind", root.path, root.path])
+    }
+    // Overlay reviewed inputs and validator inputs read-only after any parent
+    // staging directory bind. Mount order makes the narrower read-only bind
+    // authoritative inside an otherwise writable stage.
+    for root in forcedReadOnlyRoots {
+        addParents(of: root.path)
+        result.append(contentsOf: ["--ro-bind", root.path, root.path])
     }
     for key in environment.keys.sorted() {
         result.append(contentsOf: ["--setenv", key, environment[key] ?? ""])

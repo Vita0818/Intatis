@@ -275,7 +275,9 @@ struct DocumentRenderArguments: Codable, Equatable, Sendable {
 
     static let schema = DocumentContractSchema.object(
         properties: [
-            "input_format": DocumentContractSchema.format(editableOnly: false),
+            "input_format": DocumentContractSchema.format([
+                .pdf, .docx, .pptx, .xlsx, .html,
+            ]),
             "input_path": DocumentContractSchema.path,
             "expected_source_sha256": DocumentContractSchema.sha256,
             "local_asset_paths": DocumentContractSchema.localAssetPaths,
@@ -315,6 +317,11 @@ struct DocumentRenderArguments: Codable, Equatable, Sendable {
             ],
             required: ["input_format", "input_path", "expected_source_sha256", "output_dir"])
         let value: Self = try DocumentContractValidation.decode(args)
+        guard value.inputFormat != .epub else {
+            throw DocumentToolError(
+                .unsupportedOperation,
+                "EPUB rendering remains disabled until the full-spine corpus gate passes")
+        }
         try DocumentContractValidation.validatePath(
             value.inputPath,
             extension: value.inputFormat,
@@ -382,7 +389,9 @@ struct DocumentExportPDFArguments: Codable, Equatable, Sendable {
 
     static let schema = DocumentContractSchema.object(
         properties: [
-            "input_format": DocumentContractSchema.format(editableOnly: true),
+            "input_format": DocumentContractSchema.format([
+                .docx, .pptx, .xlsx, .html,
+            ]),
             "input_path": DocumentContractSchema.path,
             "expected_source_sha256": DocumentContractSchema.sha256,
             "local_asset_paths": DocumentContractSchema.localAssetPaths,
@@ -407,10 +416,10 @@ struct DocumentExportPDFArguments: Codable, Equatable, Sendable {
             ],
             required: ["input_format", "input_path", "expected_source_sha256", "output_path"])
         let value: Self = try DocumentContractValidation.decode(args)
-        guard DocumentFormat.editableFormats.contains(value.inputFormat) else {
+        guard [.docx, .pptx, .xlsx, .html].contains(value.inputFormat) else {
             throw DocumentToolError(
                 .unsupportedOperation,
-                "document_export_pdf does not accept PDF input")
+                "document_export_pdf supports DOCX, PPTX, XLSX, and HTML only")
         }
         try DocumentContractValidation.validatePath(
             value.inputPath,
@@ -451,6 +460,7 @@ struct DocumentWriteArguments: Codable, Equatable, Sendable {
     let mode: DocumentWriteMode
     let inputPath: String?
     let expectedSourceSHA256: String?
+    let localAssetPaths: [String]?
     let outputPath: String
     let replaceExisting: Bool?
     let expectedOutputSHA256: String?
@@ -460,6 +470,7 @@ struct DocumentWriteArguments: Codable, Equatable, Sendable {
         case format, mode
         case inputPath = "input_path"
         case expectedSourceSHA256 = "expected_source_sha256"
+        case localAssetPaths = "local_asset_paths"
         case outputPath = "output_path"
         case replaceExisting = "replace_existing"
         case expectedOutputSHA256 = "expected_output_sha256"
@@ -472,6 +483,7 @@ struct DocumentWriteArguments: Codable, Equatable, Sendable {
             "mode": DocumentContractSchema.stringEnum(DocumentWriteMode.allCases.map(\.rawValue)),
             "input_path": DocumentContractSchema.path,
             "expected_source_sha256": DocumentContractSchema.sha256,
+            "local_asset_paths": DocumentContractSchema.localAssetPaths,
             "output_path": DocumentContractSchema.path,
             "replace_existing": DocumentContractSchema.boolean,
             "expected_output_sha256": DocumentContractSchema.sha256,
@@ -493,7 +505,7 @@ struct DocumentWriteArguments: Codable, Equatable, Sendable {
             object,
             allowed: [
                 "format", "mode", "input_path", "expected_source_sha256", "output_path",
-                "replace_existing", "expected_output_sha256", "operations",
+                "local_asset_paths", "replace_existing", "expected_output_sha256", "operations",
             ],
             required: ["format", "mode", "output_path", "operations"])
         try DocumentContractValidation.validateOperationEnvelopes(object["operations"])
@@ -505,6 +517,9 @@ struct DocumentWriteArguments: Codable, Equatable, Sendable {
             value.outputPath,
             extension: value.format,
             field: "output_path")
+        try DocumentContractValidation.validateLocalAssetPaths(
+            value.localAssetPaths,
+            inputFormat: value.format)
         try DocumentContractValidation.validateReplacement(
             replaceExisting: value.replaceExisting ?? false,
             expectedOutputSHA256: value.expectedOutputSHA256)
@@ -644,6 +659,10 @@ private enum DocumentContractSchema {
             ? DocumentFormat.editableFormats.map(\.rawValue).sorted()
             : DocumentFormat.allCases.map(\.rawValue)
         return stringEnum(formats)
+    }
+
+    static func format(_ formats: [DocumentFormat]) -> JSONValue {
+        stringEnum(formats.map(\.rawValue))
     }
 
     static let documentReadOptions = object(

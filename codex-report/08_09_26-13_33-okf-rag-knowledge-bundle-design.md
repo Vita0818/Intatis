@@ -2,15 +2,46 @@
 
 日期：2026-08-09
 
-状态：`DESIGN CANDIDATE / FOUR-COMPONENT SCOPE AGREED / IMPLEMENTATION NOT STARTED`
+状态：`FOUR-COMPONENT LOCAL CORE IMPLEMENTED / LOCAL CONTRACT TESTED / EXTERNAL DEVICE-SCALE GATES OPEN / PHASE 5 SURFACES DEFERRED`
 
 面向读者：后续负责设计、实现、审查和验证 Intatis 知识库能力的 Codex / Intatis 维护者
 
-报告性质：dated design evidence。当前产品事实仍以 `docs/`、源码、工程配置和测试为准；本报告不得覆盖当前 active target，也不得被描述为已经实现的产品能力。
+报告性质：dated design + implementation evidence。当前产品事实仍以 `docs/`、源码、工程配置和测试为准；本报告不覆盖当前 active target。本文最初的 pre-implementation 审计结论保留为历史背景，2026-08-09 的实现状态以紧随其后的 ledger 和第 15 节为准。
 
 当前产品基线：Intatis `v0.40 (build 40)`
 
 当前 active target：Developer ID 直接分发；与本报告中的 RAG 设计无关。
+
+## 实现 ledger（2026-08-09 current working tree）
+
+四组件合同已作为 non-iOS、Swift-native core 落地；这里的“已实现”不等于已经出现用户可见的
+知识库管理页或默认挂载：
+
+| 组件 | 当前实现 | 边界 |
+| --- | --- | --- |
+| 固定标准 | `ThirdPartyStandards/OpenKnowledgeFormat/0.2/` byte-exact SPEC/LICENSE/UPSTREAM/SHA256SUMS；`NOTICE.md` 与 `ThirdPartyNotices/OpenKnowledgeFormat.md` 记录 Apache-2.0 provenance | 不包含上游 reference agent、Python package、prompt、viewer、sample bundle 或品牌资产 |
+| 薄 adapter | public non-iOS `IntatisKnowledge` target；9 份 strict schema；whole-tree OKF conformance + canonical v0.2 writer；`KnowledgeBundleBuildService`、deterministic chunker、完整 embedding/component/composite identity、immutable store | 原始连接器、PDF/Office/OCR、语义清洗和产品 UI 仍由其它工作流负责；build service 要求 exact resolved authorization，但不是 model-facing `build_knowledge` 工具，本轮也没有接 Agent producer 的 durable caller |
+| deterministic Validator | bounded Yams AST、schema/identity/path/hash/checksum/content-seal/index/source-locator/secret validation、validation receipt | 机械一致性 validator，不声称证明外部事实、自然语言蕴含或人工审校质量 |
+| `search_knowledge` | opaque snapshot-bound mount、exact query embedding、profile-selected dense-only 或 BM25+RRF hybrid、exact optional/required reranker seam、ACL pre-filter、bounded evidence、current-turn final grounding revalidation | 只有 host 显式注入 optional augmenter 才向 Code/Cowork 暴露；Chat/iOS/UI/CLI mount command/MCP Server 均未接入 |
+
+主要实现文件位于 `Packages/IntatisKnowledge/Sources/`；generic host seam 位于
+`Packages/IntatisTools/Sources/HostToolRegistryAugmentation.swift`，Agent final-grounding seam 位于
+`Packages/IntatisAgentKernel/Sources/TurnGroundingEvidenceRegistry.swift` / `AgentLoop.swift`。Code 与
+Cowork 只接收 optional augmenter，默认 `nil`。
+
+当前本地 route 固定为 Apple NaturalLanguage sentence embedding exact identity、L2/cosine
+`Float32` exact KNN，并按 profile 选择 dense-only 或 Intatis BM25 + deterministic RRF hybrid。仓内的
+`KnowledgeEmbeddingCosineRerankerProvider` 是最小 exact reranker seam，不是 cross-encoder。
+remote embedding/reranker 没有隐藏 fallback；host 若以后接入，必须把工具标为 network-backed 并
+经过既有网络权限链。
+
+最新 fresh full evidence：`IntatisKnowledgeTests` 106/106、
+`TurnGroundingEvidenceRegistryTests` 6/6；真实 Cowork AgentLoop probe 证明 permission
+request/resolved → durable prepared → structured `tool_result` → settled → final citation revalidation →
+close/drain；snapshot-bound dynamic registration 的 local intent/preview 与 deterministic reviewer
+boundary 另有 direct + durable 回归。`IntatisMac` unsigned arm64 Debug 构建通过；`IntatisKnowledge` 与 `IntatisCLI` 的 arm64
+及 x86_64 cross-build 通过。x86_64 结果只证明编译，Intel 真机 NLEmbedding availability/质量仍为
+`UNKNOWN`。
 
 ## 0. 本报告收敛结论（四组件边界已同用户确认）
 
@@ -36,7 +67,7 @@ Intatis 的第一版传统 RAG 知识库候选方案收敛为且只收敛为四�
   -> deterministic Validator
   -> validated immutable snapshot
   -> host 挂载并签发 opaque knowledge-base handle
-  -> search_knowledge(query)
+  -> search_knowledge(query, optional bounded limit)
        -> resolve caller-authorized corpus/partitions
        -> query embedding
        -> lexical + dense retrieval inside authorized corpus
@@ -58,7 +89,7 @@ Intatis 的第一版传统 RAG 知识库候选方案收敛为且只收敛为四�
 - 用户或宿主在查询前提供一次知识库目录，后续模型使用一个稳定工具；
 - 知识库目录必须遵守同一规范，才能在不同 Agent、LLM、embedding 和 reranker 之间复用。
 
-因此，“把已经做好的知识库路径交给查询系统”是合理产品模型。但路径应提供给 **Intatis host/mount boundary**，不应作为模型可任意填写的绝对路径进入 `search_knowledge`。Host 校验并挂载后向模型暴露 opaque handle；单知识库任务甚至可以把 handle 绑定到工具实例，使模型输入只剩 query。
+因此，“把已经做好的知识库路径交给查询系统”是合理产品模型。但路径应提供给 **Intatis host/mount boundary**，不应作为模型可任意填写的绝对路径进入 `search_knowledge`。Host 校验并挂载后向模型暴露 opaque handle；单知识库任务甚至可以把 handle 绑定到工具实例，使 model-facing input 只剩 query 和可选的 bounded limit。
 
 ### 1.2 查询时仍然必须做的工作
 
@@ -114,9 +145,10 @@ Intatis 的第一版传统 RAG 知识库候选方案收敛为且只收敛为四�
 - 自动证明任意自然语言答案在语义上被证据蕴含；
 - 当前 v0.40 Developer ID release target 的变更。
 
-### 2.3 当前仓库事实
+### 2.3 初始仓库事实（实现前历史基线）
 
-截至本报告：
+以下是本报告开始设计时的审计快照，不是 2026-08-09 实现后的 current state；当前事实见文首
+implementation ledger、`docs/CURRENT_STATE.md` 和源码：
 
 - Intatis 没有完整的 RAG/Knowledge 产品或 ingestion → chunk → embed → retrieve → rerank → citation 闭环；
 - provider `Capability.embedding` 只是能力枚举，不能当作 embedding endpoint/client/model/index 已实现；
@@ -126,7 +158,9 @@ Intatis 的第一版传统 RAG 知识库候选方案收敛为且只收敛为四�
 - Chat hosted web search 是当前模型的厂商托管网页搜索，不是本地知识库 RAG；
 - Intatis 当前只实现 external MCP **client**，没有产品 MCP Server target。
 
-因此本文所有 schema、目录、工具和错误码，除明确引用 OKF/MCP 官方字段外，均是 **PROPOSED**，不是 shipped contract。
+因此在初始审计时，本文所有 schema、目录、工具和错误码，除明确引用 OKF/MCP 官方字段外，均是
+**PROPOSED**。它们随后作为 `IntatisKnowledge` core contract 落地；用户可见 mount/management
+surface 仍未 shipped。
 
 ## 3. 标准选择结论
 
@@ -241,9 +275,9 @@ not observed as of audit; do not use a floating or invented tag
 
 `OKF_SPEC_PIN` 固定规范内容；`OKF_AUDITED_REPO_HEAD` 只记录审计时上游仓库状态。以后不得把浮动 `main` 当成规范身份。
 
-### 4.2 将来真正下载时的最小文件集
+### 4.2 已采用的最小文件集
 
-建议只保存：
+仓库已只保存：
 
 ```text
 SPEC.md
@@ -254,7 +288,10 @@ SHA256SUMS           # Intatis 自写完整性清单
 
 不要为了“采用规范”把 reference agent、visualizer、BigQuery/Gemini runtime、sample credentials 或整个上游仓库引入 Intatis 发行依赖。
 
-建议的仓内落点是 `ThirdPartyStandards/OpenKnowledgeFormat/0.2/`，但该目录名属于 **PROPOSED**。真正采用前必须按 `docs/OPEN_SOURCE_REUSE.md` 确认最终目录、许可证文件、provenance、NOTICE/ThirdPartyNotices 和 bundle 资源策略。
+实际落点为 `ThirdPartyStandards/OpenKnowledgeFormat/0.2/`；`UPSTREAM.md`、
+`SHA256SUMS`、`NOTICE.md` 与 `ThirdPartyNotices/OpenKnowledgeFormat.md` 已同步记录
+provenance、许可证和完整性。上游 reference agent、visualizer、sample bundle 和
+Python/runtime 未进入 Intatis 依赖闭包。
 
 ### 4.3 可复现下载步骤
 
@@ -1478,6 +1515,12 @@ prompt 由现有策略决定，不由 RAG 工具另造捷径。
 snapshot 的副作用，同样必须走上述 lease、三层权限、durable ticket 和 settlement；
 不能让 Agent 通过 raw file/terminal 操作绕过它。
 
+当前源码只实现了该 host seam，并在执行入口复核 exact `ResolvedToolAuthorization`、
+WorkspaceLease、capability、network risk 和 immutable snapshot；它不会自行伪造 durable ticket。
+本轮没有注册 model-facing `build_knowledge`，也没有把外部 Agent producer caller 接进
+AgentLoop。因此上段是未来实际 caller 的强制接线合同，不能从 build service 的单元测试外推为
+“建库 Agent durable 生命周期已经接通”。
+
 ### 7.9 建议失败码
 
 | Code | 含义 | 默认 retryable |
@@ -1587,7 +1630,10 @@ envelope；这只是未来映射必须满足的完整合同。
 
 - 创建并持有 staging snapshot；
 - 接收 Agent 生成的 OKF draft，但不信任其机械字段；
-- canonicalize source/concept identity、locator 与 digest；
+- canonicalize source/concept identity、concept locator 与 digest；当前 build request 不接收、chunker
+  也不生成原始 source locator，因此该字段保持省略。standalone/prebuilt snapshot 的 mount/search/final
+  路径已能验证和重放 locator；未来 producer/adapter extension 若提供该字段，只能接受已授权的
+  versioned shape，并由 exact adapter 验证/重放，不从 source URI 或正文猜造；
 - 用冻结的 deterministic chunker 生成 chunk manifest；
 - exact resolve embedding/index adapter，构建派生组件；
 - 调用同一个 Validator；
@@ -1608,7 +1654,9 @@ build request
   -> KnowledgeBundleBuildService obtains writer/authorization lease
   -> staging snapshot directory
   -> Agent outputs OKF concept/profile drafts
-  -> host canonicalizes IDs/locators/hashes
+  -> host canonicalizes IDs/concept locators/hashes
+     (current build omits original source locators)
+  -> future producer/adapter extension may supply locators for exact validation/replay
   -> deterministic host chunking
   -> exact embedding/index build
   -> deterministic validation
@@ -1939,7 +1987,7 @@ search_knowledge Tool
 
 ## 13. 分阶段落地顺序
 
-### Phase 0：标准固定和合同冻结
+### Phase 0：标准固定和合同冻结（完成）
 
 1. 下载 fixed OKF spec/license；
 2. 记录 upstream/provenance/hashes；
@@ -1952,7 +2000,7 @@ search_knowledge Tool
 
 Gate：不写检索业务代码前，先让 schema 和 fixture 能回答“什么叫一个可用知识库”。
 
-### Phase 1：薄 adapter + Validator + backend bake-off
+### Phase 1：薄 adapter + Validator + local backend 验证（core 已实现；Intel 真机 release gate 仍开放）
 
 1. OKF reader；
 2. profile/chunk reader；
@@ -1964,21 +2012,25 @@ Gate：不写检索业务代码前，先让 schema 和 fixture 能回答“什�
 8. 验证 Apple Silicon、Intel macOS、许可证、模型来源、内存/延迟后只选一条 P0 route；
 9. path/identity/hash/concurrency tests。
 
-Gate：手写 fixture 能 deterministic valid/invalid；没有模型参与；在写产品 retrieval
-链前已用量化结果选定一条 universal-macOS 可接受的 exact route。若没有候选通过，
-Phase 1 停止，不用未经验证的 backend 填空。
+Gate status：手写 fixture 的 deterministic valid/invalid 与本机 local route 已通过，Validator 没有
+模型参与；universal-macOS 的 Intel 真机、最低支持 macOS 与 release-device gate 仍为 `OPEN`。
+当前仅继续实现 non-shipping local core，不能把 cross-build 或本机量化结果写成 universal gate 已过；
+shipping 前若候选未通过，Phase 1 release 停止，不用未经验证的 backend 填空。
 
-### Phase 2：建库 Agent producer workflow
+### Phase 2：建库 Agent producer workflow（host build/publish seam 完成；上游生产者工作流不在本报告接线）
 
 1. 现有 Agent 写 staging OKF；
-2. host service 生成 IDs/locators/hashes 和 deterministic chunks；
+2. host service 生成 IDs、concept locators、hashes 和 deterministic chunks；当前 build seam 省略原始
+   source locators。已实现的 locator schema/replay 用于 standalone/prebuilt snapshot；未来生产者/adapter
+   extension 才可提供该可选字段，host 只做 exact schema/revision/replay 验证，绝不猜造；
 3. 使用 Phase 1 选定的 exact embedding/index adapter；
 4. validator feedback → Agent 修复；
 5. validated complete-snapshot publish。
 
-Gate：小型真实知识集可从原始材料生成、验证、更新、删除并重开。
+Gate status：`NOT RUN in current scope`。从原始材料开始的 Agent producer E2E 与 durable caller 由外部
+解析/清洗工作流负责；本轮只验证 host build/publish seam 及其更新、删除、重开机械合同。
 
-### Phase 3：`search_knowledge` 最小查询链
+### Phase 3：`search_knowledge` 最小查询链（完成；host opt-in，默认不暴露）
 
 1. host mount/opaque handle；
 2. exact query embedding；
@@ -1989,7 +2041,7 @@ Gate：小型真实知识集可从原始材料生成、验证、更新、删除�
 
 Gate：不接 Chat/UI；模型能用工具回答并只引用返回 evidence。
 
-### Phase 4：hybrid + rerank + 扩展 eval
+### Phase 4：hybrid + rerank + 扩展 eval（local 机制与冻结 corpus 已验证；设备/大规模/真实增益 gate 仍开放）
 
 1. lexical/BM25；
 2. RRF；
@@ -2000,7 +2052,7 @@ Gate：不接 Chat/UI；模型能用工具回答并只引用返回 evidence。
 
 Gate：只有量化结果证明收益才扩大 backend 或模型矩阵。
 
-### Phase 5：产品化决策
+### Phase 5：产品化决策（明确 deferred）
 
 之后才决定：
 
@@ -2012,11 +2064,11 @@ Gate：只有量化结果证明收益才扩大 backend 或模型矩阵。
 - share/export/import；
 - automated source refresh。
 
-## 14. 本报告内已冻结的原则（仍需 Phase 0/1 验证）
+## 14. 本报告内已冻结并由 core 实现的原则
 
-这里“冻结”表示后续设计不得无说明地偏离用户确认的四组件方向，不表示 schema、
-依赖、lease 或 backend 已成为 shipped contract。OKF 的正式 adoption 仍以 Phase 0
-固定文件、provenance/license 审查和最小 fixture/spike 通过为前提。
+这里“冻结”表示后续设计不得无说明地偏离用户确认的四组件方向。Phase 0 的标准、schema、
+依赖和 provenance，Phase 1/3 的本地 core、Phase 2 的 host build seam 以及 Phase 4 的本地机制已进入
+当前源码；Agent producer durable caller、外部设备/规模 gate 和 Phase 5 surface 仍按下文边界保留。
 
 - 四组件边界，不新增第五个 RAG 产品组件；
 - OKF v0.2 是 canonical knowledge content baseline；
@@ -2034,30 +2086,62 @@ Gate：只有量化结果证明收益才扩大 backend 或模型矩阵。
 - 无静默 fallback；
 - 任何外部 runtime/依赖另做许可证与 provenance 审查。
 
-## 15. 仍为 `UNKNOWN` / 需要后续确认
+## 15. 实现后收敛项、deferred 与 `UNKNOWN`
 
-1. `ThirdPartyStandards/` 是否是最终仓内目录；真正 adoption patch 前确认。
-2. Profile/chunk/evidence JSON Schema 的最终字段名和上限。
-3. Bundle canonical digest 的精确 canonicalization algorithm。
-4. YAML parser/JSON Schema validator 的具体实现与许可证。
-5. 是否新增独立 `IntatisKnowledge` target，还是放入现有 macOS Code/Cowork-only
-   internal target；不得放进被 iOS Chat 链接的 shared Providers target。
-6. P0 已固定只允许现有 WorkspaceLease；未来是否支持 workspace 外路径并新增独立 KnowledgeLease。
-7. 首个 embedding 模型及其中文、英文、代码质量。
-8. universal macOS 中 Apple Silicon/Intel 的 local embedding/reranker runtime 策略。
-9. remote embedding service 无 immutable revision 时的风险接受策略。
-10. 首个 dense backend：exact KNN、sqlite-vec、USearch 或其它。
-11. lexical tokenizer 对中英文/代码的实际策略。
-12. reranker 是否首版 required，以及具体模型/license/runtime。
-13. source locator 首版支持 UTF-8 byte、line、page、DOM 还是 layout node。
-14. live source revalidation 与 immutable snapshot 的默认 policy。
-15. current MCP client stack 对 2026-07-28 `_meta`、outputSchema、structuredContent 的完整支持度；内部工具不依赖该项。
-16. final answer citation renderer/UI；本报告只冻结后台证据合同。
-17. semantic faithfulness 的通过门槛和 eval corpus。
-18. 多进程 reader/writer lease、atomic pointer、retention/GC 的精确存储协议；必须在 Phase 0/1 冻结后才能实现 publish/mount。
-19. `knowledge://` 是否保留为内部 URI、改用其它资源标识，或未来注册/映射为 MCP resource URI。
-20. 既有 append-only EventLog 中 bounded evidence 的保留期，以及未来是否需要
-    encrypted-artifact indirection 才能提供跨 knowledge store/session 的强清除。
+### 15.1 已从初始 `UNKNOWN` 收敛
+
+- `ThirdPartyStandards/OpenKnowledgeFormat/0.2/` 已成为固定目录，spec/license/provenance/hash 和
+  NOTICE 同步落地；Profile/chunk/evidence/store/checksum/validation/source-locator/search input/output
+  共 9 份 schema 已冻结。
+- digest 使用 Intatis canonical JSON/SHA-256 projection；bundle、chunk manifest、dense/lexical
+  component、retrieval policy、reranker binding、composite snapshot 和 host content seal 分层绑定。
+- YAML 选择 Yams 6.2.2 exact dependency；JSON Schema evaluator 为仓内 bounded subset，未引入第二个
+  schema package。独立 public non-iOS `IntatisKnowledge` target 已落地，iOS 无 direct/transitive link。
+- P0 dense route 选择 Apple NaturalLanguage sentence embedding + Swift `Float32` exact KNN；lexical
+  使用多语言/代码 tokenizer + BM25，fusion 使用 RRF。没有引入 sqlite-vec/USearch/MLX 或向量数据库。
+- reranker profile 支持 disabled/optional/required exact binding；当前随仓 local provider 是
+  embedding-cosine seam，不是 cross-encoder，也不静默下载模型或切 remote。
+- source locator 首版只注册 immutable UTF-8 byte range；mount/search/final grounding 使用同一
+  executable adapter registry 和 digest。live URL/path 不会在 query 时被执行。
+- reader/writer locks、staging、atomic pointer、content seal、reader drain、retention/GC、explicit A/B、
+  validation receipt 与 urgent purge 协议已实现。`knowledge://` 当前保留为内部 evidence URI。
+
+### 15.2 明确 deferred / integration boundary
+
+- workspace 外路径及独立 KnowledgeLease/bookmark；
+- 用户可见 build/mount/status UI 与 CLI mount commands；当前 CLI 只是 manifest 预链接 target；
+- Chat/iOS RAG、外部 MCP Server/resource surface、remote vector store、share/import/export、自动 source refresh；
+- cross-encoder reranker、其它 source locator kind、其它 dense/ANN backend；
+- HTTP(S) citation renderer/UI；`knowledge://` 不能直接进入现有 hosted-web URL citation surface；
+- Agent 语义清洗/外部解析/连接器的具体产品工作流，它们只消费/产生本报告冻结的 bundle seam。
+- Agent producer 到 `KnowledgeBundleBuildService` 的实际 durable caller/wrapper；当前 service 只接收并
+  复核外层已解析的 authorization，不注册 `build_knowledge`，也不自行写 prepared/result/settled 事件。
+
+### 15.3 仍为 `UNKNOWN` / release-only 外部门
+
+1. Intel 真机上 exact Apple NaturalLanguage language/revision/dimension 的 availability、检索质量、延迟和
+   内存；x86_64 cross-build 已过，但不能替代真机。
+2. 大 corpus 的 index size、build latency、query tail latency 与 memory ceiling；当前只有冻结小 corpus
+   和 deterministic proxy。
+3. 真实 remote embedding/reranker provider 的 immutable revision、credential/network、timeout/cancel
+   与成本 smoke；当前没有 shipping remote route。
+4. 当前 eval 能证明冻结 corpus 上的 retrieval/provenance 指标，不能证明任意答案的 semantic
+   faithfulness；claim↔evidence 的自然语言蕴含仍不是 deterministic Validator 能力。
+5. append-only EventLog 中已提交 bounded evidence 的 retention、跨 store/session 强删除与未来
+   encrypted-artifact indirection；current purge 不等于 APFS/SSD/backup secure erase。
+6. Developer ID 签名、公证和发行包中的完整 universal runtime closure；本轮只做 unsigned Debug 与
+   SwiftPM arm64/x86_64 compile。
+7. MCP 2026-07-28 外层 server envelope/resource mapping；内部 `search_knowledge` 不依赖 MCP Server，
+   当前仓库仍是 external MCP client-only。
+8. 最低支持 macOS 版本上 exact NaturalLanguage model/revision/dimension availability；当前只在本机
+   macOS 27/Xcode 27 和 cross-compile 环境验证。
+9. hybrid 相对 dense-only、当前 embedding-cosine reranker 相对无 rerank 的独立 comparative uplift；
+   当前 aggregate corpus 指标证明冻结 route 达门，不证明每个附加阶段的因果收益。
+10. Linux 没有 shipping local NaturalLanguage embedding/mount route；non-Apple buildability 不能写成
+    Linux 本地 RAG runtime 已可用。
+11. urgent purge 以 current-pointer removal 持久关闭 admission，并以 exact tombstone 阻止旧 receipt
+    并发复活；它不是 pointer、receipt 和物理 snapshot 删除三者的跨组件 crash-atomic 事务。崩溃可留下
+    不可查询的 orphan/receipt metadata，仍需 host reconciliation，且不构成 secure erasure。
 
 ## 16. 官方与一手参考
 
@@ -2080,7 +2164,13 @@ Gate：只有量化结果证明收益才扩大 backend 或模型矩阵。
 - [sqlite-vec](https://github.com/asg017/sqlite-vec)
 - [USearch](https://github.com/unum-cloud/usearch)
 
-## 17. 项目核对记录
+## 17. 初始设计阶段项目核对记录（历史）
+
+本节原样保留报告创建时的只读设计审计，时态和 `IMPLEMENTATION NOT STARTED` 结论不再代表
+current working tree；实现后的记录见第 18 节。
+
+> **历史提示：** 本节中的“不能写成已实现”和“下一步只做 Phase 0”是实现前的
+> 当时结论，已由第 18 节和当前权威 `docs/` 取代，不是现在的执行指令。
 
 ### MODEL_CHECK_RESULT
 
@@ -2179,3 +2269,68 @@ meta-validator。JSON 语法检查与三路独立合同复核已通过。
 ### NEXT_RECOMMENDED_ACTION
 
 下一步只做 Phase 0：在用户明确授权实现后，下载并固定 OKF `3fcbb9f...` 的 `SPEC.md`/`LICENSE.md`，完成 provenance/NOTICE 决策，并先提交 Profile/Validator/tool schema 与 valid/invalid fixtures。不要先接模型、数据库、UI 或 Chat。
+
+## 18. 2026-08-09 实现核对记录
+
+### MODEL_CHECK_RESULT
+
+当前运行模型属于 GPT-5 系列；运行上下文未提供更精确的公开 model ID。
+
+### PATH_CHECK_RESULT
+
+```text
+pwd:      /Users/vita/Vitemis/Intatis
+Git root: /Users/vita/Vitemis/Intatis
+Result:   MATCH
+```
+
+### IMPLEMENTED_SCOPE
+
+- Phase 0：OKF/provenance/NOTICE、9 schemas、fixture/corpus 与四组件合同完成；
+- Phase 1：thin adapter、Validator/receipt、local embedding/index、immutable store 完成；Intel 真机 gate
+  仍 UNKNOWN；
+- Phase 2：host-owned build/chunk/embed/validate/atomic-publish seam 完成；外部解析与 Agent 语义生产者
+  工作流及其 durable caller/wrapper由其它任务消费该 seam，本轮不新增 model-facing build tool，也不
+  宣称 build prepared/result/settled 已接通；
+- Phase 3：opaque mount、`search_knowledge`、Code/Cowork optional host injection、durable tool execution 与
+  final citation revalidation 完成；默认不暴露；
+- Phase 4：BM25/RRF、exact reranker seam、ACL/filter/budget/deadline 与 aggregate frozen-corpus eval
+  完成；hybrid/reranker comparative uplift、大 corpus、Intel 真机和真实 remote provider 仍 UNKNOWN；
+- Phase 5：UI/CLI mount surface、Chat/iOS、MCP Server、remote store 等按设计明确 deferred。
+
+### VALIDATION_RESULT
+
+截至本次实现收口，已取得的直接证据包括：
+
+```text
+IntatisKnowledgeTests                        106 tests / 0 failures / 0 skips
+TurnGroundingEvidenceRegistryTests             6 tests / 0 failures
+Cowork durable search_knowledge AgentLoop probe 1 test / 0 failures
+Cowork narrow-mailbox negative                  1 test / 0 failures
+Knowledge host authority/mount/drain             1 test / 0 failures
+final grounding + urgent purge                  1 test / 0 failures
+IntatisMac unsigned Debug                    BUILD SUCCEEDED (arm64)
+IntatisKnowledge / IntatisCLI arm64 build     PASS
+IntatisKnowledge / IntatisCLI x86_64 cross-build PASS
+```
+
+冻结 retrieval corpus 当前 Apple NaturalLanguage 结果：Recall@5 `0.882`、MRR `0.681`、
+nDCG@5 `0.698`、citation precision `1.000`；200 次 deterministic dense+BM25 proxy 平均
+`1.625 ms`（200 次 proxy 总计 `324.994 ms`）。这些数字只描述当前小 corpus/arm64 host，不能外推
+Intel、最低支持 macOS、大库、Linux local runtime 或真实 remote route；它们也不是 hybrid/reranker
+相对 baseline 的独立增益证明。
+
+### FILES_AND_DOCS
+
+实现新增/修改集中在 `Packages/IntatisKnowledge/`、generic host/grounding seam、Code/Cowork optional
+injection，以及 `Package.swift`/`project.yml` 已声明的 non-iOS linkage。当前权威说明同步回写
+`docs/ARCHITECTURE.md`、`CURRENT_STATE.md`、`PROJECT_MAP.md`、`DO_NOT_BREAK.md`、
+`OPEN_SOURCE_REUSE.md` 和 `TESTING.md`。工作树另有并发多模态/文档工具改动；本报告不归属、回退或
+替它们宣称验收。
+
+### REMAINING_UNCERTAINTIES_AND_NEXT_ACTION
+
+剩余边界见第 15.2/15.3 节。面向 release 的下一步先补 Intel/最低支持 macOS、大 corpus、真实 route
+和 comparative uplift gates；外部 producer 需要使用建库 seam 时，再由对应工作流接入 durable
+caller。之后才单独选择 Phase 5 的 host-owned mount lifecycle/CLI 或 macOS UI；在这些决策前，不
+默认向用户、Chat、iOS 或任意 task 暴露知识库工具。

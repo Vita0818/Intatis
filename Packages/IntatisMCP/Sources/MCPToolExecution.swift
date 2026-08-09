@@ -287,6 +287,22 @@ public enum MCPToolExecutionError:
     }
 }
 
+/// Stable model-facing text for non-inline MCP content. Re-lowering a durable
+/// structured result must use these same presentations as the live converter.
+public enum MCPToolResultPresentation {
+    public static func resource(uri: String) -> String {
+        "[MCP resource \(uri)]"
+    }
+
+    public static func embeddedResource(uri: String) -> String {
+        "[MCP embedded resource \(uri)]"
+    }
+
+    public static func textArtifact(artifactID: String) -> String {
+        "[MCP text artifact \(artifactID)]"
+    }
+}
+
 /// Converts untrusted MCP content into the additive structured observation.
 public struct MCPToolResultConverter: Sendable {
     public let limits: MCPToolResultLimits
@@ -414,8 +430,8 @@ public struct MCPToolResultConverter: Sendable {
                         mimeType: "text/plain",
                         provenance: provenance,
                         blocks: &blocks)
-                    textParts.append(
-                        "[MCP text artifact \(artifact.artifactID.rawValue)]")
+                    textParts.append(MCPToolResultPresentation.textArtifact(
+                        artifactID: artifact.artifactID.rawValue))
                     truncated = true
                     continue
                 }
@@ -506,7 +522,8 @@ public struct MCPToolResultConverter: Sendable {
                     byteCount: bytes,
                     sha256: Self.sha256(Data(safeURI.utf8)),
                     provenance: provenance))
-                textParts.append("[MCP resource \(safeURI)]")
+                textParts.append(MCPToolResultPresentation.resource(
+                    uri: safeURI))
 
             case .embeddedResource(
                 let uri,
@@ -571,7 +588,8 @@ public struct MCPToolResultConverter: Sendable {
                     throw MCPToolExecutionError.contentBlockTooLarge(
                         maximum: limits.maximumTextBytesPerBlock)
                 }
-                textParts.append("[MCP embedded resource \(safeURI)]")
+                textParts.append(MCPToolResultPresentation.embeddedResource(
+                    uri: safeURI))
             }
         }
 

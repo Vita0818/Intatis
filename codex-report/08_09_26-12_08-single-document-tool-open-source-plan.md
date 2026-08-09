@@ -2,14 +2,15 @@
 
 日期：2026-08-09
 
-状态：`FINAL DESIGN / IMPLEMENTATION NOT STARTED`
+状态：`IMPLEMENTED IN SOURCE / EXTERNAL RUNTIME & CORPUS RELEASE GATES OPEN`
 
-面向读者：后续负责实现的 Codex / Intatis 维护者
+面向读者：后续负责验证、打包和维护的 Codex / Intatis 维护者
 
 范围：
 
 - PDF：读取已有文字、显式 OCR、页面直接导出 PNG 预览、验证转换生成的 PDF；
-- DOCX、PPTX、XLSX、HTML、EPUB：读取、常见创建与编辑、静态预览、导出 PDF；
+- DOCX、PPTX、XLSX、HTML：读取、常见创建与编辑、静态预览、导出 PDF；
+- EPUB：读取和声明子集创建/编辑；当前不注册 EPUB 渲染或导出 PDF；
 - 不支持任何以 PDF 为输入的修改操作。
 
 > 方案已经收口。Intatis 不实现文档解析器、排版引擎、OCR 引擎、Office 渲染器或 PDF 内容编辑器，只把经过能力核实的成熟组件接到现有权限和工作区边界上。组件缺失或失败时明确失败，不自动切换后端。
@@ -20,14 +21,25 @@
 
 1. **PDF 编辑整体后置。** 不支持正文编辑、批注、表单修改、合并、拆分、抽页、删页、重排、旋转、裁剪、水印、遮盖或脱敏。即使某个候选库能做其中一部分，本期也不注册这些 operation。
 2. **PDF 观察能力必须具备。** 支持读取已有文字、显式 OCR，以及把指定页面直接渲染成 PNG。
-3. **文档转 PDF 必须具备。** DOCX、PPTX、XLSX、HTML 使用唯一固定导出链；EPUB→PDF 的目标不变，但当前 `epub.js`/WKWebView 候选必须先通过 full-spine corpus gate，失败则改选一个经证明的成熟固定后端。生成新的 PDF 不等于编辑输入 PDF。
+3. **文档转 PDF 必须具备。** DOCX、PPTX、XLSX、HTML 使用唯一固定导出链。EPUB→PDF 不以未证明的 `epub.js`/WKWebView 路线冒充完成：full-spine corpus gate 通过或另一个成熟固定后端经审计前，该格式不进入 render/export schema。生成新的 PDF 不等于编辑输入 PDF。
 4. **工具按权限边界拆分。** 不再把读取、执行、写入全部塞进一个静态 `document` descriptor。
 5. **XLSX 接受 LibreOffice 重写。** `openpyxl` 表达结构修改，LibreOffice Calc 重算并保存 staged XLSX；最终文件可能是 LibreOffice round-trip 结果。
 6. **runtime 分发另案。** 本报告假定开发和测试环境已预置固定版本的后端；不设计下载器、安装器、App 内打包、双架构闭包、签名或公证。
 7. **图片进入模型上下文另案。** 本报告负责可靠生成页面 PNG 及其元数据，不重复设计 provider、EventLog、replay 和 compaction 的多模态协议。相关平台问题见 `08_09_26-13_42-durable-multimodal-context-handoff.md`。
 8. **成熟组件优先。** 只写 schema、权限和路径校验、固定调用、错误映射、staging、验证及原子提交；已有成熟实现的算法不在 Intatis 内重写。
 
-在这些边界下，没有阻止编码的架构 blocker。后续仍要对精确版本、许可证、实际 API 和真实样本做集成核验，但这些是实现门，不再是产品范围选择。
+在这些边界下，没有阻止源码实现的架构 blocker。当前连接层、权限、事务和固定后端源码已经落地；尚未完成的是被本报告明确排除的 runtime 分发，以及依赖真实制品/样本的 release gate，不应把二者混写成源码未实现。
+
+### 0.1 本次实现收口
+
+当前源码状态如下：
+
+- 六个 exact 工具已进入 production registry：`read_pdf`、`document_read`、`document_ocr`、`document_render`、`document_export_pdf`、`document_write`；旧自动 fallback/PDF mutation/reconstruct 入口已下架，legacy capability 只保留解码。
+- PDF 仅实现 native text read、显式 OCR 和页面 PNG；生产 schema 中没有 PDF mutation。
+- DOCX/PPTX/XLSX/HTML 使用固定 Python/LibreOffice/WKWebView 链；EPUB 使用仓内 pinned rbook Rust helper source 读写，并要求 EPUBCheck。EPUB render/export 现在是 schema-level `unsupported_operation`，不是运行到一半再降级。
+- process-backed observation 与写入 capability 已拆分。read-only worker 可获得 `read_pdf`、`document_read`、`document_ocr`；后两项必须是 exact `structured_read_only` intent，不能借此获得工作区写入、网络或通用 shell。render/export/write 只向 read-write worker/coordinator 签发。
+- fixed backend runner、独立日志/生成物预算、辅助资产冻结与重验、owner-only staging、目标父目录 identity 固定、后置条件验证和原子提交均已实现。
+- runtime 缺失、版本不符或未满足 corpus gate 时 typed fail closed；当前源码没有下载器、自动安装或备用 backend。
 
 ## 1. 成熟开源优先是硬原则
 
@@ -128,12 +140,12 @@ PDFKit 和 WKWebView 是 Apple-native 渲染例外，不应写成开源组件。
 - `document_write(format=pdf)`、`document_export_pdf(input_format=pdf)` 以及任何 PDF mutation 都在 schema/dispatch 边界返回 `unsupported_operation`。
 - 工具名可以在实现时按现有 catalog 命名规范微调，但上述权限分组不得重新合并成一个万能 descriptor。
 
-实现新目录时还必须同步迁移旧生产入口：
+旧生产入口的迁移结果：
 
-- `edit_pdf_pages` 从 standard/Code/Cowork 生产 registry 下架，生产 lease 不再授予对应 PDF 编辑 capability；若为历史日志兼容保留 decoder 或源码，也不得再被模型发现或执行。
-- 当前带 `backend=auto` 和 Docling→MarkItDown fallback 的旧 `read_document`，必须重写成无 backend 选择的新固定入口，或从生产目录下架；不能和新工具并存成为隐式备用路线。
-- 当前 `read_pdf` 对 image-only PDF 的提示必须从“调用 `read_document auto`”改成 typed `ocr_required`，只允许用户或模型随后显式调用 `document_ocr`。
-- 旧 capability 名若为历史事件解码保留，不等于继续向 live roster/lease 授权。
+- `edit_pdf_pages` 已从 standard/Code/Cowork 生产 registry 下架，fresh lease 不再授予对应 PDF 编辑 capability；历史 decoder 不会映射为 model-visible tool。
+- 带 `backend=auto` 和 Docling→MarkItDown fallback 的旧 `read_document` 已从生产目录下架，不与新工具形成隐式备用路线。
+- `read_pdf` 对 image-only PDF 返回 typed `ocr_required`，只允许用户或模型随后显式调用 `document_ocr`。
+- 旧 capability raw value 仍可随历史 EventLog/durable lease 解码和恢复，但 registry 没有映射，因而不能形成 live tool authority；fresh factory 永不签发。这里不要求破坏旧日志或在内存反序列化时丢弃兼容字段。
 
 ## 4. 固定组件与 operation 映射
 
@@ -144,7 +156,7 @@ PDFKit 和 WKWebView 是 Apple-native 渲染例外，不应写成开源组件。
 | PPTX | `python-pptx` | `python-pptx` 已证明的 shape/text/image/table/chart 子集 | LibreOffice Impress | LibreOffice 临时 PDF → PDFKit PNG | `python-pptx` reopen + LibreOffice export + PDF 输出验证 |
 | XLSX | `openpyxl`；大表必须指定范围 | `openpyxl` 修改 → LibreOffice Calc 重算并保存 staged XLSX | LibreOffice Calc | LibreOffice 临时 PDF → PDFKit PNG | `openpyxl` reopen + Calc round-trip 语义断言 + PDF 输出验证 |
 | HTML | `lxml` | `lxml` DOM/attribute/text/style 节点操作 | WKWebView print-to-PDF，网络和远程资源关闭 | WKWebView PDF → PDFKit PNG | `lxml` parse + WKWebView load/render smoke + PDF 输出验证 |
-| EPUB | `rbook` + 必要的章节 XHTML `lxml` 操作 | rbook 已证明的 metadata/resource/spine/ToC 子集 | **PROVISIONAL**：本地 `epub.js` + WKWebView print-to-PDF；整本 corpus 通过前不得标为 supported | 同一临时 PDF → PDFKit PNG | 固定 release EPUBCheck + full-spine render smoke + PDF 输出验证 |
+| EPUB | pinned `rbook` helper | metadata/resource/spine/ToC 声明子集 | **不支持（当前 schema 不注册）** | **不支持（当前 schema 不注册）** | helper reopen/postcondition + 固定 release EPUBCheck；未来 render/export 另需 full-spine gate |
 
 多个组件列在同一格时表示固定流水线，不表示失败后换后端。
 
@@ -259,11 +271,9 @@ HTML 使用 `lxml` 做 DOM 操作。selector 首期固定为 XPath；如果以�
 
 WKWebView 只加载工作区本地资源；网络、远程字体、远程图片和业务脚本默认关闭。WKWebView load/render 是视觉 smoke test，不是 HTML 标准合规证明。
 
-EPUB 使用 rbook 已证明的 EPUB2/3 高层 API 子集，章节 XHTML 可走 `lxml`。导航只承诺 ToC/guide/landmarks/生成导航子集，不承诺任意 nav XHTML 无损重写。rbook 当前仍是需要真实 round-trip corpus 验收的候选，不因已有 checkout 就称为完全成熟。
+EPUB 使用仓内 `Packages/IntatisTools/Runtime/rbook-helper` 对 rbook 0.7.10 做固定 `json-v1` 连接。当前公开子集是 bounded read，以及 metadata/resource/spine/ToC 的 create/edit；不承诺 remove/reorder、任意 nav XHTML 或通用 EPUB serializer。helper 自身做 ZIP 预算、路径/重复项/加密/非普通成员检查、写后 reopen 和 operation postcondition，最终 conformance 仍由固定正式 EPUBCheck 负责。
 
-`epub.js` 只负责本地渲染，EPUBCheck 只负责 conformance。必须采用固定正式 release artifact，不能把开发 snapshot 当成发行基线；Java runtime 和发行闭包留给后续 runtime-distribution 任务。
-
-EPUB→PDF 是本报告中唯一仍带实现 gate 的格式链。`epub.js` 是阅读渲染组件，只有真实整本 corpus 证明它能稳定加载完整 spine、字体和本地资源，并由 WKWebView 打印全部章节而不是当前可见章节后，才可把该 route 注册为 `supported`。若证明失败，必须先审计并选定一个许可证可接受、已经能完成整本 EPUB→PDF 的成熟开源后端；不得在 Intatis 中自行实现章节拼接、分页或 PDF 合并算法。
+EPUB→PDF/PNG 当前不属于 supported surface。`epub.js` 仍可作为未来候选研究材料，但不会被当前工具偷偷调用。只有真实整本 corpus 证明固定路线能稳定加载完整 spine、字体和本地资源并输出全部章节后，才可重新加入 schema；若证明失败，先审计另一个成熟后端，不在 Intatis 中自行实现章节拼接、分页或 PDF 合并算法。
 
 ## 5. “Structured runner”只是固定命令连接器
 
@@ -292,14 +302,14 @@ stdin/stdout = 版本化 JSON envelope
 
 模型不能提供 executable、command string 或额外环境变量。
 
-当前 `StructuredProcessShellRunner` 可复用 workspace allow-list、Seatbelt/bwrap、断网、timeout/cancel、环境清洗和进程树清理，但它目前仍接受整段命令并通过 `/bin/sh -c` 运行。因此本期要在它之上增加很窄的 `DocumentBackendInvocation/Runner`，或直接像现有 browser typed runner 一样接受固定 invocation。
+实现已经增加窄的 `DocumentBackendInvocation` / `DocumentBackendProcessRunner`。模型只提交文档 tool schema；宿主生成固定 executable、argv、环境和 JSON request。macOS 使用 exact Seatbelt roots，Linux 使用 exact/empty bwrap roots，缺少可信 sandbox 时 fail closed，不通过通用 shell 解释 model-authored command。
 
-同时必须修正一个现有边界：当前默认 8 MiB `maximumOutputBytes` 还被转换为 `ulimit -f`，会同时限制后端生成的文档。文档 runner 必须分别限制：
+日志和生成物预算已经拆开：
 
 - stdout/stderr/log bytes；
 - 单个生成文件大小；
-- 多输出总大小；
-- 页面/像素/解压后内容预算。
+- 多输出总大小与 entry 数；
+- 页面/像素预算；OOXML/EPUB 在语义后端入口另做 ZIP entry、单项/总展开量、压缩比、加密、重复名、穿越和非普通成员检查。
 
 这属于必要连接层，不是重建文档平台。
 
@@ -307,16 +317,16 @@ P0 使用 native Tool path，不新增 MCP server。
 
 ## 6. Staging、验证和提交
 
-现有权限与进程底座可复用，但仓库目前没有一个可直接用于大文档 backend 输出的完整提交 helper。需要增加窄的 document staged-output commit：
+仓库现已增加窄的 document staged-output commit：
 
 ```text
-校验 source/destination、格式和 expected source digest
+校验 source/destination、辅助资产、格式和 expected source digest
   -> 在目标同目录创建唯一 no-follow staging
   -> 固定 backend 只写 staging
   -> reopen/结构验证/operation postcondition/必要的 render smoke
   -> 计算 staging digest
-  -> commit 前重新核对 source/destination identity 和 expected digest
-  -> 单次原子 replace 或创建
+  -> backend 前及 commit lock 内重核 source/destination/辅助资产 identity 和 digest
+  -> 固定目标父目录 fd/identity，no-follow 单次原子 replace 或创建
   -> fsync 并读回 committed target，与 staging digest 核对
   -> 返回 changedFiles、digest、engine/version
 ```
@@ -329,6 +339,7 @@ P0 使用 native Tool path，不新增 MCP server。
 - terminal commit 一旦开始，必须把取消延迟到 commit/read-back/reconciliation 得到结论之后；若 rename/fsync 后无法证明最终状态，返回 `commit_uncertain`，不得声称原目标未变，也不得自动进行第二次写入。
 - `document_render` 必须接收显式 workspace `output_dir`，并按写入型工具授权。多页 PNG 与 manifest 作为一个新的输出目录整体提交，不接 ArtifactStore sink，也不得暴露部分成功的页面集合。
 - validator 只按它真正证明的属性报告，不把 reopen/render 夸大为语义或视觉等价证明。
+- 辅助图片/HTML local assets 不是 live path 旁路：先冻结 regular/single-link 文件的 digest、size、dev、inode，backend 前与 commit lock 内重验；授权后替换、symlink 或 hardlink 均 fail closed。
 
 预览图片进入 ArtifactStore、provider request、replay 和 compaction 的协议属于独立多模态任务。本报告只冻结 renderer 输出的 PNG 与 metadata contract；不得在这里再造“文档专用图片上下文桥”。
 
@@ -347,12 +358,14 @@ P0 使用 native Tool path，不新增 MCP server。
 - `epub.js`
 - `epubcheck`
 
-仍需在集成前锁定：
+本次核对的开发机状态：
 
-- `openpyxl` 精确版本和来源；当前本地清单没有对应 checkout。
-- `lxml` 精确版本和传递依赖；是否单独 checkout 按 provenance 需要决定。
-- Docling OCR 实际采用的 extra、模型 artifact、`pypdfium2` wheel 和绑定的 PDFium revision。
-- LibreOffice、Tesseract/tessdata、EPUBCheck 的开发/测试版本和可执行文件 hash。
+- 用户管理的 document runtime 可导入 Docling 2.117.0、python-docx 1.2.0、python-pptx 1.0.2、openpyxl 3.1.5、lxml 6.1.1；它不是 App 分发闭包。
+- LibreOffice 26.2.5.2 与 Tesseract 5.5.3 / Leptonica 1.87.0 可发现。
+- 用户 runtime 尚无固定 Docling model artifact，也未安装 `intatis-rbook-helper`、`pdfcpu` 或正式 EPUBCheck wrapper/artifact；对应真实 route 当前应返回 `backend_missing`，不能把 source checkout 或版本命令成功当作可用能力。
+- `Packages/IntatisTools/Runtime/rbook-helper` 已有 exact Cargo pins/lock、测试与 provenance；这证明 source/build closure，不等于 universal signed binary 已进入产品。
+
+发行前仍需锁定 Docling models 与 `pypdfium2`/PDFium、LibreOffice/Tesseract/tessdata、pdfcpu、EPUBCheck、Python/wheel 原生闭包的实际制品 hash、架构、许可证和签名状态。
 
 本地 checkout 只代表候选源码存在，不代表已经集成、分发或通过许可证审计。每个实际采用项仍须按 `docs/OPEN_SOURCE_REUSE.md`：
 
@@ -364,9 +377,9 @@ P0 使用 native Tool path，不新增 MCP server。
 
 LibreOffice 的使用、许可和最终分发方式必须单独核查。本报告只假设开发/测试环境能通过严格版本 preflight 找到它；不承诺当前 Intatis 安装包已经自带任何 document runtime。
 
-## 8. 第一方工程量：按 Codex 工作包估算
+## 8. 第一方工程量：原估算与实际判断
 
-以下只估算 Intatis connector/glue，不用人日表达：
+下表是编码前对 Intatis connector/glue 的工作包估算，不用人日表达：
 
 | 本报告内第一方工作 | 估算 |
 |---|---:|
@@ -385,10 +398,10 @@ LibreOffice 的使用、许可和最终分发方式必须单独核查。本报�
 1. 工具拆分、typed runner、staging/commit；
 2. PDFKit read/render、显式 OCR、pdfcpu validation；
 3. Office worker、LibreOffice 导出与 XLSX recalc/save；
-4. HTML/EPUB create/edit/export；
+4. HTML create/edit/export 与 EPUB read/write；
 5. corpus、权限、安全、取消和无兜底回归。
 
-第一包完成后，PDF/OCR 与 Office adapter 可以并行。它不适合做成一个无法审阅的大 patch，但不需要再开展 PDF 编辑 backend 研究。
+实现后的判断仍是“中等偏大”，但主要工作已经完成。实际安全闭包比原表更大：除了格式 adapter，还必须处理辅助资产 TOCTOU、父目录替换、运行期聚合输出预算、OOXML/EPUB ZIP 预算、last-write-wins 后置条件、XLSX 外链/pivot/vendor-extension 拒绝和 read-only process 权限形状。这些不是重写文档算法，而是让薄连接层符合 Intatis 既有安全/持久化合同；因此不应为了命中原行数估算而删除。
 
 以上估算不包括：
 
@@ -423,17 +436,19 @@ LibreOffice 的使用、许可和最终分发方式必须单独核查。本报�
 18. 搜索生产文档执行代码，不应出现 backend 遍历、`fallback`、`best_effort` 或失败后第二实现 retry。
 19. renderer 能稳定生成完整页面 PNG 集及 metadata；本测试不冒充“模型已收到图片”的多模态验收。
 20. iOS target 不链接 IntatisTools、document runtime 或本地 Agent 执行能力。
-21. 生产目录不再暴露旧 `edit_pdf_pages` 或带 `backend=auto` 的旧 `read_document`；`read_pdf` 不再建议隐式 auto OCR，legacy capability 不能进入 live lease。
+21. 生产目录不再暴露旧 `edit_pdf_pages` 或带 `backend=auto` 的旧 `read_document`；`read_pdf` 不再建议隐式 auto OCR；legacy capability 可以兼容解码，但不能映射为 live tool authority，fresh lease 不得签发。
+
+本次源码验证已覆盖合同、registry/lease、PDF native render、staging/commit、Python writer/verifier、HTML WKWebView、权限和 rbook helper。当前聚焦结果为：DocumentToolContract 16/16、DocumentToolsIntegration 10/10、DocumentInfrastructure 12/12、PDFNativeDocumentService 7/7、DocumentPythonWriteBackend 19/19、CapabilityLease 5/5、ToolRegistryLease 23/23、MessageDelegationSplit 10/10、IntatisPermission 28/28；rbook helper 8/8，并通过 locked check/fmt/clippy。真实 Docling OCR、pdfcpu validation、EPUBCheck 以及 clean-machine runtime corpus 因制品缺失仍是 release gate，不能由 fake runner 或 source test 代替。
 
 ## 10. 单一完成标准
 
-本报告范围完成时必须同时满足：
+源码范围完成时必须同时满足：
 
 - 模型目录按权限暴露拆分后的文档工具，而不是一个万能 `document` descriptor；
 - 旧 `edit_pdf_pages` 和自动 fallback `read_document` 已从生产 registry/lease 下架或被固定实现替换，不能绕过新合同；
 - PDF 只有 native read、显式 OCR 和页面 PNG，任何 PDF mutation 均明确不支持；
-- DOCX/PPTX/XLSX/HTML/EPUB 的声明子集使用唯一成熟 backend 读写；
-- DOCX/PPTX/XLSX/HTML 能通过固定链导出新 PDF；EPUB 只有在 full-spine corpus gate 通过，或先选定并验证另一个成熟固定后端后，才可计入完整完成；
+- DOCX/PPTX/XLSX/HTML/EPUB 的声明子集各绑定唯一 backend；缺少实际 runtime 时 typed fail closed；
+- DOCX/PPTX/XLSX/HTML 绑定固定导出链；EPUB render/export 在 full-spine gate 前明确不属于当前完成面；
 - XLSX 经 LibreOffice Calc `calculateAll()` 和 save 后再提交，并接受合法 OOXML 重写；
 - 所有写入都经过 staged output、精确验证和原子提交；
 - runner 只接受 host-owned typed invocation，不接受模型 shell command；
@@ -443,34 +458,22 @@ LibreOffice 的使用、许可和最终分发方式必须单独核查。本报�
 - 实际采用的开源版本、许可证、来源和传递依赖可追溯；
 - 第一方实现保持在薄连接层，不重写 parser、renderer、OCR、formula 或 serializer。
 
-达到这些条件就结束，不顺手扩展成通用文档平台。
+当前源码已按上述边界收口。真正分发或在 clean machine 宣称 route 可用之前，仍必须补齐外部 runtime、正式制品、许可证/签名与真实 corpus gate；这些不会触发隐藏 fallback，也不改变当前 tool contract。达到这些条件就结束，不顺手扩展成通用文档平台。
 
-## 11. 本报告核查过的本地依据
+## 11. 当前实现依据
 
-- `Packages/IntatisTools/Sources/DocumentMediaTools.swift`
-  - 当前 `read_document` 默认 `auto`，存在 Docling→MarkItDown fallback；
-  - 当前 `edit_pdf_pages` 直接写最终路径，不能作为 staged commit 先例。
-- `Packages/IntatisTools/Sources/ShellGit.swift`
-  - 当前 structured process 底座仍通过 `/bin/sh -c` 接收命令字符串；
-  - 默认 output cap 同时进入 `ulimit -f`；
-  - 当前 document runtime 是 optional/user-managed，Intatis 不负责安装。
-- `Packages/IntatisTools/Sources/ToolProtocol.swift`
-  - `ToolDescriptor.sideEffect` 和 authorization snapshot 是静态合同；
-  - `ToolContext` 当前没有可直接复用的 ArtifactStore sink。
-- `Package.swift`
-  - `IntatisTools` 当前不依赖 `IntatisArtifacts`，图片持久化不能在本报告里假定已经接通。
-- `OpenSource/pdfcpu`
-  - stock CLI annotations 只有 list/remove；没有 secure redaction apply 命令；
-  - 本报告因此删除所有 PDF mutation claim，只保留 strict validation/info。
-- `OpenSource/docling/docling/datamodel/pipeline_options.py`
-  - 默认 `do_ocr=true` 且 `ocr_options=OcrAutoOptions()`；
-  - 存在可固定 binary/tessdata/language/PSM 的 `TesseractCliOcrOptions`。
-- `OpenSource/libreoffice-core/offapi/com/sun/star/sheet/XCalculatable.idl`
-  - `calculateAll()` 明确定义为重算全部单元格；
-  - 保存 staged XLSX 仍需经 UNO storage API 和固定 filter 实现与测试。
-- `OpenSource/python-docx`、`python-pptx`、`rbook`、`epub.js`、`epubcheck`
-  - 只按公开 API 已证明的操作子集列入，不把仓库存在等同于任意编辑能力。
+- `DocumentToolContracts.swift` / `DocumentTools.swift`：六工具 strict schema、format/operation matrix、permission/touched paths、固定后端编排；PDF 和 EPUB render/export 边界在 decode/dispatch 前收窄。
+- `DocumentMediaTools.swift` / `PDFNativeDocumentService.swift`：PDFKit native read、typed `ocr_required`、精确页面 PNG 与无 PDF mutation surface。
+- `ShellGit.swift`：host-owned document invocation、exact WorkspaceLease、Seatbelt/bwrap、版本 preflight、断网、timeout/cancel、进程树清理，以及彼此独立的日志/生成物预算。
+- `DocumentInfrastructure.swift`：source/destination/辅助资产 snapshot，owner-only staging，commit-lock CAS，父目录 identity 固定，file/directory 原子提交和 `commit_uncertain`。
+- `DocumentPythonBackend.swift` / `DocumentFixedBackends.swift`：固定 Office/HTML/OCR JSON 路线、OOXML 预算和 preservation gate、LibreOffice UNO `calculateAll()` + save、operation postcondition；XLSX cache 检查只证明可读缓存存在，不声称数学正确。
+- `HTMLDocumentPDFRenderer.swift`：HTML local assets 先受 allowlist/快照约束并内联到 stage，WKWebView 只读 stage root，网络/active content fail closed。
+- `DocumentEPUBBackends.swift` / `Runtime/rbook-helper`：固定 rbook/EPUBCheck 连接、EPUB read/write 子集与 ZIP/reopen/postcondition；Cargo exact pins、依赖许可证和发行 gate 记录在 `ThirdPartyNotices/DocumentRBookHelper.md`。
+- `Leases.swift` / `PermissionIntent.swift` / `DeterministicPolicyGate.swift` / `Orchestrator.swift`：五项 process capability 拆分、legacy decode-only、exact `structured_read_only` 观察权限和 worker 可见性。
+- `OpenSource/pdfcpu`、Docling pipeline options、LibreOffice `XCalculatable` 及各格式库公开 API 仍是能力边界的上游核查依据；checkout 不冒充已安装 runtime。
 
 ## 12. 本轮状态
 
-本轮只修订本报告，没有修改产品源码、配置、测试、项目既有说明文档或 `OpenSource/` checkout；没有运行构建或测试。
+本轮已经修改产品源码、测试、项目文档、NOTICE/ThirdPartyNotices，并新增 pinned rbook helper source；未修改 `OpenSource/` 研究 checkout。Swift 文档工具与权限相关 target/聚焦 XCTest、Rust locked check/test/fmt/clippy 均已执行。普通全仓 `swift test --filter ...` 当前会先被同一脏工作树中独立 Knowledge 实现的编译错误阻断，因此本报告只把已直接运行并通过的目标/bundle 记为通过，不把未运行到的全仓 suite 冒充成功。
+
+未完成且明确留给后续的事项：document runtime 下载/安装/打包、双架构闭包、Developer ID 签名/公证、clean-machine 验证、固定 Docling models、实际 pdfcpu/EPUBCheck/rbook helper 安装，以及受授权的真实大样本 corpus。图片进入模型上下文仍由独立报告处理。

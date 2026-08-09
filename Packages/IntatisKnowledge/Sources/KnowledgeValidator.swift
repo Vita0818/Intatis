@@ -28,8 +28,12 @@ public struct KnowledgeValidationPolicy: Equatable, Sendable {
 public struct KnowledgeBackendRegistry: Equatable, Sendable {
     public let dense: Set<KnowledgeBackendIdentity>
     public let lexical: Set<KnowledgeBackendIdentity>
-    public let sourceLocators: Set<String>
+    public let sourceLocatorAdapters: KnowledgeSourceLocatorAdapterRegistry
     public let digest: String
+
+    public var sourceLocators: Set<String> {
+        sourceLocatorAdapters.adapterKeys
+    }
 
     public init(dense: Set<KnowledgeBackendIdentity> = [
                     KnowledgeBackendIdentity(
@@ -43,19 +47,22 @@ public struct KnowledgeBackendRegistry: Equatable, Sendable {
                         formatVersion: KnowledgeContract.lexicalFormatVersion,
                         runtimeVersion: KnowledgeContract.lexicalRuntimeVersion),
                 ],
-                sourceLocators: Set<String> = []) throws {
+                sourceLocatorAdapters: KnowledgeSourceLocatorAdapterRegistry? = nil) throws {
         self.dense = dense
         self.lexical = lexical
-        self.sourceLocators = sourceLocators
+        self.sourceLocatorAdapters = try sourceLocatorAdapters
+            ?? KnowledgeSourceLocatorAdapterRegistry()
         struct Projection: Codable {
             let dense: [KnowledgeBackendIdentity]
             let lexical: [KnowledgeBackendIdentity]
-            let sourceLocators: [String]
+            let sourceLocatorRegistryDigest: String
+            let sourceLocatorAdapters: [KnowledgeSourceLocatorAdapterDescriptor]
         }
         digest = try KnowledgeDigest.canonical(Projection(
             dense: dense.sorted(by: Self.order),
             lexical: lexical.sorted(by: Self.order),
-            sourceLocators: sourceLocators.sorted()))
+            sourceLocatorRegistryDigest: self.sourceLocatorAdapters.digest,
+            sourceLocatorAdapters: self.sourceLocatorAdapters.descriptors))
     }
 
     private static func order(_ lhs: KnowledgeBackendIdentity,
@@ -68,6 +75,30 @@ public struct KnowledgeBackendRegistry: Equatable, Sendable {
     }
 }
 
+/// Exact, Sendable evidence-validation seam captured when a snapshot is
+/// admitted. Search must reuse this file-system policy, schema runtime, and
+/// executable adapter registry rather than reconstructing process defaults.
+public struct KnowledgeEvidenceValidationContext: Sendable {
+    public let fileSystem: KnowledgeSecureFileSystem
+    public let backendRegistry: KnowledgeBackendRegistry
+    public let schemaValidator: KnowledgeJSONSchemaValidator
+
+    public init(fileSystem: KnowledgeSecureFileSystem,
+                backendRegistry: KnowledgeBackendRegistry,
+                schemaValidator: KnowledgeJSONSchemaValidator) {
+        self.fileSystem = fileSystem
+        self.backendRegistry = backendRegistry
+        self.schemaValidator = schemaValidator
+    }
+
+    func makeValidator() throws -> KnowledgeValidator {
+        try KnowledgeValidator(
+            fileSystem: fileSystem,
+            backendRegistry: backendRegistry,
+            schemaValidator: schemaValidator)
+    }
+}
+
 public struct KnowledgeValidatedSnapshot: Sendable {
     public let root: URL
     public let rootIdentity: WorkspaceRootIdentity
@@ -77,6 +108,14 @@ public struct KnowledgeValidatedSnapshot: Sendable {
     public let denseFile: KnowledgeDenseIndexFile
     public let lexicalFile: KnowledgeLexicalIndexFile?
     public let checksums: KnowledgeChecksums
+    /// Exact backend/locator registry admitted by the Validator. Receipts use
+    /// this value rather than silently reconstructing the default registry.
+    public let backendRegistryDigest: String
+    /// Executable evidence-validation dependencies frozen by mount validation.
+    public let evidenceValidationContext: KnowledgeEvidenceValidationContext
+    /// Host-computed digest of every leaf byte, including checksums.json.
+    /// It is not written into the snapshot and therefore cannot self-reference.
+    public let contentSealDigest: String
     public let report: KnowledgeValidationReport
 }
 
@@ -102,7 +141,8 @@ public struct KnowledgeValidator: Sendable {
         policy: KnowledgeValidationPolicy,
         workspaceLease: WorkspaceLease? = nil
     ) throws -> KnowledgeValidatedSnapshot {
-        guard ISO8601DateFormatter().date(from: policy.evaluationDate) != nil else {
+        guard let evaluationInstant = ISO8601DateFormatter().date(
+            from: policy.evaluationDate) else {
             throw KnowledgeDomainError(
                 .profileInvalid,
                 "Knowledge validation policy contains an invalid evaluation date.")
@@ -192,6 +232,13 @@ public struct KnowledgeValidator: Sendable {
                 relativePath: ".intatis-rag/checksums.json",
                 maximumBytes: 32 * 1_024 * 1_024,
                 expectedRootIdentity: authorized.identity)
+            if PermissionReviewTextSanitizer.containsSensitiveMaterial(
+                String(decoding: checksumData, as: UTF8.self)) {
+                recordError(
+                    "secret_material",
+                    ".intatis-rag/checksums.json",
+                    "Knowledge metadata contains credential-like material.")
+            }
             try schemaValidator.validate(data: checksumData, against: .checksums)
             checksums = try KnowledgeJSON.decode(
                 KnowledgeChecksums.self,
@@ -208,10 +255,8 @@ public struct KnowledgeValidator: Sendable {
 
         var concepts: [String: OKFConcept] = [:]
         let conceptPaths = paths.filter {
-            ($0.hasPrefix("concepts/") || $0.hasPrefix("references/"))
-                && $0.hasSuffix(".md")
-                && URL(fileURLWithPath: $0).lastPathComponent != "index.md"
-                && URL(fileURLWithPath: $0).lastPathComponent != "log.md"
+            !$0.hasPrefix(".intatis-rag/")
+                && OKFBundleLayout.isConcept($0)
         }.sorted()
         for path in conceptPaths {
             do {
@@ -227,6 +272,14 @@ public struct KnowledgeValidator: Sendable {
                     continue
                 }
                 concepts[concept.conceptID] = concept
+                do {
+                    try okfReader.validateFootnoteAttribution(concept)
+                } catch {
+                    recordError(
+                        "source_attribution",
+                        concept.conceptID,
+                        "Concept footnote attribution does not bind declared source identities.")
+                }
                 if !["draft", "stable", "deprecated"].contains(concept.status) {
                     recordError(
                         "concept_status",
@@ -235,12 +288,12 @@ public struct KnowledgeValidator: Sendable {
                 }
                 if concept.sources.contains(where: {
                     guard let id = $0.id else { return false }
-                    return id.isEmpty || id.count > 256
+                    return !KnowledgeSourceIdentity.isPortable(id)
                 }) {
                     recordError(
                         "source_id",
                         concept.conceptID,
-                        "Concept source identity is empty or exceeds its bound.")
+                        "Concept source identity is not a portable opaque identifier.")
                 }
                 if concept.verifications.contains(where: {
                     ISO8601DateFormatter().date(from: $0.at) == nil
@@ -263,19 +316,20 @@ public struct KnowledgeValidator: Sendable {
                 if concept.status == "deprecated" {
                     warning("deprecated_concept", concept.conceptID, "Concept is deprecated and is excluded by the default query policy.")
                 }
-                if let staleAfter = concept.staleAfter,
-                   let staleDate = ISO8601DateFormatter().date(from: staleAfter),
-                   let evaluationDate = ISO8601DateFormatter().date(
-                    from: policy.evaluationDate),
-                   staleDate <= evaluationDate {
-                    warning("stale_concept", concept.conceptID, "Concept is stale under the validation date policy.")
-                } else if concept.staleAfter != nil,
-                          ISO8601DateFormatter().date(
-                            from: concept.staleAfter ?? "") == nil {
-                    recordError(
-                        "stale_after_invalid",
-                        concept.conceptID,
-                        "Concept stale_after is not a valid date-time.")
+                if let staleAfter = concept.staleAfter {
+                    if let staleDate = OKFReader.parseISODateOnly(staleAfter) {
+                        if staleDate <= evaluationInstant {
+                            warning(
+                                "stale_concept",
+                                concept.conceptID,
+                                "Concept is stale under the validation date policy.")
+                        }
+                    } else {
+                        recordError(
+                            "stale_after_invalid",
+                            concept.conceptID,
+                            "Concept stale_after must use YYYY-MM-DD.")
+                    }
                 }
                 validateSourceReferences(
                     concept,
@@ -285,6 +339,11 @@ public struct KnowledgeValidator: Sendable {
                     concept,
                     knownPaths: paths,
                     warning: warning)
+            } catch let domain as KnowledgeDomainError
+                where domain.failure.code == .unsafeStorage {
+                // YAML alias/custom-tag policy is a host parser safety
+                // boundary, not evidence that the OKF vocabulary is invalid.
+                throw domain
             } catch let domain as KnowledgeDomainError {
                 recordError("okf_concept_invalid", path, domain.failure.message)
             } catch {
@@ -292,23 +351,64 @@ public struct KnowledgeValidator: Sendable {
             }
         }
         if concepts.isEmpty {
-            recordError("no_concepts", "concepts", "Knowledge snapshot contains no valid concepts.")
+            recordError("no_concepts", "bundle", "Knowledge snapshot contains no valid concepts.")
         }
 
-        do {
-            let indexData = try fileSystem.readFile(
-                root: authorized.canonical,
-                relativePath: "index.md",
-                maximumBytes: okfReader.limits.maximumConceptBytes,
-                expectedRootIdentity: authorized.identity)
-            let version = try okfReader.readRootIndexVersion(data: indexData)
-            if policy.requireRootOKFVersion, version != KnowledgeContract.okfVersion {
-                recordError("okf_version", "index.md", "Root index must declare OKF version 0.2.")
+        let indexPaths = paths.filter {
+            URL(fileURLWithPath: $0).lastPathComponent == "index.md"
+                && !$0.hasPrefix(".intatis-rag/")
+        }.sorted()
+        for path in indexPaths {
+            do {
+                let indexData = try fileSystem.readFile(
+                    root: authorized.canonical,
+                    relativePath: path,
+                    maximumBytes: okfReader.limits.maximumConceptBytes,
+                    expectedRootIdentity: authorized.identity)
+                let index = try okfReader.readIndexDocument(
+                    data: indexData,
+                    relativePath: path)
+                if path == "index.md",
+                   policy.requireRootOKFVersion,
+                   index.declaredVersion != KnowledgeContract.okfVersion {
+                    recordError(
+                        "okf_version",
+                        path,
+                        "Root index must declare OKF version 0.2.")
+                }
+            } catch let domain as KnowledgeDomainError
+                where domain.failure.code == .unsafeStorage {
+                // Reserved-document aliases/custom tags are a host parser
+                // safety boundary, not an OKF vocabulary diagnostic.
+                throw domain
+            } catch let domain as KnowledgeDomainError {
+                recordError("okf_index_invalid", path, domain.failure.message)
+            } catch {
+                recordError("okf_index_invalid", path, "OKF index could not be read.")
             }
-        } catch let domain as KnowledgeDomainError {
-            recordError("okf_index_invalid", "index.md", domain.failure.message)
-        } catch {
-            recordError("okf_index_invalid", "index.md", "Root OKF index could not be read.")
+        }
+
+        let logPaths = paths.filter {
+            URL(fileURLWithPath: $0).lastPathComponent == "log.md"
+                && !$0.hasPrefix(".intatis-rag/")
+        }.sorted()
+        for path in logPaths {
+            do {
+                _ = try okfReader.readLogDocument(
+                    data: fileSystem.readFile(
+                        root: authorized.canonical,
+                        relativePath: path,
+                        maximumBytes: okfReader.limits.maximumConceptBytes,
+                        expectedRootIdentity: authorized.identity),
+                    relativePath: path)
+            } catch let domain as KnowledgeDomainError
+                where domain.failure.code == .unsafeStorage {
+                throw domain
+            } catch let domain as KnowledgeDomainError {
+                recordError("okf_log_invalid", path, domain.failure.message)
+            } catch {
+                recordError("okf_log_invalid", path, "OKF log could not be read.")
+            }
         }
 
         let chunkData = try fileSystem.readFile(
@@ -321,6 +421,8 @@ public struct KnowledgeValidator: Sendable {
             chunks,
             concepts: concepts,
             checksums: checksums,
+            snapshotRoot: authorized.canonical,
+            rootIdentity: authorized.identity,
             policy: policy,
             recordError: recordError)
 
@@ -468,9 +570,6 @@ public struct KnowledgeValidator: Sendable {
            profile.retrievalSnapshot.lexical == nil {
             recordError("lexical_required", "profile", "Required lexical retrieval component is unavailable.")
         }
-        if profile.retrieval.reranker.mode == .required {
-            recordError("reranker_unavailable", "profile", "No exact reranker runtime is registered in the first release.")
-        }
         if mode == .publish, profile.retrieval.reranker.mode != .disabled {
             warning("reranker_not_baked_off", "profile", "Reranker remains outside the completed backend bake-off.")
         }
@@ -496,6 +595,13 @@ public struct KnowledgeValidator: Sendable {
             denseFile: denseFile,
             lexicalFile: lexicalFile,
             checksums: checksums,
+            backendRegistryDigest: backendRegistry.digest,
+            evidenceValidationContext: KnowledgeEvidenceValidationContext(
+                fileSystem: fileSystem,
+                backendRegistry: backendRegistry,
+                schemaValidator: schemaValidator),
+            contentSealDigest: try fileSystem.snapshotSealDigest(
+                root: authorized.canonical),
             report: report)
     }
 
@@ -503,6 +609,13 @@ public struct KnowledgeValidator: Sendable {
         _ evidence: KnowledgeSearchEvidence,
         in snapshot: KnowledgeValidatedSnapshot
     ) throws {
+        guard backendRegistry.digest == snapshot.backendRegistryDigest,
+              snapshot.evidenceValidationContext.backendRegistry.digest
+                == snapshot.backendRegistryDigest else {
+            throw KnowledgeDomainError(
+                .integrityFailed,
+                "Evidence validation backend registry does not match the mounted snapshot.")
+        }
         do {
             try schemaValidator.validate(evidence, against: .evidence)
         } catch {
@@ -512,8 +625,12 @@ public struct KnowledgeValidator: Sendable {
               !evidence.text.isEmpty,
               evidence.text.count <= 4_096,
               Data(evidence.text.utf8).count <= 16 * 1_024,
+              !PermissionReviewTextSanitizer.containsSensitiveMaterial(
+                  evidence.text),
               KnowledgeDigest.sha256(evidence.text) == evidence.textSha256,
-              !evidence.sourceIDs.isEmpty else {
+              !evidence.sourceIDs.isEmpty,
+              evidence.sourceIDs.allSatisfy(
+                  KnowledgeSourceIdentity.isPortable) else {
             throw KnowledgeDomainError(.integrityFailed, "Grounded evidence shape or hash is invalid.")
         }
         switch evidence.evidenceClass {
@@ -524,7 +641,9 @@ public struct KnowledgeValidator: Sendable {
                   let concept = snapshot.concepts[conceptID],
                   concept.revision == revision,
                   try Self.slice(concept.normalizedText, locator: locator) == evidence.text,
-                  Set(evidence.sourceIDs).isSubset(of: Set(concept.sources.compactMap(\.id))),
+                  evidence.sourceIDs == (try OKFReader.attributedSourceIDs(
+                    in: evidence.text,
+                    declaredSourceIDs: concept.sources.compactMap(\.id))),
                   evidence.producer == nil,
                   evidence.supportingConcepts == nil else {
                 throw KnowledgeDomainError(.integrityFailed, "Exact evidence no longer maps to its concept.")
@@ -533,7 +652,9 @@ public struct KnowledgeValidator: Sendable {
                 evidence.sourceLocators,
                 allowedSourceIDs: Set(evidence.sourceIDs),
                 concepts: [concept],
-                checksums: snapshot.checksums)
+                checksums: snapshot.checksums,
+                snapshotRoot: snapshot.root,
+                rootIdentity: snapshot.rootIdentity)
         case .generatedDerivative:
             guard evidence.producer != nil,
                   let supports = evidence.supportingConcepts,
@@ -542,6 +663,7 @@ public struct KnowledgeValidator: Sendable {
                 throw KnowledgeDomainError(.integrityFailed, "Generated evidence provenance is incomplete.")
             }
             var resolvedConcepts: [OKFConcept] = []
+            var supportingSourceIDs = Set<String>()
             for support in supports {
                 guard let concept = snapshot.concepts[support.conceptID],
                       concept.revision == support.conceptRevision else {
@@ -549,12 +671,21 @@ public struct KnowledgeValidator: Sendable {
                 }
                 _ = try Self.slice(concept.normalizedText, locator: support.conceptLocator)
                 resolvedConcepts.append(concept)
+                supportingSourceIDs.formUnion(
+                    concept.sources.compactMap(\.id))
+            }
+            guard Set(evidence.sourceIDs).isSubset(of: supportingSourceIDs) else {
+                throw KnowledgeDomainError(
+                    .integrityFailed,
+                    "Generated evidence source is not declared by its supporting concepts.")
             }
             try validateSourceLocators(
                 evidence.sourceLocators,
                 allowedSourceIDs: Set(evidence.sourceIDs),
                 concepts: resolvedConcepts,
-                checksums: snapshot.checksums)
+                checksums: snapshot.checksums,
+                snapshotRoot: snapshot.root,
+                rootIdentity: snapshot.rootIdentity)
         }
     }
 
@@ -563,21 +694,12 @@ public struct KnowledgeValidator: Sendable {
         chunking: KnowledgeProfile.Chunking,
         jsonLines: Data
     ) throws -> String {
-        struct Projection: Codable {
-            let version: String
-            let bundleRevision: String
-            let algorithm: String
-            let algorithmVersion: String
-            let parametersDigest: String
-            let jsonLinesSha256: String
-        }
-        return try KnowledgeDigest.canonical(Projection(
-            version: "intatis-chunk-manifest-digest/1",
+        try KnowledgeChunkManifestIdentity.digest(
             bundleRevision: bundleRevision,
             algorithm: chunking.algorithm,
             algorithmVersion: chunking.version,
             parametersDigest: chunking.parametersDigest,
-            jsonLinesSha256: KnowledgeDigest.sha256(jsonLines)))
+            chunks: KnowledgeChunkManifestIdentity.decode(jsonLines))
     }
 
     public static func denseComponentRevision(
@@ -794,6 +916,13 @@ public struct KnowledgeValidator: Sendable {
                     || KnowledgeDigest.sha256(data) != entry.sha256 {
                     recordError("checksums_mismatch", entry.path, "Inventoried size or hash does not match.")
                 }
+                if PermissionReviewTextSanitizer.containsSensitiveMaterial(
+                    String(decoding: data, as: UTF8.self)) {
+                    recordError(
+                        "secret_material",
+                        entry.path,
+                        "Knowledge snapshot contains credential-like material.")
+                }
             } catch {
                 recordError("checksums_read", entry.path, "Inventoried file could not be re-read safely.")
             }
@@ -833,6 +962,8 @@ public struct KnowledgeValidator: Sendable {
         _ chunks: [KnowledgeChunk],
         concepts: [String: OKFConcept],
         checksums: KnowledgeChecksums,
+        snapshotRoot: URL,
+        rootIdentity: WorkspaceRootIdentity,
         policy: KnowledgeValidationPolicy,
         recordError: (String, String, String) -> Void
     ) {
@@ -842,6 +973,8 @@ public struct KnowledgeValidator: Sendable {
                   IDs.insert(chunk.chunkID).inserted,
                   KnowledgeDigest.sha256(chunk.text) == chunk.textSha256,
                   !chunk.sourceIDs.isEmpty,
+                  chunk.sourceIDs.allSatisfy(
+                      KnowledgeSourceIdentity.isPortable),
                   Set(chunk.sourceIDs).count == chunk.sourceIDs.count else {
                 recordError("chunk_identity", chunk.chunkID, "Chunk identity, text hash, or source IDs are invalid.")
                 continue
@@ -864,8 +997,21 @@ public struct KnowledgeValidator: Sendable {
                 } catch {
                     recordError("chunk_exact_slice", chunk.chunkID, "Exact chunk locator is invalid.")
                 }
-                if !Set(chunk.sourceIDs).isSubset(of: Set(concept.sources.compactMap(\.id))) {
-                    recordError("chunk_source", chunk.chunkID, "Chunk source ID is missing from its concept.")
+                do {
+                    let attributed = try OKFReader.attributedSourceIDs(
+                        in: chunk.text,
+                        declaredSourceIDs: concept.sources.compactMap(\.id))
+                    if chunk.sourceIDs != attributed {
+                        recordError(
+                            "chunk_source",
+                            chunk.chunkID,
+                            "Exact chunk source IDs do not match deterministic concept attribution.")
+                    }
+                } catch {
+                    recordError(
+                        "chunk_source",
+                        chunk.chunkID,
+                        "Exact chunk source attribution could not be parsed deterministically.")
                 }
             case .generatedDerivative:
                 guard policy.allowGeneratedDerivatives,
@@ -875,17 +1021,26 @@ public struct KnowledgeValidator: Sendable {
                     recordError("chunk_derivative_provenance", chunk.chunkID, "Generated derivative provenance is incomplete.")
                     continue
                 }
+                var supportingSourceIDs = Set<String>()
                 for support in supports {
                     guard let concept = concepts[support.conceptID],
                           concept.revision == support.conceptRevision else {
                         recordError("chunk_derivative_support", chunk.chunkID, "Generated derivative support is missing or changed.")
                         continue
                     }
+                    supportingSourceIDs.formUnion(
+                        concept.sources.compactMap(\.id))
                     do {
                         _ = try Self.slice(concept.normalizedText, locator: support.conceptLocator)
                     } catch {
                         recordError("chunk_derivative_support", chunk.chunkID, "Generated derivative support locator is invalid.")
                     }
+                }
+                if !Set(chunk.sourceIDs).isSubset(of: supportingSourceIDs) {
+                    recordError(
+                        "chunk_source",
+                        chunk.chunkID,
+                        "Generated chunk source ID is missing from its supporting concepts.")
                 }
             }
             do {
@@ -902,7 +1057,9 @@ public struct KnowledgeValidator: Sendable {
                     chunk.sourceLocators,
                     allowedSourceIDs: Set(chunk.sourceIDs),
                     concepts: sourceConcepts,
-                    checksums: checksums)
+                    checksums: checksums,
+                    snapshotRoot: snapshotRoot,
+                    rootIdentity: rootIdentity)
             } catch let domain as KnowledgeDomainError {
                 recordError("source_locator", chunk.chunkID, domain.failure.message)
             } catch {
@@ -976,9 +1133,16 @@ public struct KnowledgeValidator: Sendable {
         _ locators: [KnowledgeSourceLocator]?,
         allowedSourceIDs: Set<String>,
         concepts: [OKFConcept],
-        checksums: KnowledgeChecksums
+        checksums: KnowledgeChecksums,
+        snapshotRoot: URL,
+        rootIdentity: WorkspaceRootIdentity
     ) throws {
         guard let locators else { return }
+        guard Set(locators).count == locators.count else {
+            throw KnowledgeDomainError(
+                .integrityFailed,
+                "Source locator collection contains a duplicate entry.")
+        }
         var inventory: [String: KnowledgeChecksumEntry] = [:]
         for entry in checksums.files {
             guard inventory.updateValue(entry, forKey: entry.path) == nil else {
@@ -989,7 +1153,7 @@ public struct KnowledgeValidator: Sendable {
         }
         for locator in locators {
             guard locator.schema == "intatis-source-locator/1",
-                  !locator.sourceID.isEmpty,
+                  KnowledgeSourceIdentity.isPortable(locator.sourceID),
                   allowedSourceIDs.contains(locator.sourceID),
                   KnowledgeDigest.isValid(locator.sourceRevision),
                   !locator.adapterIdentity.isEmpty,
@@ -998,22 +1162,38 @@ public struct KnowledgeValidator: Sendable {
                     locator.adapterIdentity + "@" + locator.adapterVersion) else {
                 throw KnowledgeDomainError(.integrityFailed, "Source locator cannot be replayed by an exact registered adapter.")
             }
-            let bindings = concepts.compactMap { concept -> (OKFConcept, OKFSource)? in
-                concept.sources.first(where: { $0.id == locator.sourceID }).map {
-                    (concept, $0)
+            let resourcePaths = Set(concepts.compactMap { concept -> String? in
+                guard let source = concept.sources.first(where: {
+                    $0.id == locator.sourceID
+                }) else {
+                    return nil
                 }
-            }
-            guard bindings.count == 1,
-                  let binding = bindings.first,
-                  let resourcePath = Self.localSourcePath(
-                    binding.1.resource,
-                    relativeTo: binding.0.relativePath),
+                return Self.localSourcePath(
+                    source.resource,
+                    relativeTo: concept.relativePath)
+            })
+            guard resourcePaths.count == 1,
+                  let resourcePath = resourcePaths.first,
                   let entry = inventory[resourcePath],
                   entry.sha256 == locator.sourceRevision else {
                 throw KnowledgeDomainError(
                     .integrityFailed,
                     "Source locator is not bound to one immutable source inventory entry.")
             }
+            let sourceBytes = try fileSystem.readFile(
+                root: snapshotRoot,
+                relativePath: resourcePath,
+                maximumBytes: entry.size,
+                expectedRootIdentity: rootIdentity)
+            guard sourceBytes.count == entry.size,
+                  KnowledgeDigest.sha256(sourceBytes) == entry.sha256 else {
+                throw KnowledgeDomainError(
+                    .integrityFailed,
+                    "Source locator bytes no longer match the immutable source inventory.")
+            }
+            _ = try backendRegistry.sourceLocatorAdapters.replay(
+                locator,
+                in: sourceBytes)
         }
     }
 
@@ -1022,20 +1202,12 @@ public struct KnowledgeValidator: Sendable {
         relativeTo conceptPath: String
     ) -> String? {
         guard !resource.isEmpty,
-              !resource.contains("://"),
-              !resource.contains(" ") else { return nil }
-        let base = URL(fileURLWithPath: conceptPath)
-            .deletingLastPathComponent().path
-        let raw = resource.hasPrefix("/")
-            ? String(resource.dropFirst())
-            : ((base == "." ? "" : base + "/") + resource)
-        let normalized = URL(fileURLWithPath: raw)
-            .standardizedFileURL.path
-            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        guard !normalized.isEmpty,
-              !normalized.hasPrefix("../"),
-              !normalized.contains("/../") else { return nil }
-        return normalized
+              resource.range(
+                of: #"^[A-Za-z][A-Za-z0-9+.-]*:"#,
+                options: .regularExpression) == nil else { return nil }
+        return normalizedBundlePath(
+            resource,
+            relativeTo: conceptPath)
     }
 
     private func validateSourceReferences(
@@ -1043,18 +1215,17 @@ public struct KnowledgeValidator: Sendable {
         knownPaths: Set<String>,
         recordError: (String, String, String) -> Void
     ) {
-        let base = URL(fileURLWithPath: concept.relativePath).deletingLastPathComponent().path
         for source in concept.sources {
             let resource = source.resource
-            if resource.contains("://") || resource.contains(" ") { continue }
-            let raw = resource.hasPrefix("/") ? String(resource.dropFirst()) : {
-                let prefix = base == "." ? "" : base + "/"
-                return prefix + resource
-            }()
-            let normalized = URL(fileURLWithPath: raw).standardizedFileURL.path
-                .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-            if normalized.contains("../") || !knownPaths.contains(normalized) {
+            if resource.range(
+                of: #"^[A-Za-z][A-Za-z0-9+.-]*:"#,
+                options: .regularExpression) != nil { continue }
+            guard let normalized = Self.normalizedBundlePath(
+                resource,
+                relativeTo: concept.relativePath),
+                  knownPaths.contains(normalized) else {
                 recordError("grounding_source_missing", concept.conceptID, "A grounding-required bundle source is missing.")
+                continue
             }
         }
     }
@@ -1069,8 +1240,6 @@ public struct KnowledgeValidator: Sendable {
         let range = NSRange(
             concept.normalizedText.startIndex..<concept.normalizedText.endIndex,
             in: concept.normalizedText)
-        let base = URL(fileURLWithPath: concept.relativePath)
-            .deletingLastPathComponent().path
         for match in expression.matches(in: concept.normalizedText, range: range) {
             guard let targetRange = Range(match.range(at: 1), in: concept.normalizedText) else {
                 continue
@@ -1082,19 +1251,50 @@ public struct KnowledgeValidator: Sendable {
             guard !target.isEmpty,
                   !target.contains("://"),
                   !target.hasPrefix("#") else { continue }
-            let raw = target.hasPrefix("/")
-                ? String(target.dropFirst())
-                : ((base == "." ? "" : base + "/") + target)
-            let normalized = URL(fileURLWithPath: raw)
-                .standardizedFileURL.path
-                .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-            if normalized.contains("../") || !knownPaths.contains(normalized) {
+            guard let normalized = Self.normalizedBundlePath(
+                target,
+                relativeTo: concept.relativePath),
+                  knownPaths.contains(normalized) else {
                 warning(
                     "ordinary_link_missing",
                     concept.conceptID,
                     "A non-grounding Markdown link does not resolve inside this snapshot.")
+                continue
             }
         }
+    }
+
+    /// Resolves a bundle-local reference without ever asking Foundation to
+    /// reinterpret a relative string against the process working directory.
+    private static func normalizedBundlePath(
+        _ reference: String,
+        relativeTo ownerPath: String
+    ) -> String? {
+        guard !reference.isEmpty,
+              !reference.contains("\\"),
+              !reference.contains("\0") else {
+            return nil
+        }
+        var components = reference.hasPrefix("/")
+            ? []
+            : ownerPath
+                .split(separator: "/", omittingEmptySubsequences: true)
+                .dropLast()
+                .map(String.init)
+        for rawComponent in reference.split(
+            separator: "/",
+            omittingEmptySubsequences: false) {
+            let component = String(rawComponent)
+            if component.isEmpty || component == "." { continue }
+            if component == ".." {
+                guard !components.isEmpty else { return nil }
+                components.removeLast()
+            } else {
+                components.append(component)
+            }
+        }
+        let normalized = components.joined(separator: "/")
+        return normalized.isEmpty ? nil : normalized
     }
 
     private static func slice(

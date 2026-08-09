@@ -60,6 +60,26 @@ final class IntatisPermissionTests: XCTestCase {
         }
     }
 
+    func testGateLocalKnowledgeSearchPassesToReviewerInsteadOfGenericReadAllow() {
+        let intent = PermissionIntent(
+            action: "knowledge.search.local",
+            resources: [PermissionResource(
+                kind: .tool,
+                value: "knowledge_base:host-bound")],
+            dataEffects: [.read],
+            replayPolicy: .safeToReplay)
+        guard case .pass(let reason, let risk) = gate.evaluate(
+            call(
+                "search_knowledge",
+                .readOnly,
+                intent: intent),
+            ctx(profile: .reviewed)) else {
+            return XCTFail("local knowledge search should reach the reviewer route")
+        }
+        XCTAssertEqual(reason, "search host-mounted untrusted knowledge evidence")
+        XCTAssertEqual(risk, .low)
+    }
+
     func testGateWriteReviewedPassesToReviewer() {
         guard case .pass(let reason, let risk) = gate.evaluate(call("write_file", .write, paths: ["a.swift"]),
                                                              ctx(profile: .reviewed)) else {
@@ -112,6 +132,60 @@ final class IntatisPermissionTests: XCTestCase {
         guard case .pass = gate.evaluate(call("browser_navigate", .exec, network: true, args: #"{"url":"https://example.com"}"#),
                                         ctx(profile: .reviewed, allowsShell: true)) else {
             return XCTFail("shell-backed browser network should pass to reviewer when shell is allowed")
+        }
+    }
+
+    func testGateStructuredDocumentReaderPassesUnderReadOnlyWithoutShellAuthority() {
+        let intent = PermissionIntent(
+            action: "document.read",
+            resources: [PermissionResource(
+                kind: .workspacePath,
+                value: "report.docx",
+                access: .readOnly)],
+            metadata: [
+                "execution_class": .string(
+                    PermissionIntent.structuredReadOnlyExecutionClass),
+            ],
+            dataEffects: [.read, .execute],
+            risks: [.processExecution],
+            replayPolicy: .requiresManualReconciliation)
+
+        XCTAssertTrue(intent.isReadOnlyWorkspaceCompatible)
+        XCTAssertTrue(intent.isStructuredReadOnlyExecution)
+        guard case .pass(let reason, let risk) = gate.evaluate(
+            call(
+                "document_read",
+                .exec,
+                paths: ["report.docx"],
+                intent: intent),
+            ctx(profile: .readOnly, allowsShell: false)) else {
+            return XCTFail("fixed structured read-only execution should reach review")
+        }
+        XCTAssertEqual(reason, "run fixed structured read-only document backend")
+        XCTAssertEqual(risk, .medium)
+    }
+
+    func testStructuredReadOnlyMarkerCannotAuthorizeMutationOrGenericShell() {
+        let mutating = PermissionIntent(
+            action: "document.read",
+            resources: [PermissionResource(
+                kind: .workspacePath,
+                value: "report.docx",
+                access: .readWrite)],
+            metadata: [
+                "execution_class": .string(
+                    PermissionIntent.structuredReadOnlyExecutionClass),
+            ],
+            dataEffects: [.read, .execute, .mutate],
+            risks: [.processExecution, .workspaceMutation],
+            replayPolicy: .requiresManualReconciliation)
+        XCTAssertFalse(mutating.isReadOnlyWorkspaceCompatible)
+        XCTAssertFalse(mutating.isStructuredReadOnlyExecution)
+
+        guard case .deny = gate.evaluate(
+            call("run_shell", .exec, args: #"{"command":"ls"}"#),
+            ctx(profile: .readOnly, allowsShell: true)) else {
+            return XCTFail("generic shell must remain denied in read_only")
         }
     }
 

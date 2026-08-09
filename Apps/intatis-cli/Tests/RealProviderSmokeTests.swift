@@ -11,6 +11,73 @@ import IntatisTools
 @testable import IntatisCLI
 
 final class RealProviderSmokeTests: XCTestCase {
+    func testRealOpenAIMultimodalUserAndFunctionOutputWhenEnabled()
+        async throws
+    {
+        guard ProcessInfo.processInfo.environment[
+            "INTATIS_REAL_MULTIMODAL_SMOKE"
+        ] == "1" else {
+            throw XCTSkip(
+                "Set INTATIS_REAL_MULTIMODAL_SMOKE=1 to spend one real provider request containing both user and function-output images.")
+        }
+
+        let config = try CLIConfig.load()
+        let registry = ProviderRegistry(
+            config: config.providerConfig(),
+            resolver: CLIExactSecretResolver(config: config))
+        let models = await registry.models()
+        let route = models.agent ?? models.chat
+        let provider = try await registry.agentProvider(for: route)
+        XCTAssertTrue(
+            provider.toolCallingCapabilities.supportsUserImageInput,
+            "The exact configured Agent route does not advertise user images.")
+        XCTAssertTrue(
+            provider.toolCallingCapabilities
+                .supportsFunctionOutputImageInput,
+            "The exact configured Agent route does not advertise function-output images.")
+
+        let image = ImageAttachment(url:
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+        let call = ToolCall(
+            id: "call_real_multimodal_smoke",
+            name: "inspect_image",
+            arguments: "{}")
+        let request = AgentRequest(
+            model: route.model,
+            messages: [
+                .user(
+                    "A one-pixel image is attached. A completed image tool call follows; acknowledge the available evidence briefly.",
+                    images: [image]),
+                .assistant(toolCalls: [call]),
+                .tool(
+                    id: call.id,
+                    content: "The tool returned one image.",
+                    images: [image]),
+            ],
+            tools: [
+                ToolSpec(
+                    name: call.name,
+                    description: "Returns a previously inspected image.",
+                    parameters: .object([
+                        "type": .string("object"),
+                        "properties": .object([:]),
+                        "additionalProperties": .bool(false),
+                    ])),
+            ],
+            includeUsage: true,
+            maxOutputTokens: 64)
+
+        var sawTerminal = false
+        for try await chunk in provider.stream(request) {
+            if case .done = chunk {
+                sawTerminal = true
+            }
+        }
+        XCTAssertTrue(
+            sawTerminal,
+            "The real multimodal Responses stream ended without a completion marker.")
+    }
+
     func testConfiguredAgentRouteWithRealProvider() async throws {
         guard ProcessInfo.processInfo.environment["INTATIS_REAL_PROVIDER_SMOKE"] == "1" else {
             throw XCTSkip(

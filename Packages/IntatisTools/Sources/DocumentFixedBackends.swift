@@ -18,6 +18,19 @@ enum LibreOfficeDocumentBackend {
         let profileDirectory = stageRoot.appendingPathComponent("libreoffice-profile", isDirectory: true)
         try createPrivateBackendDirectory(outputDirectory)
         try createPrivateBackendDirectory(profileDirectory)
+        let exportFilter: String
+        switch actualInput.pathExtension.lowercased() {
+        case "docx":
+            exportFilter = "pdf:writer_pdf_Export"
+        case "pptx":
+            exportFilter = "pdf:impress_pdf_Export"
+        case "xlsx":
+            exportFilter = "pdf:calc_pdf_Export"
+        default:
+            throw DocumentToolError(
+                .unsupportedOperation,
+                "LibreOffice PDF export accepts only DOCX, PPTX, or XLSX")
+        }
         let profileArgument = "-env:UserInstallation=\(profileDirectory.absoluteString)"
         let invocation = DocumentBackendInvocation(
             executable: .libreOffice,
@@ -28,7 +41,7 @@ enum LibreOfficeDocumentBackend {
                 "--nofirststartwizard",
                 "--nolockcheck",
                 profileArgument,
-                "--convert-to", "pdf",
+                "--convert-to", exportFilter,
                 "--outdir", outputDirectory.path,
                 actualInput.path,
             ],
@@ -90,7 +103,8 @@ enum LibreOfficeDocumentBackend {
             ],
             readableWorkspacePaths: [reviewedInputPath],
             writableWorkspacePaths: [reviewedOutputPath],
-            internalWritableWorkspacePaths: [stageRoot.path])
+            internalWritableWorkspacePaths: [stageRoot.path],
+            internalReadOnlyWorkspacePaths: [editedInput.path])
         let result: ShellResult
         do {
             result = try await context.documentBackend.run(invocation, cwd: context.workspaceRoot)
@@ -306,7 +320,8 @@ enum PDFCPUValidationBackend {
             ],
             readableWorkspacePaths: [],
             writableWorkspacePaths: [reviewedOutputPath],
-            internalWritableWorkspacePaths: [stageRoot.path])
+            internalWritableWorkspacePaths: [stageRoot.path],
+            internalReadOnlyWorkspacePaths: [stagedPDF.path])
         let result = try await run(invocation, in: context)
         guard result.exitCode == 0 else {
             throw DocumentToolError(.validationFailed, "pdfcpu strict validation rejected the generated PDF")

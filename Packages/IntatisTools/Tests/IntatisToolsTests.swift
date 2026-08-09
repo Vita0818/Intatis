@@ -1478,36 +1478,6 @@ final class IntatisToolsTests: XCTestCase {
 
     // MARK: Document/media tools
 
-    func testPDFReadExtractAndSplitTools() async throws {
-        #if canImport(PDFKit) && canImport(AppKit)
-        let ws = try tempWorkspace()
-        defer { try? FileManager.default.removeItem(at: ws) }
-        let pdfURL = ws.appendingPathComponent("input.pdf")
-        try makeBlankPDF(pageCount: 3, at: pdfURL)
-        let ctx = ToolContext(workspaceRoot: ws)
-
-        let read = try await ReadPDFTool().execute(ToolArgs(raw: #"{"path":"input.pdf","pages":"1-2"}"#), in: ctx)
-        XCTAssertTrue(read.text.contains("Pages: 3"))
-        XCTAssertTrue(read.text.contains("--- page 1 ---"))
-        XCTAssertTrue(read.text.contains("use read_document"))
-        XCTAssertTrue(read.text.contains("backend omitted or set to 'auto'"))
-        XCTAssertFalse(read.text.contains("use reconstruct_document_image with"))
-
-        let extractArgs = #"{"mode":"extract","inputPath":"input.pdf","pages":"2-3","outputPath":"out/extract.pdf"}"#
-        let extracted = try await EditPDFPagesTool().execute(ToolArgs(raw: extractArgs), in: ctx)
-        XCTAssertEqual(extracted.changedFiles, ["out/extract.pdf"])
-        XCTAssertTrue(FileManager.default.fileExists(atPath: ws.appendingPathComponent("out/extract.pdf").path))
-
-        let splitArgs = #"{"mode":"split","inputPath":"input.pdf","pages":"1,3","outputDir":"split","outputPrefix":"doc"}"#
-        let split = try await EditPDFPagesTool().execute(ToolArgs(raw: splitArgs), in: ctx)
-        XCTAssertEqual(split.changedFiles?.count, 2)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: ws.appendingPathComponent("split/doc-page-001.pdf").path))
-        XCTAssertTrue(FileManager.default.fileExists(atPath: ws.appendingPathComponent("split/doc-page-003.pdf").path))
-        #else
-        throw XCTSkip("PDFKit/AppKit unavailable")
-        #endif
-    }
-
     func testCompileLatexUsesInjectedShellAndReportsPDF() async throws {
         let ws = try tempWorkspace()
         defer { try? FileManager.default.removeItem(at: ws) }
@@ -1588,87 +1558,31 @@ final class IntatisToolsTests: XCTestCase {
     }
     #endif
 
-    func testReconstructDocumentImageUsesInjectedShellAndReportsOutput() async throws {
-        let ws = try tempWorkspace()
-        defer { try? FileManager.default.removeItem(at: ws) }
-        try Data("image".utf8).write(to: ws.appendingPathComponent("scan.png"))
-        try FileManager.default.createDirectory(at: ws.appendingPathComponent("docs"), withIntermediateDirectories: true)
-        try Data("# Scan".utf8).write(to: ws.appendingPathComponent("docs/scan.md"))
-        let ctx = ToolContext(
-            workspaceRoot: ws,
-            shell: FakeShell(result: ShellResult(stdout: "docling ok", stderr: "", exitCode: 0)),
-            git: FakeGit(statusText: "", diffText: ""))
-
-        let obs = try await ReconstructDocumentImageTool().execute(
-            ToolArgs(raw: #"{"imagePath":"scan.png","outputPath":"docs/scan.md","format":"markdown","backend":"docling"}"#),
-            in: ctx)
-
-        XCTAssertEqual(obs.changedFiles, ["docs/scan.md"])
-        XCTAssertTrue(obs.text.contains("reconstructed scan.png"))
-    }
-
     func testDocumentToolDescriptionsDefineNonOverlappingSelectionContract() {
         let pdf = ReadPDFTool.descriptor.description
-        XCTAssertTrue(pdf.contains("does not perform OCR"))
-        XCTAssertTrue(pdf.contains("use read_document"))
+        XCTAssertTrue(pdf.contains("never performs OCR"))
+        XCTAssertTrue(pdf.contains("document_ocr"))
 
-        let document = ReadDocumentTool.descriptor.description
-        XCTAssertTrue(document.contains("up to 512 MiB"))
-        XCTAssertTrue(document.contains("preferred reading tool"))
-        XCTAssertTrue(document.contains("omit backend or use 'auto'"))
-        XCTAssertTrue(document.contains("does not create an output artifact"))
+        let document = DocumentReadTool.descriptor.description
+        XCTAssertTrue(document.contains("single fixed local parser"))
+        XCTAssertTrue(document.contains("PDF is intentionally handled"))
+        XCTAssertTrue(document.contains("No fallback backend"))
 
-        let reconstruction = ReconstructDocumentImageTool.descriptor.description
-        XCTAssertTrue(reconstruction.contains("explicitly requests conversion or reconstruction"))
-        XCTAssertTrue(reconstruction.contains("do not use it for ordinary reading or summarization"))
-        XCTAssertTrue(reconstruction.contains("do not pass a PDF as imagePath"))
-    }
+        let ocr = DocumentOCRTool.descriptor.description
+        XCTAssertTrue(ocr.contains("explicit offline OCR"))
+        XCTAssertTrue(ocr.contains("never chooses an OCR engine automatically"))
 
-    func testReadDocumentAccepts314MiBSparsePDF() async throws {
-        let ws = try tempWorkspace()
-        defer { try? FileManager.default.removeItem(at: ws) }
-        let inputURL = ws.appendingPathComponent("textbook-scan.pdf")
-        XCTAssertTrue(FileManager.default.createFile(atPath: inputURL.path, contents: nil))
-        let handle = try FileHandle(forWritingTo: inputURL)
-        try handle.truncate(atOffset: 329_384_679)
-        try handle.close()
-        let shell = FakeShell(result: ShellResult(
-            stdout: "__INTATIS_DOCUMENT_BACKEND__=docling\n# Table of Contents\n",
-            stderr: "",
-            exitCode: 0))
+        let render = DocumentRenderTool.descriptor.description
+        XCTAssertTrue(render.contains("deterministic PNG"))
+        XCTAssertTrue(render.contains("committed atomically"))
 
-        let observation = try await ReadDocumentTool().execute(
-            ToolArgs(raw: #"{"path":"textbook-scan.pdf"}"#),
-            in: ToolContext(workspaceRoot: ws, shell: shell))
+        let export = DocumentExportPDFTool.descriptor.description
+        XCTAssertTrue(export.contains("PDF input is rejected"))
+        XCTAssertTrue(export.contains("pdfcpu strict validation"))
 
-        XCTAssertTrue(observation.text.contains("Backend: docling"))
-        XCTAssertTrue(observation.text.contains("# Table of Contents"))
-    }
-
-    func testReadDocumentOversizePreflightRejectsWithoutSideEffect() async throws {
-        let ws = try tempWorkspace()
-        defer { try? FileManager.default.removeItem(at: ws) }
-        let inputURL = ws.appendingPathComponent("oversize.pdf")
-        XCTAssertTrue(FileManager.default.createFile(atPath: inputURL.path, contents: nil))
-        let handle = try FileHandle(forWritingTo: inputURL)
-        try handle.truncate(atOffset: UInt64(ReadDocumentTool.maximumInputBytes + 1))
-        try handle.close()
-        let recorder = CommandRecorder()
-        let shell = RecordingShell(
-            recorder: recorder,
-            result: ShellResult(stdout: "unexpected", stderr: "", exitCode: 0))
-
-        do {
-            _ = try await ReadDocumentTool().execute(
-                ToolArgs(raw: #"{"path":"oversize.pdf"}"#),
-                in: ToolContext(workspaceRoot: ws, shell: shell))
-            XCTFail("oversize input unexpectedly reached the document backend")
-        } catch let error as ToolExecutionRejectedWithoutSideEffect {
-            XCTAssertEqual(error.code, "read_document_input_too_large")
-            XCTAssertTrue(error.message.contains("512 MiB"))
-        }
-        let recordedCommands = await recorder.all()
-        XCTAssertTrue(recordedCommands.isEmpty)
+        let write = DocumentWriteTool.descriptor.description
+        XCTAssertTrue(write.contains("PDF mutation is unsupported"))
+        XCTAssertTrue(write.contains("atomically committed"))
     }
 
     func testGenerateImageUsesInjectedService() async throws {
