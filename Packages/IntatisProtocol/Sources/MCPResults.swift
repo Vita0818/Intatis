@@ -113,7 +113,15 @@ public struct MCPContentBlock: Codable, Equatable, Sendable {
 /// Additive typed MCP result stored beside the existing text observation.
 /// `structuredContent` is validated against `outputSchemaHash` by the runtime;
 /// the protocol layer deliberately stays SDK-independent.
+public enum MCPToolResultType: String, Codable, Equatable, Sendable {
+    case complete
+}
+
 public struct MCPStructuredToolResult: Codable, Equatable, Sendable {
+    /// MCP 2026-07-28 complete-result discriminator. Legacy durable events
+    /// decode a missing discriminator as `.complete` because this pre-task
+    /// Intatis value never represented streaming/incomplete tool results.
+    public let resultType: MCPToolResultType
     public let content: [MCPContentBlock]
     public let structuredContent: JSONValue?
     public let outputSchemaHash: String?
@@ -121,17 +129,52 @@ public struct MCPStructuredToolResult: Codable, Equatable, Sendable {
     public let totalByteCount: Int?
     public let truncated: Bool
 
-    public init(content: [MCPContentBlock],
+    public init(resultType: MCPToolResultType = .complete,
+                content: [MCPContentBlock],
                 structuredContent: JSONValue? = nil,
                 outputSchemaHash: String? = nil,
                 isError: Bool = false,
                 totalByteCount: Int? = nil,
                 truncated: Bool = false) {
+        self.resultType = resultType
         self.content = content
         self.structuredContent = structuredContent
         self.outputSchemaHash = outputSchemaHash
         self.isError = isError
         self.totalByteCount = totalByteCount
         self.truncated = truncated
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case resultType, content, structuredContent, outputSchemaHash
+        case isError, totalByteCount, truncated
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        resultType = try container.decodeIfPresent(
+            MCPToolResultType.self,
+            forKey: .resultType) ?? .complete
+        content = try container.decode([MCPContentBlock].self, forKey: .content)
+        structuredContent = try container.decodeIfPresent(
+            JSONValue.self,
+            forKey: .structuredContent)
+        outputSchemaHash = try container.decodeIfPresent(
+            String.self,
+            forKey: .outputSchemaHash)
+        isError = try container.decodeIfPresent(Bool.self, forKey: .isError) ?? false
+        totalByteCount = try container.decodeIfPresent(Int.self, forKey: .totalByteCount)
+        truncated = try container.decodeIfPresent(Bool.self, forKey: .truncated) ?? false
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(resultType, forKey: .resultType)
+        try container.encode(content, forKey: .content)
+        try container.encodeIfPresent(structuredContent, forKey: .structuredContent)
+        try container.encodeIfPresent(outputSchemaHash, forKey: .outputSchemaHash)
+        try container.encode(isError, forKey: .isError)
+        try container.encodeIfPresent(totalByteCount, forKey: .totalByteCount)
+        try container.encode(truncated, forKey: .truncated)
     }
 }

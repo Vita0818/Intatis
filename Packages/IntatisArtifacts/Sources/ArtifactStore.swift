@@ -68,6 +68,27 @@ public actor ArtifactStore {
         return data
     }
 
+    /// Reads one artifact through the same no-follow, owner-only, single-link
+    /// boundary as `data(for:)`, while enforcing the byte ceiling before the
+    /// file can be accumulated in memory.
+    public func data(
+        for id: ArtifactID,
+        maximumBytes: Int
+    ) throws -> Data {
+        guard let ref = index[id] else {
+            throw IntatisError.notFound("artifact \(id)")
+        }
+        let blobURL = try Self.validatedBlobURL(
+            for: ref,
+            root: root)
+        guard let data = try DurableOwnerOnlyFile.read(
+            from: blobURL,
+            maximumBytes: maximumBytes) else {
+            throw IntatisError.notFound("artifact \(id)")
+        }
+        return data
+    }
+
     public func list() -> [ArtifactRef] {
         index.values.sorted { $0.createdAt < $1.createdAt }
     }

@@ -19,6 +19,7 @@ let package = Package(
         .library(name: "IntatisArtifacts", targets: ["IntatisArtifacts"]),
         .library(name: "IntatisConversation", targets: ["IntatisConversation"]),
         .library(name: "IntatisTools", targets: ["IntatisTools"]),
+        .library(name: "IntatisKnowledge", targets: ["IntatisKnowledge"]),
         .library(name: "IntatisSkills", targets: ["IntatisSkills"]),
         .library(name: "IntatisPermission", targets: ["IntatisPermission"]),
         .library(name: "IntatisMCP", targets: ["IntatisMCP"]),
@@ -47,6 +48,13 @@ let package = Package(
         .package(
             url: "https://github.com/apple/swift-crypto.git",
             exact: "4.5.1"
+        ),
+        // Safe YAML parser for bounded OKF frontmatter in the non-iOS
+        // knowledge target. Exact commit/license provenance is recorded in
+        // ThirdPartyNotices/KnowledgeRetrieval.md.
+        .package(
+            url: "https://github.com/jpsim/Yams.git",
+            exact: "6.2.2"
         ),
     ],
     targets: [
@@ -101,6 +109,27 @@ let package = Package(
                 ),
             ],
             path: "Packages/IntatisTools/Sources"
+        ),
+        // OKF/Profile snapshots, deterministic validation, local embedding,
+        // derived indexes, and the snapshot-bound search_knowledge tool.
+        // No iOS app target links this product.
+        .target(
+            name: "IntatisKnowledge",
+            dependencies: [
+                "IntatisCore", "IntatisProtocol", "IntatisTools",
+                .product(name: "Yams", package: "Yams"),
+                .product(
+                    name: "Crypto",
+                    package: "swift-crypto",
+                    condition: .when(platforms: [.linux])
+                ),
+            ],
+            path: "Packages/IntatisKnowledge",
+            exclude: ["Tests"],
+            sources: ["Sources"],
+            resources: [
+                .copy("Resources/Schemas"),
+            ]
         ),
         .target(
             name: "IntatisSkills",
@@ -232,8 +261,8 @@ let package = Package(
             name: "IntatisCLI",
             dependencies: [
                 "IntatisCore", "IntatisProtocol", "IntatisProviders", "IntatisConversation",
-                "IntatisTools", "IntatisPermission", "IntatisAgentKernel", "IntatisCowork",
-                "IntatisMCP", "IntatisMCPStdio", "IntatisSkills",
+                "IntatisArtifacts", "IntatisTools", "IntatisPermission", "IntatisAgentKernel", "IntatisCowork",
+                "IntatisMCP", "IntatisMCPStdio", "IntatisSkills", "IntatisKnowledge",
                 .product(
                     name: "Crypto",
                     package: "swift-crypto",
@@ -287,6 +316,17 @@ let package = Package(
             name: "IntatisToolsTests",
             dependencies: ["IntatisTools", "IntatisCore"],
             path: "Packages/IntatisTools/Tests"
+        ),
+        .testTarget(
+            name: "IntatisKnowledgeTests",
+            dependencies: [
+                "IntatisKnowledge", "IntatisCore", "IntatisProtocol",
+                "IntatisTools",
+            ],
+            path: "Packages/IntatisKnowledge/Tests",
+            resources: [
+                .copy("Fixtures"),
+            ]
         ),
         .testTarget(
             name: "IntatisSkillsTests",

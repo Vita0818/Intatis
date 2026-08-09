@@ -1,7 +1,7 @@
 # DO_NOT_BREAK
 
 文档状态：当前回归禁区
-最近核对：2026-08-08
+最近核对：2026-08-09
 产品基线：v0.40（build 40）
 
 ## macOS 分发不变量
@@ -362,6 +362,25 @@
 - **Chat/Code/Cowork session/history**：不得回退为单一固定会话日志。New session 必须生成新的 `SessionID` 并打开独立 `<session>/events.jsonl` 与 `<session>/artifacts/`；History/Resume 只能切换到目标 session 的日志投影。macOS/iOS 共享 `SessionHistoryStore` 路径与最近会话扫描逻辑。legacy display name 必须在任何 schema-v2 rebuild 前只读捕获，并在同一 EventLog transaction 中先追加 settings+marker；Chat、Code、Cowork 实际恢复入口都不得先 rebuild 覆盖旧值。Rename 仍须 EventLog-first；不得只改 cache、目录名、`SessionID`、Envelope 或既有 JSONL。删除只允许 app-support root 的单个直接子目录，运行中 session 不得删除，也不得删除其绑定工作区内容。
 - **Session settings 权威性**：`events.jsonl` 是 session settings、migration、agent/lease 登记与运行状态的唯一 durable 权威。`session_settings_updated` 必须是版本化全快照并保持严格、overflow-safe 的 revision/previousRevision、session/kind/schema 校验；Cowork canonical writer 不得写 legacy `defaultProviderID`。append 返回值和 subscriber 必须发布从实际落盘 bytes 反解的 canonical Envelope，不得发布会与 replay 分叉的编码前对象。`<session>/session.json` 只是 schema-v2、secret-free、可删除重建的派生投影；refresh 必须用完整 EventLog fold 验证。unknown future event、wrong-session、非法 revision/schema 或写后校验失败时必须拒绝覆盖；历史 main recovery 初检与最终 CAS 也必须复用同一严格 fold。
 - **模型会话改名边界**：`rename_session` 的 model schema 只能接受 `name`，不得接受 SessionID、SessionKind、路径、operation ID 或任意目标选择字段；宿主必须把服务绑定到当前 runtime 的 EventLog/kind，并把 durable execution ID 作为唯一 operation ID。Code 单 agent 与 Cowork exact `@main` 可用；worker、spawn coordinator、普通 agent、reviewer 和 Chat 不得获得该工具或从父 lease 继承。它必须经过 strict schema、ToolRegistry/CapabilityLease、PermissionEngine、durable prepare/settle 与 `tool_result`；只有 exact current-session/no-path/no-network/no-data-effect intent 可 deterministic low-risk allow，near-miss/locked 调用不能复用。raw 名称不得进入 durable tool-call args/digest，且必须在 authorization/prepared 前 secret-scan。operation ID first-write-wins：exact retry 幂等，冲突 payload fail closed，旧 operation retry 不能覆盖更晚 rename；`session.json` 与窗口列表只消费 verified EventLog projection。
+- **Chat 自动命名边界**：自动标题只能由成功完成的 Chat 回合触发，必须保持为宿主侧独立、无工具、
+  无 web search 的 metadata request；不得给 Chat 添加 ToolRegistry/AgentLoop/PermissionEngine，亦不得
+  从 Code/Cowork 入口调用自动 set-if-absent API。必须复用触发回合冻结的 exact provider/model 与
+  durable completed terminal seq；后台上下文只能读取该 seq 及以前的 EventLog，旧 route 不得读取
+  后续 route 的回合，
+  不得另选隐藏模型或把标题 request/response 写入 conversation messages、turn stats、错误事件、
+  `isBusy`/Stop。资格只能来自 complete-known EventLog 和可证明串行的最早三个 completed Chat
+  segment；歧义必须 fail closed。每进程、每 SessionID 最多三个逻辑 generation；只有同步调用
+  `provider.stream` 才能消费 attempt，prepare/ineligible/already-named/pre-dispatch cancel 均不得计次。
+  `ChatProvider.stream` 必须 prompt-return request-owned stream，并把 consumer termination 传播给
+  producer；不得引入会在该同步入口执行永久阻塞 I/O 的 conformer。
+  attempt ledger 不得
+  因同 session runtime 重建而重置；同 session 保持 single-flight，关闭围栏后旧 binding 不得复活或
+  阻塞 fresh binding。输出必须按冻结 stream/格式/敏感内容合同 accept-or-reject，禁止截短、补前缀、
+  二次 AI 清洗或语义改写。持久化必须在 EventLog 跨进程锁内 Chat-only set-if-absent，source 保持 nil
+  兼容，随后 rebuild/read-back `session.json`；只有 verified exact projection 可发 callback。手工 Rename
+  永远优先，automatic settings event 不得提升 recent-session activity；失败、取消、timeout、no-op、
+  append/rebuild/read-back failure 均不得污染已成功 Chat 回合或发布伪 commit。macOS/iOS 通知必须按
+  exact SessionID + revision/seq 水位处理，迟到 A 不得覆盖当前 B。
 - **Cowork project settings**：Cowork per-session project metadata 必须通过 `session_settings_updated` 保存到 EventLog；UserDefaults `intatis.cowork.projectSettings.<sessionID>` 及旧 bookmark/path key 只作一次性迁移输入。settings 只能保存 sessionID、主 agent 名称、未来新 agent exact inference binding、默认权限 profile、可选 token budget 与 secret-free workspace path/agent/primary metadata；不得保存 bookmark bytes、API key、raw endpoint、完整 request options/响应/转写或秘密内容。修改 default 只影响未来 agent，不得动态重写现有 agent、queued/running task、控制面 provider 或授予 lease。Cowork composer 的模型选择器只能展示 host-approved、secret-free current profile options，并暂存“下一次 `@main`”选择；选择动作本身不得 live rebind，忙时也不得禁用。只有按下 Send 才把当时的 exact binding 冻结进该 submission，FIFO 到达空闲执行边界后才允许 host-only rebind `@main`。不得复用 Chat/Code 的 session-global provider selection，也不得连带修改既有 worker、控制面 binding、当前任务或 future-agent default。
 - **Workspace bookmark capability**：Apple security-scoped bookmark bytes 只能保存在 session-owned `<session>/workspace-access.plist` schema v1 binary plist；必须 `0600`、稳定 no-follow cross-process lock、owner-only atomic replace、file fsync + parent-directory fsync、session/path/schema/单一-primary/写后等值校验。EventLog、`session.json`、UserDefaults 和 UI projection 不得复制 bookmark bytes。macOS 必须让 `WorkspaceAccessLease` 从 bookmark 解析所得的 scoped URL start access，在完整 Code/Cowork 使用期保留并在 teardown 后 stop。共享 path 不得由最后写入的单个 agent 冒充唯一 owner；Agent/目录移除必须先 durable persist 新 settings，再只删除 settings + live roster 均零引用的非-primary capability，任何 canonical identity 无法证明时都保留。primary 必须在 UI、业务方法和 store 默认拒删；底层绕过只允许新建/重授权事务尚未成立时的显式回滚，不得供普通项目目录删除调用。
 - **Fresh Cowork bootstrap**：唯一无需普通模型审批的初始路径是 brand-new empty session 的严格 settings-first 七事件合同：settings；`@main` workspace/capability/agent；`@permission-reviewer` workspace/capability/agent，连续 `seq 0...6`。两 agent 可共享 exact inference binding，但 identity 和 leases 必须不同；reviewer 必须 read-only、空工具、无 communication/delegation、depth 0。任何事件存在、非空 roster、binding/profile mismatch、路径/sensitive-root/root-identity 问题或持久化失败都必须 fail closed；bootstrap 不得调用模型/provider，也不能被普通 attach/spawn/tool/recovery 复用。
@@ -609,6 +628,13 @@
 - 改 `@main` 模型历史、恢复或上下文归一化：至少覆盖 `ModelHistoryProtocolTests`、`ModelHistoryProjectionTests`、`ModelHistoryAgentLoopTests`、`SubmittedIntentHistoryTests`、`ContextProjectionTests` 与 main continuity / worker isolation Cowork tests；必须证明 U1/A1/U2 的顺序、tool call/output 配对、崩溃缺 output、orphan output、retry attempt 选择、重启后恢复、direct/audit 去重和 `write_stdin` 不落原文。
 - 改 managed terminal / PTY / shell sandbox：至少覆盖 `TerminalToolsTests`、`TerminalAgentLoopTests`、`ShellPermissionTests`、`WorkspaceSandboxDenialTests`、`CapabilityLeaseTests`、`ToolRegistryLeaseTests`、`AgentLoopPolicyTests`、`OrchestrationReliabilityTests` 与 full `swift test`；并构建 IntatisMac 和 IntatisiOS，证明 macOS 真终端可链接且 iOS 仍未链接本地 agent/shell 模块。
 - 改 session settings/projection/workspace bookmark/bootstrap/recovery：至少覆盖 `SessionStateProtocolTests`、`SessionProjectionStoreTests`、`IntatisCoreTests`、`AutomaticPermissionReviewTests`；触及模型改名工具时追加 `SessionNamingToolTests`、`SessionRenameAgentLoopTests`、`IntatisPermissionTests`、`ToolRegistryLeaseTests` 与 main/worker tool-surface 回归。必须证明 strict seven-event/no-provider bootstrap、EventLog-wins cache repair、owner-only binary bookmark、legacy provenance+marker 幂等、historical main/reviewer repair、Rename EventLog-first、operation retry/冲突/晚改名保护、secret pre-authorization denial 与 exact-session capability isolation，并构建受影响 macOS/iOS target。
+- 改 Chat 自动命名：至少覆盖 `ChatSessionAutoTitleTests` 与 `ChatAutoTitleViewModelTests`，证明
+  successful-only trigger、exact frozen route + completed seq 前缀（旧 route 不读取后续轮次）、前三
+  completed segment、user/assistant 正文字段合计 6,000-Character budget（JSON 编码开销不计入）、严格
+  stream/validator、官方 provider pre-byte retry 边界、Chat-only set-if-absent/manual race、跨 runtime
+  attempt ledger、pre-stream cancel 不计次、pending single-flight（含 ineligible 后的较新 pending）、
+  timeout/close/shutdown drain、消息/错误/busy 隔离；并构建
+  `IntatisMac` 与 `IntatisiOS`，复核 iOS target 未链接 Tools/Permission/AgentKernel/Cowork/MCP。
 - 改 permission response、pending queue、turn outcome、sandbox failure 分类或 cancel/cleanup：至少覆盖 `TurnOutcomeProtocolTests`、`PermissionSettlementTransactionTests`、`PermissionProjectionTests`、`AgentLoopOutcomeTests`、`SandboxDenialOutcomeTests`、`WorkspaceSandboxDenialTests`、`PermissionReviewControlPlaneTests`、`OrchestrationReliabilityTests`；触及 GUI/CLI 时构建对应 target，并用隔离 fixture 验证 Approve/Decline/Cancel 与 automatic non-actionable，不能用 fixture 冒充真实 provider/EventLog/executor E2E。
 - 文档任务：至少 `git diff --check` + `git status --short`
 - 未运行构建/测试时，最终报告必须声明"未运行构建/测试"。

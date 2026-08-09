@@ -371,10 +371,23 @@ public actor ProviderRegistry {
         endpoint: ProviderEndpoint,
         model: ModelID
     ) -> ToolCallingProviderCapabilities {
-        ToolCallingProviderCapabilities(
+        let declaredCapabilities =
+            endpoint.capabilities(for: model)
+        let isReviewedNativeOpenAIResponsesRoute: Bool
+        switch endpoint.wire {
+        case .openai:
+            isReviewedNativeOpenAIResponsesRoute =
+                endpoint.requestAdapter(for: model) == .openAI
+        }
+        let supportsImageInput =
+            isReviewedNativeOpenAIResponsesRoute
+            && declaredCapabilities.contains(.visionInput)
+        return ToolCallingProviderCapabilities(
             supportsToolSearch:
-                endpoint.capabilities(for: model)
-                    .contains(.toolSearch))
+                declaredCapabilities.contains(.toolSearch),
+            supportsUserImageInput: supportsImageInput,
+            supportsFunctionOutputImageInput:
+                supportsImageInput)
     }
 
     // MARK: Multimodal (v0.4)

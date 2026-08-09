@@ -158,18 +158,36 @@ private func validatedToolCallArguments(_ arguments: String,
 extension OpenAIWireProvider: ToolCallingProvider {
 
     public func stream(_ request: AgentRequest) -> AsyncThrowingStream<AgentChunk, Error> {
-        if request.requiresResponsesAPI {
-            guard toolCallingCapabilities.supportsToolSearch else {
-                return AsyncThrowingStream { continuation in
-                    continuation.finish(
-                        throwing:
-                            ToolCallingProviderCapabilityError
-                                .toolSearchUnsupported)
-                }
+        if let capabilityError = toolCallingCapabilityError(
+            for: request)
+        {
+            return AsyncThrowingStream { continuation in
+                continuation.finish(throwing: capabilityError)
             }
+        }
+        if request.requiresResponsesAPI {
             return streamResponses(request)
         }
         return streamChatCompletions(request)
+    }
+
+    private func toolCallingCapabilityError(
+        for request: AgentRequest
+    ) -> ToolCallingProviderCapabilityError? {
+        if request.requiresToolSearchCapability,
+           !toolCallingCapabilities.supportsToolSearch {
+            return .toolSearchUnsupported
+        }
+        if request.containsUserImageInput,
+           !toolCallingCapabilities.supportsUserImageInput {
+            return .userImageInputUnsupported
+        }
+        if request.containsFunctionOutputImageInput,
+           !toolCallingCapabilities
+            .supportsFunctionOutputImageInput {
+            return .functionOutputImageInputUnsupported
+        }
+        return nil
     }
 
     private func streamChatCompletions(
@@ -532,11 +550,12 @@ extension OpenAIWireProvider: ToolCallingProvider {
     }
 
     func buildAgentRequest(_ request: AgentRequest) throws -> URLRequest {
+        if let capabilityError = toolCallingCapabilityError(
+            for: request)
+        {
+            throw capabilityError
+        }
         if request.requiresResponsesAPI {
-            guard toolCallingCapabilities.supportsToolSearch else {
-                throw ToolCallingProviderCapabilityError
-                    .toolSearchUnsupported
-            }
             return try buildResponsesAgentRequest(request)
         }
         return try buildChatCompletionsAgentRequest(request)
@@ -726,11 +745,31 @@ extension OpenAIWireProvider: ToolCallingProvider {
             }
             return .object(object)
 
-        case .functionCallOutput(let callID, let output):
+        case .functionCallOutput(let callID, let output, let images):
+            guard !images.isEmpty else {
+                return .object([
+                    "type": .string("function_call_output"),
+                    "call_id": .string(callID),
+                    "output": .string(output),
+                ])
+            }
+            var parts: [JSONValue] = []
+            if !output.isEmpty {
+                parts.append(.object([
+                    "type": .string("input_text"),
+                    "text": .string(output),
+                ]))
+            }
+            parts.append(contentsOf: images.map {
+                .object([
+                    "type": .string("input_image"),
+                    "image_url": .string($0.url),
+                ])
+            })
             return .object([
                 "type": .string("function_call_output"),
                 "call_id": .string(callID),
-                "output": .string(output),
+                "output": .array(parts),
             ])
 
         case .toolSearchCall(

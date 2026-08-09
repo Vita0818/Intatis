@@ -599,6 +599,8 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                 },
                 requiresInferenceBindings: true,
                 imageGeneratorFor: { _ in await registryBox.imageToolService() },
+                imageResolver: AgentImageResolution.resolver(
+                    store: artifactStore),
                 toolSnapshotProvider:
                     toolSnapshotProvider,
                 sessionNaming: sessionNaming,
@@ -966,7 +968,9 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                 capabilityLease,
             workspaceLease: workspaceLease,
             baseRegistry: skillSnapshot.augmenting(
-                ToolRegistry.standard(
+                Orchestrator.toolRegistry(
+                    for: capabilityLease,
+                    agentID: descriptor.agentID,
                     includesTerminal:
                         allowsShell)),
             activationReason: reason)
@@ -2772,43 +2776,28 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                 let explicitGoalIntent = ExplicitGoalIntentClassifier
                     .classify(payload.text)
                     .isExplicit
-                do {
-                    let images = try await submissionImages(for: payload)
-                    let result: OrchestratorSendResult
-                    if let retryTask = submissionRetryTasks[submissionID] {
-                        result = await orchestrator.retry(
-                            retryTask,
-                            images: images,
-                            userMessage: payload,
-                            recordUserMessage: false,
-                            explicitGoalIntent: explicitGoalIntent)
-                        submissionRetryTasks.removeValue(forKey: submissionID)
-                    } else {
-                        result = await goalRuntime.sendUserTurn(
-                            payload.text,
-                            to: target,
-                            images: images,
-                            userMessage: payload,
-                            recordUserMessage: false,
-                            explicitGoalIntent: explicitGoalIntent)
-                    }
-                    if let message = result.errorMessage {
-                        executionFailure = await submissionExecutionFailure(
-                            submissionID: submissionID,
-                            message: message)
-                    } else {
-                        executionFailure = nil
-                    }
-                } catch let error as IntatisComposerAttachmentResolutionError {
-                    executionFailure = SubmissionFailure(
-                        code: error.code,
-                        message: error.localizedDescription,
-                        retryable: error.retryable)
-                } catch {
-                    executionFailure = SubmissionFailure(
-                        code: "attachment_unreadable",
-                        message: "Attachment recovery failed: \(error.localizedDescription)",
-                        retryable: true)
+                let result: OrchestratorSendResult
+                if let retryTask = submissionRetryTasks[submissionID] {
+                    result = await orchestrator.retry(
+                        retryTask,
+                        userMessage: payload,
+                        recordUserMessage: false,
+                        explicitGoalIntent: explicitGoalIntent)
+                    submissionRetryTasks.removeValue(forKey: submissionID)
+                } else {
+                    result = await goalRuntime.sendUserTurn(
+                        payload.text,
+                        to: target,
+                        userMessage: payload,
+                        recordUserMessage: false,
+                        explicitGoalIntent: explicitGoalIntent)
+                }
+                if let message = result.errorMessage {
+                    executionFailure = await submissionExecutionFailure(
+                        submissionID: submissionID,
+                        message: message)
+                } else {
+                    executionFailure = nil
                 }
             }
             await synchronizePermissionReviewerHealth(using: orchestrator)
@@ -2848,14 +2837,6 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             }
             if didStartGoalContinuation { return }
         }
-    }
-
-    private func submissionImages(
-        for payload: UserMessagePayload
-    ) async throws -> [ImageAttachment] {
-        try await composerAttachmentStore.imageAttachments(
-            for: payload.attachments ?? [],
-            surface: "Cowork remote execution")
     }
 
     private func settleSubmissionFailure(

@@ -140,6 +140,57 @@ public protocol ShellRunner: Sendable {
     func run(_ command: String, cwd: URL) async throws -> ShellResult
 }
 
+/// Fixed executable families accepted by the document process boundary.
+/// Model-authored arguments never select one of these values: each concrete
+/// document tool constructs one opaque invocation after schema, path, and
+/// operation validation.
+public enum DocumentBackendExecutable: String, Equatable, Sendable {
+    case pythonRuntime
+    case libreOffice
+    case libreOfficePython
+    case pdfcpu
+    case rbookHelper
+    case epubCheck
+}
+
+/// Opaque, host-authored document backend request. Public read-only fields
+/// keep injected runners observable in tests while the internal initializer
+/// prevents clients outside IntatisTools from manufacturing a process launch.
+public struct DocumentBackendInvocation: Equatable, Sendable {
+    public let executable: DocumentBackendExecutable
+    public let arguments: [String]
+    public let environment: [String: String]
+    public let readableWorkspacePaths: [String]
+    /// User-visible destinations that were included in permission review.
+    public let writableWorkspacePaths: [String]
+    /// Host-created same-parent staging paths. The production runner verifies
+    /// their binding to a reviewed destination before extending the process
+    /// allow-list; these paths are never accepted from model arguments.
+    public let internalWritableWorkspacePaths: [String]
+
+    init(executable: DocumentBackendExecutable,
+         arguments: [String],
+         environment: [String: String] = [:],
+         readableWorkspacePaths: [String],
+         writableWorkspacePaths: [String],
+         internalWritableWorkspacePaths: [String] = []) {
+        self.executable = executable
+        self.arguments = arguments
+        self.environment = environment
+        self.readableWorkspacePaths = readableWorkspacePaths
+        self.writableWorkspacePaths = writableWorkspacePaths
+        self.internalWritableWorkspacePaths = internalWritableWorkspacePaths
+    }
+}
+
+/// Dedicated no-shell process seam for mature document runtimes. Production
+/// implementations resolve the executable from a fixed Intatis runtime and
+/// reuse the managed timeout/cancellation/process-tree boundary.
+public protocol DocumentBackendRunner: Sendable {
+    func run(_ invocation: DocumentBackendInvocation,
+             cwd: URL) async throws -> ShellResult
+}
+
 /// Opaque invocation accepted by the dedicated browser backend. Production
 /// callers cannot turn this into a general shell: only Intatis browser tools
 /// construct the fixed Node source, encoded structured arguments, and exact
@@ -401,6 +452,9 @@ public struct ToolContext: Sendable {
     /// invocations. It accepts only the opaque structured invocation above,
     /// never a model-authored shell string.
     let browserBackend: BrowserBackendRunner
+    /// Dedicated backend for fixed document runtime invocations. Unlike
+    /// `structuredShell`, this interface cannot receive a shell command.
+    public let documentBackend: any DocumentBackendRunner
     /// Long-lived, runtime-owned terminal service used by `exec_command` and
     /// `write_stdin`. It is optional so isolated tool hosts must opt in rather
     /// than silently creating a process manager with the wrong lifetime.
@@ -434,6 +488,7 @@ public struct ToolContext: Sendable {
                 structuredShell: ShellRunner? = nil,
                 networkStructuredShell: ShellRunner? = nil,
                 browserBackendShell: ShellRunner? = nil,
+                documentBackend: (any DocumentBackendRunner)? = nil,
                 terminal: (any TerminalSessionManaging)? = nil,
                 git: GitService = ProcessGitService(),
                 messenger: AgentMessenger? = nil,
@@ -509,6 +564,12 @@ public struct ToolContext: Sendable {
             self.browserBackend = InjectedShellBrowserBackendRunner(
                 shell: resolvedNetworkStructuredShell)
         }
+        if let documentBackend {
+            self.documentBackend = documentBackend
+        } else {
+            self.documentBackend = DocumentBackendProcessRunner(
+                workspaceLease: effectiveLease)
+        }
         self.terminal = terminal
         if let processGit = git as? ProcessGitService {
             self.git = processGit.scoped(to: effectiveLease)
@@ -537,6 +598,11 @@ public protocol Tool: Sendable {
     /// `write_file` and `apply_patch` are two operations in one
     /// `filesystem.edit` capability family.
     static var canonicalPermission: String? { get }
+    /// Tool-specific semantic validation that runs before permission review.
+    /// JSON Schema remains the provider-facing shape check; this hook enforces
+    /// nested operation matrices and cross-field invariants without widening
+    /// the generic schema interpreter.
+    func validateArguments(_ args: ToolArgs) throws
     func touchedPaths(_ args: ToolArgs) -> [String]
     func risksNetwork(_ args: ToolArgs) -> Bool
     /// Build the structured authorization input for this exact invocation.
@@ -565,6 +631,7 @@ public protocol Tool: Sendable {
 
 public extension Tool {
     static var canonicalPermission: String? { nil }
+    func validateArguments(_ args: ToolArgs) throws {}
     func touchedPaths(_ args: ToolArgs) -> [String] { [] }
     func risksNetwork(_ args: ToolArgs) -> Bool { false }
     func permissionIntent(_ args: ToolArgs, workspaceRoot: URL) -> PermissionIntent {
@@ -676,6 +743,8 @@ public struct ToolRegistration: Sendable {
     private let usesStaticToolMetadata: Bool
     private let argumentValidator:
         @Sendable (ToolArgs) throws -> Void
+    private let argumentValidationFailureBuilder:
+        (@Sendable (String) -> ToolObservation)?
 
     /// Compatibility initializer for the existing static tool surface.
     public init(tool: any Tool,
@@ -691,7 +760,8 @@ public struct ToolRegistration: Sendable {
             requiredDelegation: requiredDelegation,
             mcpAuthorization: nil,
             mcpResourceAuthorizationResolver: nil,
-            argumentValidator: { _ in },
+            argumentValidator: { try tool.validateArguments($0) },
+            argumentValidationFailureBuilder: nil,
             usesStaticToolMetadata: true)
     }
 
@@ -712,7 +782,9 @@ public struct ToolRegistration: Sendable {
                     ) throws -> MCPResourceInvocationAuthorizationSnapshot?)?
                         = nil,
                 argumentValidator:
-                    @escaping @Sendable (ToolArgs) throws -> Void = { _ in }) {
+                    @escaping @Sendable (ToolArgs) throws -> Void = { _ in },
+                argumentValidationFailureBuilder:
+                    (@Sendable (String) -> ToolObservation)? = nil) {
         self.init(
             descriptor: descriptor,
             tool: tool,
@@ -724,6 +796,8 @@ public struct ToolRegistration: Sendable {
             mcpResourceAuthorizationResolver:
                 mcpResourceAuthorizationResolver,
             argumentValidator: argumentValidator,
+            argumentValidationFailureBuilder:
+                argumentValidationFailureBuilder,
             usesStaticToolMetadata: false)
     }
 
@@ -740,6 +814,8 @@ public struct ToolRegistration: Sendable {
                     ) throws -> MCPResourceInvocationAuthorizationSnapshot?)?,
                  argumentValidator:
                     @escaping @Sendable (ToolArgs) throws -> Void,
+                 argumentValidationFailureBuilder:
+                    (@Sendable (String) -> ToolObservation)?,
                  usesStaticToolMetadata: Bool) {
         self.descriptor = descriptor
         self.tool = tool
@@ -751,6 +827,8 @@ public struct ToolRegistration: Sendable {
         self.mcpResourceAuthorizationResolver =
             mcpResourceAuthorizationResolver
         self.argumentValidator = argumentValidator
+        self.argumentValidationFailureBuilder =
+            argumentValidationFailureBuilder
         self.usesStaticToolMetadata = usesStaticToolMetadata
     }
 
@@ -798,6 +876,15 @@ public struct ToolRegistration: Sendable {
 
     public func validateArguments(_ args: ToolArgs) throws {
         try argumentValidator(args)
+    }
+
+    /// Optional typed result for a structurally valid tool call whose business
+    /// arguments fail this registration's strict schema. Unknown tools and
+    /// malformed outer transports remain protocol/runtime failures.
+    public func argumentValidationFailure(
+        message: String
+    ) -> ToolObservation? {
+        argumentValidationFailureBuilder?(message)
     }
 
     public func execute(_ args: ToolArgs,
@@ -1594,7 +1681,8 @@ public struct ToolRegistry: Sendable {
             GitWorktreeCreateTool(), GitWorktreeRemoveTool(),
             GitRemotesTool(), GitFetchTool(), GitPullFastForwardTool(),
             GitPushTool(), GitSwitchBranchTool(),
-            ReadPDFTool(), ReadDocumentTool(), EditPDFPagesTool(), ReconstructDocumentImageTool(),
+            ReadPDFTool(), DocumentReadTool(), DocumentOCRTool(), DocumentRenderTool(),
+            DocumentExportPDFTool(), DocumentWriteTool(),
             CompileLaTeXTool(), GenerateImageTool(), EditImageTool(),
             WebFetchTool(), BrowserDiagnosticsTool(), BrowserProfilesTool(), BrowserProfileDeleteTool(), BrowserHistoryTool(),
             BrowserNavigateTool(), BrowserSnapshotTool(), BrowserHandoffTool(), BrowserClickTool(),
@@ -1608,7 +1696,11 @@ public struct ToolRegistry: Sendable {
             tools.append(ExecCommandTool())
             tools.append(WriteStdinTool())
         }
-        return ToolRegistry(tools)
+        // The document surface changed incompatibly from the legacy
+        // read_document/edit_pdf_pages/reconstruct_document_image group. Keep
+        // the replacement identity explicit so a durable authorization issued
+        // for the old catalog can never validate against this one.
+        return ToolRegistry(tools, registryVersion: "intatis.standard.v2")
     }
 }
 

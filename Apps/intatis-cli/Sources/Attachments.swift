@@ -1,10 +1,22 @@
 import Foundation
 import IntatisProviders
 
+struct PendingImageAttachment {
+    var name: String
+    var data: Data
+    var mime: String
+
+    var providerAttachment: ImageAttachment {
+        .base64(
+            mime: mime,
+            base64: data.base64EncodedString())
+    }
+}
+
 /// Files queued for the next message: images become vision input; UTF-8 text
 /// files are inlined as context.
 struct PendingAttachments {
-    var images: [ImageAttachment] = []
+    var images: [PendingImageAttachment] = []
     var textFiles: [(name: String, content: String)] = []
 
     var isEmpty: Bool { images.isEmpty && textFiles.isEmpty }
@@ -13,7 +25,7 @@ struct PendingAttachments {
 }
 
 enum LoadedAttachment {
-    case image(ImageAttachment)
+    case image(PendingImageAttachment)
     case text(name: String, content: String)
     case failure(String)
 }
@@ -28,7 +40,10 @@ enum AttachmentLoader {
         let ext = url.pathExtension.lowercased()
         if imageExtensions.contains(ext) {
             let mime = (ext == "jpg") ? "image/jpeg" : "image/\(ext)"
-            return .image(ImageAttachment.base64(mime: mime, base64: data.base64EncodedString()))
+            return .image(PendingImageAttachment(
+                name: url.lastPathComponent,
+                data: data,
+                mime: mime))
         }
         if let text = String(data: data, encoding: .utf8) {
             return .text(name: url.lastPathComponent, content: text)

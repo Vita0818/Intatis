@@ -13,8 +13,19 @@ public struct AgentModelHistoryCheckpointCursor: Equatable, Sendable {
     }
 }
 
+/// Durable media provenance aligned one-for-one with projected messages.
+/// A nil entry means the corresponding message has no durable image carrier.
+public enum ProjectedImageBinding: Equatable, Sendable {
+    case userVerified([ModelHistoryImageReference])
+    case userLegacy([ArtifactID])
+    case toolVerified(
+        callID: String,
+        imageReferences: [ModelHistoryImageReference])
+}
+
 public struct AgentModelHistoryProjection: Equatable, Sendable {
     public var messages: [AgentMessage]
+    public var imageBindings: [ProjectedImageBinding?]
     public var realUserMessages: [AgentModelHistoryRealUserMessage]
     /// Checkpoint selected as the base of the reconstructed provider history.
     /// This may be older than `latestCheckpoint` after a whole-task retry.
@@ -26,12 +37,21 @@ public struct AgentModelHistoryProjection: Equatable, Sendable {
 
     public init(
         messages: [AgentMessage],
+        imageBindings: [ProjectedImageBinding?]? = nil,
         realUserMessages: [AgentModelHistoryRealUserMessage],
         baseCheckpoint: AgentModelHistoryCheckpointCursor? = nil,
         latestCheckpoint: AgentModelHistoryCheckpointCursor?,
         latestAgentHistorySequence: Int?
     ) {
         self.messages = messages
+        let resolvedBindings = imageBindings
+            ?? [ProjectedImageBinding?](
+                repeating: nil,
+                count: messages.count)
+        precondition(
+            resolvedBindings.count == messages.count,
+            "projected image bindings must align with messages")
+        self.imageBindings = resolvedBindings
         self.realUserMessages = realUserMessages
         self.baseCheckpoint = baseCheckpoint
         self.latestCheckpoint = latestCheckpoint
@@ -55,10 +75,15 @@ public struct AgentModelHistoryProjector: Sendable {
         currentTask: TaskContract,
         events: [Envelope]
     ) throws -> [AgentMessage] {
-        try projectState(
+        let projection = try projectState(
             agentID: agentID,
             currentTask: currentTask,
-            events: events).messages
+            events: events)
+        guard projection.imageBindings.allSatisfy({ $0 == nil }) else {
+            throw AgentModelHistoryProjectionError
+                .mediaBindingsRequireProjectionState
+        }
+        return projection.messages
     }
 
     public func projectState(
@@ -192,6 +217,55 @@ public struct AgentModelHistoryProjector: Sendable {
         return projection
     }
 
+    /// Rebuilds the just-committed replacement without replaying the complete
+    /// event log. Callers must invoke this only after the checkpoint append
+    /// succeeds; replay still uses `projectState`/`projectConversationState`
+    /// so accepted-submission provenance and checkpoint lineage are checked.
+    public func projectReplacementState(
+        _ payload: ModelHistoryCompactedPayload
+    ) throws -> AgentModelHistoryProjection {
+        do {
+            try payload.validate()
+        } catch {
+            throw AgentModelHistoryProjectionError.invalidCheckpoint(
+                sequence: 0,
+                reason: "replacement payload failed v1/v2 structural validation")
+        }
+
+        var messages: [AgentMessage] = []
+        var imageBindings: [ProjectedImageBinding?] = []
+        var realUsers: [AgentModelHistoryRealUserMessage] = []
+        for item in payload.replacementHistory {
+            guard let content = item.content else {
+                throw AgentModelHistoryProjectionError.invalidCheckpoint(
+                    sequence: 0,
+                    reason: "replacement message has no content")
+            }
+            messages.append(.user(content))
+            if let references = item.imageReferences {
+                imageBindings.append(.userVerified(references))
+            } else {
+                imageBindings.append(Self.legacyUserBinding(
+                    item.attachmentIDs))
+            }
+            if item.messageClassification == .realUser {
+                realUsers.append(AgentModelHistoryRealUserMessage(
+                    content: content,
+                    submissionID: item.sourceSubmissionID,
+                    attachmentIDs: item.attachmentIDs,
+                    imageReferences: item.imageReferences,
+                    contentTruncated: item.contentTruncated == true))
+            }
+        }
+        return AgentModelHistoryProjection(
+            messages: messages,
+            imageBindings: imageBindings,
+            realUserMessages: realUsers,
+            baseCheckpoint: nil,
+            latestCheckpoint: nil,
+            latestAgentHistorySequence: nil)
+    }
+
     private func conversationUncheckpointedProjection(
         agentID: AgentID,
         currentSubmissionID: SubmissionID,
@@ -231,6 +305,7 @@ public struct AgentModelHistoryProjector: Sendable {
         }
         return AgentModelHistoryProjection(
             messages: ordered.flatMap(\.messages),
+            imageBindings: ordered.flatMap(\.imageBindings),
             realUserMessages: ordered.compactMap(\.realUser),
             baseCheckpoint: nil,
             latestCheckpoint: nil,
@@ -292,6 +367,9 @@ public struct AgentModelHistoryProjector: Sendable {
                 messages: alreadyRetained
                     ? Array(legacy.messages.dropFirst())
                     : legacy.messages,
+                imageBindings: alreadyRetained
+                    ? Array(legacy.imageBindings.dropFirst())
+                    : legacy.imageBindings,
                 realUser: alreadyRetained ? nil : legacy.realUser))
         }
         suffixTurns.sort {
@@ -312,6 +390,9 @@ public struct AgentModelHistoryProjector: Sendable {
         }
         return AgentModelHistoryProjection(
             messages: base.messages + suffixTurns.flatMap(\.messages),
+            imageBindings:
+                base.imageBindings
+                + suffixTurns.flatMap(\.imageBindings),
             realUserMessages: realUsers,
             baseCheckpoint: AgentModelHistoryCheckpointCursor(
                 sequence: checkpoint.sequence,
@@ -395,6 +476,12 @@ public struct AgentModelHistoryProjector: Sendable {
                                 .user(legacy.userText),
                                 .assistant(legacy.assistantText),
                             ],
+                            imageBindings: [
+                                Self.legacyUserBinding(
+                                    accepted[legacy.submissionID]?
+                                        .payload.attachments),
+                                nil,
+                            ],
                             realUser: accepted[legacy.submissionID].map {
                                 acceptedSubmission in
                                 AgentModelHistoryRealUserMessage(
@@ -422,6 +509,9 @@ public struct AgentModelHistoryProjector: Sendable {
         return AgentModelHistoryProjection(
             messages: ordered.flatMap {
                 $0.messages
+            },
+            imageBindings: ordered.flatMap {
+                $0.imageBindings
             },
             realUserMessages: ordered.compactMap {
                 $0.realUser
@@ -512,6 +602,13 @@ public struct AgentModelHistoryProjector: Sendable {
                         .user(legacy.userText),
                         .assistant(legacy.assistantText),
                     ],
+                imageBindings: alreadyRetained
+                    ? [nil]
+                    : [
+                        Self.legacyUserBinding(
+                            acceptedUser?.attachments),
+                        nil,
+                    ],
                 realUser: alreadyRetained
                     ? nil
                     : acceptedUser.map {
@@ -545,6 +642,9 @@ public struct AgentModelHistoryProjector: Sendable {
             messages:
                 base.messages
                 + suffixTurns.flatMap(\.messages),
+            imageBindings:
+                base.imageBindings
+                + suffixTurns.flatMap(\.imageBindings),
             realUserMessages: realUsers,
             baseCheckpoint: AgentModelHistoryCheckpointCursor(
                 sequence: checkpoint.sequence,
@@ -575,6 +675,7 @@ public struct AgentModelHistoryProjector: Sendable {
         var acceptedSequence: Int
         var firstHistorySequence: Int
         var messages: [AgentMessage]
+        var imageBindings: [ProjectedImageBinding?]
         var realUser: AgentModelHistoryRealUserMessage?
     }
 
@@ -596,7 +697,13 @@ public struct AgentModelHistoryProjector: Sendable {
 
     private struct ReplacementProjection {
         var messages: [AgentMessage]
+        var imageBindings: [ProjectedImageBinding?]
         var realUserMessages: [AgentModelHistoryRealUserMessage]
+    }
+
+    private struct ProjectedInvocation {
+        var messages: [AgentMessage]
+        var imageBindings: [ProjectedImageBinding?]
     }
 
     private static func validatedCheckpointChain(
@@ -775,6 +882,7 @@ public struct AgentModelHistoryProjector: Sendable {
         }
 
         var messages: [AgentMessage] = []
+        var imageBindings: [ProjectedImageBinding?] = []
         var realUsers: [AgentModelHistoryRealUserMessage] = []
         var seenRealSubmissionIDs = Set<SubmissionID>()
         var contextualIndices: [Int] = []
@@ -838,6 +946,11 @@ public struct AgentModelHistoryProjector: Sendable {
                                 reason: "retained real user text does not match its source")
                     }
                 }
+                guard item.attachmentIDs == source.payload.attachments else {
+                    throw AgentModelHistoryProjectionError.invalidCheckpoint(
+                        sequence: checkpoint.sequence,
+                        reason: "retained real user attachments do not match their source")
+                }
                 if let explicitTarget = source.payload.to,
                    explicitTarget != agentID {
                     throw AgentModelHistoryProjectionError.invalidCheckpoint(
@@ -862,6 +975,7 @@ public struct AgentModelHistoryProjector: Sendable {
                     content: content,
                     submissionID: submissionID,
                     attachmentIDs: item.attachmentIDs,
+                    imageReferences: item.imageReferences,
                     contentTruncated: item.contentTruncated == true))
                 realUserIndices.append(index)
             } else if item.messageClassification == .contextual {
@@ -878,6 +992,14 @@ public struct AgentModelHistoryProjector: Sendable {
                     reason: "replacement item \(item.itemID) has an invalid classification")
             }
             messages.append(.user(content))
+            if let references = item.imageReferences {
+                imageBindings.append(.userVerified(references))
+            } else if item.messageClassification == .realUser {
+                imageBindings.append(Self.legacyUserBinding(
+                    item.attachmentIDs))
+            } else {
+                imageBindings.append(nil)
+            }
         }
         if !contextualIndices.isEmpty {
             guard let lastRealUserIndex = realUserIndices.last else {
@@ -898,6 +1020,7 @@ public struct AgentModelHistoryProjector: Sendable {
         }
         return ReplacementProjection(
             messages: messages,
+            imageBindings: imageBindings,
             realUserMessages: realUsers)
     }
 
@@ -1021,21 +1144,27 @@ public struct AgentModelHistoryProjector: Sendable {
             let hasRealUser = selected.contains {
                 Self.isRealUserMessage($0.payload)
             }
+            let projected = try projectInvocation(
+                acceptedUser:
+                    hasRealUser ? acceptedSubmission.payload : nil,
+                items: selected)
+            let verifiedReferences = selected.first(where: {
+                Self.isRealUserMessage($0.payload)
+            })?.payload.imageReferences
             result[submissionID] = ProjectedTurn(
                 acceptedSequence: acceptedSubmission.sequence,
                 firstHistorySequence:
                     selected.first?.sequence
                     ?? acceptedSubmission.sequence,
-                messages: try projectInvocation(
-                    acceptedUser:
-                        hasRealUser ? acceptedSubmission.payload : nil,
-                    items: selected),
+                messages: projected.messages,
+                imageBindings: projected.imageBindings,
                 realUser: hasRealUser
                     ? AgentModelHistoryRealUserMessage(
                         content: acceptedSubmission.payload.text,
                         submissionID: submissionID,
                         attachmentIDs:
-                            acceptedSubmission.payload.attachments)
+                            acceptedSubmission.payload.attachments,
+                        imageReferences: verifiedReferences)
                     : nil)
         }
         return result
@@ -1082,6 +1211,10 @@ public struct AgentModelHistoryProjector: Sendable {
                         firstHistorySequence:
                             completed?.sequence ?? source.sequence,
                         messages: messages,
+                        imageBindings: [
+                            Self.legacyUserBinding(
+                                source.payload.attachments),
+                        ] + (completed == nil ? [] : [nil]),
                         realUser:
                             AgentModelHistoryRealUserMessage(
                                 content: source.payload.text,
@@ -1112,6 +1245,9 @@ public struct AgentModelHistoryProjector: Sendable {
                     acceptedSequence: envelope.seq,
                     firstHistorySequence: envelope.seq,
                     messages: [.user(payload.text)],
+                    imageBindings: [
+                        Self.legacyUserBinding(payload.attachments),
+                    ],
                     realUser: nil))
 
             case .messageCompleted(let payload)
@@ -1127,6 +1263,7 @@ public struct AgentModelHistoryProjector: Sendable {
                     continue
                 }
                 turns[index].messages.append(.assistant(payload.text))
+                turns[index].imageBindings.append(nil)
 
             default:
                 continue
@@ -1227,21 +1364,27 @@ public struct AgentModelHistoryProjector: Sendable {
             let hasRealUser = selected.contains {
                 Self.isRealUserMessage($0.payload)
             }
+            let projected = try projectInvocation(
+                acceptedUser:
+                    hasRealUser ? acceptedSubmission.payload : nil,
+                items: selected)
+            let verifiedReferences = selected.first(where: {
+                Self.isRealUserMessage($0.payload)
+            })?.payload.imageReferences
             result[submissionID] = ProjectedTurn(
                 acceptedSequence: acceptedSubmission.sequence,
                 firstHistorySequence:
                     selected.first?.sequence
                     ?? acceptedSubmission.sequence,
-                messages: try projectInvocation(
-                    acceptedUser:
-                        hasRealUser ? acceptedSubmission.payload : nil,
-                    items: selected),
+                messages: projected.messages,
+                imageBindings: projected.imageBindings,
                 realUser: hasRealUser
                     ? AgentModelHistoryRealUserMessage(
                         content: acceptedSubmission.payload.text,
                         submissionID: submissionID,
                         attachmentIDs:
-                            acceptedSubmission.payload.attachments)
+                            acceptedSubmission.payload.attachments,
+                        imageReferences: verifiedReferences)
                     : nil)
         }
         return result
@@ -1295,15 +1438,20 @@ public struct AgentModelHistoryProjector: Sendable {
         allowsCheckpointContinuation: Bool = false
     ) throws -> [SequencedItem] {
         for item in items {
-            guard item.payload.schemaVersion == ModelHistoryItemPayload.currentSchemaVersion else {
+            guard item.payload.schemaVersion
+                    == ModelHistoryItemPayload.currentSchemaVersion
+                    || item.payload.schemaVersion
+                        == ModelHistoryItemPayload.mediaSchemaVersion else {
                 throw AgentModelHistoryProjectionError.unsupportedSchema(
                     itemID: item.payload.itemID,
                     version: item.payload.schemaVersion)
             }
-            if let attempt = item.payload.taskAttempt, attempt < 1 {
+            do {
+                try item.payload.validate()
+            } catch {
                 throw AgentModelHistoryProjectionError.invalidItem(
                     item.payload.itemID,
-                    "taskAttempt must be one-based")
+                    "payload failed v1/v2 structural validation")
             }
         }
 
@@ -1339,8 +1487,10 @@ public struct AgentModelHistoryProjector: Sendable {
     private static func projectInvocation(
         acceptedUser: UserMessagePayload?,
         items: [SequencedItem]
-    ) throws -> [AgentMessage] {
-        guard let first = items.first else { return [] }
+    ) throws -> ProjectedInvocation {
+        guard let first = items.first else {
+            return ProjectedInvocation(messages: [], imageBindings: [])
+        }
         let turnID = first.payload.turnID
         guard items.allSatisfy({ $0.payload.turnID == turnID }) else {
             throw AgentModelHistoryProjectionError.invalidItem(
@@ -1354,7 +1504,9 @@ public struct AgentModelHistoryProjector: Sendable {
         if let acceptedUser {
             guard userItems.count == 1,
                   let userContent = userItems[0].payload.content,
-                  userContent == acceptedUser.text else {
+                  userContent == acceptedUser.text,
+                  userItems[0].payload.attachmentIDs
+                    == acceptedUser.attachments else {
                 throw AgentModelHistoryProjectionError.invalidItem(
                     userItems.first?.payload.itemID
                         ?? first.payload.itemID,
@@ -1412,6 +1564,7 @@ public struct AgentModelHistoryProjector: Sendable {
         }
 
         var messages: [AgentMessage] = []
+        var imageBindings: [ProjectedImageBinding?] = []
         for item in items {
             switch item.payload.kind {
             case .message:
@@ -1430,6 +1583,12 @@ public struct AgentModelHistoryProjector: Sendable {
                             "a direct item cannot impersonate a compaction summary")
                     }
                     messages.append(.user(content))
+                    if let references = item.payload.imageReferences {
+                        imageBindings.append(.userVerified(references))
+                    } else {
+                        imageBindings.append(Self.legacyUserBinding(
+                            item.payload.attachmentIDs))
+                    }
                 case .assistant:
                     guard item.payload.messageClassification == nil else {
                         throw AgentModelHistoryProjectionError.invalidItem(
@@ -1437,6 +1596,7 @@ public struct AgentModelHistoryProjector: Sendable {
                             "assistant messages cannot carry a user classification")
                     }
                     messages.append(.assistant(content))
+                    imageBindings.append(nil)
                 }
 
             case .functionCallBatch:
@@ -1455,6 +1615,7 @@ public struct AgentModelHistoryProjector: Sendable {
                 messages.append(.assistant(
                     toolCalls: calls,
                     content: item.payload.content))
+                imageBindings.append(nil)
                 for call in calls {
                     let key = CallKey(turnID: turnID, callID: call.id)
                     let validOutputs = (outputsByKey[key] ?? []).filter {
@@ -1476,10 +1637,18 @@ public struct AgentModelHistoryProjector: Sendable {
                     }
                     switch call.kind {
                     case .function:
+                        let output = validOutputs.first?.payload
                         messages.append(.tool(
                             id: call.id,
-                            content: validOutputs.first?.payload.output
+                            content: output?.output
                                 ?? "aborted"))
+                        if let references = output?.imageReferences {
+                            imageBindings.append(.toolVerified(
+                                callID: call.id,
+                                imageReferences: references))
+                        } else {
+                            imageBindings.append(nil)
+                        }
                     case .toolSearch:
                         messages.append(.toolSearchOutput(
                             id: call.id,
@@ -1489,6 +1658,7 @@ public struct AgentModelHistoryProjector: Sendable {
                                     execution:
                                         call.execution ?? "client",
                                     tools: [])))
+                        imageBindings.append(nil)
                     }
                 }
 
@@ -1505,90 +1675,20 @@ public struct AgentModelHistoryProjector: Sendable {
                 continue
             }
         }
-        return messages
+        return ProjectedInvocation(
+            messages: messages,
+            imageBindings: imageBindings)
     }
 
     private static func validateShape(
         _ payload: ModelHistoryItemPayload
     ) throws {
-        func invalid(_ reason: String) throws -> Never {
+        do {
+            try payload.validate()
+        } catch {
             throw AgentModelHistoryProjectionError.invalidItem(
                 payload.itemID,
-                reason)
-        }
-
-        switch payload.kind {
-        case .message:
-            guard payload.role != nil,
-                  payload.content != nil,
-                  payload.functionCalls == nil,
-                  payload.callID == nil,
-                  payload.output == nil,
-                  payload.toolSearchOutput == nil else {
-                try invalid("message fields are inconsistent")
-            }
-            if payload.role == .assistant,
-               payload.messageClassification != nil {
-                try invalid("assistant message classification is inconsistent")
-            }
-            if payload.role == .user,
-               payload.messageClassification == .compactionSummary {
-                try invalid("direct history cannot contain a compaction summary")
-            }
-
-        case .functionCallBatch:
-            guard payload.role == nil,
-                  let calls = payload.functionCalls,
-                  !calls.isEmpty,
-                  payload.callID == nil,
-                  payload.output == nil,
-                  payload.toolSearchOutput == nil else {
-                try invalid("function-call batch fields are inconsistent")
-            }
-            for call in calls {
-                guard !call.callID.trimmingCharacters(
-                    in: .whitespacesAndNewlines).isEmpty,
-                      !call.name.trimmingCharacters(
-                        in: .whitespacesAndNewlines).isEmpty,
-                      isJSONObject(call.arguments) else {
-                    try invalid("function call has an invalid ID, name, or JSON argument object")
-                }
-            }
-
-        case .functionCallOutput:
-            guard payload.role == nil,
-                  payload.functionCalls == nil,
-                  let callID = payload.callID,
-                  !callID.trimmingCharacters(
-                    in: .whitespacesAndNewlines).isEmpty,
-                  payload.output != nil,
-                  payload.toolSearchOutput == nil else {
-                try invalid("function-call output fields are inconsistent")
-            }
-
-        case .toolSearchOutput:
-            guard payload.role == nil,
-                  payload.functionCalls == nil,
-                  payload.output == nil,
-                  let callID = payload.callID,
-                  !callID.trimmingCharacters(
-                    in: .whitespacesAndNewlines).isEmpty,
-                  let toolSearchOutput = payload.toolSearchOutput,
-                  !toolSearchOutput.status.trimmingCharacters(
-                    in: .whitespacesAndNewlines).isEmpty,
-                  !toolSearchOutput.execution.trimmingCharacters(
-                    in: .whitespacesAndNewlines).isEmpty else {
-                try invalid("tool-search output fields are inconsistent")
-            }
-
-        case .reasoning:
-            guard payload.role == nil,
-                  payload.functionCalls == nil,
-                  payload.callID == nil,
-                  payload.output == nil,
-                  payload.toolSearchOutput == nil else {
-                try invalid("reasoning fields are inconsistent")
-            }
+                "payload failed v1/v2 structural validation")
         }
     }
 
@@ -1607,6 +1707,15 @@ public struct AgentModelHistoryProjector: Sendable {
         payload.kind == .message
             && payload.role == .user
             && payload.messageClassification == .contextual
+    }
+
+    private static func legacyUserBinding(
+        _ attachmentIDs: [ArtifactID]?
+    ) -> ProjectedImageBinding? {
+        guard let attachmentIDs, !attachmentIDs.isEmpty else {
+            return nil
+        }
+        return .userLegacy(attachmentIDs)
     }
 
     private static func isJSONObject(_ string: String) -> Bool {
@@ -1733,6 +1842,7 @@ public enum AgentModelHistoryProjectionError:
     case missingUserItem(SubmissionID)
     case ambiguousCallID(String)
     case conflictingOutput(String)
+    case mediaBindingsRequireProjectionState
 
     public var errorDescription: String? {
         switch self {
@@ -1758,6 +1868,8 @@ public enum AgentModelHistoryProjectionError:
             return "Model history reused tool call ID \(callID) within one provider turn."
         case .conflictingOutput(let callID):
             return "Model history contains multiple outputs for tool call ID \(callID)."
+        case .mediaBindingsRequireProjectionState:
+            return "Model history contains durable image bindings; use projectState so media cannot be silently discarded."
         }
     }
 }

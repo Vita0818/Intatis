@@ -39,11 +39,13 @@ public struct ChatLoop: Sendable {
     }
 
     /// Send one user message and stream the assistant reply into the log.
+    /// Returns the durable sequence of this turn's completed terminal event.
+    @discardableResult
     public func send(_ userText: String,
                      images: [ImageAttachment] = [],
                      userMessage: UserMessagePayload? = nil,
                      userMessageDidPersist:
-                        (@Sendable () async -> Void)? = nil) async throws {
+                        (@Sendable () async -> Void)? = nil) async throws -> Int {
         let turnID = TurnID.new()
         let submissionID = userMessage?.submissionID
         let history = try await buildHistory()
@@ -97,10 +99,11 @@ public struct ChatLoop: Sendable {
                     citations: citations)))
             await appendTurnStats(start: start, firstTokenAt: firstTokenAt, usage: usage)
             try Task.checkCancellation()
-            try await log.append(.turnOutcome(TurnOutcomePayload(
+            let completed = try await log.append(.turnOutcome(TurnOutcomePayload(
                 turnID: turnID,
                 outcome: .completed,
                 submissionID: submissionID)))
+            return completed.seq
         } catch {
             let interrupted = IntatisCancellation.isCurrentTaskCancellation(error)
             if !interrupted {

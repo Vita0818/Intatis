@@ -13,6 +13,12 @@ private struct FakeHTTP2: HTTPByteStreaming {
     }
 }
 
+private struct FixedToolSecretResolver: SecretResolver {
+    func secret(for ref: KeychainRef) async throws -> String {
+        "test-key"
+    }
+}
+
 private struct ToolStreamAttempt {
     var chunks: [Data]
     var error: Error?
@@ -924,6 +930,275 @@ final class IntatisProvidersToolCallingTests: XCTestCase {
         XCTAssertEqual(img["type"], .string("image_url"))
         guard case .object(let imageURL)? = img["image_url"] else { return XCTFail() }
         XCTAssertEqual(imageURL["url"], .string("data:image/png;base64,QUJD"))
+    }
+
+    func testToolMessageImagesFlowIntoFunctionCallOutput() {
+        let image = ImageAttachment(
+            url: "data:image/png;base64,QUJD")
+
+        XCTAssertEqual(
+            AgentInputItem.from(messages: [
+                .tool(
+                    id: "call-1",
+                    content: "observation",
+                    images: [image]),
+            ]),
+            [
+                .functionCallOutput(
+                    callID: "call-1",
+                    output: "observation",
+                    images: [image]),
+            ])
+    }
+
+    func testUserAndFunctionOutputImagesRequireResponsesAPI() {
+        let image = ImageAttachment(
+            url: "data:image/png;base64,QUJD")
+
+        XCTAssertTrue(AgentRequest(
+            model: ModelID(rawValue: "m"),
+            messages: [.user("inspect", images: [image])],
+            tools: []).requiresResponsesAPI)
+        XCTAssertTrue(AgentRequest(
+            model: ModelID(rawValue: "m"),
+            messages: [
+                .tool(
+                    id: "call-1",
+                    content: "result",
+                    images: [image]),
+            ],
+            tools: []).requiresResponsesAPI)
+        XCTAssertFalse(AgentRequest(
+            model: ModelID(rawValue: "m"),
+            messages: [.user("text only")],
+            tools: []).requiresResponsesAPI)
+    }
+
+    func testFunctionOutputImagesUseResponsesWithoutToolSearchCapability()
+        throws {
+        let image = ImageAttachment(
+            url: "data:image/png;base64,QUJD")
+        let provider = OpenAIWireProvider(
+            endpoint: endpoint,
+            apiKey: "k",
+            http: FakeHTTP2(chunks: []),
+            toolCallingCapabilities:
+                ToolCallingProviderCapabilities(
+                    supportsFunctionOutputImageInput: true))
+
+        let encoded = try provider.buildAgentRequest(AgentRequest(
+            model: ModelID(rawValue: "m"),
+            messages: [
+                .tool(
+                    id: "call-1",
+                    content: "observation",
+                    images: [image]),
+            ],
+            tools: []))
+
+        XCTAssertEqual(encoded.url?.path, "/v1/responses")
+        let decoded = try JSONDecoder().decode(
+            JSONValue.self,
+            from: XCTUnwrap(encoded.httpBody))
+        guard case .object(let body) = decoded,
+              case .array(let input)? = body["input"],
+              case .object(let output)? = input.first,
+              case .array(let parts)? = output["output"] else {
+            return XCTFail("missing function output content")
+        }
+        XCTAssertEqual(output["type"], .string("function_call_output"))
+        XCTAssertEqual(output["call_id"], .string("call-1"))
+        XCTAssertEqual(parts, [
+            .object([
+                "type": .string("input_text"),
+                "text": .string("observation"),
+            ]),
+            .object([
+                "type": .string("input_image"),
+                "image_url": .string(image.url),
+            ]),
+        ])
+    }
+
+    func testUserImagesUseResponsesWithoutToolSearchCapability()
+        throws {
+        let image = ImageAttachment(
+            url: "data:image/png;base64,QUJD")
+        let provider = OpenAIWireProvider(
+            endpoint: endpoint,
+            apiKey: "k",
+            http: FakeHTTP2(chunks: []),
+            toolCallingCapabilities:
+                ToolCallingProviderCapabilities(
+                    supportsUserImageInput: true))
+
+        let encoded = try provider.buildAgentRequest(AgentRequest(
+            model: ModelID(rawValue: "m"),
+            messages: [.user("inspect", images: [image])],
+            tools: []))
+
+        XCTAssertEqual(encoded.url?.path, "/v1/responses")
+        let decoded = try JSONDecoder().decode(
+            JSONValue.self,
+            from: XCTUnwrap(encoded.httpBody))
+        guard case .object(let body) = decoded,
+              case .array(let input)? = body["input"],
+              case .object(let message)? = input.first,
+              case .array(let parts)? = message["content"] else {
+            return XCTFail("missing user message content")
+        }
+        XCTAssertEqual(parts, [
+            .object([
+                "type": .string("input_text"),
+                "text": .string("inspect"),
+            ]),
+            .object([
+                "type": .string("input_image"),
+                "image_url": .string(image.url),
+            ]),
+        ])
+    }
+
+    func testPureImageFunctionOutputOmitsEmptyTextPlaceholder() {
+        let images = [
+            ImageAttachment(url: "data:image/png;base64,QUJD"),
+            ImageAttachment(url: "data:image/jpeg;base64,REVG"),
+        ]
+
+        guard case .object(let output)? =
+            OpenAIWireProvider.responsesInputJSON(
+                .functionCallOutput(
+                    callID: "call-1",
+                    output: "",
+                    images: images)),
+              case .array(let parts)? = output["output"] else {
+            return XCTFail("missing function output content")
+        }
+        XCTAssertEqual(parts, images.map {
+            .object([
+                "type": .string("input_image"),
+                "image_url": .string($0.url),
+            ])
+        })
+    }
+
+    func testImageCapabilityFailuresAreTypedAndPrecedeTransport()
+        async {
+        let image = ImageAttachment(
+            url: "data:image/png;base64,QUJD")
+        let http = SequencedToolHTTP(attempts: [
+            ToolStreamAttempt(
+                chunks: [Data("data: [DONE]\n\n".utf8)]),
+        ])
+        let provider = OpenAIWireProvider(
+            endpoint: endpoint,
+            apiKey: "k",
+            http: http)
+
+        do {
+            for try await _ in provider.stream(AgentRequest(
+                model: ModelID(rawValue: "m"),
+                messages: [.user("inspect", images: [image])],
+                tools: [])) {}
+            XCTFail("expected user-image capability failure")
+        } catch {
+            XCTAssertEqual(
+                error as? ToolCallingProviderCapabilityError,
+                .userImageInputUnsupported)
+        }
+        XCTAssertEqual(http.attemptCount, 0)
+
+        XCTAssertThrowsError(try provider.buildAgentRequest(AgentRequest(
+            model: ModelID(rawValue: "m"),
+            messages: [
+                .tool(
+                    id: "call-1",
+                    content: "",
+                    images: [image]),
+            ],
+            tools: []))) { error in
+            XCTAssertEqual(
+                error as? ToolCallingProviderCapabilityError,
+                .functionOutputImageInputUnsupported)
+        }
+        XCTAssertEqual(http.attemptCount, 0)
+    }
+
+    func testRegistryEnablesImageInputOnlyForNativeOpenAIVisionRoute()
+        async throws {
+        let model = ModelID(rawValue: "vision-model")
+        func makeEndpoint(
+            id: String,
+            adapter: ProviderRequestAdapter,
+            capabilities: [Capability],
+            modelOverride: ProviderRequestAdapter? = nil
+        ) -> ProviderEndpoint {
+            ProviderEndpoint(
+                id: id,
+                baseURL: URL(string: "https://example.test/v1")!,
+                apiKeyRef: KeychainRef(service: "s", account: id),
+                wire: .openai,
+                requestAdapter: adapter,
+                modelRequestAdapters: modelOverride.map {
+                    [model.rawValue: $0]
+                } ?? [:],
+                modelCapabilities: [
+                    model.rawValue: capabilities,
+                ])
+        }
+        let endpoints = [
+            makeEndpoint(
+                id: "native-vision",
+                adapter: .openAI,
+                capabilities: [.toolCalling, .visionInput]),
+            makeEndpoint(
+                id: "native-text",
+                adapter: .openAI,
+                capabilities: [.toolCalling]),
+            makeEndpoint(
+                id: "compatible-vision",
+                adapter: .openAICompatible,
+                capabilities: [.toolCalling, .visionInput]),
+            makeEndpoint(
+                id: "overridden-compatible-vision",
+                adapter: .openAI,
+                capabilities: [.toolCalling, .visionInput],
+                modelOverride: .openAICompatible),
+        ]
+        let registry = ProviderRegistry(
+            config: ProviderConfig(
+                endpoints: endpoints,
+                models: ResolvedModels(
+                    chat: ModelRef(
+                        endpoint: "native-vision",
+                        model: model))),
+            resolver: FixedToolSecretResolver(),
+            http: FakeHTTP2(chunks: []))
+
+        for endpointID in ["native-vision"] {
+            let provider = try await registry.agentProvider(
+                for: ModelRef(endpoint: endpointID, model: model))
+            XCTAssertTrue(
+                provider.toolCallingCapabilities
+                    .supportsUserImageInput)
+            XCTAssertTrue(
+                provider.toolCallingCapabilities
+                    .supportsFunctionOutputImageInput)
+        }
+        for endpointID in [
+            "native-text",
+            "compatible-vision",
+            "overridden-compatible-vision",
+        ] {
+            let provider = try await registry.agentProvider(
+                for: ModelRef(endpoint: endpointID, model: model))
+            XCTAssertFalse(
+                provider.toolCallingCapabilities
+                    .supportsUserImageInput)
+            XCTAssertFalse(
+                provider.toolCallingCapabilities
+                    .supportsFunctionOutputImageInput)
+        }
     }
 
     func testChatMessageWithImageEncodesAsContentArray() {

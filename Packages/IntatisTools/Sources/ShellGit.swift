@@ -121,6 +121,7 @@ public struct ProcessShellRunner: ShellRunner {
             environment: [:],
             timeoutSeconds: timeoutSeconds,
             terminationGraceSeconds: terminationGraceSeconds,
+            maximumGeneratedFileBytes: maximumOutputBytes,
             maximumOutputBytes: maximumOutputBytes)
     }
 }
@@ -169,7 +170,64 @@ struct StructuredProcessShellRunner: ShellRunner {
             environment: [:],
             timeoutSeconds: timeoutSeconds,
             terminationGraceSeconds: terminationGraceSeconds,
+            maximumGeneratedFileBytes: maximumOutputBytes,
             maximumOutputBytes: maximumOutputBytes)
+    }
+}
+
+/// Fixed, no-command-string boundary for document runtimes. The small shell
+/// shim used by `runWorkspaceProcess` only marks successful sandbox startup;
+/// backend arguments are passed as positional argv and are never evaluated as
+/// shell source.
+struct DocumentBackendProcessRunner: DocumentBackendRunner {
+    private let timeoutSeconds: TimeInterval
+    private let terminationGraceSeconds: TimeInterval
+    private let maximumOutputBytes: Int
+    private let workspaceLease: WorkspaceLease?
+
+    init(timeoutSeconds: TimeInterval = 300,
+         terminationGraceSeconds: TimeInterval = 0.5,
+         maximumOutputBytes: Int = 8 * 1_024 * 1_024,
+         workspaceLease: WorkspaceLease? = nil) {
+        self.timeoutSeconds = max(0.05, timeoutSeconds)
+        self.terminationGraceSeconds = max(0.05, terminationGraceSeconds)
+        self.maximumOutputBytes = max(1_024, maximumOutputBytes)
+        self.workspaceLease = workspaceLease
+    }
+
+    func run(_ invocation: DocumentBackendInvocation,
+             cwd: URL) async throws -> ShellResult {
+        #if os(macOS) || os(Linux)
+        let workspace = try validatedWorkspace(cwd)
+        let reviewedLease = try validateManagedWorkspaceAccess(
+            readablePaths: invocation.readableWorkspacePaths,
+            writablePaths: invocation.writableWorkspacePaths,
+            cwd: workspace,
+            workspaceLease: workspaceLease,
+            subject: "document")
+        let processLease = try documentProcessLease(
+            reviewedLease,
+            workspace: workspace,
+            reviewedWritablePaths: invocation.writableWorkspacePaths,
+            internalWritablePaths: invocation.internalWritableWorkspacePaths)
+        try validateDocumentBackendArguments(invocation)
+        return try await runWorkspaceProcess(
+            executable: try trustedDocumentExecutable(invocation.executable),
+            arguments: invocation.arguments,
+            cwd: workspace,
+            networkAccess: .denied,
+            trustedReadRoots: structuredRuntimeReadRoots(),
+            writableRoots: [],
+            workspaceLease: processLease,
+            environment: invocation.environment,
+            timeoutSeconds: timeoutSeconds,
+            terminationGraceSeconds: terminationGraceSeconds,
+            maximumGeneratedFileBytes: nil,
+            maximumOutputBytes: maximumOutputBytes)
+        #else
+        throw IntatisError.config(
+            "document backend execution is unavailable on this platform")
+        #endif
     }
 }
 
@@ -485,17 +543,18 @@ func effectiveWorkspaceLease(_ candidate: WorkspaceLease?,
 }
 
 @discardableResult
-func validateBrowserWorkspaceAccess(
+func validateManagedWorkspaceAccess(
     readablePaths: [String],
     writablePaths: [String],
     cwd: URL,
-    workspaceLease: WorkspaceLease?
+    workspaceLease: WorkspaceLease?,
+    subject: String
 ) throws -> WorkspaceLease {
     let workspace = try validatedWorkspace(cwd)
     let lease = try effectiveWorkspaceLease(workspaceLease, workspace: workspace)
     if writablePaths.isEmpty == false, lease.access != .readWrite {
         throw IntatisError.permissionDenied(
-            "browser execution requires a read-write workspace lease")
+            "\(subject) execution requires a read-write workspace lease")
     }
 
     for rawPath in readablePaths + writablePaths {
@@ -505,7 +564,7 @@ func validateBrowserWorkspaceAccess(
             workspaceLeasePath(relative, matches: $0, caseInsensitive: true)
         }) {
             throw IntatisError.permissionDenied(
-                "browser path is denied by the workspace lease: \(relative)")
+                "\(subject) path is denied by the workspace lease: \(relative)")
         }
         let allowed = lease.allowedPathRules.contains { rule in
             rule.pattern == "."
@@ -513,10 +572,132 @@ func validateBrowserWorkspaceAccess(
         }
         if allowed == false {
             throw IntatisError.permissionDenied(
-                "browser path is outside the workspace lease allow-list: \(relative)")
+                "\(subject) path is outside the workspace lease allow-list: \(relative)")
         }
     }
     return lease
+}
+
+@discardableResult
+func validateBrowserWorkspaceAccess(
+    readablePaths: [String],
+    writablePaths: [String],
+    cwd: URL,
+    workspaceLease: WorkspaceLease?
+) throws -> WorkspaceLease {
+    try validateManagedWorkspaceAccess(
+        readablePaths: readablePaths,
+        writablePaths: writablePaths,
+        cwd: cwd,
+        workspaceLease: workspaceLease,
+        subject: "browser")
+}
+
+private func documentProcessLease(
+    _ reviewedLease: WorkspaceLease,
+    workspace: URL,
+    reviewedWritablePaths: [String],
+    internalWritablePaths: [String]
+) throws -> WorkspaceLease {
+    guard internalWritablePaths.isEmpty == false else { return reviewedLease }
+    guard reviewedLease.access == .readWrite else {
+        throw IntatisError.permissionDenied(
+            "document staging requires a read-write workspace lease")
+    }
+    let reviewedParents = try reviewedWritablePaths.map {
+        try PathConfinement.resolve($0, within: workspace)
+            .deletingLastPathComponent()
+            .standardizedFileURL.path
+    }
+    guard reviewedParents.isEmpty == false else {
+        throw IntatisError.permissionDenied(
+            "document staging is not bound to a reviewed destination")
+    }
+
+    var processLease = reviewedLease
+    var patterns = Set(processLease.allowedPathRules.map(\.pattern))
+    for rawPath in internalWritablePaths {
+        let resolved = try PathConfinement.resolve(rawPath, within: workspace)
+        guard resolved.lastPathComponent.hasPrefix(".intatis-document-stage-") else {
+            throw IntatisError.permissionDenied(
+                "document backend received an invalid internal staging path")
+        }
+        let parent = resolved.deletingLastPathComponent().standardizedFileURL.path
+        guard reviewedParents.contains(parent) else {
+            throw IntatisError.permissionDenied(
+                "document staging path is not a sibling of a reviewed destination")
+        }
+        let relative = PathConfinement.relativePath(of: resolved, root: workspace)
+        if reviewedLease.deniedPatterns.contains(where: {
+            workspaceLeasePath(relative, matches: $0, caseInsensitive: true)
+        }) {
+            throw IntatisError.permissionDenied(
+                "document staging path is denied by the workspace lease")
+        }
+        if patterns.insert(relative).inserted {
+            processLease.allowedPathRules.append(PathRule(pattern: relative))
+        }
+    }
+    return processLease
+}
+
+private func validateDocumentBackendArguments(
+    _ invocation: DocumentBackendInvocation
+) throws {
+    guard invocation.arguments.allSatisfy({ !$0.contains("\0") }),
+          invocation.environment.keys.allSatisfy({ key in
+              !key.contains("\0")
+                  && key.range(
+                      of: #"^[A-Z][A-Z0-9_]{0,63}$"#,
+                      options: .regularExpression) != nil
+          }),
+          invocation.environment.values.allSatisfy({ !$0.contains("\0") }) else {
+        throw IntatisError.config("document backend invocation contains an unsafe argv or environment value")
+    }
+    let allowedEnvironment = Set([
+        "INTATIS_DOCUMENT_REQUEST",
+        "INTATIS_DOCUMENT_OPERATION",
+        "PYTHONHASHSEED",
+    ])
+    guard Set(invocation.environment.keys).isSubset(of: allowedEnvironment) else {
+        throw IntatisError.config(
+            "document backend invocation requested a non-allowlisted environment key")
+    }
+}
+
+private func trustedDocumentExecutable(
+    _ executable: DocumentBackendExecutable
+) throws -> URL {
+    let runtime = intatisDocumentRuntimeRoot()
+    let path: String?
+    switch executable {
+    case .pythonRuntime:
+        path = runtime?.appendingPathComponent("bin/python3").path
+    case .pdfcpu:
+        path = runtime?.appendingPathComponent("bin/pdfcpu").path
+    case .rbookHelper:
+        path = runtime?.appendingPathComponent("bin/intatis-rbook-helper").path
+    case .epubCheck:
+        path = runtime?.appendingPathComponent("bin/intatis-epubcheck").path
+    case .libreOffice:
+        #if os(macOS)
+        path = "/Applications/LibreOffice.app/Contents/MacOS/soffice"
+        #else
+        path = "/usr/bin/libreoffice"
+        #endif
+    case .libreOfficePython:
+        #if os(macOS)
+        path = "/Applications/LibreOffice.app/Contents/Resources/python"
+        #else
+        path = runtime?.appendingPathComponent("bin/libreoffice-python").path
+        #endif
+    }
+    guard let path,
+          FileManager.default.isExecutableFile(atPath: path) else {
+        throw IntatisError.config(
+            "document backend is unavailable at its fixed runtime path: \(executable.rawValue)")
+    }
+    return URL(fileURLWithPath: path)
 }
 
 private func workspaceLeasePath(_ path: String,
@@ -585,6 +766,7 @@ private func runWorkspaceProcess(executable: URL,
                                  environment: [String: String],
                                  timeoutSeconds: TimeInterval,
                                  terminationGraceSeconds: TimeInterval,
+                                 maximumGeneratedFileBytes: Int?,
                                  maximumOutputBytes: Int) async throws -> ShellResult {
     let workspace = try validatedWorkspace(cwd)
     let lease = try effectiveWorkspaceLease(workspaceLease, workspace: workspace)
@@ -632,7 +814,7 @@ private func runWorkspaceProcess(executable: URL,
             executable: executable,
             arguments: arguments,
             startupMarker: startupMarkerURL,
-            maximumOutputBytes: maximumOutputBytes),
+            maximumGeneratedFileBytes: maximumGeneratedFileBytes),
         environment: sanitized)
     sandboxBackend = .macOSSandboxExec
     #elseif os(Linux)
@@ -658,7 +840,7 @@ private func runWorkspaceProcess(executable: URL,
             environment: sanitized,
             networkAccess: networkAccess,
             startupMarker: startupMarkerURL,
-            maximumOutputBytes: maximumOutputBytes),
+            maximumGeneratedFileBytes: maximumGeneratedFileBytes),
         environment: sanitized)
     sandboxBackend = .bubblewrap
     #endif
@@ -953,11 +1135,17 @@ func sanitizedProcessEnvironment(home: URL, temporary: URL) -> [String: String] 
 func limitedExecutionArguments(executable: URL,
                                arguments: [String],
                                startupMarker: URL,
-                               maximumOutputBytes: Int) -> [String] {
-    let blocks = max(2, maximumOutputBytes / 512)
+                               maximumGeneratedFileBytes: Int?) -> [String] {
+    let limitCommand: String
+    if let maximumGeneratedFileBytes {
+        let blocks = max(2, maximumGeneratedFileBytes / 512)
+        limitCommand = "ulimit -f \(blocks) 2>/dev/null; "
+    } else {
+        limitCommand = ""
+    }
     return [
         "/bin/sh", "-c",
-        "marker=$1; shift; printf 1 > \"$marker\" || exit 125; rm -f -- \"$marker\" || exit 125; ulimit -f \(blocks) 2>/dev/null; exec \"$@\"",
+        "marker=$1; shift; printf 1 > \"$marker\" || exit 125; rm -f -- \"$marker\" || exit 125; \(limitCommand)exec \"$@\"",
         "intatis-managed", startupMarker.path, executable.path,
     ] + arguments
 }
@@ -977,6 +1165,7 @@ func structuredRuntimeReadRoots() -> [URL] {
         "/opt/homebrew",
         "/usr/local",
         "/Library/TeX",
+        "/Library/Frameworks/Python.framework",
         "/Applications/LibreOffice.app",
         "/Applications/Google Chrome.app",
         "/Applications/Microsoft Edge.app",
@@ -1225,7 +1414,7 @@ func bubblewrapArguments(workspace: URL,
                          environment: [String: String],
                          networkAccess: WorkspaceNetworkAccess,
                          startupMarker: URL,
-                         maximumOutputBytes: Int) -> [String] {
+                         maximumGeneratedFileBytes: Int?) -> [String] {
     let baseRoots = ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc/ssl", "/etc/pki",
                      "/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf"]
         .filter { FileManager.default.fileExists(atPath: $0) }
@@ -1268,7 +1457,7 @@ func bubblewrapArguments(workspace: URL,
         executable: executable,
         arguments: arguments,
         startupMarker: startupMarker,
-        maximumOutputBytes: maximumOutputBytes))
+        maximumGeneratedFileBytes: maximumGeneratedFileBytes))
     return result
 }
 #elseif !os(macOS)
@@ -2078,6 +2267,7 @@ public struct ProcessGitService: GitService {
             environment: gitEnvironment(),
             timeoutSeconds: timeoutSeconds,
             terminationGraceSeconds: 0.5,
+            maximumGeneratedFileBytes: 8 * 1_024 * 1_024,
             maximumOutputBytes: 8 * 1_024 * 1_024)
         if checked, result.exitCode != 0 {
             let message = summarize(result, fallback: "exit \(result.exitCode)")

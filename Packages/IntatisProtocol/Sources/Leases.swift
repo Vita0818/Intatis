@@ -5,12 +5,20 @@ public enum ToolCapability: String, Codable, Sendable, Hashable {
     case readWorkspace = "read_workspace"
     case listWorkspace = "list_workspace"
     case searchWorkspace = "search_workspace"
+    case searchKnowledge = "search_knowledge"
+    case buildKnowledge = "build_knowledge"
     case runShell = "run_shell"
     case gitControl = "git_control"
     case gitRemote = "git_remote"
     case proposePatch = "propose_patch"
     case applyPatch = "apply_patch"
     case readPDF = "read_pdf"
+    case documentRead = "document_read"
+    case documentOCR = "document_ocr"
+    case documentRender = "document_render"
+    case documentExportPDF = "document_export_pdf"
+    case documentWrite = "document_write"
+    // Legacy decode-only capabilities. Fresh leases must not issue them.
     case readDocument = "read_document"
     case editPDF = "edit_pdf"
     case reconstructDocument = "reconstruct_document"
@@ -137,9 +145,11 @@ public struct CapabilityLease: Codable, Sendable, Hashable {
                 .gitControl,
                 .gitRemote,
                 .applyPatch,
-                .readDocument,
-                .editPDF,
-                .reconstructDocument,
+                .documentRead,
+                .documentOCR,
+                .documentRender,
+                .documentExportPDF,
+                .documentWrite,
                 .compileLaTeX,
                 .generateMedia,
                 .browseWeb,

@@ -11,6 +11,7 @@ import Musl
 public enum DurableOwnerOnlyFileError: Error, LocalizedError, Equatable, Sendable {
     case unsafeFile
     case readFailed
+    case fileTooLarge
     case writeFailed
     /// `rename(2)` completed, but the caller could not prove the installed
     /// bytes and directory entry durable. The destination may contain either
@@ -25,6 +26,8 @@ public enum DurableOwnerOnlyFileError: Error, LocalizedError, Equatable, Sendabl
             return "The owner-only file is not a safe regular file."
         case .readFailed:
             return "The owner-only file could not be read."
+        case .fileTooLarge:
+            return "The owner-only file exceeds the permitted read size."
         case .writeFailed:
             return "The owner-only file could not be written durably."
         case .commitUncertain:
@@ -73,6 +76,30 @@ public enum DurableOwnerOnlyFile {
     }
 
     public static func read(from url: URL) throws -> Data? {
+        try read(from: url, maximumBytes: nil)
+    }
+
+    /// Reads an owner-only regular file without following its leaf and without
+    /// ever accumulating more than `maximumBytes` in memory. The limit is
+    /// checked against the opened descriptor before reading and again while the
+    /// same descriptor is consumed, so a concurrently growing file also fails
+    /// closed.
+    public static func read(
+        from url: URL,
+        maximumBytes: Int
+    ) throws -> Data? {
+        guard maximumBytes >= 0 else {
+            throw DurableOwnerOnlyFileError.readFailed
+        }
+        return try read(
+            from: url,
+            maximumBytes: Optional(maximumBytes))
+    }
+
+    private static func read(
+        from url: URL,
+        maximumBytes: Int?
+    ) throws -> Data? {
         let descriptor = open(url.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
         guard descriptor >= 0 else {
             if errno == ENOENT { return nil }
@@ -80,11 +107,20 @@ public enum DurableOwnerOnlyFile {
             throw DurableOwnerOnlyFileError.readFailed
         }
         defer { _ = close(descriptor) }
-        guard safeOwnerOnlyStatus(for: descriptor) != nil else {
+        guard let initialStatus = safeOwnerOnlyStatus(for: descriptor) else {
             throw DurableOwnerOnlyFileError.unsafeFile
+        }
+        if let maximumBytes,
+           (initialStatus.st_size < 0
+            || UInt64(initialStatus.st_size) > UInt64(maximumBytes)) {
+            throw DurableOwnerOnlyFileError.fileTooLarge
         }
 
         var result = Data()
+        if let maximumBytes {
+            result.reserveCapacity(
+                min(maximumBytes, 64 * 1_024))
+        }
         var buffer = [UInt8](repeating: 0, count: 64 * 1_024)
         while true {
             let count: Int = buffer.withUnsafeMutableBytes { rawBuffer in
@@ -103,6 +139,10 @@ public enum DurableOwnerOnlyFile {
             if count < 0 {
                 if errno == EINTR { continue }
                 throw DurableOwnerOnlyFileError.readFailed
+            }
+            if let maximumBytes,
+               count > maximumBytes - result.count {
+                throw DurableOwnerOnlyFileError.fileTooLarge
             }
             result.append(contentsOf: buffer.prefix(count))
         }

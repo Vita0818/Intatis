@@ -13,6 +13,28 @@ third-party names, logos, icons, screenshots, UI assets, trademarks, or brand
 copy as its product identity. Open-source reuse does not bypass Intatis'
 permission, workspace, event-log, secret, or Apple-platform boundaries.
 
+## Open Knowledge Format v0.2 standard
+
+Intatis pins the unmodified, self-contained Open Knowledge Format v0.2
+specification from `GoogleCloudPlatform/knowledge-catalog` at commit
+`3fcbb9f828c2f23d109c855ee403c3a4c81f3a96`. The adopted documentation is
+Apache License 2.0. The exact specification, license, upstream identities, and
+SHA-256 inventory are stored under
+`ThirdPartyStandards/OpenKnowledgeFormat/0.2/`; detailed scope and exclusions
+are recorded in `ThirdPartyNotices/OpenKnowledgeFormat.md`. The upstream
+reference agent, prompts, samples, viewer, Python runtime, and data bundles are
+not copied, linked, or executed.
+
+## Knowledge retrieval parser dependency
+
+The non-iOS `IntatisKnowledge` target uses **Yams 6.2.2**
+(`jpsim/Yams`, commit `a27b21e0c81c5bf42049b897a62aaf387e80f279`),
+including its in-package CYaml/libYAML sources, under the MIT License. It is an
+exact SwiftPM dependency with no external package dependencies. Provenance,
+runtime scope, parser-hardening boundaries, and the complete license are in
+`ThirdPartyNotices/KnowledgeRetrieval.md` and
+`ThirdPartyNotices/Licenses/Yams-6.2.2-MIT.txt`.
+
 ## OpenAI Codex Skill Creator derivative
 
 The project-local `.agents/skills/intatis-skill-creator/` Skill is a modified

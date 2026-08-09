@@ -1,7 +1,7 @@
 # ARCHITECTURE
 
 文档状态：当前架构规范
-最近核对：2026-08-08
+最近核对：2026-08-09
 产品基线：v0.40（build 40）
 
 文中较早的 v0.x 只表示能力最初引入或兼容格式冻结的里程碑；除明确标为历史的段落外，
@@ -1135,6 +1135,31 @@ voice 不创建 artifact，也不在用户 Send 前写 EventLog；其 exact rout
 - **UI 配色与跨平台设计语言**：macOS detail 由 `IntatisSystemCanvas` 使用 SwiftUI `.windowBackground`（macOS 13 fallback 为 `NSVisualEffectView.Material.windowBackground`）提供动态系统 window surface，`NavigationSplitView` sidebar 不再被自定义底色覆盖。`IntatisThreadStyle.intatisMac` / `.standard` 注入系统 `.primary` / `.secondary`、separator、accent 与错误语义；正常完成的 assistant/agent 正文直接继承系统 canvas，不叠 Material 或描边；用户消息、失败回复、数据卡片、权限和 artifact 等结构化内容层默认使用 `.regularMaterial`。composer、模型菜单、主要操作及确实需要融合的紧凑 action group 在 macOS 26 / iOS 26 使用 `glassEffect`、`GlassEffectContainer` 与 `.glass` / `.glassProminent`，旧系统走 Material / bordered control fallback；用户明确指定的 Cowork 紧凑 trailing status rail 是唯一内容层玻璃例外，权限、Agents、Goal、Tasks 各自使用独立原生 `Glass.clear` backdrop，不绘制固定灰框或自制玻璃，也不由一个会重组 shape 的 container 包住。macOS 与 iOS Chat composer 现在都采用共享两排结构：首排为关闭态只显示模型名的 interactive glass `Menu` 与可用 usage，第二排为当前产品面已有 action、输入、紧邻主操作左侧的 voice 和唯一 Send/Stop；iOS 仍只提供 paperclip Chat 功能菜单，不能伪造通用附件。iOS 将该排 `GlassEffectContainer` 的 merge spacing 固定为 0，保留 8pt 布局间距但禁止输入胶囊、voice 与 Send/Stop 物理融合；四个 icon action 都从 composer 专用 modifier 获得同一 40×40 外框，iOS 使用 `.small` 原生 control size，避免 `.regular` glass chrome 超出 40pt 并抬高中心线，macOS 继续使用本来就与 40pt 合拍的 `.regular`。主排继续 bottom alignment，保证多行输入只向上增长。macOS sidebar `Recent` 旁 `+` 使用 30×30 原生小型圆形 glass control；iOS 左抽屉使用同一品牌/模式/history/Settings 层级，并支持从 24pt 屏幕左缘、具有水平优势的右滑打开，避免抢占 transcript/TextField 的纵向或编辑手势。`IntatisTypography` 是两平台字体角色的单一实现：品牌、session 与页面级标题使用相同名义字号/字重的系统 serif，Chat 正文、输入和控件使用系统 sans，技术值使用系统 monospaced；iOS 只在这些共享名义值之上应用 Dynamic Type 缩放。Markdown/代码/公式继续保持 renderer 的语义字体。Glass 不铺页面或长内容。iOS 根视图与约 82% 抽屉继续使用系统容器背景，不复制参考应用固定渐变或另建平台私有底色。当前规范见 `docs/CURRENT_UI_COLOR_SYSTEM.md`；上一版方案独立保存在 `docs/UI_COLOR_SYSTEM.md`。
 - **GUI token/turn stats**：ChatLoop 与 AgentLoop 每轮结束追加 `turn_stats`，包含 endpoint 返回的 prompt/completion/total token（若有）、可选 cached prompt tokens、可选 context window tokens、TTFT、总耗时和 model。OpenAI-compatible `prompt_tokens_details.cached_tokens` 会进入 `Usage.cachedPromptTokens`；未缓存 input 可由 prompt-cached 在 UI 层展示。ChatLoop、AgentLoop 与 ProviderHealthCheck 共用 `Usage` 规则：同一次响应内的 usage chunk 字段级合并，Agent 工具循环中多个模型请求再按请求累计。GUI 不解析消息文本计算 token，而是通过共享 `TurnStatsProjection` 折叠最近一轮统计；macOS Chat / Code / Cowork 与 iOS Chat 均复用 `IntatisComposerUsageStrip` 在 composer 第一排右侧显示低噪音 usage，第一排左侧保留 model/profile。endpoint 不返回 cached/context usage 时，只显示可证明字段，不虚构数值。
 - **Chat/Code/Cowork session/history**：macOS `IntatisMacRootView` 通过 root-owned view models 和 `SessionHistoryStore.recentSessions(kind:)` 将当前 mode 的最近 sessions 投影到同一 sidebar navigation/session center；Chat 启动时优先恢复最近 Chat session，无历史时才使用 `sess_default`，Code/Cowork 在首次进入时创建对应 session。iOS `IOSAppEnvironment` 仍只恢复 Chat session，无历史时才使用 `sess_ios`。新建会话生成新的 `SessionID.new()`，打开独立 `EventLog` 与 artifact store，停止旧 view model 并重建当前 view model。恢复历史会话只切换到对应 `events.jsonl`，不会把新消息继续追加到旧的固定默认日志。macOS session row 的原生右键菜单支持 Rename/Delete；Code 与 Cowork `@main` 另可通过 `rename_session` 改当前会话，model 不提供 SessionID/kind。两条 Rename 路径都先追加 EventLog settings rename 事件并刷新派生 `<session>/session.json`，再通过 exact-session、revision/seq 有序的低频 publisher 更新所有窗口；不改目录名、`SessionID` 或既有 envelope。Delete 在二次确认后删除目标 session 目录及其 session-owned bookmark/settings/projection，不触碰绑定工作区内容，当前运行中的 session 禁止删除。路径与元数据规则在 `IntatisCore` 复用，平台层只传不同 application-support root。
+- **Chat 自动命名**：该能力是 Chat 宿主 metadata 流，不是 Tool，也不进入 `ChatLoop`、`AgentLoop`、
+  PermissionEngine、Code 或 Cowork。`ChatLoop.send` 只有在 assistant completion 与
+  `turn_outcome(completed)` 均已 durable append 后返回该 terminal 的 seq；`ChatViewModel` 随后把
+  本轮冻结的 exact `ResolvedChatRuntimeRoute` 与 completed seq 一起交给进程级
+  `ChatSessionAutoTitleCoordinator` 做轻量 admission，并立即清除主 Chat busy/Stop。协调器后台用
+  complete-known checked replay，但只投影 `seq <= completedThroughSeq` 的冻结 EventLog 前缀；因此
+  后续轮次即使先于后台 prepare 落盘，也不会进入旧 route 的标题上下文。冻结前缀从 session 起点
+  投影最早三个
+  可证明串行的 completed Chat segment；任何 orphan、交错、legacy 未终结或 agent/task 归因都
+  fail closed。标题 request 只含 Intatis 自有严格 System 指令，以及 user/assistant 正文字段合计最多
+  6,000 个 Swift `Character` 的 untrusted JSON 对话数据（JSON 结构和转义另有编码开销），使用同一
+  provider/model、`tools: []` 语义、无 web search/citation/附件、
+  不写消息 EventLog 或 turn stats。每进程、每 SessionID 最多三个逻辑 generation，single-flight；
+  preparation 与 pre-dispatch cancellation 不计次，只有同步创建 `provider.stream` 时才消费 attempt，
+  `ChatProvider.stream` 的公共合同要求立即返回 request-owned stream 并把 consumer termination 传播给
+  producer；阻塞式同步 provider 不属于该协议合同，任意 transport 的物理远端取消仍不作保证。
+  每次 15 秒；前两次可精确返回 `NO_TITLE` 等待下一成功回合，第三次必须返回标题。stream 必须恰好
+  一个 done 后正常 EOF，输出只做首尾 trim 与确定性 accept/reject，不做二次 AI/智能改写；通过
+  1–48 Character、格式、敏感内容、URL/path/长编号/长标识验收后，
+  `SessionProjectionStore.setAutomaticDisplayNameIfAbsent` 才在 EventLog 跨进程锁内为 Chat 追加一个
+  source=nil 的 rename settings revision，并 rebuild/read-back `session.json` 后发布 exact commit。
+  手工 Rename 在事务前或事务后都优先；自动 rename 不提升 recent activity。macOS 复用进程级
+  exact-session revision/seq publisher 与 runtime delete/Quit drain；iOS 使用稳定 per-session watermark
+  relay，因此 session A 的迟到 commit 只更新 A，不污染当前 B。所有标题失败静默，不改变主回合、
+  `errorText`、Stop、输入能力或 UI 错误状态；iOS 被系统强杀不承诺异步 drain。
 - **GUI provider catalog**：macOS `AppConfig` 与 iOS `IOSConfig` 使用 UserDefaults 主键 `intatis.providerCatalog.v1` 保存两层 mutable 配置。第一层 provider 存 `id` / 展示名 / `baseURL` / `chatEndpoint` / secret ref 元数据；第二层 model 存模型 id / 展示名。macOS Chat/Code 模型菜单把配置中的 variants 作为同一 model 的独立选择项；切换后只把 provider/model/variant identity 写入 `intatis.providerSelection.v1` 并重建 `ProviderRegistry`，Chat/Code 下一条请求使用新选择的基础 options + variant 覆盖。Cowork composer 复用同一份配置所编译的 secret-free `AppInferenceProfileOption` 列表，以 provider 分组显示“下一次 `@main`”的 exact 暂存项；三个产品面的弹出菜单均保留 provider 分组与 variant detail，但关闭态 label 只读取选中项的 model title。新 options 先交给 Orchestrator 更新 host-approved catalog，再发布到菜单，避免可见项与 admission catalog 竞态。工作中仍可选择，选择本身不 rebind，只有随后按下 Send 才把当时值冻结进该 submission；FIFO 执行边界把仅 `@main` 的 durable rebind 与对应 root queue admission 原子提交。既有 worker、当前/已冻结 task、控制面 agent 与未来新 agent 默认值均不跟随。Project Settings 的独立 exact-profile picker 仍只更新**未来新 agent 默认值**，逐 agent Rebind 继续用于显式修改其他空闲 ordinary agent。iOS 保持 provider/model 两层 Chat 选择。设置页编辑 Base URL 时自动生成 Chat endpoint；编辑 Chat endpoint 时清洗 `/chat/completions` 后缀回填 Base URL。旧 `intatis.baseURL` / `intatis.model` 仍作为迁移来源与兼容镜像。
 - **iOS imported Chat config**：iOS 不扫描 `INTATIS_CONFIG`、macOS home 或 app-support 候选路径；用户只能从 Chat 左抽屉底部 Settings 进入设置页，再经系统 Files picker 显式选择 JSON/JSONC。共享 `ChatConfigurationImporter` 解析 OpenCode-compatible `provider` map 与 legacy direct `providers`，执行 1 MiB/数量/字符串/HTTP(S) URL 边界检查，并只投影 iOS Chat 所需 provider/model/endpoint/options/adapter/capabilities。成功后不保留 security-scoped 外部 URL，也不监视或重写原文件，而是在 app Application Support 的 `Intatis/imported-chat-configuration.json` 写 schema-v1、complete-file-protection app-owned snapshot。直接 `options.apiKey` 先迁入同样受保护的 `Intatis/auth.json`，snapshot 与 UserDefaults 只保留 secret reference；环境变量/文件引用保持引用但导入结果会提示在 iOS 重新验证或录入。variants 当前被忽略并明确告警；未知 adapter 保留 exact identity并让既有 adapter gate 在网络前 fail closed，绝不静默改成 compatible。iOS root 持有 thread-only Chat 的唯一 `NavigationStack`，顶部 sidebar/session/new、左抽屉、底部两排 composer 和 Settings sheet 属于同一导航层级；model label 在 composer 第一排有界，不能把第二排 controls 推出屏幕。该路径不会扩大 iOS 的 7-product Chat-only linkage。
 - **Chat 搜索路由配置**：搜索运行时只有用户当前选择的 exact Chat route，不存在隐藏第二模型。`web_search_model` / `webSearchModel` 的后台路由语义已取消；兼容 decoder 可以接受并保留旧字段，但 runtime 忽略它，新生成配置不再主动写入，也不因字段存在显示警告或阻止普通 Chat。`responsesEndpoint`、URL、provider/model 名称同样不能证明兼容；能力来自受审声明和 exact adapter。设置表单、模型菜单和对话均不显示搜索状态或降级提示，durable stats/诊断关联当前实际执行的安全 provider/model identity。

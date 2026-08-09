@@ -303,11 +303,60 @@ final class ToolRegistryLeaseTests: XCTestCase {
         XCTAssertEqual(patchAuthorization.canonicalPermission, "filesystem.edit")
         XCTAssertEqual(writeAuthorization.actionPreview?.fields["content"], "a")
         XCTAssertTrue(patchAuthorization.actionPreview?.fields["diff"]?.contains("Add File: b.txt") == true)
-        XCTAssertEqual(writeAuthorization.concreteToolID, "intatis.cowork.v1/write_file")
-        XCTAssertEqual(patchAuthorization.concreteToolID, "intatis.cowork.v1/apply_patch")
+        XCTAssertEqual(writeAuthorization.concreteToolID, "intatis.cowork.v2/write_file")
+        XCTAssertEqual(patchAuthorization.concreteToolID, "intatis.cowork.v2/apply_patch")
         XCTAssertNotEqual(writeAuthorization.concreteToolID, patchAuthorization.concreteToolID)
         XCTAssertFalse(writeAuthorization.descriptorFingerprint.isEmpty)
         XCTAssertFalse(patchAuthorization.descriptorFingerprint.isEmpty)
+    }
+
+    func testDocumentCapabilitiesRegisterOnlyTheirExactReplacementTools() {
+        let expected: [(ToolCapability, String)] = [
+            (.readPDF, "read_pdf"),
+            (.documentRead, "document_read"),
+            (.documentOCR, "document_ocr"),
+            (.documentRender, "document_render"),
+            (.documentExportPDF, "document_export_pdf"),
+            (.documentWrite, "document_write"),
+        ]
+        let registry = Orchestrator.toolRegistry(
+            for: CapabilityLease(tools: Set(expected.map { $0.0 })))
+
+        XCTAssertEqual(registry.registryVersion, "intatis.cowork.v2")
+        XCTAssertEqual(Set(registry.descriptors().map(\.name)), Set(expected.map { $0.1 }))
+        for (capability, name) in expected {
+            XCTAssertEqual(
+                registry.registration(named: name)?.grantingCapabilities,
+                [capability])
+        }
+
+        let legacy = Orchestrator.toolRegistry(for: CapabilityLease(tools: [
+            .readDocument,
+            .editPDF,
+            .reconstructDocument,
+        ]))
+        XCTAssertTrue(legacy.descriptors().isEmpty)
+    }
+
+    func testDocumentProcessAccessIsSeparateFromMutationConflictAuthority() {
+        for capability in [ToolCapability.documentRead, .documentOCR] {
+            let lease = CapabilityLease(tools: [capability])
+            XCTAssertTrue(Orchestrator.requiresReadWriteWorkspaceAccess(lease))
+            XCTAssertFalse(Orchestrator.hasWorkspaceMutationCapability(lease))
+        }
+        for capability in [
+            ToolCapability.documentRender,
+            .documentExportPDF,
+            .documentWrite,
+        ] {
+            let lease = CapabilityLease(tools: [capability])
+            XCTAssertTrue(Orchestrator.requiresReadWriteWorkspaceAccess(lease))
+            XCTAssertTrue(Orchestrator.hasWorkspaceMutationCapability(lease))
+        }
+        XCTAssertFalse(Orchestrator.requiresReadWriteWorkspaceAccess(
+            CapabilityLease(tools: [.readPDF])))
+        XCTAssertFalse(Orchestrator.hasWorkspaceMutationCapability(
+            CapabilityLease(tools: [.readPDF])))
     }
 
     func testScopedRegistryFailsClosedForWrongLeaseAndDuplicateNames() throws {
@@ -423,7 +472,7 @@ final class ToolRegistryLeaseTests: XCTestCase {
                 }
             }
 
-        let wrongConcreteTool = try replacing("concreteToolID", with: "intatis.cowork.v1/other")
+        let wrongConcreteTool = try replacing("concreteToolID", with: "intatis.cowork.v2/other")
         XCTAssertThrowsError(try registry.validateAuthorizationSnapshot(
             wrongConcreteTool,
             toolName: "write_file",
@@ -656,11 +705,19 @@ final class ToolRegistryLeaseTests: XCTestCase {
         let registry = Orchestrator.toolRegistry(for: .worker(taskID: TaskID(rawValue: "task_worker")))
         let toolNames = Set(registry.descriptors().map(\.name))
 
+        XCTAssertEqual(registry.registryVersion, "intatis.cowork.v2")
         XCTAssertTrue(toolNames.contains("read_file"))
         XCTAssertTrue(toolNames.contains("read_pdf"))
         XCTAssertTrue(toolNames.contains("list_files"))
         XCTAssertTrue(toolNames.contains("search_text"))
+        XCTAssertFalse(toolNames.contains("document_read"))
+        XCTAssertFalse(toolNames.contains("document_ocr"))
+        XCTAssertFalse(toolNames.contains("document_render"))
+        XCTAssertFalse(toolNames.contains("document_export_pdf"))
+        XCTAssertFalse(toolNames.contains("document_write"))
+        XCTAssertFalse(toolNames.contains("read_document"))
         XCTAssertFalse(toolNames.contains("edit_pdf_pages"))
+        XCTAssertFalse(toolNames.contains("reconstruct_document_image"))
         XCTAssertFalse(toolNames.contains("compile_latex"))
         XCTAssertFalse(toolNames.contains("generate_image"))
         XCTAssertFalse(toolNames.contains("edit_image"))
@@ -732,8 +789,14 @@ final class ToolRegistryLeaseTests: XCTestCase {
         XCTAssertTrue(toolNames.contains("list_agents"))
         XCTAssertTrue(toolNames.contains("ask_agent"))
         XCTAssertTrue(toolNames.contains("read_pdf"))
-        XCTAssertTrue(toolNames.contains("edit_pdf_pages"))
-        XCTAssertTrue(toolNames.contains("reconstruct_document_image"))
+        XCTAssertTrue(toolNames.contains("document_read"))
+        XCTAssertTrue(toolNames.contains("document_ocr"))
+        XCTAssertTrue(toolNames.contains("document_render"))
+        XCTAssertTrue(toolNames.contains("document_export_pdf"))
+        XCTAssertTrue(toolNames.contains("document_write"))
+        XCTAssertFalse(toolNames.contains("read_document"))
+        XCTAssertFalse(toolNames.contains("edit_pdf_pages"))
+        XCTAssertFalse(toolNames.contains("reconstruct_document_image"))
         XCTAssertTrue(toolNames.contains("compile_latex"))
         XCTAssertTrue(toolNames.contains("generate_image"))
         XCTAssertTrue(toolNames.contains("edit_image"))

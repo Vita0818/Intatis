@@ -1,7 +1,7 @@
 # TESTING
 
 文档状态：当前验证矩阵
-最近核对：2026-08-08
+最近核对：2026-08-09
 产品基线：v0.40（build 40）
 
 历史测试数量、性能数字和事故复验保留在 Git 历史及 dated reports；它们不能替代当前
@@ -75,6 +75,30 @@ workspace ceiling，reviewer provider 只在完整 host validation 后被调用�
 
 MCP、browser、managed terminal、OAuth、real provider 和设备测试中明确标为 opt-in 的项目，
 必须在具备相应 runtime/credential/网络的环境单独执行。
+
+### Chat 自动命名专项
+
+涉及 Chat 自动命名、session set-if-absent 或 ChatViewModel 自动标题接线时，至少运行：
+
+```sh
+swift test --filter ChatSessionAutoTitleTests
+swift test --filter ChatAutoTitleViewModelTests
+swift test
+```
+
+专项必须覆盖成功回合才触发、主回合失败/取消不触发、同一 exact provider/model 的隐藏两消息请求、
+无 tools/web search/citation/附件、冻结 completed seq 前缀且旧 route 不读取后续轮次、最早三个可证明
+completed segment、歧义 fail closed、user/assistant 正文字段合计 6,000 个 Swift
+`Character` 上下文预算（JSON 编码开销不计入）、前三次 attempt/`NO_TITLE`、single-flight/pending/timeout、官方 provider 在首个
+response byte 前至多一次 transport retry 且不额外消耗逻辑 attempt、收到 byte 后不 retry、严格
+done/EOF 与格式/敏感内容 validator、Chat-only EventLog set-if-absent、手工 Rename 竞争、跨 runtime
+attempt ledger、pre-stream cancel 不计次、ineligible 后消费较新 pending、recent 排序不变、Chat
+消息/error/busy 隔离、官方 provider request-owned stream termination，以及 shutdown cancel+await。
+
+macOS/iOS host 另须确认 verified commit 发布时 EventLog 与读回 projection 已存在；重复/迟到
+revision+seq 被丢弃；iOS 在 A→B 后收到 A commit 只更新 A row/header，不改变 B；目标依赖图仍是
+7-product Chat 子集。真实 provider smoke 要另外记录 provider/model、是否首轮命名、15 秒可见性与
+失败静默；单元测试和编译不能替代该联网产品验收。
 
 ## Apple App 构建
 
@@ -195,6 +219,9 @@ recovery App metadata/architecture/signature/entitlements 重新验证；超时�
 
 - macOS/iOS Light 与 Dark；
 - Chat/Code/Cowork session 切换、16-row paging、Earlier/Newer/Latest；
+- macOS/iOS 新建未命名 Chat：首个有主题成功回合后标题在 15 秒内出现；简单问候可先保留默认名，
+  后续有主题回合再命名；标题生成期间可立即继续 Send，Stop 只控制当前主回合；手工 Rename 在生成
+  前/中/后均不得被自动标题覆盖；iOS 快速 A→B 时 A 的迟到标题只更新 A；
 - Cowork 默认查看 `@main`；右侧 ordinary agent 点击后只出现该 agent 内容；
   detach 当前 agent 后它仍留在同一列表、状态图标变为 detached、选择和历史页不跳回 main，
   且所有运行时操作禁用；`@permission-reviewer` 为 status-only；两个窗口选择互不覆盖；切走再

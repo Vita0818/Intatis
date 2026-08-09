@@ -402,6 +402,7 @@ public actor Orchestrator {
     private let resolvedInferenceFor: (@Sendable (Agent) async throws -> ResolvedInferenceProfile)?
     private let providerFor: @Sendable (Agent) async throws -> ToolCallingProvider
     private let imageGeneratorFor: @Sendable (Agent) async -> ImageGenerationToolService?
+    private let imageResolver: AgentImageResolver?
     private let toolSnapshotProvider:
         ToolSnapshotProvider?
     private let sessionNaming: SessionNamingService?
@@ -442,6 +443,7 @@ public actor Orchestrator {
         inferenceProfileRoutingMetadata: [InferenceProfileRoutingMetadata] = [],
         requiresInferenceBindings: Bool = false,
         imageGeneratorFor: @escaping @Sendable (Agent) async -> ImageGenerationToolService? = { _ in nil },
+        imageResolver: AgentImageResolver? = nil,
         toolSnapshotProvider:
             ToolSnapshotProvider? = nil,
         sessionNaming: SessionNamingService? = nil,
@@ -468,6 +470,7 @@ public actor Orchestrator {
             inferenceProfileRoutingMetadata: inferenceProfileRoutingMetadata,
             requiresInferenceBindings: requiresInferenceBindings,
             imageGeneratorFor: imageGeneratorFor,
+            imageResolver: imageResolver,
             toolSnapshotProvider:
                 toolSnapshotProvider,
             sessionNaming: sessionNaming,
@@ -495,6 +498,7 @@ public actor Orchestrator {
         inferenceProfileRoutingMetadata: [InferenceProfileRoutingMetadata] = [],
         requiresInferenceBindings: Bool = true,
         imageGeneratorFor: @escaping @Sendable (Agent) async -> ImageGenerationToolService? = { _ in nil },
+        imageResolver: AgentImageResolver? = nil,
         toolSnapshotProvider:
             ToolSnapshotProvider? = nil,
         sessionNaming: SessionNamingService? = nil,
@@ -517,6 +521,7 @@ public actor Orchestrator {
             inferenceProfileRoutingMetadata: inferenceProfileRoutingMetadata,
             requiresInferenceBindings: requiresInferenceBindings,
             imageGeneratorFor: imageGeneratorFor,
+            imageResolver: imageResolver,
             toolSnapshotProvider:
                 toolSnapshotProvider,
             sessionNaming: sessionNaming,
@@ -545,6 +550,7 @@ public actor Orchestrator {
                 inferenceProfileRoutingMetadata: [InferenceProfileRoutingMetadata] = [],
                 requiresInferenceBindings: Bool = false,
                 imageGeneratorFor: @escaping @Sendable (Agent) async -> ImageGenerationToolService? = { _ in nil },
+                imageResolver: AgentImageResolver? = nil,
                 toolSnapshotProvider:
                     ToolSnapshotProvider? = nil,
                 sessionNaming: SessionNamingService? = nil,
@@ -618,6 +624,7 @@ public actor Orchestrator {
         self.resolvedInferenceFor = resolvedInferenceFor
         self.providerFor = providerFor
         self.imageGeneratorFor = imageGeneratorFor
+        self.imageResolver = imageResolver
         self.toolSnapshotProvider =
             toolSnapshotProvider
         self.sessionNaming = sessionNaming
@@ -7590,6 +7597,7 @@ public actor Orchestrator {
                     orchestrator: self)
                 : nil,
             imageGenerator: imageGenerator,
+            imageResolver: imageResolver,
             sessionNaming: agent.name == Self.mainAgentID ? sessionNaming : nil,
             capabilityLease: capabilityLease,
             workspaceLease: workspaceLease,
@@ -8815,7 +8823,7 @@ public actor Orchestrator {
         let defaultWorkspaceAccess = defaultWorkspaceLeaseIDs[assignee.name]
             .flatMap { workspaceLeases[$0]?.access } ?? .readOnly
         let workspaceAccess: WorkspaceAccess = defaultWorkspaceAccess == .readWrite
-            && defaultLease.map(Self.hasWorkspaceMutationCapability) == true
+            && defaultLease.map(Self.requiresReadWriteWorkspaceAccess) == true
             ? .readWrite
             : .readOnly
         var capabilityLease = defaultLease
@@ -10755,10 +10763,10 @@ public actor Orchestrator {
         }
     }
 
-    static func toolRegistry(for lease: CapabilityLease,
-                             agentID: AgentID? = nil,
-                             includesTerminal: Bool = true,
-                             canControlRun: Bool = false) -> ToolRegistry {
+    public static func toolRegistry(for lease: CapabilityLease,
+                                    agentID: AgentID? = nil,
+                                    includesTerminal: Bool = true,
+                                    canControlRun: Bool = false) -> ToolRegistry {
         var registrations: [ToolRegistration] = []
         func register(
             _ tools: [any Tool],
@@ -10780,8 +10788,20 @@ public actor Orchestrator {
         if lease.tools.contains(.readPDF) {
             register([ReadPDFTool()], granting: [.readPDF])
         }
-        if lease.tools.contains(.readDocument) {
-            register([ReadDocumentTool()], granting: [.readDocument])
+        if lease.tools.contains(.documentRead) {
+            register([DocumentReadTool()], granting: [.documentRead])
+        }
+        if lease.tools.contains(.documentOCR) {
+            register([DocumentOCRTool()], granting: [.documentOCR])
+        }
+        if lease.tools.contains(.documentRender) {
+            register([DocumentRenderTool()], granting: [.documentRender])
+        }
+        if lease.tools.contains(.documentExportPDF) {
+            register([DocumentExportPDFTool()], granting: [.documentExportPDF])
+        }
+        if lease.tools.contains(.documentWrite) {
+            register([DocumentWriteTool()], granting: [.documentWrite])
         }
         if lease.tools.contains(.listWorkspace) {
             register([ListFilesTool()], granting: [.listWorkspace])
@@ -10794,9 +10814,6 @@ public actor Orchestrator {
             // tools. Keep that alias here in the same entries used for model
             // schemas, host authorization, and executor lookup.
             register([WriteFileTool(), ApplyPatchTool()], granting: [.applyPatch])
-        }
-        if lease.tools.contains(.editPDF) {
-            register([EditPDFPagesTool()], granting: [.editPDF])
         }
         // `run_shell` remains unavailable. The two managed terminal tools use
         // an OS-enforced WorkspaceLease sandbox and an owner-bound process
@@ -10827,9 +10844,6 @@ public actor Orchestrator {
                 GitRemotesTool(), GitFetchTool(), GitPullFastForwardTool(),
                 GitPushTool(),
             ], granting: [.gitRemote])
-        }
-        if lease.tools.contains(.reconstructDocument) {
-            register([ReconstructDocumentImageTool()], granting: [.reconstructDocument])
         }
         if lease.tools.contains(.compileLaTeX) {
             register([CompileLaTeXTool()], granting: [.compileLaTeX])
@@ -10956,7 +10970,7 @@ public actor Orchestrator {
         }
         return ToolRegistry(
             registrations: registrations,
-            registryVersion: "intatis.cowork.v1")
+            registryVersion: "intatis.cowork.v2")
     }
 
     private static func canCoordinate(_ lease: CapabilityLease) -> Bool {
@@ -10971,16 +10985,28 @@ public actor Orchestrator {
         return max(1, min(Agent.defaultCoordinationDepth, budget.maxDepth + 1))
     }
 
-    private static func hasWorkspaceMutationCapability(_ lease: CapabilityLease) -> Bool {
+    static func hasWorkspaceMutationCapability(_ lease: CapabilityLease) -> Bool {
         !lease.tools.isDisjoint(with: [
             .applyPatch,
-            .readDocument,
-            .editPDF,
-            .reconstructDocument,
+            .documentRender,
+            .documentExportPDF,
+            .documentWrite,
             .compileLaTeX,
             .generateMedia,
             .gitControl,
         ])
+    }
+
+    /// A document reader or OCR engine may need a managed helper process even
+    /// though it does not mutate user files. Keep that process-access decision
+    /// separate from writer conflict detection so read-only document work is
+    /// never treated as an active workspace writer.
+    static func requiresReadWriteWorkspaceAccess(_ lease: CapabilityLease) -> Bool {
+        hasWorkspaceMutationCapability(lease)
+            || !lease.tools.isDisjoint(with: [
+                .documentRead,
+                .documentOCR,
+            ])
     }
 
     private static let defaultWorkerConstraints: [String] = [

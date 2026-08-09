@@ -8,6 +8,7 @@ import IntatisPermission
 import IntatisAgentKernel
 import IntatisCowork
 import IntatisSkills
+import IntatisArtifacts
 
 enum REPLExit { case quit; case switchTo(Mode) }
 
@@ -66,6 +67,31 @@ private func coworkSessionLog(workspace: URL) throws -> EventLog {
         fileURL: directory.appendingPathComponent("events.jsonl"))
 }
 
+private func sessionArtifactStore(_ log: EventLog) throws -> ArtifactStore {
+    try ArtifactStore(
+        root: log.sessionDirectoryURL
+            .appendingPathComponent(
+                "artifacts",
+                isDirectory: true))
+}
+
+private func preserveAgentImages(
+    _ images: [PendingImageAttachment],
+    in store: ArtifactStore
+) async throws -> [ArtifactID] {
+    var ids: [ArtifactID] = []
+    ids.reserveCapacity(images.count)
+    for image in images {
+        try Task.checkCancellation()
+        let ref = try await store.addAttachment(
+            name: image.name,
+            data: image.data,
+            mime: image.mime)
+        ids.append(ref.id)
+    }
+    return ids
+}
+
 /// Top-level mode driver: runs the current mode's REPL and relaunches when a
 /// `/mode` command asks to switch (so chat ⇄ code ⇄ cowork is live).
 func runMode(_ config: CLIConfig, mode startMode: Mode, workspace: URL) async throws {
@@ -109,6 +135,10 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
     var reasoning = config.reasoningEffort
     var pending = PendingAttachments()
     var log = try sessionLog()
+    var codeArtifactStore =
+        mode == .code
+            ? try sessionArtifactStore(log)
+            : nil
     var codeMCPHost =
         mode == .code
             ? MCPCLIInteractiveCodeHost(
@@ -246,6 +276,10 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
                             "CLI Code /clear replaced the exact session")
                 }
                 log = try sessionLog()
+                codeArtifactStore =
+                    mode == .code
+                        ? try sessionArtifactStore(log)
+                        : nil
                 codeMCPHost =
                     mode == .code
                         ? MCPCLIInteractiveCodeHost(
@@ -287,8 +321,27 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
                     reasoningEffort: reasoning,
                     includeUsage: config.includeUsage,
                     webSearch: route.webSearch)
-                    .send(sendText, images: sendImages)
+                    .send(
+                        sendText,
+                        images: sendImages.map(
+                            \.providerAttachment))
             case .code:
+                guard let codeArtifactStore else {
+                    throw IntatisError.config(
+                        "CLI Code artifact storage is unavailable.")
+                }
+                let attachmentIDs = try await preserveAgentImages(
+                    sendImages,
+                    in: codeArtifactStore)
+                let userMessage = UserMessagePayload(
+                    text: sendText,
+                    attachments: attachmentIDs.isEmpty
+                        ? nil
+                        : attachmentIDs,
+                    submissionID: SubmissionID.new(),
+                    turnID: TurnID.new())
+                let imageResolver = AgentImageResolution.resolver(
+                    store: codeArtifactStore)
                 let mcpActivation:
                     MCPCLIInteractiveCodeActivation?
                 if let codeMCPHost {
@@ -342,6 +395,7 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
                         imageGenerator:
                             ProviderImageGenerationToolService(
                                 registry: registry),
+                        imageResolver: imageResolver,
                         sessionNaming:
                             EventLogSessionNamingService(
                                 log: log,
@@ -378,7 +432,7 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
                         })
                     _ = try await loop.send(
                         sendText,
-                        images: sendImages)
+                        userMessage: userMessage)
                 } else {
                     let agent = Agent(
                         name:
@@ -413,6 +467,7 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
                         imageGenerator:
                             ProviderImageGenerationToolService(
                                 registry: registry),
+                        imageResolver: imageResolver,
                         sessionNaming:
                             EventLogSessionNamingService(
                                 log: log,
@@ -421,7 +476,7 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
                             workspaceLease)
                         .send(
                             sendText,
-                            images: sendImages)
+                            userMessage: userMessage)
                 }
             case .cowork:
                 break
@@ -475,6 +530,7 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
     let controlPlaneInference = CLIControlPlaneInferenceBinding()
     var pending = PendingAttachments()
     let log = try coworkSessionLog(workspace: workspace)
+    let artifactStore = try sessionArtifactStore(log)
     let coworkMCPHost =
         MCPCLIInteractiveCoworkHost(
             log: log,
@@ -502,6 +558,8 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
         },
         requiresInferenceBindings: true,
         imageGeneratorFor: { _ in ProviderImageGenerationToolService(registry: registry) },
+        imageResolver: AgentImageResolution.resolver(
+            store: artifactStore),
         toolSnapshotProvider: {
             agent,
             capabilityLease,
@@ -1248,17 +1306,43 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
             .isExplicit
         for file in pending.textFiles { message += "\n\n[attached file: \(file.name)]\n\(file.content)" }
         let images = pending.images
+        let attachmentIDs: [ArtifactID]
+        do {
+            attachmentIDs = try await preserveAgentImages(
+                images,
+                in: artifactStore)
+        } catch {
+            errOut(
+                "attachments could not be preserved: \(error.localizedDescription)\n")
+            continue
+        }
+        let mainInferenceBinding: AgentInferenceBinding?
+        if target == Orchestrator.mainAgentID {
+            guard let binding = await resolvableMainBinding() else {
+                errOut(
+                    "@main has no exact, resolvable inference profile; rebind it before sending\n")
+                continue
+            }
+            mainInferenceBinding = binding
+        } else {
+            mainInferenceBinding = nil
+        }
         pending.clear()
         spinner.start()
         _ = await goalRuntime.sendUserTurn(
             message,
             to: target,
-            images: images,
             userMessage: UserMessagePayload(
                 text: message,
+                attachments: attachmentIDs.isEmpty
+                    ? nil
+                    : attachmentIDs,
                 to: target,
                 tags: parsedInput.tags.isEmpty ? nil : parsedInput.tags,
-                goal: parsedInput.goal),
+                goal: parsedInput.goal,
+                submissionID: SubmissionID.new(),
+                mainAgentInferenceBinding: mainInferenceBinding,
+                turnID: TurnID.new()),
             explicitGoalIntent: explicitGoalIntent)
         spinner.stop()
     }

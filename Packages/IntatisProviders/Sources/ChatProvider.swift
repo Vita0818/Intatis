@@ -165,6 +165,14 @@ public enum ChatChunk: Equatable, Sendable {
 
 /// A model that can stream a chat completion. The only `Capability.chat` surface
 /// v0.1 needs. Concrete adapters (e.g. `OpenAIWireProvider`) conform per wire.
+///
+/// `stream(_:)` must return promptly with a request-owned stream. Conformers
+/// must move blocking network/provider work into that stream's producer and
+/// propagate consumer termination to the producer. Synchronously blocking in
+/// this method is outside the protocol contract: Chat hosts use the return as
+/// the request-dispatch boundary for cancellation, timeout, and attempt
+/// accounting. Propagation is cooperative and does not imply that an arbitrary
+/// transport can physically stop remote work instantaneously.
 public protocol ChatProvider: Sendable {
     func stream(_ request: ChatRequest) -> AsyncThrowingStream<ChatChunk, Error>
 }

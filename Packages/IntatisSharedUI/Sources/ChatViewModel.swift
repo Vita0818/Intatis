@@ -95,6 +95,7 @@ public final class ChatViewModel: ObservableObject {
     private let log: EventLog
     private var registry: ProviderRegistry
     private let composerAttachmentStore: IntatisComposerAttachmentStore?
+    private let autoTitleSession: ChatSessionAutoTitleSession?
     private var subscription: Task<Void, Never>?
     private var runningOperation: Task<Void, Never>?
     private var attachmentImportOperation: Task<Void, Never>?
@@ -108,10 +109,12 @@ public final class ChatViewModel: ObservableObject {
     public init(
         log: EventLog,
         registry: ProviderRegistry,
-        artifactStore: ArtifactStore? = nil
+        artifactStore: ArtifactStore? = nil,
+        autoTitleSession: ChatSessionAutoTitleSession? = nil
     ) {
         self.log = log
         self.registry = registry
+        self.autoTitleSession = autoTitleSession
         self.composerAttachmentStore = artifactStore.map {
             IntatisComposerAttachmentStore(store: $0)
         }
@@ -130,10 +133,12 @@ public final class ChatViewModel: ObservableObject {
         registry: ProviderRegistry,
         artifactStore: ArtifactStore? = nil,
         historyProjectionBuilder: ChatHistoryProjectionBuilder,
-        historySnapshotLoader: @escaping ChatHistorySnapshotLoader
+        historySnapshotLoader: @escaping ChatHistorySnapshotLoader,
+        autoTitleSession: ChatSessionAutoTitleSession? = nil
     ) {
         self.log = log
         self.registry = registry
+        self.autoTitleSession = autoTitleSession
         self.composerAttachmentStore = artifactStore.map {
             IntatisComposerAttachmentStore(store: $0)
         }
@@ -275,6 +280,23 @@ public final class ChatViewModel: ObservableObject {
             return
         }
         isShutdown = true
+        // Install the one-shot task before the first suspension. MainActor can
+        // re-enter while the shutdown body awaits the coordinator; a second
+        // caller must join this exact drain instead of starting another one.
+        let task = Task<Void, Never> { @MainActor [weak self] in
+            await self?.performShutdown(reason: reason)
+        }
+        shutdownTask = task
+        await task.value
+    }
+
+    private func performShutdown(reason: String) async {
+        // Close metadata admission before cancelling the main operation. A
+        // turn that is already crossing its success boundary can then never
+        // enqueue title work after this exact runtime starts shutting down.
+        if let autoTitleSession {
+            await autoTitleSession.closeAdmission()
+        }
         let runningSubscription = subscription
         subscription = nil
         runningSubscription?.cancel()
@@ -284,6 +306,11 @@ public final class ChatViewModel: ObservableObject {
         runningOperation?.cancel()
         attachmentImportOperation?.cancel()
         imageGenerationOperation?.cancel()
+        let autoTitleShutdown = autoTitleSession.map { session in
+            Task<Void, Never> {
+                await session.shutdown()
+            }
+        }
         let task = Task<Void, Never> { @MainActor [weak self] in
             #if canImport(AVFoundation)
             if let self { await self.voiceInput.shutdown() }
@@ -294,8 +321,8 @@ public final class ChatViewModel: ObservableObject {
             }
             if let imageGenerationOperation { await imageGenerationOperation.value }
             if let runningSubscription { await runningSubscription.value }
+            if let autoTitleShutdown { await autoTitleShutdown.value }
         }
-        shutdownTask = task
         await task.value
         self.runningOperation = nil
         self.attachmentImportOperation = nil
@@ -417,7 +444,7 @@ public final class ChatViewModel: ObservableObject {
                     model: route.model,
                     webSearch: route.webSearch,
                     attachmentResolver: attachmentResolver)
-                try await loop.send(
+                let completedThroughSeq = try await loop.send(
                     parsed.text,
                     images: images,
                     userMessage: userMessage,
@@ -426,6 +453,11 @@ public final class ChatViewModel: ObservableObject {
                             input: originalInput,
                             attachmentIDs: attachmentIDs)
                     })
+                if !Task.isCancelled, let autoTitleSession = self.autoTitleSession {
+                    await autoTitleSession.successfulTurn(
+                        using: route,
+                        completedThroughSeq: completedThroughSeq)
+                }
             } catch {
                 if IntatisCancellation.isCurrentTaskCancellation(error) {
                     self.errorText = nil

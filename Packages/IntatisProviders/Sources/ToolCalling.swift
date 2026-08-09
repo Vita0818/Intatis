@@ -219,8 +219,16 @@ public struct AgentMessage: Equatable, Sendable {
     public static func assistant(toolCalls: [ToolCall], content: String? = nil) -> AgentMessage {
         .init(role: .assistant, content: content, toolCalls: toolCalls)
     }
-    public static func tool(id: String, content: String) -> AgentMessage {
-        .init(role: .tool, content: content, toolCallId: id)
+    public static func tool(
+        id: String,
+        content: String,
+        images: [ImageAttachment] = []
+    ) -> AgentMessage {
+        .init(
+            role: .tool,
+            content: content,
+            toolCallId: id,
+            images: images)
     }
     public static func toolSearchOutput(
         id: String,
@@ -243,7 +251,10 @@ public enum AgentInputItem: Equatable, Sendable {
         content: String?,
         images: [ImageAttachment])
     case functionCall(ToolCall)
-    case functionCallOutput(callID: String, output: String)
+    case functionCallOutput(
+        callID: String,
+        output: String,
+        images: [ImageAttachment] = [])
     case toolSearchCall(
         callID: String,
         status: String?,
@@ -274,7 +285,8 @@ public enum AgentInputItem: Equatable, Sendable {
                let callID = message.toolCallId {
                 items.append(.functionCallOutput(
                     callID: callID,
-                    output: message.content ?? ""))
+                    output: message.content ?? "",
+                    images: message.images))
                 continue
             }
 
@@ -351,7 +363,7 @@ public struct AgentRequest: Sendable {
         inputItems ?? AgentInputItem.from(messages: messages)
     }
 
-    public var requiresResponsesAPI: Bool {
+    var requiresToolSearchCapability: Bool {
         if tools.contains(where: { $0.kind != .function }) {
             return true
         }
@@ -363,6 +375,30 @@ public struct AgentRequest: Sendable {
                 return false
             }
         }
+    }
+
+    var containsUserImageInput: Bool {
+        effectiveInputItems.contains { item in
+            guard case .message(let role, _, let images) = item else {
+                return false
+            }
+            return role == .user && !images.isEmpty
+        }
+    }
+
+    var containsFunctionOutputImageInput: Bool {
+        effectiveInputItems.contains { item in
+            guard case .functionCallOutput(_, _, let images) = item else {
+                return false
+            }
+            return !images.isEmpty
+        }
+    }
+
+    public var requiresResponsesAPI: Bool {
+        requiresToolSearchCapability
+            || containsUserImageInput
+            || containsFunctionOutputImageInput
     }
 }
 
@@ -383,9 +419,18 @@ public enum AgentChunk: Equatable, Sendable {
 /// without letting AgentKernel guess from a model name or endpoint URL.
 public struct ToolCallingProviderCapabilities: Equatable, Sendable {
     public let supportsToolSearch: Bool
+    public let supportsUserImageInput: Bool
+    public let supportsFunctionOutputImageInput: Bool
 
-    public init(supportsToolSearch: Bool = false) {
+    public init(
+        supportsToolSearch: Bool = false,
+        supportsUserImageInput: Bool = false,
+        supportsFunctionOutputImageInput: Bool = false
+    ) {
         self.supportsToolSearch = supportsToolSearch
+        self.supportsUserImageInput = supportsUserImageInput
+        self.supportsFunctionOutputImageInput =
+            supportsFunctionOutputImageInput
     }
 
     public static let chatCompletionsOnly =
@@ -399,11 +444,17 @@ public enum ToolCallingProviderCapabilityError:
     Error, Equatable, Sendable, LocalizedError
 {
     case toolSearchUnsupported
+    case userImageInputUnsupported
+    case functionOutputImageInputUnsupported
 
     public var errorDescription: String? {
         switch self {
         case .toolSearchUnsupported:
             return "The selected model/provider route does not support the Responses tool_search contract."
+        case .userImageInputUnsupported:
+            return "The selected model/provider route does not support user image input."
+        case .functionOutputImageInputUnsupported:
+            return "The selected model/provider route does not support function-output image input."
         }
     }
 }

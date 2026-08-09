@@ -39,9 +39,7 @@ struct IntatisMacComposerAttachmentAccessory: View {
             .disabled(isDisabled || isBusy)
 
             if !attachments.isEmpty {
-                Menu(IntatisLocalization.format(
-                    "%lld attached",
-                    Int64(attachments.count))) {
+                Menu {
                     ForEach(attachments) { attachment in
                         Button(IntatisLocalization.format(
                             "Remove %@",
@@ -49,9 +47,21 @@ struct IntatisMacComposerAttachmentAccessory: View {
                             onRemove(attachment.id)
                         }
                     }
+                } label: {
+                    HStack(spacing: 8) {
+                        Text(IntatisLocalization.format(
+                            "%lld attached",
+                            Int64(attachments.count)))
+                            .font(IntatisTypography.body(13, .semibold))
+                            .foregroundStyle(.primary)
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                            .accessibilityHidden(true)
+                    }
+                    .intatisComposerSelectionLabel()
                 }
-                .controlSize(.regular)
-                .menuStyle(.borderlessButton)
+                .intatisComposerSelectionMenu()
                 .accessibilityIdentifier(
                     "\(accessibilityPrefix).composer.attachments")
                 .disabled(isDisabled || isBusy)

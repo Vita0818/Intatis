@@ -85,6 +85,8 @@ targets:
       - package: Intatis
         product: IntatisTools
       - package: Intatis
+        product: IntatisKnowledge
+      - package: Intatis
         product: IntatisPermission
       - package: Intatis
         product: IntatisAgentKernel

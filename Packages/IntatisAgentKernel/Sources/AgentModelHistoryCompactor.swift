@@ -52,17 +52,20 @@ public struct AgentModelHistoryRealUserMessage: Equatable, Sendable {
     public var content: String
     public var submissionID: SubmissionID?
     public var attachmentIDs: [ArtifactID]?
+    public var imageReferences: [ModelHistoryImageReference]?
     public var contentTruncated: Bool
 
     public init(
         content: String,
         submissionID: SubmissionID? = nil,
         attachmentIDs: [ArtifactID]? = nil,
+        imageReferences: [ModelHistoryImageReference]? = nil,
         contentTruncated: Bool = false
     ) {
         self.content = content
         self.submissionID = submissionID
         self.attachmentIDs = attachmentIDs
+        self.imageReferences = imageReferences
         self.contentTruncated = contentTruncated
     }
 }

@@ -86,16 +86,28 @@ final class AppChatSessionRuntime {
     let log: EventLog
     let viewModel: ChatViewModel
 
-    init(sessionID: SessionID, registry: ProviderRegistry) throws {
-        self.sessionID = sessionID
-        self.log = try EventLog(
+    init(
+        sessionID: SessionID,
+        registry: ProviderRegistry,
+        autoTitleCoordinator: ChatSessionAutoTitleCoordinator,
+        onAutoTitleCommit: @escaping ChatSessionAutoTitleCommitHandler
+    ) throws {
+        let openedLog = try EventLog(
             session: sessionID,
             fileURL: AppConfig.sessionFile(sessionID))
         let store = try ArtifactStore(root: AppConfig.artifactsDir(sessionID))
-        self.viewModel = ChatViewModel(
-            log: log,
+        let autoTitleSession = autoTitleCoordinator.bind(
+            sessionID: sessionID,
+            log: openedLog,
+            onCommit: onAutoTitleCommit)
+        let model = ChatViewModel(
+            log: openedLog,
             registry: registry,
-            artifactStore: store)
+            artifactStore: store,
+            autoTitleSession: autoTitleSession)
+        self.sessionID = sessionID
+        self.log = openedLog
+        self.viewModel = model
         updateProviderRegistry(registry)
     }
 
@@ -153,6 +165,7 @@ final class AppSessionRuntimeManager: ObservableObject {
     let sessionActivitySettled = PassthroughSubject<AppSessionActivitySettlement, Never>()
     let sessionRuntimeStatusChanged = PassthroughSubject<AppSessionRuntimeStatusChange, Never>()
     private var chatRuntimes: [SessionID: AppChatSessionRuntime] = [:]
+    private let chatAutoTitleCoordinator = ChatSessionAutoTitleCoordinator()
     private var codeRuntimes: [SessionID: CodeViewModel] = [:]
     private var coworkRuntimes: [SessionID: CoworkSlot] = [:]
     private var mcpRuntimes: [AppSessionRuntimeKey: MCPSlot] = [:]
@@ -169,7 +182,7 @@ final class AppSessionRuntimeManager: ObservableObject {
     private var runtimePresentationStatuses: [
         AppSessionRuntimeKey: AppSessionRuntimePresentationStatus
     ] = [:]
-    private var sessionDisplayNameWatermarks: [AppSessionRuntimeKey: (revision: Int, seq: Int)] = [:]
+    private var sessionDisplayNameWatermarks = SessionDisplayNameWatermarks()
     private var removingKeys: Set<AppSessionRuntimeKey> = []
     private var shutdownBatch: BoundedSessionRuntimeShutdown?
     private(set) var shutdownReport: SessionRuntimeShutdownReport?
@@ -199,7 +212,19 @@ final class AppSessionRuntimeManager: ObservableObject {
         }
         let runtime = try AppChatSessionRuntime(
             sessionID: sessionID,
-            registry: registry)
+            registry: registry,
+            autoTitleCoordinator: chatAutoTitleCoordinator,
+            onAutoTitleCommit: { [weak self] commit in
+                guard commit.kind == .chat else { return }
+                await self?.publishSessionDisplayNameChange(
+                    AppSessionDisplayNameChange(
+                        key: AppSessionRuntimeKey(
+                            kind: .chat,
+                            sessionID: commit.sessionID),
+                        displayName: commit.displayName,
+                        settingsRevision: commit.settingsRevision,
+                        projectedThroughSeq: commit.projectedThroughSeq))
+            })
         chatRuntimes[sessionID] = runtime
         entries[key] = RuntimeEntry(
             isBusy: { runtime.isBusy },
@@ -514,16 +539,12 @@ final class AppSessionRuntimeManager: ObservableObject {
     /// projections out of order, so revision and sequence form a per-key
     /// high-watermark before any window is notified.
     func publishSessionDisplayNameChange(_ change: AppSessionDisplayNameChange) {
-        if let watermark = sessionDisplayNameWatermarks[change.key] {
-            guard change.settingsRevision > watermark.revision ||
-                    (change.settingsRevision == watermark.revision &&
-                     change.projectedThroughSeq > watermark.seq) else {
-                return
-            }
-        }
-        sessionDisplayNameWatermarks[change.key] = (
-            revision: change.settingsRevision,
-            seq: change.projectedThroughSeq)
+        guard sessionDisplayNameWatermarks.accept(
+            sessionID: change.key.sessionID,
+            kind: change.key.kind,
+            settingsRevision: change.settingsRevision,
+            projectedThroughSeq: change.projectedThroughSeq
+        ) else { return }
         sessionDisplayNameChanged.send(change)
     }
 
@@ -580,7 +601,9 @@ final class AppSessionRuntimeManager: ObservableObject {
         runtimeActivityStates.removeValue(forKey: key)
         runtimeSettlementObservations.removeValue(forKey: key)?.cancel()
         runtimeSettlementStates.removeValue(forKey: key)
-        sessionDisplayNameWatermarks.removeValue(forKey: key)
+        sessionDisplayNameWatermarks.remove(
+            sessionID: key.sessionID,
+            kind: key.kind)
         publishRuntimeStatus(key: key, status: nil)
         runtimeRemoved.send(key)
         if let storageError {

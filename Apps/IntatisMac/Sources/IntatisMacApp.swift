@@ -850,6 +850,7 @@ struct CodeSessionView: View {
     @State private var showMCPProjectSettings =
         false
     @State private var showMCPContent = false
+    @State private var showAttachmentImporter = false
     @Environment(\.colorScheme) private var scheme
 
     var body: some View {
@@ -883,6 +884,16 @@ struct CodeSessionView: View {
                             vm.pendingMCPExternalContextCount,
                         onCancel: {
                             vm.cancelPendingMCPExternalContexts()
+                        })
+                    IntatisMacComposerAttachmentAccessory(
+                        attachments: vm.draftAttachments,
+                        accessibilityPrefix: "code",
+                        isDisabled: vm.isWorking,
+                        onAttach: {
+                            showAttachmentImporter = true
+                        },
+                        onRemove: {
+                            vm.removeDraftAttachment($0)
                         })
                   }),
                   composerTrailingAction:
@@ -936,6 +947,10 @@ struct CodeSessionView: View {
                     minWidth: 980,
                     minHeight: 680)
             }
+            .intatisComposerAttachmentImport(
+                isPresented: $showAttachmentImporter,
+                onImport: { vm.importDraftAttachments($0) },
+                onFailure: { vm.reportAttachmentImportFailure($0) })
     }
 
 }

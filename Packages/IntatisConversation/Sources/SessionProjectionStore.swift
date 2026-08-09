@@ -524,6 +524,84 @@ public enum SessionProjectionStore {
             projection: projection)
     }
 
+    /// Installs the host-generated initial Chat title only while the canonical
+    /// session name is still absent. The absence check and settings append are
+    /// performed under EventLog's cross-process lock, so a user Rename that
+    /// wins before this transaction can never be overwritten.
+    ///
+    /// `nil` means no verified automatic-title commit should be published:
+    /// either a name already existed at the linearization point, or a newer
+    /// settings revision (for example a concurrent user Rename) won before the
+    /// derived projection was rebuilt and read back.
+    @discardableResult
+    public static func setAutomaticDisplayNameIfAbsent(
+        in log: EventLog,
+        kind: SessionKind,
+        displayName: String
+    ) async throws -> SessionDisplayNameUpdateResult? {
+        let session = await log.sessionID
+        guard kind == .chat, inferredKind(session) == .chat else {
+            throw SessionProjectionStoreError.sessionMismatch
+        }
+        guard let normalized = try normalizedDisplayName(displayName) else {
+            throw SessionProjectionStoreError.invalidDisplayName
+        }
+        let capture = SessionDisplayNameTransactionCapture()
+        let appended = try await log.appendSessionStateTransaction { envelopes in
+            let state = try foldSessionState(envelopes, session: session)
+            let effectiveKind = state.settings?.kind ?? kind
+            guard effectiveKind == kind else {
+                throw SessionProjectionStoreError.sessionMismatch
+            }
+            guard state.settings?.displayName == nil else {
+                return []
+            }
+            let revision = try nextRevision(after: state.settings?.revision)
+            capture.set(SessionDisplayNameTransactionValue(
+                previousDisplayName: nil,
+                displayName: normalized,
+                revision: revision))
+            return [.sessionSettingsUpdated(SessionSettingsUpdatedPayload(
+                revision: revision,
+                previousRevision: state.settings?.revision,
+                changeKind: .renamed,
+                kind: effectiveKind,
+                displayName: normalized,
+                renameOperationID: nil,
+                displayNameSource: nil,
+                cowork: state.settings?.cowork))]
+        }
+        guard !appended.isEmpty else { return nil }
+
+        let projection = try await rebuild(from: log)
+        guard let transaction = capture.get(),
+              projection.sessionID == session,
+              projection.kind == kind,
+              projection.projectedThroughSeq >= (appended.last?.seq ?? -1) else {
+            throw SessionProjectionStoreError.verificationFailed
+        }
+
+        guard projection.settingsRevision == transaction.revision,
+              projection.displayName == transaction.displayName else {
+            if let projectedRevision = projection.settingsRevision,
+               projectedRevision > transaction.revision,
+               projection.displayName != nil {
+                // A later explicit Rename is canonical. The automatic event
+                // remains valid history, but it must not emit a stale UI
+                // callback or attempt to restore its older title.
+                return nil
+            }
+            throw SessionProjectionStoreError.verificationFailed
+        }
+
+        return SessionDisplayNameUpdateResult(
+            previousDisplayName: transaction.previousDisplayName,
+            displayName: transaction.displayName,
+            revision: transaction.revision,
+            didAppend: true,
+            projection: projection)
+    }
+
     /// Imports a full legacy settings snapshot exactly once. Canonical append
     /// precedes legacy-key cleanup; callers remove old preferences only after
     /// this method returns a read-back-verified projection.

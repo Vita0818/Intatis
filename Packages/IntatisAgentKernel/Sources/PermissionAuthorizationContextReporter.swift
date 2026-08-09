@@ -24,6 +24,10 @@ struct PermissionAuthorizationReportingTurn: Sendable {
     var toolCalls: [ToolCall]
     var visibleUserMessages: [PermissionAuthorizationVisibleUserMessage]
     var currentSubmissionID: SubmissionID?
+
+    var containsMedia: Bool {
+        providerMessages.contains { !$0.images.isEmpty }
+    }
 }
 
 struct PermissionAuthorizationReporterResult: Sendable {

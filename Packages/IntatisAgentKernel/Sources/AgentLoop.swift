@@ -6,6 +6,7 @@ import IntatisTools
 import IntatisPermission
 import IntatisConversation
 import IntatisMCP
+import IntatisArtifacts
 
 public typealias ToolAuthorizationRevalidator = @Sendable (
     ResolvedToolAuthorization
@@ -65,6 +66,9 @@ public enum AgentLoopError: Error, Sendable, Equatable, LocalizedError {
     case toolExecutionRequiresManualReconciliation(tool: String, executionID: String, reason: String)
     case repeatedDeniedToolCall(tool: String)
     case unresolvedDeniedSideEffects([String])
+    case invalidEvidenceCitation(String)
+    case mediaOutputUnsupported(String)
+    case mediaOutputInvalid(String)
 
     public var errorDescription: String? {
         switch self {
@@ -82,6 +86,12 @@ public enum AgentLoopError: Error, Sendable, Equatable, LocalizedError {
             return "Agent repeatedly retried the identical denied tool call \(tool); the task was stopped to protect the automatic permission reviewer."
         case .unresolvedDeniedSideEffects(let actions):
             return "Agent invocation cannot complete because required side effects remain denied or failed: \(actions.joined(separator: "; "))."
+        case .invalidEvidenceCitation(let reason):
+            return "Agent invocation contains an invalid knowledge evidence citation: \(reason)"
+        case .mediaOutputUnsupported(let reason):
+            return "Tool media cannot be delivered to the selected model route: \(reason)"
+        case .mediaOutputInvalid(let reason):
+            return "Tool media failed durable validation: \(reason)"
         }
     }
 }
@@ -435,6 +445,7 @@ public struct AgentLoop: Sendable {
     private let goalManager: GoalManager?
     private let runController: RunController?
     private let imageGenerator: ImageGenerationToolService?
+    private let imageResolver: AgentImageResolver?
     private let sessionNaming: SessionNamingService?
     private let reasoningEffort: ReasoningEffort?
     private let includeUsage: Bool
@@ -467,6 +478,7 @@ public struct AgentLoop: Sendable {
                 goalManager: GoalManager? = nil,
                 runController: RunController? = nil,
                 imageGenerator: ImageGenerationToolService? = nil,
+                imageResolver: AgentImageResolver? = nil,
                 sessionNaming: SessionNamingService? = nil,
                 reasoningEffort: ReasoningEffort? = nil,
                 includeUsage: Bool = false,
@@ -498,6 +510,7 @@ public struct AgentLoop: Sendable {
         self.goalManager = goalManager
         self.runController = runController
         self.imageGenerator = imageGenerator
+        self.imageResolver = imageResolver
         self.sessionNaming = sessionNaming
         self.reasoningEffort = reasoningEffort
         self.includeUsage = includeUsage
@@ -598,6 +611,10 @@ public struct AgentLoop: Sendable {
                 maximumBytes:
                     MCPToolResultAggregateLimits
                         .maximumTurnBytes)
+        // Citation authority is intentionally request-local. Previous tool
+        // results may be visible in history, but their evidence IDs are never
+        // admitted into a new turn's registry.
+        var groundingEvidence = TurnGroundingEvidenceRegistry()
         // Stable Code/Cowork main-thread history must measure the exact tool
         // surface that the first ordinary provider request will receive. Freeze
         // that request-owned snapshot before pre-turn compaction, then consume
@@ -860,6 +877,12 @@ public struct AgentLoop: Sendable {
                !Self.finishReasonIsSuccessful(finishReason) {
                 throw AgentLoopError.incompleteFinishReason(finishReason)
             }
+            do {
+                try groundingEvidence.validateCitations(in: assistantText)
+            } catch {
+                throw AgentLoopError.invalidEvidenceCitation(
+                    RuntimeErrorPresentation.message(for: error))
+            }
 
             var completedResponseEvents: [Event] = []
             if !assistantText.isEmpty {
@@ -961,6 +984,14 @@ public struct AgentLoop: Sendable {
                 permissionAuthorizationUsage: permissionAuthorizationUsage)
             for (toolCall, observation) in zip(pendingToolCalls, observations) {
                 try Task.checkCancellation()
+                do {
+                    try groundingEvidence.record(
+                        toolName: toolCall.name,
+                        observation: observation)
+                } catch {
+                    throw AgentLoopError.invalidEvidenceCitation(
+                        RuntimeErrorPresentation.message(for: error))
+                }
                 if toolCall.kind == .toolSearch {
                     convo.append(.toolSearchOutput(
                         id: toolCall.id,
@@ -1411,6 +1442,29 @@ public struct AgentLoop: Sendable {
                 message: error.localizedDescription,
                 submissionID: submissionID)
         }
+        if let imageError = error as? ArtifactImageResolutionError {
+            return ErrorPayload(
+                code: imageError.code,
+                message: imageError.localizedDescription,
+                submissionID: submissionID)
+        }
+        if let capabilityError =
+            error as? ToolCallingProviderCapabilityError
+        {
+            let code: String
+            switch capabilityError {
+            case .toolSearchUnsupported:
+                code = "tool_search_unsupported"
+            case .userImageInputUnsupported:
+                code = "user_image_input_unsupported"
+            case .functionOutputImageInputUnsupported:
+                code = "media_output_unsupported"
+            }
+            return ErrorPayload(
+                code: code,
+                message: capabilityError.localizedDescription,
+                submissionID: submissionID)
+        }
         guard let loopError = error as? AgentLoopError else {
             var payload = RuntimeErrorPresentation.payload(for: error, fallbackCode: "agent")
             payload.submissionID = submissionID
@@ -1432,6 +1486,12 @@ public struct AgentLoop: Sendable {
             code = "repeated_denied_tool_call"
         case .unresolvedDeniedSideEffects:
             code = "unresolved_denied_side_effects"
+        case .invalidEvidenceCitation:
+            code = "invalid_evidence_citation"
+        case .mediaOutputUnsupported:
+            code = "media_output_unsupported"
+        case .mediaOutputInvalid:
+            code = "media_output_invalid"
         }
         return ErrorPayload(
             code: code,
@@ -1747,6 +1807,9 @@ public struct AgentLoop: Sendable {
                 validatedArguments: arguments,
                 forceRedaction: Self.redactsDurableArguments(for: descriptor.name))
         case .invalid(let message):
+            let invalidObservation = registration
+                .argumentValidationFailure(message: message)
+                ?? ToolObservation(text: message)
             try await appendDurableToolCall(
                 toolCall,
                 canonicalName: descriptor.name,
@@ -1761,12 +1824,17 @@ public struct AgentLoop: Sendable {
             try await appendToolCompletion(
                 [.toolResult(ToolResultPayload(
                     toolCallId: toolCall.id,
-                    observation: message,
+                    observation: invalidObservation.text,
+                    truncated: invalidObservation.truncated,
                     outcome: .failed,
                     failureSource: .runtimeFailed,
-                    turnID: turnID))],
+                    turnID: turnID,
+                    structuredResult: invalidObservation.structuredResult,
+                    provenance: invalidObservation.structuredResult?.content
+                        .compactMap(\.provenance)
+                        .first))],
                 toolCall: toolCall,
-                observation: message,
+                observation: invalidObservation.text,
                 modelHistoryScope: modelHistoryScope)
             await denialCircuitBreaker.recordDenial(signature: denialSignature)
             await sideEffectEvidence.recordDenied(
@@ -1777,7 +1845,7 @@ public struct AgentLoop: Sendable {
                     rawArguments: toolCall.arguments,
                     workspaceRoot: effectiveWorkspaceRoot),
                 authorization: nil)
-            return ToolObservation(text: message)
+            return invalidObservation
         }
 
         let args = ToolArgs(raw: normalizedArguments)
@@ -3077,6 +3145,10 @@ public struct AgentLoop: Sendable {
         case .askUser:
             let requestID = RequestID.new()
             let boundedArguments = "digest=\(authorization.normalizedArgumentsDigest); characters=\(authorization.normalizedArgumentsCharacterCount)"
+            let automaticMediaDenied =
+                context.runtimeEnvironment.mode == .cowork
+                && responder.approvalMode == .automaticReviewer
+                && authorizationReportingTurn.containsMedia
             var requestContext = permissionRequestContext(
                 outcome: outcome,
                 callContext: callContext,
@@ -3086,7 +3158,8 @@ public struct AgentLoop: Sendable {
                 executionID: executionID,
                 replayPolicy: replayPolicy)
             if context.runtimeEnvironment.mode == .cowork,
-               responder.approvalMode == .automaticReviewer {
+               responder.approvalMode == .automaticReviewer,
+               !automaticMediaDenied {
                 let reportResult = await PermissionAuthorizationContextReporter(
                     log: log,
                     provider: provider,
@@ -3116,6 +3189,37 @@ public struct AgentLoop: Sendable {
                 .permissionRequest(request),
                 .agentStatus(AgentStatusPayload(agent: agent.name, state: .blocked)),
             ])
+
+            if automaticMediaDenied {
+                let reason =
+                    "automatic permission review cannot authorize a request whose exact model context contains images"
+                let denied = PermissionResolvedPayload(
+                    requestId: requestID,
+                    turnID: turnID,
+                    toolCallID: toolCall.id,
+                    tool: descriptor.name,
+                    decision: .deny,
+                    risk: outcome.risk,
+                    reason: reason,
+                    intent: callContext.intent,
+                    authorization: authorization,
+                    source: .automaticReviewerFailure,
+                    reviewStatus: .failed,
+                    failureKind: .mediaAuthorizationUnsupported,
+                    failureSource: .reviewerFailed,
+                    action: .decline)
+                let settlement = try await log.settlePermissionRequest(denied)
+                try await log.append(.agentStatus(AgentStatusPayload(
+                    agent: agent.name,
+                    state: .tool)))
+                return SettledPermission(
+                    decision: settlement.resolution.decision,
+                    reason: settlement.resolution.reason,
+                    requestID: requestID,
+                    failureSource: settlement.resolution.failureSource,
+                    approvalSource: settlement.resolution.source,
+                    failureKind: settlement.resolution.failureKind)
+            }
 
             let resolution: PermissionApprovalResolution
             do {

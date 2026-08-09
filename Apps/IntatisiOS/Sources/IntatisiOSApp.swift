@@ -16,6 +16,26 @@ struct IOSConfigurationImportSummary: Equatable, Sendable {
     var warnings: [ImportedChatConfiguration.Warning]
 }
 
+/// Stable, process-level metadata channel. It is deliberately separate from
+/// the replaceable ChatViewModel so a title generated for session A can still
+/// update A's row after the user has switched to session B.
+@MainActor
+private final class IOSChatSessionMetadataRelay {
+    let changes = PassthroughSubject<ChatSessionAutoTitleCommit, Never>()
+    private var watermarks = SessionDisplayNameWatermarks()
+
+    func accept(_ commit: ChatSessionAutoTitleCommit) {
+        guard commit.kind == .chat else { return }
+        guard watermarks.accept(
+            sessionID: commit.sessionID,
+            kind: commit.kind,
+            settingsRevision: commit.settingsRevision,
+            projectedThroughSeq: commit.projectedThroughSeq
+        ) else { return }
+        changes.send(commit)
+    }
+}
+
 /// iOS app environment — the chat-only subset. It links Core / Providers /
 /// Conversation / Artifacts / Multimodal / SharedUI and *cannot* reach Tools,
 /// Permission, AgentKernel, or Cowork: those packages are simply not linked, so
@@ -32,10 +52,22 @@ final class IOSAppEnvironment: ObservableObject {
     @Published var needsAPIKey: Bool
 
     private let secrets: ConfigSecretResolver
+    private let chatAutoTitleCoordinator: ChatSessionAutoTitleCoordinator
+    private let chatSessionMetadataRelay: IOSChatSessionMetadataRelay
+    private var chatAutoTitleSessions: [SessionID: ChatSessionAutoTitleSession]
+
+    var chatSessionMetadataChanged:
+        PassthroughSubject<ChatSessionAutoTitleCommit, Never> {
+        chatSessionMetadataRelay.changes
+    }
 
     init() {
         PlatformProfile.current = .iOS   // chat-only, no workspace, no shell
 
+        let autoTitleCoordinator = ChatSessionAutoTitleCoordinator()
+        let metadataRelay = IOSChatSessionMetadataRelay()
+        self.chatAutoTitleCoordinator = autoTitleCoordinator
+        self.chatSessionMetadataRelay = metadataRelay
         self.secrets = ConfigSecretResolver()
         self.providerCatalog = IOSConfig.providerCatalog
         let initialRegistry = Self.makeProviderRegistry(resolver: secrets)
@@ -54,10 +86,18 @@ final class IOSAppEnvironment: ObservableObject {
             fatalError("Failed to open artifact store: \(error)")
         }
         self.multimodal = MultimodalService(log: log, store: store)
+        let autoTitleSession = autoTitleCoordinator.bind(
+            sessionID: initialSession,
+            log: log,
+            onCommit: { commit in
+                await metadataRelay.accept(commit)
+            })
+        self.chatAutoTitleSessions = [initialSession: autoTitleSession]
         self.viewModel = ChatViewModel(
             log: log,
             registry: initialRegistry,
-            artifactStore: store)
+            artifactStore: store,
+            autoTitleSession: autoTitleSession)
         self.needsAPIKey = !Self.hasAPIKey(ref: IOSConfig.selectedAPIKeyRef)
 
         wireImageGeneration()
@@ -181,10 +221,23 @@ final class IOSAppEnvironment: ObservableObject {
         viewModel.stop()
         let log = try EventLog(session: session, fileURL: IOSConfig.sessionFile(session))
         let store = try ArtifactStore(root: IOSConfig.artifactsDir(session))
+        let autoTitleSession: ChatSessionAutoTitleSession
+        if let existing = chatAutoTitleSessions[session] {
+            autoTitleSession = existing
+        } else {
+            autoTitleSession = chatAutoTitleCoordinator.bind(
+                sessionID: session,
+                log: log,
+                onCommit: { [metadataRelay = chatSessionMetadataRelay] commit in
+                    await metadataRelay.accept(commit)
+                })
+            chatAutoTitleSessions[session] = autoTitleSession
+        }
         let model = ChatViewModel(
             log: log,
             registry: registry,
-            artifactStore: store)
+            artifactStore: store,
+            autoTitleSession: autoTitleSession)
         self.log = log
         self.multimodal = MultimodalService(log: log, store: store)
         self.viewModel = model
@@ -297,6 +350,9 @@ struct IOSRootView: View {
             if !isBusy {
                 refreshSessions()
             }
+        }
+        .onReceive(env.chatSessionMetadataChanged) { commit in
+            applyAutoTitleCommit(commit)
         }
     }
 
@@ -444,6 +500,25 @@ struct IOSRootView: View {
 
     private func refreshSessions() {
         recentSessions = env.recentChatSessions()
+    }
+
+    private func applyAutoTitleCommit(_ commit: ChatSessionAutoTitleCommit) {
+        guard commit.kind == .chat else { return }
+        // Reload the canonical list for any activity that landed alongside the
+        // rename, then exact-patch the verified commit. The patch also avoids a
+        // filesystem metadata-cache edge where an equal-length title could be
+        // temporarily returned from an older projection entry.
+        refreshSessions()
+        guard let index = recentSessions.firstIndex(where: {
+            $0.id == commit.sessionID && $0.kind == .chat
+        }) else { return }
+        let current = recentSessions[index]
+        recentSessions[index] = SessionSummary(
+            id: current.id,
+            kind: current.kind,
+            updatedAt: current.updatedAt,
+            eventCount: current.eventCount,
+            displayName: commit.displayName)
     }
 
     private var openSidebarEdgeGesture: some Gesture {

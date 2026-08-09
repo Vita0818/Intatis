@@ -126,8 +126,80 @@ public struct ModelToolSearchOutput: Codable, Equatable, Sendable {
     }
 }
 
+public enum ModelHistoryImageReferenceValidationError:
+    Error, Equatable, Sendable
+{
+    case emptyArtifactID
+    case unsupportedMIMEType(String)
+    case invalidByteCount(Int)
+    case nonCanonicalSHA256
+}
+
+/// Durable, provider-neutral identity for one image admitted into model
+/// history. Provider wire data (for example a base64 data URL) is deliberately
+/// materialized only for an exact request and never stored here.
+public struct ModelHistoryImageReference: Codable, Equatable, Sendable {
+    public static let supportedMIMETypes: Set<String> = [
+        "image/jpeg",
+        "image/png",
+    ]
+
+    public var artifactID: ArtifactID
+    public var mimeType: String
+    public var byteCount: Int
+    public var sha256: String
+
+    public init(
+        artifactID: ArtifactID,
+        mimeType: String,
+        byteCount: Int,
+        sha256: String
+    ) {
+        self.artifactID = artifactID
+        self.mimeType = mimeType
+        self.byteCount = byteCount
+        self.sha256 = sha256
+    }
+
+    public func validate() throws {
+        guard !artifactID.rawValue.trimmingCharacters(
+            in: .whitespacesAndNewlines).isEmpty else {
+            throw ModelHistoryImageReferenceValidationError.emptyArtifactID
+        }
+        guard Self.supportedMIMETypes.contains(mimeType) else {
+            throw ModelHistoryImageReferenceValidationError
+                .unsupportedMIMEType(mimeType)
+        }
+        guard byteCount > 0 else {
+            throw ModelHistoryImageReferenceValidationError
+                .invalidByteCount(byteCount)
+        }
+        let digestBytes = Array(sha256.utf8)
+        guard digestBytes.count == 64,
+              digestBytes.allSatisfy({ byte in
+                  (UInt8(ascii: "0")...UInt8(ascii: "9")).contains(byte)
+                      || (UInt8(ascii: "a")...UInt8(ascii: "f")).contains(byte)
+              }) else {
+            throw ModelHistoryImageReferenceValidationError.nonCanonicalSHA256
+        }
+    }
+}
+
+public enum ModelHistoryItemPayloadValidationError:
+    Error, Equatable, Sendable
+{
+    case unsupportedSchemaVersion(Int)
+    case invalidShape(String)
+    case invalidImageReference(
+        index: Int,
+        reason: ModelHistoryImageReferenceValidationError)
+}
+
 public struct ModelHistoryItemPayload: Codable, Equatable, Sendable {
+    /// Text-only legacy/default schema. This remains the default for writers
+    /// that do not carry verified media.
     public static let currentSchemaVersion = 1
+    public static let mediaSchemaVersion = 2
 
     public var schemaVersion: Int
     public var itemID: String
@@ -142,6 +214,7 @@ public struct ModelHistoryItemPayload: Codable, Equatable, Sendable {
     public var messageClassification: ModelHistoryMessageClassification?
     public var content: String?
     public var attachmentIDs: [ArtifactID]?
+    public var imageReferences: [ModelHistoryImageReference]?
     public var functionCalls: [ModelHistoryFunctionCall]?
     public var callID: String?
     public var output: String?
@@ -163,6 +236,7 @@ public struct ModelHistoryItemPayload: Codable, Equatable, Sendable {
         messageClassification: ModelHistoryMessageClassification? = nil,
         content: String? = nil,
         attachmentIDs: [ArtifactID]? = nil,
+        imageReferences: [ModelHistoryImageReference]? = nil,
         functionCalls: [ModelHistoryFunctionCall]? = nil,
         callID: String? = nil,
         output: String? = nil,
@@ -183,6 +257,7 @@ public struct ModelHistoryItemPayload: Codable, Equatable, Sendable {
         self.messageClassification = messageClassification
         self.content = content
         self.attachmentIDs = attachmentIDs
+        self.imageReferences = imageReferences
         self.functionCalls = functionCalls
         self.callID = callID
         self.output = output
@@ -202,9 +277,13 @@ public struct ModelHistoryItemPayload: Codable, Equatable, Sendable {
         role: ModelHistoryMessageRole,
         content: String,
         attachmentIDs: [ArtifactID]? = nil,
+        imageReferences: [ModelHistoryImageReference]? = nil,
         messageClassification: ModelHistoryMessageClassification? = nil
     ) -> ModelHistoryItemPayload {
         ModelHistoryItemPayload(
+            schemaVersion: imageReferences == nil
+                ? Self.currentSchemaVersion
+                : Self.mediaSchemaVersion,
             itemID: itemID,
             turnID: turnID,
             agent: agent,
@@ -213,9 +292,12 @@ public struct ModelHistoryItemPayload: Codable, Equatable, Sendable {
             taskAttempt: taskAttempt,
             kind: .message,
             role: role,
-            messageClassification: messageClassification,
+            messageClassification: imageReferences == nil
+                ? messageClassification
+                : (messageClassification ?? .realUser),
             content: content,
-            attachmentIDs: attachmentIDs)
+            attachmentIDs: attachmentIDs,
+            imageReferences: imageReferences)
     }
 
     public static func functionCallBatch(
@@ -248,9 +330,13 @@ public struct ModelHistoryItemPayload: Codable, Equatable, Sendable {
         submissionID: SubmissionID?,
         taskAttempt: Int?,
         callID: String,
-        output: String
+        output: String,
+        imageReferences: [ModelHistoryImageReference]? = nil
     ) -> ModelHistoryItemPayload {
         ModelHistoryItemPayload(
+            schemaVersion: imageReferences == nil
+                ? Self.currentSchemaVersion
+                : Self.mediaSchemaVersion,
             itemID: itemID,
             turnID: turnID,
             agent: agent,
@@ -259,7 +345,8 @@ public struct ModelHistoryItemPayload: Codable, Equatable, Sendable {
             taskAttempt: taskAttempt,
             kind: .functionCallOutput,
             callID: callID,
-            output: output)
+            output: output,
+            imageReferences: imageReferences)
     }
 
     public static func toolSearchOutput(
@@ -288,6 +375,275 @@ public struct ModelHistoryItemPayload: Codable, Equatable, Sendable {
                 execution: execution,
                 tools: tools))
     }
+
+    public func validate() throws {
+        func invalid(_ reason: String) throws -> Never {
+            throw ModelHistoryItemPayloadValidationError.invalidShape(reason)
+        }
+        guard schemaVersion == Self.currentSchemaVersion
+                || schemaVersion == Self.mediaSchemaVersion else {
+            throw ModelHistoryItemPayloadValidationError
+                .unsupportedSchemaVersion(schemaVersion)
+        }
+        guard !itemID.trimmingCharacters(
+            in: .whitespacesAndNewlines).isEmpty else {
+            try invalid("itemID is empty")
+        }
+        if let taskAttempt, taskAttempt < 1 {
+            try invalid("taskAttempt must be one-based")
+        }
+
+        if schemaVersion == Self.currentSchemaVersion {
+            guard imageReferences == nil else {
+                try invalid("schema v1 cannot carry image references")
+            }
+        } else {
+            guard let imageReferences, !imageReferences.isEmpty else {
+                try invalid("schema v2 requires non-empty image references")
+            }
+            for (index, reference) in imageReferences.enumerated() {
+                do {
+                    try reference.validate()
+                } catch let error as ModelHistoryImageReferenceValidationError {
+                    throw ModelHistoryItemPayloadValidationError
+                        .invalidImageReference(index: index, reason: error)
+                }
+            }
+        }
+
+        let hasReasoningFields = reasoningSummary != nil
+            || reasoningContent != nil
+            || encryptedReasoningContent != nil
+        switch kind {
+        case .message:
+            guard let role,
+                  content != nil,
+                  functionCalls == nil,
+                  callID == nil,
+                  output == nil,
+                  toolSearchOutput == nil,
+                  !hasReasoningFields else {
+                try invalid("message fields are inconsistent")
+            }
+            switch role {
+            case .assistant:
+                guard messageClassification == nil,
+                      attachmentIDs == nil,
+                      imageReferences == nil else {
+                    try invalid("assistant message fields are inconsistent")
+                }
+            case .user:
+                guard messageClassification != .compactionSummary else {
+                    try invalid("direct history cannot contain a compaction summary")
+                }
+                if messageClassification == .contextual {
+                    guard attachmentIDs == nil,
+                          imageReferences == nil else {
+                        try invalid("contextual messages cannot carry media")
+                    }
+                }
+                if schemaVersion == Self.mediaSchemaVersion {
+                    guard messageClassification == .realUser,
+                          let attachmentIDs,
+                          attachmentIDs == imageReferences?.map(\.artifactID) else {
+                        try invalid("v2 user media does not match attachment IDs")
+                    }
+                }
+            }
+
+        case .functionCallBatch:
+            guard role == nil,
+                  messageClassification == nil,
+                  attachmentIDs == nil,
+                  imageReferences == nil,
+                  let functionCalls,
+                  !functionCalls.isEmpty,
+                  callID == nil,
+                  output == nil,
+                  toolSearchOutput == nil,
+                  !hasReasoningFields else {
+                try invalid("function-call batch fields are inconsistent")
+            }
+            for call in functionCalls {
+                guard !call.callID.trimmingCharacters(
+                    in: .whitespacesAndNewlines).isEmpty,
+                      !call.name.trimmingCharacters(
+                        in: .whitespacesAndNewlines).isEmpty,
+                      Self.isJSONObject(call.arguments) else {
+                    try invalid("function call has an invalid ID, name, or JSON argument object")
+                }
+            }
+
+        case .functionCallOutput:
+            guard role == nil,
+                  messageClassification == nil,
+                  attachmentIDs == nil,
+                  functionCalls == nil,
+                  let callID,
+                  !callID.trimmingCharacters(
+                    in: .whitespacesAndNewlines).isEmpty,
+                  let output,
+                  toolSearchOutput == nil,
+                  !hasReasoningFields else {
+                try invalid("function-call output fields are inconsistent")
+            }
+            if imageReferences == nil, output.isEmpty {
+                try invalid("text-only function-call output cannot be empty")
+            }
+
+        case .toolSearchOutput:
+            guard role == nil,
+                  messageClassification == nil,
+                  attachmentIDs == nil,
+                  imageReferences == nil,
+                  functionCalls == nil,
+                  output == nil,
+                  let callID,
+                  !callID.trimmingCharacters(
+                    in: .whitespacesAndNewlines).isEmpty,
+                  let toolSearchOutput,
+                  !toolSearchOutput.status.trimmingCharacters(
+                    in: .whitespacesAndNewlines).isEmpty,
+                  !toolSearchOutput.execution.trimmingCharacters(
+                    in: .whitespacesAndNewlines).isEmpty,
+                  !hasReasoningFields else {
+                try invalid("tool-search output fields are inconsistent")
+            }
+
+        case .reasoning:
+            guard role == nil,
+                  messageClassification == nil,
+                  attachmentIDs == nil,
+                  imageReferences == nil,
+                  functionCalls == nil,
+                  callID == nil,
+                  output == nil,
+                  toolSearchOutput == nil,
+                  hasReasoningFields else {
+                try invalid("reasoning fields are inconsistent")
+            }
+        }
+    }
+
+    private static func isJSONObject(_ string: String) -> Bool {
+        guard let data = string.data(using: .utf8),
+              let value = try? JSONSerialization.jsonObject(
+                  with: data,
+                  options: [.fragmentsAllowed]) else {
+            return false
+        }
+        return value is [String: Any]
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion
+        case itemID
+        case turnID
+        case agent
+        case taskID
+        case submissionID
+        case taskAttempt
+        case kind
+        case role
+        case messageClassification
+        case content
+        case attachmentIDs
+        case imageReferences
+        case functionCalls
+        case callID
+        case output
+        case toolSearchOutput
+        case reasoningSummary
+        case reasoningContent
+        case encryptedReasoningContent
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try container.decode(Int.self, forKey: .schemaVersion)
+        itemID = try container.decode(String.self, forKey: .itemID)
+        turnID = try container.decode(TurnID.self, forKey: .turnID)
+        agent = try container.decode(AgentID.self, forKey: .agent)
+        taskID = try container.decodeIfPresent(TaskID.self, forKey: .taskID)
+        submissionID = try container.decodeIfPresent(
+            SubmissionID.self,
+            forKey: .submissionID)
+        taskAttempt = try container.decodeIfPresent(Int.self, forKey: .taskAttempt)
+        kind = try container.decode(ModelHistoryItemKind.self, forKey: .kind)
+        role = try container.decodeIfPresent(ModelHistoryMessageRole.self, forKey: .role)
+        messageClassification = try container.decodeIfPresent(
+            ModelHistoryMessageClassification.self,
+            forKey: .messageClassification)
+        content = try container.decodeIfPresent(String.self, forKey: .content)
+        attachmentIDs = try container.decodeIfPresent(
+            [ArtifactID].self,
+            forKey: .attachmentIDs)
+        imageReferences = try container.decodeIfPresent(
+            [ModelHistoryImageReference].self,
+            forKey: .imageReferences)
+        functionCalls = try container.decodeIfPresent(
+            [ModelHistoryFunctionCall].self,
+            forKey: .functionCalls)
+        callID = try container.decodeIfPresent(String.self, forKey: .callID)
+        output = try container.decodeIfPresent(String.self, forKey: .output)
+        toolSearchOutput = try container.decodeIfPresent(
+            ModelToolSearchOutput.self,
+            forKey: .toolSearchOutput)
+        reasoningSummary = try container.decodeIfPresent(
+            [String].self,
+            forKey: .reasoningSummary)
+        reasoningContent = try container.decodeIfPresent(
+            String.self,
+            forKey: .reasoningContent)
+        encryptedReasoningContent = try container.decodeIfPresent(
+            String.self,
+            forKey: .encryptedReasoningContent)
+        do {
+            try validate()
+        } catch {
+            throw DecodingError.dataCorruptedError(
+                forKey: .schemaVersion,
+                in: container,
+                debugDescription: "model history item payload is invalid")
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        do {
+            try validate()
+        } catch {
+            throw EncodingError.invalidValue(
+                self,
+                EncodingError.Context(
+                    codingPath: encoder.codingPath,
+                    debugDescription: "model history item payload is invalid"))
+        }
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(schemaVersion, forKey: .schemaVersion)
+        try container.encode(itemID, forKey: .itemID)
+        try container.encode(turnID, forKey: .turnID)
+        try container.encode(agent, forKey: .agent)
+        try container.encodeIfPresent(taskID, forKey: .taskID)
+        try container.encodeIfPresent(submissionID, forKey: .submissionID)
+        try container.encodeIfPresent(taskAttempt, forKey: .taskAttempt)
+        try container.encode(kind, forKey: .kind)
+        try container.encodeIfPresent(role, forKey: .role)
+        try container.encodeIfPresent(
+            messageClassification,
+            forKey: .messageClassification)
+        try container.encodeIfPresent(content, forKey: .content)
+        try container.encodeIfPresent(attachmentIDs, forKey: .attachmentIDs)
+        try container.encodeIfPresent(imageReferences, forKey: .imageReferences)
+        try container.encodeIfPresent(functionCalls, forKey: .functionCalls)
+        try container.encodeIfPresent(callID, forKey: .callID)
+        try container.encodeIfPresent(output, forKey: .output)
+        try container.encodeIfPresent(toolSearchOutput, forKey: .toolSearchOutput)
+        try container.encodeIfPresent(reasoningSummary, forKey: .reasoningSummary)
+        try container.encodeIfPresent(reasoningContent, forKey: .reasoningContent)
+        try container.encodeIfPresent(
+            encryptedReasoningContent,
+            forKey: .encryptedReasoningContent)
+    }
 }
 
 /// One provider-history item inside a full replacement-history checkpoint.
@@ -313,6 +669,7 @@ public struct ModelHistoryReplacementItem: Codable, Equatable, Sendable {
     /// accepted durable submission.
     public var contentTruncated: Bool?
     public var attachmentIDs: [ArtifactID]?
+    public var imageReferences: [ModelHistoryImageReference]?
     public var functionCalls: [ModelHistoryFunctionCall]?
     public var callID: String?
     public var output: String?
@@ -330,6 +687,7 @@ public struct ModelHistoryReplacementItem: Codable, Equatable, Sendable {
         content: String? = nil,
         contentTruncated: Bool? = nil,
         attachmentIDs: [ArtifactID]? = nil,
+        imageReferences: [ModelHistoryImageReference]? = nil,
         functionCalls: [ModelHistoryFunctionCall]? = nil,
         callID: String? = nil,
         output: String? = nil,
@@ -346,6 +704,7 @@ public struct ModelHistoryReplacementItem: Codable, Equatable, Sendable {
         self.content = content
         self.contentTruncated = contentTruncated
         self.attachmentIDs = attachmentIDs
+        self.imageReferences = imageReferences
         self.functionCalls = functionCalls
         self.callID = callID
         self.output = output
@@ -371,13 +730,19 @@ public enum ModelHistoryCompactedPayloadValidationError:
     case invalidInitialWindow
     case emptyReplacementItemID(index: Int)
     case duplicateReplacementItemID(itemID: String)
+    case invalidImageReference(
+        itemIndex: Int,
+        referenceIndex: Int,
+        reason: ModelHistoryImageReferenceValidationError)
 }
 
 /// Durable full replacement-history checkpoint, mirroring Codex's compacted
 /// rollout item while adding the agent identity required by Intatis's shared
 /// multi-agent EventLog.
 public struct ModelHistoryCompactedPayload: Codable, Equatable, Sendable {
+    /// Text-only legacy/default checkpoint schema.
     public static let currentSchemaVersion = 1
+    public static let mediaSchemaVersion = 2
 
     public var schemaVersion: Int
     public var agent: AgentID
@@ -408,7 +773,7 @@ public struct ModelHistoryCompactedPayload: Codable, Equatable, Sendable {
         self.windowID = windowID
     }
 
-    /// Validates the complete v1 checkpoint shape before it can become
+    /// Validates the complete v1/v2 checkpoint shape before it can become
     /// canonical history.
     ///
     /// A v1 replacement contains only user-role messages: retained real-user
@@ -416,7 +781,8 @@ public struct ModelHistoryCompactedPayload: Codable, Equatable, Sendable {
     /// summary. Future replacement item shapes require a new schema version
     /// instead of being silently accepted by an older projector.
     public func validate() throws {
-        guard schemaVersion == Self.currentSchemaVersion else {
+        guard schemaVersion == Self.currentSchemaVersion
+                || schemaVersion == Self.mediaSchemaVersion else {
             throw ModelHistoryCompactedPayloadValidationError
                 .unsupportedSchemaVersion(schemaVersion)
         }
@@ -491,7 +857,9 @@ public struct ModelHistoryCompactedPayload: Codable, Equatable, Sendable {
                 guard item.messageClassification == .compactionSummary,
                       item.content == message,
                       item.sourceSubmissionID == nil,
-                      item.contentTruncated != true else {
+                      item.contentTruncated != true,
+                      item.attachmentIDs == nil,
+                      item.imageReferences == nil else {
                     throw ModelHistoryCompactedPayloadValidationError
                         .finalSummaryMismatch
                 }
@@ -506,9 +874,50 @@ public struct ModelHistoryCompactedPayload: Codable, Equatable, Sendable {
                         throw ModelHistoryCompactedPayloadValidationError
                             .invalidRealUserProvenance(index: index)
                     }
+                    if schemaVersion == Self.currentSchemaVersion {
+                        guard item.imageReferences == nil else {
+                            throw ModelHistoryCompactedPayloadValidationError
+                                .unsupportedReplacementItemShape(index: index)
+                        }
+                    } else {
+                        if let imageReferences = item.imageReferences {
+                            guard !imageReferences.isEmpty,
+                                  item.attachmentIDs
+                                    == imageReferences.map(\.artifactID) else {
+                                throw ModelHistoryCompactedPayloadValidationError
+                                    .unsupportedReplacementItemShape(index: index)
+                            }
+                            for (referenceIndex, reference) in
+                                imageReferences.enumerated()
+                            {
+                                do {
+                                    try reference.validate()
+                                } catch let error
+                                    as ModelHistoryImageReferenceValidationError
+                                {
+                                    throw ModelHistoryCompactedPayloadValidationError
+                                        .invalidImageReference(
+                                            itemIndex: index,
+                                            referenceIndex: referenceIndex,
+                                            reason: error)
+                                }
+                            }
+                        } else if item.attachmentIDs?.isEmpty == false {
+                            throw ModelHistoryCompactedPayloadValidationError
+                                .unsupportedReplacementItemShape(index: index)
+                        }
+                    }
+                    if item.attachmentIDs?.isEmpty == false {
+                        guard item.contentTruncated != true else {
+                            throw ModelHistoryCompactedPayloadValidationError
+                                .unsupportedReplacementItemShape(index: index)
+                        }
+                    }
                 case .contextual:
                     guard item.sourceSubmissionID == nil,
-                          item.contentTruncated != true else {
+                          item.contentTruncated != true,
+                          item.attachmentIDs == nil,
+                          item.imageReferences == nil else {
                         throw ModelHistoryCompactedPayloadValidationError
                             .invalidReplacementItemClassification(
                                 index: index)

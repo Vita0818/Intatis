@@ -1,0 +1,524 @@
+import Foundation
+import XCTest
+@testable import IntatisTools
+
+private actor DocumentInvocationCounter {
+    private var count = 0
+
+    func record() {
+        count += 1
+    }
+
+    func value() -> Int {
+        count
+    }
+}
+
+private actor DocumentContinuationGate {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var arrivalWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func suspend() async {
+        await withCheckedContinuation { continuation in
+            self.continuation = continuation
+            let waiters = arrivalWaiters
+            arrivalWaiters.removeAll()
+            waiters.forEach { $0.resume() }
+        }
+    }
+
+    func waitUntilSuspended() async {
+        if continuation != nil { return }
+        await withCheckedContinuation { continuation in
+            arrivalWaiters.append(continuation)
+        }
+    }
+
+    func resume() {
+        guard let continuation else { return }
+        self.continuation = nil
+        continuation.resume()
+    }
+}
+
+final class DocumentInfrastructureTests: XCTestCase {
+    private let fileManager = FileManager.default
+
+    private func makeWorkspace() throws -> URL {
+        let workspace = fileManager.temporaryDirectory.appendingPathComponent(
+            "intatis-document-infrastructure-tests-\(UUID().uuidString)",
+            isDirectory: true)
+        try fileManager.createDirectory(at: workspace, withIntermediateDirectories: false)
+        return workspace
+    }
+
+    private func makeParent(_ relativePath: String, workspace: URL) throws {
+        try fileManager.createDirectory(
+            at: workspace.appendingPathComponent(relativePath, isDirectory: true),
+            withIntermediateDirectories: true)
+    }
+
+    private func writeFile(
+        _ data: Data,
+        destinationPath: String,
+        workspace: URL,
+        sourcePath: String? = nil,
+        expectedSourceSHA256: String? = nil,
+        replaceExisting: Bool = false,
+        expectedDestinationSHA256: String? = nil,
+        maximumBytes: UInt64 = 32 * 1_024 * 1_024
+    ) async throws -> DocumentCommitReceipt {
+        try await DocumentStagedOutput.writeFile(
+            DocumentStagedFileRequest(
+                sourcePath: sourcePath,
+                expectedSourceSHA256: expectedSourceSHA256,
+                destinationPath: destinationPath,
+                replaceExisting: replaceExisting,
+                expectedDestinationSHA256: expectedDestinationSHA256,
+                fileExtension: "docx",
+                maximumBytes: maximumBytes),
+            workspace: workspace,
+            produce: { url in
+                try data.write(to: url)
+            },
+            validate: { url in
+                guard try Data(contentsOf: url) == data else {
+                    throw DocumentToolError(.validationFailed, "fixture read-back mismatch")
+                }
+            })
+    }
+
+    private func writeBundle(
+        _ files: [String: Data],
+        destinationPath: String,
+        workspace: URL,
+        replaceExisting: Bool = false,
+        expectedDestinationSHA256: String? = nil
+    ) async throws -> DocumentCommitReceipt {
+        try await DocumentStagedOutput.writeDirectory(
+            DocumentStagedDirectoryRequest(
+                sourcePath: nil,
+                expectedSourceSHA256: nil,
+                destinationPath: destinationPath,
+                replaceExisting: replaceExisting,
+                expectedDestinationSHA256: expectedDestinationSHA256,
+                maximumFiles: 32,
+                maximumBytes: 4 * 1_024 * 1_024),
+            workspace: workspace,
+            produce: { root in
+                for (relativePath, data) in files {
+                    let output = root.appendingPathComponent(relativePath, isDirectory: false)
+                    try FileManager.default.createDirectory(
+                        at: output.deletingLastPathComponent(),
+                        withIntermediateDirectories: true)
+                    try data.write(to: output)
+                }
+            },
+            validate: { root in
+                for (relativePath, data) in files {
+                    let output = root.appendingPathComponent(relativePath, isDirectory: false)
+                    guard try Data(contentsOf: output) == data else {
+                        throw DocumentToolError(.validationFailed, "fixture bundle read-back mismatch")
+                    }
+                }
+            })
+    }
+
+    private func assertDocumentError(
+        _ expectedCode: DocumentToolErrorCode,
+        file: StaticString = #filePath,
+        line: UInt = #line,
+        operation: () async throws -> Void
+    ) async {
+        do {
+            try await operation()
+            XCTFail("expected \(expectedCode.rawValue)", file: file, line: line)
+        } catch let error as DocumentToolError {
+            XCTAssertEqual(error.code, expectedCode, error.localizedDescription, file: file, line: line)
+        } catch {
+            XCTFail("unexpected error: \(error)", file: file, line: line)
+        }
+    }
+
+    func testExistingFileIsNotOverwrittenByDefaultAndReplacementRequiresDigest() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? fileManager.removeItem(at: workspace) }
+        try makeParent("docs", workspace: workspace)
+        let destination = workspace.appendingPathComponent("docs/output.docx")
+        let original = Data("original bytes".utf8)
+        _ = try await writeFile(original, destinationPath: "docs/output.docx", workspace: workspace)
+        let counter = DocumentInvocationCounter()
+
+        await assertDocumentError(.outputConflict) {
+            _ = try await DocumentStagedOutput.writeFile(
+                DocumentStagedFileRequest(
+                    sourcePath: nil,
+                    expectedSourceSHA256: nil,
+                    destinationPath: "docs/output.docx",
+                    replaceExisting: false,
+                    expectedDestinationSHA256: nil,
+                    fileExtension: "docx",
+                    maximumBytes: 1_024),
+                workspace: workspace,
+                produce: { url in
+                    await counter.record()
+                    try Data("unexpected".utf8).write(to: url)
+                },
+                validate: { _ in })
+        }
+
+        await assertDocumentError(.outputConflict) {
+            _ = try await DocumentStagedOutput.writeFile(
+                DocumentStagedFileRequest(
+                    sourcePath: nil,
+                    expectedSourceSHA256: nil,
+                    destinationPath: "docs/output.docx",
+                    replaceExisting: true,
+                    expectedDestinationSHA256: nil,
+                    fileExtension: "docx",
+                    maximumBytes: 1_024),
+                workspace: workspace,
+                produce: { url in
+                    await counter.record()
+                    try Data("unexpected".utf8).write(to: url)
+                },
+                validate: { _ in })
+        }
+
+        let invocationCount = await counter.value()
+        XCTAssertEqual(invocationCount, 0)
+        XCTAssertEqual(try Data(contentsOf: destination), original)
+    }
+
+    func testSourceAndDestinationCASChangesPreventCommit() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? fileManager.removeItem(at: workspace) }
+        try makeParent("docs", workspace: workspace)
+        let source = workspace.appendingPathComponent("docs/source.docx")
+        let sourceOriginal = Data("source-A".utf8)
+        let sourceChanged = Data("source-B".utf8)
+        let sourceReceipt = try await writeFile(
+            sourceOriginal,
+            destinationPath: "docs/source.docx",
+            workspace: workspace)
+
+        let sourceDestination = workspace.appendingPathComponent("docs/from-source.docx")
+        let destinationOriginal = Data("destination original".utf8)
+        let sourceDestinationReceipt = try await writeFile(
+            destinationOriginal,
+            destinationPath: "docs/from-source.docx",
+            workspace: workspace)
+        let staged = Data("staged replacement".utf8)
+
+        await assertDocumentError(.outputConflict) {
+            _ = try await DocumentStagedOutput.writeFile(
+                DocumentStagedFileRequest(
+                    sourcePath: "docs/source.docx",
+                    expectedSourceSHA256: sourceReceipt.sha256,
+                    destinationPath: "docs/from-source.docx",
+                    replaceExisting: true,
+                    expectedDestinationSHA256: sourceDestinationReceipt.sha256,
+                    fileExtension: "docx",
+                    maximumBytes: 1_024),
+                workspace: workspace,
+                produce: { payload in
+                    try staged.write(to: payload)
+                    try sourceChanged.write(to: source)
+                },
+                validate: { _ in })
+        }
+        XCTAssertEqual(try Data(contentsOf: sourceDestination), destinationOriginal)
+
+        let concurrentDestination = workspace.appendingPathComponent("docs/concurrent.docx")
+        let concurrentReceipt = try await writeFile(
+            destinationOriginal,
+            destinationPath: "docs/concurrent.docx",
+            workspace: workspace)
+        let concurrentWriter = Data("concurrent writer won".utf8)
+
+        await assertDocumentError(.outputConflict) {
+            _ = try await DocumentStagedOutput.writeFile(
+                DocumentStagedFileRequest(
+                    sourcePath: nil,
+                    expectedSourceSHA256: nil,
+                    destinationPath: "docs/concurrent.docx",
+                    replaceExisting: true,
+                    expectedDestinationSHA256: concurrentReceipt.sha256,
+                    fileExtension: "docx",
+                    maximumBytes: 1_024),
+                workspace: workspace,
+                produce: { payload in
+                    try staged.write(to: payload)
+                    try concurrentWriter.write(to: concurrentDestination)
+                },
+                validate: { _ in })
+        }
+        XCTAssertEqual(try Data(contentsOf: concurrentDestination), concurrentWriter)
+    }
+
+    func testBackendAndValidatorFailuresLeaveDestinationUnchanged() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? fileManager.removeItem(at: workspace) }
+        try makeParent("docs", workspace: workspace)
+        let destination = workspace.appendingPathComponent("docs/output.docx")
+        let original = Data("known good output".utf8)
+        let receipt = try await writeFile(
+            original,
+            destinationPath: "docs/output.docx",
+            workspace: workspace)
+        let request = DocumentStagedFileRequest(
+            sourcePath: nil,
+            expectedSourceSHA256: nil,
+            destinationPath: "docs/output.docx",
+            replaceExisting: true,
+            expectedDestinationSHA256: receipt.sha256,
+            fileExtension: "docx",
+            maximumBytes: 1_024)
+
+        await assertDocumentError(.backendFailed) {
+            _ = try await DocumentStagedOutput.writeFile(
+                request,
+                workspace: workspace,
+                produce: { _ in
+                    throw DocumentToolError(.backendFailed, "fixture backend failed")
+                },
+                validate: { _ in })
+        }
+        XCTAssertEqual(try Data(contentsOf: destination), original)
+
+        await assertDocumentError(.validationFailed) {
+            _ = try await DocumentStagedOutput.writeFile(
+                request,
+                workspace: workspace,
+                produce: { url in
+                    try Data("invalid output".utf8).write(to: url)
+                },
+                validate: { _ in
+                    throw DocumentToolError(.validationFailed, "fixture validator failed")
+                })
+        }
+        XCTAssertEqual(try Data(contentsOf: destination), original)
+    }
+
+    func testFileCreateAndReplaceReturnsReconciledReceiptAndReadback() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? fileManager.removeItem(at: workspace) }
+        try makeParent("docs", workspace: workspace)
+        let destination = workspace.appendingPathComponent("docs/output.docx")
+        let created = Data("created document".utf8)
+
+        let createReceipt = try await writeFile(
+            created,
+            destinationPath: "docs/output.docx",
+            workspace: workspace)
+
+        XCTAssertEqual(createReceipt.relativePath, "docs/output.docx")
+        XCTAssertEqual(createReceipt.byteCount, UInt64(created.count))
+        XCTAssertEqual(createReceipt.fileCount, 1)
+        XCTAssertEqual(createReceipt.sha256.count, 64)
+        XCTAssertNil(createReceipt.cleanupWarning)
+        XCTAssertEqual(try Data(contentsOf: destination), created)
+
+        let replacement = Data("replacement document".utf8)
+        let replaceReceipt = try await writeFile(
+            replacement,
+            destinationPath: "docs/output.docx",
+            workspace: workspace,
+            replaceExisting: true,
+            expectedDestinationSHA256: createReceipt.sha256)
+
+        XCTAssertEqual(replaceReceipt.relativePath, "docs/output.docx")
+        XCTAssertEqual(replaceReceipt.byteCount, UInt64(replacement.count))
+        XCTAssertEqual(replaceReceipt.fileCount, 1)
+        XCTAssertNotEqual(replaceReceipt.sha256, createReceipt.sha256)
+        XCTAssertNil(replaceReceipt.cleanupWarning)
+        XCTAssertEqual(try Data(contentsOf: destination), replacement)
+    }
+
+    func testDirectoryBundleCreateAndReplaceUsesWholeManifestDigest() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? fileManager.removeItem(at: workspace) }
+        try makeParent("bundles", workspace: workspace)
+        let initialFiles = [
+            "manifest.json": Data(#"{"pages":2}"#.utf8),
+            "pages/page-1.txt": Data("page one".utf8),
+            "pages/page-2.txt": Data("page two".utf8),
+            "legacy.txt": Data("old bundle only".utf8),
+        ]
+        let expectedInitialBytes = initialFiles.values.reduce(UInt64(0)) {
+            $0 + UInt64($1.count)
+        }
+
+        let createReceipt = try await writeBundle(
+            initialFiles,
+            destinationPath: "bundles/rendered",
+            workspace: workspace)
+        let copyReceipt = try await writeBundle(
+            initialFiles,
+            destinationPath: "bundles/rendered-copy",
+            workspace: workspace)
+
+        XCTAssertEqual(createReceipt.relativePath, "bundles/rendered")
+        XCTAssertEqual(createReceipt.fileCount, initialFiles.count)
+        XCTAssertEqual(createReceipt.byteCount, expectedInitialBytes)
+        XCTAssertEqual(createReceipt.sha256.count, 64)
+        XCTAssertEqual(copyReceipt.sha256, createReceipt.sha256)
+        XCTAssertEqual(copyReceipt.fileCount, createReceipt.fileCount)
+        XCTAssertEqual(copyReceipt.byteCount, createReceipt.byteCount)
+
+        await assertDocumentError(.outputConflict) {
+            _ = try await self.writeBundle(
+                initialFiles,
+                destinationPath: "bundles/rendered",
+                workspace: workspace,
+                replaceExisting: true,
+                expectedDestinationSHA256: nil)
+        }
+
+        #if canImport(Darwin)
+        let replacementFiles = [
+            "manifest.json": Data(#"{"pages":3}"#.utf8),
+            "pages/page-1.txt": Data("page one revised".utf8),
+            "pages/page-2.txt": Data("page two".utf8),
+            "pages/page-3.txt": Data("page three".utf8),
+        ]
+        let replaceReceipt = try await writeBundle(
+            replacementFiles,
+            destinationPath: "bundles/rendered",
+            workspace: workspace,
+            replaceExisting: true,
+            expectedDestinationSHA256: createReceipt.sha256)
+        let installed = workspace.appendingPathComponent("bundles/rendered", isDirectory: true)
+
+        XCTAssertEqual(replaceReceipt.fileCount, replacementFiles.count)
+        XCTAssertNotEqual(replaceReceipt.sha256, createReceipt.sha256)
+        XCTAssertFalse(fileManager.fileExists(atPath: installed.appendingPathComponent("legacy.txt").path))
+        for (relativePath, data) in replacementFiles {
+            XCTAssertEqual(try Data(contentsOf: installed.appendingPathComponent(relativePath)), data)
+        }
+        #endif
+    }
+
+    func testSymlinkAndNonRegularStagedOutputsAreRejected() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? fileManager.removeItem(at: workspace) }
+        try makeParent("outputs", workspace: workspace)
+        let symlinkTarget = workspace.appendingPathComponent("target.txt")
+        try Data("target".utf8).write(to: symlinkTarget)
+
+        await assertDocumentError(.validationFailed) {
+            _ = try await DocumentStagedOutput.writeDirectory(
+                DocumentStagedDirectoryRequest(
+                    sourcePath: nil,
+                    expectedSourceSHA256: nil,
+                    destinationPath: "outputs/symlink-bundle",
+                    replaceExisting: false,
+                    expectedDestinationSHA256: nil,
+                    maximumFiles: 8,
+                    maximumBytes: 1_024),
+                workspace: workspace,
+                produce: { root in
+                    try FileManager.default.createSymbolicLink(
+                        at: root.appendingPathComponent("link"),
+                        withDestinationURL: symlinkTarget)
+                },
+                validate: { _ in })
+        }
+        XCTAssertFalse(fileManager.fileExists(
+            atPath: workspace.appendingPathComponent("outputs/symlink-bundle").path))
+
+        await assertDocumentError(.validationFailed) {
+            _ = try await DocumentStagedOutput.writeFile(
+                DocumentStagedFileRequest(
+                    sourcePath: nil,
+                    expectedSourceSHA256: nil,
+                    destinationPath: "outputs/non-regular.docx",
+                    replaceExisting: false,
+                    expectedDestinationSHA256: nil,
+                    fileExtension: "docx",
+                    maximumBytes: 1_024),
+                workspace: workspace,
+                produce: { payload in
+                    try FileManager.default.createDirectory(
+                        at: payload,
+                        withIntermediateDirectories: false)
+                },
+                validate: { _ in })
+        }
+        XCTAssertFalse(fileManager.fileExists(
+            atPath: workspace.appendingPathComponent("outputs/non-regular.docx").path))
+    }
+
+    func testFileLargerThanEightMiBUsesConfiguredMaximum() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? fileManager.removeItem(at: workspace) }
+        try makeParent("docs", workspace: workspace)
+        let size = 9 * 1_024 * 1_024 + 17
+        let maximum = UInt64(10 * 1_024 * 1_024)
+        let data = Data(repeating: 0xA5, count: size)
+
+        let receipt = try await writeFile(
+            data,
+            destinationPath: "docs/large.docx",
+            workspace: workspace,
+            maximumBytes: maximum)
+
+        XCTAssertEqual(receipt.byteCount, UInt64(size))
+        XCTAssertEqual(receipt.fileCount, 1)
+        XCTAssertEqual(
+            try Data(contentsOf: workspace.appendingPathComponent("docs/large.docx")),
+            data)
+    }
+
+    func testPrecommitCancellationDoesNotInstallStagedFile() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? fileManager.removeItem(at: workspace) }
+        try makeParent("docs", workspace: workspace)
+        let destination = workspace.appendingPathComponent("docs/cancelled.docx")
+        let gate = DocumentContinuationGate()
+        let data = Data("cancel before commit".utf8)
+        let request = DocumentStagedFileRequest(
+            sourcePath: nil,
+            expectedSourceSHA256: nil,
+            destinationPath: "docs/cancelled.docx",
+            replaceExisting: false,
+            expectedDestinationSHA256: nil,
+            fileExtension: "docx",
+            maximumBytes: 1_024)
+
+        let operation = Task {
+            try await DocumentStagedOutput.writeFile(
+                request,
+                workspace: workspace,
+                produce: { payload in
+                    try data.write(to: payload)
+                    await gate.suspend()
+                },
+                validate: { url in
+                    guard try Data(contentsOf: url) == data else {
+                        throw DocumentToolError(.validationFailed, "fixture read-back mismatch")
+                    }
+                })
+        }
+        await gate.waitUntilSuspended()
+        operation.cancel()
+        await gate.resume()
+
+        do {
+            _ = try await operation.value
+            XCTFail("cancelled staged output unexpectedly committed")
+        } catch is CancellationError {
+            // Expected before the synchronous commit boundary.
+        } catch {
+            XCTFail("unexpected cancellation error: \(error)")
+        }
+
+        XCTAssertFalse(fileManager.fileExists(atPath: destination.path))
+        let docsContents = try fileManager.contentsOfDirectory(
+            at: destination.deletingLastPathComponent(),
+            includingPropertiesForKeys: nil)
+        XCTAssertFalse(docsContents.contains {
+            $0.lastPathComponent.hasPrefix(".intatis-document-stage-")
+        })
+    }
+}

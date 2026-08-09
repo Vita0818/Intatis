@@ -1,7 +1,7 @@
 # CURRENT_STATE
 
 文档状态：当前源码摘要
-最近核对：2026-08-08
+最近核对：2026-08-09
 产品基线：v0.40（build 40）
 
 ## 版本与发行状态
@@ -40,6 +40,17 @@ macOS 是完整产品：Chat、Code、Cowork、Settings 和本地诊断导出。
   历史重建时再解析为 provider `ImageAttachment`，不会把 base64 图片写入 EventLog。
   每次 Send 只按当前 exact route 的显式 capability 与 adapter dialect 可选地提供 hosted search；
   不支持、未知或未适配时在同一路由静默发送普通 Chat。
+- macOS/iOS Chat 在成功回合落盘后可启动独立、无工具、无 web search 的隐藏标题请求，复用该
+  回合冻结的 exact provider/model 与 `turn_outcome(completed)` seq 水位；后台重放只能读取该水位
+  及以前的 EventLog，后续由其他 route 完成的内容不会泄入旧标题请求。它从该冻结前缀中只读取
+  session 起点可证明串行的最早三个
+  completed Chat 回合，不写入消息历史、turn stats 或 busy/Stop 状态；每进程、每 session 最多
+  三个逻辑 generation，前两次可精确返回 `NO_TITLE`，第三次必须给出标题。输出通过严格 stream、
+  长度、格式、路径/长标识与敏感内容验收后，才在跨进程锁内执行 Chat-only set-if-absent rename。
+  手工 Rename 永远优先，自动命名不改变 recent-session 排序；生成、验收或 EventLog append 前的
+  失败、取消、超时与旧/歧义历史均静默保留默认名称。若 rename 已 append、仅 projection/通知失败，
+  EventLog 中标题已是 canonical truth，UI 可在刷新或重启后恢复。Code/Cowork 仍只使用既有显式
+  Rename/`rename_session` 路径。
 - Code 使用共享 headless `AgentRuntime.code`，提供工作区文件、patch、Git、managed
   terminal、Skills、外部 MCP、文档/媒体及浏览器工具。工具可见性、lease、权限和 durable
   execution ticket 在执行前逐层核对。
@@ -114,8 +125,10 @@ macOS 是完整产品：Chat、Code、Cowork、Settings 和本地诊断导出。
 
 iOS 是结构性 Chat 子集，只链接 Core、Protocol、Providers、Conversation、Artifacts、
 Multimodal 与 SharedUI。它支持 provider 配置导入、Chat/history、当前托管搜索 wire、
-citations、图片生成、输入栏语音转写和当前系统原生界面，但不链接 Tools、Permission、AgentKernel、Cowork、
-MCP 或本地 workspace/shell。其 Chat 与 macOS 共用同一个 exact-route hosted-search planner。
+citations、Chat 自动命名、图片生成、输入栏语音转写和当前系统原生界面，但不链接 Tools、
+Permission、AgentKernel、Cowork、MCP 或本地 workspace/shell。其 Chat 与 macOS 共用同一个
+exact-route hosted-search planner；自动标题通过 exact-session metadata relay 更新对应 header/row，
+切换到其他 session 不会把迟到标题写到当前会话。
 
 ### CLI
 
