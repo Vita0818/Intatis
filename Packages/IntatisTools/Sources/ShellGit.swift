@@ -817,12 +817,6 @@ private func trustedDocumentExecutable(
         #else
         path = "/usr/bin/libreoffice"
         #endif
-    case .libreOfficePython:
-        #if os(macOS)
-        path = "/Applications/LibreOffice.app/Contents/Resources/python"
-        #else
-        path = runtime?.appendingPathComponent("bin/libreoffice-python").path
-        #endif
     }
     guard let path,
           FileManager.default.isExecutableFile(atPath: path) else {

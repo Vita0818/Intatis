@@ -270,6 +270,8 @@ def require_request():
         raise ToolFailure('backend_version_mismatch', 'request schema mismatch')
     if value['operation'] not in {'read', 'validate', 'ocr', 'write', 'verify_write', 'prepare_html_render'}:
         raise ToolFailure('unsupported_operation', 'unsupported fixed Python route')
+    if os.environ.get('INTATIS_DOCUMENT_OPERATION') != value['operation']:
+        raise ToolFailure('validation_failed', 'operation binding mismatch')
     if not isinstance(value['payload'], dict):
         raise ToolFailure('validation_failed', 'payload must be an object')
     return value['operation'], value['payload']

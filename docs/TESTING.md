@@ -135,6 +135,7 @@ swift test --filter DocumentToolContractTests
 swift test --filter DocumentInfrastructureTests
 swift test --filter PDFNativeDocumentServiceTests
 swift test --filter DocumentPythonWriteBackendTests
+swift test --filter DocumentFixedBackendsTests
 swift test --filter DocumentToolsIntegrationTests
 swift test --filter CapabilityLeaseTests
 swift test --filter ToolRegistryLeaseTests
@@ -153,7 +154,8 @@ swift test --filter ToolRegistryLeaseTests
   前后固定，目录 bundle 不暴露 partial pages 或 staging 文件；
 - 缺失/版本不符 backend 明确返回 `backend_missing` / `backend_version_mismatch`，不触发 fallback；
 - DOCX/PPTX/XLSX/HTML 每个公开 operation 都有真实 runtime corpus；write 后重新打开并按声明
-  postcondition 验证。XLSX 的此项必须发生在 LibreOffice 重算与另存之后；
+  postcondition 验证。XLSX 的此项必须发生在 LibreOffice Calc round-trip/save 之后，并同时用
+  formula 与 data-only 两种视图证明目标公式文本保留且存在可读非公式缓存；不能只断言转换成功；
 - 生成 PDF 经 strict pdfcpu validation 和 PDFKit reopen/render smoke；validator 不能被描述为视觉保真、
   任意无损往返或 secure redaction 证明；
 - EPUB read/write 的 Rust helper 必须通过 `cargo fmt -- --check`、`cargo check --locked`、

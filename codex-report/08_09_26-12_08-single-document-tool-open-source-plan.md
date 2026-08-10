@@ -23,7 +23,7 @@
 2. **PDF 观察能力必须具备。** 支持读取已有文字、显式 OCR，以及把指定页面直接渲染成 PNG。
 3. **文档转 PDF 必须具备。** DOCX、PPTX、XLSX、HTML 使用唯一固定导出链。EPUB→PDF 不以未证明的 `epub.js`/WKWebView 路线冒充完成：full-spine corpus gate 通过或另一个成熟固定后端经审计前，该格式不进入 render/export schema。生成新的 PDF 不等于编辑输入 PDF。
 4. **工具按权限边界拆分。** 不再把读取、执行、写入全部塞进一个静态 `document` descriptor。
-5. **XLSX 接受 LibreOffice 重写。** `openpyxl` 表达结构修改，LibreOffice Calc 重算并保存 staged XLSX；最终文件可能是 LibreOffice round-trip 结果。
+5. **XLSX 接受 LibreOffice 重写。** `openpyxl` 表达结构修改，LibreOffice Calc round-trip/save staged XLSX，再由 formula + data-only cache gate 决定是否接受；最终文件可能是 LibreOffice 重写结果。
 6. **runtime 分发另案。** 本报告假定开发和测试环境已预置固定版本的后端；不设计下载器、安装器、App 内打包、双架构闭包、签名或公证。
 7. **图片进入模型上下文另案。** 本报告负责可靠生成页面 PNG 及其元数据，不重复设计 provider、EventLog、replay 和 compaction 的多模态协议。相关平台问题见 `08_09_26-13_42-durable-multimodal-context-handoff.md`。
 8. **成熟组件优先。** 只写 schema、权限和路径校验、固定调用、错误映射、staging、验证及原子提交；已有成熟实现的算法不在 Intatis 内重写。
@@ -154,7 +154,7 @@ PDFKit 和 WKWebView 是 Apple-native 渲染例外，不应写成开源组件。
 | PDF | PDFKit；只读已有文字和 metadata | **不支持** | 不适用；只验证其他格式生成的新 PDF | PDFKit 直接 bitmap draw → PNG | `pdfcpu validate` 显式 strict 模式 + PDFKit reopen/render smoke |
 | DOCX | `python-docx` | `python-docx` 的常见高层 API 子集 | LibreOffice Writer | LibreOffice 临时 PDF → PDFKit PNG | `python-docx` reopen + LibreOffice export + PDF 输出验证 |
 | PPTX | `python-pptx` | `python-pptx` 已证明的 shape/text/image/table/chart 子集 | LibreOffice Impress | LibreOffice 临时 PDF → PDFKit PNG | `python-pptx` reopen + LibreOffice export + PDF 输出验证 |
-| XLSX | `openpyxl`；大表必须指定范围 | `openpyxl` 修改 → LibreOffice Calc 重算并保存 staged XLSX | LibreOffice Calc | LibreOffice 临时 PDF → PDFKit PNG | `openpyxl` reopen + Calc round-trip 语义断言 + PDF 输出验证 |
+| XLSX | `openpyxl`；大表必须指定范围 | `openpyxl` 修改 → LibreOffice Calc round-trip/save + cache gate | LibreOffice Calc | LibreOffice 临时 PDF → PDFKit PNG | `openpyxl` formula/data-only reopen + Calc round-trip 语义断言 + PDF 输出验证 |
 | HTML | `lxml` | `lxml` DOM/attribute/text/style 节点操作 | WKWebView print-to-PDF，网络和远程资源关闭 | WKWebView PDF → PDFKit PNG | `lxml` parse + WKWebView load/render smoke + PDF 输出验证 |
 | EPUB | pinned `rbook` helper | metadata/resource/spine/ToC 声明子集 | **不支持（当前 schema 不注册）** | **不支持（当前 schema 不注册）** | helper reopen/postcondition + 固定 release EPUBCheck；未来 render/export 另需 full-spine gate |
 
@@ -221,7 +221,7 @@ DOCX、PPTX、XLSX 的事实源始终是原生格式：
 ```text
 DOCX -> python-docx -> staged DOCX
 PPTX -> python-pptx -> staged PPTX
-XLSX -> openpyxl -> staged XLSX -> LibreOffice Calc recalc + save
+XLSX -> openpyxl -> staged XLSX -> LibreOffice Calc round-trip/save + cache gate
 ```
 
 静态预览链固定为：
@@ -247,15 +247,17 @@ validated staged Office file
 
 ```text
 openpyxl 修改 staged XLSX
-  -> LibreOffice Calc 以隔离 profile 打开
-  -> UNO XCalculatable.calculateAll()
-  -> 以固定 XLSX filter 保存 staged XLSX
-  -> openpyxl reopen 做语义验证
+  -> LibreOffice Calc 以隔离 profile 做固定 XLSX round-trip/save
+  -> openpyxl 以 formula view reopen 做语义验证
+  -> openpyxl 以 data-only view 验证目标公式存在可读非公式缓存
   -> LibreOffice 导出临时 PDF 做静态预览
   -> 全部通过后原子提交
 ```
 
-不能只调用 `--convert-to` 就声称最终 XLSX 的 cached values 已刷新。
+不能只凭 `--convert-to` 退出成功就声称最终 XLSX 的 cached values 已刷新。本实现选择 `soffice`
+自身的固定 Calc XLSX filter，而不直接启动带 macOS parent launch constraint 的 bundled Python；只有
+round-trip 后 exact 公式文本仍在、且 data-only 视图得到非 `nil`、非 formula 的可读缓存时才继续。
+该 verifier 不自行计算公式，也不声称缓存值在数学上正确。
 
 接受以下结果：
 
@@ -397,7 +399,7 @@ LibreOffice 的使用、许可和最终分发方式必须单独核查。本报�
 
 1. 工具拆分、typed runner、staging/commit；
 2. PDFKit read/render、显式 OCR、pdfcpu validation；
-3. Office worker、LibreOffice 导出与 XLSX recalc/save；
+3. Office worker、LibreOffice 导出与 XLSX round-trip/save + cache gate；
 4. HTML create/edit/export 与 EPUB read/write；
 5. corpus、权限、安全、取消和无兜底回归。
 
@@ -422,10 +424,10 @@ LibreOffice 的使用、许可和最终分发方式必须单独核查。本报�
 4. `document_ocr` 必须报告固定 Docling + Tesseract engine chain；缺组件或非零退出明确失败，不换 OCR 引擎。
 5. OCR 测试断言 binary、tessdata、language、PSM 和本地 artifacts 路径均为 host 冻结值，且断网。
 6. PDF 页面 PNG 固定 page box、rotation、background、annotation 策略、像素预算、MIME、digest 和 ordinal。
-7. `pdfcpu` 只以显式 strict validation/info 身份出现；不得调用 annotation、redaction、page mutation、form 或 watermark 命令。
+7. `pdfcpu` 只以显式 `--conf disable --offline validate --mode strict` validation/info 身份出现；不得调用 annotation、redaction、page mutation、form 或 watermark 命令。
 8. DOCX/PPTX/XLSX 普通 read 分别只启动 `python-docx`、`python-pptx`、`openpyxl`；不得调用 Docling 代读。
 9. LibreOffice 缺失时 Office render/export 明确失败；不得只返回文本或静默省略视觉步骤。
-10. XLSX 写入测试证明固定执行 `openpyxl edit -> Calc calculateAll -> save XLSX -> reopen`；以语义断言验证公式、值、样式和关键对象，不比较 ZIP bytes。
+10. XLSX 写入测试证明固定执行 `openpyxl edit -> Calc XLSX round-trip/save -> formula + data-only reopen`；以语义断言验证公式、可读缓存、样式和关键对象，不比较 ZIP bytes，也不把转换退出码冒充重算证明。
 11. Office edit 的最终输出保持原生格式，临时 PDF 不参与回写。
 12. HTML 远程 URL、字体、图片和网络请求被拒绝；selector 零命中或多命中按 schema 失败。
 13. EPUBCheck 拒绝 staged EPUB 时不得提交；rbook round-trip 只验收声明的 API 子集；EPUB→PDF 必须证明完整 spine 而非单章渲染，gate 通过前 route 不得注册为 supported。
@@ -433,12 +435,12 @@ LibreOffice 的使用、许可和最终分发方式必须单独核查。本报�
 15. 模型不能注入 backend、binary path、command、environment、network URL 或临时目录。
 16. 日志上限和生成文件上限相互独立，大于 8 MiB 的合法文档不会仅因 stdout cap 被 `ulimit -f` 截断。
 17. 每个工具在 ToolRegistry、CapabilityLease、WorkspaceLease、PermissionIntent 和 touched paths 上都与精确权限分组一致。
-18. 搜索生产文档执行代码，不应出现 backend 遍历、`fallback`、`best_effort` 或失败后第二实现 retry。
+18. 生产文档执行代码不得遍历候选 backend、使用 `best_effort` 语义，或在失败后切换到第二个 semantic backend/retry；辅助几何计算等局部实现细节不属于后端兜底。
 19. renderer 能稳定生成完整页面 PNG 集及 metadata；本测试不冒充“模型已收到图片”的多模态验收。
 20. iOS target 不链接 IntatisTools、document runtime 或本地 Agent 执行能力。
 21. 生产目录不再暴露旧 `edit_pdf_pages` 或带 `backend=auto` 的旧 `read_document`；`read_pdf` 不再建议隐式 auto OCR；legacy capability 可以兼容解码，但不能映射为 live tool authority，fresh lease 不得签发。
 
-本次源码验证已覆盖合同、registry/lease、PDF native render、staging/commit、Python writer/verifier、HTML WKWebView、权限和 rbook helper。当前聚焦结果为：DocumentToolContract 16/16、DocumentToolsIntegration 10/10、DocumentInfrastructure 12/12、PDFNativeDocumentService 7/7、DocumentPythonWriteBackend 19/19、CapabilityLease 5/5、ToolRegistryLease 23/23、MessageDelegationSplit 10/10、IntatisPermission 28/28；rbook helper 8/8，并通过 locked check/fmt/clippy。真实 Docling OCR、pdfcpu validation、EPUBCheck 以及 clean-machine runtime corpus 因制品缺失仍是 release gate，不能由 fake runner 或 source test 代替。
+本次源码验证已覆盖合同、registry/lease、PDF native render、staging/commit、Python writer/verifier、HTML WKWebView、固定 LibreOffice/pdfcpu argv、权限和 rbook helper。当前聚焦结果为：DocumentToolContract 16/16、DocumentToolsIntegration 10/10、DocumentInfrastructure 12/12、PDFNativeDocumentService 7/7、DocumentPythonWriteBackend 20/20、DocumentFixedBackends 4/4、CapabilityLease 5/5、ToolRegistryLease 23/23、MessageDelegationSplit 10/10、IntatisPermission 29/29；rbook helper 9/9，并通过 locked check/fmt/clippy。开发机还完成了真实 LibreOffice 26.2.5.2 safe-profile XLSX round-trip smoke：`=SUM(A1:A2)` 初次 data-only cache 为 `3`；只把前置单元格 `A1` 从 `1` 改成 `5` 后再次 round-trip，未直接编辑的公式缓存更新为 `7`。真实 Docling OCR、pdfcpu validation、EPUBCheck 以及 clean-machine runtime corpus 因制品缺失仍是 release gate，不能由 fake runner 或 source test 代替。
 
 ## 10. 单一完成标准
 
@@ -449,7 +451,7 @@ LibreOffice 的使用、许可和最终分发方式必须单独核查。本报�
 - PDF 只有 native read、显式 OCR 和页面 PNG，任何 PDF mutation 均明确不支持；
 - DOCX/PPTX/XLSX/HTML/EPUB 的声明子集各绑定唯一 backend；缺少实际 runtime 时 typed fail closed；
 - DOCX/PPTX/XLSX/HTML 绑定固定导出链；EPUB render/export 在 full-spine gate 前明确不属于当前完成面；
-- XLSX 经 LibreOffice Calc `calculateAll()` 和 save 后再提交，并接受合法 OOXML 重写；
+- XLSX 经 LibreOffice Calc 固定 XLSX round-trip/save 和 formula + data-only cache gate 后再提交，并接受合法 OOXML 重写；
 - 所有写入都经过 staged output、精确验证和原子提交；
 - runner 只接受 host-owned typed invocation，不接受模型 shell command；
 - 组件缺失或失败时明确失败，没有自动后端切换；
@@ -466,14 +468,14 @@ LibreOffice 的使用、许可和最终分发方式必须单独核查。本报�
 - `DocumentMediaTools.swift` / `PDFNativeDocumentService.swift`：PDFKit native read、typed `ocr_required`、精确页面 PNG 与无 PDF mutation surface。
 - `ShellGit.swift`：host-owned document invocation、exact WorkspaceLease、Seatbelt/bwrap、版本 preflight、断网、timeout/cancel、进程树清理，以及彼此独立的日志/生成物预算。
 - `DocumentInfrastructure.swift`：source/destination/辅助资产 snapshot，owner-only staging，commit-lock CAS，父目录 identity 固定，file/directory 原子提交和 `commit_uncertain`。
-- `DocumentPythonBackend.swift` / `DocumentFixedBackends.swift`：固定 Office/HTML/OCR JSON 路线、OOXML 预算和 preservation gate、LibreOffice UNO `calculateAll()` + save、operation postcondition；XLSX cache 检查只证明可读缓存存在，不声称数学正确。
+- `DocumentPythonBackend.swift` / `DocumentFixedBackends.swift`：固定 Office/HTML/OCR JSON 路线、请求 operation 与宿主环境绑定、OOXML 预算和 preservation gate、LibreOffice safe-profile Calc XLSX round-trip/save、完整 pdfcpu strict argv 与 operation postcondition；XLSX cache 检查只证明目标公式保留且可读缓存存在，不声称数学正确。
 - `HTMLDocumentPDFRenderer.swift`：HTML local assets 先受 allowlist/快照约束并内联到 stage，WKWebView 只读 stage root，网络/active content fail closed。
 - `DocumentEPUBBackends.swift` / `Runtime/rbook-helper`：固定 rbook/EPUBCheck 连接、EPUB read/write 子集与 ZIP/reopen/postcondition；Cargo exact pins、依赖许可证和发行 gate 记录在 `ThirdPartyNotices/DocumentRBookHelper.md`。
 - `Leases.swift` / `PermissionIntent.swift` / `DeterministicPolicyGate.swift` / `Orchestrator.swift`：五项 process capability 拆分、legacy decode-only、exact `structured_read_only` 观察权限和 worker 可见性。
-- `OpenSource/pdfcpu`、Docling pipeline options、LibreOffice `XCalculatable` 及各格式库公开 API 仍是能力边界的上游核查依据；checkout 不冒充已安装 runtime。
+- `OpenSource/pdfcpu`、Docling pipeline options、LibreOffice Calc filter/security schema 及各格式库公开 API 仍是能力边界的上游核查依据；checkout 不冒充已安装 runtime。
 
 ## 12. 本轮状态
 
-本轮已经修改产品源码、测试、项目文档、NOTICE/ThirdPartyNotices，并新增 pinned rbook helper source；未修改 `OpenSource/` 研究 checkout。Swift 文档工具与权限相关 target/聚焦 XCTest、Rust locked check/test/fmt/clippy 均已执行。普通全仓 `swift test --filter ...` 当前会先被同一脏工作树中独立 Knowledge 实现的编译错误阻断，因此本报告只把已直接运行并通过的目标/bundle 记为通过，不把未运行到的全仓 suite 冒充成功。
+本轮已经修改产品源码、测试、项目文档、NOTICE/ThirdPartyNotices，并新增 pinned rbook helper source；未修改 `OpenSource/` 研究 checkout。Swift 文档工具与权限相关 target/聚焦 XCTest、Rust locked check/test/fmt/clippy 均已执行。最新合并文档过滤器在当前工作树执行 69/69 通过；其余非文档测试结果只按实际运行记录表述，不把未执行的全仓 suite 冒充成功。
 
 未完成且明确留给后续的事项：document runtime 下载/安装/打包、双架构闭包、Developer ID 签名/公证、clean-machine 验证、固定 Docling models、实际 pdfcpu/EPUBCheck/rbook helper 安装，以及受授权的真实大样本 corpus。图片进入模型上下文仍由独立报告处理。

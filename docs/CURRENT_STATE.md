@@ -61,8 +61,11 @@ macOS 是完整产品：Chat、Code、Cowork、Settings 和本地诊断导出。
   PDF 校验，不提供任何 PDF mutation。写入使用 source/destination snapshot、owner-only staging、
   CAS、格式语义验证与 file/directory 原子提交；模型不能选择 executable/backend/command/env 或
   fallback。DOCX/PPTX/XLSX/HTML 的 common-operation 子集由 python-docx/python-pptx/openpyxl/lxml
-  负责，XLSX 在 openpyxl staging 后经 LibreOffice UNO `calculateAll()`、显式另存、operation
-  postcondition 与 PDF preview 验证；EPUB read/write 绑定仓内可重复构建的 pinned rbook helper source
+  负责，XLSX 在 openpyxl staging 后经固定 safe-profile LibreOffice Calc XLSX round-trip/save、formula + data-only
+  cache postcondition 与 PDF preview 验证；不能只凭转换退出码声称已重算。开发机已用 LibreOffice
+  26.2.5.2 对真实公式完成 round-trip/cache smoke，并确认只修改前置单元格后，未直接编辑的公式缓存
+  会从 `3` 更新为 `7`。EPUB read/write 绑定仓内
+  可重复构建的 pinned rbook helper source
   和正式 EPUBCheck，EPUB render/export 在 full-spine corpus gate 通过前不进入 model schema，并返回
   `unsupported_operation`。文档辅助资产会先冻结 digest/identity，backend 运行与提交锁内再次核对；
   staged commit 固定目标父目录 identity，生成物同时受单文件、总字节与 entry 数预算约束。当前用户

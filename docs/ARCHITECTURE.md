@@ -820,8 +820,8 @@ provider tool_call -> AgentLoop schema validation
 - `document_read`：用固定 Python/rbook 后端读取 DOCX/PPTX/XLSX/HTML/EPUB；不接受 PDF，也不接受模型选择 backend。
 - `document_ocr`：只接受 PDF；固定 Docling pipeline、显式 Tesseract CLI、语言/PSM/tessdata/model artifact 配置，并强制禁用 remote services 与 external plugins。
 - `document_render`：PDF 直接由 PDFKit 按固定 box/DPI/背景导出 PNG；其他格式先用唯一 renderer 生成临时 PDF，再转页面 PNG。页面、SHA-256/尺寸/字节 metadata 与 manifest 作为单一目录 bundle 提交。
-- `document_export_pdf`：DOCX/PPTX/XLSX 走 LibreOffice，HTML 走固定 WKWebView renderer；生成 PDF 固定经过 `pdfcpu validate -mode strict` 与 PDFKit reopen/render smoke。EPUB 在 full-spine corpus gate 通过前不进入该工具 schema，显式请求返回 `unsupported_operation`。
-- `document_write`：DOCX/PPTX/XLSX/HTML 使用 python-docx/python-pptx/openpyxl/lxml 的明确 operation allowlist；EPUB 使用 rbook helper 并要求 EPUBCheck；XLSX 在 openpyxl 写 staging 后必须经 LibreOffice UNO `calculateAll()`、显式另存 XLSX、reopen/operation postcondition 校验与 PDF preview 验证，最终文件允许被 LibreOffice 重写。
+- `document_export_pdf`：DOCX/PPTX/XLSX 走 LibreOffice，HTML 走固定 WKWebView renderer；生成 PDF 固定经过 `pdfcpu --conf disable --offline validate --mode strict` 与 PDFKit reopen/render smoke。EPUB 在 full-spine corpus gate 通过前不进入该工具 schema，显式请求返回 `unsupported_operation`。
+- `document_write`：DOCX/PPTX/XLSX/HTML 使用 python-docx/python-pptx/openpyxl/lxml 的明确 operation allowlist；EPUB 使用 rbook helper 并要求 EPUBCheck；XLSX 在 openpyxl 写 staging 后必须经固定 LibreOffice Calc XLSX round-trip/save、reopen/operation postcondition、formula + data-only cache 检查与 PDF preview 验证，最终文件允许被 LibreOffice 重写。CLI round-trip 成功本身不构成重算证明；目标公式缺少可读非公式缓存值时 fail closed。
 - `read_document`、`edit_pdf_pages`、`reconstruct_document_image` 已从生产 registry 与 fresh lease 下架；旧 capability raw value 只为历史日志解码保留，不能被模型发现或执行。P0 不包含任何 PDF mutation、annotation 或 secure redaction。
 
 相邻但不属于六工具合同的媒体/编译工具继续保留：

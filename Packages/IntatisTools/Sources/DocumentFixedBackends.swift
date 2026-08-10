@@ -17,7 +17,7 @@ enum LibreOfficeDocumentBackend {
         let outputDirectory = stageRoot.appendingPathComponent("libreoffice-output", isDirectory: true)
         let profileDirectory = stageRoot.appendingPathComponent("libreoffice-profile", isDirectory: true)
         try createPrivateBackendDirectory(outputDirectory)
-        try createPrivateBackendDirectory(profileDirectory)
+        try prepareSafeLibreOfficeProfile(profileDirectory)
         let exportFilter: String
         switch actualInput.pathExtension.lowercased() {
         case "docx":
@@ -32,6 +32,8 @@ enum LibreOfficeDocumentBackend {
                 "LibreOffice PDF export accepts only DOCX, PPTX, or XLSX")
         }
         let profileArgument = "-env:UserInstallation=\(profileDirectory.absoluteString)"
+        let inputIsInternal = actualInput.path != stageRoot.path
+            && PathConfinement.isWithin(actualInput.path, root: stageRoot)
         let invocation = DocumentBackendInvocation(
             executable: .libreOffice,
             arguments: [
@@ -47,7 +49,8 @@ enum LibreOfficeDocumentBackend {
             ],
             readableWorkspacePaths: [reviewedInputPath],
             writableWorkspacePaths: [reviewedOutputPath],
-            internalWritableWorkspacePaths: [stageRoot.path])
+            internalWritableWorkspacePaths: [stageRoot.path],
+            internalReadOnlyWorkspacePaths: inputIsInternal ? [actualInput.path] : [])
         let result = try await run(invocation, in: context)
         guard result.exitCode == 0 else {
             throw DocumentToolError(.backendFailed, "LibreOffice PDF export failed")
@@ -67,9 +70,10 @@ enum LibreOfficeDocumentBackend {
         return ["libreoffice": version]
     }
 
-    /// The fixed Calc route is intentionally a UNO `calculateAll` + explicit
-    /// XLSX save, not a `--convert-to` claim. The helper launches the exact
-    /// bundled soffice binary with an isolated profile and no macro/link update.
+    /// Calc owns the final XLSX round trip. A newly written formula is accepted
+    /// only after the caller's data-only verifier proves that LibreOffice wrote
+    /// a readable cached value, so this route does not infer recalculation from
+    /// a successful conversion alone.
     static func recalculateAndSaveXLSX(
         editedInput: URL,
         stagedXLSX: URL,
@@ -80,63 +84,59 @@ enum LibreOfficeDocumentBackend {
     ) async throws -> [String: String] {
         let version = try await requireVersion(in: context)
         let stageRoot = stagedXLSX.deletingLastPathComponent()
-        let profile = stageRoot.appendingPathComponent("libreoffice-profile", isDirectory: true)
-        try createPrivateBackendDirectory(profile)
-        let request: JSONValue = .object([
-            "input_path": .string(editedInput.path),
-            "output_path": .string(stagedXLSX.path),
-            "preview_pdf_path": .string(previewPDF.path),
-            "profile_path": .string(profile.path),
-            "expected_version": .string(expectedVersion),
-        ])
-        let data = try JSONEncoder.sortedFixedBackendEncoder.encode(request)
-        guard let encoded = String(data: data, encoding: .utf8) else {
-            throw DocumentToolError(.validationFailed, "Calc request could not be encoded")
-        }
+        let outputDirectory = stageRoot.appendingPathComponent(
+            "libreoffice-calc-output",
+            isDirectory: true)
+        let profile = stageRoot.appendingPathComponent(
+            "libreoffice-calc-profile",
+            isDirectory: true)
+        try createPrivateBackendDirectory(outputDirectory)
+        try prepareSafeLibreOfficeProfile(profile)
+        let profileArgument = "-env:UserInstallation=\(profile.absoluteString)"
         let invocation = DocumentBackendInvocation(
-            executable: .libreOfficePython,
-            arguments: ["-c", calcUNOProgram],
-            environment: [
-                "INTATIS_DOCUMENT_REQUEST": encoded,
-                "INTATIS_DOCUMENT_OPERATION": "xlsx_calculate_save",
-                "PYTHONHASHSEED": "0",
+            executable: .libreOffice,
+            arguments: [
+                "--headless",
+                "--nologo",
+                "--nodefault",
+                "--nofirststartwizard",
+                "--nolockcheck",
+                profileArgument,
+                "--convert-to", "xlsx:Calc MS Excel 2007 XML",
+                "--outdir", outputDirectory.path,
+                editedInput.path,
             ],
             readableWorkspacePaths: [reviewedInputPath],
             writableWorkspacePaths: [reviewedOutputPath],
             internalWritableWorkspacePaths: [stageRoot.path],
             internalReadOnlyWorkspacePaths: [editedInput.path])
-        let result: ShellResult
-        do {
-            result = try await context.documentBackend.run(invocation, cwd: context.workspaceRoot)
-        } catch let error as IntatisError {
-            if case .config = error {
-                throw DocumentToolError(.backendMissing, "LibreOffice UNO runtime is unavailable")
-            }
-            throw DocumentToolError(.backendFailed, "LibreOffice UNO helper could not start")
-        } catch let error as DocumentToolError {
-            throw error
-        } catch {
-            throw DocumentToolError(.backendFailed, "LibreOffice UNO helper could not start")
+        let result = try await run(invocation, in: context)
+        guard result.exitCode == 0 else {
+            throw DocumentToolError(.backendFailed, "LibreOffice Calc XLSX round trip failed")
         }
-        guard result.exitCode == 0,
-              let responseData = result.stdout.data(using: .utf8),
-              let response = try? JSONDecoder().decode(
-                  LibreOfficeUNOResponse.self,
-                  from: responseData) else {
+        let candidates = try safeRegularFiles(in: outputDirectory).filter {
+            $0.pathExtension.lowercased() == "xlsx"
+        }
+        guard candidates.count == 1,
+              FileManager.default.fileExists(atPath: stagedXLSX.path) == false else {
             throw DocumentToolError(
-                .backendMissing,
-                "LibreOffice UNO helper is unavailable or incompatible")
+                .validationFailed,
+                "LibreOffice Calc did not produce exactly one XLSX")
         }
-        guard response.ok else {
-            let code = response.code.flatMap(DocumentToolErrorCode.init(rawValue:))
-                ?? .backendFailed
-            throw DocumentToolError(code, "LibreOffice Calc calculate/save failed")
+        do {
+            try FileManager.default.moveItem(at: candidates[0], to: stagedXLSX)
+        } catch {
+            throw DocumentToolError(.backendFailed, "LibreOffice Calc output could not be staged")
         }
-        guard FileManager.default.fileExists(atPath: stagedXLSX.path),
-              FileManager.default.fileExists(atPath: previewPDF.path) else {
-            throw DocumentToolError(.validationFailed, "Calc did not produce both XLSX and preview PDF")
-        }
-        return ["libreoffice": version, "uno": "calculateAll"]
+        var versions = try await exportPDF(
+            actualInput: stagedXLSX,
+            reviewedInputPath: reviewedOutputPath,
+            stagedPDF: previewPDF,
+            reviewedOutputPath: reviewedOutputPath,
+            in: context)
+        versions["libreoffice"] = version
+        versions["xlsx_recalculation"] = "calc_roundtrip_cache_verified"
+        return versions
     }
 
     private static func requireVersion(in context: ToolContext) async throws -> String {
@@ -176,117 +176,36 @@ enum LibreOfficeDocumentBackend {
         }
     }
 
-    private struct LibreOfficeUNOResponse: Decodable {
-        let ok: Bool
-        let code: String?
-    }
+}
 
-    private static let calcUNOProgram = #"""
-import json
-import os
-import pathlib
-import subprocess
-import sys
-import time
-
-def emit(value):
-    print(json.dumps(value, sort_keys=True, separators=(',', ':')))
-
-process = None
-document = None
-try:
-    import uno
-    from com.sun.star.beans import PropertyValue
-    request = json.loads(os.environ['INTATIS_DOCUMENT_REQUEST'])
-    if set(request) != {'expected_version', 'input_path', 'output_path', 'preview_pdf_path', 'profile_path'}:
-        raise ValueError('invalid UNO request')
-    for key in ('input_path', 'output_path', 'preview_pdf_path', 'profile_path'):
-        if not isinstance(request[key], str) or not os.path.isabs(request[key]) or '\x00' in request[key]:
-            raise ValueError('invalid UNO path')
-    soffice = '/Applications/LibreOffice.app/Contents/MacOS/soffice'
-    version = subprocess.run([soffice, '--version'], stdin=subprocess.DEVNULL,
-                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                             text=True, timeout=5, check=False).stdout
-    if ('LibreOffice ' + request['expected_version']) not in version:
-        emit({'ok': False, 'code': 'backend_version_mismatch'})
-        sys.exit(0)
-    pipe_name = 'intatis_document_' + os.urandom(12).hex()
-    profile_url = pathlib.Path(request['profile_path']).as_uri()
-    process = subprocess.Popen([
-        soffice, '--headless', '--nologo', '--nodefault', '--nofirststartwizard',
-        '--nolockcheck', '-env:UserInstallation=' + profile_url,
-        '--accept=pipe,name=' + pipe_name + ';urp;StarOffice.ComponentContext',
-    ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    local_context = uno.getComponentContext()
-    resolver = local_context.ServiceManager.createInstanceWithContext(
-        'com.sun.star.bridge.UnoUrlResolver', local_context)
-    context = None
-    deadline = time.monotonic() + 10.0
-    while time.monotonic() < deadline:
-        if process.poll() is not None:
-            break
-        try:
-            context = resolver.resolve(
-                'uno:pipe,name=' + pipe_name + ';urp;StarOffice.ComponentContext')
-            break
-        except Exception:
-            time.sleep(0.05)
-    if context is None:
-        emit({'ok': False, 'code': 'backend_missing'})
-        sys.exit(0)
-    service_manager = context.ServiceManager
-    desktop = service_manager.createInstanceWithContext('com.sun.star.frame.Desktop', context)
-    def prop(name, value):
-        item = PropertyValue()
-        item.Name = name
-        item.Value = value
-        return item
-    load_properties = (
-        prop('Hidden', True),
-        prop('ReadOnly', False),
-        prop('MacroExecutionMode', 0),
-        prop('UpdateDocMode', 0),
-    )
-    document = desktop.loadComponentFromURL(
-        pathlib.Path(request['input_path']).as_uri(), '_blank', 0, load_properties)
-    if document is None or not hasattr(document, 'calculateAll'):
-        emit({'ok': False, 'code': 'unsupported_feature'})
-        sys.exit(0)
-    document.calculateAll()
-    xlsx_properties = (
-        prop('FilterName', 'Calc MS Excel 2007 XML'),
-        prop('Overwrite', True),
-    )
-    document.storeAsURL(pathlib.Path(request['output_path']).as_uri(), xlsx_properties)
-    pdf_properties = (
-        prop('FilterName', 'calc_pdf_Export'),
-        prop('Overwrite', True),
-    )
-    document.storeToURL(pathlib.Path(request['preview_pdf_path']).as_uri(), pdf_properties)
-    emit({'ok': True})
-except ModuleNotFoundError:
-    emit({'ok': False, 'code': 'backend_missing'})
-except Exception:
-    emit({'ok': False, 'code': 'backend_failed'})
-finally:
-    if document is not None:
-        try:
-            document.close(True)
-        except Exception:
-            try:
-                document.dispose()
-            except Exception:
-                pass
-    if process is not None:
-        try:
-            process.terminate()
-            process.wait(timeout=2)
-        except Exception:
-            try:
-                process.kill()
-            except Exception:
-                pass
+private func prepareSafeLibreOfficeProfile(_ profile: URL) throws {
+    try createPrivateBackendDirectory(profile)
+    let user = profile.appendingPathComponent("user", isDirectory: true)
+    try createPrivateBackendDirectory(user)
+    let configuration = user.appendingPathComponent("registrymodifications.xcu")
+    let xml = #"""
+<?xml version="1.0" encoding="UTF-8"?>
+<oor:items xmlns:oor="http://openoffice.org/2001/registry" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <item oor:path="/org.openoffice.Office.Common/Security/Scripting">
+    <prop oor:name="MacroSecurityLevel" oor:op="fuse"><value>3</value></prop>
+    <prop oor:name="DisableMacrosExecution" oor:op="fuse"><value>true</value></prop>
+    <prop oor:name="DisableActiveContent" oor:op="fuse"><value>true</value></prop>
+    <prop oor:name="DisablePythonRuntime" oor:op="fuse"><value>true</value></prop>
+    <prop oor:name="DisableOLEAutomation" oor:op="fuse"><value>true</value></prop>
+    <prop oor:name="BlockUntrustedRefererLinks" oor:op="fuse"><value>true</value></prop>
+  </item>
+</oor:items>
 """#
+    do {
+        try Data(xml.utf8).write(to: configuration, options: .withoutOverwriting)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: Int16(0o600))],
+            ofItemAtPath: configuration.path)
+    } catch {
+        throw DocumentToolError(
+            .backendFailed,
+            "LibreOffice safe profile could not be prepared")
+    }
 }
 
 enum PDFCPUValidationBackend {
@@ -311,10 +230,10 @@ enum PDFCPUValidationBackend {
         let invocation = DocumentBackendInvocation(
             executable: .pdfcpu,
             arguments: [
-                "-conf", "disable",
-                "-offline",
+                "--conf", "disable",
+                "--offline",
                 "validate",
-                "-mode", "strict",
+                "--mode", "strict",
                 "--",
                 stagedPDF.path,
             ],

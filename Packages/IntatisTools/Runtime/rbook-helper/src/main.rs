@@ -631,14 +631,20 @@ fn preflight_epub_archive(path: &Path) -> HelperResult<()> {
     }
     let mut total = 0_u64;
     let mut names = BTreeSet::new();
+    let mut portable_names = BTreeSet::new();
     for index in 0..archive.len() {
         let entry = archive
             .by_index_raw(index)
             .map_err(|_| HelperError::validation())?;
         let name = entry.name();
+        let portable_name = name
+            .chars()
+            .flat_map(char::to_lowercase)
+            .collect::<String>();
         if name.is_empty()
             || entry.encrypted()
             || !names.insert(entry.name_raw().to_vec())
+            || !portable_names.insert(portable_name)
             || name.contains('\0')
             || name.contains('\\')
             || name.starts_with('/')
@@ -1374,5 +1380,26 @@ mod tests {
             preflight_epub_archive(&path).unwrap_err().code,
             "validation_failed"
         );
+    }
+
+    #[test]
+    fn zip_preflight_rejects_case_colliding_entry_names() {
+        let directory = TestDirectory::new();
+        let path = directory.path("case-collision.epub");
+        let file = File::create(&path).expect("create case-collision zip");
+        let mut archive = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        archive
+            .start_file("OPS/chapter.xhtml", options)
+            .expect("first member");
+        archive.write_all(b"one").expect("first content");
+        archive
+            .start_file("ops/chapter.xhtml", options)
+            .expect("second member");
+        archive.write_all(b"two").expect("second content");
+        archive.finish().expect("finish case-collision zip");
+
+        assert!(preflight_epub_archive(&path).is_err());
     }
 }

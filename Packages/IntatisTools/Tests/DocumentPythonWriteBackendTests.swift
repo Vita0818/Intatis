@@ -115,6 +115,42 @@ assert namespace['contiguous_page_runs']([1, 2, 4, 100]) == [(1, 2), (4, 4), (10
         XCTAssertFalse(envelope.summary?.contains("JSON") ?? true)
     }
 
+    func testPythonRequestOperationMustMatchHostEnvironmentBinding() throws {
+        guard FileManager.default.isExecutableFile(atPath: "/usr/bin/python3") else {
+            throw XCTSkip("system Python is unavailable for operation binding checking")
+        }
+        let invocation = try DocumentPythonBackend.invocation(
+            operation: "write",
+            payload: .object([
+                "format": .string("html"),
+                "mode": .string("create"),
+                "output_path": .string("/tmp/unused.htm"),
+                "operations": .array([]),
+            ]),
+            readableWorkspacePaths: [])
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        process.arguments = invocation.arguments
+        var environment = ProcessInfo.processInfo.environment
+        for (key, value) in invocation.environment {
+            environment[key] = value
+        }
+        environment["INTATIS_DOCUMENT_OPERATION"] = "read"
+        process.environment = environment
+        let outputPipe = Pipe()
+        process.standardOutput = outputPipe
+        try process.run()
+        process.waitUntilExit()
+
+        XCTAssertEqual(process.terminationStatus, 0)
+        let envelope = try JSONDecoder().decode(
+            DocumentBackendEnvelope.self,
+            from: outputPipe.fileHandleForReading.readDataToEndOfFile())
+        XCTAssertFalse(envelope.ok)
+        XCTAssertEqual(envelope.code, DocumentToolErrorCode.validationFailed.rawValue)
+        XCTAssertEqual(envelope.summary, "operation binding mismatch")
+    }
+
     func testSwiftBoundaryNeverForwardsBackendFailedSummary() async throws {
         let malicious = #"{"schema_version":1,"ok":false,"code":"backend_failed","summary":"ValueError: /Users/private/customer.xlsx cell SECRET","engine_versions":{},"warnings":[]}"#
         let runner = FixedPythonEnvelopeRunner(

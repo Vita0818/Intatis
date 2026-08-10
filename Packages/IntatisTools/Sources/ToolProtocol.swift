@@ -147,7 +147,6 @@ public protocol ShellRunner: Sendable {
 public enum DocumentBackendExecutable: String, Equatable, Sendable {
     case pythonRuntime
     case libreOffice
-    case libreOfficePython
     case pdfcpu
     case rbookHelper
     case epubCheck
