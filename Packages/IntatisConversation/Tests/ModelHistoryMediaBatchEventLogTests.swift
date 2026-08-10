@@ -54,15 +54,18 @@ final class ModelHistoryMediaBatchEventLogTests: XCTestCase {
         callID: String,
         itemID: String = "media-output",
         turnID: TurnID = TurnID(rawValue: "turn-media-batch"),
+        agent: AgentID = AgentID(rawValue: "main"),
+        taskID: TaskID? = nil,
+        taskAttempt: Int? = nil,
         references: [ModelHistoryImageReference]
     ) -> Event {
         .modelHistoryItem(.functionCallOutput(
             itemID: itemID,
             turnID: turnID,
-            agent: AgentID(rawValue: "main"),
-            taskID: nil,
+            agent: agent,
+            taskID: taskID,
             submissionID: nil,
-            taskAttempt: nil,
+            taskAttempt: taskAttempt,
             callID: callID,
             output: "canonical tool observation",
             imageReferences: references))
@@ -70,12 +73,17 @@ final class ModelHistoryMediaBatchEventLogTests: XCTestCase {
 
     private func settlement(
         callID: String,
-        executionID: String? = nil
+        executionID: String? = nil,
+        agent: AgentID? = AgentID(rawValue: "main"),
+        taskID: TaskID? = nil,
+        attempt: Int? = nil
     ) -> Event {
         .toolExecutionSettled(ToolExecutionSettledPayload(
             executionID: executionID ?? "execution-\(callID)",
+            taskID: taskID,
+            attempt: attempt,
             toolCallID: callID,
-            agent: AgentID(rawValue: "main"),
+            agent: agent,
             tool: "media_tool",
             sideEffect: .readOnly,
             outcome: .succeeded,
@@ -255,7 +263,7 @@ final class ModelHistoryMediaBatchEventLogTests: XCTestCase {
             mimeType: "image/jpeg",
             byteCount: 23,
             digestCharacter: "b")
-        let events: [Event] = [
+        let firstEvents: [Event] = [
             functionOutput(
                 callID: "reused-call",
                 itemID: "first-output",
@@ -263,28 +271,74 @@ final class ModelHistoryMediaBatchEventLogTests: XCTestCase {
                 references: [firstImage]),
             toolResult(
                 callID: "reused-call",
-                content: [imageBlock(secondImage)],
-                turnID: secondTurn),
-            toolResult(
-                callID: "reused-call",
                 content: [imageBlock(firstImage)],
                 turnID: firstTurn),
             settlement(
                 callID: "reused-call",
                 executionID: "execution-reused-first"),
+        ]
+        let secondEvents: [Event] = [
             functionOutput(
                 callID: "reused-call",
                 itemID: "second-output",
                 turnID: secondTurn,
                 references: [secondImage]),
+            toolResult(
+                callID: "reused-call",
+                content: [imageBlock(secondImage)],
+                turnID: secondTurn),
             settlement(
                 callID: "reused-call",
                 executionID: "execution-reused-second"),
         ]
 
-        let appended = try await log.append(events)
+        let firstAppended = try await log.append(firstEvents)
+        let secondAppended = try await log.append(secondEvents)
 
-        XCTAssertEqual(appended.map(\.event), events)
+        XCTAssertEqual(firstAppended.map(\.event), firstEvents)
+        XCTAssertEqual(secondAppended.map(\.event), secondEvents)
+    }
+
+    func testMediaFunctionOutputRequiresExactSettlementIdentity()
+        async throws
+    {
+        let image = reference("artifact-settlement-identity")
+        let taskID = TaskID(rawValue: "task-media")
+        let output = functionOutput(
+            callID: "call-identity",
+            agent: AgentID(rawValue: "main"),
+            taskID: taskID,
+            taskAttempt: 2,
+            references: [image])
+        let result = toolResult(
+            callID: "call-identity",
+            content: [imageBlock(image)])
+
+        try await assertRejectedBeforeBytes([
+            result,
+            settlement(
+                callID: "call-identity",
+                agent: AgentID(rawValue: "worker"),
+                taskID: taskID,
+                attempt: 2),
+            output,
+        ], label: "mismatched settlement agent")
+        try await assertRejectedBeforeBytes([
+            result,
+            settlement(
+                callID: "call-identity",
+                taskID: TaskID(rawValue: "task-other"),
+                attempt: 2),
+            output,
+        ], label: "mismatched settlement task")
+        try await assertRejectedBeforeBytes([
+            result,
+            settlement(
+                callID: "call-identity",
+                taskID: taskID,
+                attempt: 1),
+            output,
+        ], label: "mismatched settlement attempt")
     }
 
     func testMediaFunctionOutputRejectsDescriptorMismatchBeforeWAL()

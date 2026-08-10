@@ -1583,9 +1583,17 @@ public actor EventLog {
     private static func validateModelHistoryMediaBatch(
         _ events: [Event]
     ) throws {
+        struct SettlementKey: Hashable {
+            var callID: String
+            var taskID: TaskID?
+            var attempt: Int?
+            var agent: AgentID?
+        }
+
         var toolResultsByTurnAndCall:
             [TurnID: [String: [ToolResultPayload]]] = [:]
-        var settlementCountsByCallID: [String: Int] = [:]
+        var settlementsByKey:
+            [SettlementKey: [ToolExecutionSettledPayload]] = [:]
         for event in events {
             switch event {
             case .toolResult(let payload):
@@ -1595,14 +1603,18 @@ public actor EventLog {
                     default: []
                 ].append(payload)
             case .toolExecutionSettled(let payload):
-                settlementCountsByCallID[payload.toolCallID, default: 0] += 1
+                settlementsByKey[SettlementKey(
+                    callID: payload.toolCallID,
+                    taskID: payload.taskID,
+                    attempt: payload.attempt,
+                    agent: payload.agent), default: []].append(payload)
             default:
                 continue
             }
         }
 
         var mediaOutputCallIDsByTurn: [TurnID: Set<String>] = [:]
-        var mediaOutputCountsByCallID: [String: Int] = [:]
+        var mediaOutputSettlementKeys = Set<SettlementKey>()
         for event in events {
             guard case .modelHistoryItem(let payload) = event,
                   payload.schemaVersion
@@ -1621,11 +1633,15 @@ public actor EventLog {
                     payload.turnID
                   ]?[callID],
                   matchingResults.count == 1,
-                  let structuredResult = matchingResults[0].structuredResult
+                  let structuredResult = matchingResults[0].structuredResult,
+                  mediaOutputSettlementKeys.insert(SettlementKey(
+                    callID: callID,
+                    taskID: payload.taskID,
+                    attempt: payload.taskAttempt,
+                    agent: payload.agent)).inserted
             else {
                 throw EventLogError.invalidModelHistoryMediaBatch
             }
-            mediaOutputCountsByCallID[callID, default: 0] += 1
 
             let imageBlocks = structuredResult.content.filter {
                 $0.kind == .imageReference
@@ -1642,8 +1658,8 @@ public actor EventLog {
                 }
             }
         }
-        for (callID, count) in mediaOutputCountsByCallID {
-            guard settlementCountsByCallID[callID] == count else {
+        for key in mediaOutputSettlementKeys {
+            guard settlementsByKey[key]?.count == 1 else {
                 throw EventLogError.invalidModelHistoryMediaBatch
             }
         }

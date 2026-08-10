@@ -1,12 +1,12 @@
 # CURRENT_STATE
 
 文档状态：当前源码摘要
-最近核对：2026-08-09
+最近核对：2026-08-10
 产品基线：v0.40（build 40）
 
 ## 版本与发行状态
 
-- `HEAD` 与 `origin/main` 当前均为标题为 `v0.34` 的提交 `c4727c1`。仓库没有 Git tag；该
+- `HEAD` 与 `origin/main` 当前均为标题为 `v0.44` 的提交 `21cacff`。仓库没有 Git tag；该
   commit 标题不是产品版本事实源，`project.yml` 把当前产品基线定义为 `0.40 (40)`。
 - `MARKETING_VERSION` / `CURRENT_PROJECT_VERSION` 已推进为 `0.40 (40)`。两个仓库参考
   Info.plist、README、文档入口和发行脚本使用同一基线。
@@ -84,16 +84,26 @@ macOS 是完整产品：Chat、Code、Cowork、Settings 和本地诊断导出。
   两者均只接受 `data[].b64_json` 输出。mask、多参考图与原地覆盖尚未支持。
 - Code 与 Cowork 的 Agent 图片输入已改为 durable active-history 链路。macOS共享composer reader对
   `.png`/`.jpg`/`.jpeg`使用确定性canonical MIME映射（其他格式才查询系统type database），GUI/CLI
-  再把用户图片写入 exact-session `ArtifactStore`；AgentLoop 在 dispatch 前通过共享 resolver 有界读取并验证
-  PNG/JPEG、MIME、完整解码、尺寸/像素、byte count 与 SHA-256，再把无 base64/path 的 v2
-  descriptor 写入 stable model history。Code stable conversation 与 Cowork exact `@main` 支持
-  current/next/restart；ordinary task-scoped agent 只承诺 current，CLI Code 只承诺同进程 next。
-  MCP structured-result 图片会以原 `callID` 进入多模态 function output，live 与 restart replay使用同一
-  canonical binding；unsupported route、缺失/损坏 blob 或 descriptor不一致均在下一次provider请求前
-  typed fail closed。自动 Cowork ask-class授权快照若含图片则 durable
+  再把用户图片写入 exact-session `ArtifactStore`；`AgentLoop.send`拒绝调用方直接传入provider-ready
+  `images`/data URL，stable与ordinary task-scoped current都只能从accepted attachment IDs经共享resolver
+  有界读取并验证PNG/JPEG、MIME、完整解码、尺寸/像素、byte count与SHA-256。stable路径再把无
+  base64/path的v2 descriptor写入model history。Code stable conversation与Cowork exact `@main`支持
+  current/next/restart；ordinary task-scoped agent只承诺current，CLI Code只承诺同进程next。
+  图片capability只在exact request adapter为`.openAI`且model声明`.visionInput`时打开；user/FCO两个
+  flag独立检查，compatible/legacy/OpenRouter/unknown route默认false，tool-search gate与图片gate分离。
+  MCP structured-result图片会以原`callID`进入多模态function output，live与restart replay使用同一
+  canonical binding；stable媒体completion batch还要求同turn/call的唯一`tool_result`与同
+  `{callID, agent, taskID, attempt}`的唯一settlement，Code首轮工具票据复用model-history规范化的attempt 1。
+  unsupported route、缺失/损坏blob或descriptor不一致均在下一次provider请求前typed fail closed。
+  自动Cowork ask-class授权快照若含图片则durable
   `media_authorization_unsupported` deny，不把图片描述交给可返回allow的文本reviewer。上下文压缩的
   summarizer会看见完整active window中的用户/工具图片；checkpoint成功后所有旧原图只由摘要接替，
   replacement不保留attachment/ref，但ArtifactStore blob与审计事实不删除。
+- Cowork显式Retry由纯`SubmittedIntentRetryPlanner`按canonical task状态决定：outbox canonicalization
+  继续保持attempt 1；restored queued exact task不递增attempt或改写queued事件，restored running已经由
+  Orchestrator durable requeue到下一attempt时只对齐该exact attempt；只有failed/cancelled whole-task
+  execution retry才递增，created/assigned/running或不一致状态fail closed。所有分支都复用同一
+  SubmissionID、冻结payload/附件IDs与root task，不重复user event。
 - macOS Chat/Code/Cowork 与 iOS Chat 的 composer 已在 Send/Stop 左侧接入同一个语音输入按钮。
   第一次点击开始录音，第二次点击停止并通过顶层 canonical `transcription_model` 指定的 exact
   provider/model 调用 `audio/transcriptions`；转写结果追加到完成时仍然可编辑的当前草稿，不自动

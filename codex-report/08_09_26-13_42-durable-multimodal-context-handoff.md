@@ -524,7 +524,9 @@ ModelHistoryReplacementItem.imageReferences: [ModelHistoryImageReference]?
 bounded resolve/验证并生成descriptor。对Code与Cowork exact `@main` stable-history policy，先把v2
 real-user model-history item原子落盘，current turn再从实际append返回的canonical Envelope物化，不能
 继续使用调用方的pre-append副本。ordinary-agent task-scoped直投只保留本次request snapshot，不写
-stable history；GUI Retry重新从同一blob解析。若进程崩在stable v2 item落盘前，尚未发生provider
+stable history；GUI Retry重新从同一blob解析。`AgentLoop.send`同时拒绝调用方直接传入任何
+provider-ready `images`/data URL，因此task-scoped current也不能绕过accepted attachment IDs和同一
+resolver。若进程崩在stable v2 item落盘前，尚未发生provider
 dispatch，restart/GUI Retry可重新生成binding；这不声称具备ingestion-time digest取证，也不需要
 新event、outbox schema或sidecar文件。
 
@@ -581,7 +583,9 @@ MIME为canonical白名单值、SHA-256为canonical lowercase hex。FCO的`output
 - 新 multimodal model-history/event payload不写base64、路径或未经限制的远程URL；现有
   `artifact_added.path` 是明确legacy debt，不是可复用先例；
 - UI/audit text projection 与 provider model history保持分离；
-- tool result、model-history function output和 tool execution settlement 保持精确 correlation；
+- 含图model-history function output必须在同一batch绑定同turn/call的唯一tool result与同
+  `{callID, agent, taskID, attempt}`的唯一tool execution settlement；仅靠邻近事件、call ID或数量匹配
+  不构成correlation；stable Code prepare/settle使用model-history规范化的attempt 1；
 - 新字段/事件只能 additive；Code与Cowork exact `@main` stable Agent history遇到unknown event、seq gap或未知
   schema时必须在provider/compaction/授权前fail closed。Chat使用独立的event/projection合同，
   不应把这条Agent语义扩张成重构Chat replay的理由。
@@ -713,6 +717,11 @@ AgentLoop应：
 - `tool_result` audit payload；
 - `tool_execution_settled`；
 - exact `callID + output` 的model-history binding；ordered image refs非空时为v2，否则为v1。
+
+含图binding还必须在WAL/JSONL前验证：同一batch只有一个同turn/call的`tool_result`，并只有一个
+`{callID, agent, taskID, attempt}`全等的settlement；复用call ID但turn、agent、task或attempt不同不能
+互相配对。stable Code的工具prepare/settle沿用model-history规范化attempt 1，不能落成`nil`后再依赖
+位置猜测。
 
 task-scoped ordinary-agent policy不制造stable model history：其completion batch只写canonical
 `tool_result + tool_execution_settled`，然后从append返回的canonical
@@ -902,15 +911,16 @@ release-only外部验证；旧reader则另以`v0.41` exact source snapshot编译
   与replay同路，task-scoped policy复用同一resolver但不制造跨轮history；
 - projector以现有messages加index-aligned imageBindings输出durable refs，dispatch前由同一resolver
   生成`ImageAttachment`；`AgentModelHistoryRealUserMessage`同步携带refs供compactor使用；
-- 将`.visionInput`与exact provider route合取为`supportsUserImageInput`，unsupported route在任何
-  user-image网络请求前typed fail；reviewed `.openAI` route的user image同样强制Responses，Slice 1
-  不得依赖后续FCO slice补gate；
-- Code GUI当前没有附件入口；只接入既有`IntatisMacComposerAttachmentAccessory`、import modifier与
-  attachment store，不另做composer；
-- Cowork GUI不重写ingestion/outbox/Retry，只验证同一SubmissionID、同一附件IDs、不重复user event。
-  必须区分三条既有路径：outbox canonicalization Retry仍是submission attempt 1；restart释放尚未执行的
-  queued task仍是taskAttempt 1并复用frozen TurnID；只有failed/cancelled whole-task execution retry才
-  增加taskAttempt并获得新TurnID；
+- 将`.visionInput`与effective `.openAI` request adapter合取为`supportsUserImageInput`，unsupported
+  route在任何user-image网络请求前typed fail；该显式wire opt-in的user image同样强制Responses，
+  compatible/legacy/OpenRouter/unknown adapter默认false，Slice 1不得依赖后续FCO slice补gate；
+- Code GUI只接入共享`IntatisMacComposerAttachmentAccessory`、import modifier与attachment store，
+  不另做composer或第二套图片入口；
+- Cowork不改ingestion payload、outbox schema或user event；只增加一个纯Retry planner来保留既有
+  identity。outbox canonicalization Retry仍是submission attempt 1；restored queued exact task不新增
+  queued事件、不增taskAttempt并复用frozen TurnID；restored running若已由Orchestrator durable requeue，
+  submission状态只对齐该下一exact attempt；只有failed/cancelled whole-task execution retry才增加
+  taskAttempt并获得新TurnID。created/assigned/running或identity/attempt不一致均typed拒绝；
 - macOS CLI Code `/attach`先落session ArtifactStore并承诺同一进程next-turn；macOS CLI Cowork exact `@main`
   使用既有持久session承诺next/restart，ordinary target只承诺current。CLI没有submission Retry命令。
   CLI Chat不在本Agent图片任务中扩建；不得把CLI Chat/Code session产品重构塞进图片任务；
@@ -967,7 +977,7 @@ metadata；
 | macOS CLI Code | 同一进程next-turn恢复；不把整个CLI session持久化冒充图片修复 |
 | macOS CLI Cowork | exact `@main` next/restart恢复同一图片；ordinary target只承诺current |
 | Linux CLI | Phase 0若未冻结至少一种安全bounded解码格式，则图片route稳定typed unsupported，不列入正向完成矩阵 |
-| Cowork retry | 同一SubmissionID与附件IDs、不重复user event；outbox retry/queued resume保持attempt 1与既有TurnID语义，只有whole-task execution retry递增taskAttempt并用新TurnID |
+| Cowork retry | 同一SubmissionID/冻结payload/附件IDs且不重复user event；outbox retry保持attempt 1，restored queued exact resume不递增或重写queued，restored running durable requeue只对齐下一exact attempt；只有failed/cancelled whole-task execution retry递增taskAttempt并用新TurnID |
 | User image after compaction | summarizer真实看见后由summary接替；checkpoint不保留ID/ref，也不把旧原图重新插入provider history |
 | MCP image tool output | 下一模型请求收到同一 `call_id` 的原生 FCO image |
 | Text + structured JSON + image | JSON只canonicalize一次进output；非空text若有则在前、图片source-order；纯图片不造placeholder，不因副本去重丢media |
@@ -1086,15 +1096,16 @@ CLI Chat/Code进程级session恢复、reviewer直接看图、audio、GC/reachabi
 > 上述structured-media工具图片必须作为exact `call_id` 的function output，禁止伪造user message。
 > current turn也必须从已durable提交的ref物化；stable policy与next/restart同路，task-scoped只复用
 > resolver而不制造跨轮history。用当前reader/legacy fixtures证明model-history/checkpoint schema
-> v2 fail-closed，并从`v0.41` exact source snapshot编译旧reader fixture。reviewed `.openAI` route的
-> user/FCO image都选择Responses；只有请求
+> v2 fail-closed，并从`v0.41` exact source snapshot编译旧reader fixture。effective `.openAI`
+> request adapter与`.visionInput`合取后的显式wire route，其user/FCO image都选择Responses；只有请求
 > 存在non-function Responses tool或tool-search call/output时才检查tool-search capability。上下文
 > 压缩时summarizer真实看见“latest valid replacement + 完整active suffix”的完整窗口及其中
 > user/tool images；成功后全部旧raw images与相关媒体组从model-facing replacement退出并由summary
 > 替代，原blob保留。
-> Code GUI只接入现有attachment accessory；Cowork所有Retry保持同一SubmissionID/附件IDs，但只有
-> failed/cancelled whole-task execution retry才递增taskAttempt并使用新TurnID；outbox retry与queued
-> resume保持attempt 1/既有frozen TurnID语义。macOS CLI Code只承诺同进程next-turn，macOS CLI Cowork只有exact
+> Code GUI只接入现有attachment accessory；Cowork所有Retry保持同一SubmissionID/冻结payload/附件IDs，
+> restored queued exact resume不递增，restored running durable requeue只对齐下一exact attempt，只有
+> failed/cancelled whole-task execution retry才递增taskAttempt并使用新TurnID；outbox retry保持attempt 1。
+> macOS CLI Code只承诺同进程next-turn，macOS CLI Cowork只有exact
 > `@main`承诺既有session next/restart，ordinary target只承诺current；CLI Chat不在本任务扩建。
 > automatic review的exact snapshot只要含user/FCO image就以typed
 > `.mediaAuthorizationUnsupported` durable deny，不生成图片描述交给
@@ -1118,8 +1129,9 @@ CLI Chat/Code进程级session恢复、reviewer直接看图、audio、GC/reachabi
 
 1. macOS Chat既有图片链路不回归；Code GUI与Cowork所有目标current通过，next/restart只要求Code与
    Cowork exact `@main` stable main-thread；
-2. Cowork Retry复用同一SubmissionID/附件IDs、不重复user event，并分别满足outbox retry、queued
-   resume与whole-task execution retry的既有attempt/TurnID合同；
+2. Cowork Retry复用同一SubmissionID/冻结payload/附件IDs、不重复user event，并分别满足outbox retry、
+   restored queued exact resume、restored running durable requeue对齐与whole-task execution retry的
+   attempt/TurnID合同；
 3. macOS CLI Code同进程next-turn、CLI Cowork exact `@main` restart接线闭合；Linux无安全backend时
    typed unsupported；CLI Chat既有行为不回归。宿主级自动测试必须实际重建runtime/log/store，不能由
    loader单测或静态审计冒充；
@@ -1144,22 +1156,27 @@ CLI Chat/Code进程级session恢复、reviewer直接看图、audio、GC/reachabi
   等长projector image sidecar、v2→v1 checkpoint围栏，以及summarizer看见完整active window后
   checkpoint剥离全部旧图片的summary-only compaction；
 - 解析与请求：PNG/JPEG使用session-scoped bounded resolver校验MIME/magic、完整解码、bytes、尺寸、
-  像素与SHA-256；AgentLoop对current/replay/compaction使用同一路径，并在stable history中坚持
-  append-returned canonical payload后再物化；
+  像素与SHA-256；AgentLoop拒绝调用方provider-ready `images`/data URL，对task-scoped current、stable
+  current/replay/compaction都使用同一路径，并在stable history中坚持append-returned canonical payload
+  后再物化；
 - 工具与provider：`structuredResult.content`唯一降低为bounded canonical text + ordered image refs；
-  图片以原`call_id`的FCO进入OpenAI Responses，user/FCO capability与tool-search分别检查；已committed
-  工具事实不会因后续媒体交付失败被改写；
+  图片以原`call_id`的FCO进入OpenAI Responses，`.openAI + .visionInput`才打开首版route，user/FCO
+  capability与tool-search分别检查；含图completion严格绑定same-turn/call result和完整settlement
+  identity，已committed工具事实不会因后续媒体交付失败被改写；
 - 产品与权限：macOS共享composer reader对PNG/JPEG扩展使用确定性canonical MIME映射，Code/Cowork和
   macOS CLI附件走exact-session ArtifactStore；Code与Cowork exact
   `@main`覆盖stable next/restart，ordinary Cowork保持task-scoped current；automatic review遇media
-  snapshot durable typed deny；Chat继续独立使用`ChatLoop`，iOS仍为Chat子集。
+  snapshot durable typed deny；Cowork纯Retry planner保留queued exact resume、running requeue对齐与
+  failed/cancelled whole-task attempt递增语义；Chat继续独立使用`ChatLoop`，iOS仍为Chat子集。
 
 实际验证结果：
 
 - `DurableOwnerOnlyFileTests` 2/2、`ArtifactImageResolverTests` 10/10、
   `IntatisProvidersToolCallingTests` 36/36、`AgentToolOutputLoweringTests` 6/6、
-  `DurableMultimodalAgentLoopTests` 8/8、`CLIAttachmentTests` 4/4，均为0 failures；
-- `swift test --filter ModelHistory`：Protocol 13、Conversation 16、AgentKernel 49，共78 tests / 0 failures；
+  `DurableMultimodalAgentLoopTests` 9/9、`CLIAttachmentTests` 4/4，均为0 failures；
+- `ModelHistoryMediaBatchEventLogTests` 7/7、`SubmittedIntentStoreTests` 13/13，均为0 failures；前者覆盖
+  same-turn/call result与完整settlement identity，后者覆盖Retry planner及outbox冻结payload保真；
+- `swift test --filter ModelHistory`：Protocol 14、Conversation 17、AgentKernel 49，共80 tests / 0 failures；
 - `ComposerAttachmentTests` 2/2，验证PNG/JPEG deterministic canonical MIME、exact bytes读回与非图片
   typed拒绝；Chat跨轮图片持久化/rehydration定向用例1/1，确认既有Chat链路未回归；
 - 从`v0.41` commit `e5f64ed`归档源码并临时编译`LegacyMediaSchemaFixtureTests`：3 tests / 0 failures，
@@ -1167,18 +1184,16 @@ CLI Chat/Code进程级session恢复、reviewer直接看图、audio、GC/reachabi
   schema-v2 checkpoint；
 - `swift build --disable-sandbox --target IntatisCLI`退出0；`IntatisMac` macOS Debug与`IntatisiOS`
   generic Simulator Debug无签名构建均退出0，只有仓库既有warning；
-- 真实端点smoke的opt-in测试壳已在隔离的`v0.42`源码快照用`swift build --target IntatisCLITests`
-  编译通过；未设置开关时不发请求，真实credential/network调用仍未执行；
-- 此前完整`swift test --disable-sandbox`运行没有全绿：当时唯一失败为并发中的文档工具能力改动所涉及的
-  `MessageDelegationSplitTests.testSendMessageCreatesDurableMailboxWakeTaskAndConsumesMessage`
-  （4个断言）。隔离复现证明`CapabilityLease.worker()`/测试已要求`documentRead`、`documentOCR`，但
-  mailbox `allowedTools`尚未同步。此后并发Document resource-limit改动又在`ShellGit.swift`/
-  `TerminalTools.swift`留下未穷尽switch等编译错误，当前树会在测试启动前被阻断；这些都与durable
-  multimodal路径无关，本轮未越界修改该组用户改动；
+- 真实端点smoke的opt-in测试壳已编入当前`IntatisCLITests`；未设置开关时必须skip且不发请求，真实
+  credential/network调用仍未执行；
+- 当前完整`swift test --disable-sandbox`成功构建全部targets，并先完成Tools 209 tests（15 skipped）
+  与Skills 29 tests、均0 failures；随后在既有SharedUI
+  `MarkdownSchedulerTests.testCancelAllDoesNotReleaseSynchronousWorkBeforeFinish`等待超过3分钟。采样显示
+  XCTest停在async expectation且无继续工作的worker，因此人工中断，命令退出130。没有观察到多模态
+  failure，但完整suite不能宣称全绿；本轮未越界修改该无关hang；
 - `CLIAttachmentTests`含2个loader用例及2个宿主用例：CLI Code复用同一session log/ArtifactStore完成
   next-turn replay；CLI Cowork销毁并重建shipping `Orchestrator.runtime`、EventLog与ArtifactStore后，
-  exact `@main`仍恢复历史图片。4/4结果来自仅叠加多模态差异的clean snapshot中构建
-  `IntatisCLITests`并直接运行XCTest bundle，因为当前共享树被无关Knowledge编译错误阻断；
+  exact `@main`仍恢复历史图片；当前工作树直接运行4/4、0 failures；
 - 未执行真实OpenAI credential/network smoke，因此线上endpoint接受多模态FCO仍是release-only
   `UNKNOWN`，不能从fake provider外推；未重放当时实际分发的旧App制品，但exact旧源码编译fixture
   已覆盖reader语义；

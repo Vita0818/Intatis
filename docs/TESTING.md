@@ -1,7 +1,7 @@
 # TESTING
 
 文档状态：当前验证矩阵
-最近核对：2026-08-09
+最近核对：2026-08-10
 产品基线：v0.40（build 40）
 
 历史测试数量、性能数字和事故复验保留在 Git 历史及 dated reports；它们不能替代当前
@@ -444,17 +444,26 @@ INTATIS_REAL_MULTIMODAL_SMOKE=1 swift test \
 
 专项必须证明：
 
-- 用户图先进入 exact-session ArtifactStore；model-history ref 不含 bytes/base64/path，current、stable
-  next/restart 与 legacy ID 路径都使用同一 bounded resolver；
+- 用户图先进入 exact-session ArtifactStore；`AgentLoop.send`拒绝调用方直接传provider-ready
+  `images`/data URL，task-scoped current、stable current/next/restart与legacy ID路径都使用同一bounded
+  resolver；
 - PNG/JPEG MIME/magic、完整解码、byte/aggregate/count/dimension/pixel、SHA-256 与 no-follow/owner-only
   失败矩阵均 fail closed；缺少可信 decoder 的平台不列入正向图片矩阵；
 - MCP structured image以原call ID进入Responses function output，text/JSON只canonicalize一次，live与
-  replay使用同一append-return binding；不支持FCO图片的route在网络前typed失败但不改写工具settlement；
+  replay使用同一append-return binding；含图completion batch必须绑定同turn/call的唯一`tool_result`与
+  同`{callID, agent, taskID, attempt}`的唯一settlement；不支持FCO图片的route在网络前typed失败但不
+  改写工具settlement；
+- 图片正向route必须是effective `.openAI` request adapter与exact model `.visionInput`的合取；user/FCO
+  capability分别验证，compatible/legacy/OpenRouter/unknown adapter保持false，图片Responses transport
+  不得误触发tool-search capability错误；
 - projector image sidecar与messages严格等长，v2 direct/checkpoint不能降级为v1；compaction
   summarizer看见完整active window，成功checkpoint不保留任何旧图片ref，resume不偷回checkpoint前图片；
 - automatic Cowork authorization snapshot含user或FCO图片时durable media deny，文本reviewer没有allow
   旁路；当前端到端回归分别直接覆盖user image与历史FCO image，并证明后者不启动reporter、reviewer或
   executor；
+- Cowork Retry planner矩阵必须证明outbox canonicalization保持attempt 1、restored queued exact resume
+  不递增、restored running durable requeue只对齐下一exact attempt、只有failed/cancelled whole-task
+  retry递增，并且所有分支保持同一SubmissionID/冻结payload/附件IDs且不重复user event；
 - macOS Code/Cowork GUI与CLI产品接线编译；iOS仍不链接AgentKernel/Tools/Cowork。fake provider只能证明
   request shape与事件顺序，真实OpenAI Responses user/FCO image smoke必须另列且需要凭据/网络。
 
@@ -528,12 +537,14 @@ INTATIS_REAL_MULTIMODAL_SMOKE=1 swift test \
 - urgent purge 的 current-pointer removal 是持久 admission boundary，receipt tombstone 阻止旧回执并发
   复活；它不是 pointer/receipt/physical delete 的跨组件 crash-atomic 事务，也不等于 secure erase。
 
-2026-08-09 Agent durable多模态上下文最小闭环的直接证据：
+2026-08-10 Agent durable多模态上下文最小闭环的直接证据：
 
 - `DurableOwnerOnlyFileTests` 2 tests、`ArtifactImageResolverTests` 10 tests、
   `IntatisProvidersToolCallingTests` 36 tests、`AgentToolOutputLoweringTests` 6 tests、
-  `DurableMultimodalAgentLoopTests` 8 tests、`CLIAttachmentTests` 4 tests，均为0 failures；
-- `swift test --filter ModelHistory`覆盖Protocol 13、Conversation 16、AgentKernel 49，共78 tests / 0
+  `DurableMultimodalAgentLoopTests` 9 tests、`CLIAttachmentTests` 4 tests，均为0 failures；
+- `ModelHistoryMediaBatchEventLogTests` 7 tests、`SubmittedIntentStoreTests` 13 tests，均为0 failures；前者
+  覆盖same-turn/call result与完整settlement identity，后者覆盖Retry planner和outbox payload保真；
+- `swift test --filter ModelHistory`覆盖Protocol 14、Conversation 17、AgentKernel 49，共80 tests / 0
   failures；验证v2 direct/checkpoint、append-return binding、原call FCO、active-window summarizer与
   summary-only checkpoint；
 - `ComposerAttachmentTests` 2 tests / 0 failures；验证PNG/JPEG扩展到canonical MIME的确定性映射、
@@ -544,17 +555,16 @@ INTATIS_REAL_MULTIMODAL_SMOKE=1 swift test \
   schema-v2 checkpoint；
 - `swift build --disable-sandbox --target IntatisCLI`退出0；`IntatisMac` macOS Debug和`IntatisiOS`
   generic Simulator Debug unsigned build均退出0，只有仓库既有unused-result/deprecation warning；
-- 真实端点smoke的opt-in测试壳已在隔离的`v0.42`源码快照用`swift build --target IntatisCLITests`
-  编译通过；未设置开关时不发请求，真实credential/network调用仍未执行；
-- 此前完整`swift test --disable-sandbox`运行时，多模态相关suite均通过，但全命令退出1：当时另一组
-  document capability改动已让worker/test要求`documentRead`和`documentOCR`，Cowork mailbox
-  `allowedTools`却尚未同步，导致`MessageDelegationSplitTests.testSendMessageCreatesDurableMailboxWakeTaskAndConsumesMessage`
-  稳定出现4个断言失败。此后并发Document resource-limit改动又在`ShellGit.swift`/`TerminalTools.swift`
-  留下未穷尽switch等编译错误，当前树会在测试启动前被阻断；两者均与图片链路无关，本轮未越界修复；
+- 真实端点smoke的opt-in测试壳已编入当前`IntatisCLITests`；未设置开关时必须skip且不发请求，真实
+  credential/network调用仍未执行；
+- 当前完整`swift test --disable-sandbox`已成功构建全部targets，并先完成Tools 209 tests（15 skipped）
+  与Skills 29 tests、均0 failures；随后在既有SharedUI
+  `MarkdownSchedulerTests.testCancelAllDoesNotReleaseSynchronousWorkBeforeFinish`等待超过3分钟。采样显示
+  XCTest停在async expectation且无继续工作的worker，因此人工中断，命令退出130。没有观察到多模态
+  failure，但完整suite不能据此宣称全绿；本轮未越界修改该无关hang；
 - `CLIAttachmentTests`除2个附件loader用例外，还直接覆盖CLI Code复用同一session log/ArtifactStore的
   next-turn，以及CLI Cowork销毁并重建shipping `Orchestrator.runtime`、EventLog与ArtifactStore后的exact
-  `@main`图片replay；4 tests / 0 failures。由于当前共享树被无关Knowledge编译错误阻断，这组结果来自
-  仅叠加多模态差异的clean snapshot中构建`IntatisCLITests`并直接运行其XCTest bundle；
+  `@main`图片replay；当前工作树直接运行4 tests / 0 failures；
 - 未执行真实OpenAI credential/network smoke；线上多模态FCO仍是release-only外部门，不能从scripted
   provider外推。未重放当时实际分发的旧App制品，但已用exact旧源码编译fixture覆盖reader语义；
   `git diff --check`通过。

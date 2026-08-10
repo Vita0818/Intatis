@@ -2740,7 +2740,7 @@ public struct AgentLoop: Sendable {
         let prepared = ToolExecutionPreparedPayload(
             executionID: executionID,
             taskID: context.taskContract?.id,
-            attempt: taskAttempt,
+            attempt: modelHistoryScope?.taskAttempt ?? taskAttempt,
             toolCallID: toolCall.id,
             agent: agent.name,
             tool: descriptor.name,
