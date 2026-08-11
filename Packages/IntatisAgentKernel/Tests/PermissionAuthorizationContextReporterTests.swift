@@ -75,9 +75,10 @@ final class PermissionAuthorizationContextReporterTests: XCTestCase {
                 text: "Continue.",
                 submissionID: currentID)))
         let provider = AuthorizationReporterProvider(chunks: [
-            .textDelta(reportJSON(handles: ["U1"])),
+            .toolCalls([reportToolCall(
+                reportJSON(handles: ["U1"]))]),
             .usage(Usage(promptTokens: 80, completionTokens: 40, totalTokens: 120)),
-            .done(finishReason: "stop"),
+            .done(finishReason: "tool_calls"),
         ])
         let providerMessages: [AgentMessage] = [
             .system("system"),
@@ -123,7 +124,14 @@ final class PermissionAuthorizationContextReporterTests: XCTestCase {
         let request = try XCTUnwrap(provider.requests.first)
         XCTAssertEqual(Array(request.messages.dropLast()), providerMessages)
         XCTAssertEqual(request.model, ModelID(rawValue: "acting-model"))
-        XCTAssertTrue(request.tools.isEmpty)
+        XCTAssertEqual(
+            request.tools.map(\.name),
+            [PermissionAuthorizationContextReporter.outputFunctionName])
+        XCTAssertEqual(
+            request.tools.first?.parameters,
+            PermissionAuthorizationContextReporter.responseSchema)
+        XCTAssertNil(request.tools.first?.strict)
+        XCTAssertEqual(request.parallelToolCalls, false)
         XCTAssertTrue(request.includeUsage)
         XCTAssertNil(request.maxOutputTokens)
         let prompt = request.messages.last?.content ?? ""
@@ -144,8 +152,9 @@ final class PermissionAuthorizationContextReporterTests: XCTestCase {
         _ = try await fixture.log.append(.userMessage(
             UserMessagePayload(text: "Make the bounded edit.", submissionID: submissionID)))
         let provider = AuthorizationReporterProvider(chunks: [
-            .textDelta(reportJSON(handles: ["U999"])),
-            .done(finishReason: "stop"),
+            .toolCalls([reportToolCall(
+                reportJSON(handles: ["U999"]))]),
+            .done(finishReason: "tool_calls"),
         ])
 
         let result = await PermissionAuthorizationContextReporter(
@@ -184,10 +193,10 @@ final class PermissionAuthorizationContextReporterTests: XCTestCase {
             UserMessagePayload(text: "Make the bounded edit.", submissionID: submissionID)))
         let secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
         let provider = AuthorizationReporterProvider(chunks: [
-            .textDelta(reportJSON(
+            .toolCalls([reportToolCall(reportJSON(
                 handles: ["U1"],
-                justification: "Use credential \(secret) to perform the action.")),
-            .done(finishReason: "stop"),
+                justification: "Use credential \(secret) to perform the action."))]),
+            .done(finishReason: "tool_calls"),
         ])
 
         let result = await PermissionAuthorizationContextReporter(
@@ -229,8 +238,9 @@ final class PermissionAuthorizationContextReporterTests: XCTestCase {
             text: "Audit the selected report section.",
             submissionID: scopedID)))
         let provider = AuthorizationReporterProvider(chunks: [
-            .textDelta(reportJSON(handles: ["U1"])),
-            .done(finishReason: "stop"),
+            .toolCalls([reportToolCall(
+                reportJSON(handles: ["U1"]))]),
+            .done(finishReason: "tool_calls"),
         ])
 
         let result = await PermissionAuthorizationContextReporter(
@@ -320,7 +330,8 @@ final class PermissionAuthorizationContextReporterTests: XCTestCase {
             text: "Make the bounded edit.",
             submissionID: submissionID)))
         let provider = AuthorizationReporterProvider(chunks: [
-            .textDelta(reportJSON(handles: ["U1"])),
+            .toolCalls([reportToolCall(
+                reportJSON(handles: ["U1"]))]),
         ])
 
         let result = await PermissionAuthorizationContextReporter(
@@ -463,6 +474,17 @@ final class PermissionAuthorizationContextReporterTests: XCTestCase {
                 decision: .ask,
                 risk: .medium,
                 reason: "workspace mutation requires review"))
+    }
+
+    private func reportToolCall(
+        _ arguments: String,
+        id: String = "authorization-report"
+    ) -> ToolCall {
+        ToolCall(
+            id: id,
+            name: PermissionAuthorizationContextReporter
+                .outputFunctionName,
+            arguments: arguments)
     }
 
     private func reportJSON(

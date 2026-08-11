@@ -566,12 +566,12 @@ final class RealProviderSmokeTests: XCTestCase {
         XCTAssertFalse(report.responsePreview?.isEmpty ?? true)
     }
 
-    func testRealAgentFunctionToolShapeWhenEnabled() async throws {
+    func testRealAgentOutputFunctionShapeWhenEnabled() async throws {
         guard ProcessInfo.processInfo.environment[
             "INTATIS_REAL_TOOL_SHAPE_DIAGNOSTIC"
         ] == "1" else {
             throw XCTSkip(
-                "Set INTATIS_REAL_TOOL_SHAPE_DIAGNOSTIC=1 to compare the configured Agent route with and without the optional strict function-tool field. This can make two billable requests.")
+                "Set INTATIS_REAL_TOOL_SHAPE_DIAGNOSTIC=1 to verify that the configured Agent route calls one output-only function with structured arguments. This makes one billable request.")
         }
 
         let config = try CLIConfig.load()
@@ -583,19 +583,19 @@ final class RealProviderSmokeTests: XCTestCase {
         let parameters: JSONValue = .object([
             "type": .string("object"),
             "properties": .object([
-                "optional_note": .object([
+                "status": .object([
                     "type": .string("string"),
                 ]),
             ]),
-            "required": .array([]),
+            "required": .array([.string("status")]),
             "additionalProperties": .bool(false),
         ])
 
-        func request(strict: Bool?) -> AgentRequest {
+        func toolRequest(strict: Bool?) -> AgentRequest {
             AgentRequest(
                 model: route.model,
                 messages: [.user(
-                    "Reply briefly. You may call the diagnostic tool if useful.")],
+                    "Call diagnostic_noop exactly once with status OK. Emit no prose before or after the call.")],
                 tools: [ToolSpec(
                     name: "diagnostic_noop",
                     description: "A no-op diagnostic function.",
@@ -605,27 +605,39 @@ final class RealProviderSmokeTests: XCTestCase {
                 includeUsage: true)
         }
 
-        var strictError: Error?
+        var outputError: Error?
+        var outputText = ""
+        var outputCalls: [ToolCall] = []
         do {
-            for try await _ in route.provider.stream(request(strict: true)) {}
+            for try await chunk in route.provider.stream(
+                toolRequest(strict: nil)) {
+                if case .textDelta(let delta) = chunk {
+                    outputText += delta
+                }
+                if case .toolCalls(let calls) = chunk {
+                    outputCalls.append(contentsOf: calls)
+                }
+            }
         } catch {
-            strictError = error
+            outputError = error
         }
 
-        var compatibleError: Error?
-        do {
-            for try await _ in route.provider.stream(request(strict: nil)) {}
-        } catch {
-            compatibleError = error
-        }
-
-        print("[RealAgentToolShape] strict="
-            + (strictError == nil ? "accepted" : "rejected")
-            + " compatible="
-            + (compatibleError == nil ? "accepted" : "rejected"))
+        print("[RealAgentToolShape] output_function="
+            + (outputError == nil ? "accepted" : "rejected"))
         XCTAssertNil(
-            compatibleError,
-            compatibleError?.localizedDescription ?? "compatible request failed")
+            outputError,
+            outputError?.localizedDescription
+                ?? "output function request failed")
+        XCTAssertTrue(
+            outputText.trimmingCharacters(
+                in: .whitespacesAndNewlines).isEmpty)
+        XCTAssertEqual(outputCalls.count, 1)
+        XCTAssertEqual(outputCalls.first?.name, "diagnostic_noop")
+        let arguments = try XCTUnwrap(
+            outputCalls.first?.arguments.data(using: .utf8))
+        let object = try JSONSerialization.jsonObject(
+            with: arguments) as? [String: Any]
+        XCTAssertEqual(object?["status"] as? String, "OK")
     }
 
     func testRealPermissionReviewControlPlaneWhenEnabled() async throws {

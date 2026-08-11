@@ -979,8 +979,12 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
                 .done(finishReason: "tool_calls"),
             ],
             [
-                .textDelta(authorizationReportJSON(handles: ["U1"])),
-                .done(finishReason: "stop"),
+                .toolCalls([ToolCall(
+                    id: "permission-authorization-report",
+                    name: "submit_permission_authorization",
+                    arguments: authorizationReportJSON(
+                        handles: ["U1"]))]),
+                .done(finishReason: "tool_calls"),
             ],
             [.textDelta("done"), .done(finishReason: "stop")],
         ])
@@ -1043,7 +1047,9 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
         let reportRequest = try XCTUnwrap(
             mainProvider.requests.dropFirst().first)
         XCTAssertEqual(reportRequest.model, ModelID(rawValue: "main-model"))
-        XCTAssertTrue(reportRequest.tools.isEmpty)
+        XCTAssertEqual(
+            reportRequest.tools.map(\.name),
+            ["submit_permission_authorization"])
         XCTAssertEqual(
             Array(reportRequest.messages.dropLast()),
             mainProvider.requests[0].messages)

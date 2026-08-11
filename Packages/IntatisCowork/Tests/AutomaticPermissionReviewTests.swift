@@ -286,8 +286,11 @@ private func autoReviewAuthorizationReport(
         withJSONObject: object,
         options: [.sortedKeys])
     return [
-        .textDelta(String(decoding: data, as: UTF8.self)),
-        .done(finishReason: "stop"),
+        .toolCalls([ToolCall(
+            id: "permission-authorization-report",
+            name: "submit_permission_authorization",
+            arguments: String(decoding: data, as: UTF8.self))]),
+        .done(finishReason: "tool_calls"),
     ]
 }
 
@@ -1813,6 +1816,110 @@ final class AutomaticPermissionReviewTests: XCTestCase {
         XCTAssertEqual(resolved.reviewStatus, .allowed)
     }
 
+    func testOneAssistantBatchReportsEachAskClassCallIndependently()
+        async throws {
+        let log = try autoReviewTempLog()
+        let ws = try autoReviewWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let mainProvider = AutoReviewScriptedProvider([
+            [
+                .toolCalls([
+                    ToolCall(
+                        id: "write-first",
+                        name: "write_file",
+                        arguments: autoReviewWriteArgs(
+                            path: "first.txt",
+                            content: "first")),
+                    ToolCall(
+                        id: "write-second",
+                        name: "write_file",
+                        arguments: autoReviewWriteArgs(
+                            path: "second.txt",
+                            content: "second")),
+                ]),
+                .done(finishReason: "tool_calls"),
+            ],
+            autoReviewAuthorizationReport(
+                justification: "The first exact write creates first.txt."),
+            autoReviewAuthorizationReport(
+                justification: "The second exact write creates second.txt."),
+            [.textDelta("done"), .done(finishReason: "stop")],
+        ])
+        let reviewerProvider = AutoReviewScriptedProvider([
+            [
+                .textDelta(#"{"decision":"allow","reason":"first requested file"}"#),
+                .done(finishReason: "stop"),
+            ],
+            [
+                .textDelta(#"{"decision":"allow","reason":"second requested file"}"#),
+                .done(finishReason: "stop"),
+            ],
+        ])
+        let reviewerID = reviewer
+        let orch = Orchestrator(
+            log: log,
+            allowsShell: true,
+            responder: AttachOnlyResponder()) { agent -> any ToolCallingProvider in
+                agent.name == reviewerID
+                    ? reviewerProvider
+                    : mainProvider
+            }
+        let attached = await orch.attach(Agent(
+            name: main,
+            workspaceRoot: ws,
+            model: ModelID(rawValue: "main-model"),
+            profile: .reviewed,
+            coordinationDepth: Agent.defaultCoordinationDepth))
+        let enabled = await orch.enableAutomaticPermissionReview(
+            model: ModelID(rawValue: "reviewer-model"),
+            workspaceRoot: ws)
+        XCTAssertTrue(attached)
+        XCTAssertEqual(enabled, .enabled(reviewer))
+
+        let result = await orch.send(
+            "create first.txt and second.txt",
+            to: main,
+            userMessage: autoReviewUserMessage(
+                "create first.txt and second.txt",
+                id: "submission_two_writes"))
+
+        XCTAssertEqual(result, .sent)
+        XCTAssertEqual(
+            try String(
+                contentsOf: ws.appendingPathComponent("first.txt"),
+                encoding: .utf8),
+            "first")
+        XCTAssertEqual(
+            try String(
+                contentsOf: ws.appendingPathComponent("second.txt"),
+                encoding: .utf8),
+            "second")
+        let reportRequests = mainProvider.requests.filter {
+            $0.tools.map(\.name) == [
+                "submit_permission_authorization",
+            ]
+        }
+        XCTAssertEqual(reportRequests.count, 2)
+        XCTAssertTrue(reportRequests[0].messages.last?.content?.contains(
+            "target_tool_call_id: write-first") == true)
+        XCTAssertTrue(reportRequests[1].messages.last?.content?.contains(
+            "target_tool_call_id: write-second") == true)
+        let reviewTasks = await log.replay().compactMap {
+            envelope -> PermissionReviewTask? in
+            guard case .permissionReviewRequested(let payload) =
+                    envelope.event,
+                  payload.task.toolCallID == "write-first"
+                    || payload.task.toolCallID == "write-second" else {
+                return nil
+            }
+            return payload.task
+        }
+        XCTAssertEqual(reviewTasks.count, 2)
+        XCTAssertTrue(reviewTasks.allSatisfy {
+            $0.causalContext.authorizationContext != nil
+        })
+    }
+
     func testMalformedAuthorizationReportDurablyDeniesBeforeReviewerProvider()
         async throws {
         let log = try autoReviewTempLog()
@@ -2323,7 +2430,11 @@ final class AutomaticPermissionReviewTests: XCTestCase {
                 "The broad overwrite is the first proposed way to make the requested edit.",
                 "The minimal patch is the corrected bounded way to make the requested edit.",
             ])
-        let reportRequests = mainProvider.requests.filter { $0.tools.isEmpty }
+        let reportRequests = mainProvider.requests.filter {
+            $0.tools.map(\.name) == [
+                "submit_permission_authorization",
+            ]
+        }
         XCTAssertEqual(reportRequests.count, 2)
         XCTAssertTrue(reportRequests[0].messages.last?.content?.contains(
             "target_tool_call_id: denied-write") == true)

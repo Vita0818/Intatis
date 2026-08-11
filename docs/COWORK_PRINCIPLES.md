@@ -293,7 +293,8 @@ created automatically on GUI/CLI Cowork session startup when possible
 reserved identity, not a normal task/message/delegation target
 read-only profile and no tool capability lease
 no nested AgentLoop; reviewer receives no-tool provider judgement request
-automatic ask-class exact call first receives one same-acting-model tools=[] report request
+automatic ask-class exact call first receives one same-acting-model report request exposing exactly one output-only submit_permission_authorization function; it is not registered or executed
+reporter does not depend on forced tool_choice or response_format; host accepts exactly one matching function call with no prose and strictly validates its arguments
 model report is untrusted interpretation; it cannot supply author, EventLog seq, binding, or permission decision
 host maps temporary user handles to canonical same-session EventLog messages and closes every visible user turn from earliest cited through current
 reviewer sees report, canonical latest instruction, and supporting user evidence as separate quoted blocks
@@ -408,7 +409,7 @@ automatic permission reviewer can be enabled/disabled without becoming a normal 
 automatic model-authored ask-class review requires a complete host-validated authorizationContext; legacy decode does not authorize a new live call
 authorization report provenance, canonical user evidence, requestingAgent, and ResolvedToolAuthorization remain separate trust sources
 supporting user evidence always contains current submission and the full visible earliest-cited-to-current closure, including intervening revocation/scope changes
-one assistant batch with multiple ask-class calls receives one independently bound no-tools report per call; report output is never reused across calls
+one assistant batch with multiple ask-class calls receives one independently bound output-function report per call; report output is never reused across calls
 permission request identity is first-write-wins and conflicting RequestID reuse fails closed
 permission settlement is first-terminal-wins under concurrency; exact duplicates are idempotent and conflicting terminals cannot overwrite the first
 legacy outcome/action/mode/correlation fields decode conservatively, while each new Chat/Code/Cowork turn records one semantic terminal turn outcome

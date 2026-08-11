@@ -14,6 +14,25 @@
 公开调用方式。对外协议面只有两个 additive `Codable` 类型、一个 optional 字段和一个 typed failure
 枚举值；其余改动位于 AgentKernel 请求内报告器、Permission Review 控制面验证、测试和项目文档。
 
+## 2026-08-11 兼容性修正（覆盖本文旧 `tools: []` / `no-tools` 报告器描述）
+
+真实 OpenRouter exact Agent route 验证发现：原报告器虽然接口与 host binding 已完成，但依靠
+`tools: []` 自由文本返回 JSON，不能可靠保证模型交付结构化报告；而在本次验证的
+`deepseek/deepseek-v4-flash-0731` 路由上，forced `tool_choice` 与 `response_format` 又会在模型调用前被
+上游兼容性检查拒绝。最终最小修正不改公开协议、PermissionEngine、reviewer 接口或业务工具 schema：
+
+- 报告请求仍复用 acting agent 的 exact provider/model 与冻结 conversation snapshot，但只暴露一个
+  output-only `submit_permission_authorization` function；该 function 不注册进 `ToolRegistry`，不获得执行
+  ticket，也永远不会执行；
+- 不强制 `tool_choice` / `response_format`。宿主只接受无 prose、恰好一个同名 function call，随后对
+  arguments 做原有 exact JSON、secret、handle、EventLog closure 与 authorization binding 验证；错名、
+  缺失、多个 call、混入文本或 malformed arguments 均保持 typed fail closed；
+- 同一 assistant batch 内每个 ask-class call 仍单独生成、绑定、计量，报告不能跨 call 缓存或复用；
+- 新增真实 provider smoke，并新增“双写同一 assistant batch 分别报告、分别审查、分别执行”的集成测试。
+
+因此，下表中关于报告器 `tools: []`、`no-tools`、文本 JSON response 或“任何 tool call 都拒绝”的描述只
+记录 2026-08-08 当时实现，均由本节覆盖；reviewer 本身仍保持无工具 JSON 判决请求。
+
 下表逐项列出本次新增或修改的接口、类型、属性、函数、测试函数和文档位置。行号均指当前工作树。
 
 ## 逐项总表
@@ -147,3 +166,17 @@
 受管 sandbox 内第一次完整 suite 因外层 Seatbelt 拒绝既有 browser/LaTeX/Git/process 子进程启动而失败；
 同一 working tree 在允许真实子进程边界的宿主环境重跑后全部通过。本次未执行真实
 provider/credential/network smoke，也未修改 App/UI，因而未另跑 Xcode App build。
+
+### 2026-08-11 修正验证补记
+
+| 验证 | 结果 |
+|---|---|
+| `PermissionAuthorizationContextReporterTests` | 7 tests / 0 failures |
+| `PermissionReviewProtocolTests` | 11 tests / 0 failures |
+| `PermissionReviewControlPlaneTests` | 40 tests / 0 failures |
+| `AutomaticPermissionReviewTests` | 32 tests / 0 failures（含同一 batch 两个 ask-class call 独立报告） |
+| `testRealAgentOutputFunctionShapeWhenEnabled` | 真实 OpenRouter exact Agent route；1 test / 0 failures |
+| `IntatisMac` Debug build（`CODE_SIGNING_ALLOWED=NO`） | 通过；仅既有 warnings |
+
+本次真实 smoke 已获用户明确网络与计费授权；只发送合成诊断内容，不把知识库资料作为报告器测试输入。
+上文“未执行真实 provider smoke”仅描述 2026-08-08 当轮，不再代表 2026-08-11 的修正验证状态。

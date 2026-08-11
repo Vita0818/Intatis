@@ -143,12 +143,15 @@ macOS 是完整产品：Chat、Code、Cowork、Settings 和本地诊断导出。
   `@permission-reviewer` 等控制面 identity 仍为不可选择的状态项。
 - Cowork automatic ask-class 权限请求现已带 host-validated authorization context。请求工具的
   acting agent 复用刚才的 exact provider/model 与 provider-facing conversation snapshot，另发一次
-  `tools: []` 的 request-owned 报告请求；模型只返回五项语义报告和临时 user handles。宿主把 handles
+  request-owned 报告请求；该请求只暴露一个未注册、永不执行的 output-only
+  `submit_permission_authorization` function，不依赖 forced `tool_choice` 或 `response_format`。宿主只接受
+  无 prose 的单个同名 call，并严格解析其中的五项语义报告和临时 user handles。宿主把 handles
   映射到同 session canonical `user_message` sequence，无条件加入当前 submission，并从最早引用到
   当前消息闭包覆盖所有可见用户指令，防止跳过中途撤销或缩窄。`PermissionReviewControlPlane` 再独立
   验证 complete-known history、main/worker projection、current submission、report secret/shape 与 exact
   authorization binding，最后把 untrusted report、canonical latest instruction 和 supporting evidence
-  分栏交给 reviewer。任何缺失、超预算、unknown future event、malformed/secret output、timeout 或 cancel
+  分栏交给 reviewer。任何缺失、超预算、unknown future event、错误/多个 function call、混入 prose、
+  malformed/secret output、timeout 或 cancel
   均在 reviewer provider 前以 `authorization_context_unavailable` durable deny；hard deny、manual flow、
   host `agentAdmission`、CapabilityLease/WorkspaceLease 和 durable-first settlement 语义没有改变。
 - Cowork final turn 现在先校验 side-effect evidence，再原子发布 final message/model-history、idle

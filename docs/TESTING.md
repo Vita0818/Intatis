@@ -66,12 +66,22 @@ swift test --filter PermissionReviewControlPlaneTests
 swift test --filter AutomaticPermissionReviewTests
 ```
 
-必须覆盖 legitimate `continue`/省略指令映射、acting-provider request snapshot 与 `tools: []`、
+必须覆盖 legitimate `continue`/省略指令映射、acting-provider request snapshot、唯一 output-only
+`submit_permission_authorization` function、无 prose/单 call/严格 arguments 验收、
 canonical current user message、earliest-cited→current evidence closure、intervening revoke/scope change、
 main/worker projection 隔离、同 assistant batch 多 call 独立报告、usage/no-history、legacy optional decode，
 以及 malformed/secret/unknown handle/timeout/cancel/unknown future event/缺 context 的 durable typed deny。
 另须证明 hard deny 与 manual flow 不触发 reporter，report 不能改变 exact authorization、gate、capability/
 workspace ceiling，reviewer provider 只在完整 host validation 后被调用。
+
+得到用户明确的真实网络与计费授权后，还应对当前 exact Agent route 运行：
+
+```sh
+INTATIS_REAL_TOOL_SHAPE_DIAGNOSTIC=1 swift test --filter RealProviderSmokeTests/testRealAgentOutputFunctionShapeWhenEnabled
+```
+
+该 smoke 只验证普通单 function 形状确实返回一个结构化 call；生产 reporter 仍须由上述离线测试覆盖
+host binding、secret scan、EventLog closure 与 fail-closed 语义。
 
 MCP、browser、managed terminal、OAuth、real provider 和设备测试中明确标为 opt-in 的项目，
 必须在具备相应 runtime/credential/网络的环境单独执行。
@@ -774,6 +784,21 @@ INTATIS_REAL_MULTIMODAL_SMOKE=1 swift test \
   --disable-sandbox` 与 `git diff --check` 均通过；
 - 本次未修改 App/UI、Xcode 工程或平台 target，因此未另跑 macOS/iOS App build；未执行真实
   provider/credential/network smoke，不能从 scripted provider 测试外推线上模型质量。
+
+2026-08-11 authorization reporter 结构化交接修补的直接证据：
+
+- `PermissionAuthorizationContextReporterTests`：7 tests / 0 failures；验证唯一 output-only function
+  schema、单 call/无 prose、strict host parse、canonical evidence closure，以及异常输出 fail closed；
+- `PermissionReviewProtocolTests`：11 tests / 0 failures；`PermissionReviewControlPlaneTests`：
+  40 tests / 0 failures；`AutomaticPermissionReviewTests`：32 tests / 0 failures；新增同一 assistant batch
+  两个 ask-class 写操作分别报告、分别审查并分别执行的集成覆盖；
+- 在用户明确允许真实网络、计费及向 OpenRouter 发送测试内容后，当前 exact Agent route 运行
+  `testRealAgentOutputFunctionShapeWhenEnabled`：1 test / 0 failures，普通单 function request 成功返回
+  一个同名结构化 call。探索过程中 forced `tool_choice` 与 `response_format` 均被该 exact route 的上游
+  参数兼容性检查拒绝，因此生产合同不依赖这两个可选参数；
+- `IntatisMac` Debug、`CODE_SIGNING_ALLOWED=NO` 构建通过；仅出现既有 unused-result 与 SwiftUI
+  deprecation warnings；
+- 本节是对 2026-08-08 `tools: []` 报告器测试证据的后续修正，不改变 reviewer 自身无工具判决请求。
 
 2026-08-08 Cowork current-run 终态控制与 correlation-scoped mailbox 修复的直接证据：
 
