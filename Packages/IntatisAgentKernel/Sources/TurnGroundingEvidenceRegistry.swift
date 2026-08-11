@@ -24,6 +24,7 @@ struct TurnGroundingEvidenceRegistry: Sendable {
     enum ValidationError: Error, Equatable, Sendable, LocalizedError {
         case malformedSearchResult(String)
         case malformedCitation
+        case missingCitation
         case unknownCitation(String)
         case evidenceChanged(String)
 
@@ -33,6 +34,8 @@ struct TurnGroundingEvidenceRegistry: Sendable {
                 return "search_knowledge returned an invalid grounding result: \(reason)"
             case .malformedCitation:
                 return "The final answer contains a malformed evidence citation."
+            case .missingCitation:
+                return "The final answer must cite evidence returned by the successful current-turn knowledge search."
             case .unknownCitation(let evidenceID):
                 return "The final answer cites evidence that was not returned successfully in this turn: \(evidenceID)"
             case .evidenceChanged(let evidenceID):
@@ -127,9 +130,17 @@ struct TurnGroundingEvidenceRegistry: Sendable {
         entries.merge(replay) { _, latest in latest }
     }
 
-    func validateCitations(in text: String) async throws {
+    func validateCitations(
+        in text: String,
+        requireAtLeastOne: Bool = false
+    ) async throws {
         let marker = "[[evidence:"
-        guard text.contains(marker) else { return }
+        guard text.contains(marker) else {
+            if requireAtLeastOne, !bindings.isEmpty {
+                throw ValidationError.missingCitation
+            }
+            return
+        }
         let pattern = #"\[\[evidence:(ev_[A-Za-z0-9._-]{1,128})\]\]"#
         let expression = try NSRegularExpression(pattern: pattern)
         let range = NSRange(text.startIndex..<text.endIndex, in: text)

@@ -573,7 +573,8 @@ extension OpenAIWireProvider: ToolCallingProvider {
         root["messages"] = .array(request.messages.map(Self.messageJSON))
         root["stream"] = .bool(true)
         if !request.tools.isEmpty {
-            root["tools"] = .array(request.tools.map(Self.toolJSON))
+            root["tools"] = .array(
+                request.tools.map(Self.chatCompletionsToolJSON))
         }
         try Self.applyChatCompletionsInvocationControls(
             to: &root,
@@ -816,6 +817,29 @@ extension OpenAIWireProvider: ToolCallingProvider {
             })
         case .namespace, .toolSearch:
             // These two shapes are already Responses-native.
+            return toolJSON(tool)
+        }
+    }
+
+    static func chatCompletionsToolJSON(_ tool: ToolSpec) -> JSONValue {
+        switch tool.kind {
+        case .function:
+            var function: [String: JSONValue] = [
+                "name": .string(tool.name),
+                "description": .string(tool.description),
+                "parameters": tool.parameters,
+            ]
+            if let strict = tool.strict {
+                function["strict"] = .bool(strict)
+            }
+            return .object([
+                "type": .string("function"),
+                "function": .object(function),
+            ])
+        case .namespace, .toolSearch:
+            // AgentRequest routes Responses-native tool kinds through the
+            // Responses API. Keep this fallback deterministic for callers
+            // constructing a request directly.
             return toolJSON(tool)
         }
     }

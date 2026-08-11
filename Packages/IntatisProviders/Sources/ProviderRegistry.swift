@@ -63,10 +63,10 @@ public struct ResolvedChatRuntimeRoute: Sendable {
 /// (ARCHITECTURE.md §3.3, §9.2). Secrets are fetched lazily via the injected
 /// `SecretResolver`, never stored in the config.
 public actor ProviderRegistry {
-    private let config: ProviderConfig
-    private let resolver: SecretResolver
+    let config: ProviderConfig
+    let resolver: SecretResolver
     private let http: HTTPByteStreaming
-    private let dataClient: HTTPDataClient
+    let dataClient: HTTPDataClient
     private let inferenceCatalogSnapshot: InferenceCatalogSnapshot?
 
     public init(config: ProviderConfig,

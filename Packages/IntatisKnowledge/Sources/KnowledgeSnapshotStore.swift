@@ -209,6 +209,16 @@ private final class KnowledgeReaderLeaseState: @unchecked Sendable {
 /// It captures both the reviewed workspace authority and the exact store root
 /// inode. Every operation revalidates both identities before using a path.
 public struct KnowledgeSnapshotStore: Sendable {
+    /// Reserved host-owned component. General workspace leases deny this
+    /// component at every executor boundary; only the Knowledge store writer
+    /// and reader operate below it.
+    public static let publishedSnapshotsDirectoryName =
+        ".intatis-rag-snapshots"
+    /// Pre-product core builds used this generic component. It is never opened
+    /// in place because ordinary workspace tools could address it; an exact
+    /// read-write Knowledge writer must migrate it under the store lock first.
+    static let legacyPublishedSnapshotsDirectoryName = "snapshots"
+
     public let root: URL
     public let coordinationRoot: URL
     public let workspaceLeaseID: WorkspaceLeaseID
@@ -218,9 +228,13 @@ public struct KnowledgeSnapshotStore: Sendable {
 
     let workspaceLease: WorkspaceLease
     let fileSystem: KnowledgeSecureFileSystem
+    private let pointerWriteOperation:
+        @Sendable (Data, URL, String) throws -> Void
 
     private var snapshotsRoot: URL {
-        root.appendingPathComponent("snapshots", isDirectory: true)
+        root.appendingPathComponent(
+            Self.publishedSnapshotsDirectoryName,
+            isDirectory: true)
     }
 
     private var stagingRoot: URL {
@@ -229,6 +243,22 @@ public struct KnowledgeSnapshotStore: Sendable {
 
     private var pointerURL: URL {
         root.appendingPathComponent(".intatis-rag-store.json", isDirectory: false)
+    }
+
+    /// Knowledge-internal projection used only after the store root itself has
+    /// passed the exact reviewed workspace/Knowledge authority check. General
+    /// tools keep the original lease and therefore cannot use this projection
+    /// to enter the host-owned publication components.
+    var managedContentWorkspaceLease: WorkspaceLease {
+        var projected = workspaceLease
+        let managed = Set(
+            WorkspaceLease.mandatoryManagedStoreDeniedPatterns.map {
+                $0.lowercased()
+            })
+        projected.deniedPatterns.removeAll {
+            managed.contains($0.lowercased())
+        }
+        return projected
     }
 
     private var storeLockURL: URL {
@@ -240,6 +270,30 @@ public struct KnowledgeSnapshotStore: Sendable {
                 coordinationRoot requestedCoordinationRoot: URL? = nil,
                 createIfMissing: Bool = false,
                 fileSystem: KnowledgeSecureFileSystem = KnowledgeSecureFileSystem()) throws {
+        try self.init(
+            root: requestedRoot,
+            workspaceLease: workspaceLease,
+            coordinationRoot: requestedCoordinationRoot,
+            createIfMissing: createIfMissing,
+            fileSystem: fileSystem,
+            pointerWriteOperation: { data, url, temporaryPrefix in
+                try DurableOwnerOnlyFile.writeAtomically(
+                    data,
+                    to: url,
+                    temporaryPrefix: temporaryPrefix)
+            })
+    }
+
+    /// Internal deterministic fault seam for proving the post-rename pointer
+    /// commit-uncertain contract. Shipping clients always use the public
+    /// initializer above and therefore the hardened durable writer.
+    init(root requestedRoot: URL,
+         workspaceLease: WorkspaceLease,
+         coordinationRoot requestedCoordinationRoot: URL? = nil,
+         createIfMissing: Bool = false,
+         fileSystem: KnowledgeSecureFileSystem = KnowledgeSecureFileSystem(),
+         pointerWriteOperation:
+            @escaping @Sendable (Data, URL, String) throws -> Void) throws {
         guard let workspaceIdentity = workspaceLease.rootIdentity,
               workspaceIdentity.matchesCurrentDirectory(rootPath: workspaceLease.rootPath) else {
             throw KnowledgeDomainError(
@@ -285,10 +339,108 @@ public struct KnowledgeSnapshotStore: Sendable {
                 "Knowledge store canonical path escapes the active workspace lease.")
         }
 
-        let snapshots = authorized.canonical.appendingPathComponent(
-            "snapshots",
+        let coordination = requestedCoordinationRoot.map {
+            URL(fileURLWithPath: ($0.path as NSString).expandingTildeInPath, isDirectory: true)
+                .standardizedFileURL
+        } ?? authorized.canonical.appendingPathComponent(
+            ".intatis-rag-host",
             isDirectory: true)
-        if !FileManager.default.fileExists(atPath: snapshots.path) {
+        if !FileManager.default.fileExists(atPath: coordination.path) {
+            guard createIfMissing, workspaceLease.access == .readWrite else {
+                throw KnowledgeDomainError(
+                    .indexNotReady,
+                    retryable: true,
+                    "Knowledge store coordination directory is missing.")
+            }
+            try Self.createOwnedDirectory(coordination)
+        }
+        let validatedCoordination = try DurableOwnerOnlyFile
+            .validateOwnedDirectory(at: coordination)
+        guard let coordinationIdentity = WorkspaceRootIdentity.capture(
+                rootPath: validatedCoordination.path) else {
+            throw KnowledgeDomainError(.unsafeStorage, "Knowledge coordination directory identity is unavailable.")
+        }
+
+        let snapshots = authorized.canonical.appendingPathComponent(
+            Self.publishedSnapshotsDirectoryName,
+            isDirectory: true)
+        let legacySnapshots = authorized.canonical.appendingPathComponent(
+            Self.legacyPublishedSnapshotsDirectoryName,
+            isDirectory: true)
+        var hasSnapshots = FileManager.default.fileExists(
+            atPath: snapshots.path)
+        var hasLegacySnapshots = FileManager.default.fileExists(
+            atPath: legacySnapshots.path)
+        guard !(hasSnapshots && hasLegacySnapshots) else {
+            throw KnowledgeDomainError(
+                .unsafeStorage,
+                "Knowledge store contains ambiguous current and legacy snapshot directories.")
+        }
+        if hasLegacySnapshots {
+            guard createIfMissing, workspaceLease.access == .readWrite else {
+                throw KnowledgeDomainError(
+                    .indexNotReady,
+                    retryable: false,
+                    "Knowledge store uses a legacy snapshot layout and requires an explicit build/update migration.")
+            }
+            let validatedLegacy = try DurableOwnerOnlyFile
+                .validateOwnedDirectory(at: legacySnapshots)
+            guard let legacyIdentity = WorkspaceRootIdentity.capture(
+                    rootPath: validatedLegacy.path) else {
+                throw KnowledgeDomainError(
+                    .unsafeStorage,
+                    "Legacy knowledge snapshot identity is unavailable.")
+            }
+            guard let migrationLock = try KnowledgeAdvisoryFileLock.acquire(
+                at: validatedCoordination.appendingPathComponent(
+                    "store.lock",
+                    isDirectory: false),
+                mode: .exclusive,
+                blocking: true,
+                expectedParentIdentity: coordinationIdentity) else {
+                throw KnowledgeDomainError(
+                    .searchTimeout,
+                    retryable: true,
+                    "Knowledge legacy-layout migration could not acquire its writer lock.")
+            }
+            defer { migrationLock.release() }
+            hasSnapshots = FileManager.default.fileExists(atPath: snapshots.path)
+            hasLegacySnapshots = FileManager.default.fileExists(
+                atPath: legacySnapshots.path)
+            guard !(hasSnapshots && hasLegacySnapshots) else {
+                throw KnowledgeDomainError(
+                    .unsafeStorage,
+                    "Knowledge store layout changed ambiguously during migration.")
+            }
+            if hasLegacySnapshots {
+                guard rename(legacySnapshots.path, snapshots.path) == 0 else {
+                    throw KnowledgeDomainError(
+                        .unsafeStorage,
+                        "Legacy knowledge snapshots could not be atomically migrated.")
+                }
+                guard let migratedIdentity = WorkspaceRootIdentity.capture(
+                        rootPath: snapshots.path),
+                      migratedIdentity.deviceID == legacyIdentity.deviceID,
+                      migratedIdentity.fileID == legacyIdentity.fileID else {
+                    throw KnowledgeDomainError(
+                        .commitUncertain,
+                        retryable: false,
+                        "Legacy knowledge snapshot migration may have committed and requires disk reconciliation.")
+                }
+                do {
+                    try KnowledgeSnapshotDurability.synchronizeDirectory(
+                        authorized.canonical)
+                } catch {
+                    throw KnowledgeDomainError(
+                        .commitUncertain,
+                        retryable: false,
+                        "Legacy knowledge snapshot migration may have committed and requires disk reconciliation.")
+                }
+                hasSnapshots = true
+            }
+        }
+
+        if !hasSnapshots {
             guard createIfMissing, workspaceLease.access == .readWrite else {
                 throw KnowledgeDomainError(
                     .indexNotReady,
@@ -306,22 +458,6 @@ public struct KnowledgeSnapshotStore: Sendable {
             }
         }
 
-        let coordination = requestedCoordinationRoot.map {
-            URL(fileURLWithPath: ($0.path as NSString).expandingTildeInPath, isDirectory: true)
-                .standardizedFileURL
-        } ?? authorized.canonical.appendingPathComponent(
-            ".intatis-rag-host",
-            isDirectory: true)
-        if !FileManager.default.fileExists(atPath: coordination.path) {
-            try Self.createOwnedDirectory(coordination)
-        }
-        let validatedCoordination = try DurableOwnerOnlyFile
-            .validateOwnedDirectory(at: coordination)
-        guard let coordinationIdentity = WorkspaceRootIdentity.capture(
-                rootPath: validatedCoordination.path) else {
-            throw KnowledgeDomainError(.unsafeStorage, "Knowledge coordination directory identity is unavailable.")
-        }
-
         self.root = authorized.canonical
         coordinationRoot = validatedCoordination
         workspaceLeaseID = workspaceLease.id
@@ -330,6 +466,7 @@ public struct KnowledgeSnapshotStore: Sendable {
         coordinationRootIdentity = coordinationIdentity
         self.workspaceLease = workspaceLease
         self.fileSystem = fileSystem
+        self.pointerWriteOperation = pointerWriteOperation
     }
 
     public func loadCurrentPointer() throws -> KnowledgeStorePointer {
@@ -545,14 +682,14 @@ public struct KnowledgeSnapshotStore: Sendable {
     fileprivate func writePointerWithoutLock(_ pointer: KnowledgeStorePointer) throws {
         try KnowledgeStorePointerCodec.validate(pointer)
         do {
-            try DurableOwnerOnlyFile.writeAtomically(
+            try pointerWriteOperation(
                 try KnowledgeJSON.encode(pointer, pretty: true),
-                to: pointerURL,
-                temporaryPrefix: ".intatis-rag-store-")
+                pointerURL,
+                ".intatis-rag-store-")
         } catch let error as DurableOwnerOnlyFileError {
             throw KnowledgeDomainError(
-                error == .commitUncertain ? .revisionChanged : .unsafeStorage,
-                retryable: error == .commitUncertain,
+                error == .commitUncertain ? .commitUncertain : .unsafeStorage,
+                retryable: false,
                 error == .commitUncertain
                     ? "Knowledge store pointer commit is uncertain and must be reconciled from disk."
                     : "Knowledge store pointer could not be written safely.")
@@ -687,7 +824,9 @@ public final class KnowledgeStoreWriterLease: @unchecked Sendable {
             throw KnowledgeDomainError(.profileInvalid, "Knowledge snapshot identifier is invalid.")
         }
         let stagingRoot = store.root
-            .appendingPathComponent("snapshots", isDirectory: true)
+            .appendingPathComponent(
+                KnowledgeSnapshotStore.publishedSnapshotsDirectoryName,
+                isDirectory: true)
             .appendingPathComponent(".staging", isDirectory: true)
         if !FileManager.default.fileExists(atPath: stagingRoot.path) {
             try KnowledgeSnapshotStore.createOwnedDirectory(stagingRoot)
@@ -731,7 +870,9 @@ public final class KnowledgeStoreWriterLease: @unchecked Sendable {
         try KnowledgeSnapshotDeletion.removeTree(
             staging.root,
             confinedTo: store.root
-                .appendingPathComponent("snapshots", isDirectory: true)
+                .appendingPathComponent(
+                    KnowledgeSnapshotStore.publishedSnapshotsDirectoryName,
+                    isDirectory: true)
                 .appendingPathComponent(".staging", isDirectory: true))
     }
 
@@ -773,7 +914,9 @@ public final class KnowledgeStoreWriterLease: @unchecked Sendable {
         try verifyContentSeal(validatedSnapshot, at: staging.root)
 
         let finalRoot = store.root
-            .appendingPathComponent("snapshots", isDirectory: true)
+            .appendingPathComponent(
+                KnowledgeSnapshotStore.publishedSnapshotsDirectoryName,
+                isDirectory: true)
             .appendingPathComponent(staging.snapshotID, isDirectory: true)
         guard !FileManager.default.fileExists(atPath: finalRoot.path) else {
             throw KnowledgeDomainError(.revisionChanged, "Knowledge snapshot identifier is already published.")
@@ -865,7 +1008,9 @@ public final class KnowledgeStoreWriterLease: @unchecked Sendable {
         try requireActive()
         try store.revalidateStoreAuthority()
         let current = try store.readPointerWithoutLock()?.currentSnapshot
-        let snapshotsRoot = store.root.appendingPathComponent("snapshots", isDirectory: true)
+        let snapshotsRoot = store.root.appendingPathComponent(
+            KnowledgeSnapshotStore.publishedSnapshotsDirectoryName,
+            isDirectory: true)
         let children = try FileManager.default.contentsOfDirectory(
             at: snapshotsRoot,
             includingPropertiesForKeys: [.contentModificationDateKey],
@@ -940,7 +1085,9 @@ public final class KnowledgeStoreWriterLease: @unchecked Sendable {
         try requireActive()
         try store.revalidateStoreAuthority()
         let current = try store.readPointerWithoutLock()?.currentSnapshot
-        let snapshotsRoot = store.root.appendingPathComponent("snapshots", isDirectory: true)
+        let snapshotsRoot = store.root.appendingPathComponent(
+            KnowledgeSnapshotStore.publishedSnapshotsDirectoryName,
+            isDirectory: true)
         var removed: [String] = []
         for id in snapshotIDs.sorted() {
             guard KnowledgeStoreIdentifier.isValidSnapshotID(id), id != current else {
@@ -1015,10 +1162,12 @@ public final class KnowledgeStoreWriterLease: @unchecked Sendable {
         guard staging.writerNonce == nonce,
               staging.storeIdentity == store.storeRootIdentity,
               KnowledgeStoreIdentifier.isValidSnapshotID(staging.snapshotID),
-              PathConfinement.isWithin(
+            PathConfinement.isWithin(
                 staging.root.path,
                 root: store.root
-                    .appendingPathComponent("snapshots", isDirectory: true)
+                    .appendingPathComponent(
+                        KnowledgeSnapshotStore.publishedSnapshotsDirectoryName,
+                        isDirectory: true)
                     .appendingPathComponent(".staging", isDirectory: true)) else {
             throw KnowledgeDomainError(.accessDenied, "Knowledge staging snapshot is not owned by this writer lease.")
         }
@@ -1041,7 +1190,9 @@ public final class KnowledgeStoreWriterLease: @unchecked Sendable {
                                          now: Date) throws -> [String] {
         guard let age else { return [] }
         let stagingRoot = store.root
-            .appendingPathComponent("snapshots", isDirectory: true)
+            .appendingPathComponent(
+                KnowledgeSnapshotStore.publishedSnapshotsDirectoryName,
+                isDirectory: true)
             .appendingPathComponent(".staging", isDirectory: true)
         guard FileManager.default.fileExists(atPath: stagingRoot.path) else { return [] }
         let children = try FileManager.default.contentsOfDirectory(

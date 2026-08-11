@@ -41,7 +41,9 @@ final class IntatisPermissionTests: XCTestCase {
 
     func testContainsSecret() {
         XCTAssertTrue(SecretScanner.containsSecret("token=ghp_abcdef123456"))
+        XCTAssertTrue(SecretScanner.containsSecret("api_key=sk-supersecretvalue"))
         XCTAssertTrue(SecretScanner.containsSecret("-----BEGIN OPENSSH PRIVATE KEY-----"))
+        XCTAssertFalse(SecretScanner.containsSecret("ask-user or automatic-review"))
         XCTAssertFalse(SecretScanner.containsSecret("just some normal source code"))
     }
 

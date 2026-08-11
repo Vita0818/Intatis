@@ -20,6 +20,12 @@ public struct ReadFileTool: Tool {
 
     public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {
         let a = try args.decode(Args.self)
+        _ = try validateManagedWorkspaceAccess(
+            readablePaths: [a.path],
+            writablePaths: [],
+            cwd: context.workspaceRoot,
+            workspaceLease: context.workspaceLease,
+            subject: "read_file")
         let url = try PathConfinement.resolve(a.path, within: context.workspaceRoot)
         let data = try Data(contentsOf: url)
         let limit = a.maxBytes ?? 100_000
@@ -47,7 +53,14 @@ public struct ListFilesTool: Tool {
 
     public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {
         let a = try? args.decode(Args.self)
-        let dir = try PathConfinement.resolve(a?.path ?? ".", within: context.workspaceRoot)
+        let path = a?.path ?? "."
+        _ = try validateManagedWorkspaceAccess(
+            readablePaths: [path],
+            writablePaths: [],
+            cwd: context.workspaceRoot,
+            workspaceLease: context.workspaceLease,
+            subject: "list_files")
+        let dir = try PathConfinement.resolve(path, within: context.workspaceRoot)
         let names = try FileManager.default.contentsOfDirectory(atPath: dir.path).sorted()
         let lines = names.map { name -> String in
             var isDir: ObjCBool = false
@@ -76,7 +89,14 @@ public struct SearchTextTool: Tool {
 
     public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {
         let a = try args.decode(Args.self)
-        let base = try PathConfinement.resolve(a.path ?? ".", within: context.workspaceRoot)
+        let path = a.path ?? "."
+        _ = try validateManagedWorkspaceAccess(
+            readablePaths: [path],
+            writablePaths: [],
+            cwd: context.workspaceRoot,
+            workspaceLease: context.workspaceLease,
+            subject: "search_text")
+        let base = try PathConfinement.resolve(path, within: context.workspaceRoot)
         let maxMatches = 200
         var matches: [String] = []
 
@@ -137,6 +157,12 @@ public struct WriteFileTool: Tool {
 
     public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {
         let a = try args.decode(Args.self)
+        _ = try validateManagedWorkspaceAccess(
+            readablePaths: [],
+            writablePaths: [a.path],
+            cwd: context.workspaceRoot,
+            workspaceLease: context.workspaceLease,
+            subject: "write_file")
         let url = try PathConfinement.resolve(a.path, within: context.workspaceRoot)
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         let data = Data(a.content.utf8)

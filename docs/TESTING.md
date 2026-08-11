@@ -1,7 +1,7 @@
 # TESTING
 
 文档状态：当前验证矩阵
-最近核对：2026-08-10
+最近核对：2026-08-11
 产品基线：v0.40（build 40）
 
 历史测试数量、性能数字和事故复验保留在 Git 历史及 dated reports；它们不能替代当前
@@ -84,6 +84,9 @@ MCP、browser、managed terminal、OAuth、real provider 和设备测试中明�
 ```sh
 swift build --target IntatisKnowledge --disable-automatic-resolution
 swift test --filter IntatisKnowledgeTests
+swift test --filter KnowledgeModelProviderTests
+swift test --filter CLIProviderAdapterTests
+swift test --filter ModelDrivenKnowledgeAgentLoopTests
 swift test --filter TurnGroundingEvidenceRegistryTests
 swift test --filter ToolRegistryLeaseTests
 ```
@@ -117,12 +120,71 @@ swift test --filter ToolRegistryLeaseTests
   窄 capability 时工具完全缺席，close/shutdown 会 cancel/drain mount；snapshot-bound dynamic
   registration 必须保留 instance-owned local/remote intent，本地 `search_knowledge` 即使 read-only 也要
   从 deterministic gate 的 `pass` 进入 reviewer/PermissionEngine，不能继承普通文件读取的 auto-allow。
+- canonical `embedding_model` / `reranker_model` decode 与 exact independent route；Knowledge-only provider
+  可以没有普通 inference models。任一 role/dialect 不可用时，secret、network、store 与 bookmark
+  副作用前 fail closed；credential 必须在真实 embedding/rerank dispatch 内才解析；official-shaped
+  embedding/rerank fixtures 必须证明 endpoint、payload、result index/permutation 与 bounded candidates。
+- path-aware `build_knowledge` / `search_knowledge` 的 closed input/output schema 与 host strict validation、
+  provider strict 仅在所有 properties 都 required 时启用、existing-store 双 ID CAS、
+  workspace/external authority 分流、read-only/broad/sensitive/root-swap/父目录替代/撤权，以及 raw bookmark
+  与 safe projection 分离；bookmark sidecar lock 必须拒绝 symlink/hardlink 等 unsafe inode。至少一个
+  真实 AgentLoop turn 应查询两个 exact store，并证明每个成功结果
+  `rerank_applied=true`、current-turn citations 不串 snapshot、scope 在 grounding 后 drain。
+- `.intatis-rag-store.json` / `.intatis-rag-snapshots` / `.intatis-rag-host` 必须由普通 file/patch/
+  Git/process 与实际 managed-terminal anti-bypass 回归覆盖；legacy `snapshots/` 只能由 writer 原子迁移，
+  read-only open 不得创建基础设施，dual layout 必须拒绝。pointer/layout rename 的 post-commit
+  uncertainty 必须返回 non-retryable typed failure；checked augmentation close 必须证明 false drain 不会
+  结算为成功且 repeated close 仍 single-flight。
 
 质量测试必须冻结 corpus 与阈值，至少记录 Recall@5、MRR、nDCG@5、unanswerable、citation
 coverage/precision、index bytes、memory proxy 和 deterministic latency proxy。Apple NaturalLanguage
 不可用时只能 `XCTSkip`；开发机 arm64 结果不能外推 Intel 真机。x86_64 编译、Intel 上 exact
 language/revision/dimension availability 和质量、真实 remote embedding/reranker credential/network smoke
 必须分开记录，缺一项就标 `UNKNOWN`，不得静默换模型或宣称 universal runtime 已验证。
+
+真实 Knowledge route 是显式付费 opt-in：
+
+运行前先在 `INTATIS_CONFIG` 指向的 Intatis JSON/JSONC（或默认 Intatis-owned 配置）中确认顶层
+`embedding_model`、`reranker_model` 均为完整 `<provider>/<model-id>`，且两个 provider 的
+`options.baseURL`、`options.apiKey` 引用和 `npm` adapter 与实际服务一致。可复制的无 secret 配置 shape
+见根目录 `README.md` 和
+`codex-report/08_10_26-16_57-model-driven-knowledge-tools-design.md` §4.1。CLI 的 `/config` 必须显示
+`knowledge ready`；该状态必须来自与真实 provider 构造共用 configuration builder 的同步预检。字段缺失、
+endpoint 不存在、embedding 维度不明或 adapter 不受支持时应在解析/组装阶段失败，不得先解析 credential、
+发网、取得 bookmark 或触碰 store。
+
+```sh
+INTATIS_REAL_KNOWLEDGE_SMOKE=1 swift test \
+  --filter RealProviderSmokeTests.testRealKnowledgeEmbeddingAndRerankerWhenEnabled
+
+INTATIS_REAL_KNOWLEDGE_QUALITY=1 swift test \
+  --filter RealProviderSmokeTests.testRealKnowledgeRerankQualityWhenEnabled
+
+INTATIS_REAL_KNOWLEDGE_AGENT_E2E=1 swift test \
+  --filter RealProviderSmokeTests.testRealModelBuildsSearchesAndCitesExternalKnowledgeWhenEnabled
+
+INTATIS_REAL_KNOWLEDGE_PDF_E2E=1 \
+INTATIS_REAL_KNOWLEDGE_PDF_SOURCE=/absolute/path/to/pdf-directory \
+swift test \
+  --filter RealProviderSmokeTests.testRealModelBuildsSearchesAndCitesPDFKnowledgeWhenEnabled
+```
+
+第一条使用当前高级配置的 exact `embedding_model` / `reranker_model` 各发一个最小请求；第二条在冻结
+的中英/代码 corpus 与 ground-truth queries 上分别报告 embedding-cosine baseline 和 configured semantic
+reranker 的 MRR/nDCG@5/Recall@5；两个入口同时汇总 provider 实际返回的 token/billable units，未返回
+时打印 `unreported`，不按可变价目表推算金额。第三条让当前配置的真实 Agent、embedding 与 reranker
+执行“读取资料 → 整理 draft → 外部建库 → 检索 → 引用”；第四条先把指定目录中三个冻结 PDF 复制到
+隔离临时 workspace，再要求 Agent 用 `read_pdf` 读取冻结页段、建立三主题库并回答。原始 PDF 不得修改。
+后两条会产生多次可计费请求。执行任一入口前必须由用户提供或确认配置、credential、网络、费用与所需
+资料外发授权；默认 `XCTSkip` 不能记为通过。这四条仍不能替代 macOS NSOpenPanel/bookmark 跨重启
+restore 交互验收。
+
+macOS external bookmark 手动验收必须使用 Developer ID/Debug `IntatisMac`（不使用 legacy App Store
+target）：在 Code 中用自然语言给出一个 workspace 外的精确 `store_path`，批准 tool permission 后在
+NSOpenPanel 只选择该目录；核对当前 session 的 `knowledge-access.plist` 是 binary、owner-only `0600`，
+且只含 exact normalized path、opaque bookmark、revision 与 digest。随后退出 App、重新启动、恢复同一
+Code session 并再次调用同一路径：不得再次出现授权面板。换 session、不同路径、root identity 漂移或
+撤权后仍必须重新授权；测试时不得打印 raw bookmark bytes。
 
 ### 六工具文档链专项
 
@@ -143,6 +205,24 @@ swift test --filter ToolRegistryLeaseTests
 
 外层 managed sandbox 若阻止测试内的 Seatbelt/process spawn，可直接运行已构建的 XCTest bundle
 做聚焦验证，并在真实 host 环境补跑完整 suite；必须记录采用的方式，不能把环境性失败冒充通过。
+本机已安装 runtime 的 opt-in smoke 使用精确 test product，避免 `--skip-build` 误跑旧 bundle：
+
+```sh
+swift build --target IntatisToolsTests-product --disable-automatic-resolution
+INTATIS_REAL_DOCUMENT_RUNTIME_SMOKE=1 xcrun xctest \
+  -XCTest IntatisToolsTests.DocumentToolsIntegrationTests/testInstalledDocumentRuntimeEPUBWriteWhenEnabled \
+  .build/out/Products/Debug/IntatisToolsTests.xctest
+INTATIS_REAL_DOCUMENT_RUNTIME_SMOKE=1 xcrun xctest \
+  -XCTest IntatisToolsTests.DocumentToolsIntegrationTests/testInstalledDocumentRuntimePDFCPUAndOCRWhenEnabled \
+  .build/out/Products/Debug/IntatisToolsTests.xctest
+INTATIS_REAL_DOCUMENT_RUNTIME_SMOKE=1 xcrun xctest \
+  -XCTest IntatisToolsTests.DocumentToolsIntegrationTests/testInstalledDocumentRuntimeCoreToolChainWhenEnabled \
+  .build/out/Products/Debug/IntatisToolsTests.xctest
+```
+
+第三项包含 DOCX write/read、LibreOffice PDF preview/export、PDF read/render，PPTX
+write/read/preview/export/PDF read，以及 XLSX write/Calc round-trip/formula-cache/preview/export；
+任一中途失败都不得把前面的 Python write 或直接无沙箱 LibreOffice 基准记为六工具链通过。
 专项至少证明：
 
 - 生产 registry 只有 `read_pdf`、`document_read`、`document_ocr`、`document_render`、
@@ -516,6 +596,88 @@ INTATIS_REAL_MULTIMODAL_SMOKE=1 swift test \
   线上 provider smoke 必须单独记录，不能从离线测试或编译外推。
 
 ## 最近一次真实结果
+
+2026-08-11 本机 LibreOffice 26.8 替换与真实链路证据：
+
+- 官方 `LibreOfficeDev_26.8.0.0.beta1_MacOS_aarch64.dmg` 为 298,129,546 bytes，SHA-256
+  `a56a5af102c78c294b3da48154958ecd9fa52d357589305c54e6e215ce611900`；`hdiutil verify` 和官方
+  detached PGP signature 均通过。CLI exact 输出为 `LibreOfficeDev 26.8.0.0.beta1`，固定后端只解析
+  `~/Library/Application Support/Intatis/document-runtime/libreoffice/26.8.0.0.beta1/LibreOffice.app`；
+- 在不受 Codex 外层 sandbox 干扰的宿主环境，DMG 原件、替换前 staging 和最终固定路径均通过
+  `codesign --verify --deep --strict`；签名者为 The Document Foundation Developer ID（Team ID
+  `7P5S3ZLCN7`），`spctl --assess --type execute --verbose=4` 返回 `accepted` / `Notarized Developer ID`。
+  早先在外层受限环境得到的 Code Signing subsystem internal error 不能作为宿主签名失败证据；
+- 一次无 Intatis Seatbelt 的诊断运行确实让内置 Python 改写了签名包内的 `__pycache__/*.pyc`，随后
+  `codesign` 正确报告 sealed resource modified。该副本已移入废纸篓，并从仍为只读、已验签的官方
+  DMG 重新复制；这与前述外层 sandbox 假阴性是两个不同事件；
+- 根因最终收敛为 LibreOffice SingleOffice IPC。`OSL_SOCKET_PATH` 是 LibreOffice bootstrap 值，
+  必须以 `-env:OSL_SOCKET_PATH=...` 传入；旧实现只设置普通 process environment，因此无效。长 Darwin
+  temp root 还会在 LibreOffice 追加 `OSL_PIPE_*` 后超过 `sockaddr_un.sun_path`，在 `socket()` 前就返回
+  `BE_PATHINFO_MISSING`；
+- fixed runner 现为每次调用创建 `/private/tmp/intatis-lo-<12 hex>`，创建后以 `lstat` 证明它是
+  current-UID、非 symlink、`0700` 目录。Seatbelt 只允许该 root 的文件读写、本地 `OSL_PIPE_*`
+  Unix socket bind/connect，并继续拒绝 IP 网络和其他 Unix socket；调用结束清理 exact root。对应
+  profile 单元测试 1/1、`DocumentFixedBackendsTests` 4/4；
+- `INTATIS_REAL_DOCUMENT_RUNTIME_SMOKE=1 swift test --filter DocumentToolsIntegrationTests/testInstalledDocumentRuntimeCoreToolChainWhenEnabled`
+  在干净副本上 1/1：
+  DOCX write/read/preview/export/PDF read/render；PPTX write/read/preview/export/PDF read；XLSX write、
+  LibreOffice Calc round-trip、公式文本保留、data-only cache 值 `4`、preview/export。真实测试后再次
+  `codesign --verify --deep --strict` 与 `spctl`，结果仍为 valid/accepted，证明 Intatis 路径没有修改
+  App 签名资源。旧 26.2.4 runtime 已按用户授权移入废纸篓；
+- 当前用户 runtime 的真实 smoke 仍只证明这台开发机，不代表 App bundle、双架构、NOTICE、许可证或
+  clean-machine distribution closure 已完成。真实 EPUB write/EPUBCheck 和 strict pdfcpu +
+  Docling/Tesseract OCR 的既有 1/1 证据继续有效。
+
+2026-08-11 model-driven Knowledge 实现与 live acceptance 证据：
+
+- `IntatisKnowledgeTests.xctest` 118 tests / 0 failures；当前宿主 local-core corpus 指标为
+  Recall@1 0.529、Recall@5 0.882、MRR 0.681、nDCG@5 0.698、citation coverage 0.882、citation
+  precision 1.000，最近一次离线 Knowledge run 的 deterministic search proxy 200 次平均 1.640 ms；
+  这些不是 semantic reranker uplift 报告；
+- `KnowledgeModelProviderTests` 11/11、`ToolSpecMetadataTests` 5/5、`CLIProviderAdapterTests` 9/9、
+  `ModelDrivenKnowledgeAgentLoopTests` 2/2、`TurnGroundingEvidenceRegistryTests` 7/7、
+  `ToolRegistryLeaseTests` 25/25、SecretScanner 精确回归 1/1、checked drain 1/1。
+  AgentLoop 用两个 exact external store 跑通 2 build + 2 search，4 个
+  prepared/settled correlation 一致，两次 search 均为 `rerank_applied=true`，两个 citation 通过
+  current-turn revalidation；随后 fresh host generation 重新打开其中一个 durable external store 并完成
+  第三次 query embedding/semantic rerank/citation，最终 query/reranker 各调用 3 次、external scope
+  acquire/release 5/5；
+- 普通 file mutation 与实际 Seatbelt managed terminal anti-bypass 定向通过；legacy snapshot layout
+  writer-only atomic migration、read-only no-mutation、pointer `commitUncertain`、provider route identity/
+  redirect/malformed/timeout/cancel/credential failure 均通过；official-shaped provider fixture 还验证了
+  embedding token 与 reranker token/billable-search-unit 解析，build descriptor 保持 `.write` 且
+  network/model-cost 风险独立存在；
+- `INTATIS_REAL_KNOWLEDGE_SMOKE=1` 已使用 OpenRouter exact routes 运行 1/1、0 failures（3.447 秒）：
+  `google/gemini-embedding-2` 返回并通过 1536 维校验，provider usage 为 input/total token 7；
+  `cohere/rerank-4-pro` 返回完整两候选 permutation、有限 score，provider usage 为 search unit 1；
+- `INTATIS_REAL_KNOWLEDGE_QUALITY=1` 运行 1/1、0 failures：冻结 8-query 中英/代码集合的 dense
+  embedding baseline 为 MRR 1.000、nDCG@5 1.000、Recall@5 1.000；configured semantic reranker 为
+  MRR 1.000、nDCG@5 0.990、Recall@5 1.000。embedding usage 为 343 token，reranker usage 为 8
+  search units。该结果证明 100% configured-rerank 调用和独立指标报告，但没有证明 uplift，nDCG@5
+  回退 0.010，不能改写成推荐模型优于 baseline；
+- `INTATIS_REAL_KNOWLEDGE_AGENT_E2E=1` 运行 1/1、0 failures（32.686 秒）：真实 Agent 调用了
+  `list_files` / `read_file` / `write_file` / `build_knowledge` / `search_knowledge`，在隔离外部 store
+  完成 read-organize-build-search-cite，最终回答含通过 current-turn revalidation 的 exact evidence ID；
+- `INTATIS_REAL_KNOWLEDGE_PDF_E2E=1` 以项目根目录 `test-DS-Algorithm` 为 source 运行 1/1、0 failures
+  （110.980 秒）。harness 只复制并读取 `DPV-chap2.pdf` 6–7 页、`DPV-chap4.pdf` 5–7 页、
+  `DPV-chap6.pdf` 1–5 页；Agent 实际调用三次 `read_pdf`，写出 3 个 grounded concept，build 生成
+  22 chunks，再用 configured query embedding 与 required reranker 搜索并在覆盖 mergesort、Dijkstra、
+  LIS 的最终答案中引用 exact evidence。原始 PDF 未修改；
+- macOS Debug App 通过 Computer Use 执行真实 Code 交互：用户自然语言给出 workspace 外 exact path 后，
+  首次 `search_knowledge` 显示 NSOpenPanel 并只授权该目录，保存 session-owned binary
+  `knowledge-access.plist`（mode `0600`、schema 1、revision 1）。退出应用、重新启动、恢复同一 Code
+  session 后再次搜索没有出现授权面板，证明 bookmark restore；测试目录为空，因此两次均按设计返回
+  typed `KB_INDEX_NOT_READY` 且未写文件；
+- 工作区沙箱外精确运行
+  `TerminalToolsTests.testManagedTerminalCannotMutateKnowledgePublicationWithEmptyDenyList` 1/1、0 failures，
+  证明实际 Seatbelt managed terminal 不能绕过 Knowledge publication deny floor。默认 skipped 的其它
+  real provider/browser/Git/document/Keychain 用例不计为真实环境通过；
+- `IntatisMac` macOS Debug 与 `IntatisiOS` generic Simulator Debug unsigned build均退出 0；Mac 只出现
+  仓内既有 warning，未构建 legacy `IntatisMacAppStore`。本轮整仓 `swift test` 已完成 Tools 与 Skills，
+  随后 `IntatisSharedUITests.xctest` 进程持续约 7 分钟 0% CPU 且无新输出，复现既有 async scheduler
+  挂起后人工中断，命令退出 130；不得记为整仓全绿，也没有观察到本任务相关 failure。本段所列
+  Knowledge/Provider/Agent/Cowork/Permission/terminal 定向 suites 均独立退出 0。账单金额因 provider
+  未返回 versioned monetary amount 而不推算。
 
 2026-08-09 OKF / RAG knowledge bundle 本地 core 的直接证据：
 

@@ -3,7 +3,8 @@ import IntatisCore
 import IntatisProtocol
 
 enum LibreOfficeDocumentBackend {
-    static let expectedVersion = "26.2.5.2"
+    static let expectedProductName = "LibreOfficeDev"
+    static let expectedVersion = "26.8.0.0.beta1"
 
     static func exportPDF(
         actualInput: URL,
@@ -42,6 +43,7 @@ enum LibreOfficeDocumentBackend {
                 "--nodefault",
                 "--nofirststartwizard",
                 "--nolockcheck",
+                "--norestore",
                 profileArgument,
                 "--convert-to", exportFilter,
                 "--outdir", outputDirectory.path,
@@ -101,6 +103,7 @@ enum LibreOfficeDocumentBackend {
                 "--nodefault",
                 "--nofirststartwizard",
                 "--nolockcheck",
+                "--norestore",
                 profileArgument,
                 "--convert-to", "xlsx:Calc MS Excel 2007 XML",
                 "--outdir", outputDirectory.path,
@@ -152,7 +155,10 @@ enum LibreOfficeDocumentBackend {
         let firstLine = result.stdout.split(whereSeparator: { $0.isNewline }).first.map(String.init)
             ?? result.stderr.split(whereSeparator: { $0.isNewline }).first.map(String.init)
             ?? ""
-        guard firstLine.contains("LibreOffice \(expectedVersion)") else {
+        let versionFields = firstLine.split(whereSeparator: { $0.isWhitespace })
+        guard versionFields.count >= 2,
+              versionFields[0] == Substring(expectedProductName),
+              versionFields[1] == Substring(expectedVersion) else {
             throw DocumentToolError(.backendVersionMismatch, "LibreOffice version does not match the fixed manifest")
         }
         return expectedVersion
@@ -219,12 +225,15 @@ enum PDFCPUValidationBackend {
         let stageRoot = stagedPDF.deletingLastPathComponent()
         let versionInvocation = DocumentBackendInvocation(
             executable: .pdfcpu,
-            arguments: ["version"],
+            arguments: ["--conf", "disable", "version"],
             readableWorkspacePaths: [],
             writableWorkspacePaths: [])
         let versionResult = try await run(versionInvocation, in: context)
+        let versionLines = (versionResult.stdout + "\n" + versionResult.stderr)
+            .split(whereSeparator: { $0.isNewline })
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
         guard versionResult.exitCode == 0,
-              (versionResult.stdout + versionResult.stderr).contains("v\(expectedVersion)") else {
+              versionLines.contains("version: \(expectedVersion)") else {
             throw DocumentToolError(.backendVersionMismatch, "pdfcpu version does not match the fixed manifest")
         }
         let invocation = DocumentBackendInvocation(

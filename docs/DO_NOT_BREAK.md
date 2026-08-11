@@ -27,9 +27,15 @@
 
 ## OKF / RAG knowledge bundle 不变量
 
-- 第一版知识库只有四个组件：固定的 OKF v0.2 规范、薄 Intatis RAG Profile/build
-  adapter、deterministic non-AI Validator、唯一 model-facing `search_knowledge`。建库 Agent
-  是现有 Code/Cowork 工作流，不得另造能绕过 ToolRegistry/权限/EventLog 的第五套 runtime。
+- 第一版知识库继续只有既有 OKF/Profile/Validator/immutable-store core 与现有 Code/Cowork Agent
+  工作流；产品只增加 closed-schema `build_knowledge` 和 path-aware `search_knowledge` 两个 model-facing
+  ToolRegistration，不新增独立 Knowledge Agent/runtime/UI。两工具不得绕过 ToolRegistry、
+  CapabilityLease、PermissionEngine、durable execution 或 EventLog。
+- 两个 Knowledge 工具必须由宿主在 permission/execution 前做 closed-schema 与语义联合校验；含可选
+  CAS/limit 字段时不得向 OpenAI/OpenRouter 宣告 provider `strict: true`，因为 strict Structured Outputs
+  要求所有 properties 同时 required。Chat Completions function tool wire 不得携带 Responses-only
+  `defer_loading` / `output_schema`；Responses wire 也不得因此丢失自己的 metadata。关闭 provider strict
+  不得被解释为允许额外字段或跳过宿主校验。
 - `ThirdPartyStandards/OpenKnowledgeFormat/0.2/` 的规范、许可证、upstream identity 和
   `SHA256SUMS` 必须一起保持 byte-exact；`.intatis-rag/` profile、chunks、index、checksums、
   receipt 和 store pointer 都是 Intatis 派生状态，不得冒充 OKF 标准或知识真值。
@@ -42,9 +48,21 @@
 - 解析、清洗、来源标注、deterministic chunk、全库 embedding/index build 必须发生在独立
   build/publish 流程。普通 query 不得偷偷解析全库、重建索引、下载模型、换 backend、访问网络
   或静默扫描 retained snapshot fallback。
-- build 和 mount 只接受 host 已授权且 root identity 精确匹配的现有 WorkspaceLease。模型输入
-  不得包含知识库 path、provider/model/backend、credential、ACL 或 store lifecycle 操作；只使用
-  host 签发的 opaque、snapshot-bound handle 和当前 exact capability/task/agent lease。
+- `store_path` 可以是 workspace 内路径或用户自然语言点名的外部绝对目录，但路径文本不授予权限。
+  workspace 内必须匹配现有 WorkspaceLease；workspace 外必须由宿主在 permission settlement 后签发
+  exact `KnowledgeLease`，绑定 session/agent/task/root identity/access/operation/revision，并且不得扩展
+  普通文件、patch、Git 或 terminal authority。model-facing 参数不得包含 provider/model/backend、
+  credential、bookmark、ACL 或任意 capability 数据。
+- macOS raw security-scoped bookmark 只能进入 session-owned `knowledge-access.plist`，必须 binary、
+  owner-only、no-follow、read-merge-atomic-write；其 sidecar lock 也必须验证 current owner、普通文件、
+  single-link 后才可收窄为 `0600` 并加锁；不得进入 EventLog、session.json、tool result 或安全
+  durable projection。restore、stale refresh、revoke、cancel 和 shutdown 必须保持 scope acquire/release
+  配对；父目录替代、symlink/root replacement、过宽或敏感 root 均 fail closed。
+- shipping Knowledge 必须同时解析 canonical `embedding_model` 与 `reranker_model`。build document
+  embedding 与 search query embedding 必须来自 compatible configured route；snapshot 必须冻结 complete
+  embedding identity 和 exact required reranker binding。每次成功 search 都必须实际调用 semantic
+  reranker 且 `rerank_applied=true`；不得退回 Chat model、Apple NaturalLanguage、cosine、RRF-only 或
+  相似名称 route 冒充完成。
 - Profile 的 embedding identity、normalization/similarity、chunker、component format、retrieval
   policy、reranker、bundle/chunk/component/composite revision 是单一 compatibility contract。任一
   语义字段变化必须 fail closed 或全量重建；不能按相似名称、维度或可用性猜 fallback。L2/cosine
@@ -56,6 +74,16 @@
   host 明确 admission exact snapshot，不能从 retained 集合自动选择。urgent purge 必须先 revoke
   admission、cancel/drain、持久清除 current pointer/receipt，再删已 drain snapshot；不得把普通 GC
   写成紧急清除。
+- shipping 发布区固定为 `.intatis-rag-store.json`、`.intatis-rag-snapshots/` 与
+  `.intatis-rag-host/`。它们必须留在 WorkspaceLease/managed terminal 的不可移除、大小写无关 deny
+  floor；普通 file/patch/Git/process/terminal 不得通过 read-write workspace authority 修改、移动或删除
+  这些内容。只有 Knowledge writer/Validator 内部最小 projection 可以解除这三个 exact managed
+  pattern，且不能扩大到 credential deny floor 或其它路径。
+- legacy `snapshots/` 与 current `.intatis-rag-snapshots/` 同时存在必须 fail closed；只读 open 不得
+  创建 coordination/snapshot/staging 目录，也不得迁移旧布局。迁移只能由 read-write build/update 在
+  exact store lock 内原子 rename 并复核 identity。pointer publish 或 layout migration 在 rename 后无法
+  证明 parent directory durability 时必须返回 non-retryable `commitUncertain`，不得自动重试或宣称
+  未提交。
 - YAML alias/custom tag、unsafe mode/owner/link/root identity 和路径逃逸是 host safety refusal，不能
   被误标成普通 OKF conformance 错误。source locator 只可由 exact executable adapter
   identity/version 重放 Validator 已验证的 immutable source bytes；未注册 kind、source revision 或
@@ -63,19 +91,32 @@
 - `search_knowledge` evidence 始终是 untrusted tool-role data。只有本轮成功结果登记的 stable
   evidence ID 可引用；同一 ID 只有 exact binding 完全一致时才可幂等重复。final answer 前必须异步
   重开 exact snapshot 并复核 handle/revisions/hash/URI/concept/source-locator；fabricated、old-turn、
-  cross-KB、purged 或漂移的引用必须阻止 final，而不是只做字符串 membership 检查。
+  cross-KB、purged 或漂移的引用必须阻止 final，而不是只做字符串 membership 检查。当前 turn 一旦有
+  成功 Knowledge evidence，最终回答必须至少包含一个本轮 exact `[[evidence:<id>]]` 引用；无引用 final
+  必须被 AgentLoop 拒绝并要求模型修正。
+- SecretScanner 对 API key 的识别必须要求 credential-shaped 边界与足够长度；不得用裸 `sk-` 子串
+  把 `ask-user` 等普通文本误判为 secret，也不得因此绕过真实 credential 的 fail-before-egress。
 - snapshot-bound dynamic registration 不得丢失 instance-owned permission intent/preview 或
   local/network semantics。local-only `search_knowledge` 也必须让 deterministic gate 返回 `pass` 并
   经过 reviewer、PermissionEngine、authorization correlation 和 durable lifecycle；不得因
   `.readOnly` 套用普通本地文件读取的自动 allow。
-- `KnowledgeBundleBuildService` 只复核外层 resolved authorization，不等于已经拥有 Agent durable
-  caller。未来 producer 接线必须产生真实 prepared/result/settled；不得伪造 authorization 或让
-  service/raw terminal 代替执行生命周期。
+- `KnowledgeBundleBuildService` 只复核外层 resolved authorization，不是独立 caller。正式
+  `build_knowledge` 必须持续产生真实 permission/authorization/prepared/result/settled correlation；
+  不得伪造 authorization，也不得让 service/raw terminal 代替执行生命周期。更新现有 store 必须在
+  writer lock 内同时 CAS exact `expected_store_id` 与 `expected_snapshot_id`。其 descriptor 主副作用
+  必须保持 `.write`，同时以 `risksNetwork` 与 permission intent 保留 embedding 外发和 model-cost 风险；
+  不得因它需要联网而把 durable publish 错标成纯 `.network`。
+- Knowledge provider usage 只能记录供应商真实返回且经过有限/非负校验的 token/billable units；未报告
+  必须保持 unknown/unreported，不得伪造零用量，也不得脱离明确版本化价目表推算或持久化虚构金额。
 - `knowledge://` 是内部 provenance URI，不得交给 hosted web citation renderer 当 HTTP(S) 链接。
   Validator/grounding 只能证明 bundle 内机械一致性，不能声称证明现实世界真伪或自然语言蕴含。
-- 默认 Code/Cowork augmenter 为 `nil`；Chat 的无工具 `ChatLoop` 和 iOS 依赖图不得接入
-  `IntatisKnowledge`。建库/挂载 UI、CLI mount commands、Chat/iOS RAG 和 MCP Server 属后续明确
-  产品阶段，不能因底层 library/manifest 已存在而写成用户可见能力。
+- Code、Cowork exact `@main` 和 CLI 只在两个 configured role 均存在时组合 Knowledge augmenter；
+  缺失时 registration 必须完全不可见并给出 actionable status。普通 Cowork worker/mailbox、permission
+  reviewer、GoalVerifier、Chat 的无工具 `ChatLoop` 与 iOS 依赖图不得继承 Knowledge tools。没有
+  Knowledge 管理 UI、CLI mount command、Chat/iOS RAG 或 MCP Server，不能从 model-driven 工具面外推。
+- augmentation close/shutdown 必须 cancel 并等待 active build/search/mount/provider/scope drain；false/
+  timeout 是可见的 runtime failure，不能被 Code/Cowork/CLI 当成成功 completion。重复 close 仍须
+  single-flight/idempotent，且 closed handle 不得恢复 admission。
 - snapshot purge 不等于安全擦除 APFS/SSD/backup，也不会倒写 append-only EventLog 中已经提交的
   bounded evidence。任何跨 store/session 强删除承诺必须另行设计 encrypted-artifact indirection、
   retention 与 migration，不能由当前 purge API 外推。
@@ -515,7 +556,7 @@
 - **Provider health check**：设置页 Test Provider/Health Check 必须调用共享 `ProviderRegistry.healthCheck(role:options:)` / `ProviderHealthReport`，不得在 macOS/iOS UI 里复制 provider-specific 判断。chat 与 agent health check 都应请求 usage，并复用 `turn_stats` 的 usage 合并语义。报告只能展示裁剪后的 response preview、endpoint/model/wire/耗时/usage/code/message，不得展示 secret、完整响应体或原始 SSE dump；timeout 与 partial stream 必须有明确状态；缺 `[DONE]` 但已有 `finish_reason` 的流不应误判为 partial；真正缺完成标记时应保留 preview 并报告 partial stream。
 - **工具执行反馈**：工具失败仍应通过 `tool_result` observation 表达，且 GUI/CLI 应消费 `CodeProjection` / 事件投影；失败状态和恢复建议必须从结构化 `tool_result` / `ErrorPayload` 投影派生，不得通过解析 assistant transcript 文案来判断工具是否失败。已知工具的坏 JSON、非对象、缺 required 字段、基础类型错误参数、数字 `minimum`/`maximum` 约束违规、字符串 `minLength`/`maxLength` 约束违规，或被 `additionalProperties:false` schema 禁止的未知字段，必须在权限判断和工具执行前变成 `invalid tool input:` 结果；当前 shipped tool schemas 应保持 strict object shape，`read_file.maxBytes` 必须保持 `>= 1`，标准工具 path/query/command/diff 字符串必须保持非空约束，不得让坏参数通过 `try?` 默认值进入路径计算、权限请求或工具执行。
 - **Tool-call 参数持久化边界**：provider/model 输出的 raw tool arguments 必须在 `.tool_call` append 前分类，不能先落盘再校验。Unknown tool、schema-invalid input 与作为 inference-control surface 的所有 `spawn_agent` 调用只能持久化固定、bounded redacted placeholder + character count/redacted flag，且不得写 raw-value digest；其他 schema-valid tool args 也必须 secret-scrub 与限长，只有未脱敏/未截断的 canonical args 才可附加 digest。`ToolCallPayload.argsDigest` / `argsCharacterCount` / `argsRedacted` 只能作为 additive optional audit metadata，旧日志缺字段继续解码；不得把含秘密/endpoint/options 的 raw input 变成可离线猜测的普通 fingerprint。endpoint、Authorization/header、api_key/token/credential、secret-shaped unknown field 或其 raw hash 不得出现在新写入的 `args`、错误、UI 或 projection 中。
-- **Agent 文档/媒体工具**：生产文档面固定为 `read_pdf`、`document_read`、`document_ocr`、`document_render`、`document_export_pdf`、`document_write`；相邻的 `compile_latex`、`generate_image`、`edit_image` 仍是独立普通 Agent 工具。全部工具必须经过 strict schema、`PermissionEngine`、CapabilityLease、`PathConfinement`、WorkspaceLease、durable tool ticket 与 `tool_result`，不能走私有快捷路径。`read_document`、`edit_pdf_pages`、`reconstruct_document_image` 不得重新进入生产 registry 或 fresh lease；legacy capability 只能 decode，不能执行。P0 禁止所有 PDF mutation、annotation 与 redaction；PDFKit 只读/渲染，pdfcpu 只做 strict validate/info，固定 argv 使用 `--conf disable --offline validate --mode strict`。文档 process backend 必须是 host-owned 固定 executable + versioned JSON/argv 连接器，保留 regular-file/extension/operation/input-output bounds、固定 runtime/version、默认断网、Docling remote-service/plugin 禁用、timeout/cancel/process-tree cleanup 与受信 runtime-root；不得接收 model-authored command、URL、backend、environment、临时目录或 fallback 顺序，JSON request 的 operation 必须与 host-owned 环境绑定一致。写入必须先 snapshot source/destination 及所有辅助资产，再在 owner-only staging 中生成；辅助资产在 backend 前与 commit lock 内必须按 digest/size/dev/inode 重验，symlink/hardlink fail closed。terminal commit 必须固定目标父目录 fd/identity，并使用 no-follow `*at` 操作完成安装、读回与清理。生成物的 stdout/stderr、单文件、聚合字节和 entry 数预算相互独立，必须在运行期和进程退出后都核对。输出经唯一 semantic validator 和 source/destination CAS 后才可提交；验证器只能声称它实际证明的属性。缺 runtime/helper/model/validator 或版本不符必须 typed fail closed，不得自动换组件。XLSX 的 committed 文件若声称已重算，必须经禁用宏、active content、Python runtime、OLE automation 和 untrusted referer links 的 isolated-profile LibreOffice Calc XLSX round-trip/save，再重新打开并校验声明 operation；转换成功本身不是证明，最终仍为公式的目标单元格必须保留 exact 公式文本，且 data-only 视图存在可读非公式缓存值，否则 fail closed。该检查不自行计算公式，也不声称缓存值数学正确。多页 PNG 必须以完整目录 bundle 提交，不接 ArtifactStore/model-image sink。两种图片工具的 provider/model 必须由宿主从同一 `image_model` 解析；其原有文件签名、大小、路径与输出限制不变。不得把 Docling/LibreOffice/Tesseract/pdfcpu/rbook/EPUBCheck/Tectonic/ComfyUI/Diffusers 等源码或 runtime 隐式打包；真正采用的制品必须先完成版本/hash/架构/传递依赖、许可证、NOTICE、签名与平台边界审查。工具输出不得包含完整 OCR 文本、完整 provider 响应、secret、私密绝对路径或未裁剪诊断；长文本必须有界或作为用户明确选择的工作区文件存在。
+- **Agent 文档/媒体工具**：生产文档面固定为 `read_pdf`、`document_read`、`document_ocr`、`document_render`、`document_export_pdf`、`document_write`；相邻的 `compile_latex`、`generate_image`、`edit_image` 仍是独立普通 Agent 工具。全部工具必须经过 strict schema、`PermissionEngine`、CapabilityLease、`PathConfinement`、WorkspaceLease、durable tool ticket 与 `tool_result`，不能走私有快捷路径。`read_document`、`edit_pdf_pages`、`reconstruct_document_image` 不得重新进入生产 registry 或 fresh lease；legacy capability 只能 decode，不能执行。P0 禁止所有 PDF mutation、annotation 与 redaction；PDFKit 只读/渲染，pdfcpu 只做 strict validate/info，固定 argv 使用 `--conf disable --offline validate --mode strict`。文档 process backend 必须是 host-owned 固定 executable + versioned JSON/argv 连接器，保留 regular-file/extension/operation/input-output bounds、固定 runtime/version、默认断网、Docling remote-service/plugin 禁用、timeout/cancel/process-tree cleanup 与受信 runtime-root；不得接收 model-authored command、URL、backend、environment、临时目录或 fallback 顺序，JSON request 的 operation 必须与 host-owned 环境绑定一致。macOS LibreOffice 的 SingleOffice IPC 必须使用每调用 current-UID `0700` 短路径，通过 `-env:OSL_SOCKET_PATH=...` 注入 bootstrap；Seatbelt 只能放行该 root 内 `OSL_PIPE_*` Unix socket，IP 网络与其他 socket 继续拒绝，结束后清理，不得为兼容性改成无 Seatbelt 或广泛 `network*` allow。写入必须先 snapshot source/destination 及所有辅助资产，再在 owner-only staging 中生成；辅助资产在 backend 前与 commit lock 内必须按 digest/size/dev/inode 重验，symlink/hardlink fail closed。terminal commit 必须固定目标父目录 fd/identity，并使用 no-follow `*at` 操作完成安装、读回与清理。生成物的 stdout/stderr、单文件、聚合字节和 entry 数预算相互独立，必须在运行期和进程退出后都核对。输出经唯一 semantic validator 和 source/destination CAS 后才可提交；验证器只能声称它实际证明的属性。缺 runtime/helper/model/validator 或版本不符必须 typed fail closed，不得自动换组件。XLSX 的 committed 文件若声称已重算，必须经禁用宏、active content、Python runtime、OLE automation 和 untrusted referer links 的 isolated-profile LibreOffice Calc XLSX round-trip/save，再重新打开并校验声明 operation；转换成功本身不是证明，最终仍为公式的目标单元格必须保留 exact 公式文本，且 data-only 视图存在可读非公式缓存值，否则 fail closed。该检查不自行计算公式，也不声称缓存值数学正确。多页 PNG 必须以完整目录 bundle 提交，不接 ArtifactStore/model-image sink。两种图片工具的 provider/model 必须由宿主从同一 `image_model` 解析；其原有文件签名、大小、路径与输出限制不变。不得把 Docling/LibreOffice/Tesseract/pdfcpu/rbook/EPUBCheck/Tectonic/ComfyUI/Diffusers 等源码或 runtime 隐式打包；真正采用的制品必须先完成版本/hash/架构/传递依赖、许可证、NOTICE、签名与平台边界审查。工具输出不得包含完整 OCR 文本、完整 provider 响应、secret、私密绝对路径或未裁剪诊断；长文本必须有界或作为用户明确选择的工作区文件存在。
 - **Agent Git control 工具**：`git_status`、`git_diff`、`git_diff_staged`、`git_info`、`git_recent_commits`、`git_diff_base`、`git_branch`、`git_create_branch`、`git_stage`、`git_unstage`、`git_commit`、`git_apply_patch_check`、`git_apply_patch`、`git_stage_patch`、`git_unstage_patch`、`git_revert_patch`、`git_worktree_list`、`git_worktree_create`、`git_worktree_remove`、`git_remotes`、`git_fetch`、`git_pull_ff`、`git_push`、`git_switch` 必须继续作为普通 Agent 工具运行，不能绕过 schema 校验、`PermissionEngine`、`PathConfinement` 或 `tool_result` 事件记录。Git read-only 工具只能观察状态/diff/ref/commit/worktree/remote metadata 或做 patch preflight；`git_create_branch`、path/patch stage/unstage、`git_commit`、`git_apply_patch`、`git_worktree_create`、`git_fetch`、`git_pull_ff` 是写入工具，必须触发写/网络权限流；`git_revert_patch`、`git_worktree_remove`、`git_push`、`git_switch` 是 destructive 工具，必须要求显式确认参数并仍走权限门，其中 `git_push` 是 destructive + network high-risk。动态 Git 参数不得拼进 shell 字符串；当前 process-backed 后端必须使用参数数组调用 `git`，并保持 repository root 与 agent workspace root 一致。普通 repo 的 git metadata 不得逃出 workspace；Intatis 受管 linked worktree 只能位于 `.intatis/git-worktrees/<name>`，且 `.git` file 只能指向 owning workspace repo 的 `worktrees/` metadata。`git_stage` / `git_unstage` 只能接受 workspace-confined paths；patch 工具必须先从 diff 解析 changed paths 并做 workspace confinement；worktree name 必须是简单安全目录名；remote Git 工具只接受已配置 remote name，不接受 URL remote/refspec，输出必须遮蔽 remote URL 中的凭据/token；`git_pull_ff` 和 `git_switch` 必须要求 clean working tree；`git_pull_ff` 只能执行 `--ff-only`；`git_push` 不得支持 force/force-with-lease，必须要求 `confirmRemote` / `confirmBranch` 精确匹配；`git_switch` 不得实现 `checkout .`、discard 或隐式创建分支。`git_commit` 必须在提交前拒绝 staged sensitive path，并保持 hooks/GPG 交互关闭。worker 默认不得获得 `gitControl` 或 `gitRemote`；coordinator lease 可暴露本地 Git control 与 remote Git control；旧 `runShell` 兼容 lease 只能暴露 Git read-only 工具。不得暗中加入 merge/rebase/reset/clean/force-push/remote auth 管理/PR/CI/review workflow；这些能力必须另做权限、UI 和测试设计。不得复制 Codex/libgit2/SwiftGit2/GitButler/Jujutsu 等外部项目源码；若未来引入依赖，必须先完成许可证和平台边界审查。
 - **Agent 网络/浏览器工具**：`web_fetch`、`browser_diagnostics`、
   `browser_profiles`、`browser_profile_delete`、`browser_history` 及全部

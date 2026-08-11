@@ -77,6 +77,47 @@ final class ToolSpecMetadataTests: XCTestCase {
             ]))
     }
 
+    func testChatCompletionsOmitsResponsesOnlyFunctionMetadata()
+        throws {
+        let output: JSONValue = .object([
+            "type": .string("object"),
+        ])
+        let spec = ToolSpec(
+            name: "portable",
+            description: "Portable function",
+            parameters: .object(["type": .string("object")]),
+            strict: true,
+            deferLoading: true,
+            outputSchema: output)
+
+        XCTAssertEqual(
+            OpenAIWireProvider.chatCompletionsToolJSON(spec),
+            .object([
+                "type": .string("function"),
+                "function": .object([
+                    "name": .string("portable"),
+                    "description": .string("Portable function"),
+                    "parameters": .object([
+                        "type": .string("object"),
+                    ]),
+                    "strict": .bool(true),
+                ]),
+            ]))
+        XCTAssertEqual(
+            OpenAIWireProvider.responsesToolJSON(spec),
+            .object([
+                "type": .string("function"),
+                "name": .string("portable"),
+                "description": .string("Portable function"),
+                "parameters": .object([
+                    "type": .string("object"),
+                ]),
+                "strict": .bool(true),
+                "defer_loading": .bool(true),
+                "output_schema": output,
+            ]))
+    }
+
     func testNamespaceAndToolSearchMatchCodexResponsesShapes() {
         let child = ToolSpec(
             name: "create_event",

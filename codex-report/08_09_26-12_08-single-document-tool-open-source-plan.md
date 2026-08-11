@@ -2,7 +2,7 @@
 
 日期：2026-08-09
 
-状态：`IMPLEMENTED IN SOURCE / EXTERNAL RUNTIME & CORPUS RELEASE GATES OPEN`
+状态：`IMPLEMENTED / DEVELOPMENT RUNTIME VERIFIED / DISTRIBUTION & CORPUS RELEASE GATES OPEN`
 
 面向读者：后续负责验证、打包和维护的 Codex / Intatis 维护者
 
@@ -40,6 +40,28 @@
 - process-backed observation 与写入 capability 已拆分。read-only worker 可获得 `read_pdf`、`document_read`、`document_ocr`；后两项必须是 exact `structured_read_only` intent，不能借此获得工作区写入、网络或通用 shell。render/export/write 只向 read-write worker/coordinator 签发。
 - fixed backend runner、独立日志/生成物预算、辅助资产冻结与重验、owner-only staging、目标父目录 identity 固定、后置条件验证和原子提交均已实现。
 - runtime 缺失、版本不符或未满足 corpus gate 时 typed fail closed；当前源码没有下载器、自动安装或备用 backend。
+
+### 0.2 2026-08-11 LibreOffice 实机验收更新
+
+本节覆盖本报告后文 2026-08-09 的开发机盘点，但不改变“runtime 分发另案”的产品决定：
+
+- 用户 Intatis runtime 已换成官方 Apple Silicon LibreOfficeDev 26.8.0.0.beta1，固定路径为
+  `~/Library/Application Support/Intatis/document-runtime/libreoffice/26.8.0.0.beta1/LibreOffice.app`。
+  官方 DMG 为 298,129,546 bytes，SHA-256
+  `a56a5af102c78c294b3da48154958ecd9fa52d357589305c54e6e215ce611900`；DMG 内建校验、官方 detached
+  PGP signature、宿主严格 codesign 与 Gatekeeper 公证验收均通过；
+- 先前的无 Seatbelt 诊断运行曾让 LibreOffice 内置 Python 改写 App 包内已签名 `.pyc`，造成一次真实
+  sealed-resource failure。该副本已移入废纸篓并从只读官方 DMG 重装；干净副本在完整 Intatis
+  smoke 前后均保持 `valid on disk` / `Notarized Developer ID`；
+- LibreOffice SingleOffice IPC 不能靠普通 process environment 设置 `OSL_SOCKET_PATH`，也不能放在
+  会超出 Unix socket 长度上限的长 Darwin temp root。fixed runner 现在建立每调用 current-UID
+  `0700` 的 `/private/tmp/intatis-lo-<12 hex>`，以 `-env:OSL_SOCKET_PATH=...` 传入 bootstrap，Seatbelt
+  仅放行该目录和 exact `OSL_PIPE_*` 本地 Unix socket，继续拒绝 IP 网络及其他 socket，并在结束后清理；
+- 真实 opt-in core smoke 已通过 DOCX、PPTX、XLSX 三格式。覆盖 write/read、LibreOffice preview/export、
+  PDF read/render，以及 XLSX Calc round-trip、公式文本保留与 data-only cache 值 `4`。旧 26.2.4
+  runtime 已按用户授权移入废纸篓；
+- 这些结果关闭的是当前 Apple Silicon 开发机的 LibreOffice 可用性 gate，不代表 universal runtime、App
+  内打包、NOTICE/许可证、Developer ID 重签、公证或 clean-machine corpus/distribution closure 已完成。
 
 ## 1. 成熟开源优先是硬原则
 
@@ -440,7 +462,7 @@ LibreOffice 的使用、许可和最终分发方式必须单独核查。本报�
 20. iOS target 不链接 IntatisTools、document runtime 或本地 Agent 执行能力。
 21. 生产目录不再暴露旧 `edit_pdf_pages` 或带 `backend=auto` 的旧 `read_document`；`read_pdf` 不再建议隐式 auto OCR；legacy capability 可以兼容解码，但不能映射为 live tool authority，fresh lease 不得签发。
 
-本次源码验证已覆盖合同、registry/lease、PDF native render、staging/commit、Python writer/verifier、HTML WKWebView、固定 LibreOffice/pdfcpu argv、权限和 rbook helper。当前聚焦结果为：DocumentToolContract 16/16、DocumentToolsIntegration 10/10、DocumentInfrastructure 12/12、PDFNativeDocumentService 7/7、DocumentPythonWriteBackend 20/20、DocumentFixedBackends 4/4、CapabilityLease 5/5、ToolRegistryLease 23/23、MessageDelegationSplit 10/10、IntatisPermission 29/29；rbook helper 9/9，并通过 locked check/fmt/clippy。开发机还完成了真实 LibreOffice 26.2.5.2 safe-profile XLSX round-trip smoke：`=SUM(A1:A2)` 初次 data-only cache 为 `3`；只把前置单元格 `A1` 从 `1` 改成 `5` 后再次 round-trip，未直接编辑的公式缓存更新为 `7`。真实 Docling OCR、pdfcpu validation、EPUBCheck 以及 clean-machine runtime corpus 因制品缺失仍是 release gate，不能由 fake runner 或 source test 代替。
+本次源码验证已覆盖合同、registry/lease、PDF native render、staging/commit、Python writer/verifier、HTML WKWebView、固定 LibreOffice/pdfcpu argv、权限和 rbook helper。2026-08-09 的聚焦 suite 数量保留为历史证据；2026-08-11 当前工作树重新运行 `swift test --filter IntatisToolsTests` 退出 0，其中 DocumentToolContract 16/16、DocumentInfrastructure 12/12、DocumentPythonWriteBackend 20/20、DocumentFixedBackends 4/4，DocumentToolsIntegration 非 opt-in 项 11/11（3 个真实 runtime 项按设计跳过）。另以 opt-in 单独运行 LibreOffice core smoke 1/1，覆盖 DOCX/PPTX/XLSX 和公式缓存；真实 Docling/Tesseract OCR、pdfcpu validation、rbook/EPUBCheck 的既有本机 1/1 证据也已取得。仍开放的是 clean-machine、大样本 corpus 和发行闭包 gate，不能由 fake runner、开发机安装或 source test 代替。
 
 ## 10. 单一完成标准
 
@@ -478,4 +500,4 @@ LibreOffice 的使用、许可和最终分发方式必须单独核查。本报�
 
 本轮已经修改产品源码、测试、项目文档、NOTICE/ThirdPartyNotices，并新增 pinned rbook helper source；未修改 `OpenSource/` 研究 checkout。Swift 文档工具与权限相关 target/聚焦 XCTest、Rust locked check/test/fmt/clippy 均已执行。最新合并文档过滤器在当前工作树执行 69/69 通过；其余非文档测试结果只按实际运行记录表述，不把未执行的全仓 suite 冒充成功。
 
-未完成且明确留给后续的事项：document runtime 下载/安装/打包、双架构闭包、Developer ID 签名/公证、clean-machine 验证、固定 Docling models、实际 pdfcpu/EPUBCheck/rbook helper 安装，以及受授权的真实大样本 corpus。图片进入模型上下文仍由独立报告处理。
+未完成且明确留给后续的事项：document runtime 的 App 内打包/安装器方案、双架构闭包、Intatis 发行物的 Developer ID 重签/公证、第三方 NOTICE/许可证闭包、clean-machine 验证，以及受授权的真实大样本 corpus。当前开发机已安装并验收的 LibreOffice、Docling model、pdfcpu、EPUBCheck 与 rbook helper 不能外推为发行完成。图片进入模型上下文仍由独立报告处理。

@@ -2,7 +2,7 @@
 
 日期：2026-08-09
 
-状态：`FOUR-COMPONENT LOCAL CORE IMPLEMENTED / LOCAL CONTRACT TESTED / EXTERNAL DEVICE-SCALE GATES OPEN / PHASE 5 SURFACES DEFERRED`
+状态：`FOUR-COMPONENT LOCAL CORE IMPLEMENTED / PRODUCT SURFACE SUPERSEDED BY 2026-08-10 MAIN CONTRACT`
 
 面向读者：后续负责设计、实现、审查和验证 Intatis 知识库能力的 Codex / Intatis 维护者
 
@@ -11,6 +11,19 @@
 当前产品基线：Intatis `v0.40 (build 40)`
 
 当前 active target：Developer ID 直接分发；与本报告中的 RAG 设计无关。
+
+> **后续实施注意：**时间更晚的
+> `08_10_26-16_57-model-driven-knowledge-tools-design.md` 是知识库产品补齐的唯一主实施合同。本报告
+> 继续作为 OKF/Profile/Validator/immutable-store/search core 与 2026-08-09 实现证据；以下旧产品
+> surface 不再约束后续实现：仅限 workspace、模型不得传 path、只暴露 search、固定 Apple embedding、
+> optional/cosine rerank 以及不配置 embedding/reranker。新合同要求自然语言 external path、独立
+> `KnowledgeLease`、`build_knowledge` + path-aware `search_knowledge`、canonical
+> `embedding_model`/`reranker_model`，并且每次成功 search 都真实使用 semantic reranker。
+>
+> 2026-08-10 当前工作树已按新合同落地配置、provider adapters、external `KnowledgeLease`、两个
+> model-facing tools 与 Mac/CLI composition，并通过离线 AgentLoop E2E；真实 provider/主模型、
+> macOS bookmark UI 和质量 uplift 仍待验收。精确状态以 08-10 报告及正式 `docs/` 为准；若两份
+> 报告在未来产品行为或完成标准上冲突，以 08-10 报告为准。
 
 ## 实现 ledger（2026-08-09 current working tree）
 
@@ -89,7 +102,10 @@ Intatis 的第一版传统 RAG 知识库候选方案收敛为且只收敛为四�
 - 用户或宿主在查询前提供一次知识库目录，后续模型使用一个稳定工具；
 - 知识库目录必须遵守同一规范，才能在不同 Agent、LLM、embedding 和 reranker 之间复用。
 
-因此，“把已经做好的知识库路径交给查询系统”是合理产品模型。但路径应提供给 **Intatis host/mount boundary**，不应作为模型可任意填写的绝对路径进入 `search_knowledge`。Host 校验并挂载后向模型暴露 opaque handle；单知识库任务甚至可以把 handle 绑定到工具实例，使 model-facing input 只剩 query 和可选的 bounded limit。
+因此，“把已经做好的知识库路径交给查询系统”是合理产品模型。本报告实现时采用 host 预绑路径、
+模型只见 opaque handle/query 的 local-core 合同；这是当前源码事实。08-10 主合同已将后续产品行为
+修订为：用户可自然语言提供 workspace 内或外部 `store_path`，模型可以传递该地址，但宿主必须用
+exact `WorkspaceLease` 或独立 `KnowledgeLease` 将 path 转为 authority。
 
 ### 1.2 查询时仍然必须做的工作
 
@@ -355,7 +371,8 @@ Profile 不负责：
 ```text
 knowledge-store/                 # user supplies this stable path to the host
   .intatis-rag-store.json        # atomically selected current snapshot; not an OKF file
-  snapshots/
+  .intatis-rag-host/             # owner-only cross-process coordination; not model-facing
+  .intatis-rag-snapshots/
     snap_<opaque-id>/            # one complete immutable query snapshot
       index.md                   # OKF root index; okf_version: "0.2"
       log.md                     # optional OKF history captured at this revision
@@ -372,6 +389,11 @@ knowledge-store/                 # user supplies this stable path to the host
         dense/                   # exact selected dense component; rebuildable
         auxiliary/               # optional backend-private data
 ```
+
+08-10 shipping 实现把旧提案名 `snapshots/` 收窄为 `.intatis-rag-snapshots/`，使普通
+file/patch/Git/managed-terminal 的强制 WorkspaceLease deny floor 可以机械保护整个发布区。已有
+`snapshots/` 只能由持有 read-write writer authority 的 build/update 在 store lock 内原子迁移；
+只读打开不得创建或迁移任何 store 基础设施。
 
 关键边界：
 
@@ -723,6 +745,10 @@ identity/revision、tokenizer revision、query-document template digest、最大
 `model` 必须缺失。不能把不可比较的 score 当作跨模型公共标准；模型侧只需要最终
 连续 `rank`。
 
+上述三态继续作为 core/profile 兼容合同。08-10 主合同定义的完整产品模式只接受 required semantic
+reranker：每次成功 search 必须 `rerank_applied=true`；optional/disabled 或当前 embedding-cosine seam
+不能通过产品完成验收。
+
 ### 5.11 权限字段只可作为提示，不是 authority
 
 Bundle 可带 classification、owner、visibility hint，但不得让外部文件自授予访问权。真实 authorization 始终来自 Intatis host 的 CapabilityLease、WorkspaceLease、PermissionEngine 和当前调用 identity。
@@ -938,7 +964,7 @@ exclusive store writer lease
   -> write complete OKF + profile + chunks + dense/lexical indexes
   -> fsync/atomic completion boundary for the whole snapshot
   -> deterministic validation
-  -> atomic rename to immutable snapshots/snap_<id>
+  -> atomic rename to immutable .intatis-rag-snapshots/snap_<id>
   -> atomic current-snapshot pointer/host registry update
 ```
 
@@ -979,6 +1005,11 @@ exclusive store writer lease
 
 ### 7.2 路径与 handle
 
+> 下述 opaque-handle 流程是 2026-08-09 已实现 core/legacy path。08-10 主合同的 model-facing v2
+> 允许用户提供的 `store_path`，包括 authorized external absolute path；内部仍可在
+> `WorkspaceLease`/`KnowledgeLease` 授权后转换为 exact opaque mount。path 进入 schema 不等于 path
+> 获得 authority。
+
 知识库路径只出现在 host mount boundary：
 
 ```text
@@ -1007,9 +1038,9 @@ snapshot-specific handle 必须撤销新 admission，只有更新前已经取得
 截断和排名，也可能通过远程 backend、时间或结果形状形成 side channel。Bundle
 自带的 classification 仍不是 authority；partition membership 必须来自 host state。
 
-模型不可提供：
+在 08-10 v2 合同下，模型可提供用户点名的 `store_path`，但仍不可提供或控制：
 
-- 任意绝对路径；
+- 未经用户/host 精确授权的路径，或把任意绝对路径本身当作 capability；
 - index backend；
 - embedding/reranker provider/model；
 - endpoint、API key 或 headers；
@@ -1018,6 +1049,9 @@ snapshot-specific handle 必须撤销新 admission，只有更新前已经取得
 - raw SQL/shell/ANN parameters。
 
 ### 7.3 最小 input schema
+
+以下是已实现的 v1 opaque-handle schema。后续产品接线使用 08-10 主合同的 path-aware v2
+`store_path/query/limit` schema，不能把本节 v1 当成最终 model-facing surface。
 
 多知识库工具：
 
@@ -1503,11 +1537,10 @@ ToolRegistry registration
   -> durable tool_result + settlement
 ```
 
-P0 只支持现有 WorkspaceLease 内的 knowledge store。若以后允许 workspace 外路径，
-必须先设计并测试独立 KnowledgeLease/bookmark/lifecycle；在此之前不得用一个 future
-类型名跳过现有边界。即使 deterministic gate 判定只读 pass，也不能省略 reviewer、
-PermissionEngine、authorization correlation 或 durable lifecycle；它们是否产生用户
-prompt 由现有策略决定，不由 RAG 工具另造捷径。
+当前已实现 P0 仍只支持现有 WorkspaceLease 内的 knowledge store。08-10 主合同已经决定支持
+workspace 外路径；落地前必须先设计并测试独立 `KnowledgeLease`/bookmark/CLI exact authorization/
+lifecycle。新合同不是跳过现有边界的理由。即使 deterministic gate 判定只读 pass，也不能省略
+reviewer、PermissionEngine、authorization correlation 或 durable lifecycle。
 
 若 embedding/reranker 走远程服务，则 query 或候选正文外发是 network/data-egress 行为，不能藏在“只读 search”名称下面绕过 provider/credential/permission/audit。Local-only 和 remote-backed route 必须有不同的 exact execution semantics。
 
@@ -1639,11 +1672,10 @@ envelope；这只是未来映射必须满足的完整合同。
 - 调用同一个 Validator；
 - 在 exclusive writer lease 下发布完整 immutable snapshot 并原子切换 pointer。
 
-它属于“薄 adapter”的内部实现 seam，不是第五个面向用户的 RAG 产品组件，也不
-默认成为模型可见工具。现有 Agent workflow/host orchestration 可以调用它；若未来
-要暴露 `build_knowledge` 工具，必须另行冻结 schema 和权限，不能由本报告自动授权。
-该 seam 不得通过 raw terminal/file edits 模拟，且必须遵守第 7.8 节的完整权限与
-durable execution 链。
+它属于“薄 adapter”的内部实现 seam，不是第五个独立 RAG 子系统。2026-08-09 实现没有把它注册为
+模型工具；08-10 主合同已经决定在该 seam 外增加正式 model-facing `build_knowledge`
+ToolRegistration。其 schema、配置、外部路径权限和完成门槛以主合同为准。该 seam 不得通过 raw
+terminal/file edits 模拟，且必须遵守第 7.8 节的完整权限与 durable execution 链。
 
 ### 8.4 staging-first
 
@@ -2052,19 +2084,16 @@ Gate：不接 Chat/UI；模型能用工具回答并只引用返回 evidence。
 
 Gate：只有量化结果证明收益才扩大 backend 或模型矩阵。
 
-### Phase 5：产品化决策（明确 deferred）
+### Phase 5：产品化决策（历史 deferred；08-10 主合同已部分确定）
 
-之后才决定：
+08-10 主合同已经确定：自然语言 workspace 内/外 path、独立 `KnowledgeLease`、无 Knowledge 管理 UI/
+mount command、正式 `build_knowledge`、path-aware `search_knowledge`、canonical
+`embedding_model`/`reranker_model`，以及 required semantic rerank。
 
-- 是否支持 workspace 外 knowledge path；若支持，先设计独立 KnowledgeLease/bookmark/lifecycle；
-- UI/CLI mount surface；
-- 是否外部暴露 MCP；
-- remote vector store；
-- Chat/iOS；
-- share/export/import；
-- automated source refresh。
+仍然 deferred：外部 MCP、remote vector store、Chat/iOS、share/export/import、automated source
+refresh。
 
-## 14. 本报告内已冻结并由 core 实现的原则
+## 14. 本报告内已冻结并由 core 实现的原则（product surface 例外见 08-10 主合同）
 
 这里“冻结”表示后续设计不得无说明地偏离用户确认的四组件方向。Phase 0 的标准、schema、
 依赖和 provenance，Phase 1/3 的本地 core、Phase 2 的 host build seam 以及 Phase 4 的本地机制已进入
@@ -2076,13 +2105,14 @@ Gate：只有量化结果证明收益才扩大 backend 或模型矩阵。
 - index 是派生、可删除、可重建，不是知识真值；
 - heavy preprocessing 在建库阶段；
 - query 阶段只做 query-specific retrieval/rerank/validation；
-- 模型只调用一个 `search_knowledge`；
-- raw path 不进入 model-facing schema；
+- current core 对查询只暴露一个 `search_knowledge`，不拆出 embed/vector/rerank 子工具；08-10 主合同
+  另增加 `build_knowledge`；
+- current v1 使用 opaque handle；08-10 v2 允许用户提供的 `store_path`，同时坚持 path 不是 authority；
 - embedding/reranker/backend 由 host exact resolve，模型不能选择；
 - Validator 不用 LLM、不执行 bundle 内容、fail closed；
 - generated summary 与 exact evidence 分开；
 - citation 只能引用 current-turn returned evidence；
-- Chat/iOS/UI/MCP Server 不在首版；
+- Knowledge 管理 UI、Chat/iOS/MCP Server 不在首版；现有权限/目录授权呈现不算 Knowledge UI；
 - 无静默 fallback；
 - 任何外部 runtime/依赖另做许可证与 provenance 审查。
 
@@ -2106,16 +2136,21 @@ Gate：只有量化结果证明收益才扩大 backend 或模型矩阵。
 - reader/writer locks、staging、atomic pointer、content seal、reader drain、retention/GC、explicit A/B、
   validation receipt 与 urgent purge 协议已实现。`knowledge://` 当前保留为内部 evidence URI。
 
-### 15.2 明确 deferred / integration boundary
+### 15.2 后续主合同已提升的实施项与继续 deferred 的边界
 
-- workspace 外路径及独立 KnowledgeLease/bookmark；
-- 用户可见 build/mount/status UI 与 CLI mount commands；当前 CLI 只是 manifest 预链接 target；
+08-10 主合同已提升为必须补齐：workspace 外路径与 `KnowledgeLease`、model-facing
+`build_knowledge`、path-aware `search_knowledge`、`embedding_model`/`reranker_model` provider
+routes、required semantic reranker，以及 Mac Code/Cowork `@main`/CLI 产品接线。
+
+继续 deferred：
+
 - Chat/iOS RAG、外部 MCP Server/resource surface、remote vector store、share/import/export、自动 source refresh；
-- cross-encoder reranker、其它 source locator kind、其它 dense/ANN backend；
+- 其它 source locator kind、其它 dense/ANN backend；
 - HTTP(S) citation renderer/UI；`knowledge://` 不能直接进入现有 hosted-web URL citation surface；
 - Agent 语义清洗/外部解析/连接器的具体产品工作流，它们只消费/产生本报告冻结的 bundle seam。
-- Agent producer 到 `KnowledgeBundleBuildService` 的实际 durable caller/wrapper；当前 service 只接收并
-  复核外层已解析的 authorization，不注册 `build_knowledge`，也不自行写 prepared/result/settled 事件。
+
+08-10 shipping caller 已将 strict `build_knowledge` 注册进既有 AgentLoop durable execution，service
+继续只复核外层 exact authorization；这项旧 gap 已关闭，service 本身仍不得伪造 caller 或事件。
 
 ### 15.3 仍为 `UNKNOWN` / release-only 外部门
 
@@ -2123,8 +2158,8 @@ Gate：只有量化结果证明收益才扩大 backend 或模型矩阵。
    内存；x86_64 cross-build 已过，但不能替代真机。
 2. 大 corpus 的 index size、build latency、query tail latency 与 memory ceiling；当前只有冻结小 corpus
    和 deterministic proxy。
-3. 真实 remote embedding/reranker provider 的 immutable revision、credential/network、timeout/cancel
-   与成本 smoke；当前没有 shipping remote route。
+3. shipping remote embedding/reranker adapter、exact route identity、timeout/cancel fixture 已有；真实
+   credential/network、首发 model revision、成本与 usage smoke 仍未执行。
 4. 当前 eval 能证明冻结 corpus 上的 retrieval/provenance 指标，不能证明任意答案的 semantic
    faithfulness；claim↔evidence 的自然语言蕴含仍不是 deterministic Validator 能力。
 5. append-only EventLog 中已提交 bounded evidence 的 retention、跨 store/session 强删除与未来
@@ -2300,7 +2335,9 @@ Result:   MATCH
 
 ### VALIDATION_RESULT
 
-截至本次实现收口，已取得的直接证据包括：
+以下是 08-09 local-core 收口时的历史直接证据；08-10 当前实现已增至 Knowledge 115/115、
+Provider 7/7，并补齐 model-facing build/search、fresh-host 外部库恢复与 anti-bypass 回归，精确现状以
+`docs/TESTING.md` 和 08-10 主实施合同为准：
 
 ```text
 IntatisKnowledgeTests                        106 tests / 0 failures / 0 skips

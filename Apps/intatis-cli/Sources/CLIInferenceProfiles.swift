@@ -172,7 +172,9 @@ struct CLIInferenceProfiles: Sendable {
             reasoningEffort: ReasoningEffort?
         )] = [:]
         for route in config.providerRoutes {
-            for model in route.models {
+            for model in route.models where !config.isKnowledgeRoleModel(
+                providerID: route.id,
+                modelID: model.id) {
                 metadata[profileID(route: route, model: model.id, variantID: nil)] = (
                     route.id, nil, nil)
                 for variant in model.variants {
@@ -256,7 +258,9 @@ struct CLIInferenceProfiles: Sendable {
         }
         var profiles: [InferenceProfileDraft] = []
         for route in config.providerRoutes {
-            for model in route.models {
+            for model in route.models where !config.isKnowledgeRoleModel(
+                providerID: route.id,
+                modelID: model.id) {
                 profiles.append(profileDraft(
                     route: route,
                     model: model,

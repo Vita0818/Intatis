@@ -510,24 +510,33 @@ public struct ToolContext: Sendable {
         let effectiveLease = workspaceLease ?? WorkspaceLease(
             rootPath: workspaceRoot.resolvingSymlinksInPath().standardizedFileURL.path,
             access: .readWrite)
+        var processLease = effectiveLease
+        var processDenied = Set(processLease.deniedPatterns)
+        for pattern in WorkspaceLease.mandatoryManagedStoreDeniedPatterns
+            where processDenied.insert(pattern).inserted {
+            processLease.deniedPatterns.append(pattern)
+        }
         self.workspaceRoot = workspaceRoot
+        // Keep the exact reviewed lease available to authorization-aware
+        // host tools such as Knowledge. Generic process backends receive the
+        // independently hardened projection below.
         self.workspaceLease = effectiveLease
         if let processShell = shell as? ProcessShellRunner {
-            self.shell = processShell.scoped(to: effectiveLease)
+            self.shell = processShell.scoped(to: processLease)
         } else {
             self.shell = shell
         }
         let resolvedStructuredShell: ShellRunner
         if let structuredShell {
             if let processShell = structuredShell as? StructuredProcessShellRunner {
-                resolvedStructuredShell = processShell.scoped(to: effectiveLease)
+                resolvedStructuredShell = processShell.scoped(to: processLease)
             } else if let processShell = structuredShell as? ProcessShellRunner {
-                resolvedStructuredShell = processShell.scoped(to: effectiveLease)
+                resolvedStructuredShell = processShell.scoped(to: processLease)
             } else {
                 resolvedStructuredShell = structuredShell
             }
         } else if shell is ProcessShellRunner {
-            resolvedStructuredShell = StructuredProcessShellRunner(workspaceLease: effectiveLease)
+            resolvedStructuredShell = StructuredProcessShellRunner(workspaceLease: processLease)
         } else {
             // Preserve injected fake runners in unit tests and custom hosts.
             resolvedStructuredShell = shell
@@ -536,16 +545,16 @@ public struct ToolContext: Sendable {
         let resolvedNetworkStructuredShell: ShellRunner
         if let networkStructuredShell {
             if let processShell = networkStructuredShell as? StructuredProcessShellRunner {
-                resolvedNetworkStructuredShell = processShell.scoped(to: effectiveLease)
+                resolvedNetworkStructuredShell = processShell.scoped(to: processLease)
             } else if let processShell = networkStructuredShell as? ProcessShellRunner {
-                resolvedNetworkStructuredShell = processShell.scoped(to: effectiveLease)
+                resolvedNetworkStructuredShell = processShell.scoped(to: processLease)
             } else {
                 resolvedNetworkStructuredShell = networkStructuredShell
             }
         } else if shell is ProcessShellRunner, structuredShell == nil {
             resolvedNetworkStructuredShell = StructuredProcessShellRunner(
                 allowsNetwork: true,
-                workspaceLease: effectiveLease)
+                workspaceLease: processLease)
         } else {
             // Preserve the pre-existing single fake-runner injection behavior.
             resolvedNetworkStructuredShell = resolvedStructuredShell
@@ -554,16 +563,16 @@ public struct ToolContext: Sendable {
         if let browserBackendShell {
             let resolvedShell: ShellRunner
             if let processShell = browserBackendShell as? StructuredProcessShellRunner {
-                resolvedShell = processShell.scoped(to: effectiveLease)
+                resolvedShell = processShell.scoped(to: processLease)
             } else if let processShell = browserBackendShell as? ProcessShellRunner {
-                resolvedShell = processShell.scoped(to: effectiveLease)
+                resolvedShell = processShell.scoped(to: processLease)
             } else {
                 resolvedShell = browserBackendShell
             }
             self.browserBackend = InjectedShellBrowserBackendRunner(shell: resolvedShell)
         } else if shell is ProcessShellRunner {
             self.browserBackend = BrowserBackendProcessRunner(
-                workspaceLease: effectiveLease)
+                workspaceLease: processLease)
         } else {
             // Preserve the pre-existing single fake-runner injection behavior.
             self.browserBackend = InjectedShellBrowserBackendRunner(
@@ -573,11 +582,11 @@ public struct ToolContext: Sendable {
             self.documentBackend = documentBackend
         } else {
             self.documentBackend = DocumentBackendProcessRunner(
-                workspaceLease: effectiveLease)
+                workspaceLease: processLease)
         }
         self.terminal = terminal
         if let processGit = git as? ProcessGitService {
-            self.git = processGit.scoped(to: effectiveLease)
+            self.git = processGit.scoped(to: processLease)
         } else {
             self.git = git
         }

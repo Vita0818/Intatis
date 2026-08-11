@@ -1,12 +1,12 @@
 # CURRENT_STATE
 
 文档状态：当前源码摘要
-最近核对：2026-08-10
+最近核对：2026-08-11
 产品基线：v0.40（build 40）
 
 ## 版本与发行状态
 
-- `HEAD` 与 `origin/main` 当前均为标题为 `v0.44` 的提交 `21cacff`。仓库没有 Git tag；该
+- `HEAD` 与 `origin/main` 当前均为标题为 `v0.45` 的提交 `0f98fe9`。仓库没有 Git tag；该
   commit 标题不是产品版本事实源，`project.yml` 把当前产品基线定义为 `0.40 (40)`。
 - `MARKETING_VERSION` / `CURRENT_PROJECT_VERSION` 已推进为 `0.40 (40)`。两个仓库参考
   Info.plist、README、文档入口和发行脚本使用同一基线。
@@ -62,16 +62,35 @@ macOS 是完整产品：Chat、Code、Cowork、Settings 和本地诊断导出。
   CAS、格式语义验证与 file/directory 原子提交；模型不能选择 executable/backend/command/env 或
   fallback。DOCX/PPTX/XLSX/HTML 的 common-operation 子集由 python-docx/python-pptx/openpyxl/lxml
   负责，XLSX 在 openpyxl staging 后经固定 safe-profile LibreOffice Calc XLSX round-trip/save、formula + data-only
-  cache postcondition 与 PDF preview 验证；不能只凭转换退出码声称已重算。开发机已用 LibreOffice
-  26.2.5.2 对真实公式完成 round-trip/cache smoke，并确认只修改前置单元格后，未直接编辑的公式缓存
-  会从 `3` 更新为 `7`。EPUB read/write 绑定仓内
+  cache postcondition 与 PDF preview 验证；不能只凭转换退出码声称已重算。EPUB read/write 绑定仓内
   可重复构建的 pinned rbook helper source
   和正式 EPUBCheck，EPUB render/export 在 full-spine corpus gate 通过前不进入 model schema，并返回
   `unsupported_operation`。文档辅助资产会先冻结 digest/identity，backend 运行与提交锁内再次核对；
-  staged commit 固定目标父目录 identity，生成物同时受单文件、总字节与 entry 数预算约束。当前用户
-  runtime 可导入固定 Python Office/HTML 组件并发现 LibreOffice/Tesseract，但缺少固定 Docling models、
-  已安装的 rbook helper、pdfcpu 与 EPUBCheck，因此对应路线 typed fail closed，不会自动降级；runtime
-  打包、双架构、签名/公证和其余发行许可闭包仍是独立工作。read-only Cowork worker 获得 in-process
+  staged commit 固定目标父目录 identity，生成物同时受单文件、总字节与 entry 数预算约束。当前开发机
+  用户 runtime 已安装固定 Python Office/HTML/Docling 组件、Docling layout model、Tesseract、
+  `intatis-rbook-helper`、pdfcpu 0.13.0、正式 EPUBCheck 5.3.0，以及版本化的官方
+  LibreOfficeDev 26.8.0.0.beta1；固定后端只解析
+  `~/Library/Application Support/Intatis/document-runtime/libreoffice/26.8.0.0.beta1/LibreOffice.app`，
+  不再使用 `/Applications` 中的用户副本。该 App 来自 Document Foundation 官方
+  298,129,546-byte Apple Silicon DMG，SHA-256
+  `a56a5af102c78c294b3da48154958ecd9fa52d357589305c54e6e215ce611900`；`hdiutil verify`、官方
+  detached PGP signature、宿主 `codesign --verify --deep --strict` 与 Gatekeeper 均通过，签名者为
+  The Document Foundation Developer ID（Team ID `7P5S3ZLCN7`），Gatekeeper 判定为
+  `Notarized Developer ID`。一次无 Intatis Seatbelt 的诊断调用曾让内置 Python 重写 App 内已签名
+  `__pycache__`，造成随后真实 sealed-resource failure；该副本已移入废纸篓并从只读官方 DMG 重装。
+  重装后的干净副本在完整 Intatis smoke 前后均通过相同签名/公证复验。
+
+  macOS fixed runner 现在为每次 LibreOffice 调用创建当前用户、`0700`、短路径的
+  `/private/tmp/intatis-lo-<12 hex>` 目录，并以 LibreOffice bootstrap 参数
+  `-env:OSL_SOCKET_PATH=...` 传入。Seatbelt 只给该目录文件读写和匹配 `OSL_PIPE_*` 的本地 Unix
+  socket bind/connect；IP 网络及其他 Unix socket 继续默认拒绝，调用结束后删除该目录。这个短路径
+  同时避免 `sockaddr_un.sun_path` 超限；把 `OSL_SOCKET_PATH` 仅作为普通进程环境变量或放在长
+  Darwin temp path 都不能满足 LibreOffice bootstrap/长度合同。真实 core smoke 已在同一 Seatbelt
+  下跑通 DOCX write/read/preview/export/PDF read/render、PPTX write/read/preview/export/PDF read，
+  以及 XLSX write、Calc round-trip、公式文本与 data-only cache `4`、preview/export；不会自动降级。
+  旧 26.2.4 runtime 已按用户授权移入废纸篓。生产 runner 的 EPUB write/EPUBCheck 和 strict
+  pdfcpu + Docling/Tesseract OCR smoke 也已分别通过。runtime 打包、双架构和其余发行许可闭包仍是
+  独立工作。read-only Cowork worker 获得 in-process
   `read_pdf` 以及固定、无持久写入的 `document_read` / `document_ocr`；render/export/write 只向
   read-write worker/coordinator 显式签发。iOS Chat 不链接任何文档 runtime。
 - Code/Cowork/CLI 的 `generate_image` 与 `edit_image` 已接入 macOS/CLI 高级配置顶层
@@ -185,11 +204,42 @@ profiles 与外部 MCP client。macOS/Linux 的 stdio、sandbox、bwrap/guard �
   JSON Schema、bounded Yams OKF reader、deterministic Validator、validation receipt、
   `KnowledgeBundleBuildService`、immutable multi-version store、embedding/dense/BM25/RRF/reranker
   runtime contracts、mount registry、source-locator replay 和 `search_knowledge`。
-- 建库与查询已分离。build service 只接收 workspace 内已授权的 OKF draft root 和已解析的 exact
-  authorization；它在任何 embedding 前做 secret scan，用 host chunker 生成 grounded chunks，
-  只在完整 Validator 通过后原子 publish。相同完整 embedding/chunker/normalization identity 可按
-  canonical text 复用 vector；修改、删除或任一支持的模型身份字段变化会精确重建，冻结不支持的
-  scalar/quantization/metric 等组合直接拒绝。
+- 高级 JSON/JSONC 配置现有 canonical `embedding_model` 与 `reranker_model` 两个独立 role；Mac、
+  CLI 和共享 provider catalog 将它们解析为与 Chat/Agent route 无关的 exact binding。两者任一缺失
+  时 Code/Cowork 不广告 Knowledge tools，并在现有状态面明确提示配置；不会退回当前聊天模型、
+  Apple NaturalLanguage 或 embedding-cosine seam。首发 native adapter 为 OpenAI-compatible /
+  OpenRouter embeddings 与显式 `intatis:siliconflow-v1` / `intatis:cohere-v2` / OpenRouter rerank
+  dialect，credential 只在
+  真实网络 dispatch 时解析。Mac/CLI 在广告工具或显示 `knowledge ready` 前，复用真实 provider
+  构造器的同步 route 预检；缺 endpoint、维度或合规 adapter 时工具保持缺席且显示具体配置错误，
+  预检不解析 credential、不联网、不取得目录 authority。adapter 现在还会校验并返回 provider 报告的
+  token 与 billable units。Knowledge role 的 model-level adapter/options 会保留到 exact route，但同一
+  provider 下的 embedding/reranker model 不会进入 Mac/CLI 普通 inference profile 或模型菜单；
+  opt-in smoke/quality harness 可按 exact route 汇总这些原始计数，但不根据可变价目表臆算金额。
+- Code、Cowork exact `@main` 与 macOS CLI 已通过 `HostToolRegistryAugmenter` 接入 closed-schema
+  `build_knowledge` 和 path-aware `search_knowledge`。模型继续使用已有文件/文档工具阅读与整理，
+  写出 OKF draft；build 工具只负责 deterministic canonicalization、configured document embedding、
+  validate 与 atomic publish。两个工具都走原有 CapabilityLease、PermissionEngine、durable
+  prepared/result/settled 和参数脱敏链，未新增 Knowledge 管理 UI。Chat、iOS、permission reviewer、
+  GoalVerifier 与普通 Cowork worker 不获得这两个工具。
+- `store_path` 可位于当前 WorkspaceLease 内，也可为用户自然语言点名的外部绝对目录。外部目录不
+  扩大 WorkspaceLease，而由 exact `KnowledgeLease` 授予单一 root/operation/agent/session authority；
+  Mac bookmark 只写入 session-owned、binary、owner-only `knowledge-access.plist`，CLI 在权限通过后
+  生成 exact authorization reference。过宽/敏感目录、父目录替代、root replacement、只读 lease
+  mutation 与 identity drift 均 fail closed；bookmark 文件及 sidecar lock 都执行 no-follow、owner、
+  regular-file、single-link 边界，bookmark 可按 exact path 撤销，活动 scope 仍须先 drain。
+- 建库与查询保持分离。build service 接收 workspace 内已授权的 OKF draft root，以及 workspace store
+  或独立 KnowledgeLease 绑定的外部 store；它在任何 embedding 前做 secret scan，用 host chunker
+  生成 grounded chunks，只在完整 Validator 通过后原子 publish。更新既有 store 必须在 writer lock
+  内同时命中 `expected_store_id` 与 `expected_snapshot_id`。相同完整
+  embedding/chunker/normalization identity 可按 canonical text 复用 vector；修改、删除或任一支持的
+  模型身份字段变化会精确重建，冻结不支持的 scalar/quantization/metric 等组合直接拒绝。
+- 发布布局现为 `.intatis-rag-store.json` + `.intatis-rag-snapshots/` + `.intatis-rag-host/`。
+  WorkspaceLease 和 managed terminal 把三者作为不可移除、大小写无关 deny floor；普通 file/patch/
+  Git/process/terminal 不能绕过 writer/Validator 改写发布库，Knowledge 内部只派生解除 exact managed
+  patterns 的最小 projection。旧 `snapshots/` 只由 read-write build/update 在 store lock 内原子迁移；
+  read-only open 不创建基础设施。pointer/layout rename 后 durability 无法确认时返回 non-retryable
+  `commitUncertain`，不自动重试。
 - build boundary 现在由 host-owned canonical v0.2 writer 重写 Agent draft：任意层非保留
   Markdown 都作为 concept，任意层 `index.md` / `log.md` 都按 OKF reserved shape
   验证；legacy `timestamp` / `# Citations` 只读兼容后迁移为 v0.2；source ID 由
@@ -199,17 +249,20 @@ profiles 与外部 MCP client。macOS/Linux 的 stdio、sandbox、bwrap/guard �
 - multi-source concept 只把显式 footnote 对应的 source ID 归给该 chunk；仅 exactly-one source
   concept 允许 concept-level fallback，歧义段不会被伪装成 grounded chunk。`generated` 若出现则
   必须同时具有 valid `by` / `at`，footnote claim、definition 与 `sources[].id` 必须机械闭合。
-- 当前本地 dense route 是 Apple NaturalLanguage English sentence embedding revision 1 / 512-d
-  的 exact runtime binding，加 `Float32` L2/cosine exact KNN；lexical route 是 Intatis 多语言/代码
-  tokenizer + BM25，hybrid 使用 RRF。存在 embedding-cosine reranker seam，但它不是 cross-encoder；
-  required/optional 模式均无静默 fallback。当前宿主冻结中英/代码 corpus 的 Apple route 为
+- local-core 仍保留 Apple NaturalLanguage English sentence embedding revision 1 / 512-d 的 exact
+  runtime binding、`Float32` L2/cosine exact KNN、Intatis 多语言/代码 tokenizer、BM25/RRF 以及
+  embedding-cosine test seam；这些都不代表 shipping 产品 fallback。model-driven 产品 snapshot
+  固定 configured embedding identity 与 required semantic reranker identity；query 使用兼容 embedding，
+  授权过滤发生在远端 rerank 前，只有实际 semantic rerank 后的 `rerank_applied=true` 才能成功。
+  当前宿主冻结中英/代码 corpus 的历史 Apple local route 为
   Recall@5 0.882、MRR 0.681、nDCG@5 0.698、citation precision 1.000；这些数字只代表当前宿主与
   小型冻结 corpus，Intel 真机、最低支持 macOS 和大规模真实知识仍是 `UNKNOWN`。
-- host 可以用 `KnowledgeSearchToolHostAdapter.augmenter(storeRoot:)` 把一个 exact current snapshot
-  绑定为 Code/Cowork 的动态内部工具。model-facing input 只有 query 和可选 bounded
-  limit（单库绑定时 handle 由 host 固定），
-  看不到 path/provider/backend/ACL。默认 seam 为 `nil`，没有知识库 UI、默认 mount、Chat 或 iOS
-  接入；这与本轮明确范围一致。
+- 旧的 snapshot-bound `KnowledgeSearchToolHostAdapter` 继续兼容；shipping surface 使用
+  `ModelDrivenKnowledgeToolHost`，每次按 `store_path` 获取 exact authority、读取 current pointer、
+  mount exact immutable snapshot，并把 mount/bookmark scope 保留到当前 turn grounding 完成后 drain。
+  一个 AgentLoop turn 的离线 E2E 已对两个外部 store 完成 build/search/rerank/citation，证明证据与
+  snapshot 不串库；随后用 fresh host generation 重新取得 external authority、打开 durable current
+  pointer 并再次 search/rerank/citation，证明不依赖进程内旧 handle。
 - local-only `search_knowledge` 虽然不写文件、不联网，仍把知识正文带入 answering model，因此
   deterministic gate 对 exact instance intent 返回 `pass`，继续经过 reviewer、PermissionEngine、
   authorization correlation 与 durable lifecycle；不会继承普通本地 read 的自动放行。
@@ -217,14 +270,19 @@ profiles 与外部 MCP client。macOS/Linux 的 stdio、sandbox、bwrap/guard �
   current-turn citation，并在 final commit 前通过 exact registration 重新打开 snapshot 做异步机械
   重验。urgent purge 会关闭 admission、cancel/drain、使 current pointer 持久失活并清 receipt；不会
   擦除既有 EventLog/tool history，也不宣称物理 secure erase。
-- build service 要求并复核外层提供的 exact resolved authorization，但本轮没有 model-facing
-  `build_knowledge` registration，也没有 Agent producer 的 durable caller；外部解析/清洗工作流接入时
-  必须补 prepared/result/settled，而不能把 service 单元测试写成该生命周期已接通。
+- build service 继续复核外层 exact resolved authorization；model-facing `build_knowledge` 已有真实
+  registration 和 AgentLoop durable caller，不允许 service 或 raw terminal 旁路。
+- Host augmentation close 现在有 checked drain：timeout/active access 会成为可见的 Code/Cowork/CLI
+  runtime failure，不能误报成功；重复 close 保持 single-flight/idempotent。
 - `IntatisKnowledgeTests` 最终精确计数见 `docs/TESTING.md` 本轮验证记录，覆盖 schema、OKF safety、filesystem、
   checksum/index corruption、secret/injection、build cancellation/timeout/reuse、snapshot/receipt/
   purge、hybrid/rerank/budget/ACL/source locator/final grounding 和质量/性能代理。AgentKernel 的
-  current-turn citation registry 另有独立回归；真实 provider/remote embedding/reranker、Intel
-  NaturalLanguage runtime 和用户实际 corpus 仍需独立 smoke。
+  current-turn citation registry 另有独立回归。OpenRouter 上 configured
+  `google/gemini-embedding-2`（1536 维）与 `cohere/rerank-4-pro` 的最小 smoke、8-query 冻结质量集、
+  真实 Agent 自主 read-organize-build-search-cite 及三份 DS-Algorithm PDF E2E 均已通过。macOS Code
+  真实触发 exact-directory NSOpenPanel，生成 session-owned `0600` binary bookmark；应用退出重启并恢复
+  同一 session 后再次搜索未重新弹窗。功能性模型驱动 Knowledge RAG 验收已闭环；质量集没有证明
+  reranker uplift（dense nDCG@5 1.000，reranked 0.990），不能把功能完成外推为推荐模型质量优于 baseline。
 
 ## 当前架构事实
 
@@ -319,6 +377,21 @@ profiles 与外部 MCP client。macOS/Linux 的 stdio、sandbox、bwrap/guard �
 
 ## 最近验证状态
 
+- 2026-08-11 model-driven Knowledge live acceptance：OpenRouter 最小 smoke 1/1，embedding 为
+  1536 维并报告 input/total token 7，reranker 返回完整 permutation、有限 score 和 search unit 1；
+  8-query 冻结集的 dense baseline 为 MRR/nDCG@5/Recall@5 = 1.000/1.000/1.000，configured reranker
+  为 1.000/0.990/1.000，embedding usage 343 token、reranker usage 8 search units。真实 Agent 对测试
+  文本在 32.686 秒内完成 read → OKF draft → external build → required-rerank search → exact evidence
+  citation；另一个 110.980 秒的 E2E 用 `read_pdf` 读取 `DPV-chap2.pdf`、`DPV-chap4.pdf`、
+  `DPV-chap6.pdf` 的冻结页段，形成 3 个 concept / 22 chunks 后检索并引用。macOS Code 首次外部搜索
+  出现 exact-directory NSOpenPanel，保存 session-owned `knowledge-access.plist`（binary、`0600`、revision
+  1）；退出、重启、恢复同一 session 后再次调用未出现授权框。空库按设计返回 `KB_INDEX_NOT_READY`，
+  没有修改文件。Knowledge 118/118、Knowledge Provider 11/11、tool wire metadata 5/5、CLI 9/9、
+  AgentLoop 2/2、grounding 7/7、Cowork lease 25/25、SecretScanner 1/1，以及工作区沙箱外
+  managed-terminal publication anti-bypass 1/1 均通过；macOS/iOS Debug unsigned build退出 0。
+  本轮整仓 `swift test` 在完成 Tools/Skills 后，于既有 SharedUI async scheduler 测试进程中持续约
+  7 分钟 0% CPU/无新输出并被人工中断为 130，不能记为全量通过，也未观察到本任务相关 failure。
+  provider 没有返回完整货币金额，项目仍不按可变价格表推算账单。
 - 2026-08-05 Flotis 单模型语音 runtime 迁移：`ComposerVoiceInputTests` 6/6，覆盖 draft merge、
   WAV 16-bit PCM 及 WAV/M4A 均不注入 `AVEncoderBitRateKey`；
   `IntatisProvidersMultimodalTests` 22/22，覆盖 owner-only disk-backed multipart WAV、OpenRouter
@@ -405,6 +478,10 @@ profiles 与外部 MCP client。macOS/Linux 的 stdio、sandbox、bwrap/guard �
    `hosted_web_search` 也会按既有规则在网络前 config fail closed；在普通 adapter 完成前不能把
    已有 OpenAI Responses search encoder 宣传为完整 native OpenAI route 支持。真实厂商 smoke 仍待
    用户凭据环境验证。
+5. Knowledge 的功能性真实 E2E 已完成，但当前 8-query 冻结集没有证明推荐 reranker 相对 dense
+   baseline 的质量 uplift，nDCG@5 反而从 1.000 降至 0.990。它仍需要更难、更大、独立标注的领域集合
+   做模型选择；large-corpus latency/memory/disk/cost ceiling、Intel/最低 macOS 与 Linux provider matrix
+   仍为 `UNKNOWN`。provider usage 可报告 token/search units，但没有 versioned price evidence 时不推算金额。
 
 ## 文档治理
 

@@ -297,11 +297,13 @@ struct IntatisChatModelMenu: View {
 
     private var selectedModel: AppProviderModel? { catalog.selectedModel }
     private var menuProviders: [ProviderModelMenuProvider] {
-        catalog.providers.map { provider in
-            ProviderModelMenuProvider(
+        catalog.providers.compactMap { provider in
+            let models = catalog.inferenceModels(for: provider)
+            guard !models.isEmpty else { return nil }
+            return ProviderModelMenuProvider(
                 id: provider.id,
                 title: provider.title,
-                models: provider.models.flatMap { model in
+                models: models.flatMap { model in
                     let base = ProviderModelMenuModel(
                         id: model.id,
                         modelID: model.id,
@@ -1320,8 +1322,9 @@ struct IntatisSettingsPanel: View {
         catalog.selectedProviderID = provider.id
         isProviderConnectionExpanded = false
         isModelManagementExpanded = false
-        if !provider.models.contains(where: { $0.id == catalog.selectedModelID }) {
-            catalog.selectedModelID = provider.models.first?.id ?? AppConfig.defaultModel
+        let models = catalog.inferenceModels(for: provider)
+        if !models.contains(where: { $0.id == catalog.selectedModelID }) {
+            catalog.selectedModelID = models.first?.id ?? AppConfig.defaultModel
         }
         saved = false
     }

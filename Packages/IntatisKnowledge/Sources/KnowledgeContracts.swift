@@ -205,7 +205,9 @@ public enum KnowledgeErrorCode: String, Codable, CaseIterable, Sendable {
     case embeddingUnavailable = "KB_EMBEDDING_UNAVAILABLE"
     case embeddingIncompatible = "KB_EMBEDDING_INCOMPATIBLE"
     case revisionChanged = "KB_REVISION_CHANGED"
+    case commitUncertain = "KB_COMMIT_UNCERTAIN"
     case rerankUnavailable = "RERANK_UNAVAILABLE"
+    case rerankIncompatible = "RERANK_INCOMPATIBLE"
     case searchBudgetExceeded = "SEARCH_BUDGET_EXCEEDED"
     case searchTimeout = "SEARCH_TIMEOUT"
     case searchCancelled = "SEARCH_CANCELLED"
@@ -362,6 +364,26 @@ public struct KnowledgeRerankerModelIdentity: Codable, Equatable, Hashable, Send
     public let maxInputTokens: Int
     public let truncation: String
     public let scoreSemantics: String
+
+    public init(identity: String,
+                revision: String,
+                tokenizerRevision: String,
+                runtimeBindingKind: KnowledgeEmbeddingModelIdentity.RuntimeBindingKind,
+                runtimeBindingDigest: String,
+                templateDigest: String,
+                maxInputTokens: Int,
+                truncation: String,
+                scoreSemantics: String) {
+        self.identity = identity
+        self.revision = revision
+        self.tokenizerRevision = tokenizerRevision
+        self.runtimeBindingKind = runtimeBindingKind
+        self.runtimeBindingDigest = runtimeBindingDigest
+        self.templateDigest = templateDigest
+        self.maxInputTokens = maxInputTokens
+        self.truncation = truncation
+        self.scoreSemantics = scoreSemantics
+    }
 }
 
 public struct KnowledgeRerankerProfile: Codable, Equatable, Sendable {

@@ -20,6 +20,15 @@ public struct ProviderRequestAdapter:
         rawValue: "@openrouter/ai-sdk-provider")
     public static let openAI = ProviderRequestAdapter(
         rawValue: "@ai-sdk/openai")
+    /// Explicit native dialect for SiliconFlow's documented OpenAI-style
+    /// embeddings plus its dedicated `/rerank` API. It is intentionally not
+    /// inferred from an arbitrary OpenAI-compatible URL.
+    public static let siliconFlowV1 = ProviderRequestAdapter(
+        rawValue: "intatis:siliconflow-v1")
+    /// Explicit native dialect for Cohere's v2 rerank API. A provider using
+    /// this adapter can be Knowledge-only and need not expose Chat models.
+    public static let cohereV2 = ProviderRequestAdapter(
+        rawValue: "intatis:cohere-v2")
 
     /// Missing adapter fields in previously persisted Intatis values decode to
     /// the pre-adapter request behavior. New OpenCode-shaped configuration must
@@ -98,6 +107,11 @@ extension ProviderRequestAdapter {
             return .openAICompatible
         case .openRouter:
             return .openRouter
+        case .siliconFlowV1:
+            return .openAICompatible
+        case .cohereV2:
+            throw IntatisError.config(
+                "the selected Cohere v2 adapter does not provide Chat completions")
         case .openAI:
             throw IntatisError.config(
                 "the selected @ai-sdk/openai package adapter is not implemented by the native request runtime")
@@ -131,10 +145,14 @@ extension ProviderRequestAdapter {
         switch self {
         case .legacyOpenAIWire,
              .openAICompatible,
-             .openAI:
+             .openAI,
+             .siliconFlowV1:
             return .openAICompatibleMultipart
         case .openRouter:
             return .openRouterJSONBase64
+        case .cohereV2:
+            throw IntatisError.config(
+                "the selected Cohere v2 adapter does not provide transcription")
         default:
             throw IntatisError.config(
                 "the selected provider npm adapter is not supported by the transcription runtime")

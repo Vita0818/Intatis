@@ -13,13 +13,16 @@ private actor FixedBackendRecordingRunner: DocumentBackendRunner {
         values.append(invocation)
         if invocation.arguments == ["--version"] {
             return ShellResult(
-                stdout: "LibreOffice 26.2.5.2 test-build\n",
+                stdout: "LibreOfficeDev 26.8.0.0.beta1 test-build\n",
                 stderr: "",
                 exitCode: 0)
         }
         if invocation.executable == .pdfcpu,
-           invocation.arguments == ["version"] {
-            return ShellResult(stdout: "pdfcpu v0.13.0\n", stderr: "", exitCode: 0)
+           invocation.arguments == ["--conf", "disable", "version"] {
+            return ShellResult(
+                stdout: "version: 0.13.0\n config: disabled\n",
+                stderr: "",
+                exitCode: 0)
         }
         if invocation.executable == .pdfcpu {
             return ShellResult(stdout: "valid\n", stderr: "", exitCode: 0)
@@ -74,6 +77,8 @@ final class DocumentFixedBackendsTests: XCTestCase {
 
         let invocations = await runner.invocations()
         XCTAssertEqual(invocations.count, 2)
+        XCTAssertEqual(invocations[0].executable, .pdfcpu)
+        XCTAssertEqual(invocations[0].arguments, ["--conf", "disable", "version"])
         XCTAssertEqual(invocations[1].executable, .pdfcpu)
         XCTAssertEqual(invocations[1].arguments, [
             "--conf", "disable",

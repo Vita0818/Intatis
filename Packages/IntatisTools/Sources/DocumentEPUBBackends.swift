@@ -13,6 +13,7 @@ enum RBookDocumentBackend {
         internalStageRoot: String? = nil,
         in context: ToolContext
     ) async throws -> DocumentBackendEnvelope {
+        let payload = canonicalizedPayload(payload)
         let request: JSONValue = .object([
             "schema_version": .number(1),
             "engine": .string("rbook"),
@@ -68,6 +69,56 @@ enum RBookDocumentBackend {
             throw DocumentToolError(.backendVersionMismatch, "rbook helper version mismatch")
         }
         return response
+    }
+
+    /// The Rust helper deliberately rejects lexical paths that differ from
+    /// their canonical filesystem identity. Foundation preserves macOS's
+    /// public `/var`, `/tmp`, and `/etc` aliases even when the corresponding
+    /// POSIX canonical path starts with `/private`; normalize only the
+    /// host-owned path fields before crossing that fixed helper boundary.
+    private static func canonicalizedPayload(_ payload: JSONValue) -> JSONValue {
+        guard case .object(var object) = payload else { return payload }
+        for key in ["input_path", "output_path"] {
+            if case .string(let path)? = object[key] {
+                object[key] = .string(canonicalPath(path))
+            }
+        }
+        if case .array(let paths)? = object["allowed_asset_paths"] {
+            object["allowed_asset_paths"] = .array(paths.map { value in
+                guard case .string(let path) = value else { return value }
+                return .string(canonicalPath(path))
+            })
+        }
+        if case .array(let operations)? = object["operations"] {
+            object["operations"] = .array(operations.map { operation in
+                guard case .object(var fields) = operation,
+                      case .object(var parameters)? = fields["parameters"] else {
+                    return operation
+                }
+                for key in ["path", "source_path"] {
+                    if case .string(let path)? = parameters[key] {
+                        parameters[key] = .string(canonicalPath(path))
+                    }
+                }
+                fields["parameters"] = .object(parameters)
+                return .object(fields)
+            })
+        }
+        return .object(object)
+    }
+
+    private static func canonicalPath(_ path: String) -> String {
+        var normalized = URL(fileURLWithPath: path)
+            .resolvingSymlinksInPath()
+            .standardizedFileURL.path
+        #if os(macOS)
+        for alias in ["/var", "/tmp", "/etc"]
+            where normalized == alias || normalized.hasPrefix(alias + "/") {
+            normalized = "/private" + normalized
+            break
+        }
+        #endif
+        return normalized
     }
 }
 

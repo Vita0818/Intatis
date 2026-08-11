@@ -278,6 +278,13 @@ public struct ResolvedModels: Codable, Equatable, Sendable {
     public var transcription: ModelRef?
     public var imageGen: ModelRef?
     public var videoGen: ModelRef?
+    /// Exact host-owned route used for knowledge document/query embeddings.
+    /// Missing configuration stays nil; Knowledge must never fall back to the
+    /// current Chat or Agent route.
+    public var embedding: ModelRef?
+    /// Exact host-owned route used for semantic knowledge reranking. This is a
+    /// dedicated model role and must not be substituted with embedding cosine.
+    public var reranker: ModelRef?
     public init(chat: ModelRef,
                 webSearch: ModelRef? = nil,
                 agent: ModelRef? = nil,
@@ -285,7 +292,9 @@ public struct ResolvedModels: Codable, Equatable, Sendable {
                 vision: ModelRef? = nil,
                 transcription: ModelRef? = nil,
                 imageGen: ModelRef? = nil,
-                videoGen: ModelRef? = nil) {
+                videoGen: ModelRef? = nil,
+                embedding: ModelRef? = nil,
+                reranker: ModelRef? = nil) {
         self.chat = chat
         self.webSearch = webSearch
         self.agent = agent
@@ -294,6 +303,8 @@ public struct ResolvedModels: Codable, Equatable, Sendable {
         self.transcription = transcription
         self.imageGen = imageGen
         self.videoGen = videoGen
+        self.embedding = embedding
+        self.reranker = reranker
     }
 }
 

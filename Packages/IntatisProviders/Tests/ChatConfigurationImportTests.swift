@@ -204,6 +204,81 @@ final class ChatConfigurationImportTests: XCTestCase {
         XCTAssertEqual(imported.selectedModelID, "chat-model")
     }
 
+    func testImportsIndependentKnowledgeRoutesWithoutAddingThemToChatModels() throws {
+        let data = Data(
+            #"""
+            {
+              "model": "chat/chat-model",
+              "embedding_model": "embedding/BAAI/bge-m3",
+              "reranker_model": "reranker/BAAI/bge-reranker-v2-m3",
+              "provider": {
+                "chat": {
+                  "baseURL": "https://chat.example.test/v1",
+                  "models": { "chat-model": "Chat Model" }
+                },
+                "embedding": {
+                  "npm": "intatis:siliconflow-v1",
+                  "baseURL": "https://embedding.example.test/v1",
+                  "models": {}
+                },
+                "reranker": {
+                  "npm": "intatis:cohere-v2",
+                  "baseURL": "https://reranker.example.test/v2",
+                  "models": {}
+                }
+              }
+            }
+            """#.utf8)
+
+        let imported = try ChatConfigurationImporter.parse(
+            data: data,
+            environment: [:])
+        let embedding = ModelRef(
+            endpoint: "embedding",
+            model: ModelID(rawValue: "BAAI/bge-m3"))
+        let reranker = ModelRef(
+            endpoint: "reranker",
+            model: ModelID(rawValue: "BAAI/bge-reranker-v2-m3"))
+
+        XCTAssertEqual(imported.embeddingModel, embedding)
+        XCTAssertEqual(imported.rerankerModel, reranker)
+        XCTAssertEqual(imported.providerConfig.models.embedding, embedding)
+        XCTAssertEqual(imported.providerConfig.models.reranker, reranker)
+        XCTAssertEqual(
+            imported.providers.first { $0.id == "embedding" }?.models,
+            [])
+        XCTAssertEqual(
+            imported.providers.first { $0.id == "reranker" }?.models,
+            [])
+        XCTAssertEqual(imported.selectedProviderID, "chat")
+        XCTAssertEqual(imported.selectedModelID, "chat-model")
+    }
+
+    func testKnowledgeRolesRejectImplicitChatProviderFallback() throws {
+        let data = Data(
+            #"""
+            {
+              "model": "chat/chat-model",
+              "embedding_model": "BAAI/bge-m3",
+              "reranker_model": "chat/reranker-model",
+              "provider": {
+                "chat": {
+                  "baseURL": "https://chat.example.test/v1",
+                  "models": { "chat-model": "Chat Model" }
+                }
+              }
+            }
+            """#.utf8)
+
+        XCTAssertThrowsError(try ChatConfigurationImporter.parse(
+            data: data,
+            environment: [:])) {
+            XCTAssertEqual(
+                $0 as? ChatConfigurationImportError,
+                .invalidModelSelection)
+        }
+    }
+
     func testWebSearchModelDefaultsToOrdinaryChatRouteWhenOmitted() throws {
         let data = Data(
             #"""

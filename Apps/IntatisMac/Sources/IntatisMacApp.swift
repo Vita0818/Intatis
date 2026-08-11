@@ -8,8 +8,12 @@ import IntatisProviders
 import IntatisConversation
 import IntatisAgentKernel
 import IntatisArtifacts
+import IntatisTools
 import IntatisMCP
 import IntatisSharedUI
+#if !INTATIS_MAC_APP_STORE
+import IntatisKnowledge
+#endif
 #if canImport(AppKit)
 import AppKit
 #endif
@@ -253,7 +257,11 @@ final class AppEnvironment: ObservableObject {
                         log: codeLog,
                         workspacePaths: [
                             workspace.canonicalPath,
-                        ]))
+                        ]),
+                internalToolRegistryAugmenter:
+                    makeKnowledgeToolAugmenter(),
+                initialConfigurationNotice:
+                    knowledgeToolsConfigurationNotice())
             return try runtimeManager.registerCodeRuntime(runtime)
         } catch {
             if !hadRememberedAccess {
@@ -419,6 +427,10 @@ final class AppEnvironment: ObservableObject {
         initialWorkspaceAccess: WorkspaceAccessLease? = nil
     ) throws -> CoworkViewModel {
         let artifactStore = try ArtifactStore(root: AppConfig.artifactsDir(session))
+        let combinedStorageWarning = [
+            sessionStorageWarning,
+            knowledgeToolsConfigurationNotice(),
+        ].compactMap { $0 }.joined(separator: " ")
         return CoworkViewModel(
             sessionID: session,
             log: coworkLog,
@@ -428,7 +440,10 @@ final class AppEnvironment: ObservableObject {
             inferenceProfileOptions: inferenceProfileOptions,
             projectSettings: projectSettings,
             launchMode: launchMode,
-            sessionStorageWarning: sessionStorageWarning,
+            sessionStorageWarning:
+                combinedStorageWarning.isEmpty
+                    ? nil
+                    : combinedStorageWarning,
             initialWorkspaceAccess: initialWorkspaceAccess,
             mcpSnapshots:
                 makeMCPSnapshotFactory(
@@ -437,7 +452,53 @@ final class AppEnvironment: ObservableObject {
                     log: coworkLog,
                     workspacePaths:
                         projectSettings.workspaces
-                            .map(\.path)))
+                            .map(\.path)),
+            internalToolRegistryAugmenter:
+                makeKnowledgeToolAugmenter())
+    }
+
+    private func makeKnowledgeToolAugmenter()
+        -> HostToolRegistryAugmenter? {
+        #if !INTATIS_MAC_APP_STORE
+        let configured = AppConfig.providerConfig()
+        guard (try? ProviderRegistry.validateKnowledgeConfiguration(
+            configured)) != nil else { return nil }
+        let providerRegistry = registry
+        let external = KnowledgeAccess.externalAuthorityProvider()
+        return HostToolRegistryAugmenter(
+            additionalCapabilities: [.buildKnowledge, .searchKnowledge]) { input in
+                let models = try await providerRegistry.configuredKnowledgeModels()
+                let embedding = try ProviderKnowledgeEmbeddingAdapter(
+                    provider: models.embedding)
+                let reranker = try ProviderKnowledgeRerankerAdapter(
+                    provider: models.reranker)
+                let formatter = ISO8601DateFormatter()
+                formatter.formatOptions = [.withInternetDateTime]
+                formatter.timeZone = TimeZone(secondsFromGMT: 0)
+                let host = try ModelDrivenKnowledgeToolHost(
+                    embeddingProvider: embedding,
+                    rerankerProvider: reranker,
+                    authorityResolver: KnowledgeStoreAuthorityResolver(
+                        externalProvider: external),
+                    policy: KnowledgeSearchPolicy(
+                        evaluationDate: formatter.string(from: Date())))
+                return try await host.augment(input)
+            }
+        #else
+        return nil
+        #endif
+    }
+
+    private func knowledgeToolsConfigurationNotice() -> String? {
+        #if !INTATIS_MAC_APP_STORE
+        do {
+            try ProviderRegistry.validateKnowledgeConfiguration(
+                AppConfig.providerConfig())
+        } catch {
+            return error.localizedDescription
+        }
+        #endif
+        return nil
     }
 
     private func makeMCPSnapshotFactory(

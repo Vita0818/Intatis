@@ -589,6 +589,63 @@ final class TerminalToolsTests: XCTestCase {
         }
     }
 
+    func testManagedTerminalCannotMutateKnowledgePublicationWithEmptyDenyList()
+        async throws {
+        let workspace = try workspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let store = workspace.appendingPathComponent("knowledge", isDirectory: true)
+        let snapshots = store.appendingPathComponent(
+            ".intatis-rag-snapshots",
+            isDirectory: true)
+        let host = store.appendingPathComponent(
+            ".intatis-rag-host",
+            isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: snapshots,
+            withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: host,
+            withIntermediateDirectories: true)
+        let pointer = store.appendingPathComponent(".intatis-rag-store.json")
+        let profile = snapshots.appendingPathComponent("profile.json")
+        try Data("pointer-original".utf8).write(to: pointer)
+        try Data("snapshot-original".utf8).write(to: profile)
+        try Data("host-original".utf8).write(
+            to: host.appendingPathComponent("store.lock"))
+
+        let manager = try manager()
+        let owner = try owner(workspace: workspace)
+        let lease = WorkspaceLease(
+            rootPath: workspace.path,
+            access: .readWrite,
+            deniedPatterns: [])
+        let result = try await manager.execute(
+            TerminalExecRequest(
+                command: """
+                printf changed > knowledge/.intatis-rag-store.json 2>/dev/null || true
+                printf changed > knowledge/.intatis-rag-snapshots/profile.json 2>/dev/null || true
+                printf changed > knowledge/.intatis-rag-host/store.lock 2>/dev/null || true
+                """,
+                loginShell: false,
+                yieldMilliseconds: 1_000,
+                timeoutMilliseconds: 5_000),
+            owner: owner,
+            workspaceLease: lease)
+
+        XCTAssertEqual(result.exitCode, 0, result.stderr)
+        XCTAssertEqual(
+            try String(contentsOf: pointer, encoding: .utf8),
+            "pointer-original")
+        XCTAssertEqual(
+            try String(contentsOf: profile, encoding: .utf8),
+            "snapshot-original")
+        XCTAssertEqual(
+            try String(
+                contentsOf: host.appendingPathComponent("store.lock"),
+                encoding: .utf8),
+            "host-original")
+    }
+
     func testManagedTerminalDoesNotLimitBuildArtifactFileSize() async throws {
         let workspace = try workspace()
         defer { try? FileManager.default.removeItem(at: workspace) }

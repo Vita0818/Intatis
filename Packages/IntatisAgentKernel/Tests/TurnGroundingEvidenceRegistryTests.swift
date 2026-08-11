@@ -30,6 +30,28 @@ final class TurnGroundingEvidenceRegistryTests: XCTestCase {
         }
     }
 
+    func testFinalAnswerRequiresCitationAfterSuccessfulSearch() async throws {
+        var registry = TurnGroundingEvidenceRegistry()
+        try registry.record(
+            toolName: "search_knowledge",
+            observation: successfulObservation(),
+            revalidator: acceptingRevalidator)
+
+        try await registry.validateCitations(
+            in: "Continuing with another tool call.",
+            requireAtLeastOne: false)
+        do {
+            try await registry.validateCitations(
+                in: "Ungrounded final answer.",
+                requireAtLeastOne: true)
+            XCTFail("a final answer without current-turn evidence unexpectedly passed")
+        } catch {
+            XCTAssertEqual(
+                error as? TurnGroundingEvidenceRegistry.ValidationError,
+                .missingCitation)
+        }
+    }
+
     func testNewTurnCannotReusePriorTurnEvidence() async throws {
         var firstTurn = TurnGroundingEvidenceRegistry()
         try firstTurn.record(

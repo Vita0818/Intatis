@@ -342,6 +342,8 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
     private let mcpSnapshots:
         (@MainActor @Sendable () async throws
             -> MCPAgentRequestToolSnapshotSource)?
+    private let internalToolRegistryAugmenter:
+        HostToolRegistryAugmenter?
     private var orchestrator: Orchestrator?
     private var goalRuntime: GoalRuntimeController?
     private var subscription: Task<Void, Never>?
@@ -401,7 +403,9 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
          mcpSnapshots:
             (@MainActor @Sendable () async throws
                 -> MCPAgentRequestToolSnapshotSource)?
-                = nil) {
+                = nil,
+         internalToolRegistryAugmenter:
+            HostToolRegistryAugmenter? = nil) {
         self.sessionID = sessionID
         self.log = log
         self.sessionNaming = sessionNaming
@@ -416,6 +420,7 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         self.voiceInput = ComposerVoiceInputController(registry: registry)
         #endif
         self.mcpSnapshots = mcpSnapshots
+        self.internalToolRegistryAugmenter = internalToolRegistryAugmenter
         self.inferenceProfileOptions = inferenceProfileOptions
         self.nextMainInferenceOption = nil
         self.projectSettings = projectSettings
@@ -603,6 +608,8 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                     store: artifactStore),
                 toolSnapshotProvider:
                     toolSnapshotProvider,
+                internalToolRegistryAugmenter:
+                    internalToolRegistryAugmenter,
                 sessionNaming: sessionNaming,
                 resolvedInferenceFor: { agent in
                     try await registryBox.resolvedInference(for: agent)

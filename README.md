@@ -17,8 +17,9 @@ client。所有运行时能力围绕结构化 EventLog、共享 AgentKernel、�
 
 - Chat：OpenAI-compatible streaming、provider/model/variant 配置、透明 hosted web search、
   citations、会话历史、多模态产物和本地诊断导出。
-- Code：单 workspace agent、文件/patch/Git、managed terminal、Skills、MCP、文档/媒体和
-  浏览器工具；所有工具均经过 CapabilityLease、WorkspaceLease、PathConfinement 与权限链。
+- Code：单 workspace agent、文件/patch/Git、managed terminal、Skills、MCP、文档/媒体、
+  浏览器和模型驱动 Knowledge 工具；所有工具均经过 CapabilityLease、WorkspaceLease、
+  PathConfinement 与权限链。
 - Cowork：多 agent roster、FIFO scheduler、WorkTask/Goal、MessageBus/Mediator、per-agent
   exact inference binding、独立 permission reviewer 和 goal verifier 控制面。
 - 设置：provider catalog、Intatis JSON/JSONC 配置、MCP、renderer fallback、第三方声明，
@@ -128,7 +129,7 @@ SHA-256 清单。不要把证书私钥、Apple 密码或 app-specific password �
   本地诊断 ZIP。
 - 日志导出当前不做远程上传；Apple notarization 仅在用户显式运行发行脚本时发生。
 
-最小配置示例（图片、语音 provider 也可与 Chat provider 相同）：
+最小配置示例（图片、语音和 Knowledge provider 也可与 Chat provider 相同）：
 
 ```json
 {
@@ -136,6 +137,8 @@ SHA-256 清单。不要把证书私钥、Apple 密码或 app-specific password �
   "model": "chat/chat-model",
   "image_model": "images/gpt-image-1",
   "transcription_model": "speech/whisper-1",
+  "embedding_model": "knowledge/BAAI/bge-m3",
+  "reranker_model": "knowledge/BAAI/bge-reranker-v2-m3",
   "provider": {
     "chat": {
       "npm": "@ai-sdk/openai-compatible",
@@ -162,6 +165,14 @@ SHA-256 清单。不要把证书私钥、Apple 密码或 app-specific password �
         "apiKey": "{env:SPEECH_API_KEY}"
       },
       "models": {}
+    },
+    "knowledge": {
+      "npm": "intatis:siliconflow-v1",
+      "options": {
+        "baseURL": "https://your-knowledge-provider.example/v1",
+        "apiKey": "{env:KNOWLEDGE_API_KEY}"
+      },
+      "models": {}
     }
   }
 }
@@ -179,6 +190,51 @@ provider 可保持空 `models`，不会混入推理模型菜单；输入栏按 F
 `input_audio`，两者都调用 `POST <baseURL>/audio/transcriptions`。录音和 upload body 使用有界、
 owner-only 的临时文件，转写完成、失败或取消后即清理；用户按下 Send 前，音频和转写草稿都不会写入
 EventLog 或 ArtifactStore。该接入不包含多模型对比，也没有新增设置页。
+
+`embedding_model` 与 `reranker_model` 是 Knowledge 的两个独立必填 route，均只接受
+`<provider>/<model-id>`；缺少任意一个时，Code/Cowork 不会获得 `build_knowledge` 和
+`search_knowledge`。上例中的 URL 和模型 ID 是需要替换的配置值；`intatis:siliconflow-v1`
+表示该 provider 同时使用 OpenAI-compatible `POST <baseURL>/embeddings` 和显式
+`POST <baseURL>/rerank`。若 reranker 使用 Cohere v2，应为它建立独立 provider 并将 `npm` 写为
+`intatis:cohere-v2`。Knowledge-only provider 的 `models` 可保持空对象，不会进入普通推理模型菜单；
+若使用没有内置维度定义的 embedding 模型，则必须在对应 model 的 `options.dimensions` 中显式声明
+正整数维度。若配置使用 `enabled_providers`，也必须把 Knowledge route 的 provider ID 加入其中。
+Knowledge 工具仅接入 macOS/CLI 的 Code 与 Cowork，不进入 Chat 或 iOS。
+用户无需学习挂载命令或新增管理页面：可以用自然语言要求 Agent 读取当前 workspace 的文本、PDF
+或其它文档，整理为有来源的 OKF draft，并把库建立在 workspace 内或用户点名并精确授权的外部目录。
+成功 build/query 会分别使用这里配置的 embedding route；每次成功 search 还必须实际使用这里配置的
+semantic reranker，并要求最终回答引用本轮返回的 exact evidence ID。
+
+使用同一个 OpenRouter provider 的已验收配置片段如下。即使 provider 默认仍用于普通
+OpenAI-compatible Chat，这两个 model 也应以 model-level `@openrouter/ai-sdk-provider` 冻结 Knowledge
+协议；顶层 role 引用的 exact model 会保留 adapter/options，但不会进入 Chat/Cowork 推理模型菜单。
+
+```json
+{
+  "embedding_model": "OpenRouter/google/gemini-embedding-2",
+  "reranker_model": "OpenRouter/cohere/rerank-4-pro",
+  "provider": {
+    "OpenRouter": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "https://openrouter.ai/api/v1",
+        "apiKey": "{env:OPENROUTER_API_KEY}"
+      },
+      "models": {
+        "google/gemini-embedding-2": {
+          "name": "Gemini Embedding 2",
+          "provider": { "npm": "@openrouter/ai-sdk-provider" },
+          "options": { "dimensions": 1536 }
+        },
+        "cohere/rerank-4-pro": {
+          "name": "Cohere Rerank 4 Pro",
+          "provider": { "npm": "@openrouter/ai-sdk-provider" }
+        }
+      }
+    }
+  }
+}
+```
 
 ## 许可证
 

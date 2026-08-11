@@ -131,6 +131,14 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
     let registry = ProviderRegistry(
         config: config.providerConfig(),
         resolver: CLIExactSecretResolver(config: config))
+    let knowledgeConfigurationNotice = mode == .code
+        ? cliKnowledgeToolsConfigurationNotice(config: config)
+        : nil
+    let knowledgeAugmenter = mode == .code
+        ? makeCLIKnowledgeToolAugmenter(
+            config: config,
+            registry: registry)
+        : nil
     var model = config.model
     var reasoning = config.reasoningEffort
     var pending = PendingAttachments()
@@ -143,7 +151,9 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
         mode == .code
             ? MCPCLIInteractiveCodeHost(
                 log: log,
-                workspace: workspace)
+                workspace: workspace,
+                additionalCapabilities:
+                    knowledgeAugmenter?.additionalCapabilities ?? [])
             : nil
     if let codeMCPHost {
         _ = try await codeMCPHost
@@ -167,6 +177,9 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
     }
 
     banner(mode: mode, model: model, host: config.selectedRouteLabel)
+    if let knowledgeConfigurationNotice {
+        out("\(S.yellow)\(knowledgeConfigurationNotice)\(S.reset)\n")
+    }
 
     while true {
         if !pending.isEmpty {
@@ -284,7 +297,9 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
                     mode == .code
                         ? MCPCLIInteractiveCodeHost(
                             log: log,
-                            workspace: workspace)
+                            workspace: workspace,
+                            additionalCapabilities:
+                                knowledgeAugmenter?.additionalCapabilities ?? [])
                         : nil
                 render.cancel()
                 render = Task {
@@ -295,7 +310,12 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
                 }
                 out("(new session)\n")
             case "config":
-                out("\(config.selectedRouteLabel) · endpoint hidden · model \(model) · reasoning \(reasoning?.rawValue ?? "off")\n")
+                let knowledge = mode == .code
+                    ? (knowledgeAugmenter == nil
+                        ? "knowledge unavailable (\(knowledgeConfigurationNotice ?? "invalid configuration"))"
+                        : "knowledge ready")
+                    : "knowledge not exposed in Chat"
+                out("\(config.selectedRouteLabel) · endpoint hidden · model \(model) · reasoning \(reasoning?.rawValue ?? "off") · \(knowledge)\n")
             default:
                 out("unknown command /\(cmd) — /help\n")
             }
@@ -369,9 +389,29 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
                         workspaceRoot: workspace,
                         model: route.model,
                         profile: .reviewed)
-                    let baseRegistry = skillSnapshot.augmenting(
+                    let unaugmentedRegistry = skillSnapshot.augmenting(
                         ToolRegistry.standard(
                             includesTerminal: true))
+                    let knowledgeLease:
+                        HostToolRegistryAugmentationLease?
+                    let baseRegistry: ToolRegistry
+                    if let knowledgeAugmenter {
+                        let lease = try await knowledgeAugmenter.augment(
+                            HostToolRegistryAugmentationInput(
+                                sessionID: codeMCPSession.sessionID,
+                                agentID: codeMCPSession.agentID,
+                                taskID: nil,
+                                capabilityLease:
+                                    codeMCPSession.capabilityLease,
+                                workspaceLease:
+                                    codeMCPSession.workspaceLease,
+                                baseRegistry: unaugmentedRegistry))
+                        knowledgeLease = lease
+                        baseRegistry = lease.registry
+                    } else {
+                        knowledgeLease = nil
+                        baseRegistry = unaugmentedRegistry
+                    }
                     let runtime = AgentRuntime.code(
                         registry: baseRegistry,
                         allowsShell: true,
@@ -429,9 +469,19 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
                                     consentConfirmation:
                                         nil)
                         })
-                    _ = try await loop.send(
-                        sendText,
-                        userMessage: userMessage)
+                    do {
+                        _ = try await loop.send(
+                            sendText,
+                            userMessage: userMessage)
+                    } catch let runError {
+                        if let knowledgeLease {
+                            try await knowledgeLease.closeRequiringDrain()
+                        }
+                        throw runError
+                    }
+                    if let knowledgeLease {
+                        try await knowledgeLease.closeRequiringDrain()
+                    }
                 } else {
                     let agent = Agent(
                         name:
@@ -439,13 +489,50 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
                         workspaceRoot: workspace,
                         model: route.model,
                         profile: .reviewed)
+                    let logSessionID = await log.sessionID
+                    var capabilityLease =
+                        CapabilityLease.worker(
+                            workspaceAccess: .readWrite)
+                    capabilityLease.id = CapabilityLeaseID(
+                        rawValue:
+                            "clease_cli_code_\(logSessionID.rawValue)")
+                    capabilityLease.expiresAtTaskCompletion = false
+                    if let knowledgeAugmenter {
+                        capabilityLease.tools.formUnion(
+                            knowledgeAugmenter.additionalCapabilities)
+                    }
                     let workspaceLease =
                         WorkspaceLease(
+                            id: WorkspaceLeaseID(
+                                rawValue:
+                                    "wlease_cli_code_\(logSessionID.rawValue)"),
+                            workspaceID: WorkspaceID(
+                                rawValue:
+                                    "workspace_cli_code_\(logSessionID.rawValue)"),
                             rootPath: workspace.path,
-                            access: .readWrite)
-                    let baseRegistry = skillSnapshot.augmenting(
+                            access: .readWrite,
+                            expiresAtTaskCompletion: false)
+                    let unaugmentedRegistry = skillSnapshot.augmenting(
                         ToolRegistry.standard(
                             includesTerminal: true))
+                    let knowledgeLease:
+                        HostToolRegistryAugmentationLease?
+                    let baseRegistry: ToolRegistry
+                    if let knowledgeAugmenter {
+                        let lease = try await knowledgeAugmenter.augment(
+                            HostToolRegistryAugmentationInput(
+                                sessionID: logSessionID,
+                                agentID: agent.name,
+                                taskID: nil,
+                                capabilityLease: capabilityLease,
+                                workspaceLease: workspaceLease,
+                                baseRegistry: unaugmentedRegistry))
+                        knowledgeLease = lease
+                        baseRegistry = lease.registry
+                    } else {
+                        knowledgeLease = nil
+                        baseRegistry = unaugmentedRegistry
+                    }
                     let runtime = AgentRuntime.code(
                         registry: baseRegistry,
                         allowsShell: true,
@@ -454,7 +541,7 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
                         maxIterations: config.maxSteps,
                         modelContextPolicy:
                             route.modelContextPolicy)
-                    _ = try await runtime.makeLoop(
+                    let loop = runtime.makeLoop(
                         log: log,
                         provider: route.provider,
                         responder: TerminalResponder(),
@@ -471,11 +558,23 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
                             EventLogSessionNamingService(
                                 log: log,
                                 kind: .code),
+                        capabilityLease:
+                            capabilityLease,
                         workspaceLease:
                             workspaceLease)
-                        .send(
+                    do {
+                        _ = try await loop.send(
                             sendText,
                             userMessage: userMessage)
+                    } catch let runError {
+                        if let knowledgeLease {
+                            try await knowledgeLease.closeRequiringDrain()
+                        }
+                        throw runError
+                    }
+                    if let knowledgeLease {
+                        try await knowledgeLease.closeRequiringDrain()
+                    }
                 }
             case .cowork:
                 break
@@ -526,6 +625,11 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
         config: config.providerConfig(),
         resolver: CLIExactSecretResolver(config: config),
         inferenceCatalogSnapshot: inferenceProfiles.snapshot)
+    let knowledgeConfigurationNotice =
+        cliKnowledgeToolsConfigurationNotice(config: config)
+    let knowledgeAugmenter = makeCLIKnowledgeToolAugmenter(
+        config: config,
+        registry: registry)
     var defaultProfile = inferenceProfiles.defaultBinding
     let controlPlaneInference = CLIControlPlaneInferenceBinding()
     var pending = PendingAttachments()
@@ -593,6 +697,7 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
                     outputBudget,
                 consentConfirmation: nil)
         },
+        internalToolRegistryAugmenter: knowledgeAugmenter,
         sessionNaming: EventLogSessionNamingService(log: log, kind: .cowork),
         resolvedInferenceFor: { agent in
             guard let binding = agent.agentInferenceBinding else {
@@ -762,6 +867,9 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
         mode: .cowork,
         model: defaultProfile.modelID.rawValue,
         host: "profile \(defaultProfile.inferenceProfileID.rawValue)")
+    if let knowledgeConfigurationNotice {
+        out("\(S.yellow)\(knowledgeConfigurationNotice)\(S.reset)\n")
+    }
     let startupControlPlaneProfileID = await controlPlaneInference.binding()?
         .inferenceProfileID.rawValue ?? "unresolved"
     var automaticReviewRequired = true

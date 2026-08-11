@@ -74,10 +74,15 @@ final class WorkspaceLeaseTests: XCTestCase {
         for required in [
             ".netrc", ".pgpass", ".npmrc", ".aws", ".gnupg",
             "**/.config/gh/**", "**/.config/intatis/**", "**/.git/config",
+            ".intatis-rag-store.json", ".intatis-rag-snapshots",
+            ".intatis-rag-host",
         ] {
             XCTAssertTrue(
                 lease.deniedPatterns.contains(required),
                 "default WorkspaceLease must deny \(required)")
         }
+        XCTAssertTrue(
+            Set(WorkspaceLease.mandatoryManagedStoreDeniedPatterns)
+                .isSubset(of: Set(lease.deniedPatterns)))
     }
 }

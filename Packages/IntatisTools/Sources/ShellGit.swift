@@ -24,6 +24,11 @@ enum WorkspaceSandboxBackend: Sendable {
     case bubblewrap
 }
 
+enum WorkspaceProcessCompatibility: Sendable, Equatable {
+    case none
+    case libreOfficeHeadless
+}
+
 /// Recognizes only diagnostics emitted by the sandbox wrapper while it is
 /// setting up the isolation boundary. A command that merely exits non-zero or
 /// prints an unqualified "Operation not permitted" is intentionally not
@@ -234,6 +239,13 @@ struct DocumentBackendProcessRunner: DocumentBackendRunner {
             executable: try trustedDocumentExecutable(invocation.executable),
             arguments: invocation.arguments,
             cwd: workspace,
+            // Fixed document invocations carry absolute input/output paths.
+            // Launching at `/` lets libraries call getcwd() without granting
+            // file-read-data on every ancestor of a user workspace.
+            managedWorkingDirectory: URL(fileURLWithPath: "/", isDirectory: true),
+            processCompatibility: invocation.executable == .libreOffice
+                ? .libreOfficeHeadless
+                : .none,
             networkAccess: .denied,
             trustedReadRoots: structuredRuntimeReadRoots(),
             writableRoots: [],
@@ -618,7 +630,11 @@ func validateManagedWorkspaceAccess(
     subject: String
 ) throws -> WorkspaceLease {
     let workspace = try validatedWorkspace(cwd)
-    let lease = try effectiveWorkspaceLease(workspaceLease, workspace: workspace)
+    let lease = try effectiveWorkspaceLease(
+        workspaceLease,
+        workspace: workspace,
+        mandatoryDeniedPatterns:
+            WorkspaceLease.mandatoryManagedStoreDeniedPatterns)
     if writablePaths.isEmpty == false, lease.access != .readWrite {
         throw IntatisError.permissionDenied(
             "\(subject) execution requires a read-write workspace lease")
@@ -813,7 +829,9 @@ private func trustedDocumentExecutable(
         path = runtime?.appendingPathComponent("bin/intatis-epubcheck").path
     case .libreOffice:
         #if os(macOS)
-        path = "/Applications/LibreOffice.app/Contents/MacOS/soffice"
+        path = intatisLibreOfficeRuntimeAppURL()?
+            .appendingPathComponent("Contents/MacOS/soffice", isDirectory: false)
+            .path
         #else
         path = "/usr/bin/libreoffice"
         #endif
@@ -885,6 +903,8 @@ private func workspaceLeaseGlob(_ value: String,
 private func runWorkspaceProcess(executable: URL,
                                  arguments: [String],
                                  cwd: URL,
+                                 managedWorkingDirectory: URL? = nil,
+                                 processCompatibility: WorkspaceProcessCompatibility = .none,
                                  networkAccess: WorkspaceNetworkAccess,
                                  trustedReadRoots: [URL],
                                  writableRoots: [URL],
@@ -900,6 +920,17 @@ private func runWorkspaceProcess(executable: URL,
                                  maximumGeneratedTotalBytes: Int? = nil,
                                  maximumGeneratedEntries: Int = 100_000) async throws -> ShellResult {
     let workspace = try validatedWorkspace(cwd)
+    let requestedWorkingDirectory: URL?
+    if let managedWorkingDirectory {
+        let resolved = managedWorkingDirectory.resolvingSymlinksInPath().standardizedFileURL
+        guard resolved.path == "/" else {
+            throw IntatisError.config(
+                "managed process working-directory override must be the filesystem root")
+        }
+        requestedWorkingDirectory = resolved
+    } else {
+        requestedWorkingDirectory = nil
+    }
     let lease = try effectiveWorkspaceLease(
         workspaceLease,
         workspace: workspace,
@@ -911,6 +942,27 @@ private func runWorkspaceProcess(executable: URL,
     try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
     try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: runtime) }
+    #if os(macOS)
+    let libreOfficeSocketRoot: URL?
+    if processCompatibility == .libreOfficeHeadless {
+        libreOfficeSocketRoot = try createLibreOfficeSocketRoot()
+    } else {
+        libreOfficeSocketRoot = nil
+    }
+    defer {
+        if let libreOfficeSocketRoot {
+            try? FileManager.default.removeItem(at: libreOfficeSocketRoot)
+        }
+    }
+    #endif
+    let processWorkingDirectory: URL
+    if processCompatibility == .libreOfficeHeadless {
+        // Keep incidental bootstrap and temporary writes in the private managed
+        // runtime instead of the reviewed workspace or filesystem root.
+        processWorkingDirectory = temporary
+    } else {
+        processWorkingDirectory = requestedWorkingDirectory ?? workspace
+    }
     let startupMarkerURL = runtime.appendingPathComponent(
         "command-shim-started-\(UUID().uuidString)")
     guard FileManager.default.createFile(
@@ -929,6 +981,12 @@ private func runWorkspaceProcess(executable: URL,
 
     var sanitized = sanitizedProcessEnvironment(home: home, temporary: temporary)
     environment.forEach { sanitized[$0.key] = $0.value }
+    if processCompatibility == .libreOfficeHeadless {
+        // AppKit consults CoreFoundation's resolved home directory even when
+        // HOME is isolated. Keep spelling, input-method, and preference probes
+        // inside the same per-invocation runtime instead of the real user home.
+        sanitized["CFFIXED_USER_HOME"] = home.path
+    }
     let processSpec: ManagedProcessSpec
     let sandboxBackend: WorkspaceSandboxBackend
     #if os(macOS)
@@ -942,12 +1000,25 @@ private func runWorkspaceProcess(executable: URL,
         writableRoots: writableRoots,
         workspaceLease: lease,
         forcedReadOnlyWorkspaceRoots: forcedReadOnlyWorkspaceRoots,
+        processCompatibility: processCompatibility,
+        libreOfficeSocketRoot: libreOfficeSocketRoot,
         networkAccess: networkAccess)
+    let processArguments: [String]
+    if let libreOfficeSocketRoot {
+        // OSL_SOCKET_PATH is a LibreOffice bootstrap variable, not a process
+        // environment variable. Its AF_UNIX path must also remain shorter than
+        // sockaddr_un.sun_path after LibreOffice appends OSL_PIPE_*.
+        processArguments = [
+            "-env:OSL_SOCKET_PATH=\(libreOfficeSocketRoot.path)",
+        ] + arguments
+    } else {
+        processArguments = arguments
+    }
     processSpec = ManagedProcessSpec(
         executable: URL(fileURLWithPath: "/usr/bin/sandbox-exec"),
         arguments: ["-p", profile] + limitedExecutionArguments(
             executable: executable,
-            arguments: arguments,
+            arguments: processArguments,
             startupMarker: startupMarkerURL,
             maximumGeneratedFileBytes: maximumGeneratedFileBytes),
         environment: sanitized)
@@ -988,7 +1059,7 @@ private func runWorkspaceProcess(executable: URL,
     #endif
     let result = try await runManagedProcess(
         spec: processSpec,
-        cwd: workspace,
+        cwd: processWorkingDirectory,
         timeoutSeconds: timeoutSeconds,
         terminationGraceSeconds: terminationGraceSeconds,
         maximumOutputBytes: maximumOutputBytes,
@@ -1350,6 +1421,8 @@ func sanitizedProcessEnvironment(home: URL, temporary: URL) -> [String: String] 
     [
         "HOME": home.path,
         "TMPDIR": temporary.path + "/",
+        "TEMP": temporary.path,
+        "TMP": temporary.path,
         "XDG_CONFIG_HOME": home.appendingPathComponent(".config", isDirectory: true).path,
         "XDG_CACHE_HOME": home.appendingPathComponent(".cache", isDirectory: true).path,
         "PATH": "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin:/Library/TeX/texbin",
@@ -1395,8 +1468,8 @@ func structuredRuntimeReadRoots() -> [URL] {
         "/opt/homebrew",
         "/usr/local",
         "/Library/TeX",
+        "/Library/Java",
         "/Library/Frameworks/Python.framework",
-        "/Applications/LibreOffice.app",
         "/Applications/Google Chrome.app",
         "/Applications/Microsoft Edge.app",
         "/Applications/Chromium.app",
@@ -1431,13 +1504,54 @@ func intatisDocumentRuntimeRoot() -> URL? {
 }
 
 #if os(macOS)
+func intatisLibreOfficeRuntimeAppURL() -> URL? {
+    intatisDocumentRuntimeRoot()?
+        .appendingPathComponent("libreoffice", isDirectory: true)
+        .appendingPathComponent("26.8.0.0.beta1", isDirectory: true)
+        .appendingPathComponent("LibreOffice.app", isDirectory: true)
+}
+#endif
+
+#if os(macOS)
 func macOSSandboxProfile(workspace: URL,
                          runtime: URL,
                          trustedReadRoots: [URL],
                          writableRoots: [URL],
                          workspaceLease: WorkspaceLease,
                          forcedReadOnlyWorkspaceRoots: [URL] = [],
+                         processCompatibility: WorkspaceProcessCompatibility = .none,
+                         libreOfficeSocketRoot: URL? = nil,
                          networkAccess: WorkspaceNetworkAccess) throws -> String {
+    let validatedLibreOfficeSocketRoot: URL?
+    switch (processCompatibility, libreOfficeSocketRoot) {
+    case (.none, nil):
+        validatedLibreOfficeSocketRoot = nil
+    case (.libreOfficeHeadless, .some(let socketRoot)):
+        let resolved = socketRoot.resolvingSymlinksInPath().standardizedFileURL
+        let canonical = URL(
+            fileURLWithPath: canonicalMacOSPath(resolved.path),
+            isDirectory: true)
+        let name = canonical.lastPathComponent
+        let suffix = String(name.dropFirst("intatis-lo-".count))
+        let hasExpectedParent = canonical.deletingLastPathComponent().path == "/private/tmp"
+        let hasExpectedPrefix = name.hasPrefix("intatis-lo-")
+        let hasExpectedSuffixLength = suffix.count == 12
+        let hasLowercaseHexSuffix = suffix.allSatisfy {
+            $0.isHexDigit && ($0.isLetter == false || $0.isLowercase)
+        }
+        guard hasExpectedParent,
+              hasExpectedPrefix,
+              hasExpectedSuffixLength,
+              hasLowercaseHexSuffix else {
+            throw IntatisError.config(
+                "LibreOffice socket root must be an invocation-private short path "
+                    + "(parent=\(canonical.deletingLastPathComponent().path), name=\(name))")
+        }
+        validatedLibreOfficeSocketRoot = canonical
+    default:
+        throw IntatisError.config(
+            "LibreOffice socket root does not match the process compatibility mode")
+    }
     let baseReadRoots = [
         "/System", "/usr", "/bin", "/sbin",
         "/Library/Apple", "/Library/Frameworks", "/Library/Fonts",
@@ -1445,8 +1559,43 @@ func macOSSandboxProfile(workspace: URL,
         "/private/etc/ssl", "/private/etc/pki",
     ].filter { FileManager.default.fileExists(atPath: $0) }
         .map { URL(fileURLWithPath: $0) }
-    let readRoots = canonicalUniqueURLs([workspace, runtime] + baseReadRoots + trustedReadRoots + writableRoots)
-    let writeRoots = canonicalUniqueURLs([workspace, runtime] + writableRoots)
+    let compatibilityReadRoots: [URL]
+    switch processCompatibility {
+    case .none:
+        compatibilityReadRoots = []
+    case .libreOfficeHeadless:
+        let userEncoding = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".CFUserTextEncoding")
+        let userCacheRoot = runtime
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("C", isDirectory: true)
+        compatibilityReadRoots = [
+            userEncoding,
+            userCacheRoot.appendingPathComponent("com.apple.IntlDataCache.le"),
+            userCacheRoot.appendingPathComponent("com.apple.IntlDataCache.le.kbdx"),
+            URL(fileURLWithPath: "/private/var/db/.AppleSetupDone"),
+            URL(fileURLWithPath: "/private/var/db/eligibilityd/eligibility.plist"),
+        ].filter { FileManager.default.fileExists(atPath: $0.path) }
+    }
+    let readRoots = canonicalUniqueURLs(
+        [workspace, runtime] + baseReadRoots + trustedReadRoots + writableRoots
+            + compatibilityReadRoots
+            + (validatedLibreOfficeSocketRoot.map { [$0] } ?? []))
+    let writeRoots = canonicalUniqueURLs(
+        [workspace, runtime] + writableRoots
+            + (validatedLibreOfficeSocketRoot.map { [$0] } ?? []))
+    let compatibilityDirectoryTraversalRoots: [URL]
+    switch processCompatibility {
+    case .none:
+        compatibilityDirectoryTraversalRoots = []
+    case .libreOfficeHeadless:
+        // LibreOffice asks CoreServices to enumerate each directory component
+        // while resolving its isolated profile, temporary directory, and the
+        // reviewed workspace root. Keep that exceptional directory-data read
+        // to ancestors of those two host-owned roots only.
+        compatibilityDirectoryTraversalRoots = canonicalUniqueURLs([workspace, runtime])
+    }
     let protectedZones = canonicalUniquePaths([
         NSHomeDirectory(), "/Users", "/Volumes", "/Network",
         "/private/tmp", "/private/var/folders", "/private/var/root", "/private/etc",
@@ -1455,13 +1604,16 @@ func macOSSandboxProfile(workspace: URL,
     ])
     let exceptions = readRoots.map {
         "(require-not (subpath \"\(sandboxLiteral($0.path))\"))"
-    }.joined(separator: "\n                ")
+    } + compatibilityDirectoryTraversalRoots.map {
+        "(require-not (path-ancestors \"\(sandboxLiteral($0.path))\"))"
+    }
+    let protectedExceptions = exceptions.joined(separator: "\n                ")
     let protectedRules = protectedZones.map { zone in
         """
         (deny file-read-data file-map-executable
           (require-all
             (subpath "\(sandboxLiteral(zone))")
-            \(exceptions)))
+            \(protectedExceptions)))
         """
     }.joined(separator: "\n")
     let readRules = readRoots.map { "(subpath \"\(sandboxLiteral($0.path))\")" }.joined(separator: "\n          ")
@@ -1474,18 +1626,37 @@ func macOSSandboxProfile(workspace: URL,
     let allowedRegexes = try workspaceLease.allowedPathRules.compactMap {
         try seatbeltPathRegex(pattern: $0.pattern, workspaceRoot: workspaceRoot)
     }
+    let compatibilityWorkspaceRootExceptions = processCompatibility == .libreOfficeHeadless
+        ? [
+            "(require-not (literal \"\(sandboxLiteral(workspaceRoot))\"))",
+            "(require-not (path-ancestors \"\(sandboxLiteral(workspaceRoot))\"))",
+        ]
+        : []
     let outsideAllowRule: String
     if allowsWholeWorkspace {
         outsideAllowRule = ""
     } else if allowedRegexes.isEmpty {
-        outsideAllowRule = """
-        (deny file-read-data file-map-executable file-write*
-          (subpath "\(sandboxLiteral(workspaceRoot))"))
-        """
+        if compatibilityWorkspaceRootExceptions.isEmpty == false {
+            let compatibilityExceptions = compatibilityWorkspaceRootExceptions.joined(
+                separator: "\n                ")
+            outsideAllowRule = """
+            (deny file-read-data file-map-executable file-write*
+              (require-all
+                (subpath "\(sandboxLiteral(workspaceRoot))")
+                \(compatibilityExceptions)))
+            """
+        } else {
+            outsideAllowRule = """
+            (deny file-read-data file-map-executable file-write*
+              (subpath "\(sandboxLiteral(workspaceRoot))"))
+            """
+        }
     } else {
-        let requireNotAllowed = allowedRegexes.map {
+        var outsideAllowExceptions = allowedRegexes.map {
             "(require-not (regex \"\(sandboxLiteral($0))\"))"
-        }.joined(separator: "\n            ")
+        }
+        outsideAllowExceptions.append(contentsOf: compatibilityWorkspaceRootExceptions)
+        let requireNotAllowed = outsideAllowExceptions.joined(separator: "\n            ")
         outsideAllowRule = """
         (deny file-read-data file-map-executable file-write*
           (require-all
@@ -1512,7 +1683,85 @@ func macOSSandboxProfile(workspace: URL,
     let forcedReadOnlyRules = canonicalUniqueURLs(forcedReadOnlyWorkspaceRoots).map {
         "(deny file-write* (subpath \"\(sandboxLiteral($0.path))\"))"
     }.joined(separator: "\n")
-    let networkRule = networkAccess == .allowed ? "(allow network*)" : "(deny network*)"
+    let compatibilityRules: String
+    switch processCompatibility {
+    case .none:
+        compatibilityRules = ""
+    case .libreOfficeHeadless:
+        // The macOS LibreOffice binary initializes a minimal AppKit shell even
+        // with `--headless`, and CoreServices enumerates directory components
+        // while resolving the host-owned workspace/runtime roots. The broader
+        // file, network, process, staging, and argv restrictions remain those
+        // of the document sandbox.
+        let traversalRules = compatibilityDirectoryTraversalRoots.map {
+            "(path-ancestors \"\(sandboxLiteral($0.path))\")"
+        }.joined(separator: "\n          ")
+        let intlDataCache = runtime
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("C/com.apple.IntlDataCache.le")
+        let intlDataCachePath = canonicalMacOSPath(intlDataCache.path)
+        guard let libreOfficeApp = intatisLibreOfficeRuntimeAppURL() else {
+            throw IntatisError.config(
+                "LibreOffice document runtime location is unavailable")
+        }
+        compatibilityRules = """
+        (allow user-preference-read)
+        (allow file-read-data
+          (literal "\(sandboxLiteral(workspaceRoot))")
+          \(traversalRules))
+        (allow file-write-data
+          (literal "\(sandboxLiteral(intlDataCachePath))"))
+        (allow file-issue-extension
+          (literal "\(sandboxLiteral(libreOfficeApp.path))"))
+        (allow iokit-open-user-client
+          (iokit-user-client-class "IOSurfaceRootUserClient"))
+        (allow mach-lookup
+          (global-name "com.apple.DiskArbitration.diskarbitrationd")
+          (global-name "com.apple.MenuBarAgent.systemservices")
+          (global-name "com.apple.CARenderServer")
+          (global-name "com.apple.CoreServices.coreservicesd")
+          (global-name "com.apple.SystemConfiguration.configd")
+          (global-name "com.apple.appkit.restoration_storage")
+          (global-name "com.apple.coreservices.appleevents")
+          (global-name "com.apple.coreservices.launchservicesd")
+          (global-name "com.apple.distributed_notifications@Uv3")
+          (global-name "com.apple.dock.server")
+          (global-name "com.apple.lsd.mapdb")
+          (global-name "com.apple.pasteboard.1")
+          (global-name "com.apple.pbs.fetch_services")
+          (global-name "com.apple.tccd")
+          (global-name "com.apple.tccd.system")
+          (global-name "com.apple.touchbarserver.mig")
+          (global-name "com.apple.window_proxies")
+          (global-name "com.apple.windowmanager.server")
+          (global-name "com.apple.windowserver.active"))
+        """
+    }
+    let networkRule: String
+    switch (networkAccess, processCompatibility) {
+    case (.allowed, _):
+        networkRule = "(allow network*)"
+    case (.denied, .none):
+        networkRule = "(deny network*)"
+    case (.denied, .libreOfficeHeadless):
+        guard let validatedLibreOfficeSocketRoot else {
+            throw IntatisError.config("LibreOffice socket root is unavailable")
+        }
+        let localSocketRoot = canonicalMacOSPath(validatedLibreOfficeSocketRoot.path)
+        let socketPathRegex = "^\(NSRegularExpression.escapedPattern(for: localSocketRoot))/OSL_PIPE_[^/]+$"
+        // LibreOffice's SingleOffice "pipe" is an AF_UNIX stream socket.
+        // Permit only its invocation-private socket path; IP networking stays
+        // explicitly denied and the default-deny profile covers every other
+        // Unix socket not admitted here.
+        networkRule = """
+        (allow network-bind network-inbound
+          (local unix-socket (path-regex "\(sandboxLiteral(socketPathRegex))")))
+        (allow network-outbound
+          (remote unix-socket (path-regex "\(sandboxLiteral(socketPathRegex))")))
+        (deny network* (local ip) (remote ip))
+        """
+    }
     return """
     (version 1)
     (deny default)
@@ -1521,6 +1770,7 @@ func macOSSandboxProfile(workspace: URL,
     (allow process-fork)
     (allow signal (target same-sandbox))
     (allow process-info* (target same-sandbox))
+    \(compatibilityRules)
     (allow file-read* file-write* file-ioctl (literal "/dev/tty"))
     (allow file-ioctl (regex "^/dev/ttys[0-9a-f]+$"))
     (allow file-read* \(readRules))
@@ -1622,6 +1872,33 @@ private func canonicalMacOSPath(_ path: String) -> String {
         return "/private" + path
     }
     return path
+}
+
+private func createLibreOfficeSocketRoot() throws -> URL {
+    let parent = URL(fileURLWithPath: "/private/tmp", isDirectory: true)
+    let suffix = UUID().uuidString
+        .replacingOccurrences(of: "-", with: "")
+        .lowercased()
+        .prefix(12)
+    let root = parent.appendingPathComponent("intatis-lo-\(suffix)", isDirectory: true)
+    do {
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: NSNumber(value: Int16(0o700))])
+    } catch {
+        throw IntatisError.io("could not create LibreOffice socket root")
+    }
+    var status = stat()
+    guard lstat(root.path, &status) == 0,
+          status.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR),
+          status.st_uid == geteuid(),
+          status.st_mode & mode_t(0o7777) == mode_t(0o700) else {
+        try? FileManager.default.removeItem(at: root)
+        throw IntatisError.permissionDenied(
+            "LibreOffice socket root did not preserve its private identity")
+    }
+    return root
 }
 #endif
 

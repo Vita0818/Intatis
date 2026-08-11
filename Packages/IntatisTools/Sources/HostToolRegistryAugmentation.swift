@@ -67,6 +67,16 @@ public final class HostToolRegistryAugmentationLease: @unchecked Sendable {
         await closeState.close()
     }
 
+    /// Runtime-owner boundary for invocations that are able to surface a
+    /// terminal failure. A timed-out mount/provider/security-scope drain must
+    /// not be silently converted into a successful turn or process command.
+    public func closeRequiringDrain() async throws {
+        guard await close() else {
+            throw IntatisError.io(
+                "Internal tool resources did not drain before invocation completion.")
+        }
+    }
+
     deinit {
         let state = closeState
         Task {

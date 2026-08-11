@@ -437,6 +437,75 @@ final class KnowledgeSearchEngineTests: XCTestCase {
         }
     }
 
+    func testExactEmbeddingAndRerankerRouteDriftFailClosed() throws {
+        let fixture = try SearchFixture.make(
+            rerankerMode: .required,
+            provideReranker: true)
+        defer { fixture.remove() }
+        let expectedEmbedding = try XCTUnwrap(
+            fixture.snapshot.profile.embeddingIndexes.first?.model)
+        let driftedEmbedding = KnowledgeEmbeddingModelIdentity(
+            identity: expectedEmbedding.identity,
+            revision: "drifted-embedding-revision",
+            tokenizerRevision: expectedEmbedding.tokenizerRevision,
+            runtimeBindingKind: expectedEmbedding.runtimeBindingKind,
+            runtimeBindingDigest: expectedEmbedding.runtimeBindingDigest,
+            dimensions: expectedEmbedding.dimensions,
+            scalarType: expectedEmbedding.scalarType,
+            quantization: expectedEmbedding.quantization,
+            pooling: expectedEmbedding.pooling,
+            normalization: expectedEmbedding.normalization,
+            similarity: expectedEmbedding.similarity,
+            documentInstruction: expectedEmbedding.documentInstruction,
+            queryInstruction: expectedEmbedding.queryInstruction,
+            maxInputTokens: expectedEmbedding.maxInputTokens,
+            truncation: expectedEmbedding.truncation)
+        let driftedEmbeddingRegistry = try KnowledgeEmbeddingRuntimeRegistry([
+            MockEmbeddingProvider(
+                modelIdentity: driftedEmbedding,
+                queryVector: [1, 0],
+                documentVectors: [:]),
+        ])
+
+        XCTAssertThrowsError(try KnowledgeSnapshotSearchReader(
+            snapshot: fixture.snapshot,
+            embeddingRegistry: driftedEmbeddingRegistry,
+            rerankerRegistry: fixture.rerankerRegistry,
+            policy: KnowledgeSearchPolicy(
+                evaluationDate: SearchFixture.evaluationDate))) { error in
+            XCTAssertEqual(
+                (error as? KnowledgeDomainError)?.failure.code,
+                .embeddingIncompatible)
+        }
+
+        let expectedReranker = try XCTUnwrap(
+            fixture.snapshot.profile.retrieval.reranker.model)
+        let driftedReranker = KnowledgeRerankerModelIdentity(
+            identity: expectedReranker.identity,
+            revision: "drifted-reranker-revision",
+            tokenizerRevision: expectedReranker.tokenizerRevision,
+            runtimeBindingKind: expectedReranker.runtimeBindingKind,
+            runtimeBindingDigest: expectedReranker.runtimeBindingDigest,
+            templateDigest: expectedReranker.templateDigest,
+            maxInputTokens: expectedReranker.maxInputTokens,
+            truncation: expectedReranker.truncation,
+            scoreSemantics: expectedReranker.scoreSemantics)
+        let driftedRerankerRegistry = try KnowledgeRerankerRuntimeRegistry([
+            DriftedSearchRerankerProvider(modelIdentity: driftedReranker),
+        ])
+
+        XCTAssertThrowsError(try KnowledgeSnapshotSearchReader(
+            snapshot: fixture.snapshot,
+            embeddingRegistry: fixture.embeddingRegistry,
+            rerankerRegistry: driftedRerankerRegistry,
+            policy: KnowledgeSearchPolicy(
+                evaluationDate: SearchFixture.evaluationDate))) { error in
+            XCTAssertEqual(
+                (error as? KnowledgeDomainError)?.failure.code,
+                .rerankUnavailable)
+        }
+    }
+
     func testEvidenceIDIsStableAcrossOpaqueRemountHandles() async throws {
         let fixture = try SearchFixture.make()
         defer { fixture.remove() }
@@ -635,6 +704,22 @@ private struct MockEmbeddingProvider: KnowledgeEmbeddingProvider {
 
     func embedQuery(_ text: String) async throws -> [Float] {
         queryVector
+    }
+}
+
+private struct DriftedSearchRerankerProvider: KnowledgeRerankerProvider {
+    let modelIdentity: KnowledgeRerankerModelIdentity
+
+    func rerank(
+        query: String,
+        candidates: [KnowledgeRerankCandidate]
+    ) async throws -> [KnowledgeRerankedCandidate] {
+        _ = query
+        return candidates.map {
+            KnowledgeRerankedCandidate(
+                chunkID: $0.chunkID,
+                score: $0.retrievalScore)
+        }
     }
 }
 

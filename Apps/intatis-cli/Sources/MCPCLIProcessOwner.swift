@@ -192,7 +192,8 @@ func makeMCPCLIInteractiveCodeSession(
     workspace: URL,
     sessionID: SessionID = .new(),
     agentID: AgentID =
-        AgentID(rawValue: "cli")
+        AgentID(rawValue: "cli"),
+    additionalCapabilities: Set<ToolCapability> = []
 ) async throws -> MCPCLIInteractiveCodeSession {
     let log = try await context.sessionLog(
         sessionID.rawValue)
@@ -200,7 +201,8 @@ func makeMCPCLIInteractiveCodeSession(
         context: context,
         workspace: workspace,
         log: log,
-        agentID: agentID)
+        agentID: agentID,
+        additionalCapabilities: additionalCapabilities)
 }
 
 func makeMCPCLIInteractiveCodeSession(
@@ -208,7 +210,8 @@ func makeMCPCLIInteractiveCodeSession(
     workspace: URL,
     log: EventLog,
     agentID: AgentID =
-        AgentID(rawValue: "cli")
+        AgentID(rawValue: "cli"),
+    additionalCapabilities: Set<ToolCapability> = []
 ) async throws -> MCPCLIInteractiveCodeSession {
     let canonicalWorkspace =
         workspace.resolvingSymlinksInPath()
@@ -224,6 +227,7 @@ func makeMCPCLIInteractiveCodeSession(
     var capabilityLease =
         CapabilityLease.worker(
             workspaceAccess: .readWrite)
+    capabilityLease.tools.formUnion(additionalCapabilities)
     capabilityLease.expiresAtTaskCompletion =
         false
     let workspaceLease = WorkspaceLease(
@@ -273,6 +277,7 @@ actor MCPCLIInteractiveCodeHost {
     let log: EventLog
     let workspace: URL
     let agentID: AgentID
+    let additionalCapabilities: Set<ToolCapability>
 
     private let suppliedContext: MCPCLIContext?
     private var activation:
@@ -286,12 +291,14 @@ actor MCPCLIInteractiveCodeHost {
         workspace: URL,
         context: MCPCLIContext? = nil,
         agentID: AgentID =
-            AgentID(rawValue: "cli")
+            AgentID(rawValue: "cli"),
+        additionalCapabilities: Set<ToolCapability> = []
     ) {
         self.log = log
         self.workspace = workspace
         suppliedContext = context
         self.agentID = agentID
+        self.additionalCapabilities = additionalCapabilities
     }
 
     func activationIfAttached()
@@ -326,6 +333,7 @@ actor MCPCLIInteractiveCodeHost {
         let log = self.log
         let workspace = self.workspace
         let agentID = self.agentID
+        let additionalCapabilities = self.additionalCapabilities
         let task =
             Task<MCPCLIInteractiveCodeActivation, Error> {
                 let session =
@@ -333,7 +341,8 @@ actor MCPCLIInteractiveCodeHost {
                         context: context,
                         workspace: workspace,
                         log: log,
-                        agentID: agentID)
+                        agentID: agentID,
+                        additionalCapabilities: additionalCapabilities)
                 return MCPCLIInteractiveCodeActivation(
                     context: context,
                     session: session)

@@ -46,6 +46,8 @@ public struct ImportedChatConfiguration: Sendable, CustomStringConvertible,
     public var selectedProviderID: String
     public var selectedModelID: String
     public var transcriptionModel: ModelRef?
+    public var embeddingModel: ModelRef?
+    public var rerankerModel: ModelRef?
     public var webSearchModel: ModelRef?
     public var providers: [Provider]
     public var warnings: [Warning]
@@ -54,6 +56,8 @@ public struct ImportedChatConfiguration: Sendable, CustomStringConvertible,
     public init(selectedProviderID: String,
                 selectedModelID: String,
                 transcriptionModel: ModelRef? = nil,
+                embeddingModel: ModelRef? = nil,
+                rerankerModel: ModelRef? = nil,
                 webSearchModel: ModelRef? = nil,
                 providers: [Provider],
                 warnings: [Warning] = [],
@@ -61,6 +65,8 @@ public struct ImportedChatConfiguration: Sendable, CustomStringConvertible,
         self.selectedProviderID = selectedProviderID
         self.selectedModelID = selectedModelID
         self.transcriptionModel = transcriptionModel
+        self.embeddingModel = embeddingModel
+        self.rerankerModel = rerankerModel
         self.webSearchModel = webSearchModel
         self.providers = providers
         self.warnings = warnings
@@ -77,7 +83,9 @@ public struct ImportedChatConfiguration: Sendable, CustomStringConvertible,
                 chat: chat,
                 webSearch: webSearchModel,
                 agent: chat,
-                transcription: transcriptionModel))
+                transcription: transcriptionModel,
+                embedding: embeddingModel,
+                reranker: rerankerModel))
     }
 
     public var providerCount: Int { providers.count }
@@ -216,6 +224,12 @@ public enum ChatConfigurationImporter {
         let transcriptionRaw = resolvedSelection(
             root.string("transcription_model"),
             environment: environment)
+        let embeddingRaw = resolvedSelection(
+            root.string("embedding_model"),
+            environment: environment)
+        let rerankerRaw = resolvedSelection(
+            root.string("reranker_model"),
+            environment: environment)
 
         var providers: [ImportedChatConfiguration.Provider] = []
         var warnings: [ImportedChatConfiguration.Warning] = []
@@ -254,6 +268,12 @@ public enum ChatConfigurationImporter {
             if models.isEmpty,
                !explicitRoleModel(
                    transcriptionRaw,
+                   targetsProviderID: id),
+               !explicitRoleModel(
+                   embeddingRaw,
+                   targetsProviderID: id),
+               !explicitRoleModel(
+                   rerankerRaw,
                    targetsProviderID: id) {
                 models = [ParsedModel(
                     display: .init(id: "gpt-4o-mini", displayName: "GPT-4o mini"),
@@ -348,10 +368,20 @@ public enum ChatConfigurationImporter {
             transcriptionRaw,
             preferredProviderID: selection.providerID,
             providers: providers)
+        let embeddingModel = try knowledgeModelRef(
+            embeddingRaw,
+            preferredProviderID: selection.providerID,
+            providers: providers)
+        let rerankerModel = try knowledgeModelRef(
+            rerankerRaw,
+            preferredProviderID: selection.providerID,
+            providers: providers)
         return ImportedChatConfiguration(
             selectedProviderID: selection.providerID,
             selectedModelID: selection.modelID,
             transcriptionModel: transcriptionModel,
+            embeddingModel: embeddingModel,
+            rerankerModel: rerankerModel,
             webSearchModel: webSearchModel,
             providers: providers,
             warnings: warnings,
@@ -371,6 +401,12 @@ public enum ChatConfigurationImporter {
 
         let transcriptionRaw = resolvedSelection(
             root.string("transcription_model"),
+            environment: environment)
+        let embeddingRaw = resolvedSelection(
+            root.string("embedding_model"),
+            environment: environment)
+        let rerankerRaw = resolvedSelection(
+            root.string("reranker_model"),
             environment: environment)
         var providers: [ImportedChatConfiguration.Provider] = []
         var warnings: [ImportedChatConfiguration.Warning] = []
@@ -416,6 +452,12 @@ public enum ChatConfigurationImporter {
             if models.isEmpty,
                !explicitRoleModel(
                    transcriptionRaw,
+                   targetsProviderID: id),
+               !explicitRoleModel(
+                   embeddingRaw,
+                   targetsProviderID: id),
+               !explicitRoleModel(
+                   rerankerRaw,
                    targetsProviderID: id) {
                 models = [.init(id: "gpt-4o-mini", displayName: "GPT-4o mini")]
             }
@@ -493,10 +535,20 @@ public enum ChatConfigurationImporter {
             transcriptionRaw,
             preferredProviderID: selection.providerID,
             providers: providers)
+        let embeddingModel = try knowledgeModelRef(
+            embeddingRaw,
+            preferredProviderID: selection.providerID,
+            providers: providers)
+        let rerankerModel = try knowledgeModelRef(
+            rerankerRaw,
+            preferredProviderID: selection.providerID,
+            providers: providers)
         return ImportedChatConfiguration(
             selectedProviderID: selection.providerID,
             selectedModelID: selection.modelID,
             transcriptionModel: transcriptionModel,
+            embeddingModel: embeddingModel,
+            rerankerModel: rerankerModel,
             webSearchModel: webSearchModel,
             providers: providers,
             warnings: warnings,
@@ -749,6 +801,31 @@ public enum ChatConfigurationImporter {
         return ModelRef(
             endpoint: providers[providerIndex].id,
             model: ModelID(rawValue: boundedModelID))
+    }
+
+    /// Knowledge roles intentionally have no implicit "current Chat provider"
+    /// fallback. Their portable configuration contract is the canonical
+    /// `<provider-id>/<model-id>` shape, so an unqualified or malformed value
+    /// must fail before any provider or credential is touched.
+    private static func knowledgeModelRef(
+        _ raw: String?,
+        preferredProviderID: String,
+        providers: [ImportedChatConfiguration.Provider]
+    ) throws -> ModelRef? {
+        guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty else {
+            return nil
+        }
+        guard providers.contains(where: { provider in
+            let prefix = provider.id + "/"
+            return raw.hasPrefix(prefix) && raw.count > prefix.count
+        }) else {
+            throw ChatConfigurationImportError.invalidModelSelection
+        }
+        return try backgroundModelRef(
+            raw,
+            preferredProviderID: preferredProviderID,
+            providers: providers)
     }
 
     /// Role routes use the canonical `<provider>/<model-id>` shape. Only an

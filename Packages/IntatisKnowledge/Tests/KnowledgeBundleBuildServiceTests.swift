@@ -12,6 +12,38 @@ import Glibc
 #endif
 
 final class KnowledgeBundleBuildServiceTests: XCTestCase {
+    func testExistingStoreUpdateRequiresExactCurrentStoreAndSnapshotCAS() async throws {
+        let fixture = try BuildFixture()
+        defer { fixture.cleanup() }
+        let provider = CountingBuildEmbeddingProvider()
+        let service = try KnowledgeBundleBuildService(
+            embeddingProvider: provider)
+        let first = try await service.buildAndPublish(fixture.request())
+        let requestsAfterFirst = await provider.requestTextCount()
+
+        do {
+            _ = try await service.buildAndPublish(
+                fixture.request(expectedStoreID: first.storeID))
+            XCTFail("an update without expected_snapshot_id must fail")
+        } catch let error as KnowledgeDomainError {
+            XCTAssertEqual(error.failure.code, .toolInputInvalid)
+        }
+        let requestsAfterMissingSnapshot = await provider.requestTextCount()
+        XCTAssertEqual(requestsAfterMissingSnapshot, requestsAfterFirst)
+
+        do {
+            _ = try await service.buildAndPublish(fixture.request(
+                expectedStoreID: first.storeID,
+                expectedSnapshotID: "snap_stale"))
+            XCTFail("a stale snapshot CAS must fail")
+        } catch let error as KnowledgeDomainError {
+            XCTAssertEqual(error.failure.code, .revisionChanged)
+            XCTAssertTrue(error.failure.retryable)
+        }
+        let requestsAfterStaleSnapshot = await provider.requestTextCount()
+        XCTAssertEqual(requestsAfterStaleSnapshot, requestsAfterFirst)
+    }
+
     func testPublishesCompleteSnapshotAndReusesUnchangedEmbeddings() async throws {
         let fixture = try BuildFixture()
         defer { fixture.cleanup() }
@@ -37,7 +69,9 @@ final class KnowledgeBundleBuildServiceTests: XCTestCase {
         XCTAssertEqual(oldReader.pointer.currentSnapshot, first.snapshotID)
 
         let second = try await service.buildAndPublish(
-            fixture.request(expectedStoreID: first.storeID))
+            fixture.request(
+                expectedStoreID: first.storeID,
+                expectedSnapshotID: first.snapshotID))
         XCTAssertEqual(second.storeID, first.storeID)
         XCTAssertEqual(second.storeRevision, 2)
         XCTAssertNotEqual(second.snapshotID, first.snapshotID)
@@ -54,7 +88,9 @@ final class KnowledgeBundleBuildServiceTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: oldReader.snapshotRoot.path))
 
         let secondRoot = fixture.store
-            .appendingPathComponent("snapshots", isDirectory: true)
+            .appendingPathComponent(
+                KnowledgeSnapshotStore.publishedSnapshotsDirectoryName,
+                isDirectory: true)
             .appendingPathComponent(second.snapshotID, isDirectory: true)
         let validated = try KnowledgeValidator().validateSnapshot(
             at: secondRoot,
@@ -411,7 +447,9 @@ final class KnowledgeBundleBuildServiceTests: XCTestCase {
         let second = try await KnowledgeBundleBuildService(
             embeddingProvider: provider,
             now: { Date(timeIntervalSince1970: 1_786_320_000) })
-            .buildAndPublish(fixture.request(expectedStoreID: first.storeID))
+            .buildAndPublish(fixture.request(
+                expectedStoreID: first.storeID,
+                expectedSnapshotID: first.snapshotID))
         let secondProfile = try KnowledgeJSON.decode(
             KnowledgeProfile.self,
             from: fixture.snapshotData(
@@ -565,7 +603,9 @@ final class KnowledgeBundleBuildServiceTests: XCTestCase {
             atPath: fixture.store
                 .appendingPathComponent(".intatis-rag-store.json").path))
         let staging = fixture.store
-            .appendingPathComponent("snapshots", isDirectory: true)
+            .appendingPathComponent(
+                KnowledgeSnapshotStore.publishedSnapshotsDirectoryName,
+                isDirectory: true)
             .appendingPathComponent(".staging", isDirectory: true)
         if FileManager.default.fileExists(atPath: staging.path) {
             XCTAssertEqual(
@@ -616,6 +656,7 @@ final class KnowledgeBundleBuildServiceTests: XCTestCase {
         let second = try await changedService.buildAndPublish(
             fixture.request(
                 expectedStoreID: first.storeID,
+                expectedSnapshotID: first.snapshotID,
                 embeddingModel: changedIdentity))
 
         XCTAssertEqual(second.reusedVectorCount, 0)
@@ -644,7 +685,9 @@ final class KnowledgeBundleBuildServiceTests: XCTestCase {
                     minimumUTF8Bytes: 24)),
             embeddingProvider: changedProvider)
         let second = try await changedService.buildAndPublish(
-            fixture.request(expectedStoreID: first.storeID))
+            fixture.request(
+                expectedStoreID: first.storeID,
+                expectedSnapshotID: first.snapshotID))
 
         XCTAssertEqual(second.reusedVectorCount, 0)
         XCTAssertEqual(second.embeddedVectorCount, second.chunkCount)
@@ -680,7 +723,9 @@ final class KnowledgeBundleBuildServiceTests: XCTestCase {
             atPath: fixture.store
                 .appendingPathComponent(".intatis-rag-store.json").path))
         let staging = fixture.store
-            .appendingPathComponent("snapshots", isDirectory: true)
+            .appendingPathComponent(
+                KnowledgeSnapshotStore.publishedSnapshotsDirectoryName,
+                isDirectory: true)
             .appendingPathComponent(".staging", isDirectory: true)
         if FileManager.default.fileExists(atPath: staging.path) {
             XCTAssertEqual(
@@ -1076,7 +1121,9 @@ final class KnowledgeBundleBuildServiceTests: XCTestCase {
             relativePath: "concepts/publication.md",
             text: BuildFixture.modifiedPublicationConcept)
         let modified = try await service.buildAndPublish(
-            fixture.request(expectedStoreID: first.storeID))
+            fixture.request(
+                expectedStoreID: first.storeID,
+                expectedSnapshotID: first.snapshotID))
         XCTAssertGreaterThan(modified.reusedVectorCount, 0)
         XCTAssertGreaterThan(modified.embeddedVectorCount, 0)
         XCTAssertEqual(
@@ -1085,7 +1132,9 @@ final class KnowledgeBundleBuildServiceTests: XCTestCase {
 
         try fixture.removeDraft(relativePath: "concepts/publication.md")
         let deleted = try await service.buildAndPublish(
-            fixture.request(expectedStoreID: first.storeID))
+            fixture.request(
+                expectedStoreID: modified.storeID,
+                expectedSnapshotID: modified.snapshotID))
         XCTAssertEqual(deleted.reusedVectorCount, deleted.chunkCount)
         XCTAssertEqual(deleted.embeddedVectorCount, 0)
         XCTAssertEqual(deleted.vectorCount, deleted.chunkCount)
@@ -1125,6 +1174,7 @@ final class KnowledgeBundleBuildServiceTests: XCTestCase {
                 embeddingProvider: changedProvider)
                 .buildAndPublish(fixture.request(
                     expectedStoreID: first.storeID,
+                    expectedSnapshotID: first.snapshotID,
                     embeddingModel: identity))
             XCTAssertEqual(
                 second.reusedVectorCount,
@@ -1157,6 +1207,7 @@ final class KnowledgeBundleBuildServiceTests: XCTestCase {
                     embeddingProvider: provider)
                     .buildAndPublish(fixture.request(
                         expectedStoreID: first.storeID,
+                        expectedSnapshotID: first.snapshotID,
                         embeddingModel: identity))
                 XCTFail("unsupported embedding semantics unexpectedly published")
             } catch let error as KnowledgeDomainError {
@@ -1459,6 +1510,7 @@ private final class BuildFixture {
     }
 
     func request(expectedStoreID: String? = nil,
+                 expectedSnapshotID: String? = nil,
                  embeddingModel: KnowledgeEmbeddingModelIdentity = testBuildEmbeddingIdentity,
                  authorization explicit: ResolvedToolAuthorization? = nil)
         -> KnowledgeBundleBuildRequest {
@@ -1466,15 +1518,18 @@ private final class BuildFixture {
             draftRoot: draft,
             storeRoot: store,
             expectedStoreID: expectedStoreID,
+            expectedSnapshotID: expectedSnapshotID,
             workspaceLease: workspaceLease,
             authorization: explicit ?? authorization(
                 expectedStoreID: expectedStoreID,
+                expectedSnapshotID: expectedSnapshotID,
                 embeddingModel: embeddingModel),
             trustedVerificationActors: ["human:test"])
     }
 
     func authorization(
         expectedStoreID: String? = nil,
+        expectedSnapshotID: String? = nil,
         embeddingModel: KnowledgeEmbeddingModelIdentity = testBuildEmbeddingIdentity,
         deterministicGate: PermissionReviewGateSnapshot? = PermissionReviewGateSnapshot(
             decision: .ask,
@@ -1497,6 +1552,7 @@ private final class BuildFixture {
             draftRoot: draft,
             storeRoot: store,
             expectedStoreID: expectedStoreID,
+            expectedSnapshotID: expectedSnapshotID,
             workspaceLease: workspaceLease,
             embeddingModel: embeddingModel,
             trustedVerificationActors: ["human:test"])
@@ -1546,7 +1602,9 @@ private final class BuildFixture {
     }
 
     func snapshotRoot(_ result: KnowledgeBundleBuildResult) -> URL {
-        store.appendingPathComponent("snapshots", isDirectory: true)
+        store.appendingPathComponent(
+            KnowledgeSnapshotStore.publishedSnapshotsDirectoryName,
+            isDirectory: true)
             .appendingPathComponent(result.snapshotID, isDirectory: true)
     }
 

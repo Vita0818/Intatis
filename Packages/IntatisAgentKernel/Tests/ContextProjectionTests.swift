@@ -196,6 +196,9 @@ final class ContextProjectionTests: XCTestCase {
         XCTAssertTrue(coordinator.contains("directory-scoped work with delegate_task"))
         XCTAssertTrue(coordinator.contains("workspace-expansion request is denied"))
         XCTAssertTrue(coordinator.contains("needed access instead of claiming the"))
+        XCTAssertTrue(coordinator.contains("build_knowledge or search_knowledge"))
+        XCTAssertTrue(coordinator.contains("authorization remains private to that tool"))
+        XCTAssertTrue(coordinator.contains("does not become a child workspace"))
         XCTAssertTrue(coordinator.contains("workspace-boundary routing is required"))
 
         let worker = ContextBuilder.coworkSystemPrompt(
@@ -630,6 +633,9 @@ final class ContextProjectionTests: XCTestCase {
         XCTAssertTrue(systemPrompt.contains("in Code mode"))
         XCTAssertTrue(systemPrompt.contains("Every external action must be performed through a tool call"))
         XCTAssertTrue(systemPrompt.contains("authoritative API tools list"))
+        XCTAssertTrue(systemPrompt.contains("dedicated advertised tool"))
+        XCTAssertTrue(systemPrompt.contains("host obtains exact authorization"))
+        XCTAssertTrue(systemPrompt.contains("never expands the WorkspaceLease"))
         XCTAssertTrue(systemPrompt.contains("strict JSON object"))
         XCTAssertTrue(systemPrompt.contains("narrowest advertised tool"))
         XCTAssertTrue(systemPrompt.contains("inspection or read-only tools"))

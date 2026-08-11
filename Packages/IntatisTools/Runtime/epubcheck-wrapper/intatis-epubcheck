@@ -1,0 +1,20 @@
+#!/bin/sh
+
+set -eu
+
+case "$0" in
+    /*) wrapper_path=$0 ;;
+    *) wrapper_path=$(pwd -P)/$0 ;;
+esac
+
+runtime_bin=$(dirname -- "$wrapper_path")
+runtime_root=$(CDPATH= cd -- "$runtime_bin/.." && pwd -P)
+distribution="$runtime_root/lib/epubcheck-5.3.0"
+jar="$distribution/epubcheck.jar"
+
+if [ ! -r "$jar" ]; then
+    printf '%s\n' 'Intatis EPUBCheck 5.3.0 runtime is incomplete' >&2
+    exit 69
+fi
+
+exec /usr/bin/java -Djava.awt.headless=true -jar "$jar" "$@"

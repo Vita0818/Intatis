@@ -135,7 +135,8 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
                 -> MCPAgentRequestToolSnapshotSource)?
                 = nil,
          internalToolRegistryAugmenter:
-            HostToolRegistryAugmenter? = nil) {
+            HostToolRegistryAugmenter? = nil,
+         initialConfigurationNotice: String? = nil) {
         self.sessionID = sessionID
         self.workspaceAccess = workspaceAccess
         self.workspaceRoot = workspaceAccess.canonicalURL
@@ -153,6 +154,7 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
         self.mcpSnapshots = mcpSnapshots
         self.internalToolRegistryAugmenter =
             internalToolRegistryAugmenter
+        self.composerError = initialConfigurationNotice
         #if canImport(AVFoundation)
         observeVoiceInput()
         #endif
@@ -461,7 +463,15 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
                 self.mcpInternalToolRegistryLease
             self.mcpInternalToolRegistryLease = nil
             if let internalLease {
-                _ = await internalLease.close()
+                do {
+                    try await internalLease.closeRequiringDrain()
+                } catch {
+                    self.composerError = error.localizedDescription
+                    try? await self.log.append(.error(
+                        RuntimeErrorPresentation.payload(
+                            for: error,
+                            fallbackCode: "internal_tool_drain")))
+                }
             }
             self.workspaceAccess?.release()
             self.workspaceAccess = nil
@@ -661,21 +671,33 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
                     submissionID:
                         durableUserMessage.submissionID)
                 if let lease = internalToolLease {
-                    _ = await lease.close()
+                    try await lease.closeRequiringDrain()
                     internalToolLease = nil
                 }
-            } catch {
+            } catch let runError {
+                var effectiveError: Error = runError
+                var drainFailed = false
                 if let lease = internalToolLease {
-                    _ = await lease.close()
+                    do {
+                        try await lease.closeRequiringDrain()
+                    } catch {
+                        effectiveError = error
+                        drainFailed = true
+                    }
                     internalToolLease = nil
                 }
-                let isInterruption = error is AgentTurnInterruptedError
-                    || IntatisCancellation.isCurrentTaskCancellation(error)
-                let message = error.localizedDescription
+                let isInterruption = effectiveError is AgentTurnInterruptedError
+                    || IntatisCancellation.isCurrentTaskCancellation(
+                        effectiveError)
+                let message = effectiveError.localizedDescription
                 self.composerError = isInterruption ? nil : message
-                if !didEnterAgentLoop {
+                if !didEnterAgentLoop || drainFailed {
                     try? await self.log.append(.error(
-                        RuntimeErrorPresentation.payload(for: error, fallbackCode: "agent")))
+                        RuntimeErrorPresentation.payload(
+                            for: effectiveError,
+                            fallbackCode: drainFailed
+                                ? "internal_tool_drain"
+                                : "agent")))
                 }
             }
             self.isWorking = false
@@ -818,7 +840,7 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
                     allowsShell))
         if let previous = mcpInternalToolRegistryLease {
             mcpInternalToolRegistryLease = nil
-            _ = await previous.close()
+            try await previous.closeRequiringDrain()
         }
         let baseRegistry: ToolRegistry
         if let augmenter = internalToolRegistryAugmenter {

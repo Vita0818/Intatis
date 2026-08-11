@@ -39,8 +39,11 @@ public enum KnowledgeBuildAuthorizationIdentity {
         draftRoot: URL,
         storeRoot: URL,
         expectedStoreID: String?,
+        expectedSnapshotID: String? = nil,
         workspaceLease: WorkspaceLease,
+        storeLease: KnowledgeLease? = nil,
         embeddingModel: KnowledgeEmbeddingModelIdentity,
+        rerankerModel: KnowledgeRerankerModelIdentity? = nil,
         trustedVerificationActors: Set<String>
     ) throws -> String {
         guard let workspaceIdentity = workspaceLease.rootIdentity,
@@ -54,21 +57,48 @@ public enum KnowledgeBuildAuthorizationIdentity {
             fileURLWithPath: workspaceIdentity.canonicalPath,
             isDirectory: true)
         let draft = try PathConfinement.resolve(draftRoot.path, within: workspace)
-        let store = try PathConfinement.resolve(storeRoot.path, within: workspace)
+        let standardizedStore = storeRoot.standardizedFileURL
+        let storeAuthority: String
+        let workspacePrefix = workspace.path.hasSuffix("/")
+            ? workspace.path
+            : workspace.path + "/"
+        if standardizedStore.path == workspace.path
+            || standardizedStore.path.hasPrefix(workspacePrefix) {
+            let store = try PathConfinement.resolve(storeRoot.path, within: workspace)
+            storeAuthority = "workspace:" + PathConfinement.relativePath(
+                of: store,
+                root: workspace)
+        } else {
+            guard standardizedStore.path.hasPrefix("/"),
+                  storeLease == nil
+                    || (standardizedStore.path == storeLease?.rootPath
+                        && storeLease?.rootIdentity.matchesCurrentDirectory(
+                            rootPath: standardizedStore.path) == true) else {
+                throw KnowledgeDomainError(
+                    .accessDenied,
+                    "Knowledge build store authority changed.")
+            }
+            storeAuthority = "external-request:"
+                + KnowledgeDigest.sha256(standardizedStore.path)
+        }
         struct Projection: Codable {
             let version: String
             let draftPath: String
-            let storePath: String
+            let storeAuthority: String
             let expectedStoreID: String?
+            let expectedSnapshotID: String?
             let embeddingModel: KnowledgeEmbeddingModelIdentity
+            let rerankerModel: KnowledgeRerankerModelIdentity?
             let trustedVerificationActors: [String]
         }
         let data = try KnowledgeJSON.encode(Projection(
-            version: "intatis-knowledge-build-authorization/1",
+            version: "intatis-knowledge-build-authorization/2",
             draftPath: PathConfinement.relativePath(of: draft, root: workspace),
-            storePath: PathConfinement.relativePath(of: store, root: workspace),
+            storeAuthority: storeAuthority,
             expectedStoreID: expectedStoreID,
+            expectedSnapshotID: expectedSnapshotID,
             embeddingModel: embeddingModel,
+            rerankerModel: rerankerModel,
             trustedVerificationActors: trustedVerificationActors.sorted()))
         guard let value = String(data: data, encoding: .utf8) else {
             throw KnowledgeDomainError(
@@ -92,7 +122,9 @@ public struct KnowledgeBundleBuildRequest: Sendable {
     public let draftRoot: URL
     public let storeRoot: URL
     public let expectedStoreID: String?
+    public let expectedSnapshotID: String?
     public let workspaceLease: WorkspaceLease
+    public let storeLease: KnowledgeLease?
     public let authorization: ResolvedToolAuthorization
     /// Host policy input. This set must be resolved outside model-authored
     /// arguments; an OKF draft cannot grant trust to its own `verified.by`.
@@ -101,13 +133,17 @@ public struct KnowledgeBundleBuildRequest: Sendable {
     public init(draftRoot: URL,
                 storeRoot: URL,
                 expectedStoreID: String? = nil,
+                expectedSnapshotID: String? = nil,
                 workspaceLease: WorkspaceLease,
+                storeLease: KnowledgeLease? = nil,
                 authorization: ResolvedToolAuthorization,
                 trustedVerificationActors: Set<String> = []) {
         self.draftRoot = draftRoot
         self.storeRoot = storeRoot
         self.expectedStoreID = expectedStoreID
+        self.expectedSnapshotID = expectedSnapshotID
         self.workspaceLease = workspaceLease
+        self.storeLease = storeLease
         self.authorization = authorization
         self.trustedVerificationActors = trustedVerificationActors
     }
@@ -137,6 +173,7 @@ public struct KnowledgeBundleBuildService: Sendable {
     public let chunker: DeterministicKnowledgeChunker
     public let validator: KnowledgeValidator
     public let embeddingProvider: any KnowledgeEmbeddingProvider
+    public let rerankerModel: KnowledgeRerankerModelIdentity?
 
     private let now: @Sendable () -> Date
     private let opaqueID: @Sendable () -> String
@@ -146,6 +183,7 @@ public struct KnowledgeBundleBuildService: Sendable {
                 chunker: DeterministicKnowledgeChunker = DeterministicKnowledgeChunker(),
                 validator: KnowledgeValidator? = nil,
                 embeddingProvider: any KnowledgeEmbeddingProvider,
+                rerankerModel: KnowledgeRerankerModelIdentity? = nil,
                 now: @escaping @Sendable () -> Date = { Date() },
                 opaqueID: @escaping @Sendable () -> String = {
                     UUID().uuidString.lowercased()
@@ -157,6 +195,7 @@ public struct KnowledgeBundleBuildService: Sendable {
             fileSystem: fileSystem,
             okfReader: okfReader)
         self.embeddingProvider = embeddingProvider
+        self.rerankerModel = rerankerModel
         self.now = now
         self.opaqueID = opaqueID
     }
@@ -181,8 +220,8 @@ public struct KnowledgeBundleBuildService: Sendable {
                     "Knowledge store metadata did not satisfy the owner-only storage contract.")
             case .commitUncertain:
                 throw KnowledgeDomainError(
-                    .revisionChanged,
-                    retryable: true,
+                    .commitUncertain,
+                    retryable: false,
                     "Knowledge store publication may have committed and requires disk reconciliation.")
             case .lockFailed:
                 throw KnowledgeDomainError(
@@ -215,7 +254,7 @@ public struct KnowledgeBundleBuildService: Sendable {
         let storage = KnowledgeBuildStorage()
         let snapshotStore = try KnowledgeSnapshotStore(
             root: roots.store,
-            workspaceLease: request.workspaceLease,
+            workspaceLease: roots.storeWorkspaceLease,
             createIfMissing: true,
             fileSystem: fileSystem)
         let writer = try await acquireWriterLease(
@@ -230,6 +269,12 @@ public struct KnowledgeBundleBuildService: Sendable {
         // incremental reuse; a corrupt current snapshot is never silently
         // searched for a compatible historical fallback.
         let existingPointer = try writer.currentPointer()
+        guard (request.expectedStoreID == nil)
+                == (request.expectedSnapshotID == nil) else {
+            throw KnowledgeDomainError(
+                .toolInputInvalid,
+                "Existing-store updates require both expected_store_id and expected_snapshot_id.")
+        }
         if let expected = request.expectedStoreID {
             guard Self.validStoreID(expected), existingPointer?.storeID == expected else {
                 throw KnowledgeDomainError(
@@ -237,6 +282,21 @@ public struct KnowledgeBundleBuildService: Sendable {
                     retryable: true,
                     "The selected knowledge store identity changed before build admission.")
             }
+        }
+        if let expected = request.expectedSnapshotID {
+            guard Self.validSnapshotID(expected),
+                  existingPointer?.currentSnapshot == expected else {
+                throw KnowledgeDomainError(
+                    .revisionChanged,
+                    retryable: true,
+                    "The selected knowledge snapshot changed before build admission.")
+            }
+        }
+        if request.expectedStoreID == nil, existingPointer != nil {
+            throw KnowledgeDomainError(
+                .revisionChanged,
+                retryable: true,
+                "An existing knowledge store requires expected_store_id and expected_snapshot_id.")
         }
 
         let storeID = existingPointer?.storeID ?? "kb_\(opaqueID())"
@@ -316,7 +376,7 @@ public struct KnowledgeBundleBuildService: Sendable {
             try validatedCurrentSnapshot(
                 pointer: $0,
                 storeRoot: roots.store,
-                workspaceLease: request.workspaceLease,
+                workspaceLease: snapshotStore.managedContentWorkspaceLease,
                 evaluationDate: createdAt,
                 trustedVerificationActors: request.trustedVerificationActors)
         }
@@ -384,7 +444,7 @@ public struct KnowledgeBundleBuildService: Sendable {
             policy: KnowledgeValidationPolicy(
                 evaluationDate: createdAt,
                 trustedVerificationActors: request.trustedVerificationActors),
-            workspaceLease: request.workspaceLease)
+            workspaceLease: snapshotStore.managedContentWorkspaceLease)
         guard validated.profile == profile,
               validated.profile.retrievalSnapshot.id == snapshotID,
               validated.profile.retrievalSnapshot.revision
@@ -425,7 +485,8 @@ public struct KnowledgeBundleBuildService: Sendable {
     ) throws -> (
         draft: URL,
         draftIdentity: WorkspaceRootIdentity,
-        store: URL
+        store: URL,
+        storeWorkspaceLease: WorkspaceLease
     ) {
         let lease = request.workspaceLease
         let authorization = request.authorization
@@ -441,11 +502,19 @@ public struct KnowledgeBundleBuildService: Sendable {
             draftRoot: request.draftRoot,
             storeRoot: request.storeRoot,
             expectedStoreID: request.expectedStoreID,
+            expectedSnapshotID: request.expectedSnapshotID,
             workspaceLease: lease,
+            storeLease: request.storeLease,
             embeddingModel: embeddingProvider.modelIdentity,
+            rerankerModel: rerankerModel,
             trustedVerificationActors: request.trustedVerificationActors)
-        let modelIdentityData = try KnowledgeJSON.encode(
-            embeddingProvider.modelIdentity)
+        struct ModelIdentityProjection: Codable {
+            let embedding: KnowledgeEmbeddingModelIdentity
+            let reranker: KnowledgeRerankerModelIdentity?
+        }
+        let modelIdentityData = try KnowledgeJSON.encode(ModelIdentityProjection(
+            embedding: embeddingProvider.modelIdentity,
+            reranker: rerankerModel))
         guard let modelIdentityText = String(
             data: modelIdentityData,
             encoding: .utf8),
@@ -497,9 +566,37 @@ public struct KnowledgeBundleBuildService: Sendable {
         let draft = try fileSystem.authorizeRoot(
             request.draftRoot,
             workspaceLease: lease)
-        let requestedStore = try PathConfinement.resolve(
-            request.storeRoot.path,
-            within: workspace)
+        let storeWorkspaceLease: WorkspaceLease
+        let requestedStore: URL
+        if let knowledgeLease = request.storeLease {
+            guard let sessionID = authorization.sessionID,
+                  let agentID = authorization.agent else {
+                throw KnowledgeDomainError(
+                    .accessDenied,
+                    "External knowledge authority requires exact session and agent identity.")
+            }
+            try knowledgeLease.validate(
+                sessionID: sessionID,
+                agentID: agentID,
+                taskID: authorization.taskID,
+                turnID: nil,
+                operation: request.expectedStoreID == nil ? .build : .update)
+            guard request.storeRoot.standardizedFileURL.path
+                    == knowledgeLease.rootPath else {
+                throw KnowledgeDomainError(
+                    .accessDenied,
+                    "The requested knowledge directory does not match its exact lease.")
+            }
+            storeWorkspaceLease = knowledgeLease.projectedStoreWorkspaceLease()
+            requestedStore = URL(
+                fileURLWithPath: knowledgeLease.rootPath,
+                isDirectory: true)
+        } else {
+            storeWorkspaceLease = lease
+            requestedStore = try PathConfinement.resolve(
+                request.storeRoot.path,
+                within: workspace)
+        }
         let store: URL
         var isDirectory: ObjCBool = false
         if FileManager.default.fileExists(
@@ -512,8 +609,13 @@ public struct KnowledgeBundleBuildService: Sendable {
             }
             store = try fileSystem.authorizeRoot(
                 requestedStore,
-                workspaceLease: lease).canonical
+                workspaceLease: storeWorkspaceLease).canonical
         } else {
+            guard request.storeLease == nil else {
+                throw KnowledgeDomainError(
+                    .unsafeStorage,
+                    "An external KnowledgeLease must bind an existing exact directory.")
+            }
             var ancestor = requestedStore.deletingLastPathComponent()
             while !FileManager.default.fileExists(atPath: ancestor.path) {
                 let parent = ancestor.deletingLastPathComponent()
@@ -524,7 +626,9 @@ public struct KnowledgeBundleBuildService: Sendable {
                 }
                 ancestor = parent
             }
-            _ = try fileSystem.authorizeRoot(ancestor, workspaceLease: lease)
+            _ = try fileSystem.authorizeRoot(
+                ancestor,
+                workspaceLease: storeWorkspaceLease)
             store = requestedStore
         }
         guard draft.canonical.path != store.path,
@@ -535,11 +639,14 @@ public struct KnowledgeBundleBuildService: Sendable {
                 "Knowledge draft and versioned store must be separate workspace directories.")
         }
         try Self.validateLeasePath(draft.canonical, workspace: workspace, lease: lease)
-        try Self.validateLeasePath(store, workspace: workspace, lease: lease)
+        if request.storeLease == nil {
+            try Self.validateLeasePath(store, workspace: workspace, lease: lease)
+        }
         return (
             draft.canonical,
             draft.identity,
-            store)
+            store,
+            storeWorkspaceLease)
     }
 
     private func copyCanonicalDraft(
@@ -683,7 +790,9 @@ public struct KnowledgeBundleBuildService: Sendable {
             throw KnowledgeDomainError(.integrityFailed, "Knowledge store pointer shape is invalid.")
         }
         let snapshot = storeRoot
-            .appendingPathComponent("snapshots", isDirectory: true)
+            .appendingPathComponent(
+                KnowledgeSnapshotStore.publishedSnapshotsDirectoryName,
+                isDirectory: true)
             .appendingPathComponent(pointer.currentSnapshot, isDirectory: true)
         let validated = try validator.validateSnapshot(
             at: snapshot,
@@ -990,7 +1099,9 @@ public struct KnowledgeBundleBuildService: Sendable {
             documentCount: lexical.documentCount,
             indexDigest: lexical.indexDigest)
 
-        let reranker = KnowledgeRerankerProfile(mode: .disabled, model: nil)
+        let reranker = KnowledgeRerankerProfile(
+            mode: rerankerModel == nil ? .disabled : .required,
+            model: rerankerModel)
         let retrieval = KnowledgeProfile.Retrieval(
             dense: "required",
             lexical: "required",
@@ -1141,8 +1252,10 @@ public struct KnowledgeBundleBuildService: Sendable {
                                           workspace: URL,
                                           lease: WorkspaceLease) throws {
         let relative = PathConfinement.relativePath(of: url, root: workspace)
+        let deniedPatterns = lease.deniedPatterns
+            + WorkspaceLease.mandatoryManagedStoreDeniedPatterns
         guard relative != url.path,
-              !lease.deniedPatterns.contains(where: {
+              !deniedPatterns.contains(where: {
                   leasePath(relative, matches: $0, caseInsensitive: true)
               }),
               lease.allowedPathRules.contains(where: {

@@ -6,6 +6,7 @@ import XCTest
 
 #if canImport(CoreGraphics) && canImport(PDFKit)
 import CoreGraphics
+import CoreText
 import PDFKit
 #endif
 
@@ -32,6 +33,254 @@ private actor RecordingDocumentBackendRunner: DocumentBackendRunner {
 
 final class DocumentToolsIntegrationTests: XCTestCase {
     private let fileManager = FileManager.default
+
+    func testInstalledDocumentRuntimeEPUBWriteWhenEnabled() async throws {
+        guard ProcessInfo.processInfo.environment["INTATIS_REAL_DOCUMENT_RUNTIME_SMOKE"] == "1" else {
+            throw XCTSkip(
+                "set INTATIS_REAL_DOCUMENT_RUNTIME_SMOKE=1 to run the installed document runtime smoke")
+        }
+        guard let runtime = intatisDocumentRuntimeRoot(),
+              fileManager.isExecutableFile(
+                  atPath: runtime.appendingPathComponent("bin/intatis-rbook-helper").path),
+              fileManager.isExecutableFile(
+                  atPath: runtime.appendingPathComponent("bin/intatis-epubcheck").path) else {
+            throw XCTSkip("fixed rbook and EPUBCheck runtimes are not installed")
+        }
+        let workspace = try makeWorkspace()
+        defer { try? fileManager.removeItem(at: workspace) }
+        try Data(#"<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Chapter One</title></head><body><h1>Chapter One</h1><p>Runtime smoke.</p></body></html>"#.utf8)
+            .write(to: workspace.appendingPathComponent("chapter.xhtml"))
+        let context = ToolContext(
+            workspaceRoot: workspace,
+            documentBackend: DocumentBackendProcessRunner(timeoutSeconds: 300))
+
+        let observation = try await DocumentWriteTool().execute(
+            ToolArgs(raw: #"""
+            {
+              "format":"epub","mode":"create","output_path":"runtime-smoke.epub",
+              "operations":[
+                {"kind":"metadata.set","parameters":{"field":"identifier","value":"urn:intatis:runtime-smoke"}},
+                {"kind":"metadata.set","parameters":{"field":"title","value":"Intatis Runtime Smoke"}},
+                {"kind":"metadata.set","parameters":{"field":"language","value":"en"}},
+                {"kind":"resource.add","parameters":{"id":"chapter_one","source_path":"chapter.xhtml","href":"text/chapter.xhtml","media_type":"application/xhtml+xml"}},
+                {"kind":"spine.append","parameters":{"resource_id":"chapter_one","linear":true}},
+                {"kind":"toc.add","parameters":{"label":"Chapter One","href":"text/chapter.xhtml"}}
+              ]
+            }
+            """#),
+            in: context)
+
+        XCTAssertTrue(fileManager.fileExists(
+            atPath: workspace.appendingPathComponent("runtime-smoke.epub").path))
+        XCTAssertTrue(observation.text.contains(#""epubcheck":"5.3.0""#), observation.text)
+        XCTAssertTrue(observation.text.contains(#""rbook":"0.7.10""#), observation.text)
+    }
+
+    func testInstalledDocumentRuntimeCoreToolChainWhenEnabled() async throws {
+        guard ProcessInfo.processInfo.environment["INTATIS_REAL_DOCUMENT_RUNTIME_SMOKE"] == "1" else {
+            throw XCTSkip(
+                "set INTATIS_REAL_DOCUMENT_RUNTIME_SMOKE=1 to run the installed document runtime smoke")
+        }
+        guard let runtime = intatisDocumentRuntimeRoot(),
+              let libreOffice = intatisLibreOfficeRuntimeAppURL()?
+                  .appendingPathComponent("Contents/MacOS/soffice"),
+              fileManager.isExecutableFile(
+                  atPath: runtime.appendingPathComponent("bin/python3").path),
+              fileManager.isExecutableFile(
+                  atPath: runtime.appendingPathComponent("bin/pdfcpu").path),
+              fileManager.isExecutableFile(
+                  atPath: libreOffice.path) else {
+            throw XCTSkip("fixed Python, pdfcpu, or LibreOffice runtime is not installed")
+        }
+        let workspace = try makeWorkspace()
+        defer { try? fileManager.removeItem(at: workspace) }
+        let context = ToolContext(
+            workspaceRoot: workspace,
+            documentBackend: DocumentBackendProcessRunner(timeoutSeconds: 300))
+        let marker = "INTATIS DOCUMENT RUNTIME 73921"
+
+        let write = try await DocumentWriteTool().execute(
+            ToolArgs(raw: #"""
+            {"format":"docx","mode":"create","output_path":"runtime-smoke.docx",
+             "operations":[{"kind":"paragraph.add","parameters":{"text":"INTATIS DOCUMENT RUNTIME 73921"}}]}
+            """#),
+            in: context)
+        XCTAssertTrue(write.text.contains(#""operation":"document_write""#), write.text)
+
+        let read = try await DocumentReadTool().execute(
+            ToolArgs(raw: #"{"format":"docx","input_path":"runtime-smoke.docx"}"#),
+            in: context)
+        XCTAssertTrue(read.text.contains(marker), read.text)
+
+        let docxDigest = try DocumentInputFile.freeze(
+            path: "runtime-smoke.docx",
+            expectedFormat: .docx,
+            workspace: workspace).identity.sha256
+        let export = try await DocumentExportPDFTool().execute(
+            ToolArgs(raw: """
+            {"input_format":"docx","input_path":"runtime-smoke.docx",
+             "expected_source_sha256":"\(docxDigest)","output_path":"runtime-smoke.pdf"}
+            """),
+            in: context)
+        XCTAssertTrue(export.text.contains(#""pdfcpu":"0.13.0""#), export.text)
+        XCTAssertTrue(export.text.contains(#""libreoffice":"26.8.0.0.beta1""#), export.text)
+
+        let pdfRead = try await ReadPDFTool().execute(
+            ToolArgs(raw: #"{"path":"runtime-smoke.pdf"}"#),
+            in: context)
+        XCTAssertTrue(pdfRead.text.contains(marker), pdfRead.text)
+
+        let pdfDigest = try DocumentInputFile.freeze(
+            path: "runtime-smoke.pdf",
+            expectedFormat: .pdf,
+            workspace: workspace).identity.sha256
+        let render = try await DocumentRenderTool().execute(
+            ToolArgs(raw: """
+            {"input_format":"pdf","input_path":"runtime-smoke.pdf",
+             "expected_source_sha256":"\(pdfDigest)","pages":"1","output_dir":"runtime-pages"}
+            """),
+            in: context)
+        XCTAssertTrue(render.text.contains(#""operation":"document_render""#), render.text)
+        XCTAssertTrue(fileManager.fileExists(
+            atPath: workspace.appendingPathComponent("runtime-pages/manifest.json").path))
+        XCTAssertTrue(fileManager.fileExists(
+            atPath: workspace.appendingPathComponent("runtime-pages/page-0001.png").path))
+
+        let slideMarker = "INTATIS PRESENTATION RUNTIME 48216"
+        let pptxWrite = try await DocumentWriteTool().execute(
+            ToolArgs(raw: """
+            {"format":"pptx","mode":"create","output_path":"runtime-smoke.pptx",
+             "operations":[{"kind":"slide.add","parameters":{"layout_index":0,
+              "title":"\(slideMarker)"}}]}
+            """),
+            in: context)
+        XCTAssertTrue(pptxWrite.text.contains(#""libreoffice":"26.8.0.0.beta1""#), pptxWrite.text)
+        let pptxRead = try await DocumentReadTool().execute(
+            ToolArgs(raw: #"{"format":"pptx","input_path":"runtime-smoke.pptx"}"#),
+            in: context)
+        XCTAssertTrue(pptxRead.text.contains(slideMarker), pptxRead.text)
+        let pptxDigest = try DocumentInputFile.freeze(
+            path: "runtime-smoke.pptx",
+            expectedFormat: .pptx,
+            workspace: workspace).identity.sha256
+        let pptxExport = try await DocumentExportPDFTool().execute(
+            ToolArgs(raw: """
+            {"input_format":"pptx","input_path":"runtime-smoke.pptx",
+             "expected_source_sha256":"\(pptxDigest)","output_path":"runtime-smoke-pptx.pdf"}
+            """),
+            in: context)
+        XCTAssertTrue(pptxExport.text.contains(#""libreoffice":"26.8.0.0.beta1""#), pptxExport.text)
+        let pptxPDFRead = try await ReadPDFTool().execute(
+            ToolArgs(raw: #"{"path":"runtime-smoke-pptx.pdf"}"#),
+            in: context)
+        let pptxPDFJSON = try JSONDecoder().decode(
+            JSONValue.self,
+            from: Data(pptxPDFRead.text.utf8))
+        guard case .object(let pptxPDFRoot) = pptxPDFJSON,
+              case .string(let pptxPDFText)? = pptxPDFRoot["combinedText"] else {
+            XCTFail("PPTX PDF read did not contain combinedText")
+            return
+        }
+        let compactPPTXPDFText = pptxPDFText.filter { $0.isWhitespace == false }
+        XCTAssertTrue(
+            compactPPTXPDFText.contains(slideMarker.filter { $0.isWhitespace == false }),
+            pptxPDFRead.text)
+
+        let xlsxWrite = try await DocumentWriteTool().execute(
+            ToolArgs(raw: #"""
+            {"format":"xlsx","mode":"create","output_path":"runtime-smoke.xlsx",
+             "operations":[
+              {"kind":"cell.set","parameters":{"sheet":"Sheet","cell":"A1","value":2}},
+              {"kind":"cell.set","parameters":{"sheet":"Sheet","cell":"B1","value":"=A1*2"}}
+             ]}
+            """#),
+            in: context)
+        XCTAssertTrue(
+            xlsxWrite.text.contains(#""xlsx_recalculation":"calc_roundtrip_cache_verified""#),
+            xlsxWrite.text)
+        XCTAssertTrue(xlsxWrite.text.contains(#""libreoffice":"26.8.0.0.beta1""#), xlsxWrite.text)
+        let xlsxRead = try await DocumentReadTool().execute(
+            ToolArgs(raw: #"""
+            {"format":"xlsx","input_path":"runtime-smoke.xlsx",
+             "options":{"sheet":"Sheet","cell_range":"A1:B1","include_formulas":false}}
+            """#),
+            in: context)
+        XCTAssertTrue(xlsxRead.text.contains(#""coordinate":"B1""#), xlsxRead.text)
+        XCTAssertTrue(xlsxRead.text.contains(#""data_type":"n","value":4"#), xlsxRead.text)
+        let xlsxDigest = try DocumentInputFile.freeze(
+            path: "runtime-smoke.xlsx",
+            expectedFormat: .xlsx,
+            workspace: workspace).identity.sha256
+        let xlsxExport = try await DocumentExportPDFTool().execute(
+            ToolArgs(raw: """
+            {"input_format":"xlsx","input_path":"runtime-smoke.xlsx",
+             "expected_source_sha256":"\(xlsxDigest)","output_path":"runtime-smoke-xlsx.pdf"}
+            """),
+            in: context)
+        XCTAssertTrue(xlsxExport.text.contains(#""libreoffice":"26.8.0.0.beta1""#), xlsxExport.text)
+    }
+
+    func testInstalledDocumentRuntimePDFCPUAndOCRWhenEnabled() async throws {
+        guard ProcessInfo.processInfo.environment["INTATIS_REAL_DOCUMENT_RUNTIME_SMOKE"] == "1" else {
+            throw XCTSkip(
+                "set INTATIS_REAL_DOCUMENT_RUNTIME_SMOKE=1 to run the installed document runtime smoke")
+        }
+        #if canImport(CoreGraphics) && canImport(PDFKit)
+        guard let runtime = intatisDocumentRuntimeRoot(),
+              fileManager.isExecutableFile(
+                  atPath: runtime.appendingPathComponent("bin/pdfcpu").path),
+              fileManager.isExecutableFile(
+                  atPath: runtime.appendingPathComponent("bin/python3").path) else {
+            throw XCTSkip("fixed pdfcpu and Python document runtimes are not installed")
+        }
+        let workspace = try makeWorkspace()
+        defer { try? fileManager.removeItem(at: workspace) }
+        let stage = workspace.appendingPathComponent(
+            ".intatis-document-stage-runtime-smoke",
+            isDirectory: true)
+        try fileManager.createDirectory(at: stage, withIntermediateDirectories: false)
+        let input = stage.appendingPathComponent("ocr-source.pdf")
+        try makeOCRTextPDF(at: input)
+        let runner = DocumentBackendProcessRunner(timeoutSeconds: 300)
+        let context = ToolContext(workspaceRoot: workspace, documentBackend: runner)
+
+        let validatorVersions = try await PDFCPUValidationBackend.validateStrict(
+            stagedPDF: input,
+            reviewedOutputPath: "result.pdf",
+            in: context)
+        XCTAssertEqual(validatorVersions["pdfcpu"], "0.13.0")
+
+        let digest = try DocumentInputFile.freeze(
+            path: ".intatis-document-stage-runtime-smoke/ocr-source.pdf",
+            expectedFormat: .pdf,
+            workspace: workspace).identity.sha256
+        let observation = try await DocumentOCRTool().execute(
+            ToolArgs(raw: """
+            {"input_path":".intatis-document-stage-runtime-smoke/ocr-source.pdf",
+             "expected_source_sha256":"\(digest)",
+             "languages":["eng"],"psm":6}
+            """),
+            in: context)
+        let observationJSON = try JSONDecoder().decode(
+            JSONValue.self,
+            from: Data(observation.text.utf8))
+        guard case .object(let root) = observationJSON,
+              case .object(let result)? = root["result"],
+              case .array(let pages)? = result["pages"] else {
+            XCTFail("OCR observation did not contain result.pages")
+            return
+        }
+        let recognized = pages.compactMap { page -> String? in
+            guard case .object(let fields) = page,
+                  case .string(let text)? = fields["text"] else { return nil }
+            return text
+        }.joined(separator: "\n")
+        let normalized = recognized.uppercased().filter { $0.isLetter || $0.isNumber }
+        XCTAssertTrue(normalized.contains("INTATISOCR48291"), observation.text)
+        #else
+        throw XCTSkip("real document runtime smoke requires Apple PDF frameworks")
+        #endif
+    }
 
     func testStandardRegistryExposesOnlySixReplacementDocumentTools() throws {
         let registry = ToolRegistry.standard()
@@ -359,6 +608,38 @@ final class DocumentToolsIntegrationTests: XCTestCase {
         #endif
     }
 
+    #if os(macOS)
+    func testLibreOfficeSandboxAllowsOnlyInvocationPrivateUnixSocket() throws {
+        let workspace = try makeWorkspace()
+        defer { try? fileManager.removeItem(at: workspace) }
+        let socketRoot = URL(
+            fileURLWithPath: "/private/tmp/intatis-lo-0123456789ab",
+            isDirectory: true)
+        let lease = WorkspaceLease(
+            rootPath: workspace.path,
+            access: .readOnly,
+            allowedPathRules: [],
+            deniedPatterns: [])
+
+        let profile = try macOSSandboxProfile(
+            workspace: workspace,
+            runtime: fileManager.temporaryDirectory,
+            trustedReadRoots: [],
+            writableRoots: [],
+            workspaceLease: lease,
+            processCompatibility: .libreOfficeHeadless,
+            libreOfficeSocketRoot: socketRoot,
+            networkAccess: .denied)
+
+        XCTAssertTrue(profile.contains(#"(subpath "/private/tmp/intatis-lo-0123456789ab")"#))
+        XCTAssertTrue(profile.contains("(local unix-socket (path-regex"))
+        XCTAssertTrue(profile.contains("(remote unix-socket (path-regex"))
+        XCTAssertTrue(profile.contains("/OSL_PIPE_[^/]+$"))
+        XCTAssertTrue(profile.contains("(deny network* (local ip) (remote ip))"))
+        XCTAssertFalse(profile.contains("(allow network*)"))
+    }
+    #endif
+
     func testDocumentGeneratedOutputBudgetCountsAggregateFilesAndEntries() throws {
         let workspace = try makeWorkspace()
         defer { try? fileManager.removeItem(at: workspace) }
@@ -411,6 +692,46 @@ final class DocumentToolsIntegrationTests: XCTestCase {
     }
 
     #if canImport(CoreGraphics) && canImport(PDFKit)
+    private func makeOCRTextPDF(at url: URL) throws {
+        let width = 2_400
+        let height = 800
+        guard let bitmap = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+            throw NSError(domain: "DocumentToolsIntegrationTests", code: 3)
+        }
+        bitmap.setFillColor(CGColor(gray: 1, alpha: 1))
+        bitmap.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        let attributes: [NSAttributedString.Key: Any] = [
+            NSAttributedString.Key(kCTFontAttributeName as String):
+                CTFontCreateWithName("Helvetica-Bold" as CFString, 180, nil),
+            NSAttributedString.Key(kCTForegroundColorAttributeName as String):
+                CGColor(gray: 0, alpha: 1),
+        ]
+        let line = CTLineCreateWithAttributedString(NSAttributedString(
+            string: "INTATIS OCR 48291",
+            attributes: attributes))
+        bitmap.textPosition = CGPoint(x: 120, y: 300)
+        CTLineDraw(line, bitmap)
+        guard let image = bitmap.makeImage(),
+              let consumer = CGDataConsumer(url: url as CFURL) else {
+            throw NSError(domain: "DocumentToolsIntegrationTests", code: 4)
+        }
+        var mediaBox = CGRect(x: 0, y: 0, width: 600, height: 200)
+        guard let context = CGContext(consumer: consumer, mediaBox: &mediaBox, nil) else {
+            throw NSError(domain: "DocumentToolsIntegrationTests", code: 5)
+        }
+        context.beginPDFPage(nil)
+        context.draw(image, in: mediaBox)
+        context.endPDFPage()
+        context.closePDF()
+    }
+
     private func makeImageOnlyPDF(at url: URL) throws {
         guard let consumer = CGDataConsumer(url: url as CFURL) else {
             throw NSError(domain: "DocumentToolsIntegrationTests", code: 1)

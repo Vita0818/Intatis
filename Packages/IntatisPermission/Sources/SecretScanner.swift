@@ -36,10 +36,16 @@ public enum SecretScanner {
     /// Content that looks like it carries a secret (used for shell + agent-to-agent forwarding).
     public static func containsSecret(_ text: String) -> Bool {
         let markers = [
-            "-----BEGIN", "PRIVATE KEY", "AKIA", "ASIA", "sk-", "ssh-rsa ",
+            "-----BEGIN", "PRIVATE KEY", "AKIA", "ASIA", "ssh-rsa ",
             "xoxb-", "xoxp-", "ghp_", "github_pat_", "AIza",
         ]
-        return markers.contains { text.contains($0) }
+        if markers.contains(where: text.contains) { return true }
+        // `sk-` may occur inside ordinary prose such as "ask-user". Require
+        // a token boundary and a credential-length suffix before treating an
+        // OpenAI-style prefix as secret-bearing.
+        return text.range(
+            of: #"(^|[^A-Za-z0-9])sk-[A-Za-z0-9_-]{12,}"#,
+            options: .regularExpression) != nil
     }
 
     private static let protectedBasenames: Set<String> = [

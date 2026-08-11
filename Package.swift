@@ -117,6 +117,7 @@ let package = Package(
             name: "IntatisKnowledge",
             dependencies: [
                 "IntatisCore", "IntatisProtocol", "IntatisTools",
+                "IntatisProviders", "IntatisPermission",
                 .product(name: "Yams", package: "Yams"),
                 .product(
                     name: "Crypto",
@@ -371,7 +372,7 @@ let package = Package(
             dependencies: [
                 "IntatisAgentKernel", "IntatisCore", "IntatisProtocol", "IntatisProviders",
                 "IntatisTools", "IntatisPermission", "IntatisConversation",
-                "IntatisArtifacts", "IntatisMCP", "IntatisSkills",
+                "IntatisArtifacts", "IntatisMCP", "IntatisSkills", "IntatisKnowledge",
                 .product(
                     name: "Crypto",
                     package: "swift-crypto",

@@ -17,6 +17,15 @@ private struct FakeShell: ShellRunner {
     func run(_ command: String, cwd: URL) async throws -> ShellResult { result }
 }
 
+private actor InternalToolDrainProbe {
+    private var closes = 0
+    func close() -> Bool {
+        closes += 1
+        return false
+    }
+    func count() -> Int { closes }
+}
+
 private actor ShellResultQueue {
     private var results: [ShellResult]
 
@@ -230,6 +239,29 @@ private struct FakeImageGenerator: ImageGenerationToolService {
 }
 
 final class IntatisToolsTests: XCTestCase {
+    func testCheckedInternalToolCloseFailsAndRemainsSingleFlight() async {
+        let probe = InternalToolDrainProbe()
+        let lease = HostToolRegistryAugmentationLease(
+            registry: ToolRegistry([]),
+            close: { await probe.close() })
+
+        do {
+            try await lease.closeRequiringDrain()
+            XCTFail("a failed internal resource drain must not become success")
+        } catch let error as IntatisError {
+            guard case .io(let message) = error else {
+                return XCTFail("unexpected checked-close error: \(error)")
+            }
+            XCTAssertTrue(message.contains("did not drain"))
+        } catch {
+            XCTFail("unexpected checked-close error type: \(error)")
+        }
+        let repeated = await lease.close()
+        let closes = await probe.count()
+        XCTAssertFalse(repeated)
+        XCTAssertEqual(closes, 1)
+    }
+
 
     private func tempWorkspace() throws -> URL {
         let ws = FileManager.default.temporaryDirectory
@@ -465,6 +497,105 @@ final class IntatisToolsTests: XCTestCase {
 
         let read = try await ReadFileTool().execute(ToolArgs(raw: #"{"path":"f.txt"}"#), in: ctx)
         XCTAssertEqual(read.text, "a\nB\nc")
+    }
+
+    func testOrdinaryFileToolsCannotBypassManagedKnowledgePublication()
+        async throws {
+        let ws = try tempWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let store = ws.appendingPathComponent("knowledge", isDirectory: true)
+        let snapshots = store.appendingPathComponent(
+            ".intatis-rag-snapshots",
+            isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: snapshots,
+            withIntermediateDirectories: true)
+        let pointer = store.appendingPathComponent(".intatis-rag-store.json")
+        let snapshotFile = snapshots.appendingPathComponent("profile.json")
+        try Data("pointer-original".utf8).write(to: pointer)
+        try Data("snapshot-original".utf8).write(to: snapshotFile)
+
+        // Even a legacy/decoded lease with an empty deny list cannot remove
+        // the host-owned publication floor at the executor boundary.
+        let context = ToolContext(
+            workspaceRoot: ws,
+            workspaceLease: WorkspaceLease(
+                rootPath: ws.path,
+                access: .readWrite,
+                deniedPatterns: []))
+
+        do {
+            _ = try await ReadFileTool().execute(
+                ToolArgs(raw: #"{"path":"knowledge/.intatis-rag-store.json"}"#),
+                in: context)
+            XCTFail("read_file unexpectedly read the Knowledge pointer")
+        } catch {
+            XCTAssertTrue(
+                String(describing: error).contains(
+                    "denied by the workspace lease"),
+                "\(error)")
+        }
+
+        do {
+            _ = try await ListFilesTool().execute(
+                ToolArgs(raw: #"{"path":"knowledge/.intatis-rag-snapshots"}"#),
+                in: context)
+            XCTFail("list_files unexpectedly traversed Knowledge snapshots")
+        } catch {
+            XCTAssertTrue(
+                String(describing: error).contains(
+                    "denied by the workspace lease"),
+                "\(error)")
+        }
+
+        do {
+            _ = try await SearchTextTool().execute(
+                ToolArgs(raw: #"{"query":"snapshot","path":"knowledge/.intatis-rag-snapshots"}"#),
+                in: context)
+            XCTFail("search_text unexpectedly traversed Knowledge snapshots")
+        } catch {
+            XCTAssertTrue(
+                String(describing: error).contains(
+                    "denied by the workspace lease"),
+                "\(error)")
+        }
+
+        do {
+            _ = try await WriteFileTool().execute(
+                ToolArgs(raw: #"{"path":"knowledge/.intatis-rag-store.json","content":"changed"}"#),
+                in: context)
+            XCTFail("write_file unexpectedly modified the Knowledge pointer")
+        } catch {
+            XCTAssertTrue(
+                String(describing: error).contains(
+                    "denied by the workspace lease"),
+                "\(error)")
+        }
+
+        let diff = [
+            "--- a/knowledge/.intatis-rag-snapshots/profile.json",
+            "+++ b/knowledge/.intatis-rag-snapshots/profile.json",
+            "@@ -1 +1 @@",
+            "-snapshot-original",
+            "+changed",
+        ].joined(separator: "\n")
+        let patchData = try JSONSerialization.data(withJSONObject: [
+            "diff": diff,
+        ])
+        do {
+            _ = try await ApplyPatchTool().execute(
+                ToolArgs(raw: String(decoding: patchData, as: UTF8.self)),
+                in: context)
+            XCTFail("apply_patch unexpectedly modified a Knowledge snapshot")
+        } catch {
+            XCTAssertTrue(
+                String(describing: error).contains(
+                    "denied by the workspace lease"),
+                "\(error)")
+        }
+
+        XCTAssertEqual(try String(contentsOf: pointer), "pointer-original")
+        XCTAssertEqual(try String(contentsOf: snapshotFile), "snapshot-original")
     }
 
     // MARK: Shell + git tools (injected fakes)

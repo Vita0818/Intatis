@@ -238,7 +238,7 @@ public actor KnowledgeMountRegistry {
                 reader.snapshotRoot,
                 .mount,
                 policy,
-                store.workspaceLease)
+                store.managedContentWorkspaceLease)
             try Self.validate(
                 reader: reader,
                 snapshot: snapshot)
@@ -284,7 +284,7 @@ public actor KnowledgeMountRegistry {
                 reader.snapshotRoot,
                 .mount,
                 policy,
-                store.workspaceLease)
+                store.managedContentWorkspaceLease)
             try Self.validate(reader: reader, snapshot: snapshot)
             var handle = KnowledgeBaseHandle.make()
             while entries[handle] != nil {
@@ -349,7 +349,7 @@ public actor KnowledgeMountRegistry {
                 reader.snapshotRoot,
                 .mount,
                 policy,
-                entry.store.workspaceLease)
+                entry.store.managedContentWorkspaceLease)
             try Self.validate(reader: reader, snapshot: snapshot)
             let binding = Self.binding(
                 handle: handle,

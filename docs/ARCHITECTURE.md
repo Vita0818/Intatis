@@ -1,7 +1,7 @@
 # ARCHITECTURE
 
 文档状态：当前架构规范
-最近核对：2026-08-10
+最近核对：2026-08-11
 产品基线：v0.40（build 40）
 
 文中较早的 v0.x 只表示能力最初引入或兼容格式冻结的里程碑；除明确标为历史的段落外，
@@ -21,9 +21,93 @@ Capability/WorkspaceLease、PathConfinement、SecretScanner、durable execution�
 managed terminal 的 workspace-scoped Seatbelt/default-network-deny、
 Hardened Runtime、签名/公证与 iOS target 边界仍是当前架构。
 
+## 2026-08-10 模型驱动 Knowledge 工具架构
+
+2026-08-09 的 OKF/Profile/Validator/immutable-store 是继续复用的 local core；shipping 产品面由
+`ModelDrivenKnowledgeToolHost` 在 Code、Cowork exact `@main` 和 macOS CLI 动态接入两个
+closed-schema 工具，不新增 Knowledge 管理 UI：
+
+```text
+自然语言任务
+  -> Agent 使用现有文件/PDF/文档工具读取、归纳并写 OKF draft
+  -> build_knowledge(draft_path, store_path, expected IDs?)
+       -> PermissionEngine + durable execution ticket
+       -> WorkspaceLease store 或 exact external KnowledgeLease
+       -> configured document embedding
+       -> canonical writer + Validator + immutable atomic publish
+       -> snapshot 冻结 complete embedding identity + required reranker identity
+  -> search_knowledge(store_path, query, limit?)
+       -> per-call exact authority + current pointer + immutable mount
+       -> compatible query embedding -> dense/BM25/RRF candidates
+       -> ACL/status/trust/source filter
+       -> configured semantic reranker(query, bounded authorized text)
+       -> rerank_applied=true 的 bounded evidence
+       -> current-turn citation registry + final exact-snapshot revalidation
+```
+
+两个工具的输入、输出与 `additionalProperties: false` 均由宿主在 permission 和 execution 前完整
+校验。`expected_store_id` / `expected_snapshot_id`、`limit` 等字段按产品合同保留为可选，因此
+model-facing descriptor 不向 provider 宣告 `strict: true`；否则 OpenAI/OpenRouter 的 strict
+Structured Outputs 规则会要求所有 properties 同时出现在 `required`，真实请求会在工具执行前被拒绝。
+这不放宽宿主校验。Chat Completions function tool wire 只发送 name/description/parameters/可选 strict，
+不携带 Responses-only 的 `defer_loading` 或 `output_schema`；Responses wire 继续保留自己的 metadata。
+
+高级配置以 canonical `embedding_model` 与 `reranker_model` 提供两个独立 `ModelRef`。route identity
+提交 provider/model、base URL、wire/adapter、credential-reference digest、模型 options 和 role
+参数，但不提交 secret；credential 只在真实 embedding/rerank network dispatch 内懒解析。当前首发
+adapter 是 OpenAI-compatible / OpenRouter embeddings，以及显式 SiliconFlow v1 / Cohere v2 /
+OpenRouter rerank dialect。OpenRouter 的 exact `/embeddings`、`/rerank` 与顶层 rerank `usage` shape
+均有独立 fixture；`google/gemini-embedding-2` 的 reviewed profile 显式请求并验证 1536 维。
+任一 role 缺失、dialect 不支持、snapshot binding 漂移或 reranker 输出不是完整 candidate permutation
+都 fail closed；shipping path 不使用 Chat model、Apple NaturalLanguage 或 cosine fallback。
+Mac/CLI 在广告工具或显示 `knowledge ready` 前调用与真实 provider 构造共用 configuration builder 的
+同步预检；它验证两个 endpoint、adapter、dimension、role options 与 secret-free route identity，不解析
+credential、不联网，也不取得 bookmark/store authority。预检失败时 augmenter 为 nil，错误通过现有
+Code/Cowork 配置状态或 CLI banner/`/config` 呈现，模型不会看到一个注定失败的 Knowledge tool。
+provider adapter 同时保留经过非负/有限值校验的 token 与 billable-unit usage，供显式付费的 live
+acceptance harness 按 exact route 报告；架构不根据会变化的供应商价格表推算金额，缺失 usage 也必须
+明确显示为 unreported，不能伪造为零成本。
+顶层 Knowledge role 引用的 exact model 即使为了 adapter/options 出现在 provider `models` map 中，
+Mac/CLI 也只把它保留在 role lowering，不编译成 Chat/Cowork inference profile，不显示在模型菜单。
+
+`store_path` 只是模型提供的地址，不授予权限。workspace 内路径继续由当前 WorkspaceLease 管理；
+workspace 外路径由宿主在 permission settlement 后换成独立 `KnowledgeLease`，绑定 exact
+session/agent/task/root identity/access/operation/revision/expiry/revocation。macOS raw security-scoped
+bookmark 只存在 session-owned `knowledge-access.plist`，EventLog/session.json 只能接收不含路径和
+bookmark 的 digest projection；CLI 生成 invocation authorization reference，不持久扩大 workspace。
+bookmark 文件与跨进程 sidecar lock 均为 no-follow、current-owner、regular-file、single-link；lock 只在
+取得这些 inode 级证明并收窄为 `0600` 后才可 `flock`。
+外部 scope 由 tool invocation 持有，build 结束即释放；search scope 与 exact mount 保留到该 turn 的
+grounding revalidation 完成，并在 augmenter close/shutdown 时 revoke、cancel、drain、release。
+Host augmentation 的关闭是 checked contract：timeout 后仍有 active access 时返回失败，Code/Cowork/
+CLI 不得把它吞成正常 completion；runtime shutdown 继续报告该 drain failure，并保留 fail-closed 状态。
+
+发布布局使用 `.intatis-rag-store.json`、`.intatis-rag-snapshots/` 和 `.intatis-rag-host/`。三者是
+WorkspaceLease 与 managed terminal 的不可移除、大小写无关 deny floor，因此普通 file/patch/Git/
+process/terminal 即使拿到 workspace read-write 也不能改写或删除已发布内容。只有 Knowledge module
+内部从同一 exact lease 派生的最小 managed-content projection 可进入 writer/Validator 路径。旧
+`snapshots/` 目录只由 read-write build/update 在 store lock 内原子迁移；只读 search/restore
+不创建或修复 store 基础设施。pointer 写入或旧布局 rename 后若无法证明 parent directory durability，
+返回 non-retryable `commitUncertain`，由后续 reconciliation 判断磁盘事实，不能自动重试。
+
+能力可见性由 host registration 与 exact CapabilityLease 同时决定。Mac Code root、Cowork exact
+`@main`、CLI Code/Cowork 在两个 route 可解析时获得 build/search；普通 worker、mailbox delivery、
+permission reviewer、GoalVerifier、Chat 和 iOS 不继承。旧 snapshot-bound
+`KnowledgeSearchToolHostAdapter` 仅作兼容 seam，不是 shipping path-aware 产品 surface。
+
+2026-08-11 的 live acceptance 已覆盖 configured embedding/reranker 最小请求、冻结质量集、真实模型
+read-organize-build-search-cite、三份原生文本 PDF、macOS exact-directory NSOpenPanel、session-owned
+bookmark 跨应用重启恢复，以及实际 managed-terminal anti-bypass。冻结 8-query 质量集上，dense baseline
+为 MRR/nDCG@5/Recall@5 = 1.000/1.000/1.000，configured reranker 为
+1.000/0.990/1.000；因此链路功能验收成立，但这个小型集合没有证明 reranker uplift，反而出现 0.010
+nDCG@5 回退。该结果必须保留，不能把“required reranker 被调用”写成“质量一定提高”。
+
 ## 2026-08-09 OKF / RAG knowledge bundle 架构
 
-第一版知识库保持四组件边界：仓内固定的 Open Knowledge Format v0.2 文档、
+本节记录仍有效的 local core；其“仅 search、仅 workspace、Apple/local route 可代表产品”等旧
+surface 已由上节和 `codex-report/08_10_26-16_57-model-driven-knowledge-tools-design.md` 覆盖。
+
+08-09 第一版知识库设计保持四组件边界：仓内固定的 Open Knowledge Format v0.2 文档、
 `IntatisKnowledge` 的薄 Profile/build adapter、同 target 内不调用模型的
 deterministic Validator，以及唯一 model-facing `search_knowledge` 工具。外部知识连接器、
 PDF/Office/OCR 解析、建库 UI、Chat/iOS 接入和 MCP Server 都不属于该组件；它们不能被
@@ -54,7 +138,7 @@ quantization/pooling/L2/cosine/document+query instruction/max input/truncation�
 revision、chunk manifest、retrieval policy、reranker binding 和 composite snapshot revision。
 任一语义字段变化都不能复用旧 vector；current 不兼容时不得扫描 retained snapshot 回退。
 
-P0 local route 使用 Apple NaturalLanguage sentence embedding 的 exact language/revision/
+08-09 P0 local route 使用 Apple NaturalLanguage sentence embedding 的 exact language/revision/
 dimension/runtime binding，向量在写入与查询时按冻结 L2/cosine 合同验证；存储为 Swift
 `Float32` exact KNN JSON。lexical route 使用 Intatis 多语言/代码 tokenizer 与 BM25，融合使用
 deterministic RRF。`KnowledgeEmbeddingCosineRerankerProvider` 是可选的最小本地 reranker，
@@ -62,20 +146,20 @@ deterministic RRF。`KnowledgeEmbeddingCosineRerankerProvider` 是可选的最�
 `rerank_applied=false`。remote embedding/reranker 只有 host 把 registration 标为 network-backed
 并经过网络权限链时才可运行，没有隐藏 fallback 或自动模型下载。
 
-store 只允许位于现有 WorkspaceLease 内。reader/writer 使用 host coordination locks；publish
+08-09 产品边界只允许 store 位于现有 WorkspaceLease 内。reader/writer 使用 host coordination locks；publish
 只安装完整、重新验证且 content-seal 未漂移的 staging snapshot，然后原子切换 pointer。旧 reader
 可在 lease 内完成，旧 handle 不接受新调用，drain 后才可 retention/GC。urgent purge 先关闭
 admission、cancel/drain，再使 current pointer 持久失活、清 validation receipt 并删除已 drain
 snapshot；它不承诺 APFS/SSD/backup 物理不可恢复，也不会自动擦除已写入 append-only EventLog 的
 bounded tool evidence。
 
-`search_knowledge` 的 model schema 只接受 query 和可选的 bounded limit，不接受
+08-09 snapshot-bound `search_knowledge` 的 model schema 只接受 query 和可选的 bounded limit，不接受
 path、provider、model、backend、credential 或 ACL；单库 knowledge handle 由 host 绑定。
 Code/Cowork 通过 generic `HostToolRegistryAugmenter` opt in；host 传 store path、exact session/
 agent/task/capability/workspace leases，并取得 query-owned mount lease。默认 augmenter 为 `nil`，
 因此普通 Code/Cowork 不暴露该工具；Chat 继续使用无工具 `ChatLoop`，iOS 依赖图继续不含
-`IntatisKnowledge`。CLI manifest 虽预链接 Knowledge target，当前 call site 仍不构造 adapter，
-也没有 mount command。工具调用仍经过 ToolRegistry、CapabilityLease、WorkspaceLease、三层权限门和
+`IntatisKnowledge`。截至 08-09，CLI call site 仍不构造 adapter，也没有 mount command；这些
+产品接线已由上节的 08-10 实现替代。工具调用仍经过 ToolRegistry、CapabilityLease、WorkspaceLease、三层权限门和
 durable prepared/result/settled 事件，不存在 Knowledge 私有执行旁路。
 
 `search_knowledge` 的动态 descriptor 会随 snapshot/schema/local-or-network semantics 一起进入
@@ -83,9 +167,11 @@ registry identity；descriptor-aware permission intent/preview 必须继续使�
 local-only route 也属于把外部断言注入模型的 trust boundary，因此 deterministic gate 返回 `pass`
 并继续走 reviewer/PermissionEngine，而不是套用普通 read-only 文件工具的自动 allow。
 
-`KnowledgeBundleBuildService` 是 host-owned build/publish seam，不是当前 model-facing tool。它要求
-调用者传入并复核 exact resolved authorization，但自身不生成 durable ticket；实际 Agent producer
-caller 尚未在本轮接线，未来 caller 必须复用既有 prepared/result/settled 执行链。
+08-09 的 `KnowledgeBundleBuildService` 是 host-owned build/publish seam，当时还不是 model-facing
+tool。它要求调用者传入并复核 exact resolved authorization，但自身不生成 durable ticket；08-10
+实现现已通过 `build_knowledge` caller 复用既有 prepared/result/settled 执行链。descriptor 的主
+side effect 是 `.write`，因为最终 durable effect 是发布 immutable store；embedding 外发与模型成本
+继续由 `risksNetwork` 和 permission intent 的 network/model-cost risk 独立表达。
 
 evidence 是 untrusted tool-role data，带 stable evidence ID、internal `knowledge://` URI、text
 SHA-256、concept revision/locator、source IDs，并在存在可执行 source-locator adapter 时带 immutable
@@ -822,6 +908,11 @@ provider tool_call -> AgentLoop schema validation
 - `document_render`：PDF 直接由 PDFKit 按固定 box/DPI/背景导出 PNG；其他格式先用唯一 renderer 生成临时 PDF，再转页面 PNG。页面、SHA-256/尺寸/字节 metadata 与 manifest 作为单一目录 bundle 提交。
 - `document_export_pdf`：DOCX/PPTX/XLSX 走 LibreOffice，HTML 走固定 WKWebView renderer；生成 PDF 固定经过 `pdfcpu --conf disable --offline validate --mode strict` 与 PDFKit reopen/render smoke。EPUB 在 full-spine corpus gate 通过前不进入该工具 schema，显式请求返回 `unsupported_operation`。
 - `document_write`：DOCX/PPTX/XLSX/HTML 使用 python-docx/python-pptx/openpyxl/lxml 的明确 operation allowlist；EPUB 使用 rbook helper 并要求 EPUBCheck；XLSX 在 openpyxl 写 staging 后必须经固定 LibreOffice Calc XLSX round-trip/save、reopen/operation postcondition、formula + data-only cache 检查与 PDF preview 验证，最终文件允许被 LibreOffice 重写。CLI round-trip 成功本身不构成重算证明；目标公式缺少可读非公式缓存值时 fail closed。
+- macOS LibreOffice fixed runner 为每次调用建立当前用户 `0700` 的短路径
+  `/private/tmp/intatis-lo-<12 hex>`，通过 `-env:OSL_SOCKET_PATH=...` 设置 LibreOffice bootstrap
+  变量。Seatbelt 只允许该根内文件访问及 exact `OSL_PIPE_*` 本地 Unix socket 的 bind/connect，
+  IP 网络与其他 socket 继续默认拒绝；调用结束必须清理 exact root。不得把该值退化为普通进程环境
+  变量，也不得改回会超过 `sockaddr_un.sun_path` 的长 Darwin temp path。
 - `read_document`、`edit_pdf_pages`、`reconstruct_document_image` 已从生产 registry 与 fresh lease 下架；旧 capability raw value 只为历史日志解码保留，不能被模型发现或执行。P0 不包含任何 PDF mutation、annotation 或 secure redaction。
 
 相邻但不属于六工具合同的媒体/编译工具继续保留：
@@ -1301,9 +1392,11 @@ schema v2只表示lineage已覆盖media-aware语义。EventLog checkpoint writer
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "enabled_providers": ["OpenRouter", "Images"],
+  "enabled_providers": ["OpenRouter", "Images", "Knowledge"],
   "model": "OpenRouter/deepseek/deepseek-chat",
   "image_model": "Images/gpt-image-1",
+  "embedding_model": "Knowledge/BAAI/bge-m3",
+  "reranker_model": "Knowledge/BAAI/bge-reranker-v2-m3",
   "provider": {
     "OpenRouter": {
       "npm": "@ai-sdk/openai-compatible",
@@ -1324,10 +1417,26 @@ schema v2只表示lineage已覆盖media-aware语义。EventLog checkpoint writer
         "apiKey": "{env:IMAGE_API_KEY}"
       },
       "models": {}
+    },
+    "Knowledge": {
+      "npm": "intatis:siliconflow-v1",
+      "name": "Knowledge",
+      "options": {
+        "baseURL": "https://your-knowledge-provider.example/v1",
+        "apiKey": "{env:KNOWLEDGE_API_KEY}"
+      },
+      "models": {}
     }
   }
 }
 ```
+
+上例的 Knowledge URL 与模型 ID 是用户必须替换的值；它展示的是配置 shape，不代表内置账号或默认
+provider。两个 Knowledge 字段只接受 canonical snake_case 和完整 `<provider>/<model-id>`，任一缺失
+都使工具在 secret、network、bookmark 或 store 副作用前保持不可用。`intatis:siliconflow-v1` 明确选择
+OpenAI-compatible embeddings + SiliconFlow v1 rerank dialect；Cohere v2 reranker 必须使用独立
+`intatis:cohere-v2` provider，不从 URL 或模型名猜 dialect。role-only provider 的 `models` 可以为空；
+非内置维度的 embedding 模型必须通过对应 model `options.dimensions` 明确冻结输出维度。
 
 ## 安全机制
 

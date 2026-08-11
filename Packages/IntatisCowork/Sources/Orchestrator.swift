@@ -27,10 +27,12 @@ public enum AutomaticPermissionReviewResult: Equatable, Sendable {
 private struct DelegationAuthorizationArguments: Decodable {
     var to: String?
     var workTaskID: WorkTaskID?
+    var knowledgeAccess: DelegatedKnowledgeAccess?
 
     private enum CodingKeys: String, CodingKey {
         case to
         case workTaskID = "work_task_id"
+        case knowledgeAccess = "knowledge_access"
     }
 }
 
@@ -54,6 +56,8 @@ private struct AuthorizedDelegationAdmission: Sendable {
     var binding: AgentInferenceBinding?
     var targetFingerprint: String
     var materializedProposedTarget: Bool
+    var knowledgeCapabilities: Set<ToolCapability>
+    var workspaceAccess: WorkspaceAccess
 }
 
 private struct MaterializedDelegationTarget: Sendable {
@@ -5277,6 +5281,10 @@ public actor Orchestrator {
             authorization.intent.metadata["targetResolution"] else {
             return "error: delegate_task authorization has no target resolution"
         }
+        guard let delegatedKnowledgeGrant = Self.delegatedKnowledgeGrant(
+            from: authorization) else {
+            return "error: delegate_task Knowledge capability authorization is invalid"
+        }
 
         let durableTask = workTaskID.flatMap { workTaskGraph.task($0) }
         if let workTaskID, durableTask == nil {
@@ -5344,7 +5352,9 @@ public actor Orchestrator {
             target: target,
             binding: authorization.targetAgentInferenceBinding,
             targetFingerprint: targetFingerprint,
-            materializedProposedTarget: createdForDelegation)
+            materializedProposedTarget: createdForDelegation,
+            knowledgeCapabilities: delegatedKnowledgeGrant.capabilities,
+            workspaceAccess: delegatedKnowledgeGrant.workspaceAccess)
 
         let queued = await enqueueDelegatedTask(
             from: from,
@@ -5666,11 +5676,23 @@ public actor Orchestrator {
             scopeContract: parentTaskID.flatMap {
                 taskGraph.node($0)?.contract ?? scheduler.knownTask(taskID: $0)?.contract
             },
-            replyMode: replyMode)
+            replyMode: replyMode,
+            additionalToolCapabilities:
+                authorizedAdmission?.knowledgeCapabilities ?? [],
+            workspaceAccessOverride:
+                authorizedAdmission?.workspaceAccess)
         let contract = prepared.contract
         if let authorizedAdmission,
            contract.agentInferenceBinding != authorizedAdmission.binding {
             return (nil, "error: delegated task inference profile differs from the reviewed authorization")
+        }
+        if let authorizedAdmission {
+            guard authorizedAdmission.knowledgeCapabilities.isSubset(
+                    of: prepared.capabilityLease.tools),
+                  prepared.workspaceLease.access
+                    == authorizedAdmission.workspaceAccess else {
+                return (nil, "error: delegated Knowledge lease differs from the reviewed authorization")
+            }
         }
         guard !isGoalRunCancellationRequested(
             goalID: contract.goalID,
@@ -7532,8 +7554,8 @@ public actor Orchestrator {
             HostToolRegistryAugmentationLease?
         let toolRegistry: ToolRegistry
         if let augmenter = internalToolRegistryAugmenter,
-           augmenter.additionalCapabilities.isSubset(
-               of: capabilityLease.tools)
+           !augmenter.additionalCapabilities.isDisjoint(
+               with: capabilityLease.tools)
         {
             guard let workspaceLease else {
                 throw CoworkTaskExecutionError.invalidLease(
@@ -7668,16 +7690,20 @@ public actor Orchestrator {
                 recordUserMessage: recordUserMessage,
                 submissionID: taskContract?.submissionID)
             if let internalToolLease {
-                _ = await internalToolLease.close()
+                try await internalToolLease.closeRequiringDrain()
             }
             return AgentRunResult(
                 output: output,
                 presentedMessageIDs: contextBundle.directMessages.compactMap(\.messageID))
-        } catch {
+        } catch let runError {
             if let internalToolLease {
-                _ = await internalToolLease.close()
+                do {
+                    try await internalToolLease.closeRequiringDrain()
+                } catch {
+                    throw error
+                }
             }
-            throw error
+            throw runError
         }
     }
 
@@ -7697,6 +7723,26 @@ public actor Orchestrator {
         let arguments = try JSONDecoder().decode(
             DelegationAuthorizationArguments.self,
             from: Data(request.normalizedArguments.utf8))
+        let knowledgeCapabilities = arguments.knowledgeAccess?.capabilities ?? []
+        let requestedWorkspaceAccess = arguments.knowledgeAccess?.workspaceAccess
+            ?? .readOnly
+        if !knowledgeCapabilities.isEmpty {
+            guard let augmenter = internalToolRegistryAugmenter,
+                  knowledgeCapabilities.isSubset(
+                    of: augmenter.additionalCapabilities),
+                  let requesterLease = existingCapabilityLease(
+                    for: requesterID,
+                    taskID: request.invocation.taskID),
+                  knowledgeCapabilities.isSubset(of: requesterLease.tools),
+                  let requesterWorkspaceLease = existingWorkspaceLease(
+                    for: requesterID,
+                    taskID: request.invocation.taskID),
+                  requestedWorkspaceAccess != .readWrite
+                    || requesterWorkspaceLease.access == .readWrite else {
+                throw IntatisError.permissionDenied(
+                    "the requested delegated Knowledge capability is not available from the current exact leases")
+            }
+        }
         let suppliedTarget = arguments.to.map(Self.normalizedAgentName)
             .flatMap { value in
                 value.isEmpty || value.lowercased() == "auto" ? nil : value
@@ -7793,12 +7839,25 @@ public actor Orchestrator {
         intent.resources.append(PermissionResource(
             kind: .workspace,
             value: targetWorkspace,
-            access: .readOnly))
+            access: requestedWorkspaceAccess))
+        if let knowledgeAccess = arguments.knowledgeAccess {
+            intent.resources.append(PermissionResource(
+                kind: .tool,
+                value: "delegated_knowledge:\(knowledgeAccess.rawValue)",
+                access: requestedWorkspaceAccess))
+        }
         intent.metadata["targetResolution"] = .string(targetResolution)
         intent.metadata["targetWasExplicit"] = .bool(targetWasExplicit)
         intent.metadata["targetModel"] = .string(targetModel.rawValue)
         intent.metadata["targetWorkspace"] = .string(targetWorkspace)
-        intent.metadata["requestedAccess"] = .string(WorkspaceAccess.readOnly.rawValue)
+        intent.metadata["requestedAccess"] = .string(
+            requestedWorkspaceAccess.rawValue)
+        intent.metadata["delegatedKnowledgeAccess"] = arguments.knowledgeAccess
+            .map { .string($0.rawValue) } ?? .null
+        intent.metadata["delegatedKnowledgeCapabilities"] = .array(
+            knowledgeCapabilities
+                .sorted { $0.rawValue < $1.rawValue }
+                .map { .string($0.rawValue) })
         intent.metadata["canCoordinate"] = .bool(false)
         intent.metadata["mayCreateWorker"] = .bool(targetResolution == "create_proposed")
         intent.metadata.merge(Self.inferenceMetadata(targetInferenceBinding)) { _, profile in profile }
@@ -7950,6 +8009,55 @@ public actor Orchestrator {
         ]
     }
 
+    /// Reconstructs the task-scoped Knowledge grant only from the immutable
+    /// authorization metadata produced during delegate_task preparation. Any
+    /// missing, duplicated, unknown, or internally inconsistent value fails
+    /// closed instead of becoming an empty/default grant.
+    private static func delegatedKnowledgeGrant(
+        from authorization: ResolvedToolAuthorization
+    ) -> (capabilities: Set<ToolCapability>, workspaceAccess: WorkspaceAccess)? {
+        guard let accessValue = authorization.intent.metadata[
+                "delegatedKnowledgeAccess"],
+              let capabilitiesValue = authorization.intent.metadata[
+                "delegatedKnowledgeCapabilities"],
+              case .array(let rawCapabilities) = capabilitiesValue,
+              case .string(let rawWorkspaceAccess)? =
+                authorization.intent.metadata["requestedAccess"],
+              let workspaceAccess = WorkspaceAccess(
+                rawValue: rawWorkspaceAccess) else {
+            return nil
+        }
+        let access: DelegatedKnowledgeAccess?
+        switch accessValue {
+        case .null:
+            access = nil
+        case .string(let raw):
+            guard let parsed = DelegatedKnowledgeAccess(rawValue: raw) else {
+                return nil
+            }
+            access = parsed
+        default:
+            return nil
+        }
+        var capabilities = Set<ToolCapability>()
+        for value in rawCapabilities {
+            guard case .string(let raw) = value,
+                  let capability = ToolCapability(rawValue: raw),
+                  capability == .buildKnowledge
+                    || capability == .searchKnowledge,
+                  capabilities.insert(capability).inserted else {
+                return nil
+            }
+        }
+        let expected = access?.capabilities ?? []
+        let expectedWorkspaceAccess = access?.workspaceAccess ?? .readOnly
+        guard capabilities == expected,
+              workspaceAccess == expectedWorkspaceAccess else {
+            return nil
+        }
+        return (capabilities, workspaceAccess)
+    }
+
     /// Live actor-isolated lease check used immediately after review and again
     /// after the durable execution prepare boundary. A captured lease value is
     /// not enough: task completion, detach, or cancellation may revoke it while
@@ -8091,6 +8199,12 @@ public actor Orchestrator {
               })?.value,
               AgentID(rawValue: Self.normalizedAgentName(targetValue)) == admission.target else {
             return "delegate_task authorization binding changed before task admission"
+        }
+        guard let knowledgeGrant = Self.delegatedKnowledgeGrant(
+                from: authorization),
+              knowledgeGrant.capabilities == admission.knowledgeCapabilities,
+              knowledgeGrant.workspaceAccess == admission.workspaceAccess else {
+            return "delegate_task Knowledge capability binding changed before task admission"
         }
         guard automaticDelegationReservations.contains(reservedTarget) else {
             return "reviewed delegation reservation was lost before task admission"
@@ -8868,19 +8982,23 @@ public actor Orchestrator {
                                       expectedDeliverable: String? = nil,
                                       parentTaskID: TaskID? = nil,
                                       scopeContract: TaskContract? = nil,
-                                      replyMode: TaskReplyMode = .taskReport) -> PreparedDelegatedTask {
+                                      replyMode: TaskReplyMode = .taskReport,
+                                      additionalToolCapabilities: Set<ToolCapability> = [],
+                                      workspaceAccessOverride: WorkspaceAccess? = nil) -> PreparedDelegatedTask {
         let trimmedObjective = objective.trimmingCharacters(in: .whitespacesAndNewlines)
         let relatedAgents = agentVisibleNames(excluding: assignee.name)
         let taskID = TaskID.new()
         let defaultLease = defaultCapabilityLeaseIDs[assignee.name].flatMap { capabilityLeases[$0] }
         let defaultWorkspaceAccess = defaultWorkspaceLeaseIDs[assignee.name]
             .flatMap { workspaceLeases[$0]?.access } ?? .readOnly
-        let workspaceAccess: WorkspaceAccess = defaultWorkspaceAccess == .readWrite
-            && defaultLease.map(Self.requiresReadWriteWorkspaceAccess) == true
-            ? .readWrite
-            : .readOnly
+        let workspaceAccess: WorkspaceAccess = workspaceAccessOverride
+            ?? (defaultWorkspaceAccess == .readWrite
+                && defaultLease.map(Self.requiresReadWriteWorkspaceAccess) == true
+                ? .readWrite
+                : .readOnly)
         var capabilityLease = defaultLease
             ?? CapabilityLease.worker(taskID: taskID, workspaceAccess: workspaceAccess)
+        capabilityLease.tools.formUnion(additionalToolCapabilities)
         if assignee.name != Self.mainAgentID {
             capabilityLease.tools.remove(.createGoal)
             capabilityLease.tools.remove(.submitGoalVerdict)
@@ -8941,7 +9059,8 @@ public actor Orchestrator {
         var capabilityLease: CapabilityLease = agent.coordinationDepth > 0
             ? .coordinator(workspaceAccess: workspaceAccess)
             : .worker(workspaceAccess: grantWorkerWriteCapabilities ? workspaceAccess : .readOnly)
-        if let augmenter = internalToolRegistryAugmenter {
+        if let augmenter = internalToolRegistryAugmenter,
+           agent.name == Self.mainAgentID {
             capabilityLease.tools.formUnion(
                 augmenter.additionalCapabilities)
         }
@@ -8981,11 +9100,7 @@ public actor Orchestrator {
             ? CapabilityLease.coordinator(workspaceAccess: workspaceAccess)
             : CapabilityLease.worker(
                 workspaceAccess: workspaceAccess == .readWrite ? .readWrite : .readOnly)
-        var baselineTools = baseline.tools
-        if let augmenter = internalToolRegistryAugmenter {
-            baselineTools.formUnion(
-                augmenter.additionalCapabilities)
-        }
+        let baselineTools = baseline.tools
         var tools = baselineTools.intersection(parentCapabilityLease.tools)
         tools.remove(.createGoal)
         tools.remove(.submitGoalVerdict)
@@ -9097,7 +9212,8 @@ public actor Orchestrator {
             return Self.mainScopedCapabilityLease(lease, for: agent.name)
         }
         var lease = CapabilityLease.worker()
-        if let augmenter = internalToolRegistryAugmenter {
+        if let augmenter = internalToolRegistryAugmenter,
+           agent.name == Self.mainAgentID {
             lease.tools.formUnion(
                 augmenter.additionalCapabilities)
         }
@@ -11068,6 +11184,7 @@ public actor Orchestrator {
     /// Only capabilities that can persist user-visible output require RW.
     static func requiresReadWriteWorkspaceAccess(_ lease: CapabilityLease) -> Bool {
         hasWorkspaceMutationCapability(lease)
+            || lease.tools.contains(.buildKnowledge)
     }
 
     private static let defaultWorkerConstraints: [String] = [

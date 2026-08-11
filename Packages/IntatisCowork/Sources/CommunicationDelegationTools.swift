@@ -205,6 +205,31 @@ public struct RequestDelegationTool: Tool {
     }
 }
 
+/// Optional, explicitly reviewed Knowledge authority attached to one delegated
+/// task. Omission is the default and grants no Knowledge tools. The value is
+/// intentionally task-scoped rather than a mutation of the worker's durable
+/// default lease.
+enum DelegatedKnowledgeAccess: String, Codable, Sendable {
+    case search
+    case build
+    case buildAndSearch = "build_and_search"
+
+    var capabilities: Set<ToolCapability> {
+        switch self {
+        case .search:
+            return [.searchKnowledge]
+        case .build:
+            return [.buildKnowledge]
+        case .buildAndSearch:
+            return [.buildKnowledge, .searchKnowledge]
+        }
+    }
+
+    var workspaceAccess: WorkspaceAccess {
+        capabilities.contains(.buildKnowledge) ? .readWrite : .readOnly
+    }
+}
+
 public struct DelegateTaskTool: Tool {
     public init() {}
 
@@ -214,7 +239,7 @@ public struct DelegateTaskTool: Tool {
             + "and the invocation report is only a candidate result until task_update explicitly settles it. "
             + "Legacy unscoped calls may provide objective instead. If 'to' names an attached agent it is reused; "
             + "if that name does not exist, or 'to' is omitted/'auto', Intatis reuses an idle worker "
-            + "or atomically creates a worker in your current workspace. Returns invocation task_id, agent_id, and the mediated Task Report.",
+            + "or atomically creates a worker in your current workspace. knowledge_access may explicitly grant only this task search, build, or build_and_search Knowledge tools. Returns invocation task_id, agent_id, and the mediated Task Report.",
         sideEffect: .write,
         parameters: .object([
             "type": .string("object"),
@@ -224,6 +249,15 @@ public struct DelegateTaskTool: Tool {
                 "objective": .object(["type": .string("string"), "description": .string("legacy unscoped invocation objective")]),
                 "role_hint": .object(["type": .string("string")]),
                 "expected_deliverable": .object(["type": .string("string")]),
+                "knowledge_access": .object([
+                    "type": .string("string"),
+                    "enum": .array([
+                        .string("search"),
+                        .string("build"),
+                        .string("build_and_search"),
+                    ]),
+                    "description": .string("optional task-scoped Knowledge capability grant"),
+                ]),
                 // Compatibility aliases for previously emitted tool calls.
                 "roleHint": .object(["type": .string("string")]),
                 "expectedDeliverable": .object(["type": .string("string")]),
@@ -239,6 +273,7 @@ public struct DelegateTaskTool: Tool {
         let objective: String?
         let roleHint: String?
         let expectedDeliverable: String?
+        let knowledgeAccess: DelegatedKnowledgeAccess?
 
         enum CodingKeys: String, CodingKey {
             case to
@@ -246,6 +281,7 @@ public struct DelegateTaskTool: Tool {
             case objective
             case roleHint = "role_hint"
             case expectedDeliverable = "expected_deliverable"
+            case knowledgeAccess = "knowledge_access"
             case legacyRoleHint = "roleHint"
             case legacyExpectedDeliverable = "expectedDeliverable"
         }
@@ -259,25 +295,37 @@ public struct DelegateTaskTool: Tool {
                 ?? container.decodeIfPresent(String.self, forKey: .legacyRoleHint)
             expectedDeliverable = try container.decodeIfPresent(String.self, forKey: .expectedDeliverable)
                 ?? container.decodeIfPresent(String.self, forKey: .legacyExpectedDeliverable)
+            knowledgeAccess = try container.decodeIfPresent(
+                DelegatedKnowledgeAccess.self,
+                forKey: .knowledgeAccess)
         }
     }
 
     public func permissionIntent(_ args: ToolArgs, workspaceRoot: URL) -> PermissionIntent {
         let value = try? args.decode(Args.self)
+        var resources = [
+            PermissionResource(kind: .agent, value: value?.to ?? "auto"),
+            PermissionResource(kind: .task, value: value?.workTaskID?.rawValue ?? "new"),
+            PermissionResource(
+                kind: .workspace,
+                value: workspaceRoot.standardizedFileURL.path,
+                access: value?.knowledgeAccess?.workspaceAccess ?? .readOnly),
+        ]
+        if let knowledgeAccess = value?.knowledgeAccess {
+            resources.append(PermissionResource(
+                kind: .tool,
+                value: "delegated_knowledge:\(knowledgeAccess.rawValue)",
+                access: knowledgeAccess.workspaceAccess))
+        }
         return PermissionIntent(
             action: "task.delegate",
-            resources: [
-                PermissionResource(kind: .agent, value: value?.to ?? "auto"),
-                PermissionResource(kind: .task, value: value?.workTaskID?.rawValue ?? "new"),
-                PermissionResource(
-                    kind: .workspace,
-                    value: workspaceRoot.standardizedFileURL.path,
-                    access: .readOnly),
-            ],
+            resources: resources,
             metadata: [
                 "objectiveLength": .number(Double(value?.objective?.count ?? 0)),
                 "roleHint": value?.roleHint.map(JSONValue.string) ?? .null,
                 "mayCreateWorker": .bool(true),
+                "knowledgeAccess": value?.knowledgeAccess
+                    .map { .string($0.rawValue) } ?? .null,
             ],
             dataEffects: [.none],
             controlEffects: [.delegateTask, .createAgent, .attachWorkspace, .grantCapability],

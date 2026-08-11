@@ -14,6 +14,75 @@ import Musl
 #endif
 
 final class KnowledgeSnapshotStoreTests: XCTestCase {
+    func testReadOnlyOpenDoesNotCreateMissingStoreInfrastructure() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "intatis-knowledge-readonly-open-\(UUID().uuidString)",
+            isDirectory: true)
+        let storeRoot = root.appendingPathComponent("knowledge", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(
+            at: storeRoot,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: NSNumber(value: 0o700)])
+        let lease = WorkspaceLease(
+            rootPath: root.path,
+            access: .readOnly,
+            deniedPatterns: [])
+
+        XCTAssertThrowsError(try KnowledgeSnapshotStore(
+            root: storeRoot,
+            workspaceLease: lease)) { error in
+                XCTAssertEqual(
+                    (error as? KnowledgeDomainError)?.failure.code,
+                    .indexNotReady)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: storeRoot
+            .appendingPathComponent(".intatis-rag-host").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: storeRoot
+            .appendingPathComponent(
+                KnowledgeSnapshotStore.publishedSnapshotsDirectoryName).path))
+    }
+
+    func testLegacySnapshotLayoutRequiresWriterAndMigratesAtomically() throws {
+        let fixture = try SnapshotStoreFixture.make()
+        defer { fixture.remove() }
+        let pointer = try fixture.publish(
+            snapshotID: "snap_legacy_layout",
+            expectedRevision: nil)
+        let protected = fixture.store.root.appendingPathComponent(
+            KnowledgeSnapshotStore.publishedSnapshotsDirectoryName,
+            isDirectory: true)
+        let legacy = fixture.store.root.appendingPathComponent(
+            KnowledgeSnapshotStore.legacyPublishedSnapshotsDirectoryName,
+            isDirectory: true)
+        XCTAssertEqual(rename(protected.path, legacy.path), 0)
+
+        var readOnly = fixture.workspaceLease
+        readOnly.access = .readOnly
+        XCTAssertThrowsError(try KnowledgeSnapshotStore(
+            root: fixture.store.root,
+            workspaceLease: readOnly,
+            coordinationRoot: fixture.store.coordinationRoot)) { error in
+                let domain = error as? KnowledgeDomainError
+                XCTAssertEqual(domain?.failure.code, .indexNotReady)
+                XCTAssertEqual(domain?.failure.retryable, false)
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: legacy.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: protected.path))
+
+        let migrated = try KnowledgeSnapshotStore(
+            root: fixture.store.root,
+            workspaceLease: fixture.workspaceLease,
+            coordinationRoot: fixture.store.coordinationRoot,
+            createIfMissing: true)
+        XCTAssertEqual(try migrated.loadCurrentPointer(), pointer)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: legacy.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: protected.path))
+        let reader = try migrated.acquireCurrentReaderLease()
+        XCTAssertEqual(reader.pointer.currentSnapshot, "snap_legacy_layout")
+        reader.release()
+    }
+
     func testCrashLeftStagingIsCollectedWithoutChangingCurrentPointer() throws {
         let fixture = try SnapshotStoreFixture.make()
         defer { fixture.remove() }
@@ -255,6 +324,54 @@ final class KnowledgeSnapshotStoreTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(
             atPath: fixture.snapshotRoot("snap_stale").path))
         try writer.abortStagingSnapshot(staging)
+    }
+
+    func testPointerCommitUncertainIsNonRetryableAndLeavesExactOrphanForReconciliation()
+        throws {
+        let fixture = try SnapshotStoreFixture.make(
+            pointerWriteOperation: { _, _, _ in
+                throw DurableOwnerOnlyFileError.commitUncertain
+            })
+        defer { fixture.remove() }
+        let writer = try fixture.store.acquireWriterLease()
+        defer { writer.release() }
+        let staging = try writer.createStagingSnapshot(
+            snapshotID: "snap_pointer_unknown")
+        let stagingParent = fixture.store.root
+            .appendingPathComponent(
+                KnowledgeSnapshotStore.publishedSnapshotsDirectoryName,
+                isDirectory: true)
+            .appendingPathComponent(".staging", isDirectory: true)
+        XCTAssertTrue(
+            PathConfinement.isWithin(staging.root.path, root: stagingParent),
+            "\(staging.root.path) is not within \(stagingParent.path)")
+        XCTAssertTrue(KnowledgeStoreIdentifier.isValidSnapshotID(
+            staging.snapshotID))
+        try Data("complete snapshot".utf8).write(
+            to: staging.root.appendingPathComponent("index.md"))
+        let validated = try SnapshotStoreFixture.validatedSnapshot(
+            root: staging.root,
+            storeID: "kb_fixture",
+            snapshotID: "snap_pointer_unknown")
+
+        XCTAssertThrowsError(try writer.publishValidatedStaging(
+            staging,
+            validatedSnapshot: validated,
+            expectedPointerRevision: nil)) { error in
+            let domain = error as? KnowledgeDomainError
+            XCTAssertEqual(
+                domain?.failure.code,
+                .commitUncertain,
+                "\(error)")
+            XCTAssertEqual(
+                domain?.failure.retryable,
+                false,
+                "\(error)")
+        }
+        XCTAssertNil(try writer.currentPointer())
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: fixture.snapshotRoot("snap_pointer_unknown").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: staging.root.path))
     }
 
     func testPublishRejectsBytesChangedAfterValidationBeforeInstall() throws {
@@ -823,7 +940,8 @@ final class KnowledgeSnapshotStoreTests: XCTestCase {
     }
 
     func testHostRegistryAdapterRequiresExactAuthorityBindsCurrentSnapshotAndDrainsOnClose() async throws {
-        let fixture = try SnapshotStoreFixture.make()
+        let fixture = try SnapshotStoreFixture.make(
+            useDefaultCoordinationRoot: true)
         defer { fixture.remove() }
         _ = try fixture.publish(
             snapshotID: "snap_host_bound",
@@ -1010,7 +1128,11 @@ private final class SnapshotStoreFixture {
         self.store = store
     }
 
-    static func make() throws -> SnapshotStoreFixture {
+    static func make(
+        useDefaultCoordinationRoot: Bool = false,
+        pointerWriteOperation:
+            (@Sendable (Data, URL, String) throws -> Void)? = nil
+    ) throws -> SnapshotStoreFixture {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(
             "intatis-knowledge-store-tests-\(UUID().uuidString)",
             isDirectory: true)
@@ -1019,11 +1141,31 @@ private final class SnapshotStoreFixture {
             withIntermediateDirectories: true,
             attributes: [.posixPermissions: NSNumber(value: 0o700)])
         let lease = WorkspaceLease(rootPath: root.path, access: .readWrite)
-        let store = try KnowledgeSnapshotStore(
-            root: root.appendingPathComponent("knowledge", isDirectory: true),
-            workspaceLease: lease,
-            coordinationRoot: root.appendingPathComponent("host-locks", isDirectory: true),
-            createIfMissing: true)
+        let storeRoot = root.appendingPathComponent(
+            "knowledge",
+            isDirectory: true)
+        let coordinationRoot = root.appendingPathComponent(
+            "host-locks",
+            isDirectory: true)
+        let store: KnowledgeSnapshotStore
+        if let pointerWriteOperation {
+            store = try KnowledgeSnapshotStore(
+                root: storeRoot,
+                workspaceLease: lease,
+                coordinationRoot: useDefaultCoordinationRoot
+                    ? nil
+                    : coordinationRoot,
+                createIfMissing: true,
+                pointerWriteOperation: pointerWriteOperation)
+        } else {
+            store = try KnowledgeSnapshotStore(
+                root: storeRoot,
+                workspaceLease: lease,
+                coordinationRoot: useDefaultCoordinationRoot
+                    ? nil
+                    : coordinationRoot,
+                createIfMissing: true)
+        }
         return SnapshotStoreFixture(
             workspaceRoot: root,
             workspaceLease: lease,
@@ -1070,7 +1212,9 @@ private final class SnapshotStoreFixture {
 
     func snapshotRoot(_ id: String) -> URL {
         store.root
-            .appendingPathComponent("snapshots", isDirectory: true)
+            .appendingPathComponent(
+                KnowledgeSnapshotStore.publishedSnapshotsDirectoryName,
+                isDirectory: true)
             .appendingPathComponent(id, isDirectory: true)
     }
 

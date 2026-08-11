@@ -69,7 +69,7 @@ enum AppInferenceCatalogCompiler {
                     egressClassification: "user-configured-external"),
                 defaultRequestOptions: [:]))
 
-            for model in provider.models {
+            for model in catalog.inferenceModels(for: provider) {
                 try InferenceRequestOptionValidation.validateDurableRequestOptions(
                     model.requestOptions)
                 profiles.append(InferenceProfileDraft(
@@ -250,7 +250,7 @@ enum AppInferenceCatalogCompiler {
         var result: [InferenceProfileID: PresentationMetadata] = [:]
         for provider in catalog.providers {
             let providerTitle = safeProviderTitle(provider)
-            for model in provider.models {
+            for model in catalog.inferenceModels(for: provider) {
                 let modelTitle = safeModelTitle(model)
                 let baseID = profileID(providerID: provider.id, modelID: model.id, variantID: nil)
                 result[baseID] = PresentationMetadata(

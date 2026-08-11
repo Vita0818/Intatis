@@ -772,7 +772,7 @@ struct CoworkProjectSettingsSheet: View {
         Picker("", selection: modelSelectionBinding) {
             ForEach(catalog.providers) { provider in
                 Section(AppInferenceCatalogCompiler.safeProviderTitle(provider)) {
-                    ForEach(provider.models) { model in
+                    ForEach(catalog.inferenceModels(for: provider)) { model in
                         Text(AppInferenceCatalogCompiler.safeModelTitle(model))
                             .tag(modelSelectionKey(providerID: provider.id, modelID: model.id))
                     }

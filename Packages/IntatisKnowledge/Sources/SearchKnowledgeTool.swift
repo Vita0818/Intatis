@@ -502,7 +502,7 @@ public struct SearchKnowledgeTool: Tool {
             outputSchema: outputSchema)
     }
 
-    private static func callerVisibleCode(
+    static func callerVisibleCode(
         _ code: KnowledgeErrorCode
     ) -> KnowledgeErrorCode {
         switch code {
@@ -513,7 +513,7 @@ public struct SearchKnowledgeTool: Tool {
         }
     }
 
-    private static func callerVisibleMessage(
+    static func callerVisibleMessage(
         _ code: KnowledgeErrorCode
     ) -> String {
         switch callerVisibleCode(code) {
@@ -544,7 +544,7 @@ public struct SearchKnowledgeTool: Tool {
         }
     }
 
-    private static func observation(
+    static func observation(
         response: KnowledgeSearchResponse,
         outputSchemaHash: String,
         outputSchema: JSONValue
@@ -597,7 +597,7 @@ public struct SearchKnowledgeTool: Tool {
     }
 }
 
-private struct KnowledgeSearchToolSchemas: Sendable {
+struct KnowledgeSearchToolSchemas: Sendable {
     let input: JSONValue
     let output: JSONValue
     let inputHash: String

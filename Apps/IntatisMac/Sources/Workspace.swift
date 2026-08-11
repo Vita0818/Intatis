@@ -7,7 +7,7 @@ import AppKit
 
 /// Workspace folder selection. In the sandboxed App Store build this grants
 /// access via a user-selected security-scoped resource (ARCHITECTURE.md §9.1).
-final class WorkspaceAccessLease {
+final class WorkspaceAccessLease: @unchecked Sendable {
     let scopedURL: URL
     let canonicalURL: URL
     var canonicalPath: String { canonicalURL.path }

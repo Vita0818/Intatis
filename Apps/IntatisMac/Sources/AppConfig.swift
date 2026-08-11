@@ -283,18 +283,52 @@ struct AppProviderCatalog: Codable, Equatable {
     /// the top-level `transcription_model` field and never follows Chat model
     /// selection implicitly.
     var transcriptionModel: ModelRef? = nil
+    /// Host-owned Knowledge embedding route. It is independent from Chat and
+    /// Agent inference and has no hidden fallback.
+    var embeddingModel: ModelRef? = nil
+    /// Host-owned semantic reranker route. It is required together with the
+    /// embedding route before Knowledge tools can be composed.
+    var rerankerModel: ModelRef? = nil
     /// Legacy field retained only so existing configuration can be decoded and
     /// preserved. Chat runtime routing deliberately ignores it.
     var webSearchModel: ModelRef? = nil
     var providers: [AppProviderSettings]
 
+    func isKnowledgeRoleModel(
+        providerID: String,
+        modelID: String
+    ) -> Bool {
+        func normalized(_ value: String) -> String {
+            value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        }
+        return [embeddingModel, rerankerModel].compactMap { $0 }.contains {
+            normalized($0.endpoint) == normalized(providerID)
+                && $0.model.rawValue == modelID
+        }
+    }
+
+    func inferenceModels(for provider: AppProviderSettings)
+        -> [AppProviderModel] {
+        provider.models.filter {
+            !isKnowledgeRoleModel(
+                providerID: provider.id,
+                modelID: $0.id)
+        }
+    }
+
     var selectedProvider: AppProviderSettings? {
-        providers.first { $0.id == selectedProviderID } ?? providers.first
+        if let selected = providers.first(where: { $0.id == selectedProviderID }),
+           !inferenceModels(for: selected).isEmpty {
+            return selected
+        }
+        return providers.first { !inferenceModels(for: $0).isEmpty }
+            ?? providers.first
     }
 
     var selectedModel: AppProviderModel? {
         guard let provider = selectedProvider else { return nil }
-        return provider.models.first { $0.id == selectedModelID } ?? provider.models.first
+        let models = inferenceModels(for: provider)
+        return models.first { $0.id == selectedModelID } ?? models.first
     }
 
     var selectedVariant: AppProviderModelVariant? {
@@ -428,12 +462,13 @@ enum AppConfig {
         guard let provider = catalog.providers.first(where: { $0.id == providerID }) else {
             return catalog
         }
-        let selectedModelID = provider.models.first { $0.id == modelID }?.id
-            ?? provider.models.first?.id
+        let models = catalog.inferenceModels(for: provider)
+        let selectedModelID = models.first { $0.id == modelID }?.id
+            ?? models.first?.id
             ?? defaultModel
         catalog.selectedProviderID = provider.id
         catalog.selectedModelID = selectedModelID
-        catalog.selectedVariantID = provider.models
+        catalog.selectedVariantID = models
             .first(where: { $0.id == selectedModelID })?
             .variants.first(where: { $0.id == variantID })?.id
         providerCatalog = catalog
@@ -520,7 +555,8 @@ enum AppConfig {
     static func providerConfig() -> ProviderConfig {
         let catalog = providerCatalog
         let selectedProvider = catalog.selectedProvider ?? defaultProvider()
-        let selectedModel = catalog.selectedModel ?? selectedProvider.models.first
+        let selectedModel = catalog.selectedModel
+            ?? catalog.inferenceModels(for: selectedProvider).first
             ?? AppProviderModel(id: defaultModel, displayName: defaultDisplayName(for: defaultModel))
 
         let endpoints = catalog.providers.map { provider in
@@ -554,6 +590,8 @@ enum AppConfig {
         // Composer voice input uses only the explicit host route. Missing
         // configuration stays nil and never falls back to the Chat selection.
         models.transcription = catalog.transcriptionModel
+        models.embedding = catalog.embeddingModel
+        models.reranker = catalog.rerankerModel
         return ProviderConfig(endpoints: endpoints.isEmpty ? [endpoint(for: selectedProvider)] : endpoints,
                               models: models)
     }
@@ -577,6 +615,8 @@ enum AppConfig {
             let isDedicatedRoleProvider = [
                 catalog.imageModel,
                 catalog.transcriptionModel,
+                catalog.embeddingModel,
+                catalog.rerankerModel,
             ].compactMap { $0 }.contains {
                 normalizedProviderID($0.endpoint) == normalizedProviderID(id)
             }
@@ -622,16 +662,24 @@ enum AppConfig {
             providers = [defaultProvider()]
         }
 
-        let selectedProviderID = providers.first { $0.id == catalog.selectedProviderID }?.id
+        let selectedProviderID = providers.first {
+                $0.id == catalog.selectedProviderID
+                    && !catalog.inferenceModels(for: $0).isEmpty
+            }?.id
             ?? providers.first {
                 normalizedProviderID($0.id) == normalizedProviderID(catalog.selectedProviderID)
+                    && !catalog.inferenceModels(for: $0).isEmpty
+            }?.id
+            ?? providers.first {
+                !catalog.inferenceModels(for: $0).isEmpty
             }?.id
             ?? providers[0].id
         let selectedProvider = providers.first { $0.id == selectedProviderID } ?? providers[0]
-        let selectedModelID = selectedProvider.models.contains { $0.id == catalog.selectedModelID }
+        let selectableModels = catalog.inferenceModels(for: selectedProvider)
+        let selectedModelID = selectableModels.contains { $0.id == catalog.selectedModelID }
             ? catalog.selectedModelID
-            : selectedProvider.models[0].id
-        let selectedModel = selectedProvider.models.first { $0.id == selectedModelID }
+            : selectableModels.first?.id ?? defaultModel
+        let selectedModel = selectableModels.first { $0.id == selectedModelID }
         let selectedVariantID = selectedModel?.variants
             .first(where: { $0.id == catalog.selectedVariantID })?.id
         let imageModel = normalizedRoleModelRef(
@@ -639,6 +687,12 @@ enum AppConfig {
             providers: providers)
         let transcriptionModel = normalizedRoleModelRef(
             catalog.transcriptionModel,
+            providers: providers)
+        let embeddingModel = normalizedRoleModelRef(
+            catalog.embeddingModel,
+            providers: providers)
+        let rerankerModel = normalizedRoleModelRef(
+            catalog.rerankerModel,
             providers: providers)
         let webSearchModel = normalizedRoleModelRef(
             catalog.webSearchModel,
@@ -650,6 +704,8 @@ enum AppConfig {
             selectedVariantID: selectedVariantID,
             imageModel: imageModel,
             transcriptionModel: transcriptionModel,
+            embeddingModel: embeddingModel,
+            rerankerModel: rerankerModel,
             webSearchModel: webSearchModel,
             providers: providers)
     }
@@ -718,13 +774,14 @@ enum AppConfig {
     private static func applyingStoredSelection(to catalog: AppProviderCatalog) -> AppProviderCatalog {
         guard let selection = storedSelection(),
               let provider = catalog.providers.first(where: { $0.id == selection.providerID }),
-              provider.models.contains(where: { $0.id == selection.modelID }) else {
+              catalog.inferenceModels(for: provider)
+                .contains(where: { $0.id == selection.modelID }) else {
             return catalog
         }
         var selected = catalog
         selected.selectedProviderID = selection.providerID
         selected.selectedModelID = selection.modelID
-        selected.selectedVariantID = provider.models
+        selected.selectedVariantID = catalog.inferenceModels(for: provider)
             .first(where: { $0.id == selection.modelID })?
             .variants.first(where: { $0.id == selection.variantID })?.id
         return selected
@@ -1094,6 +1151,18 @@ enum AppConfig {
         } else {
             root.removeValue(forKey: "transcription_model")
         }
+        if let embeddingModel = catalog.embeddingModel {
+            root["embedding_model"] = openCodeModelReference(
+                embeddingModel)
+        } else {
+            root.removeValue(forKey: "embedding_model")
+        }
+        if let rerankerModel = catalog.rerankerModel {
+            root["reranker_model"] = openCodeModelReference(
+                rerankerModel)
+        } else {
+            root.removeValue(forKey: "reranker_model")
+        }
 
         var providerMap = root["provider"] as? [String: Any] ?? [:]
         for provider in catalog.providers {
@@ -1132,8 +1201,9 @@ enum AppConfig {
         let selectedProvider = catalog.providers.first { $0.id == catalog.selectedProviderID }
             ?? catalog.providers.first
         guard let selectedProvider else { return defaultModel }
-        let selectedModel = selectedProvider.models.first { $0.id == catalog.selectedModelID }
-            ?? selectedProvider.models.first
+        let models = catalog.inferenceModels(for: selectedProvider)
+        let selectedModel = models.first { $0.id == catalog.selectedModelID }
+            ?? models.first
         return "\(selectedProvider.id)/\(selectedModel?.id ?? defaultModel)"
     }
 
@@ -1344,6 +1414,8 @@ private struct AppProviderConfigTemplate: Encodable {
     var model: String
     var imageModel: String?
     var transcriptionModel: String?
+    var embeddingModel: String?
+    var rerankerModel: String?
     var provider: [String: AppProviderConfigTemplateProvider]
 
     enum CodingKeys: String, CodingKey {
@@ -1352,6 +1424,8 @@ private struct AppProviderConfigTemplate: Encodable {
         case model
         case imageModel = "image_model"
         case transcriptionModel = "transcription_model"
+        case embeddingModel = "embedding_model"
+        case rerankerModel = "reranker_model"
         case provider
     }
 
@@ -1361,8 +1435,9 @@ private struct AppProviderConfigTemplate: Encodable {
         let selectedProvider = catalog.providers.first { $0.id == catalog.selectedProviderID }
             ?? catalog.providers.first
         if let selectedProvider {
-            let selectedModel = selectedProvider.models.first { $0.id == catalog.selectedModelID }
-                ?? selectedProvider.models.first
+            let models = catalog.inferenceModels(for: selectedProvider)
+            let selectedModel = models.first { $0.id == catalog.selectedModelID }
+                ?? models.first
             let modelID = selectedModel?.id ?? AppConfig.defaultModel
             self.model = "\(selectedProvider.id)/\(modelID)"
         } else {
@@ -1372,6 +1447,12 @@ private struct AppProviderConfigTemplate: Encodable {
             "\($0.endpoint)/\($0.model.rawValue)"
         }
         self.transcriptionModel = catalog.transcriptionModel.map {
+            "\($0.endpoint)/\($0.model.rawValue)"
+        }
+        self.embeddingModel = catalog.embeddingModel.map {
+            "\($0.endpoint)/\($0.model.rawValue)"
+        }
+        self.rerankerModel = catalog.rerankerModel.map {
             "\($0.endpoint)/\($0.model.rawValue)"
         }
         self.provider = Dictionary(uniqueKeysWithValues: catalog.providers.map { provider in
@@ -1434,6 +1515,8 @@ private struct AppProviderConfigFile: Decodable {
     var imageModel: String?
     var image_model: String?
     var transcription_model: String?
+    var embedding_model: String?
+    var reranker_model: String?
     var webSearchModel: String?
     var web_search_model: String?
     var enabledProviders: [String]?
@@ -1456,12 +1539,20 @@ private struct AppProviderConfigFile: Decodable {
         let resolvedTranscriptionModel = resolvedConfigValue(
             transcription_model,
             configDirectory: configDirectory)
+        let resolvedEmbeddingModel = resolvedConfigValue(
+            embedding_model,
+            configDirectory: configDirectory)
+        let resolvedRerankerModel = resolvedConfigValue(
+            reranker_model,
+            configDirectory: configDirectory)
         let resolvedWebSearchModel = resolvedConfigValue(
             webSearchModel ?? web_search_model,
             configDirectory: configDirectory)
         let split = splitModel(resolvedModel)
         let imageSplit = splitModel(resolvedImageModel)
         let transcriptionSplit = splitModel(resolvedTranscriptionModel)
+        let embeddingSplit = splitModel(resolvedEmbeddingModel)
+        let rerankerSplit = splitModel(resolvedRerankerModel)
         if !entries.isEmpty {
             entries = entries.filter {
                 shouldIncludeProvider(id: $0.id, enabled: enabled, disabled: disabled)
@@ -1479,6 +1570,12 @@ private struct AppProviderConfigFile: Decodable {
                         providerIDsMatch(imageSplit.providerID, id)
                         || providerIDsMatch(
                             transcriptionSplit.providerID,
+                            id)
+                        || providerIDsMatch(
+                            embeddingSplit.providerID,
+                            id)
+                        || providerIDsMatch(
+                            rerankerSplit.providerID,
                             id),
                     configDirectory: configDirectory,
                     configFileURL: configFileURL)
@@ -1525,6 +1622,12 @@ private struct AppProviderConfigFile: Decodable {
             resolvedTranscriptionModel,
             preferredProviderID: selectedProvider,
             entries: entries)
+        let embeddingRef = knowledgeModelRef(
+            resolvedEmbeddingModel,
+            entries: entries)
+        let rerankerRef = knowledgeModelRef(
+            resolvedRerankerModel,
+            entries: entries)
         let webSearchRef = backgroundModelRef(
             resolvedWebSearchModel,
             preferredProviderID: selectedProvider,
@@ -1535,6 +1638,8 @@ private struct AppProviderConfigFile: Decodable {
                                   selectedVariantID: selectedVariantID,
                                   imageModel: imageRef,
                                   transcriptionModel: transcriptionRef,
+                                  embeddingModel: embeddingRef,
+                                  rerankerModel: rerankerRef,
                                   webSearchModel: webSearchRef,
                                   providers: entries)
     }
@@ -1568,6 +1673,32 @@ private struct AppProviderConfigFile: Decodable {
         return ModelRef(
             endpoint: endpointID,
             model: ModelID(rawValue: selection.modelID))
+    }
+
+    /// Knowledge roles never inherit the currently selected Chat provider.
+    /// Only the canonical `<provider-id>/<model-id>` spelling produces a
+    /// binding; malformed or unqualified values leave the tools unavailable.
+    private func knowledgeModelRef(
+        _ raw: String?,
+        entries: [AppProviderSettings]
+    ) -> ModelRef? {
+        guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty else {
+            return nil
+        }
+        let split = splitModel(raw)
+        guard let providerID = split.providerID,
+              let modelID = split.modelID,
+              !providerID.isEmpty,
+              !modelID.isEmpty else {
+            return nil
+        }
+        let endpointID = actualProviderID(
+            matching: providerID,
+            in: entries) ?? providerID
+        return ModelRef(
+            endpoint: endpointID,
+            model: ModelID(rawValue: modelID))
     }
 
     private func fallbackProviderSettings(id: String, modelID: String) -> AppProviderSettings? {

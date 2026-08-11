@@ -264,7 +264,7 @@ final class KnowledgeSourceLocatorTests: XCTestCase {
                 mode: .publish,
                 policy: KnowledgeValidationPolicy(
                     evaluationDate: SourceLocatorSnapshotFixture.timestamp),
-                workspaceLease: workspaceLease)
+                workspaceLease: store.managedContentWorkspaceLease)
             _ = try writer.publishValidatedStaging(
                 staging,
                 validatedSnapshot: validated,

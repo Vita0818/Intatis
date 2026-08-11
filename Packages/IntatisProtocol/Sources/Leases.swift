@@ -239,6 +239,17 @@ public struct WorkspaceRootIdentity: Codable, Sendable, Hashable {
 }
 
 public struct WorkspaceLease: Codable, Sendable, Hashable {
+    /// Host-owned Knowledge publication components are never ordinary
+    /// workspace files. This floor is re-applied at executor boundaries so a
+    /// legacy or explicitly decoded lease cannot grant file, Git, document,
+    /// browser, or managed-terminal mutation authority over a published
+    /// snapshot, pointer, or coordination record.
+    public static let mandatoryManagedStoreDeniedPatterns: [String] = [
+        ".intatis-rag-store.json",
+        ".intatis-rag-snapshots",
+        ".intatis-rag-host",
+    ]
+
     /// Sensitive path floor for a model-facing general-purpose terminal. A
     /// caller may add narrower denied patterns to a lease, but the terminal
     /// execution boundary must always union this complete list back in so an
@@ -282,7 +293,7 @@ public struct WorkspaceLease: Codable, Sendable, Hashable {
         "**/.git/config",
         "**/.git/config.worktree",
         "Library/Keychains",
-    ]
+    ] + mandatoryManagedStoreDeniedPatterns
 
     /// New leases persist the same floor for clear previews and replay. The
     /// executor still unions `mandatoryTerminalDeniedPatterns` independently,

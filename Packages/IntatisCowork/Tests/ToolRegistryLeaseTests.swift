@@ -63,6 +63,42 @@ private final class LeaseKnowledgeCallingProvider: ToolCallingProvider, @uncheck
     }
 }
 
+private final class LeaseKnowledgeDelegatingProvider: ToolCallingProvider, @unchecked Sendable {
+    private let lock = NSLock()
+    private var capturedRequests: [AgentRequest] = []
+    private let delegatedArguments: String?
+
+    init(delegatedArguments: String? = nil) {
+        self.delegatedArguments = delegatedArguments
+    }
+
+    var requests: [AgentRequest] {
+        lock.lock()
+        defer { lock.unlock() }
+        return capturedRequests
+    }
+
+    func stream(_ request: AgentRequest) -> AsyncThrowingStream<AgentChunk, Error> {
+        lock.lock()
+        capturedRequests.append(request)
+        let requestNumber = capturedRequests.count
+        lock.unlock()
+        return AsyncThrowingStream { continuation in
+            if requestNumber == 1, let delegatedArguments {
+                continuation.yield(.toolCalls([ToolCall(
+                    id: "delegate-knowledge-worker",
+                    name: "delegate_task",
+                    arguments: delegatedArguments)]))
+                continuation.yield(.done(finishReason: "tool_calls"))
+            } else {
+                continuation.yield(.textDelta("done"))
+                continuation.yield(.done(finishReason: "stop"))
+            }
+            continuation.finish()
+        }
+    }
+}
+
 private struct LeaseInternalKnowledgeProbeTool: Tool {
     static let canonicalPermission: String? = "knowledge.search"
     static let descriptor = ToolDescriptor(
@@ -134,6 +170,23 @@ private struct LeaseInternalKnowledgeProbeTool: Tool {
     }
 }
 
+private struct LeaseInternalKnowledgeBuildProbeTool: Tool {
+    static let canonicalPermission: String? = "build_knowledge"
+    static let descriptor = ToolDescriptor(
+        name: "build_knowledge",
+        description: "Bound internal knowledge build probe.",
+        sideEffect: .write,
+        parameters: .object([
+            "type": .string("object"),
+            "additionalProperties": .bool(false),
+        ]))
+
+    func execute(_ args: ToolArgs,
+                 in context: ToolContext) async throws -> ToolObservation {
+        ToolObservation(text: "built")
+    }
+}
+
 private actor LeaseAugmentationCloseProbe {
     private var closed = false
     private var mountCount = 0
@@ -176,6 +229,44 @@ private func leaseTaskCreatedContracts(_ events: [Envelope]) -> [TaskContract] {
 }
 
 final class ToolRegistryLeaseTests: XCTestCase {
+    private func delegatedKnowledgeAugmenter(
+        probe: LeaseAugmentationCloseProbe
+    ) -> HostToolRegistryAugmenter {
+        HostToolRegistryAugmenter(
+            additionalCapabilities: [.buildKnowledge, .searchKnowledge]
+        ) { input in
+            var registrations: [ToolRegistration] = []
+            if input.capabilityLease.tools.contains(.searchKnowledge) {
+                registrations.append(ToolRegistration(
+                    descriptor: LeaseInternalKnowledgeProbeTool.descriptor,
+                    tool: LeaseInternalKnowledgeProbeTool(),
+                    canonicalPermission:
+                        LeaseInternalKnowledgeProbeTool.canonicalPermission,
+                    grantingCapabilities: [.searchKnowledge],
+                    groundingEvidenceRevalidator: { _ in }))
+            }
+            if input.capabilityLease.tools.contains(.buildKnowledge) {
+                registrations.append(ToolRegistration(
+                    descriptor:
+                        LeaseInternalKnowledgeBuildProbeTool.descriptor,
+                    tool: LeaseInternalKnowledgeBuildProbeTool(),
+                    canonicalPermission:
+                        LeaseInternalKnowledgeBuildProbeTool
+                            .canonicalPermission,
+                    grantingCapabilities: [.buildKnowledge]))
+            }
+            guard !registrations.isEmpty else {
+                throw LeaseAugmentationError.invalidAuthority
+            }
+            await probe.markMounted()
+            return HostToolRegistryAugmentationLease(
+                registry: input.baseRegistry.adding(
+                    registrations: registrations,
+                    registryVersion: "cowork-worker-knowledge-probe.v1"),
+                close: { true })
+        }
+    }
+
     func testDefaultCoworkRegistryDoesNotExposeInternalKnowledgeTool() {
         let ordinary = Orchestrator.toolRegistry(
             for: CapabilityLease.coordinator(
@@ -435,6 +526,138 @@ final class ToolRegistryLeaseTests: XCTestCase {
         XCTAssertFalse(mailboxCapability.tools.contains(.searchKnowledge))
         let mountedCount = await probe.mountedCount()
         XCTAssertEqual(mountedCount, 0)
+    }
+
+    func testDelegatedWorkerCanReceiveExplicitSearchOnlyKnowledgeLease() async throws {
+        let log = try leaseTempLog()
+        let workspace = try leaseTempWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let worker = AgentID(rawValue: "knowledge-search-worker")
+        let mainProvider = LeaseKnowledgeDelegatingProvider(
+            delegatedArguments: #"{"to":"knowledge-search-worker","objective":"Search one exact knowledge store.","knowledge_access":"search"}"#)
+        let workerProvider = LeaseKnowledgeDelegatingProvider()
+        let probe = LeaseAugmentationCloseProbe()
+        let orchestrator = Orchestrator(
+            log: log,
+            allowsShell: false,
+            responder: FixedResponder(.allow),
+            internalToolRegistryAugmenter:
+                delegatedKnowledgeAugmenter(probe: probe)) { agent in
+                    agent.name == worker ? workerProvider : mainProvider
+                }
+        let mainAttached = await orchestrator.attach(Agent(
+            name: Orchestrator.mainAgentID,
+            workspaceRoot: workspace,
+            model: ModelID(rawValue: "m"),
+            profile: .reviewed,
+            coordinationDepth: Agent.defaultCoordinationDepth))
+        let workerAttached = await orchestrator.attach(Agent(
+            name: worker,
+            workspaceRoot: workspace,
+            model: ModelID(rawValue: "m"),
+            profile: .reviewed))
+        XCTAssertTrue(mainAttached)
+        XCTAssertTrue(workerAttached)
+
+        let sendResult = await orchestrator.send(
+            "Delegate an exact search.",
+            to: .init(rawValue: "main"))
+        XCTAssertEqual(sendResult, .sent)
+        let workerRequest = try XCTUnwrap(workerProvider.requests.last)
+        XCTAssertTrue(workerRequest.tools.contains { $0.name == "search_knowledge" })
+        XCTAssertFalse(workerRequest.tools.contains { $0.name == "build_knowledge" })
+
+        let events = await log.replay()
+        let task = try XCTUnwrap(leaseTaskCreatedContracts(events).first {
+            $0.assignee == worker && $0.kind == .agentInvocation
+        })
+        let capability = try XCTUnwrap(events.compactMap {
+            envelope -> CapabilityLease? in
+            guard case .capabilityLeaseCreated(let payload) = envelope.event,
+                  payload.lease.taskID == task.id else { return nil }
+            return payload.lease
+        }.first)
+        let workspaceLease = try XCTUnwrap(events.compactMap {
+            envelope -> WorkspaceLease? in
+            guard case .workspaceLeaseGranted(let payload) = envelope.event,
+                  payload.lease.taskID == task.id else { return nil }
+            return payload.lease
+        }.first)
+        XCTAssertTrue(capability.tools.contains(.searchKnowledge))
+        XCTAssertFalse(capability.tools.contains(.buildKnowledge))
+        XCTAssertEqual(workspaceLease.access, .readOnly)
+    }
+
+    func testDelegatedWorkerBuildAndSearchGrantIsTaskScopedAndReadWrite() async throws {
+        let log = try leaseTempLog()
+        let workspace = try leaseTempWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let worker = AgentID(rawValue: "knowledge-build-worker")
+        let mainProvider = LeaseKnowledgeDelegatingProvider(
+            delegatedArguments: #"{"to":"knowledge-build-worker","objective":"Build and verify one knowledge store.","knowledge_access":"build_and_search"}"#)
+        let workerProvider = LeaseKnowledgeDelegatingProvider()
+        let probe = LeaseAugmentationCloseProbe()
+        let orchestrator = Orchestrator(
+            log: log,
+            allowsShell: false,
+            responder: FixedResponder(.allow),
+            internalToolRegistryAugmenter:
+                delegatedKnowledgeAugmenter(probe: probe)) { agent in
+                    agent.name == worker ? workerProvider : mainProvider
+                }
+        let mainAttached = await orchestrator.attach(Agent(
+            name: Orchestrator.mainAgentID,
+            workspaceRoot: workspace,
+            model: ModelID(rawValue: "m"),
+            profile: .reviewed,
+            coordinationDepth: Agent.defaultCoordinationDepth))
+        let workerAttached = await orchestrator.attach(Agent(
+            name: worker,
+            workspaceRoot: workspace,
+            model: ModelID(rawValue: "m"),
+            profile: .reviewed))
+        XCTAssertTrue(mainAttached)
+        XCTAssertTrue(workerAttached)
+
+        let sendResult = await orchestrator.send(
+            "Delegate an exact build.",
+            to: .init(rawValue: "main"))
+        XCTAssertEqual(sendResult, .sent)
+        let workerRequest = try XCTUnwrap(workerProvider.requests.last)
+        XCTAssertTrue(workerRequest.tools.contains { $0.name == "search_knowledge" })
+        XCTAssertTrue(workerRequest.tools.contains { $0.name == "build_knowledge" })
+
+        let events = await log.replay()
+        let task = try XCTUnwrap(leaseTaskCreatedContracts(events).first {
+            $0.assignee == worker && $0.kind == .agentInvocation
+        })
+        let taskCapabilities = try XCTUnwrap(events.compactMap {
+            envelope -> CapabilityLease? in
+            guard case .capabilityLeaseCreated(let payload) = envelope.event,
+                  payload.lease.taskID == task.id else { return nil }
+            return payload.lease
+        }.first)
+        let taskWorkspace = try XCTUnwrap(events.compactMap {
+            envelope -> WorkspaceLease? in
+            guard case .workspaceLeaseGranted(let payload) = envelope.event,
+                  payload.lease.taskID == task.id else { return nil }
+            return payload.lease
+        }.first)
+        XCTAssertTrue(taskCapabilities.tools.contains(.buildKnowledge))
+        XCTAssertTrue(taskCapabilities.tools.contains(.searchKnowledge))
+        XCTAssertEqual(taskWorkspace.access, .readWrite)
+
+        let workerDefaults = events.compactMap {
+            envelope -> CapabilityLease? in
+            guard case .capabilityLeaseCreated(let payload) = envelope.event,
+                  payload.agent == worker,
+                  payload.lease.taskID == nil else { return nil }
+            return payload.lease
+        }
+        XCTAssertTrue(workerDefaults.allSatisfy {
+            !$0.tools.contains(.buildKnowledge)
+                && !$0.tools.contains(.searchKnowledge)
+        })
     }
 
     func testRunControlRegistryRequiresExactMainRootInvocationAndCapability() throws {

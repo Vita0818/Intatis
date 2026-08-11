@@ -977,7 +977,8 @@ public struct AgentLoop: Sendable {
             }
             do {
                 try await groundingEvidence.validateCitations(
-                    in: assistantText)
+                    in: assistantText,
+                    requireAtLeastOne: pendingToolCalls.isEmpty)
             } catch {
                 throw AgentLoopError.invalidEvidenceCitation(
                     RuntimeErrorPresentation.message(for: error))
@@ -1847,7 +1848,11 @@ public struct AgentLoop: Sendable {
                 return "path is outside the workspace lease: \(path)"
             }
             let relative = Self.relativePath(resolved, root: leaseRoot)
-            if lease.deniedPatterns.contains(where: { Self.path(relative, matches: $0) }) {
+            let mandatoryDenied = WorkspaceLease
+                .mandatoryManagedStoreDeniedPatterns
+            if (lease.deniedPatterns + mandatoryDenied).contains(where: {
+                Self.path(relative.lowercased(), matches: $0.lowercased())
+            }) {
                 return "path is denied by the workspace lease: \(relative)"
             }
             let allowed = lease.allowedPathRules.contains { rule in
@@ -3263,6 +3268,8 @@ public struct AgentLoop: Sendable {
         toolName == "spawn_agent"
             || toolName == "rename_session"
             || toolName == "write_stdin"
+            || toolName == "build_knowledge"
+            || toolName == "search_knowledge"
     }
 
     private static func sessionRenameContainsSecret(_ normalizedArguments: String) -> Bool {

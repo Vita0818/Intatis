@@ -50,6 +50,10 @@ struct CLIConfig {
     /// Host-side route used by `generate_image` and `edit_image`. Agent tool
     /// arguments never carry this provider/model selection.
     let imageModel: CLIProviderModelSelection?
+    /// Independent Knowledge roles. Both must be present before the Knowledge
+    /// tool surface is composed; neither follows the selected inference model.
+    let embeddingModel: CLIProviderModelSelection?
+    let rerankerModel: CLIProviderModelSelection?
     /// The explicitly selected Intatis config is retained only so a lazy
     /// `providerConfig` credential reference can be revalidated. It is never
     /// copied into EventLog/profile bindings or printed by the CLI.
@@ -71,6 +75,8 @@ struct CLIConfig {
          selectedProviderID: String? = nil,
          selectedVariantID: String? = nil,
          imageModel: CLIProviderModelSelection? = nil,
+         embeddingModel: CLIProviderModelSelection? = nil,
+         rerankerModel: CLIProviderModelSelection? = nil,
          configurationFileURL: URL? = nil) {
         self.baseURL = baseURL
         self.apiKey = apiKey
@@ -90,6 +96,8 @@ struct CLIConfig {
         self.selectedProviderID = selectedProviderID ?? legacy.id
         self.selectedVariantID = selectedVariantID
         self.imageModel = imageModel
+        self.embeddingModel = embeddingModel
+        self.rerankerModel = rerankerModel
         self.configurationFileURL = configurationFileURL
     }
 
@@ -170,6 +178,9 @@ struct CLIConfig {
             // provider when possible; otherwise the host must qualify them.
             let matchingRoutes = document.routes.filter { route in
                 route.models.contains(where: { $0.id == requestedModel })
+                    && !document.isKnowledgeRoleModel(
+                        providerID: route.id,
+                        modelID: requestedModel)
             }
             if matchingRoutes.count == 1, let only = matchingRoutes.first {
                 selectedProviderID = only.id
@@ -255,6 +266,8 @@ struct CLIConfig {
             selectedProviderID: selectedRoute.id,
             selectedVariantID: selectedVariantID,
             imageModel: document.imageModel,
+            embeddingModel: document.embeddingModel,
+            rerankerModel: document.rerankerModel,
             configurationFileURL: configurationFileURL.standardizedFileURL)
     }
 
@@ -336,7 +349,32 @@ struct CLIConfig {
                 endpoint: CLIInferenceRouteIdentity.endpointID(route: imageRoute),
                 model: ModelID(rawValue: imageModel.modelID))
         }
+        if let embeddingModel,
+           let embeddingRoute = providerRoutes.first(where: {
+               $0.id == embeddingModel.providerID
+           }) {
+            models.embedding = ModelRef(
+                endpoint: CLIInferenceRouteIdentity.endpointID(route: embeddingRoute),
+                model: ModelID(rawValue: embeddingModel.modelID))
+        }
+        if let rerankerModel,
+           let rerankerRoute = providerRoutes.first(where: {
+               $0.id == rerankerModel.providerID
+           }) {
+            models.reranker = ModelRef(
+                endpoint: CLIInferenceRouteIdentity.endpointID(route: rerankerRoute),
+                model: ModelID(rawValue: rerankerModel.modelID))
+        }
         return ProviderConfig(endpoints: endpoints, models: models)
+    }
+
+    func isKnowledgeRoleModel(
+        providerID: String,
+        modelID: String
+    ) -> Bool {
+        [embeddingModel, rerankerModel].compactMap { $0 }.contains {
+            $0.providerID == providerID && $0.modelID == modelID
+        }
     }
 
     var selectedRouteLabel: String {
