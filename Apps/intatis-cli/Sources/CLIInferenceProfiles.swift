@@ -103,6 +103,10 @@ struct CLIInferenceProfiles: Sendable {
     let snapshot: InferenceCatalogSnapshot
     let options: [CLIInferenceProfileOption]
     let defaultBinding: AgentInferenceBinding
+    /// Fixed config-derived base profile for the automatic permission
+    /// reviewer. Unlike `defaultBinding`, this never incorporates a runtime
+    /// main-agent selection or reasoning override.
+    let permissionReviewerBinding: AgentInferenceBinding
 
     var bindings: [AgentInferenceBinding] {
         options.map(\.binding)
@@ -220,10 +224,20 @@ struct CLIInferenceProfiles: Sendable {
         }) else {
             throw InferenceCatalogError.unresolvedProfile
         }
+        guard let permissionReviewerOption = options.first(where: {
+            $0.routeID == config.permissionReviewerModel.providerID
+                && $0.modelID.rawValue == config.permissionReviewerModel.modelID
+                && $0.configuredVariantID == nil
+        }) else {
+            // The parser normally prevents this. Keep the catalog lowering
+            // boundary fail-closed as well for programmatically built config.
+            throw InferenceCatalogError.unresolvedProfile
+        }
         return CLIInferenceProfiles(
             snapshot: snapshot,
             options: options,
-            defaultBinding: defaultOption.binding)
+            defaultBinding: defaultOption.binding,
+            permissionReviewerBinding: permissionReviewerOption.binding)
     }
 
     static func profileID(route: CLIProviderRoute,
@@ -347,10 +361,10 @@ struct CLIInferenceProfiles: Sendable {
     }
 }
 
-/// Freezes the inference identity used by long-lived no-tools control planes.
-/// Rebinding a data-plane agent later never silently retargets an already
-/// enabled permission reviewer or Goal verifier.
-actor CLIControlPlaneInferenceBinding {
+/// Freezes the inference identity used by the long-lived Goal verifier.
+/// The permission reviewer has its own config-derived binding and deliberately
+/// does not share this main-derived compatibility behavior.
+actor CLIGoalVerifierInferenceBinding {
     private var frozenBinding: AgentInferenceBinding?
 
     init(_ binding: AgentInferenceBinding? = nil) {

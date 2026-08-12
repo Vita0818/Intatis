@@ -118,6 +118,9 @@ SHA-256 清单。不要把证书私钥、Apple 密码或 app-specific password �
 
 - macOS/CLI 高级配置读取 `INTATIS_CONFIG`、Intatis-owned JSON/JSONC 路径及兼容 fallback；
   不默认读取 OpenCode app 配置。
+- Cowork 自动权限审查使用顶层 `permission_reviewer_model` 固定独立模型，不新增设置 UI，也不跟随
+  当前主 Agent、会话默认模型或后续 rebind。字段缺失时只继承该 JSON 文档的顶层 `model`；显式填写
+  但无法解析、顶层兼容来源不可用或整份已选配置损坏/不可读时 fail closed。
 - Code/Cowork 的 `generate_image` 与 `edit_image` 共用顶层 `image_model` 宿主路由；主 agent
   只提交任务参数，不选择 provider/model。`edit_image` 接收工作区内的 `imagePath`、编辑 prompt
   和新的 `.png` `outputPath`。未配置时明确失败，不再暗中回退到固定模型。
@@ -135,6 +138,7 @@ SHA-256 清单。不要把证书私钥、Apple 密码或 app-specific password �
 {
   "$schema": "https://opencode.ai/config.json",
   "model": "chat/chat-model",
+  "permission_reviewer_model": "chat/reviewer-model",
   "image_model": "images/gpt-image-1",
   "transcription_model": "speech/whisper-1",
   "embedding_model": "knowledge/BAAI/bge-m3",
@@ -147,7 +151,8 @@ SHA-256 清单。不要把证书私钥、Apple 密码或 app-specific password �
         "apiKey": "{env:CHAT_API_KEY}"
       },
       "models": {
-        "chat-model": { "name": "Chat Model" }
+        "chat-model": { "name": "Chat Model" },
+        "reviewer-model": { "name": "Permission Reviewer" }
       }
     },
     "images": {
@@ -177,6 +182,14 @@ SHA-256 清单。不要把证书私钥、Apple 密码或 app-specific password �
   }
 }
 ```
+
+`permission_reviewer_model` 是 Intatis 的顶层授权控制面字段，格式为
+`<provider>/<model-id>`，并引用 provider `models` 中已配置的 base profile。Intatis 在启动/恢复
+Cowork runtime 时冻结该 exact binding；每次审查仍从这个 binding fresh-resolve provider wrapper。
+改变 Chat/Cowork 模型菜单、session default 或 `@main` binding 都不会重定向审查者。该字段省略时，
+仅为旧配置兼容而一次性采用同一 JSON 文档的顶层 `model`；显式空值、错误类型、未知 provider/model
+或不可解析引用不会回退主模型；已选配置文件本身无法读取/解析时，普通 provider 可继续沿用既有缓存，
+但权限审查保持不可用。
 
 `image_model` 是 Intatis 的顶层扩展字段，格式为 `<provider>/<model-id>`。专用图片 provider
 可保持空 `models`，因此不会混入 Chat/Code/Cowork 的推理模型菜单；当前 backend 要求该 route

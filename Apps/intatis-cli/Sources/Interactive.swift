@@ -631,7 +631,8 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
         config: config,
         registry: registry)
     var defaultProfile = inferenceProfiles.defaultBinding
-    let controlPlaneInference = CLIControlPlaneInferenceBinding()
+    let permissionReviewerBinding = inferenceProfiles.permissionReviewerBinding
+    let goalVerifierInference = CLIGoalVerifierInferenceBinding()
     var pending = PendingAttachments()
     let log = try coworkSessionLog(workspace: workspace)
     let artifactStore = try sessionArtifactStore(log)
@@ -749,22 +750,24 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
         }
     }
 
-    /// The first exact, resolvable @main binding owns both no-tools control
-    /// planes for this CLI process. A later data-plane rebind cannot retarget a
-    /// running reviewer or verifier mid-session.
-    func freezeControlPlaneInferenceIfPossible() async -> AgentInferenceBinding? {
-        if let frozen = await controlPlaneInference.binding() { return frozen }
+    /// Goal verification preserves the compatibility behavior of freezing the
+    /// first exact, resolvable @main binding. Permission review is deliberately
+    /// separate and always uses the config-derived reviewer binding above.
+    func freezeGoalVerifierInferenceIfPossible() async -> AgentInferenceBinding? {
+        if let frozen = await goalVerifierInference.binding() { return frozen }
         guard let binding = await resolvableMainBinding() else { return nil }
-        return await controlPlaneInference.freeze(binding)
+        return await goalVerifierInference.freeze(binding)
     }
 
     func enableAutomaticReview() async -> AutomaticPermissionReviewResult {
-        guard let binding = await freezeControlPlaneInferenceIfPossible() else {
-            return .failed("@main requires an exact, resolvable inference profile before automatic review can start")
+        guard await orchestrator.agentList().contains(where: {
+            $0.name == Orchestrator.mainAgentID
+        }) else {
+            return .failed("@main must be attached before automatic permission review can start")
         }
         return await orchestrator.enableAutomaticPermissionReview(
-            model: binding.modelID,
-            agentInferenceBinding: binding,
+            model: permissionReviewerBinding.modelID,
+            agentInferenceBinding: permissionReviewerBinding,
             workspaceRoot: workspace)
     }
 
@@ -774,13 +777,9 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
     var mainAttached: Bool
     let autoReviewResult: AutomaticPermissionReviewResult
     var mainBootstrapError: String? = nil
-    if let restoredMain = currentProjection.agentRoster[Orchestrator.mainAgentID] {
+    if currentProjection.agentRoster[Orchestrator.mainAgentID] != nil {
         mainAttached = true
-        if restoredMain.agentInferenceBinding == nil {
-            autoReviewResult = .failed("legacy @main has no exact inference profile; use /agent rebind main <profile-id>")
-        } else {
-            autoReviewResult = await enableAutomaticReview()
-        }
+        autoReviewResult = await enableAutomaticReview()
     } else if restoredEvents.isEmpty {
         // The workspace passed to `intatis cowork` is the user's explicit
         // initial-session authorization. Settings and both local identities
@@ -804,7 +803,9 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
             agentInferenceBinding: defaultProfile,
             profile: .reviewed,
             coordinationDepth: Agent.defaultCoordinationDepth),
-            settings: freshSettings) {
+            settings: freshSettings,
+            permissionReviewerModel: permissionReviewerBinding.modelID,
+            permissionReviewerInferenceBinding: permissionReviewerBinding) {
         case .attached, .alreadyAttached:
             mainAttached = true
             sessionSettings = freshSettings
@@ -825,6 +826,11 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
         mainBootstrapError = "recovered session has no @main; use /agent restore-main <path> <profile-id>"
         autoReviewResult = .failed(
             "recovered session has no @main; explicitly restore it before automatic review can start")
+    }
+    // Preserve the Goal verifier's historical first-main freeze without
+    // coupling the independently configured reviewer to that binding.
+    if mainAttached {
+        _ = await freezeGoalVerifierInferenceIfPossible()
     }
 
     func persistDefaultProfile(_ binding: AgentInferenceBinding) async -> Bool {
@@ -870,8 +876,8 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
     if let knowledgeConfigurationNotice {
         out("\(S.yellow)\(knowledgeConfigurationNotice)\(S.reset)\n")
     }
-    let startupControlPlaneProfileID = await controlPlaneInference.binding()?
-        .inferenceProfileID.rawValue ?? "unresolved"
+    let startupPermissionReviewerProfileID =
+        permissionReviewerBinding.inferenceProfileID.rawValue
     var automaticReviewRequired = true
     var automaticReviewReady = false
     switch autoReviewResult {
@@ -880,7 +886,7 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
         if case .some(.degraded(let reason)) = await orchestrator.automaticPermissionReviewHealth() {
             out("\(S.yellow)automatic permission review is degraded but active (@\(id.rawValue)): \(reason)\(S.reset)\n")
         } else {
-            out("\(S.dim)automatic permission review is on (@\(id.rawValue), exact profile \(startupControlPlaneProfileID)); reviewer errors deny only the current tool call.\(S.reset)\n")
+            out("\(S.dim)automatic permission review is on (@\(id.rawValue), exact profile \(startupPermissionReviewerProfileID)); reviewer errors deny only the current tool call.\(S.reset)\n")
         }
     case .alreadyEnabled(let id):
         automaticReviewReady = true
@@ -904,14 +910,14 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
         log: log,
         orchestrator: orchestrator,
         verifierProvider: {
-            guard let binding = await controlPlaneInference.binding() else {
+            guard let binding = await goalVerifierInference.binding() else {
                 throw InferenceCatalogError.unresolvedProfile
             }
             return try await registry.agentInference(for: binding).provider
         },
         verifierModel: {
-            await controlPlaneInference.binding()?.modelID
-                ?? ModelID(rawValue: "unresolved-control-plane-profile")
+            await goalVerifierInference.binding()?.modelID
+                ?? ModelID(rawValue: "unresolved-goal-verifier-profile")
         })
     var goalRuntimeStarted = false
     var dataPlaneStartedForNewTasks = false
@@ -922,7 +928,7 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
             errOut("@main is not attached; a durable Goal cannot run\n")
             return false
         }
-        guard await freezeControlPlaneInferenceIfPossible() != nil else {
+        guard await freezeGoalVerifierInferenceIfPossible() != nil else {
             errOut("@main has no exact, resolvable inference profile; use /profiles then /agent rebind main <profile-id>\n")
             return false
         }
@@ -1105,7 +1111,7 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
                 if !profileID.isEmpty {
                     if let selected = option(profileID: profileID) {
                         if await persistDefaultProfile(selected.binding) {
-                            out("default profile for future agents → \(safeProfileDescription(defaultProfile)); control planes remain frozen\n")
+                            out("default profile for future agents → \(safeProfileDescription(defaultProfile)); configured reviewer and any frozen Goal verifier are unchanged\n")
                         }
                     } else {
                         out("unknown profile '\(profileID)' — use /profiles\n")
@@ -1157,7 +1163,7 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
                     out("default future-agent profile: \(safeProfileDescription(defaultProfile))\n")
                 } else if parts.count == 2, let selected = option(profileID: parts[1]) {
                     if await persistDefaultProfile(selected.binding) {
-                        out("default profile for future agents → \(safeProfileDescription(defaultProfile)); existing agents and control planes are unchanged\n")
+                        out("default profile for future agents → \(safeProfileDescription(defaultProfile)); existing agents, configured reviewer, and any frozen Goal verifier are unchanged\n")
                     }
                 } else if parts.count == 2 {
                     out("unknown profile '\(unbracket(parts[1]))' — use /profiles\n")
@@ -1198,9 +1204,7 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
                     if case .some(.degraded(let reason)) = await orchestrator.automaticPermissionReviewHealth() {
                         out("automatic permission review is degraded but active (@\(id.rawValue)): \(reason)\n")
                     } else {
-                        let frozenID = await controlPlaneInference.binding()?.inferenceProfileID.rawValue
-                            ?? "unresolved"
-                        out("automatic permission review → on (@\(id.rawValue), exact profile \(frozenID))\n")
+                        out("automatic permission review → on (@\(id.rawValue), exact profile \(permissionReviewerBinding.inferenceProfileID.rawValue))\n")
                     }
                 case .alreadyEnabled(let id):
                     automaticReviewRequired = true
@@ -1298,8 +1302,8 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
                     case .attached, .alreadyAttached:
                         mainAttached = true
                         mainBootstrapError = nil
-                        _ = await freezeControlPlaneInferenceIfPossible()
-                        out("restored @main · \(safeProfileDescription(selected.binding)) · \(url.path); use /auto to start the frozen automatic reviewer\n")
+                        _ = await freezeGoalVerifierInferenceIfPossible()
+                        out("restored @main · \(safeProfileDescription(selected.binding)) · \(url.path); use /auto to start the configured automatic reviewer\n")
                     case .failed(let message):
                         out("@main was not restored · \(url.path) · \(message)\n")
                     }
@@ -1356,11 +1360,11 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
                         binding: selected.binding,
                         hostAuthorized: true) {
                     case .rebound(let agentID, let binding):
-                        _ = await freezeControlPlaneInferenceIfPossible()
+                        _ = await freezeGoalVerifierInferenceIfPossible()
                         out("rebound @\(agentID.rawValue) → \(safeProfileDescription(binding))\n")
                         if agentID == Orchestrator.mainAgentID, !automaticReviewReady,
                            automaticReviewRequired {
-                            out("@main is exactly bound; use /auto to start the frozen automatic reviewer\n")
+                            out("@main is exactly bound; use /auto to start the configured automatic reviewer\n")
                         }
                     case .unchanged(let agentID, let binding):
                         out("@\(agentID.rawValue) already uses \(safeProfileDescription(binding))\n")

@@ -1,6 +1,10 @@
 import Foundation
+import IntatisAgentKernel
+import IntatisConversation
 import IntatisCore
+import IntatisCowork
 import IntatisKnowledge
+import IntatisPermission
 import IntatisProtocol
 import IntatisProviders
 import IntatisTools
@@ -8,6 +12,244 @@ import XCTest
 @testable import IntatisCLI
 
 final class CLIProviderAdapterTests: XCTestCase {
+    func testPermissionReviewerFallsBackToJSONModelNotEnvironmentMainOverride()
+        async throws {
+        let directory = try makeTemporaryDirectory(
+            prefix: "intatis-cli-reviewer-fallback")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("intatis.json")
+        try writeProviderConfig([
+            "model": "primary/main-model",
+            "provider": [
+                "primary": provider(
+                    baseURL: "https://primary.example.invalid/v1",
+                    models: ["main-model": ["name": "Configured Main"]]),
+                "runtime": provider(
+                    baseURL: "https://runtime.example.invalid/v1",
+                    models: ["runtime-model": ["name": "Runtime Main"]]),
+            ],
+        ], to: file)
+
+        let config = try CLIConfig.load(
+            configurationFileURL: file,
+            environment: ["INTATIS_MODEL": "runtime/runtime-model"])
+
+        XCTAssertEqual(config.selectedProviderID, "runtime")
+        XCTAssertEqual(config.model, "runtime-model")
+        XCTAssertEqual(
+            config.permissionReviewerModel,
+            CLIProviderModelSelection(
+                providerID: "primary",
+                modelID: "main-model"))
+
+        let providerConfig = config.providerConfig()
+        let primary = try XCTUnwrap(
+            config.providerRoutes.first { $0.id == "primary" })
+        let runtime = try XCTUnwrap(
+            config.providerRoutes.first { $0.id == "runtime" })
+        XCTAssertEqual(
+            providerConfig.models.agent,
+            ModelRef(
+                endpoint: CLIInferenceRouteIdentity.endpointID(route: runtime),
+                model: ModelID(rawValue: "runtime-model")))
+        XCTAssertEqual(
+            providerConfig.models.reviewer,
+            ModelRef(
+                endpoint: CLIInferenceRouteIdentity.endpointID(route: primary),
+                model: ModelID(rawValue: "main-model")))
+
+        let profiles = try await CLIInferenceProfiles.load(
+            config: config,
+            fileURL: directory.appendingPathComponent("catalog.json"))
+        XCTAssertEqual(profiles.defaultBinding.modelID.rawValue, "runtime-model")
+        XCTAssertEqual(
+            profiles.permissionReviewerBinding.modelID.rawValue,
+            "main-model")
+        XCTAssertNotEqual(
+            profiles.defaultBinding,
+            profiles.permissionReviewerBinding)
+    }
+
+    func testExplicitPermissionReviewerModelMustResolveCanonicalConfiguredModel()
+        throws {
+        let directory = try makeTemporaryDirectory(
+            prefix: "intatis-cli-reviewer-invalid")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("intatis.json")
+
+        for invalidValue in ["luna/model", "reviewer/missing-model"] {
+            try writeProviderConfig([
+                "model": "main/main-model",
+                "permission_reviewer_model": invalidValue,
+                "provider": [
+                    "main": provider(
+                        baseURL: "https://main.example.invalid/v1",
+                        models: ["main-model": ["name": "Main"]]),
+                    "reviewer": provider(
+                        baseURL: "https://reviewer.example.invalid/v1",
+                        models: ["luna/model": ["name": "Luna"]]),
+                ],
+            ], to: file)
+
+            XCTAssertThrowsError(try CLIConfig.load(
+                configurationFileURL: file,
+                environment: [:])) { error in
+                XCTAssertTrue(
+                    error.localizedDescription.contains(
+                        "permission_reviewer_model"),
+                    "unexpected error for \(invalidValue): \(error)")
+            }
+        }
+    }
+
+    func testMissingReviewerCannotInventAnUnavailableJSONDefaultModel()
+        throws {
+        let directory = try makeTemporaryDirectory(
+            prefix: "intatis-cli-reviewer-missing-default")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("intatis.json")
+        let configuredProvider = provider(
+            baseURL: "https://main.example.invalid/v1",
+            models: ["configured-model": ["name": "Configured"]])
+
+        for root in [
+            [
+                "provider": ["main": configuredProvider],
+            ],
+            [
+                "model": "main/unknown-model",
+                "provider": ["main": configuredProvider],
+            ],
+        ] {
+            try writeProviderConfig(root, to: file)
+
+            XCTAssertThrowsError(try CLIConfig.load(
+                configurationFileURL: file,
+                environment: [:])) { error in
+                XCTAssertTrue(
+                    error.localizedDescription.contains(
+                        "permission_reviewer_model"),
+                    "unexpected error: \(error)")
+            }
+        }
+    }
+
+    func testCoworkBootstrapKeepsConfiguredReviewerIndependentOfMainRebind()
+        async throws {
+        let directory = try makeTemporaryDirectory(
+            prefix: "intatis-cli-reviewer-runtime")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("intatis.json")
+        try writeProviderConfig([
+            "model": "main/main-model",
+            "permission_reviewer_model": "reviewer/luna/model",
+            "provider": [
+                "main": provider(
+                    baseURL: "https://main.example.invalid/v1",
+                    models: [
+                        "main-model": ["name": "Main"],
+                        "rebound-model": ["name": "Rebound Main"],
+                    ]),
+                "reviewer": provider(
+                    baseURL: "https://reviewer.example.invalid/v1",
+                    models: ["luna/model": ["name": "Luna"]]),
+            ],
+        ], to: file)
+
+        let config = try CLIConfig.load(
+            configurationFileURL: file,
+            environment: [:])
+        let profiles = try await CLIInferenceProfiles.load(
+            config: config,
+            fileURL: directory.appendingPathComponent("catalog.json"))
+        let reviewerBinding = profiles.permissionReviewerBinding
+        XCTAssertEqual(reviewerBinding.modelID.rawValue, "luna/model")
+        let reboundBinding = try XCTUnwrap(profiles.option(
+            routeID: "main",
+            model: "rebound-model",
+            variantID: nil)?.binding)
+
+        let registry = ProviderRegistry(
+            config: config.providerConfig(),
+            resolver: CLIExactSecretResolver(config: config),
+            inferenceCatalogSnapshot: profiles.snapshot)
+        let workspace = directory.appendingPathComponent(
+            "workspace",
+            isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: workspace,
+            withIntermediateDirectories: true)
+        let log = try EventLog(
+            session: SessionID(rawValue: "cli-reviewer-runtime"),
+            fileURL: directory
+                .appendingPathComponent("session", isDirectory: true)
+                .appendingPathComponent("events.jsonl"))
+        let orchestrator = try Orchestrator.runtime(
+            log: log,
+            allowsShell: false,
+            responder: FixedResponder(.allow),
+            availableInferenceProfiles: profiles.bindings,
+            requiresInferenceBindings: true,
+            resolvedInferenceFor: { agent in
+                guard let binding = agent.agentInferenceBinding else {
+                    throw InferenceCatalogError.unresolvedProfile
+                }
+                return try await registry.agentInference(for: binding)
+            })
+
+        let bootstrap = await orchestrator.bootstrapFreshSession(
+            main: Agent(
+                name: Orchestrator.mainAgentID,
+                workspaceRoot: workspace,
+                model: profiles.defaultBinding.modelID,
+                agentInferenceBinding: profiles.defaultBinding,
+                profile: .reviewed,
+                coordinationDepth: Agent.defaultCoordinationDepth),
+            settings: CoworkSessionSettings(
+                sessionID: await log.sessionID,
+                defaultModelID: profiles.defaultBinding.modelID.rawValue,
+                defaultInferenceProfileBinding: profiles.defaultBinding,
+                workspaces: [CoworkSessionWorkspace(
+                    path: workspace.path,
+                    agentName: Orchestrator.mainAgentID.rawValue,
+                    isPrimary: true)]),
+            permissionReviewerModel: reviewerBinding.modelID,
+            permissionReviewerInferenceBinding: reviewerBinding)
+        XCTAssertEqual(bootstrap, .attached(Orchestrator.mainAgentID))
+        let agentsAfterBootstrap = await orchestrator.agentList()
+        XCTAssertEqual(
+            agentsAfterBootstrap.first(where: {
+                $0.name == Orchestrator.automaticPermissionReviewerID
+            })?.agentInferenceBinding,
+            reviewerBinding)
+
+        let rebindResult = await orchestrator.rebindAgentInferenceProfile(
+            agentID: Orchestrator.mainAgentID,
+            binding: reboundBinding,
+            hostAuthorized: true)
+        XCTAssertEqual(
+            rebindResult,
+            .rebound(Orchestrator.mainAgentID, reboundBinding))
+        let agentsAfterRebind = await orchestrator.agentList()
+        XCTAssertEqual(
+            agentsAfterRebind.first(where: {
+                $0.name == Orchestrator.mainAgentID
+            })?.agentInferenceBinding,
+            reboundBinding)
+        XCTAssertEqual(
+            agentsAfterRebind.first(where: {
+                $0.name == Orchestrator.automaticPermissionReviewerID
+            })?.agentInferenceBinding,
+            reviewerBinding)
+
+        let projection = CoworkProjection.build(from: await log.replay())
+        XCTAssertEqual(
+            projection.agentRoster[Orchestrator.automaticPermissionReviewerID]?
+                .agentInferenceBinding,
+            reviewerBinding)
+        await orchestrator.cancelAll(reason: "test complete")
+    }
+
     func testOpenRouterKnowledgeRoleModelsStayOutOfInferenceProfiles()
         async throws {
         let directory = FileManager.default.temporaryDirectory
@@ -537,5 +779,40 @@ final class CLIProviderAdapterTests: XCTestCase {
                 .configuredModelOverride("  ")?
                 .rawValue,
             "  ")
+    }
+
+    private func makeTemporaryDirectory(prefix: String) throws -> URL {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "\(prefix)-\(UUID().uuidString)",
+                isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: NSNumber(value: 0o700)])
+        return directory
+    }
+
+    private func writeProviderConfig(
+        _ object: [String: Any],
+        to file: URL
+    ) throws {
+        try JSONSerialization.data(
+            withJSONObject: object,
+            options: [.prettyPrinted, .sortedKeys])
+            .write(to: file, options: .atomic)
+    }
+
+    private func provider(
+        baseURL: String,
+        models: [String: Any]
+    ) -> [String: Any] {
+        [
+            "options": [
+                "baseURL": baseURL,
+                "apiKey": "test-key",
+            ],
+            "models": models,
+        ]
     }
 }

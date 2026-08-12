@@ -58,6 +58,23 @@ final class IntatisSkillsTests: XCTestCase {
         XCTAssertTrue(activation.contains("Keep mailbox conversations live"))
         XCTAssertTrue(activation.contains("fresh request correlation"))
         XCTAssertTrue(activation.contains("requires no acknowledgment"))
+        XCTAssertTrue(activation.contains("neither a transaction nor a concurrency"))
+        XCTAssertTrue(activation.contains("Do not use one to request or assume parallel execution"))
+        XCTAssertTrue(activation.contains("A `task_create.owner`, when supplied"))
+        XCTAssertTrue(activation.contains("currently attached data-plane"))
+        XCTAssertTrue(activation.contains("Planned or future agents and tasks are not existing objects"))
+        XCTAssertTrue(activation.contains("omit `task_create.owner`"))
+        XCTAssertTrue(activation.contains("then wait for a successful `ToolResult`"))
+        XCTAssertTrue(activation.contains("A planned name is not proof"))
+        XCTAssertTrue(activation.contains("Never emit `task_create(owner: \"future-child\")`"))
+        XCTAssertTrue(activation.contains("batch within one stage only"))
+        XCTAssertTrue(activation.contains("delegate only the confirmed WorkTask and agent pairs"))
+
+        let createStage = try XCTUnwrap(activation.range(of: "1. Call `task_create`"))
+        let spawnStage = try XCTUnwrap(activation.range(of: "2. Call `spawn_agent`"))
+        let delegateStage = try XCTUnwrap(activation.range(of: "3. In a later round, call `delegate_task`"))
+        XCTAssertLessThan(createStage.lowerBound, spawnStage.lowerBound)
+        XCTAssertLessThan(spawnStage.lowerBound, delegateStage.lowerBound)
 
         let registry = snapshot.augmenting(
             ToolRegistry([], registryVersion: "test.bundled"))

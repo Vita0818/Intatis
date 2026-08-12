@@ -15,14 +15,19 @@ DeterministicPolicyGate、WorkspaceLease、CapabilityLease 或 durable tool exec
 实现状态声明：当前工作树已经完成 same-call string sidecar、Reporter live dispatch 移除、transient reviewer
 input、permission-request receipt、plain-text verdict、manual reserved-key fence、dedicated host admission、
 duplicate/recovery invocation revalidation、durable non-echo 与 in-engine reviewer misconfiguration fence。2026-08-12
-corrective focused 验证为 7 个 suite、158 tests / 0 failures；完整
-`swift test --disable-sandbox --disable-automatic-resolution` exit 0。真实 provider sidecar/UI smoke 尚未运行；
+corrective focused 验证为 7 个 suite、162 tests / 0 failures；本次 strict-schema correction 的受影响目标
+`IntatisAgentKernelTests` 217/217、`IntatisKnowledgeTests` 118/118、`IntatisCoworkTests` 364/364、
+`IntatisCLITests` 45/45（8 skipped）通过。真实 provider sidecar/UI smoke 尚未运行；
 live 路径没有固定 sidecar byte ceiling，也没有 `review_input_too_large` admission。
 
 > **2026-08-12 实现校正（覆盖本文所有冲突的旧设计措辞）**
 >
-> - `__intatis_authorization_context` 当前是 provider schema 中的 optional 单一 String；宿主仅在 deterministic
->   gate 到达 automatic ask 时强制它存在，deterministic allow/deny 不要求。
+> - `__intatis_authorization_context` 当前是 request-owned provider schema 中 required 的单一 String；任何
+>   `strict:true` function 的 decorated schema 均须满足 `required == properties.keys` 与
+>   `additionalProperties:false`；装饰器递归验证并在发网前 typed fail closed。`tool_search` 本身保持原样，
+>   provider-bound `tool_search_output` 中的 deferred function/namespace children 同样装饰而 durable output
+>   不变。原 ToolDescriptor/business required/executor schema 不变；宿主仅在
+>   deterministic gate 到达 automatic ask 时消费并验证该值，deterministic allow/deny 忽略其语义。
 > - live reviewer 收到完整 safe business arguments、完整 same-generation String 和 mechanical host facts；
 >   不收到 TaskContract objective/role/deliverable、causal userGoal、raw/current 用户消息、assistant/history、
 >   PDF 或图片原文。任务语义只来自 acting model 自己写入的 String。
@@ -556,8 +561,9 @@ ToolSpec：
 
 1. 复制原 JSON Schema。
 2. 在 properties 中加入 __intatis_authorization_context。
-3. automatic Cowork 模式下把它标为需要输出的 sidecar。
-4. 保留原业务字段、required、additionalProperties 和 strict 语义。
+3. 将它加入 decorated copy 的 `required`，使 acting model 每次 automatic Cowork function call 都输出 sidecar。
+4. 保留原业务字段、原 ToolDescriptor/business required/executor schema 与 strict 值；若 strict 为 true，
+   decorated copy 必须满足全部 properties 均 required、`additionalProperties:false`。
 5. 不改变 registry version、descriptor fingerprint 或 capability membership。
 
 ### 11.2 收到 ToolCall 后
@@ -905,15 +911,11 @@ decode-only。
 
 ### 18.3 strict tools
 
-不能为了 sidecar 把现有 strict:true 降为 false。
-
-实现必须针对真实 route 验证：
-
-- augmented required object 是否被接受；
-- nullable/required 兼容形状是否需要；
-- 不支持时是否将该 tool/route 标记 sidecar incompatible。
-
-不能按 model 名称猜支持情况。
+不能为了 sidecar 把现有 strict:true 降为 false。当前实现把 required string sidecar 加入 decorated
+`required`，并由离线 invariant 覆盖真实 shipped Skill/Knowledge strict descriptors：每个 strict object 的
+`required` 必须精确等于 `properties.keys`，且 `additionalProperties:false`。具有业务默认值的其他 strict
+property（当前 `search_knowledge.limit`）采用 provider-required integer-or-null，null 映射宿主默认值；
+sidecar 本身不 nullable。真实 route 是否接受该标准形状仍须通过 opt-in smoke 验证，不能按 model 名称猜测。
 
 ### 18.4 namespace 与 deferred tool search
 
@@ -1106,7 +1108,7 @@ EvidenceID manifest 与 route capability/size admission 尚未实现。
 
 ### 阶段 6：离线回归与 App build 已完成；真实 provider/UI smoke 未运行
 
-- focused 7-suite gate 共 158 tests / 0 failures；完整明细见第 23.8 节；
+- focused 7-suite gate 共 162 tests / 0 failures；完整明细见第 23.8 节；
 - `swift build --disable-sandbox --disable-automatic-resolution` 通过；
 - 完整 `swift test --disable-sandbox --disable-automatic-resolution` 第一次在 Codex 工作区沙箱内因既有
   WebKit/Seatbelt/terminal 环境限制失败；该次还暴露一个仍按旧 Reporter 行为编写的 reliability fixture，
@@ -1126,6 +1128,7 @@ EvidenceID manifest 与 route capability/size admission 尚未实现。
 
 - Chat Completions tool schema 包含 sidecar。
 - Responses tool schema 包含 sidecar。
+- strict function 的 sidecar 在 `required` 中，且所有 properties 均 required、additionalProperties=false。
 - 不存在 reporter-only tool。
 - 不设置 response_format。
 - 不依赖 forced reporter tool_choice。
@@ -1213,13 +1216,13 @@ EvidenceID manifest 与 route capability/size admission 尚未实现。
 | Suite / command | 结果 |
 | --- | --- |
 | `PermissionReviewControlPlaneTests` | 47/47 |
-| `AgentLoopPolicyTests` | 36/36 |
+| `AgentLoopPolicyTests` | 37/37 |
 | `AutomaticPermissionReviewTests` | 35/35 |
 | `DurableMultimodalAgentLoopTests` | 9/9 |
-| `AuthorizationSidecarTests` | 9/9 |
+| `AuthorizationSidecarTests` | 12/12 |
 | `IntatisPermissionReviewerTests` | 10/10 |
 | `PermissionReviewProtocolTests` | 12/12 |
-| focused 合计 | 158 tests / 0 failures |
+| focused 合计 | 162 tests / 0 failures |
 | `OrchestrationReliabilityTests.testCancelAllDrainsDataPlaneBeforeShuttingDownPermissionReviewer` | 1/1 |
 | `swift build --disable-sandbox --disable-automatic-resolution` | exit 0 |
 | 完整 `swift test --disable-sandbox --disable-automatic-resolution`（Codex 工作区沙箱内首次） | WebKit/Seatbelt/terminal 环境限制失败；并暴露、随后修复一个旧 Reporter reliability fixture |
@@ -1265,9 +1268,10 @@ EvidenceID manifest 与 route capability/size admission 尚未实现。
 23. Cowork 误注入 in-engine reviewer 的结果 fail closed，不能替代 control plane。
 24. Focused suites、SwiftPM build 与允许既有 process/WebKit/terminal 测试边界的完整 suite 通过。
 
-当前状态：上述源码实现与 offline 验收已经完成。focused 158/158、SwiftPM build、沙箱外完整 SwiftPM test、
-AgentKernel 212/212 与 OrchestrationReliability 54/54 均通过；首次工作区沙箱内的 WebKit/Seatbelt/terminal 环境失败
-仍按第 23.8 节保留。XcodeGen、版本一致性、macOS/iOS Debug unsigned build 也已通过。真实 provider
+当前状态：上述源码实现与 offline 验收已经完成。focused 162/162、SwiftPM build，以及本次 strict-schema
+correction 涉及的 AgentKernel 217/217、Knowledge 118/118、Cowork 364/364、CLI 45/45（8 skipped）均通过。
+本次完整 SwiftPM test 在 Tools 223/223 后挂于既有 SharedUI async waiter并人工中断；此前沙箱外完整 test、
+XcodeGen、版本一致性、macOS/iOS Debug unsigned build 的历史通过证据仍按第 23.8 节保留。真实 provider
 sidecar smoke 和 UI/manual switch smoke 明确未运行，它们是当前线上 route/交互证据缺口，不能从 offline
 suite 或 build 外推。route-derived sidecar byte ceiling 和 `review_input_too_large` admission 仍是明确后续能力，
 不得写成已实现。
@@ -1362,10 +1366,11 @@ reviewer input、permission-request receipt、plain-text verdict、媒体 blanke
 fence、correctable tool-input sidecar failure、dedicated host admission、duplicate/recovery revalidation、fixed durable reason/
 diagnostic 与 in-engine misconfiguration fail-closed 均已有生产源码和 regression coverage。
 
-验证结论是：focused 158/158、SwiftPM build、用户批准的工作区沙箱外完整 SwiftPM test、AgentKernel
-212/212、OrchestrationReliability 54/54、XcodeGen、版本一致性与 macOS/iOS Debug
-unsigned build 均通过。首次工作区沙箱内完整 test 因 WebKit/Seatbelt/terminal 环境限制失败，并促使一个
-旧 Reporter reliability fixture 修正；该历史不得省略。
+验证结论是：focused 162/162、SwiftPM build、`IntatisMac` macOS Debug unsigned build、本次受影响的
+AgentKernel 217/217、Knowledge 118/118、Cowork 364/364、CLI 45/45（8 skipped）均通过。当前完整 SwiftPM test 在 Tools 223/223 后挂于既有
+SharedUI async waiter并人工中断，不能记为本次全量通过；此前完整 test、XcodeGen、版本一致性与
+macOS/iOS Debug unsigned build 的通过证据，以及早先 WebKit/Seatbelt/terminal 环境失败历史，仍保留在
+第 23.8 节。
 
 下一步只应在获得对应授权/环境后补真实 provider sidecar compliance、UI/manual switch smoke，以及
 大输入 route budget 测量。EvidenceID provenance lookup、route-derived sidecar byte ceiling 与

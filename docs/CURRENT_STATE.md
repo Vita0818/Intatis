@@ -152,9 +152,21 @@ macOS 是完整产品：Chat、Code、Cowork、Settings 和本地诊断导出。
   当前窗口的只读对话选择；列表保留 session 历史上所有 durable agent，detached identity 继续
   可点击并由原状态图标显示已移除，当前选择不会跳回 `@main`。新窗口默认显示 `@main`，
   `@permission-reviewer` 等控制面 identity 仍为不可选择的状态项。
-- Cowork automatic 权限请求使用 single-pass same-call sidecar。provider-facing business schema 只增加
-  optional string `__intatis_authorization_context`；宿主仅在 deterministic gate 实际进入 automatic ask 时
-  要求它存在。acting model 在原业务 function call 中用这一句话概括为什么 exact action 服务当前任务，
+- macOS/CLI 高级配置已接入 canonical 顶层 `permission_reviewer_model`，只接受已配置的
+  `<provider>/<model-id>` base profile；没有新增 UI。字段缺失时仅在配置解析层一次性继承同一 JSON
+  文档的顶层 `model`；兼容来源缺失/未知、显式空值、错误类型、未知/不可解析 route 或整份已选配置
+  损坏/不可读均 fail closed，不会回退 UI
+  selection、Cowork session default、live/historical `@main` 或后续 rebind。fresh 七事件 bootstrap 与
+  restore/re-enable 都使用独立冻结的 reviewer exact binding；每个审查 generation 仍从该 binding
+  fresh-resolve provider wrapper。GoalVerifier 继续冻结首个可解析的 exact `@main` binding，与 reviewer
+  配置互不替代；未增加 session/EventLog schema 字段。
+- Cowork automatic 权限请求使用 single-pass same-call sidecar。request-owned provider-facing business schema
+  增加 required string `__intatis_authorization_context`；对 `strict:true` function，装饰后的 `required` 必须覆盖
+  全部 `properties`，同时保留 `additionalProperties:false`；装饰器递归验证 strict object，并在发网前
+  typed fail closed。`tool_search` 本身不改，但其 provider-bound `tool_search_output` 内延迟发现的 function/
+  namespace 子工具同样装饰，durable output 保留原始 schema。原 `ToolDescriptor`、registry/business required 与
+  executor schema 不变；宿主仅在 deterministic gate 实际进入 automatic ask 时消费并验证该字段，
+  deterministic allow/deny 忽略它。acting model 在原业务 function call 中用这一句话概括为什么 exact action 服务当前任务，
   不再二次调用 acting provider，也不复制 `request.messages`、完整 PDF/tool output 或全量图片。宿主在任何
   原业务 schema 校验、durable model history、EventLog 或 executor 之前拆除 sidecar，只用 canonical
   business arguments 计算 intent/path/network/action preview/authorization identity。valid sidecar 只在当前
@@ -408,6 +420,7 @@ profiles 与外部 MCP client。macOS/Linux 的 stdio、sandbox、bwrap/guard �
 
 ## 最近验证状态
 
+- 2026-08-12 Cowork dependent-call / `task_create` owner corrective gate：Code/Cowork 共享 `RuntimeEnvironmentManifest`、`task_create` descriptor/schema 与 bundled `cowork-agent-orchestration` Skill 现在共同声明 multi-call batch 非事务且不提供并发保证，只 batch 任意 host order 下仍正确的独立 calls；identity/ID/attachment/state 依赖必须等待成功 ToolResult 后跨轮使用。`task_create.owner` 保持业务可选，但只能引用较早成功 `list_agents` / `spawn_agent` ToolResult 已确认的 attached data-plane agent；多 worker 使用 ownerless creates → await → spawns → await → delegate confirmed pairs。production Orchestrator manager 将 create 的 capability/run/title/owner/dependency/graph rejection 只在首次 WorkTask EventLog append 前转换成 typed `not_started`；append 后 lost-ack 注入仍保持 unknown/manual。缺失 host-bound WorkTask manager 时 create/update 也不再伪报成功，而是返回明确的 pre-execution `not_started` rejection。Skill quick validation、独立真实 6-task/6-agent 反向 exercise、Context/Skill/schema/manager/owner-preflight/post-append 与 AgentLoop notStarted-vs-unknown focused tests 均通过；相关四组测试合计 111/111。未运行真实 provider 或 GUI smoke。
 - 2026-08-11 fixed-format document reader 拆分与瘦身 gate：完整 `IntatisToolsTests` 223/223
   （19 skipped）、`AgentLoopPolicyTests` 36/36、`CapabilityLeaseTests` 7/7、
   `ToolRegistryLeaseTests` 25/25、`MessageDelegationSplitTests` 10/10，均 0 failures。用户提供的
@@ -419,26 +432,29 @@ profiles 与外部 MCP client。macOS/Linux 的 stdio、sandbox、bwrap/guard �
   `swift test --disable-automatic-resolution` 在完成 Tools 后挂于既有 SharedUI async waiter，采样后
   人工中断为 130；不能记为本轮全量通过，也未观察到 document reader 相关 failure。
 - 2026-08-12 Cowork single-pass permission sidecar corrective gate：
-  `PermissionReviewControlPlaneTests` 47/47、`AgentLoopPolicyTests` 36/36、
+  `PermissionReviewControlPlaneTests` 47/47、`AgentLoopPolicyTests` 37/37、
   `AutomaticPermissionReviewTests` 35/35、`DurableMultimodalAgentLoopTests` 9/9、
-  `AuthorizationSidecarTests` 9/9、`IntatisPermissionReviewerTests` 10/10、
-  `PermissionReviewProtocolTests` 12/12，合计 158 tests / 0 failures。覆盖 same-call string sidecar 拆包与
+  `AuthorizationSidecarTests` 12/12、`IntatisPermissionReviewerTests` 10/10、
+  `PermissionReviewProtocolTests` 12/12，合计 162 tests / 0 failures。覆盖 same-call string sidecar 拆包与
   绑定、ask-only host requirement、valid sidecar 的 current-turn in-memory formatting example、raw/transient
   durable isolation、missing → missing → corrected same-args 调用可达 reviewer、tool-input failure 不消耗
   permission denial fuse、live reviewer prompt 不含 user/task semantic narrative、manual 保留字段拒绝、
   dedicated host admission、active/cached/recovered invocation 复验、固定宿主 reason/provider-failure 文案及
-  in-engine reviewer 误配 fail closed。上述 158 计数只代表 focused offline suites；
-  更广的构建/测试证据如下：
-  `swift build --disable-sandbox --disable-automatic-resolution` 通过。完整
-  `swift test --disable-sandbox --disable-automatic-resolution` 首次在 Codex 工作区沙箱内因既有 WebKit/
-  Seatbelt/terminal 环境限制失败，并暴露、随后修复一个仍按旧 Reporter 行为编写的 reliability fixture；
-  在用户批准的工作区沙箱外以同一命令重跑 exit 0；2026-08-12 修正后再次运行完整
-  `swift test --disable-sandbox --disable-automatic-resolution` 也为 exit 0，其中
-  `IntatisAgentKernelTests` 212/212、`OrchestrationReliabilityTests` 54/54。
-  `xcodegen generate` 通过；`scripts/check-version-consistency.sh` 输出
-  `Intatis version is consistent: 0.48 (build 48)`；`IntatisMac` macOS universal Release unsigned 与
-  `IntatisiOS` generic Simulator Debug unsigned build 均 exit 0，仅有仓库既有 warnings。未运行真实
-  provider sidecar smoke 或 UI/manual switch smoke。
+  in-engine reviewer 误配 fail closed。新增 strict-schema 回归还使用真实 shipped Skill/Knowledge descriptor，
+  并抓取 OpenRouter 与 OpenAI-compatible 两种最终 Chat Completions HTTP body，递归断言所有 strict
+  function 的递归 `required == properties.keys` 与 `additionalProperties:false`，以及 request-owned deferred
+  MCP function 装饰与 durable output 不变；其中一条贯通 automatic Cowork `tool_search` 执行到下一轮
+  `AgentRequest`。上述 162 计数只代表 focused
+  permission suites；本次 strict-schema 修正另有 `SearchKnowledgeToolTests` 4/4。
+  snapshot-bound `search_knowledge` 迁至 input schema v2；v1 resource 原样保留，v2 将 `limit` 表示为
+  provider-required integer-or-null，null 映射宿主默认 8。
+  `swift build --disable-automatic-resolution` 通过；受影响目标分别为 `IntatisAgentKernelTests` 217/217、
+  `IntatisKnowledgeTests` 118/118、`IntatisCoworkTests` 364/364、`IntatisCLITests` 45/45（8 skipped）。
+  `IntatisMac` macOS Debug、`CODE_SIGNING_ALLOWED=NO` 构建通过；只出现仓库既有 unused-result 与 SwiftUI
+  deprecation warnings。
+  完整 `swift test --disable-automatic-resolution` 完成 Tools 223/223（19 skipped）后再次挂于仓库既有
+  SharedUI async waiter，连续两分钟无输出后人工中断为 130，不能记为本次全量通过。opt-in 真实 provider
+  strict-sidecar smoke 已成功编译但按设计跳过；未运行真实计费请求或 UI/manual switch smoke。
 - 2026-08-11 model-driven Knowledge live acceptance：OpenRouter 最小 smoke 1/1，embedding 为
   1536 维并报告 input/total token 7，reranker 返回完整 permutation、有限 score 和 search unit 1；
   8-query 冻结集的 dense baseline 为 MRR/nDCG@5/Recall@5 = 1.000/1.000/1.000，configured reranker

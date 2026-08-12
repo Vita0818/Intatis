@@ -68,8 +68,12 @@ swift test --filter AutomaticPermissionReviewTests
 swift test --filter DurableMultimodalAgentLoopTests
 ```
 
-必须覆盖 provider-facing schema decoration（普通/strict/namespace/deferred/collision）：reserved sidecar 是 optional
-string property，不进入 JSON `required`，只有 deterministic gate 到达 automatic ask 时由宿主强制。还要覆盖
+必须覆盖 provider-facing schema decoration（普通/strict/namespace/deferred/collision）：reserved sidecar 是
+request-owned provider schema 中的 required string property；对任何 `strict:true` function，必须递归断言
+`required == properties.keys` 且 `additionalProperties:false`，生产装饰器也必须在发网前递归 fail closed。
+`tool_search` 本身保持不变；provider-bound `tool_search_output` 中的 deferred function/namespace children
+必须装饰，同时断言原消息与 durable output 不变。原 business descriptor/schema 不变，只有
+deterministic gate 到达 automatic ask 时宿主才消费并验证 sidecar。还要覆盖
 sidecar 拆包与 canonical business args、同文案变化不改变 digest/intent/path/retry identity、executor 永不看到
 保留字段、同 batch 多 call 独立绑定、valid sidecar 出现在同 turn 下一次 acting request 但不进入 EventLog/durable
 model history、reviewer transient exact-args 不进入 permission lifecycle、stripped business call 仍服从既有
@@ -93,7 +97,7 @@ invocation-free host
 INTATIS_REAL_TOOL_SHAPE_DIAGNOSTIC=1 swift test --filter RealProviderSmokeTests/testRealAgentAuthorizationSidecarShapeWhenEnabled
 ```
 
-该 smoke 只验证当前 exact Agent route 接受 optional string sidecar property，并在 prompt 明示需要时返回
+该 smoke 使用 `strict:true`，只验证当前 exact Agent route 接受 required string sidecar property，并在 prompt 明示需要时返回
 可拆分的 valid sidecar + business arguments；ask-only host enforcement、binding、secret scan、durable isolation 与 fail-closed
 语义仍必须由上述离线测试覆盖。本轮尚未运行该真实 provider smoke，不能从 scripted provider 测试外推
 线上 route 的 sidecar compliance、token 或 latency。
@@ -834,27 +838,28 @@ INTATIS_REAL_MULTIMODAL_SMOKE=1 swift test \
   objective/role/deliverable/userGoal/user/assistant/history/PDF marker 不进入 live prompt、delimiter injection、
   secret input、live/cache/recovery invocation 复验、recovered allow 拒绝、dedicated host admission、伪造
   agentAdmission kind 拒绝、固定 reviewer reason/provider diagnostic 与 durable non-echo；
-- `AgentLoopPolicyTests`：36/36；覆盖 ask-only sidecar enforcement、manual reserved-key 拒绝、safe structured
-  read failure 继续 batch、fresh-review fuse 与 in-engine reviewer 误配 fail closed；
-- `AutomaticPermissionReviewTests`：35/35；覆盖 production Orchestrator/control-plane 接线、optional string schema、
+- `AgentLoopPolicyTests`：37/37；覆盖 ask-only sidecar enforcement、manual reserved-key 拒绝、safe structured
+  read failure 继续 batch、fresh-review fuse、in-engine reviewer 误配 fail closed，以及 automatic Cowork
+  `tool_search` output 只在下一轮 provider request copy 中装饰；
+- `AutomaticPermissionReviewTests`：35/35；覆盖 production Orchestrator/control-plane 接线、provider-required string schema、
   missing → missing → valid 的相同 business args 不触发 permission lifecycle/reviewer fuse、valid sidecar 只留
   current-turn live history、automatic attach 专用入口、allow/deny/cancel/failure 和 Reporter 不再 dispatch；
 - `DurableMultimodalAgentLoopTests`：9/9；覆盖 user/FCO image 不再 blanket deny、sidecar 摘要媒体证据、
   raw sidecar 不进入 durable history，以及 missing sidecar 不伪造可跨重启恢复的权限拒绝；
-- `AuthorizationSidecarTests`：9/9；`IntatisPermissionReviewerTests`：10/10；
-  `PermissionReviewProtocolTests`：12/12；分别覆盖 schema decoration/extraction/binding、plain-text verdict 与
+- `AuthorizationSidecarTests`：12/12；`IntatisPermissionReviewerTests`：10/10；
+  `PermissionReviewProtocolTests`：12/12；分别覆盖 schema decoration/extraction/binding、strict 发网前
+  recursive fail-fast、deferred tool request-copy/durable isolation、plain-text verdict 与
   legacy/additive receipt wire；
-- 以上合计 158 tests / 0 failures。`swift build --disable-sandbox --disable-automatic-resolution` 通过；
-  完整 `swift test --disable-sandbox --disable-automatic-resolution` 首次在 Codex 工作区沙箱内因既有
-  WebKit/Seatbelt/terminal 环境限制失败，并暴露、随后修复一个仍按旧 Reporter 行为编写的 reliability
-  fixture；在用户批准的工作区沙箱外以同一命令重跑 exit 0。独立 xctest 复核
-  2026-08-12 修正后再次运行完整 `swift test --disable-sandbox --disable-automatic-resolution`，结果 exit 0；
-  其中 `IntatisAgentKernelTests` 212/212、`OrchestrationReliabilityTests` 54/54。
-  `xcodegen generate` 与 `scripts/check-version-consistency.sh` 通过，后者输出
-  `Intatis version is consistent: 0.48 (build 48)`；`IntatisMac` macOS Debug unsigned 与
-  `IntatisiOS` generic Simulator Debug unsigned build 均 exit 0，仅有仓库既有 warnings。首次环境失败与
-  最终外层通过都属于本轮证据，不能只保留其一。未运行 opt-in 真实 provider sidecar smoke 或 UI/manual
-  switch smoke，因此线上 route compliance、token、latency 与交互仍未证明；route-derived input ceiling 与
+- 以上合计 162 tests / 0 failures。strict-schema correction 还单独通过 `SearchKnowledgeToolTests` 4/4，
+  并在 `AuthorizationSidecarTests` 中抓取 OpenRouter 与 OpenAI-compatible 最终 HTTP body 验证 wire invariant。
+  `ModelHistoryCompactionAgentLoopTests` 另覆盖 deferred schema 对压缩阈值、compactor request 与 durable raw output
+  的影响。`swift build --disable-automatic-resolution` 通过；受影响目标完整结果为 `IntatisAgentKernelTests` 217/217、
+  `IntatisKnowledgeTests` 118/118、`IntatisCoworkTests` 364/364、`IntatisCLITests` 45/45（8 skipped）。
+  `IntatisMac` macOS Debug、`CODE_SIGNING_ALLOWED=NO` 构建通过，只出现仓库既有 warnings。完整
+  `swift test --disable-automatic-resolution` 完成 Tools 223/223（19 skipped）后挂于仓库既有 SharedUI async
+  waiter，连续两分钟无输出后人工中断为 130，不能记为本次全量通过。opt-in 真实 provider sidecar smoke
+  成功编译但因未设置计费开关而按设计跳过；本次未运行 UI/manual switch smoke，因此线上 route
+  compliance、token、latency 与交互仍未证明；route-derived input ceiling 与
   `review_input_too_large` 仍未实现。
 
 2026-08-08 Cowork automatic permission authorization context 修复的历史直接证据：
@@ -1048,6 +1053,37 @@ INTATIS_REAL_MULTIMODAL_SMOKE=1 swift test \
 - 当前未启动 App、未授予真实麦克风权限，也未以真实 credential/network 调用线上
   `audio/transcriptions`，因此录音设备、具体 provider 方言、模型可用性、计费与运行态像素仍为
   `UNKNOWN`，需要下一步手动 smoke；本轮未执行签名、公证、staple、Gatekeeper 或发行打包。
+
+2026-08-12 Cowork dependent-call / `task_create` owner 修正的直接证据：
+
+- `intatis-skill-creator/scripts/quick_validate.py`：`Skill is valid`；另用真实失败形态“同一 response 中 6 个 `task_create(owner=future)` + 6 个 `spawn_agent`”做独立只读 exercise，三层合同唯一导向 ownerless create → wait → spawn → wait → delegate confirmed pairs；
+- `ContextProjectionTests.testFirstAgentRequestDeclaresIntatisRuntimeAndToolProtocol`：1/1；同时验证 Code 与 Cowork 每次 request 收到 multi-call 非 transaction/concurrency guarantee、只 batch independent calls、依赖 successful ToolResult 后跨轮和 future-object 禁令；
+- `IntatisSkillsTests.testProductBundleDiscoversCoworkOrchestrationAsSystemSkill`：1/1；验证真实 bundled activation prompt 包含 currently-attached owner、stage barrier 与同批 future owner + spawn 禁令；
+- `WorkTaskRuntimeTests.testTaskCreateDescriptorRequiresConfirmedAttachedOwnerWithoutMakingItRequired`、`testMutatingWorkTaskToolsRejectMissingHostManagerAsNotStarted`、`testOrchestratorManagerProvesUnattachedCreateOwnerBeforeMutation`、`testCreatePostAppendFailureIsNotMisclassifiedAsNoEffect`：4/4；分别验证 provider-visible business schema、缺失 host manager 不伪报成功、owner-preflight EventLog 零变化/typed no-effect，以及 append 后 lost acknowledgement 仍保留 unknown；
+- `AgentLoopPolicyTests.testRejectedWithoutSideEffectSettlesAndReturnsRecoveryToModel` 与 `testNonReplayableToolFailureLeavesExecutionUnsettledForManualReconciliation`：2/2；验证 typed no-effect 写 `failed/not_started` 并继续模型轮次，普通 non-replayable error 仍留 unresolved/manual；
+- 相关整类组合 gate 最终为 `IntatisSkillsTests.xctest` 29/29、`WorkTaskRuntimeTests` 22/22、`AgentLoopPolicyTests` 37/37、`ContextProjectionTests` 23/23，合计 111/111；均完成相应 package Debug 编译。未运行全量 test、macOS/iOS app build、真实 provider 或 GUI smoke。
+
+2026-08-12 `permission_reviewer_model` 独立控制面 route 的直接证据：
+
+- canonical 顶层字段只接受 `<provider>/<model-id>` 的已配置 inference base profile；字段缺失只继承
+  同一 JSON 文档的顶层 `model`，而显式空值、错误类型、未知/禁用 provider、未知 model 与 unresolved
+  env/file reference、缺失/未知 top-level compatibility source，以及已选 Mac 配置整体损坏/不可读都
+  让 reviewer fail closed。Mac 当前选择、UserDefaults、Cowork session default、
+  `INTATIS_MODEL`、live/historical `@main` 与 main rebind 均不是 reviewer fallback；没有新增 UI 或
+  session/EventLog schema；
+- `AutomaticPermissionReviewTests`：39/39，覆盖独立 main/reviewer exact binding 的原子七事件落盘、
+  reviewer tuple missing/mismatch、reviewer catalog TOCTOU 零事件失败，以及既有 reviewer lifecycle；
+- `PerAgentInferenceProfileTests`：21/21；`CLIProviderAdapterTests`：13/13，覆盖 JSON-model compatibility、
+  环境变量只改变 main 而 reviewer 不漂移、显式非法 reviewer fail closed、缺失 reviewer 时不能从缺失/未知
+  JSON default 发明 route、独立 profile lowering 与 main rebind 后 reviewer durable binding 不变；
+- `IntatisCLITests`：49 tests / 0 failures / 8 个显式 opt-in real-provider smoke skipped；未发送真实网络
+  请求或产生计费；
+- `swift build --disable-automatic-resolution` 与 `IntatisMac` macOS Debug unsigned build 通过；只有仓内
+  既有 unused-result / deprecated `onChange` warning。Mac App 无独立 XCTest target，因此 Mac config
+  presence/normalization/writer 与 runtime freeze 还通过源码审计和完整 target 编译验证，不能冒充真实
+  GUI/provider smoke；
+- 未读取或修改用户的真实 provider/auth 配置，未运行真实 permission-review provider matrix；模型的
+  实际 plain-text verdict 稳定性仍需用用户配置的 reviewer route 做手动 smoke。
 
 2026-08-05 Cowork coordinator 主动推进与外部目录恢复提示词的直接证据：
 

@@ -129,6 +129,7 @@ struct CLIModernProviderConfig: Sendable {
     let routes: [CLIProviderRoute]
     let selectedProviderID: String
     let selectedModelID: String
+    let permissionReviewerModel: CLIProviderModelSelection
     let imageModel: CLIProviderModelSelection?
     let embeddingModel: CLIProviderModelSelection?
     let rerankerModel: CLIProviderModelSelection?
@@ -176,6 +177,17 @@ struct CLIModernProviderConfig: Sendable {
             root.string("model") ?? root.string("small_model") ?? root.string("smallModel"),
             environment: environment,
             configDirectory: url.deletingLastPathComponent())
+        let permissionReviewerFieldPresent = root["permission_reviewer_model"] != nil
+        let permissionReviewerModelRaw = resolvedConfigValue(
+            root.string("permission_reviewer_model"),
+            environment: environment,
+            configDirectory: url.deletingLastPathComponent())
+        if permissionReviewerFieldPresent,
+           permissionReviewerModelRaw?.trimmingCharacters(
+               in: .whitespacesAndNewlines).isEmpty != false {
+            throw IntatisError.config(
+                "invalid CLI permission_reviewer_model")
+        }
         let imageModelRaw = resolvedConfigValue(
             root.string("image_model") ?? root.string("imageModel"),
             environment: environment,
@@ -283,6 +295,39 @@ struct CLIModernProviderConfig: Sendable {
         }
 
         let selection = try selectModel(selectedRaw, routes: inferenceRoutes)
+        let permissionReviewerModel: CLIProviderModelSelection
+        if permissionReviewerFieldPresent {
+            permissionReviewerModel = try selectPermissionReviewerModel(
+                permissionReviewerModelRaw,
+                routes: inferenceRoutes)
+        } else {
+            // Compatibility is intentionally tied to the JSON document's
+            // configured default, not to INTATIS_MODEL or a runtime @main
+            // rebind performed after the document is loaded. Unlike ordinary
+            // main selection, this authorization role cannot invent a missing
+            // or unknown model by falling back to the first route.
+            guard let inheritedRaw = selectedRaw?.trimmingCharacters(
+                in: .whitespacesAndNewlines),
+                !inheritedRaw.isEmpty else {
+                throw IntatisError.config(
+                    "permission_reviewer_model is absent and the JSON top-level model is unavailable")
+            }
+            let inherited = try selectModel(
+                inheritedRaw,
+                routes: inferenceRoutes)
+            guard inferenceRoutes.contains(where: { route in
+                route.id == inherited.providerID
+                    && route.models.contains(where: {
+                        $0.id == inherited.modelID
+                    })
+            }) else {
+                throw IntatisError.config(
+                    "permission_reviewer_model cannot inherit an unknown JSON top-level model")
+            }
+            permissionReviewerModel = CLIProviderModelSelection(
+                providerID: inherited.providerID,
+                modelID: inherited.modelID)
+        }
         let imageModel = try selectRoleModel(
             imageModelRaw,
             preferredProviderID: selection.providerID,
@@ -292,6 +337,7 @@ struct CLIModernProviderConfig: Sendable {
             routes: routes,
             selectedProviderID: selection.providerID,
             selectedModelID: selection.modelID,
+            permissionReviewerModel: permissionReviewerModel,
             imageModel: imageModel,
             embeddingModel: embeddingModel,
             rerankerModel: rerankerModel,
@@ -398,6 +444,36 @@ struct CLIModernProviderConfig: Sendable {
         }
         let route = routes[0]
         return (route.id, route.models[0].id)
+    }
+
+    /// Reviewer configuration is an authorization boundary, so it does not
+    /// inherit `selectModel`'s permissive unknown-model fallback. An explicit
+    /// value must name one enabled inference model using the canonical
+    /// `<provider>/<model-id>` shape or loading fails closed.
+    private static func selectPermissionReviewerModel(
+        _ raw: String?,
+        routes: [CLIProviderRoute]
+    ) throws -> CLIProviderModelSelection {
+        guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty else {
+            throw IntatisError.config(
+                "invalid CLI permission_reviewer_model")
+        }
+        for route in routes.sorted(by: { $0.id.count > $1.id.count }) {
+            let prefix = route.id + "/"
+            guard raw.hasPrefix(prefix) else { continue }
+            let modelID = String(raw.dropFirst(prefix.count))
+            guard !modelID.isEmpty,
+                  route.models.contains(where: { $0.id == modelID }) else {
+                throw IntatisError.config(
+                    "CLI permission_reviewer_model does not resolve to a configured inference model")
+            }
+            return CLIProviderModelSelection(
+                providerID: route.id,
+                modelID: modelID)
+        }
+        throw IntatisError.config(
+            "CLI permission_reviewer_model must use the canonical provider/model shape")
     }
 
     private static func selectRoleModel(

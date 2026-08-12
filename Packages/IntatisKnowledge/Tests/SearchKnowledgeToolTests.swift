@@ -31,6 +31,14 @@ final class SearchKnowledgeToolTests: XCTestCase {
         XCTAssertEqual(
             registration.permissionActionPreview(valid)?.fields["executionSemantics"],
             "local_only")
+        let hostDefault = ToolArgs(raw: #"{"knowledge_base":"kb_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","query":"refund","limit":null}"#)
+        XCTAssertNoThrow(try registration.validateArguments(hostDefault))
+        XCTAssertEqual(
+            registration.permissionActionPreview(hostDefault)?.fields["limit"],
+            "8")
+        XCTAssertThrowsError(try registration.validateArguments(
+            ToolArgs(raw: #"{"knowledge_base":"kb_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","query":"refund"}"#)))
+        assertStrictObjectSchema(registration.descriptor.parameters)
         let invalid = ToolArgs(raw: #"{"knowledge_base":"kb_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","query":"refund","path":"/tmp/leak"}"#)
         XCTAssertThrowsError(try registration.validateArguments(invalid))
 
@@ -64,7 +72,7 @@ final class SearchKnowledgeToolTests: XCTestCase {
         let registry = ToolRegistry(
             registrations: [registration],
             registryVersion: version)
-        let raw = #"{"knowledge_base":"kb_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","query":"refund"}"#
+        let raw = #"{"knowledge_base":"kb_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","query":"refund","limit":null}"#
         let args = ToolArgs(raw: raw)
         try registration.validateArguments(args)
         let capabilityLease = CapabilityLease(tools: [.searchKnowledge])
@@ -160,12 +168,13 @@ final class SearchKnowledgeToolTests: XCTestCase {
         XCTAssertNoThrow(try registration.validateArguments(
             ToolArgs(raw: #"{"query":"refund","limit":1}"#)))
         XCTAssertThrowsError(try registration.validateArguments(
-            ToolArgs(raw: #"{"knowledge_base":"kb_dddddddddddddddddddddddddddddddd","query":"refund"}"#)))
+            ToolArgs(raw: #"{"knowledge_base":"kb_dddddddddddddddddddddddddddddddd","query":"refund","limit":null}"#)))
         guard case .object(let schema) = registration.descriptor.parameters,
               case .object(let properties)? = schema["properties"] else {
             return XCTFail("Expected an object input schema")
         }
         XCTAssertNil(properties["knowledge_base"])
+        assertStrictObjectSchema(registration.descriptor.parameters)
         XCTAssertTrue(registration.descriptor.description.contains(
             binding.knowledgeBaseHandle))
     }
@@ -195,6 +204,35 @@ final class SearchKnowledgeToolTests: XCTestCase {
         XCTAssertEqual(
             result.totalByteCount,
             Data(observation.text.utf8).count * 2 + summaryBytes)
+    }
+
+    private func assertStrictObjectSchema(
+        _ value: JSONValue,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        guard case .object(let schema) = value,
+              case .object(let properties)? = schema["properties"],
+              case .array(let requiredValues)? = schema["required"] else {
+            return XCTFail(
+                "Expected a strict object schema",
+                file: file,
+                line: line)
+        }
+        let required = Set(requiredValues.compactMap { value -> String? in
+            guard case .string(let name) = value else { return nil }
+            return name
+        })
+        XCTAssertEqual(
+            required,
+            Set(properties.keys),
+            file: file,
+            line: line)
+        XCTAssertEqual(
+            schema["additionalProperties"],
+            .bool(false),
+            file: file,
+            line: line)
     }
 
     private func mountRegistry() -> KnowledgeMountRegistry {

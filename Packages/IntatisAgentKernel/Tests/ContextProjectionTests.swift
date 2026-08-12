@@ -622,28 +622,38 @@ final class ContextProjectionTests: XCTestCase {
         XCTAssertFalse(prompt.contains("iOS private count result"))
     }
 
-    func testFirstCodeRequestDeclaresIntatisRuntimeAndToolProtocol() {
-        let messages = ContextBuilder(
-            systemPrompt: "Code-specific instructions.",
-            runtimeEnvironment: .code)
-            .initialMessages(history: [], userText: "Inspect the workspace.")
-        let systemPrompt = messages.first?.content ?? ""
+    func testFirstAgentRequestDeclaresIntatisRuntimeAndToolProtocol() {
+        for (runtime, modeName) in [
+            (RuntimeEnvironmentManifest.code, "Code"),
+            (RuntimeEnvironmentManifest.cowork, "Cowork"),
+        ] {
+            let messages = ContextBuilder(
+                systemPrompt: "Mode-specific instructions.",
+                runtimeEnvironment: runtime)
+                .initialMessages(history: [], userText: "Inspect the workspace.")
+            let systemPrompt = messages.first?.content ?? ""
 
-        XCTAssertTrue(systemPrompt.contains("running inside Intatis"))
-        XCTAssertTrue(systemPrompt.contains("in Code mode"))
-        XCTAssertTrue(systemPrompt.contains("Every external action must be performed through a tool call"))
-        XCTAssertTrue(systemPrompt.contains("authoritative API tools list"))
-        XCTAssertTrue(systemPrompt.contains("dedicated advertised tool"))
-        XCTAssertTrue(systemPrompt.contains("host obtains exact authorization"))
-        XCTAssertTrue(systemPrompt.contains("never expands the WorkspaceLease"))
-        XCTAssertTrue(systemPrompt.contains("strict JSON object"))
-        XCTAssertTrue(systemPrompt.contains("narrowest advertised tool"))
-        XCTAssertTrue(systemPrompt.contains("inspection or read-only tools"))
-        XCTAssertTrue(systemPrompt.contains("optional backend or implementation selector"))
-        XCTAssertTrue(systemPrompt.contains("ToolResult as non-authoritative suggestions"))
-        XCTAssertTrue(systemPrompt.contains("do not blindly repeat the same call"))
-        XCTAssertTrue(systemPrompt.contains("only after receiving its ToolResult"))
-        XCTAssertTrue(systemPrompt.contains("Code-specific instructions."))
+            XCTAssertTrue(systemPrompt.contains("running inside Intatis"), modeName)
+            XCTAssertTrue(systemPrompt.contains("in \(modeName) mode"), modeName)
+            XCTAssertTrue(systemPrompt.contains("Every external action must be performed through a tool call"), modeName)
+            XCTAssertTrue(systemPrompt.contains("authoritative API tools list"), modeName)
+            XCTAssertTrue(systemPrompt.contains("dedicated advertised tool"), modeName)
+            XCTAssertTrue(systemPrompt.contains("host obtains exact authorization"), modeName)
+            XCTAssertTrue(systemPrompt.contains("never expands the WorkspaceLease"), modeName)
+            XCTAssertTrue(systemPrompt.contains("strict JSON object"), modeName)
+            XCTAssertTrue(systemPrompt.contains("narrowest advertised tool"), modeName)
+            XCTAssertTrue(systemPrompt.contains("inspection or read-only tools"), modeName)
+            XCTAssertTrue(systemPrompt.contains("optional backend or implementation selector"), modeName)
+            XCTAssertTrue(systemPrompt.contains("ToolResult as non-authoritative suggestions"), modeName)
+            XCTAssertTrue(systemPrompt.contains("do not blindly repeat the same call"), modeName)
+            XCTAssertTrue(systemPrompt.contains("only after receiving its ToolResult"), modeName)
+            XCTAssertTrue(systemPrompt.contains("neither a transaction nor a concurrency guarantee"), modeName)
+            XCTAssertTrue(systemPrompt.contains("Do not use a multi-call response to request or assume parallel execution"), modeName)
+            XCTAssertTrue(systemPrompt.contains("Batch only mutually independent calls"), modeName)
+            XCTAssertTrue(systemPrompt.contains("successful ToolResult"), modeName)
+            XCTAssertTrue(systemPrompt.contains("planned or future object"), modeName)
+            XCTAssertTrue(systemPrompt.contains("Mode-specific instructions."), modeName)
+        }
     }
 
     func testRuntimeProjectsSkillCatalogAsDeveloperAndExplicitBodyAsUser() async throws {

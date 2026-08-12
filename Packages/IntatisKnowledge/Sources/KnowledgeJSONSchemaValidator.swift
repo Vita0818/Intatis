@@ -13,7 +13,7 @@ public struct KnowledgeJSONSchemaValidator: Sendable {
         case sourceLocator = "source-locator-v1.schema"
         case chunk = "chunk-v1.schema"
         case validation = "validation-v1.schema"
-        case searchInput = "search-knowledge-input-v1.schema"
+        case searchInput = "search-knowledge-input-v2.schema"
         case searchOutput = "search-knowledge-output-v1.schema"
         case evidence = "evidence-v1.schema"
         case profile = "profile-0.1.schema"

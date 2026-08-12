@@ -129,6 +129,13 @@ public enum AuthorizationSidecarSchemaDecorationError:
     case propertiesNotObject(toolPath: [String])
     case requiredNotStringArray(toolPath: [String])
     case reservedFieldCollision(toolPath: [String])
+    case malformedDeferredToolDefinition(
+        toolPath: [String],
+        reason: String)
+    case invalidStrictSchema(
+        toolPath: [String],
+        schemaPath: [String],
+        reason: String)
 
     public var errorDescription: String? {
         let path: [String]
@@ -146,6 +153,15 @@ public enum AuthorizationSidecarSchemaDecorationError:
         case .reservedFieldCollision(let value):
             path = value
             reason = "tool schema declares the reserved authorization sidecar field"
+        case .malformedDeferredToolDefinition(let value, let detail):
+            path = value
+            reason = "malformed deferred tool definition: \(detail)"
+        case .invalidStrictSchema(let value, let schemaPath, let detail):
+            path = value
+            let location = schemaPath.isEmpty
+                ? "parameters"
+                : schemaPath.joined(separator: ".")
+            reason = "invalid strict schema at \(location): \(detail)"
         }
         return "Cannot decorate tool \(path.joined(separator: ".")): \(reason)."
     }
@@ -161,7 +177,7 @@ public enum AuthorizationSidecarCodec {
         "type": .string("string"),
         "minLength": .number(1),
         "description": .string(
-            "The host conditionally requires this same-generation concise evidence for actions that need automatic permission review; pure deterministic reads may omit it. State only the relevant user intent, progress or evidence, and why this exact action is needed. Do not include ALLOW/DENY, risk, lease claims, raw credentials, full transcripts, or full document/image contents."),
+            "Required formatting field for every automatic Cowork function call. State only the relevant same-generation user intent, progress or evidence, and why this exact action is needed. The host uses it only if the action reaches automatic permission review; deterministic allow or deny paths ignore it. Do not include ALLOW/DENY, risk, lease claims, raw credentials, full transcripts, or full document/image contents."),
     ])
 
     /// Decorates ordinary and deferred function tools. Namespace containers
@@ -173,6 +189,38 @@ public enum AuthorizationSidecarCodec {
 
     public static func decorate(_ toolSpecs: [ToolSpec]) throws -> [ToolSpec] {
         try toolSpecs.map(decorate)
+    }
+
+    /// Decorates only provider-bound deferred tool definitions embedded in
+    /// `tool_search_output` messages. The caller's durable/history messages
+    /// remain unchanged.
+    public static func decorateProviderMessages(
+        _ messages: [AgentMessage]
+    ) throws -> [AgentMessage] {
+        try messages.map { message in
+            guard let output = message.toolSearchOutput else {
+                return message
+            }
+            var decorated = message
+            decorated.toolSearchOutput = try decorate(output)
+            return decorated
+        }
+    }
+
+    /// Decorates the request-owned Responses definitions returned by
+    /// `tool_search`. The special `tool_search` tool itself is not a business
+    /// function and remains unchanged; only the functions it exposes gain the
+    /// authorization sidecar.
+    public static func decorate(
+        _ output: ModelToolSearchOutput
+    ) throws -> ModelToolSearchOutput {
+        var decorated = output
+        decorated.tools = try output.tools.enumerated().map { index, tool in
+            try decorateDeferredToolDefinition(
+                tool,
+                toolPath: ["tool_search_output", "tools[\(index)]"])
+        }
+        return decorated
     }
 
     /// Canonical transient reviewer representation. This is the exact JSON
@@ -372,14 +420,16 @@ public enum AuthorizationSidecarCodec {
             var decorated = toolSpec
             decorated.parameters = try decorateParameters(
                 toolSpec.parameters,
-                toolPath: toolPath)
+                toolPath: toolPath,
+                strict: toolSpec.strict)
             return decorated
         }
     }
 
     private static func decorateParameters(
         _ parameters: JSONValue,
-        toolPath: [String]
+        toolPath: [String],
+        strict: Bool?
     ) throws -> JSONValue {
         guard case .object(var schema) = parameters else {
             throw AuthorizationSidecarSchemaDecorationError
@@ -428,9 +478,231 @@ public enum AuthorizationSidecarCodec {
         }
 
         properties[reservedFieldName] = authorizationContextSchema
+        required.append(.string(reservedFieldName))
         schema["properties"] = .object(properties)
         schema["required"] = .array(required)
-        return .object(schema)
+        let decorated = JSONValue.object(schema)
+        if strict == true {
+            try validateStrictSchema(
+                decorated,
+                toolPath: toolPath,
+                schemaPath: ["parameters"],
+                requireExplicitObjectType: true)
+        }
+        return decorated
+    }
+
+    private static func decorateDeferredToolDefinition(
+        _ definition: JSONValue,
+        toolPath: [String]
+    ) throws -> JSONValue {
+        guard case .object(var object) = definition else {
+            throw AuthorizationSidecarSchemaDecorationError
+                .malformedDeferredToolDefinition(
+                    toolPath: toolPath,
+                    reason: "definition is not an object")
+        }
+        guard case .string(let kind)? = object["type"] else {
+            throw AuthorizationSidecarSchemaDecorationError
+                .malformedDeferredToolDefinition(
+                    toolPath: toolPath,
+                    reason: "type is missing or is not a string")
+        }
+        let namedPath: [String]
+        if case .string(let name)? = object["name"],
+           !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            namedPath = toolPath + [name]
+        } else {
+            namedPath = toolPath
+        }
+
+        switch kind {
+        case "function":
+            guard let parameters = object["parameters"] else {
+                throw AuthorizationSidecarSchemaDecorationError
+                    .malformedDeferredToolDefinition(
+                        toolPath: namedPath,
+                        reason: "function parameters are missing")
+            }
+            let strict: Bool?
+            switch object["strict"] {
+            case .none:
+                strict = nil
+            case .some(.bool(let value)):
+                strict = value
+            case .some:
+                throw AuthorizationSidecarSchemaDecorationError
+                    .malformedDeferredToolDefinition(
+                        toolPath: namedPath,
+                        reason: "strict is not a boolean")
+            }
+            object["parameters"] = try decorateParameters(
+                parameters,
+                toolPath: namedPath,
+                strict: strict)
+            return .object(object)
+
+        case "namespace":
+            guard case .array(let tools)? = object["tools"] else {
+                throw AuthorizationSidecarSchemaDecorationError
+                    .malformedDeferredToolDefinition(
+                        toolPath: namedPath,
+                        reason: "namespace tools are missing or are not an array")
+            }
+            object["tools"] = .array(try tools.enumerated().map {
+                index, child in
+                try decorateDeferredToolDefinition(
+                    child,
+                    toolPath: namedPath + ["tools[\(index)]"])
+            })
+            return .object(object)
+
+        default:
+            throw AuthorizationSidecarSchemaDecorationError
+                .malformedDeferredToolDefinition(
+                    toolPath: namedPath,
+                    reason: "unsupported type \(kind)")
+        }
+    }
+
+    /// OpenAI strict function schemas require every object property to appear
+    /// exactly once in `required` and every object to reject additional
+    /// properties. Validate that recursive object invariant on the
+    /// request-owned copy before network dispatch so a violating descriptor
+    /// fails locally with a typed error.
+    private static func validateStrictSchema(
+        _ value: JSONValue,
+        toolPath: [String],
+        schemaPath: [String],
+        requireExplicitObjectType: Bool = false
+    ) throws {
+        let schema: [String: JSONValue]
+        switch value {
+        case .object(let object):
+            schema = object
+        case .bool:
+            // JSON Schema permits boolean schemas at recursive positions.
+            return
+        default:
+            throw AuthorizationSidecarSchemaDecorationError
+                .invalidStrictSchema(
+                    toolPath: toolPath,
+                    schemaPath: schemaPath,
+                    reason: "schema must be an object or boolean")
+        }
+
+        if requireExplicitObjectType,
+           schema["type"] != .string("object") {
+            throw AuthorizationSidecarSchemaDecorationError
+                .invalidStrictSchema(
+                    toolPath: toolPath,
+                    schemaPath: schemaPath,
+                    reason: "root type must be object")
+        }
+
+        let declaresObject: Bool
+        switch schema["type"] {
+        case .some(.string("object")):
+            declaresObject = true
+        case .some(.array(let types)):
+            declaresObject = types.contains(.string("object"))
+        default:
+            declaresObject = schema["properties"] != nil
+        }
+
+        if declaresObject {
+            guard case .object(let properties)? = schema["properties"] else {
+                throw AuthorizationSidecarSchemaDecorationError
+                    .invalidStrictSchema(
+                        toolPath: toolPath,
+                        schemaPath: schemaPath,
+                        reason: "properties is missing or is not an object")
+            }
+            guard schema["additionalProperties"] == .bool(false) else {
+                throw AuthorizationSidecarSchemaDecorationError
+                    .invalidStrictSchema(
+                        toolPath: toolPath,
+                        schemaPath: schemaPath,
+                        reason: "additionalProperties must be false")
+            }
+            guard case .array(let requiredValues)? = schema["required"],
+                  requiredValues.allSatisfy({
+                      if case .string = $0 { return true }
+                      return false
+                  }) else {
+                throw AuthorizationSidecarSchemaDecorationError
+                    .invalidStrictSchema(
+                        toolPath: toolPath,
+                        schemaPath: schemaPath,
+                        reason: "required must be a string array")
+            }
+            let requiredNames = requiredValues.compactMap {
+                if case .string(let name) = $0 { return name }
+                return nil
+            }
+            guard requiredNames.count == Set(requiredNames).count,
+                  Set(requiredNames) == Set(properties.keys) else {
+                throw AuthorizationSidecarSchemaDecorationError
+                    .invalidStrictSchema(
+                        toolPath: toolPath,
+                        schemaPath: schemaPath,
+                        reason: "required must contain every property exactly once")
+            }
+            for (name, propertySchema) in properties {
+                try validateStrictSchema(
+                    propertySchema,
+                    toolPath: toolPath,
+                    schemaPath: schemaPath + ["properties", name])
+            }
+        }
+
+        for key in ["items", "contains", "if", "then", "else", "not"] {
+            if let nested = schema[key] {
+                try validateStrictSchema(
+                    nested,
+                    toolPath: toolPath,
+                    schemaPath: schemaPath + [key])
+            }
+        }
+        for key in ["anyOf", "oneOf", "allOf", "prefixItems"] {
+            guard let rawBranches = schema[key] else { continue }
+            guard case .array(let branches) = rawBranches else {
+                throw AuthorizationSidecarSchemaDecorationError
+                    .invalidStrictSchema(
+                        toolPath: toolPath,
+                        schemaPath: schemaPath + [key],
+                        reason: "\(key) must be an array")
+            }
+            if key != "prefixItems", branches.isEmpty {
+                throw AuthorizationSidecarSchemaDecorationError
+                    .invalidStrictSchema(
+                        toolPath: toolPath,
+                        schemaPath: schemaPath + [key],
+                        reason: "\(key) must not be empty")
+            }
+            for (index, branch) in branches.enumerated() {
+                try validateStrictSchema(
+                    branch,
+                    toolPath: toolPath,
+                    schemaPath: schemaPath + [key, "[\(index)]"])
+            }
+        }
+        for key in ["$defs", "definitions", "dependentSchemas"] {
+            guard let rawDefinitions = schema[key] else { continue }
+            guard case .object(let definitions) = rawDefinitions else {
+                throw AuthorizationSidecarSchemaDecorationError
+                    .invalidStrictSchema(
+                        toolPath: toolPath,
+                        schemaPath: schemaPath + [key],
+                        reason: "\(key) must be an object")
+            }
+            for (name, nested) in definitions {
+                try validateStrictSchema(
+                    nested,
+                    toolPath: toolPath,
+                    schemaPath: schemaPath + [key, name])
+            }
+        }
     }
 
     private static func invalidOuter(

@@ -166,6 +166,35 @@ private struct PolicyDelegateTaskTool: Tool {
     }
 }
 
+private struct PolicyDeferredToolSearchTool: Tool {
+    static let descriptor = ToolDescriptor(
+        name: "tool_search",
+        description: "Return one deferred test function.",
+        sideEffect: .readOnly,
+        parameters: .object([
+            "type": .string("object"),
+            "properties": .object([
+                "query": .object([
+                    "type": .string("string"),
+                ]),
+            ]),
+            "required": .array([.string("query")]),
+            "additionalProperties": .bool(false),
+        ]),
+        modelSpecKind: .toolSearch)
+
+    let output: ModelToolSearchOutput
+
+    func execute(
+        _ args: ToolArgs,
+        in context: ToolContext
+    ) async throws -> ToolObservation {
+        ToolObservation(
+            text: "deferred tool loaded",
+            toolSearchOutput: output)
+    }
+}
+
 private actor CapturingPolicyResponder: PermissionResponder {
     private var captured: [PermissionRequestPayload] = []
     private let decision: PermissionDecision
@@ -630,6 +659,94 @@ final class AgentLoopPolicyTests: XCTestCase {
             guard case .error(let payload) = envelope.event else { return nil }
             return payload
         }
+    }
+
+    func testAutomaticCoworkDecoratesDeferredOutputOnlyForNextProviderRequest()
+        async throws {
+        let (workspace, log) = try makeWorkspaceAndLog(
+            "automatic-deferred-sidecar")
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let businessSchema = JSONValue.object([
+            "type": .string("object"),
+            "properties": .object([
+                "query": .object(["type": .string("string")]),
+                "limit": .object(["type": .string("integer")]),
+            ]),
+            "required": .array([.string("query")]),
+            "additionalProperties": .bool(false),
+        ])
+        let rawDeferredFunction = JSONValue.object([
+            "type": .string("function"),
+            "name": .string("remote_search"),
+            "description": .string("Search the remote service."),
+            "strict": .bool(false),
+            "defer_loading": .bool(true),
+            "parameters": businessSchema,
+        ])
+        let rawOutput = ModelToolSearchOutput(
+            tools: [rawDeferredFunction])
+        let provider = PolicyScriptedProvider([
+            [
+                .toolCalls([ToolCall(
+                    id: "search-call",
+                    name: "tool_search",
+                    arguments: #"{"query":"remote search"}"#,
+                    kind: .toolSearch,
+                    status: "completed",
+                    execution: "client")]),
+                .done(finishReason: "tool_calls"),
+            ],
+            [
+                .textDelta("Deferred tool definition received."),
+                .done(finishReason: "stop"),
+            ],
+        ])
+        let responder = SequencedStructuredPolicyResponder([
+            PermissionApprovalResolution(
+                decision: .allow,
+                reason: "must not be consulted for deterministic discovery",
+                source: .automaticReviewer,
+                reviewStatus: .allowed),
+        ])
+        let loop = makeLoop(
+            workspace: workspace,
+            log: log,
+            provider: provider,
+            registry: ToolRegistry([
+                PolicyDeferredToolSearchTool(output: rawOutput),
+            ]),
+            responder: responder,
+            context: ContextBuilder(runtimeEnvironment: .cowork))
+
+        let answer = try await loop.send("Find the remote search tool.")
+
+        XCTAssertEqual(answer, "Deferred tool definition received.")
+        let reviewRequests = await responder.requests()
+        XCTAssertTrue(reviewRequests.isEmpty)
+        XCTAssertEqual(provider.requests.count, 2)
+        let firstRequest = try XCTUnwrap(provider.requests.first)
+        XCTAssertEqual(firstRequest.tools.count, 1)
+        XCTAssertEqual(firstRequest.tools[0].kind, .toolSearch)
+        XCTAssertEqual(
+            firstRequest.tools[0].parameters,
+            PolicyDeferredToolSearchTool.descriptor.parameters)
+        let secondRequest = provider.requests[1]
+        let providerOutput = try XCTUnwrap(
+            secondRequest.messages.compactMap(\.toolSearchOutput).first)
+        guard let firstDeferredTool = providerOutput.tools.first,
+              case .object(let function) = firstDeferredTool,
+              case .object(let parameters)? = function["parameters"],
+              case .object(let properties)? = parameters["properties"],
+              case .array(let required)? = parameters["required"] else {
+            return XCTFail("expected a provider-decorated deferred function")
+        }
+        XCTAssertNotNil(
+            properties[AuthorizationSidecarCodec.reservedFieldName])
+        XCTAssertEqual(required, [
+            .string("query"),
+            .string(AuthorizationSidecarCodec.reservedFieldName),
+        ])
+        XCTAssertEqual(rawOutput.tools, [rawDeferredFunction])
     }
 
     func testReadOnlyWorkspaceLeaseRejectsWriteToolBeforeExecution() async throws {

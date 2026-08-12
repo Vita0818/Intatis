@@ -268,7 +268,9 @@ final class CLIAttachmentTests: XCTestCase {
                 workspaces: [CoworkSessionWorkspace(
                     path: workspace.path,
                     agentName: Orchestrator.mainAgentID.rawValue,
-                    isPrimary: true)]))
+                    isPrimary: true)]),
+            permissionReviewerModel: binding.modelID,
+            permissionReviewerInferenceBinding: binding)
         XCTAssertEqual(bootstrap, .attached(Orchestrator.mainAgentID))
 
         let firstSubmission = SubmissionID(

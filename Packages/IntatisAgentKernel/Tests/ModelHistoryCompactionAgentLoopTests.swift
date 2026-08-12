@@ -11,14 +11,21 @@ import IntatisConversation
 private final class CompactionScriptedProvider:
     ToolCallingProvider, @unchecked Sendable
 {
+    let toolCallingCapabilities: ToolCallingProviderCapabilities
+
     private let lock = NSLock()
     private let responses: [[AgentChunk]]
     private var responseIndex = 0
     private var capturedRequests: [AgentRequest] = []
 
-    init(_ responses: [[AgentChunk]]) {
+    init(
+        _ responses: [[AgentChunk]],
+        capabilities: ToolCallingProviderCapabilities =
+            .chatCompletionsOnly
+    ) {
         precondition(!responses.isEmpty)
         self.responses = responses
+        toolCallingCapabilities = capabilities
     }
 
     var requests: [AgentRequest] {
@@ -125,6 +132,43 @@ private struct CompactionLargeProbeTool: Tool {
             text:
                 "probe:\(decoded.path):"
                 + String(repeating: "large-observation-", count: 1_200))
+    }
+}
+
+private struct CompactionDeferredToolSearchTool: Tool {
+    static let descriptor = ToolDescriptor(
+        name: "tool_search",
+        description: "Return deferred functions for compaction testing.",
+        sideEffect: .readOnly,
+        parameters: .object([
+            "type": .string("object"),
+            "properties": .object([
+                "query": .object(["type": .string("string")]),
+            ]),
+            "required": .array([.string("query")]),
+            "additionalProperties": .bool(false),
+        ]),
+        modelSpecKind: .toolSearch)
+
+    let output: ModelToolSearchOutput
+
+    func execute(
+        _ args: ToolArgs,
+        in context: ToolContext
+    ) async throws -> ToolObservation {
+        ToolObservation(
+            text: "deferred functions loaded",
+            toolSearchOutput: output)
+    }
+}
+
+private struct CompactionAutomaticResponder: PermissionResponder {
+    let approvalMode: PermissionApprovalMode = .automaticReviewer
+
+    func requestApproval(
+        _ request: PermissionRequestPayload
+    ) async -> PermissionDecision {
+        .allow
     }
 }
 
@@ -236,6 +280,143 @@ final class ModelHistoryCompactionAgentLoopTests: XCTestCase {
         XCTAssertEqual(
             checkpoint.replacementHistory.last?.content,
             checkpoint.message)
+    }
+
+    func testMidTurnCompactionUsesDecoratedDeferredProviderCopyAndPersistsRawOutput()
+        async throws
+    {
+        let fixture = try makeFixture("deferred_sidecar")
+        defer { try? FileManager.default.removeItem(at: fixture.workspace) }
+        let submissionID = SubmissionID(
+            rawValue: "sub_compact_deferred_sidecar")
+        let task = rootTask(
+            "task_compact_deferred_sidecar",
+            submissionID,
+            "Find a deferred remote tool.")
+        try await fixture.log.append([
+            .userMessage(UserMessagePayload(
+                text: task.objective,
+                to: main,
+                submissionID: submissionID)),
+            .taskCreated(TaskCreatedPayload(contract: task)),
+        ])
+
+        let businessSchema = JSONValue.object([
+            "type": .string("object"),
+            "properties": .object([
+                "query": .object(["type": .string("string")]),
+                "limit": .object(["type": .string("integer")]),
+            ]),
+            "required": .array([.string("query")]),
+            "additionalProperties": .bool(false),
+        ])
+        let deferredFunctions: [JSONValue] = (0..<12).map { index in
+            .object([
+                "type": .string("function"),
+                "name": .string("remote_search_\(index)"),
+                "description": .string("Search remote source \(index)."),
+                "strict": .bool(false),
+                "defer_loading": .bool(true),
+                "parameters": businessSchema,
+            ])
+        }
+        let rawOutput = ModelToolSearchOutput(
+            tools: deferredFunctions)
+        let registry = ToolRegistry([
+            CompactionDeferredToolSearchTool(output: rawOutput),
+        ])
+        let searchCall = ToolCall(
+            id: "deferred-search-call",
+            name: "tool_search",
+            arguments: #"{"query":"remote"}"#,
+            kind: .toolSearch,
+            status: "completed",
+            execution: "client")
+        let builder = rootContext(task)
+        let nextSpecs = builder.toolSpecs(registry)
+        var rawNextMessages = builder.initialMessages(
+            history: [],
+            userText: task.objective)
+        rawNextMessages.append(.assistant(toolCalls: [searchCall]))
+        rawNextMessages.append(.toolSearchOutput(
+            id: searchCall.id,
+            output: rawOutput))
+        let decoratedNextMessages = try AuthorizationSidecarCodec
+            .decorateProviderMessages(rawNextMessages)
+        let rawTokens = AgentTokenEstimator.approximateInputTokens(
+            messages: rawNextMessages,
+            tools: nextSpecs)
+        let decoratedTokens = AgentTokenEstimator.approximateInputTokens(
+            messages: decoratedNextMessages,
+            tools: nextSpecs)
+        XCTAssertGreaterThan(decoratedTokens, rawTokens)
+
+        let provider = CompactionScriptedProvider(
+            [
+                [
+                    .toolCalls([searchCall]),
+                    .done(finishReason: "tool_calls"),
+                ],
+                [
+                    .textDelta("DEFERRED SUMMARY"),
+                    .done(finishReason: "stop"),
+                ],
+                [
+                    .textDelta("DEFERRED FINAL"),
+                    .done(finishReason: "stop"),
+                ],
+            ],
+            capabilities: .responsesToolSearch)
+        let loop = makeRootLoop(
+            fixture: fixture,
+            provider: provider,
+            task: task,
+            registry: registry,
+            responder: CompactionAutomaticResponder(),
+            modelContextPolicy: AgentModelContextPolicy(
+                autoCompactTokenLimit: rawTokens + 1),
+            maxIterations: 2)
+
+        let answer = try await loop.send(
+            task.objective,
+            recordUserMessage: false,
+            submissionID: submissionID)
+
+        XCTAssertEqual(answer, "DEFERRED FINAL")
+        XCTAssertEqual(provider.requests.count, 3)
+        let compactRequest = provider.requests[1]
+        XCTAssertTrue(compactRequest.tools.isEmpty)
+        let providerOutput = try XCTUnwrap(
+            compactRequest.messages.compactMap(\.toolSearchOutput).first)
+        XCTAssertEqual(providerOutput.tools.count, deferredFunctions.count)
+        for deferred in providerOutput.tools {
+            guard case .object(let function) = deferred,
+                  case .object(let parameters)? = function["parameters"],
+                  case .object(let properties)? = parameters["properties"],
+                  case .array(let required)? = parameters["required"] else {
+                return XCTFail("expected decorated deferred compaction input")
+            }
+            XCTAssertNotNil(
+                properties[AuthorizationSidecarCodec.reservedFieldName])
+            XCTAssertEqual(required, [
+                .string("query"),
+                .string(AuthorizationSidecarCodec.reservedFieldName),
+            ])
+        }
+
+        let replay = try await fixture.log.replayChecked()
+        let durableOutput = try XCTUnwrap(replay.compactMap {
+            envelope -> ModelToolSearchOutput? in
+            guard case .modelHistoryItem(let payload) = envelope.event else {
+                return nil
+            }
+            return payload.toolSearchOutput
+        }.first)
+        XCTAssertEqual(durableOutput, rawOutput)
+        XCTAssertTrue(replay.contains {
+            if case .modelHistoryCompacted = $0.event { return true }
+            return false
+        })
     }
 
     func testPreTurnCheckpointFitsNinetyFivePercentUsableWindow()
@@ -1223,6 +1404,7 @@ final class ModelHistoryCompactionAgentLoopTests: XCTestCase {
         provider: ToolCallingProvider,
         task: TaskContract,
         registry: ToolRegistry = ToolRegistry([]),
+        responder: PermissionResponder = FixedResponder(.allow),
         modelContextPolicy: AgentModelContextPolicy = .unspecified,
         maxIterations: Int = 50,
         toolSnapshotProvider:
@@ -1233,7 +1415,7 @@ final class ModelHistoryCompactionAgentLoopTests: XCTestCase {
             provider: provider,
             registry: registry,
             engine: PermissionEngine(),
-            responder: FixedResponder(.allow),
+            responder: responder,
             agent: Agent(
                 name: main,
                 workspaceRoot: fixture.workspace,

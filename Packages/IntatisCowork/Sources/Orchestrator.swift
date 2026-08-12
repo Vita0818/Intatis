@@ -1578,12 +1578,16 @@ public actor Orchestrator {
     /// Atomically establishes the complete local identity/settings baseline for
     /// a brand-new Cowork session. Registration is local durable state only;
     /// constructing the no-tools reviewer responder does not issue a model
-    /// request. The reviewer is derived from @main so their exact inference
-    /// binding cannot drift, while their identity and leases remain distinct.
+    /// request. The host must supply the reviewer's model and exact inference
+    /// binding explicitly; configuration compatibility is resolved before
+    /// this boundary, so the bootstrap can never derive reviewer inference
+    /// from @main. Their identities and leases remain distinct.
     @discardableResult
     public func bootstrapFreshSession(
         main agent: Agent,
         settings rawSettings: CoworkSessionSettings,
+        permissionReviewerModel: ModelID,
+        permissionReviewerInferenceBinding: AgentInferenceBinding?,
         reviewerPolicy: PermissionReviewControlPlanePolicy = PermissionReviewControlPlanePolicy()
     ) async -> CoworkSessionBootstrapResult {
         guard agent.name == Self.mainAgentID else {
@@ -1594,6 +1598,15 @@ public actor Orchestrator {
         }
         guard !requiresInferenceBindings || agent.agentInferenceBinding != nil else {
             return .failed("@main requires an exact inference profile binding.")
+        }
+        if let permissionReviewerInferenceBinding,
+           permissionReviewerInferenceBinding.modelID
+            != permissionReviewerModel {
+            return .failed(
+                "The permission reviewer model must match its exact inference profile binding.")
+        }
+        guard permissionReviewerInferenceBinding != nil else {
+            return .failed("The permission reviewer requires an exact inference profile binding.")
         }
         let sessionID = await log.sessionID
         let primaryWorkspaces = rawSettings.workspaces.filter(\.isPrimary)
@@ -1630,8 +1643,8 @@ public actor Orchestrator {
         let reviewer = Agent(
             name: Self.automaticPermissionReviewerID,
             workspaceRoot: canonical,
-            model: proposedMain.model,
-            agentInferenceBinding: proposedMain.agentInferenceBinding,
+            model: permissionReviewerModel,
+            agentInferenceBinding: permissionReviewerInferenceBinding,
             profile: .readOnly,
             coordinationDepth: 0)
 
@@ -1642,7 +1655,10 @@ public actor Orchestrator {
         } catch {
             return .failed("The exact @main/reviewer inference profile is unavailable or incompatible.")
         }
-        let reviewedCatalogBinding = proposedMain.agentInferenceBinding.flatMap {
+        let reviewedMainCatalogBinding = proposedMain.agentInferenceBinding.flatMap {
+            availableInferenceProfiles[$0.inferenceProfileID]
+        }
+        let reviewedReviewerCatalogBinding = reviewer.agentInferenceBinding.flatMap {
             availableInferenceProfiles[$0.inferenceProfileID]
         }
         let mainLeases = prepareDefaultLeases(for: proposedMain)
@@ -1675,7 +1691,10 @@ public actor Orchestrator {
             releaseAdmissionLock()
             return .failed("Initial Cowork bootstrap could not verify an empty event log: \(error.localizedDescription)")
         }
-        let catalogBindingBeforeResolution = proposedMain.agentInferenceBinding.flatMap {
+        let mainCatalogBindingBeforeResolution = proposedMain.agentInferenceBinding.flatMap {
+            availableInferenceProfiles[$0.inferenceProfileID]
+        }
+        let reviewerCatalogBindingBeforeResolution = reviewer.agentInferenceBinding.flatMap {
             availableInferenceProfiles[$0.inferenceProfileID]
         }
         releaseAdmissionLock()
@@ -1704,12 +1723,21 @@ public actor Orchestrator {
             return .failed("Initial Cowork bootstrap could not verify an empty event log: \(error.localizedDescription)")
         }
         if requiresInferenceBindings {
-            let liveCatalogBinding = proposedMain.agentInferenceBinding.flatMap {
+            let liveMainCatalogBinding = proposedMain.agentInferenceBinding.flatMap {
                 availableInferenceProfiles[$0.inferenceProfileID]
             }
-            guard reviewedCatalogBinding == catalogBindingBeforeResolution,
-                  catalogBindingBeforeResolution == liveCatalogBinding else {
-                return .failed("@main host-approved inference profile changed before durable admission.")
+            let liveReviewerCatalogBinding = reviewer.agentInferenceBinding.flatMap {
+                availableInferenceProfiles[$0.inferenceProfileID]
+            }
+            guard reviewedMainCatalogBinding == mainCatalogBindingBeforeResolution,
+                  mainCatalogBindingBeforeResolution == liveMainCatalogBinding else {
+                return .failed(
+                    "@main host-approved inference profile changed before durable admission.")
+            }
+            guard reviewedReviewerCatalogBinding == reviewerCatalogBindingBeforeResolution,
+                  reviewerCatalogBindingBeforeResolution == liveReviewerCatalogBinding else {
+                return .failed(
+                    "The permission reviewer host-approved inference profile changed before durable admission.")
             }
         }
         guard let mainRootIdentity = mainLeases.workspace.rootIdentity,
@@ -5893,89 +5921,151 @@ public actor Orchestrator {
         }
     }
 
+    private static func provenWorkTaskCreatePreflightRejection(
+        _ error: Error
+    ) -> ToolExecutionRejectedWithoutSideEffect {
+        if let violation = error as? WorkTaskGraphViolation {
+            return ToolExecutionRejectedWithoutSideEffect(
+                code: violation.kind.rawValue,
+                message: "task_create rejected without creating a WorkTask: \(violation.message). Confirm every depends_on ID through an earlier successful task_create, task_get, or task_list ToolResult, then retry in a later tool-call round.")
+        }
+
+        let code: String
+        let recovery: String
+        if let intatisError = error as? IntatisError {
+            switch intatisError {
+            case .permissionDenied:
+                code = "permission_denied"
+                recovery = "Use only a capability lease that can manage WorkTasks."
+            case .notFound:
+                code = "owner_not_attached"
+                recovery = "Omit owner so the current caller owns the new WorkTask, or first confirm the agent with list_agents or a successful spawn_agent ToolResult and retry task_create in a later tool-call round."
+            case .decoding:
+                code = "invalid_create"
+                recovery = "Correct the task_create arguments and retry."
+            case .config:
+                code = "invalid_state"
+                recovery = "Refresh the current run and WorkTask state before retrying."
+            case .provider:
+                code = "provider_error"
+                recovery = "Refresh the authoritative WorkTask state before retrying."
+            case .io:
+                code = "io_error"
+                recovery = "Refresh the authoritative WorkTask state before retrying."
+            case .cancelled:
+                code = "cancelled"
+                recovery = "Retry only if the current turn is still active."
+            }
+        } else {
+            code = "preflight_rejected"
+            recovery = "Refresh the authoritative WorkTask state before retrying."
+        }
+        return ToolExecutionRejectedWithoutSideEffect(
+            code: code,
+            message: "task_create rejected without creating a WorkTask: \(error.localizedDescription). \(recovery)")
+    }
+
     func createWorkTask(requestedBy: AgentID,
                         currentRunID: ContinuationRunID?,
                         currentGoalID: GoalID?,
                         canManage: Bool,
-                        request: WorkTaskCreateRequest) async throws -> WorkTaskDetail {
-        guard canManage else {
-            throw IntatisError.permissionDenied("the current capability lease cannot create WorkTasks")
-        }
-        guard let currentRunID else {
-            throw IntatisError.config("task_create requires a current ContinuationRun")
-        }
-        let title = request.title.trimmingCharacters(in: .whitespacesAndNewlines)
-        let description = request.description.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !title.isEmpty, !description.isEmpty else {
-            throw IntatisError.decoding("WorkTask title and description must be non-empty")
-        }
-
+                        request: WorkTaskCreateRequest,
+                        provePreflightRejectionHasNoEffect: Bool = false) async throws -> WorkTaskDetail {
         await acquireAdmissionLock()
         defer { releaseAdmissionLock() }
-        try requireValidWorkTaskGraph()
 
-        let owner = request.owner ?? requestedBy
-        guard owner != Self.automaticPermissionReviewerID,
-              registry.agent(owner) != nil else {
-            throw IntatisError.notFound("WorkTask owner is not an attached data-plane agent")
-        }
+        let preparedGraph: WorkTaskGraph
+        let preparedEvents: [Event]
+        let created: WorkTask
+        do {
+            guard canManage else {
+                throw IntatisError.permissionDenied("the current capability lease cannot create WorkTasks")
+            }
+            guard let currentRunID else {
+                throw IntatisError.config("task_create requires a current ContinuationRun")
+            }
+            let title = request.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            let description = request.description.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !title.isEmpty, !description.isEmpty else {
+                throw IntatisError.decoding("WorkTask title and description must be non-empty")
+            }
+            try requireValidWorkTaskGraph()
 
-        var preflight = workTaskGraph
-        var created = WorkTask(
-            runID: currentRunID,
-            goalID: currentGoalID,
-            title: title,
-            description: description,
-            acceptanceCriteria: request.acceptanceCriteria,
-            expectedArtifacts: request.expectedArtifacts,
-            status: .pending,
-            priority: request.priority,
-            owner: owner,
-            dependsOn: request.dependsOn)
-        switch preflight.add(created) {
-        case .success:
-            break
-        case .failure(let violation):
-            throw violation
-        }
+            let owner = request.owner ?? requestedBy
+            guard owner != Self.automaticPermissionReviewerID,
+                  registry.agent(owner) != nil else {
+                throw IntatisError.notFound("WorkTask owner is not an attached data-plane agent")
+            }
 
-        var events: [Event] = [.workTaskCreated(WorkTaskCreatedPayload(task: created))]
-        switch preflight.readiness(of: created.id) {
-        case .success(.ready):
-            switch preflight.transition(
-                taskID: created.id,
-                to: .ready,
-                expectedRevision: created.revision) {
-            case .success(let ready):
-                created = ready
-                events.append(.workTaskReady(WorkTaskReadyPayload(task: ready)))
+            var preflight = workTaskGraph
+            var proposed = WorkTask(
+                runID: currentRunID,
+                goalID: currentGoalID,
+                title: title,
+                description: description,
+                acceptanceCriteria: request.acceptanceCriteria,
+                expectedArtifacts: request.expectedArtifacts,
+                status: .pending,
+                priority: request.priority,
+                owner: owner,
+                dependsOn: request.dependsOn)
+            switch preflight.add(proposed) {
+            case .success:
+                break
             case .failure(let violation):
                 throw violation
             }
-        case .success(.waitingFor):
-            break
-        case .success(.blockedBy(let dependencyIDs)):
-            let blocker = "dependency failed or was cancelled: "
-                + dependencyIDs.map(\.rawValue).sorted().joined(separator: ", ")
-            switch preflight.transition(
-                taskID: created.id,
-                to: .blocked,
-                expectedRevision: created.revision,
-                progressNote: blocker) {
-            case .success(let blocked):
-                created = blocked
-                events.append(.workTaskBlocked(WorkTaskBlockedPayload(
-                    task: blocked,
-                    blocker: blocker)))
+
+            var events: [Event] = [.workTaskCreated(WorkTaskCreatedPayload(task: proposed))]
+            switch preflight.readiness(of: proposed.id) {
+            case .success(.ready):
+                switch preflight.transition(
+                    taskID: proposed.id,
+                    to: .ready,
+                    expectedRevision: proposed.revision) {
+                case .success(let ready):
+                    proposed = ready
+                    events.append(.workTaskReady(WorkTaskReadyPayload(task: ready)))
+                case .failure(let violation):
+                    throw violation
+                }
+            case .success(.waitingFor):
+                break
+            case .success(.blockedBy(let dependencyIDs)):
+                let blocker = "dependency failed or was cancelled: "
+                    + dependencyIDs.map(\.rawValue).sorted().joined(separator: ", ")
+                switch preflight.transition(
+                    taskID: proposed.id,
+                    to: .blocked,
+                    expectedRevision: proposed.revision,
+                    progressNote: blocker) {
+                case .success(let blocked):
+                    proposed = blocked
+                    events.append(.workTaskBlocked(WorkTaskBlockedPayload(
+                        task: blocked,
+                        blocker: blocker)))
+                case .failure(let violation):
+                    throw violation
+                }
             case .failure(let violation):
                 throw violation
             }
-        case .failure(let violation):
-            throw violation
+            preparedGraph = preflight
+            preparedEvents = events
+            created = proposed
+        } catch {
+            guard provePreflightRejectionHasNoEffect else {
+                throw error
+            }
+            // This scope ends before the first EventLog append. Persistence
+            // failures and lost acknowledgements below deliberately remain
+            // side-effect-unknown and require reconciliation.
+            throw Self.provenWorkTaskCreatePreflightRejection(
+                error)
         }
 
-        try await appendAdmissionEvents(events)
-        workTaskGraph = preflight
+        try await appendAdmissionEvents(preparedEvents)
+        workTaskGraph = preparedGraph
         return workTaskDetail(created)
     }
 
@@ -11508,7 +11598,12 @@ struct OrchestratorWorkTaskManager: WorkTaskManager {
             currentRunID: currentRunID,
             currentGoalID: currentGoalID,
             canManage: canManage,
-            request: request)
+            request: request,
+            // Only the production adapter opts into Orchestrator's concrete
+            // proof that this rejection happened before its first WorkTask
+            // EventLog append. Arbitrary WorkTaskManager implementations are
+            // not trusted to make the same claim.
+            provePreflightRejectionHasNoEffect: true)
     }
 
     func updateWorkTask(_ request: WorkTaskUpdateRequest) async throws -> WorkTaskDetail {

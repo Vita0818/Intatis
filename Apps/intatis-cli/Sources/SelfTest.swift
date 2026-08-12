@@ -385,7 +385,7 @@ func runSelfTest() async throws {
         && currentBDefinition.profile.effectiveRequestOptions["reasoning_effort"]
             == .string("high")
 
-    let frozenControlPlane = CLIControlPlaneInferenceBinding()
+    let frozenControlPlane = CLIGoalVerifierInferenceBinding()
     let firstFrozen = await frozenControlPlane.freeze(firstProfiles.defaultBinding)
     let secondFreezeAttempt = await frozenControlPlane.freeze(secondProfiles.defaultBinding)
     let controlPlaneStayedFrozen = firstFrozen == secondFreezeAttempt

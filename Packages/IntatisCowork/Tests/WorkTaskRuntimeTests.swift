@@ -167,6 +167,62 @@ final class WorkTaskRuntimeTests: XCTestCase {
         return (orchestrator, log)
     }
 
+    func testTaskCreateDescriptorRequiresConfirmedAttachedOwnerWithoutMakingItRequired() throws {
+        let descriptor = TaskCreateTool.descriptor
+        XCTAssertTrue(descriptor.description.contains("currently attached data-plane agent"))
+        XCTAssertTrue(descriptor.description.contains("successful list_agents or spawn_agent ToolResult received in an earlier tool-call round"))
+        XCTAssertTrue(descriptor.description.contains("Never name a planned or future agent"))
+        XCTAssertTrue(descriptor.description.contains("omit owner"))
+
+        guard case .object(let schema) = descriptor.parameters,
+              case .object(let properties)? = schema["properties"],
+              case .object(let owner)? = properties["owner"],
+              case .string(let ownerDescription)? = owner["description"],
+              case .object(let dependencies)? = properties["depends_on"],
+              case .string(let dependencyDescription)? = dependencies["description"],
+              case .array(let rawRequired)? = schema["required"] else {
+            return XCTFail("task_create must expose a documented closed object schema")
+        }
+
+        let required = Set(rawRequired.compactMap { value -> String? in
+            guard case .string(let name) = value else { return nil }
+            return name
+        })
+        XCTAssertFalse(required.contains("owner"))
+        XCTAssertNil(owner["enum"])
+        XCTAssertTrue(ownerDescription.contains("currently attached data-plane agent"))
+        XCTAssertTrue(ownerDescription.contains("successful list_agents or spawn_agent ToolResult received in an earlier tool-call round"))
+        XCTAssertTrue(ownerDescription.contains("planned or future agent"))
+        XCTAssertTrue(dependencyDescription.contains("earlier successful task_create"))
+        XCTAssertTrue(dependencyDescription.contains("same assistant response"))
+    }
+
+    func testMutatingWorkTaskToolsRejectMissingHostManagerAsNotStarted() async throws {
+        let workspace = try workTaskWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let context = ToolContext(workspaceRoot: workspace)
+
+        do {
+            _ = try await TaskCreateTool().execute(
+                ToolArgs(raw: #"{"title":"No manager","description":"Must fail closed"}"#),
+                in: context)
+            XCTFail("task_create must not report success without its host manager")
+        } catch let rejection as ToolExecutionRejectedWithoutSideEffect {
+            XCTAssertEqual(rejection.code, "work_task_manager_unavailable")
+            XCTAssertTrue(rejection.message.contains("task_create rejected before WorkTask execution started"))
+        }
+
+        do {
+            _ = try await TaskUpdateTool().execute(
+                ToolArgs(raw: #"{"task_id":"wt_missing","expected_revision":1,"progress_note":"No manager"}"#),
+                in: context)
+            XCTFail("task_update must not report success without its host manager")
+        } catch let rejection as ToolExecutionRejectedWithoutSideEffect {
+            XCTAssertEqual(rejection.code, "work_task_manager_unavailable")
+            XCTAssertTrue(rejection.message.contains("task_update rejected before WorkTask execution started"))
+        }
+    }
+
     func testWorkTaskPermissionPreviewsExposeBoundedSemanticFields() throws {
         let secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
         let createArgs = ToolArgs(raw: """
@@ -327,6 +383,46 @@ final class WorkTaskRuntimeTests: XCTestCase {
             canManage: true,
             taskID: created.task.id)
         XCTAssertEqual(unchanged.task, created.task)
+    }
+
+    func testOrchestratorManagerProvesUnattachedCreateOwnerBeforeMutation() async throws {
+        let workspace = try workTaskWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let (orchestrator, log) = try await makeOrchestrator(workspace: workspace)
+        let runID = ContinuationRunID.new()
+        let manager = OrchestratorWorkTaskManager(
+            orchestrator: orchestrator,
+            requester: main,
+            currentWorkTaskID: nil,
+            currentRunID: runID,
+            currentGoalID: nil,
+            canManage: true,
+            canUpdateOwned: false)
+        let context = ToolContext(
+            workspaceRoot: workspace,
+            workTaskManager: manager)
+        let beforeEvents = await log.replay()
+
+        do {
+            _ = try await TaskCreateTool().execute(
+                ToolArgs(raw: #"{"title":"Future owner","description":"Must wait for spawn","owner":"dpv-ch2"}"#),
+                in: context)
+            XCTFail("an unattached future owner must be rejected before mutation")
+        } catch let rejection as ToolExecutionRejectedWithoutSideEffect {
+            XCTAssertEqual(rejection.code, "owner_not_attached")
+            XCTAssertTrue(rejection.message.contains("without creating a WorkTask"))
+            XCTAssertTrue(rejection.message.contains("Omit owner"))
+            XCTAssertTrue(rejection.message.contains("successful spawn_agent ToolResult"))
+            XCTAssertTrue(rejection.message.contains("later tool-call round"))
+        }
+
+        let afterEvents = await log.replay()
+        XCTAssertEqual(afterEvents, beforeEvents)
+
+        let corrected = try await manager.createWorkTask(WorkTaskCreateRequest(
+            title: "Confirmed owner",
+            description: "Owner defaults to the current caller"))
+        XCTAssertEqual(corrected.task.owner, main)
     }
 
     func testWorkerCanCompleteOwnedTaskWhenSnapshotRepeatsFrozenContractFields() async throws {
@@ -518,6 +614,43 @@ final class WorkTaskRuntimeTests: XCTestCase {
         XCTAssertEqual(
             replayed.workTasks[created.task.id]?.progressNote,
             "durably appended")
+    }
+
+    func testCreatePostAppendFailureIsNotMisclassifiedAsNoEffect() async throws {
+        let workspace = try workTaskWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let (orchestrator, log) = try await makeOrchestrator(workspace: workspace)
+        let runID = ContinuationRunID.new()
+        await orchestrator.setAdmissionEventsAppender { events in
+            try await log.append(events)
+            throw WorkTaskRuntimeTestError.lostAcknowledgementAfterAppend
+        }
+        let manager = OrchestratorWorkTaskManager(
+            orchestrator: orchestrator,
+            requester: main,
+            currentWorkTaskID: nil,
+            currentRunID: runID,
+            currentGoalID: nil,
+            canManage: true,
+            canUpdateOwned: true)
+
+        do {
+            _ = try await manager.createWorkTask(WorkTaskCreateRequest(
+                title: "Create lost acknowledgement",
+                description: "Persist before returning an error"))
+            XCTFail("the simulated lost acknowledgement must surface")
+        } catch is ToolExecutionRejectedWithoutSideEffect {
+            XCTFail("a create failure after append must remain side-effect-unknown")
+        } catch let error as WorkTaskRuntimeTestError {
+            XCTAssertEqual(error, .lostAcknowledgementAfterAppend)
+        }
+
+        let replayed = CoworkProjection.build(from: await log.replay())
+        let persisted = replayed.workTasks.values.first {
+            $0.title == "Create lost acknowledgement"
+        }
+        XCTAssertNotNil(persisted)
+        XCTAssertEqual(persisted?.owner, main)
     }
 
     func testConcurrentCreatesPreserveBothTasksAcrossPersistenceAwait() async throws {

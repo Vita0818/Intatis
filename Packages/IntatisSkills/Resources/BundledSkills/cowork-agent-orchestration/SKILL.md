@@ -26,6 +26,13 @@ or budgets.
   current task lease. Do not build a permanent recursive role tree.
 - Use scheduler, task, delegation, and message tools. Never simulate a nested
   `AgentLoop`, a completed WorkTask, or a successful child result in prose.
+- A multi-call assistant response is neither a transaction nor a concurrency
+  guarantee. Do not use one to request or assume parallel execution. Batch only
+  mutually independent calls that remain correct in any host-controlled order.
+- An agent name, WorkTask ID, attachment, or other host object becomes usable only
+  after the call that creates or discovers it returns a successful `ToolResult`.
+  A `task_create.owner`, when supplied, must name a currently attached data-plane
+  agent. Planned or future agents and tasks are not existing objects.
 - Prefer the smallest team and the least authority that can complete the task.
   Delegation overhead is real work and real model cost.
 
@@ -40,7 +47,8 @@ or budgets.
    corresponding tool is advertised.
 3. For non-trivial work, use advertised task tools to create the smallest useful
    graph of verifiable WorkTasks. Keep ownership, dependencies, progress, result, and
-   evidence current instead of maintaining a prose-only plan.
+   evidence current instead of maintaining a prose-only plan. If a child has not
+   been attached yet, omit `task_create.owner`; never preassign a planned agent name.
 4. Evaluate the collaboration criteria below at the outset. Start ready independent,
    specialist, multimodal, review, or directory-scoped branches promptly when their
    benefit exceeds coordination cost; collaboration should not be reserved only for
@@ -166,10 +174,31 @@ coding, or synthesis.
 6. Use `spawn_agent` only for a deliberately persistent specialist, a different
    subfolder, a write-capable worker, an explicitly different approved profile, or a
    teammate that must receive several related tasks. Delegate the actual WorkTask
-   after the spawn succeeds.
+   only after the spawn returns a successful `ToolResult`.
 7. Set `canCoordinate: false` unless the child must own a real subgraph and the
    current delegation budget permits another level. Coordination authority is never
    required merely to read, edit, test, or report.
+
+### Stage causally dependent calls
+
+Use separate tool-call rounds whenever a later call depends on an earlier result.
+The recommended sequence for a WorkTask that will be assigned to a new explicit
+worker is:
+
+1. Call `task_create` with `owner` omitted, wait for its successful `ToolResult`, and
+   retain the returned durable WorkTask ID.
+2. Call `spawn_agent`, then wait for a successful `ToolResult` proving that the agent
+   is attached. A planned name is not proof.
+3. In a later round, call `delegate_task` with the confirmed WorkTask ID and attached
+   agent. The host transfers ownership as part of the delegation admission.
+
+Alternatively, spawn first, wait for success, and only then call `task_create` with
+that confirmed attached owner. Never emit `task_create(owner: "future-child")` and
+`spawn_agent(name: "future-child")` in the same assistant response. Independent
+calls may be batched, but batching is only an efficiency hint, never a concurrency
+request or guarantee. For multiple workers, batch within one stage only: create all
+ownerless tasks, await all results, spawn all workers, await all results, then
+delegate only the confirmed WorkTask and agent pairs.
 
 ## Minimize leases and information
 

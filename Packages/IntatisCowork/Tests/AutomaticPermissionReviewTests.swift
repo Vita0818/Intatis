@@ -170,6 +170,42 @@ private actor AutoReviewSecondResolutionGate {
     }
 }
 
+private actor AutoReviewReviewerRevalidationGate {
+    private var reviewerResolutionCount = 0
+    private var secondReviewerResolutionStarted = false
+    private var released = false
+    private var startedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func pauseSecondReviewerResolution(for agent: AgentID) async {
+        guard agent == Orchestrator.automaticPermissionReviewerID else { return }
+        reviewerResolutionCount += 1
+        guard reviewerResolutionCount == 2 else { return }
+        secondReviewerResolutionStarted = true
+        let waiters = startedWaiters
+        startedWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+        if released { return }
+        await withCheckedContinuation { continuation in
+            releaseWaiters.append(continuation)
+        }
+    }
+
+    func waitUntilSecondReviewerResolutionStarts() async {
+        if secondReviewerResolutionStarted { return }
+        await withCheckedContinuation { continuation in
+            startedWaiters.append(continuation)
+        }
+    }
+
+    func releaseSecondReviewerResolution() {
+        released = true
+        let waiters = releaseWaiters
+        releaseWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+    }
+}
+
 private final class AutoReviewPendingAllowProvider: ToolCallingProvider, @unchecked Sendable {
     let gate: AutoReviewPendingAllowGate
 
@@ -402,6 +438,22 @@ final class AutomaticPermissionReviewTests: XCTestCase {
             immutableDefinitionFingerprint: "sha256:phase-s-safe-fingerprint")
     }
 
+    private func phaseSReviewerBinding(
+        revision: String = "revision-1",
+        connectionRevision: String = "connection-revision-1",
+        model: String = "phase-s-reviewer-model",
+        fingerprint: String = "sha256:phase-s-reviewer-safe-fingerprint"
+    ) -> AgentInferenceBinding {
+        AgentInferenceBinding(
+            inferenceProfileRef: InferenceProfileRef(
+                inferenceProfileID: InferenceProfileID(rawValue: "phase-s-reviewer-profile"),
+                inferenceProfileRevision: InferenceProfileRevision(rawValue: revision)),
+            inferenceConnectionID: InferenceConnectionID(rawValue: "phase-s-reviewer-connection"),
+            inferenceConnectionRevision: InferenceConnectionRevision(rawValue: connectionRevision),
+            modelID: ModelID(rawValue: model),
+            immutableDefinitionFingerprint: fingerprint)
+    }
+
     func testAutoCreatesReadonlyReviewerAndDefaultRemovesIt() async throws {
         let log = try autoReviewTempLog()
         let ws = try autoReviewWorkspace()
@@ -526,7 +578,9 @@ final class AutomaticPermissionReviewTests: XCTestCase {
                 agentInferenceBinding: binding,
                 profile: .reviewed,
                 coordinationDepth: Agent.defaultCoordinationDepth),
-            settings: settings)
+            settings: settings,
+            permissionReviewerModel: binding.modelID,
+            permissionReviewerInferenceBinding: binding)
 
         XCTAssertEqual(result, .attached(main))
         XCTAssertTrue(provider.requests.isEmpty, "local registration must not issue a model request")
@@ -574,6 +628,220 @@ final class AutomaticPermissionReviewTests: XCTestCase {
         XCTAssertEqual(document.coworkSettings, settings)
     }
 
+    func testPhaseSFreshBootstrapPersistsDistinctReviewerExactBinding() async throws {
+        let log = try autoReviewTempLog()
+        let ws = try autoReviewWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let mainBinding = phaseSBinding()
+        let reviewerBinding = phaseSReviewerBinding()
+        let provider = AutoReviewCapturingProvider([.done(finishReason: "stop")])
+        let orch = Orchestrator(
+            log: log,
+            allowsShell: true,
+            responder: DenyAllResponder(),
+            availableInferenceProfiles: [mainBinding, reviewerBinding],
+            requiresInferenceBindings: true,
+            resolvedInferenceFor: { agent in
+                guard let binding = agent.agentInferenceBinding else {
+                    throw InferenceCatalogError.unresolvedProfile
+                }
+                return ResolvedInferenceProfile(
+                    binding: binding,
+                    model: agent.model,
+                    provider: provider)
+            },
+            providerFor: { _ in provider })
+        let settings = CoworkSessionSettings(
+            sessionID: await log.sessionID,
+            defaultModelID: mainBinding.modelID.rawValue,
+            defaultInferenceProfileBinding: mainBinding,
+            workspaces: [CoworkSessionWorkspace(
+                path: ws.path,
+                agentName: main.rawValue,
+                isPrimary: true)])
+
+        let result = await orch.bootstrapFreshSession(
+            main: Agent(
+                name: main,
+                workspaceRoot: ws,
+                model: mainBinding.modelID,
+                agentInferenceBinding: mainBinding,
+                profile: .reviewed,
+                coordinationDepth: Agent.defaultCoordinationDepth),
+            settings: settings,
+            permissionReviewerModel: reviewerBinding.modelID,
+            permissionReviewerInferenceBinding: reviewerBinding)
+
+        XCTAssertEqual(result, .attached(main))
+        XCTAssertTrue(provider.requests.isEmpty, "bootstrap resolution must not issue a model request")
+        let events = try await log.replayChecked()
+        XCTAssertEqual(events.count, 7)
+        let projection = CoworkProjection.build(from: events)
+        XCTAssertEqual(projection.agentRoster[main]?.model, mainBinding.modelID)
+        XCTAssertEqual(projection.agentRoster[main]?.agentInferenceBinding, mainBinding)
+        XCTAssertEqual(projection.agentRoster[reviewer]?.model, reviewerBinding.modelID)
+        XCTAssertEqual(
+            projection.agentRoster[reviewer]?.agentInferenceBinding,
+            reviewerBinding)
+        XCTAssertNotEqual(
+            projection.agentRoster[main]?.agentInferenceBinding,
+            projection.agentRoster[reviewer]?.agentInferenceBinding)
+        XCTAssertEqual(
+            projection.agentRoster[reviewer]?.profile,
+            PermissionProfile.readOnly.rawValue)
+    }
+
+    func testPhaseSFreshBootstrapRejectsMissingReviewerBindingBeforeEvents() async throws {
+        let log = try autoReviewTempLog()
+        let ws = try autoReviewWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let binding = phaseSBinding()
+        let provider = AutoReviewCapturingProvider([.done(finishReason: "stop")])
+        let orch = Orchestrator(
+            log: log,
+            allowsShell: true,
+            responder: DenyAllResponder()) { _ in provider }
+        let settings = CoworkSessionSettings(
+            sessionID: await log.sessionID,
+            defaultModelID: binding.modelID.rawValue,
+            defaultInferenceProfileBinding: binding,
+            workspaces: [CoworkSessionWorkspace(
+                path: ws.path,
+                agentName: main.rawValue,
+                isPrimary: true)])
+
+        let result = await orch.bootstrapFreshSession(
+            main: Agent(
+                name: main,
+                workspaceRoot: ws,
+                model: binding.modelID,
+                agentInferenceBinding: binding,
+                profile: .reviewed,
+                coordinationDepth: Agent.defaultCoordinationDepth),
+            settings: settings,
+            permissionReviewerModel: phaseSReviewerBinding().modelID,
+            permissionReviewerInferenceBinding: nil)
+
+        guard case .failed = result else {
+            return XCTFail("a strict bootstrap without a reviewer binding must fail closed")
+        }
+        XCTAssertTrue(provider.requests.isEmpty)
+        let events = try await log.replayChecked()
+        let agents = await orch.agentList()
+        XCTAssertTrue(events.isEmpty)
+        XCTAssertTrue(agents.isEmpty)
+    }
+
+    func testPhaseSFreshBootstrapRejectsMismatchedReviewerModelBeforeEvents() async throws {
+        let log = try autoReviewTempLog()
+        let ws = try autoReviewWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let binding = phaseSBinding()
+        let reviewerBinding = phaseSReviewerBinding()
+        let provider = AutoReviewCapturingProvider([.done(finishReason: "stop")])
+        let orch = Orchestrator(
+            log: log,
+            allowsShell: true,
+            responder: DenyAllResponder()) { _ in provider }
+        let settings = CoworkSessionSettings(
+            sessionID: await log.sessionID,
+            defaultModelID: binding.modelID.rawValue,
+            defaultInferenceProfileBinding: binding,
+            workspaces: [CoworkSessionWorkspace(
+                path: ws.path,
+                agentName: main.rawValue,
+                isPrimary: true)])
+
+        let result = await orch.bootstrapFreshSession(
+            main: Agent(
+                name: main,
+                workspaceRoot: ws,
+                model: binding.modelID,
+                agentInferenceBinding: binding,
+                profile: .reviewed,
+                coordinationDepth: Agent.defaultCoordinationDepth),
+            settings: settings,
+            permissionReviewerModel: ModelID(rawValue: "wrong-reviewer-model"),
+            permissionReviewerInferenceBinding: reviewerBinding)
+
+        guard case .failed = result else {
+            return XCTFail("a mismatched reviewer model/binding tuple must fail closed")
+        }
+        XCTAssertTrue(provider.requests.isEmpty)
+        let events = try await log.replayChecked()
+        let agents = await orch.agentList()
+        XCTAssertTrue(events.isEmpty)
+        XCTAssertTrue(agents.isEmpty)
+    }
+
+    func testPhaseSFreshBootstrapRejectsReviewerCatalogTOCTOUBeforeEvents() async throws {
+        let log = try autoReviewTempLog()
+        let ws = try autoReviewWorkspace()
+        defer { try? FileManager.default.removeItem(at: ws) }
+        let mainBinding = phaseSBinding()
+        let reviewerBinding = phaseSReviewerBinding()
+        let driftedReviewerBinding = phaseSReviewerBinding(
+            revision: "revision-2",
+            connectionRevision: "connection-revision-2",
+            fingerprint: "sha256:phase-s-reviewer-drifted-fingerprint")
+        let provider = AutoReviewCapturingProvider([.done(finishReason: "stop")])
+        let resolutionGate = AutoReviewReviewerRevalidationGate()
+        let orch = Orchestrator(
+            log: log,
+            allowsShell: true,
+            responder: DenyAllResponder(),
+            availableInferenceProfiles: [mainBinding, reviewerBinding],
+            requiresInferenceBindings: true,
+            resolvedInferenceFor: { agent in
+                await resolutionGate.pauseSecondReviewerResolution(for: agent.name)
+                guard let binding = agent.agentInferenceBinding else {
+                    throw InferenceCatalogError.unresolvedProfile
+                }
+                return ResolvedInferenceProfile(
+                    binding: binding,
+                    model: agent.model,
+                    provider: provider)
+            },
+            providerFor: { _ in provider })
+        let settings = CoworkSessionSettings(
+            sessionID: await log.sessionID,
+            defaultModelID: mainBinding.modelID.rawValue,
+            defaultInferenceProfileBinding: mainBinding,
+            workspaces: [CoworkSessionWorkspace(
+                path: ws.path,
+                agentName: main.rawValue,
+                isPrimary: true)])
+
+        let bootstrap = Task {
+            await orch.bootstrapFreshSession(
+                main: Agent(
+                    name: main,
+                    workspaceRoot: ws,
+                    model: mainBinding.modelID,
+                    agentInferenceBinding: mainBinding,
+                    profile: .reviewed,
+                    coordinationDepth: Agent.defaultCoordinationDepth),
+                settings: settings,
+                permissionReviewerModel: reviewerBinding.modelID,
+                permissionReviewerInferenceBinding: reviewerBinding)
+        }
+        await resolutionGate.waitUntilSecondReviewerResolutionStarts()
+        await orch.updateAvailableInferenceProfiles(
+            [mainBinding, driftedReviewerBinding],
+            hostAuthorized: true)
+        await resolutionGate.releaseSecondReviewerResolution()
+
+        let result = await bootstrap.value
+        guard case .failed = result else {
+            return XCTFail("reviewer catalog drift must fail the final bootstrap preflight")
+        }
+        XCTAssertTrue(provider.requests.isEmpty)
+        let events = try await log.replayChecked()
+        let agents = await orch.agentList()
+        XCTAssertTrue(events.isEmpty)
+        XCTAssertTrue(agents.isEmpty)
+    }
+
     func testPhaseSFreshBootstrapRejectsPermissionProfileDriftBeforePersistenceOrModelUse() async throws {
         let log = try autoReviewTempLog()
         let ws = try autoReviewWorkspace()
@@ -602,7 +870,9 @@ final class AutomaticPermissionReviewTests: XCTestCase {
                 agentInferenceBinding: binding,
                 profile: .reviewed,
                 coordinationDepth: Agent.defaultCoordinationDepth),
-            settings: settings)
+            settings: settings,
+            permissionReviewerModel: binding.modelID,
+            permissionReviewerInferenceBinding: binding)
 
         guard case .failed = result else {
             return XCTFail("profile drift must reject the fixed local registration")
@@ -646,7 +916,9 @@ final class AutomaticPermissionReviewTests: XCTestCase {
                 agentInferenceBinding: binding,
                 profile: .reviewed,
                 coordinationDepth: Agent.defaultCoordinationDepth),
-            settings: settings)
+            settings: settings,
+            permissionReviewerModel: binding.modelID,
+            permissionReviewerInferenceBinding: binding)
 
         guard case .failed = result else { return XCTFail("forced batch failure must fail") }
         let replayed = await log.replay()
@@ -697,10 +969,14 @@ final class AutomaticPermissionReviewTests: XCTestCase {
 
         async let firstResult = first.bootstrapFreshSession(
             main: mainAgent,
-            settings: settings)
+            settings: settings,
+            permissionReviewerModel: binding.modelID,
+            permissionReviewerInferenceBinding: binding)
         async let secondResult = second.bootstrapFreshSession(
             main: mainAgent,
-            settings: settings)
+            settings: settings,
+            permissionReviewerModel: binding.modelID,
+            permissionReviewerInferenceBinding: binding)
         let (resolvedFirst, resolvedSecond) = await (firstResult, secondResult)
         let results = [resolvedFirst, resolvedSecond]
 
@@ -1888,11 +2164,14 @@ final class AutomaticPermissionReviewTests: XCTestCase {
         let actingWriteSpec = try XCTUnwrap(
             mainProvider.requests[0].tools.first { $0.name == "write_file" })
         guard case .object(let writeSchema) = actingWriteSpec.parameters,
-              case .object(let writeProperties)? = writeSchema["properties"] else {
+              case .object(let writeProperties)? = writeSchema["properties"],
+              case .array(let writeRequired)? = writeSchema["required"] else {
             return XCTFail("automatic Cowork tools must expose the sidecar schema")
         }
         XCTAssertNotNil(writeProperties[
             AuthorizationSidecarCodec.reservedFieldName])
+        XCTAssertTrue(writeRequired.contains(
+            .string(AuthorizationSidecarCodec.reservedFieldName)))
         let liveHistoryCall = try XCTUnwrap(
             mainProvider.requests[1].messages
                 .compactMap(\.toolCalls)

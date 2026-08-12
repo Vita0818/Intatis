@@ -1442,10 +1442,13 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
         let writeSpec = try XCTUnwrap(
             mainProvider.requests.first?.tools.first { $0.name == "write_file" })
         guard case .object(let schema) = writeSpec.parameters,
-              case .object(let properties) = schema["properties"] else {
+              case .object(let properties) = schema["properties"],
+              case .array(let required)? = schema["required"] else {
             return XCTFail("write_file must expose an object schema")
         }
         XCTAssertNotNil(properties[AuthorizationSidecarCodec.reservedFieldName])
+        XCTAssertTrue(required.contains(
+            .string(AuthorizationSidecarCodec.reservedFieldName)))
         let continuationHistory = mainProvider.requests[1].messages
             .map { String(describing: $0) }
             .joined(separator: "\n")

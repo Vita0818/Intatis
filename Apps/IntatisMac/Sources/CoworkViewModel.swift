@@ -17,12 +17,17 @@ import IntatisSharedUI
 
 private actor ProviderRegistryBox {
     private var registry: ProviderRegistry
+    /// GoalVerifier keeps the legacy first-resolvable-main freeze. Permission
+    /// review has a separate immutable app-configured binding below.
     private var controlPlaneBinding: AgentInferenceBinding?
+    private let permissionReviewerBinding: AgentInferenceBinding?
 
     init(_ registry: ProviderRegistry,
-         controlPlaneBinding: AgentInferenceBinding?) {
+         controlPlaneBinding: AgentInferenceBinding?,
+         permissionReviewerBinding: AgentInferenceBinding?) {
         self.registry = registry
         self.controlPlaneBinding = controlPlaneBinding
+        self.permissionReviewerBinding = permissionReviewerBinding
     }
 
     func update(_ registry: ProviderRegistry) {
@@ -79,6 +84,16 @@ private actor ProviderRegistryBox {
 
     func controlPlaneModel(fallback: ModelID) -> ModelID {
         controlPlaneBinding?.modelID ?? fallback
+    }
+
+    func resolvablePermissionReviewerBinding() async
+        -> AgentInferenceBinding? {
+        guard let permissionReviewerBinding,
+              (try? await registry.agentInference(
+                  for: permissionReviewerBinding)) != nil else {
+            return nil
+        }
+        return permissionReviewerBinding
     }
 
     func exactBindingIsResolvable(_ binding: AgentInferenceBinding) async -> Bool {
@@ -339,6 +354,9 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
     private let composerAttachmentStore: IntatisComposerAttachmentStore
     private let submittedIntentStore: SubmittedIntentStore
     private let registryBox: ProviderRegistryBox
+    private let permissionReviewerInferenceBinding:
+        AgentInferenceBinding?
+    private let permissionReviewerConfigurationError: String?
     private let mcpSnapshots:
         (@MainActor @Sendable () async throws
             -> MCPAgentRequestToolSnapshotSource)?
@@ -396,6 +414,9 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
          sessionNaming: SessionNamingService,
          registry: ProviderRegistry,
          inferenceProfileOptions: [AppInferenceProfileOption],
+         permissionReviewerInferenceBinding:
+            AgentInferenceBinding?,
+         permissionReviewerConfigurationError: String? = nil,
          projectSettings: CoworkProjectSettings,
          launchMode: CoworkSessionLaunchMode = .restored,
          sessionStorageWarning: String? = nil,
@@ -413,9 +434,15 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         self.composerAttachmentStore = IntatisComposerAttachmentStore(
             store: artifactStore)
         self.submittedIntentStore = SubmittedIntentStore(log: log)
+        self.permissionReviewerInferenceBinding =
+            permissionReviewerInferenceBinding
+        self.permissionReviewerConfigurationError =
+            permissionReviewerConfigurationError
         self.registryBox = ProviderRegistryBox(
             registry,
-            controlPlaneBinding: nil)
+            controlPlaneBinding: nil,
+            permissionReviewerBinding:
+                permissionReviewerInferenceBinding)
         #if canImport(AVFoundation)
         self.voiceInput = ComposerVoiceInputController(registry: registry)
         #endif
@@ -1653,19 +1680,28 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         let workspaceURL: URL
         guard let mainAgent = await orchestrator.agentList().first(where: {
             $0.name == mainID
-        }), let mainBinding = mainAgent.agentInferenceBinding else {
+        }) else {
             setPermissionReviewerStatus(.failed(
                 IntatisLocalization.format(
-                    "@%@ has no resolved inference profile for the control plane.",
+                    "@%@ must be attached before automatic permission review can start.",
                     mainID.rawValue)))
             return
         }
-        guard let controlPlaneBinding = await registryBox
-            .freezeResolvableControlPlaneBinding(mainBinding) else {
+        // GoalVerifier preserves its existing first-main freeze, but that
+        // route neither supplies nor gates the permission reviewer. A legacy
+        // main without an exact binding may leave Goal verification
+        // unavailable while automatic permission review still starts from its
+        // independently configured binding.
+        if let mainBinding = mainAgent.agentInferenceBinding {
+            _ = await registryBox
+                .freezeResolvableControlPlaneBinding(mainBinding)
+        }
+        guard let permissionReviewerBinding = await registryBox
+            .resolvablePermissionReviewerBinding() else {
             setPermissionReviewerStatus(.failed(
-                IntatisLocalization.format(
-                    "@%@ exact inference profile revision is unavailable or incompatible.",
-                    mainID.rawValue)))
+                permissionReviewerConfigurationError
+                    ?? IntatisLocalization.string(
+                        "The permission_reviewer_model exact inference profile is unavailable or incompatible.")))
             return
         }
 
@@ -1696,8 +1732,8 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         }
 
         let result = await orchestrator.enableAutomaticPermissionReview(
-            model: controlPlaneBinding.modelID,
-            agentInferenceBinding: controlPlaneBinding,
+            model: permissionReviewerBinding.modelID,
+            agentInferenceBinding: permissionReviewerBinding,
             workspaceRoot: workspaceURL)
         guard !Task.isCancelled, self.orchestrator != nil else {
             setPermissionReviewerStatus(.disabled)
@@ -1882,9 +1918,22 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             coordinationDepth: Agent.defaultCoordinationDepth)
         let attached: Bool
         if allowsInitialSessionBootstrap {
+            guard let permissionReviewerInferenceBinding else {
+                didRequestMainAgentAttach = false
+                let message = permissionReviewerConfigurationError
+                    ?? IntatisLocalization.string(
+                        "Configure a resolvable permission_reviewer_model before creating Cowork.")
+                composerError = message
+                setPermissionReviewerStatus(.failed(message))
+                return
+            }
             switch await orchestrator.bootstrapFreshSession(
                 main: main,
-                settings: projectSettings) {
+                settings: projectSettings,
+                permissionReviewerModel:
+                    permissionReviewerInferenceBinding.modelID,
+                permissionReviewerInferenceBinding:
+                    permissionReviewerInferenceBinding) {
             case .attached, .alreadyAttached:
                 attached = true
             case .failed(let message):
@@ -1905,6 +1954,11 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             }
         }
         if attached {
+            // GoalVerifier keeps the first exact, resolvable @main route. The
+            // separately configured permission reviewer neither supplies nor
+            // gates this best-effort freeze.
+            _ = await registryBox
+                .freezeResolvableControlPlaneBinding(binding)
             needsPrimaryWorkspaceAuthorization = false
             composerError = nil
         } else {
@@ -2177,10 +2231,16 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             switch result {
             case .rebound, .unchanged:
                 await self.refreshInferenceResolutionState()
-                if name == self.projectSettings.mainAgentName,
-                   !self.isAutomaticPermissionReviewReady {
-                    await self.ensureAutomaticPermissionReview(
-                        existingProjection: self.latestCoworkProjection)
+                if name == self.projectSettings.mainAgentName {
+                    // A legacy/unresolved main may become the first usable
+                    // GoalVerifier route after an explicit rebind. An already
+                    // frozen verifier remains unchanged.
+                    _ = await self.registryBox
+                        .freezeResolvableControlPlaneBinding(binding)
+                    if !self.isAutomaticPermissionReviewReady {
+                        await self.ensureAutomaticPermissionReview(
+                            existingProjection: self.latestCoworkProjection)
+                    }
                 }
                 await self.resumeRuntimeIfReady()
             case .failed(let message):

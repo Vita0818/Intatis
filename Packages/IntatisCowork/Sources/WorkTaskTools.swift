@@ -29,6 +29,12 @@ private func joinedWorkTaskPreviewValues(_ values: [String]?) -> String {
     values?.joined(separator: ", ") ?? ""
 }
 
+private func missingWorkTaskManager(_ tool: String) -> ToolExecutionRejectedWithoutSideEffect {
+    ToolExecutionRejectedWithoutSideEffect(
+        code: "work_task_manager_unavailable",
+        message: "\(tool) rejected before WorkTask execution started because this invocation has no host-bound WorkTask manager")
+}
+
 private func workTaskNamespaceHint(
     rawID: String,
     underlyingError: Error
@@ -58,7 +64,7 @@ public struct TaskCreateTool: Tool {
 
     public static let descriptor = ToolDescriptor(
         name: "task_create",
-        description: "Create one durable WorkTask in the current ContinuationRun. Returns the stable task_id, host-computed status, and revision. Use concise acceptance criteria and real dependencies; this is a control-plane change, not a workspace write.",
+        description: "Create one durable WorkTask in the current ContinuationRun. Returns the stable task_id, host-computed status, and revision. Use concise acceptance criteria and real dependencies; this is a control-plane change, not a workspace write. owner is optional; when present it must name a currently attached data-plane agent confirmed by a successful list_agents or spawn_agent ToolResult received in an earlier tool-call round. Never name a planned or future agent. When creating before spawn or delegation, omit owner; the host initially assigns the current caller and delegate_task can later transfer ownership atomically.",
         sideEffect: .write,
         parameters: .object([
             "type": .string("object"),
@@ -67,8 +73,16 @@ public struct TaskCreateTool: Tool {
                 "description": workTaskStringSchema,
                 "acceptance_criteria": workTaskStringArraySchema,
                 "expected_artifacts": workTaskStringArraySchema,
-                "depends_on": workTaskStringArraySchema,
-                "owner": workTaskStringSchema,
+                "depends_on": .object([
+                    "type": .string("array"),
+                    "items": workTaskStringSchema,
+                    "description": .string("Existing durable WorkTask IDs confirmed by earlier successful task_create, task_get, or task_list results. Never reference a WorkTask that is only planned or created by another call in the same assistant response."),
+                ]),
+                "owner": .object([
+                    "type": .string("string"),
+                    "minLength": .number(1),
+                    "description": .string("Optional currently attached data-plane agent. Confirm it with a successful list_agents or spawn_agent ToolResult received in an earlier tool-call round. Never use a planned or future agent name. Omit owner when creating before spawn/delegation; the current caller becomes the initial owner."),
+                ]),
                 "priority": .object([
                     "type": .string("string"),
                     "enum": .array(WorkTaskPriority.allCases.map { .string($0.rawValue) }),
@@ -131,7 +145,7 @@ public struct TaskCreateTool: Tool {
     public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {
         let value = try args.decode(Args.self)
         guard let manager = context.workTaskManager else {
-            return ToolObservation(text: "WorkTask management is not available in this session")
+            throw missingWorkTaskManager(Self.descriptor.name)
         }
         let request = WorkTaskCreateRequest(
             title: value.title,
@@ -313,7 +327,7 @@ public struct TaskUpdateTool: Tool {
     public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {
         let request = try Self.decodeRequest(args)
         guard let manager = context.workTaskManager else {
-            return ToolObservation(text: "WorkTask management is not available in this session")
+            throw missingWorkTaskManager(Self.descriptor.name)
         }
         do {
             let detail = try await manager.updateWorkTask(request)

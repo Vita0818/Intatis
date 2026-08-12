@@ -591,13 +591,26 @@ final class RealProviderSmokeTests: XCTestCase {
             "additionalProperties": .bool(false),
         ])
 
-        func toolRequest(strict: Bool?) throws -> AgentRequest {
+        func toolRequest() throws -> AgentRequest {
             let decorated = try AuthorizationSidecarCodec.decorate(
                 ToolSpec(
                     name: "diagnostic_noop",
                     description: "A no-op diagnostic function.",
                     parameters: businessParameters,
-                    strict: strict))
+                    strict: true))
+            guard case .object(let schema) = decorated.parameters,
+                  case .object(let properties)? = schema["properties"],
+                  case .array(let required)? = schema["required"] else {
+                throw IntatisError.config(
+                    "The authorization-sidecar diagnostic schema is malformed.")
+            }
+            XCTAssertEqual(decorated.strict, true)
+            XCTAssertEqual(
+                Set(properties.keys),
+                Set(required.compactMap { value -> String? in
+                    guard case .string(let name) = value else { return nil }
+                    return name
+                }))
             return AgentRequest(
                 model: route.model,
                 messages: [.user("""
@@ -615,7 +628,7 @@ final class RealProviderSmokeTests: XCTestCase {
         var outputCalls: [ToolCall] = []
         do {
             for try await chunk in route.provider.stream(
-                try toolRequest(strict: nil)) {
+                try toolRequest()) {
                 if case .textDelta(let delta) = chunk {
                     outputText += delta
                 }

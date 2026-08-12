@@ -290,6 +290,13 @@ final class AppEnvironment: ObservableObject {
             throw IntatisError.config(IntatisLocalization.string(
                 "Choose a resolvable default inference profile before creating Cowork."))
         }
+        guard let permissionReviewerBinding =
+                configuredPermissionReviewerBinding(
+                    snapshot: inferenceCatalogSnapshot) else {
+            primaryWorkspace.release()
+            throw IntatisError.config(IntatisLocalization.string(
+                "Configure a resolvable permission_reviewer_model before creating Cowork."))
+        }
         let session = SessionID(rawValue: IDGen.random(prefix: "cowork"))
         do {
             try WorkspaceAccess.remember(
@@ -308,7 +315,9 @@ final class AppEnvironment: ObservableObject {
                     log: coworkLog,
                     projectSettings: settings,
                     launchMode: .fresh,
-                    initialWorkspaceAccess: primaryWorkspace)
+                    initialWorkspaceAccess: primaryWorkspace,
+                    permissionReviewerInferenceBinding:
+                        permissionReviewerBinding)
             }
         } catch {
             try? WorkspaceAccess.forget(
@@ -326,6 +335,9 @@ final class AppEnvironment: ObservableObject {
                 inferenceCatalogError ?? IntatisLocalization.string(
                     "Inference profiles are still loading. Try again in a moment."))
         }
+        let permissionReviewerBinding =
+            configuredPermissionReviewerBinding(
+                snapshot: inferenceCatalogSnapshot)
         return try await runtimeManager.coworkRuntime(sessionID: session) { [self] in
         let coworkLog = try EventLog(session: session, fileURL: AppConfig.sessionFile(session))
         let legacyOwnedWorkspacePaths = CoworkProjectSettingsStore
@@ -393,7 +405,9 @@ final class AppEnvironment: ObservableObject {
             log: coworkLog,
             projectSettings: projectSettings,
             launchMode: .restored,
-            sessionStorageWarning: warning)
+            sessionStorageWarning: warning,
+            permissionReviewerInferenceBinding:
+                permissionReviewerBinding)
         }
     }
 
@@ -424,9 +438,16 @@ final class AppEnvironment: ObservableObject {
         projectSettings: CoworkProjectSettings,
         launchMode: CoworkSessionLaunchMode,
         sessionStorageWarning: String? = nil,
-        initialWorkspaceAccess: WorkspaceAccessLease? = nil
+        initialWorkspaceAccess: WorkspaceAccessLease? = nil,
+        permissionReviewerInferenceBinding:
+            AgentInferenceBinding?
     ) throws -> CoworkViewModel {
         let artifactStore = try ArtifactStore(root: AppConfig.artifactsDir(session))
+        let permissionReviewerConfigurationError =
+            permissionReviewerInferenceBinding == nil
+            ? IntatisLocalization.string(
+                "The configured permission_reviewer_model is missing, invalid, or unavailable in the current inference catalog.")
+            : nil
         let combinedStorageWarning = [
             sessionStorageWarning,
             knowledgeToolsConfigurationNotice(),
@@ -438,6 +459,10 @@ final class AppEnvironment: ObservableObject {
             sessionNaming: makeSessionNamingService(log: coworkLog, kind: .cowork),
             registry: registry,
             inferenceProfileOptions: inferenceProfileOptions,
+            permissionReviewerInferenceBinding:
+                permissionReviewerInferenceBinding,
+            permissionReviewerConfigurationError:
+                permissionReviewerConfigurationError,
             projectSettings: projectSettings,
             launchMode: launchMode,
             sessionStorageWarning:
@@ -455,6 +480,21 @@ final class AppEnvironment: ObservableObject {
                             .map(\.path)),
             internalToolRegistryAugmenter:
                 makeKnowledgeToolAugmenter())
+    }
+
+    private func configuredPermissionReviewerBinding(
+        snapshot: InferenceCatalogSnapshot
+    ) -> AgentInferenceBinding? {
+        guard let reviewer = providerCatalog.permissionReviewerModel else {
+            return nil
+        }
+        // The top-level role names a base provider/model profile. It never
+        // borrows the mutable UI-selected variant or the current @main route.
+        return AppInferenceCatalogCompiler.binding(
+            providerID: reviewer.endpoint,
+            modelID: reviewer.model.rawValue,
+            variantID: nil,
+            snapshot: snapshot)
     }
 
     private func makeKnowledgeToolAugmenter()

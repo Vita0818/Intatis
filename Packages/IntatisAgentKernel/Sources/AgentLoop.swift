@@ -691,7 +691,7 @@ public struct AgentLoop: Sendable {
             }
             let preTurnTools = try providerToolSpecs(
                 for: frozenRequestToolSnapshot)
-            if shouldCompact(
+            if try shouldCompact(
                 messages: preTurnContext,
                 tools: preTurnTools)
             {
@@ -865,8 +865,9 @@ public struct AgentLoop: Sendable {
             let providerGenerationID = IDGen.random(
                 prefix: "provider-generation")
 
-            try validateRequestImageLimits(messages: convo)
-            var request = AgentRequest(model: agent.model, messages: convo, tools: specs,
+            let providerMessages = try providerMessages(for: convo)
+            try validateRequestImageLimits(messages: providerMessages)
+            var request = AgentRequest(model: agent.model, messages: providerMessages, tools: specs,
                                        reasoningEffort: reasoningEffort, includeUsage: includeUsage,
                                        parallelToolCalls:
                                         specs.contains(where: \.supportsParallelCalls)
@@ -1157,7 +1158,7 @@ public struct AgentLoop: Sendable {
             frozenRequestToolSnapshot = nextToolSnapshot
             if modelHistoryScope != nil,
                var projection = modelHistoryProjection,
-               shouldCompact(messages: convo, tools: nextSpecs)
+               try shouldCompact(messages: convo, tools: nextSpecs)
             {
                 let replay = try await log.replayForProjectionChecked()
                 guard replay.hasCompleteKnownHistory else {
@@ -1248,6 +1249,21 @@ public struct AgentLoop: Sendable {
             return specs
         }
         return try AuthorizationSidecarCodec.decorate(specs)
+    }
+
+    /// Returns the exact request-owned message copy used for provider token
+    /// estimation and dispatch. Durable/in-memory history remains sidecar-free;
+    /// automatic Cowork decorates only deferred functions embedded in
+    /// `tool_search_output` items.
+    private func providerMessages(
+        for messages: [AgentMessage]
+    ) throws -> [AgentMessage] {
+        guard context.runtimeEnvironment.mode == .cowork,
+              responder.approvalMode == .automaticReviewer else {
+            return messages
+        }
+        return try AuthorizationSidecarCodec
+            .decorateProviderMessages(messages)
     }
 
     private func modelHistoryRecordingScope(
@@ -1506,15 +1522,16 @@ public struct AgentLoop: Sendable {
     private func shouldCompact(
         messages: [AgentMessage],
         tools: [ToolSpec]
-    ) -> Bool {
+    ) throws -> Bool {
         guard context.conversationHistoryPolicy != .taskScoped,
               let limit =
                 modelContextPolicy
                     .automaticCompactionTriggerTokens else {
             return false
         }
+        let exactProviderMessages = try providerMessages(for: messages)
         return AgentTokenEstimator.approximateInputTokens(
-            messages: messages,
+            messages: exactProviderMessages,
             tools: tools) >= limit
     }
 
@@ -1528,7 +1545,9 @@ public struct AgentLoop: Sendable {
         usage: Usage?,
         envelope: Envelope
     ) {
-        try validateRequestImageLimits(messages: summaryHistory)
+        let providerSummaryHistory = try providerMessages(
+            for: summaryHistory)
+        try validateRequestImageLimits(messages: providerSummaryHistory)
         let maximumReplacementInputTokens: Int?
         if let hardLimit =
             modelContextPolicy.hardUsableContextWindowTokens {
@@ -1539,9 +1558,9 @@ public struct AgentLoop: Sendable {
                 includeCurrentTurnContext: false)
             let reservedTokens =
                 AgentTokenEstimator.approximateInputTokens(
-                    messages:
-                        fixedPrefix
-                        + contextualReplacementMessages,
+                    messages: try providerMessages(
+                        for: fixedPrefix
+                            + contextualReplacementMessages),
                     tools: tools)
             let available = hardLimit - reservedTokens
             guard available > 0 else {
@@ -1560,7 +1579,7 @@ public struct AgentLoop: Sendable {
             includeUsage: includeUsage,
             tokenBudgetMeter: tokenBudgetMeter)
             .compact(
-                history: summaryHistory,
+                history: providerSummaryHistory,
                 realUserMessages: projection.realUserMessages,
                 mediaAwareCheckpointRequired:
                     projection.latestCheckpoint?.payload.schemaVersion
@@ -1612,7 +1631,8 @@ public struct AgentLoop: Sendable {
                     includeCurrentTurnContext: false)
             let estimated =
                 AgentTokenEstimator.approximateInputTokens(
-                    messages: replacementRequestMessages,
+                    messages: try providerMessages(
+                        for: replacementRequestMessages),
                     tools: tools)
             guard estimated <= hardLimit else {
                 throw AgentModelHistoryCompactionError

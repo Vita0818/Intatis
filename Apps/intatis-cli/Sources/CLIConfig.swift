@@ -47,6 +47,11 @@ struct CLIConfig {
     let providerRoutes: [CLIProviderRoute]
     let selectedProviderID: String
     let selectedVariantID: String?
+    /// Exact host-configured model used by the automatic permission reviewer.
+    /// This is resolved from `permission_reviewer_model`, or from the JSON
+    /// document's top-level `model` when that field is absent. It never follows
+    /// a later @main selection or rebind.
+    let permissionReviewerModel: CLIProviderModelSelection
     /// Host-side route used by `generate_image` and `edit_image`. Agent tool
     /// arguments never carry this provider/model selection.
     let imageModel: CLIProviderModelSelection?
@@ -74,6 +79,7 @@ struct CLIConfig {
          providerRoutes: [CLIProviderRoute]? = nil,
          selectedProviderID: String? = nil,
          selectedVariantID: String? = nil,
+         permissionReviewerModel: CLIProviderModelSelection? = nil,
          imageModel: CLIProviderModelSelection? = nil,
          embeddingModel: CLIProviderModelSelection? = nil,
          rerankerModel: CLIProviderModelSelection? = nil,
@@ -93,8 +99,13 @@ struct CLIConfig {
             model: model,
             wire: wire)
         self.providerRoutes = providerRoutes?.isEmpty == false ? providerRoutes! : [legacy]
-        self.selectedProviderID = selectedProviderID ?? legacy.id
+        let resolvedSelectedProviderID = selectedProviderID ?? legacy.id
+        self.selectedProviderID = resolvedSelectedProviderID
         self.selectedVariantID = selectedVariantID
+        self.permissionReviewerModel = permissionReviewerModel
+            ?? CLIProviderModelSelection(
+                providerID: resolvedSelectedProviderID,
+                modelID: model)
         self.imageModel = imageModel
         self.embeddingModel = embeddingModel
         self.rerankerModel = rerankerModel
@@ -265,6 +276,7 @@ struct CLIConfig {
             providerRoutes: routes,
             selectedProviderID: selectedRoute.id,
             selectedVariantID: selectedVariantID,
+            permissionReviewerModel: document.permissionReviewerModel,
             imageModel: document.imageModel,
             embeddingModel: document.embeddingModel,
             rerankerModel: document.rerankerModel,
@@ -341,6 +353,13 @@ struct CLIConfig {
             endpoint: CLIInferenceRouteIdentity.endpointID(route: selectedRoute),
             model: ModelID(rawValue: model))
         var models = ResolvedModels(chat: ref, agent: ref)
+        if let reviewerRoute = providerRoutes.first(where: {
+            $0.id == permissionReviewerModel.providerID
+        }) {
+            models.reviewer = ModelRef(
+                endpoint: CLIInferenceRouteIdentity.endpointID(route: reviewerRoute),
+                model: ModelID(rawValue: permissionReviewerModel.modelID))
+        }
         if let imageModel,
            let imageRoute = providerRoutes.first(where: {
                $0.id == imageModel.providerID
