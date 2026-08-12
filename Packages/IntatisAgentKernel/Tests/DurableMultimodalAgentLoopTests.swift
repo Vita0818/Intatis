@@ -86,15 +86,52 @@ private struct DurableMediaTool: Tool {
 private actor AutomaticMediaTestResponder: PermissionResponder {
     nonisolated let approvalMode: PermissionApprovalMode = .automaticReviewer
     private var requestCount = 0
+    private var invocationInputs: [PermissionReviewInvocationInput] = []
 
     func requestApproval(
         _ request: PermissionRequestPayload
     ) async -> PermissionDecision {
-        requestCount += 1
+        _ = request
         return .deny
     }
 
+    func requestResolution(
+        _ request: PermissionRequestPayload,
+        invocation: PermissionReviewInvocationInput
+    ) async -> PermissionApprovalResolution {
+        requestCount += 1
+        invocationInputs.append(invocation)
+        return PermissionApprovalResolution(
+            decision: .allow,
+            action: .approve,
+            reason: "bounded image-backed request is authorized",
+            risk: request.risk,
+            source: .automaticReviewer,
+            reviewStatus: .allowed)
+    }
+
     func count() -> Int { requestCount }
+    func invocations() -> [PermissionReviewInvocationInput] {
+        invocationInputs
+    }
+}
+
+private func automaticMediaWriteArguments(
+    path: String,
+    content: String,
+    evidenceReference: String,
+    evidenceSummary: String
+) -> String {
+    let arguments: [String: Any] = [
+        "path": path,
+        "content": content,
+        AuthorizationSidecarCodec.reservedFieldName:
+            "The user requested this exact image-backed file. The acting model inspected image evidence \(evidenceReference): \(evidenceSummary). This bounded write is the next required step.",
+    ]
+    let data = try! JSONSerialization.data(
+        withJSONObject: arguments,
+        options: [.sortedKeys])
+    return String(decoding: data, as: UTF8.self)
 }
 
 private actor SequencedDurableMediaResolver {
@@ -601,7 +638,7 @@ final class DurableMultimodalAgentLoopTests: XCTestCase {
         })
     }
 
-    func testAutomaticReviewerDurablyDeniesMediaContextWithoutSeeingIt()
+    func testAutomaticReviewerUsesImageSidecarWithoutBlanketMediaDeny()
         async throws
     {
         let workspace = try makeWorkspace()
@@ -609,18 +646,23 @@ final class DurableMultimodalAgentLoopTests: XCTestCase {
         let log = try EventLog(
             session: SessionID(rawValue: "automatic-review-media"),
             fileURL: workspace.appendingPathComponent("events.jsonl"))
+        let rawSidecarSentinel =
+            "IMAGE_SIDECAR_RAW_SENTINEL_CURRENT_USER"
         let provider = DurableMediaCapturingProvider(
             responses: [
                 [
                     .toolCalls([ToolCall(
                         id: "call-media-write",
                         name: "write_file",
-                        arguments:
-                            #"{"path":"must-not-exist.txt","content":"blocked"}"#)]),
+                        arguments: automaticMediaWriteArguments(
+                            path: "image-backed.txt",
+                            content: "approved from image summary",
+                            evidenceReference: "current-user-image",
+                            evidenceSummary: rawSidecarSentinel))]),
                     .done(finishReason: "tool_calls"),
                 ],
                 [
-                    .textDelta("The write was denied."),
+                    .textDelta("The image-backed write completed."),
                     .done(finishReason: "stop"),
                 ],
             ],
@@ -635,7 +677,7 @@ final class DurableMultimodalAgentLoopTests: XCTestCase {
             issuer: nil,
             assignee: agentID,
             submissionID: submissionID,
-            objective: "Inspect the image without writing files.",
+            objective: "Inspect the image and create image-backed.txt.",
             roleHint: "root",
             expectedDeliverable: "answer")
         let responder = AutomaticMediaTestResponder()
@@ -676,27 +718,62 @@ final class DurableMultimodalAgentLoopTests: XCTestCase {
             },
             taskAttempt: 1)
 
-        do {
-            _ = try await loop.send(
-                "inspect only",
-                userMessage: UserMessagePayload(
-                    text: "inspect only",
-                    attachments: [artifactID],
-                    to: agentID,
-                    submissionID: submissionID))
-            XCTFail("a denied required write cannot complete the Cowork task")
-        } catch let error as AgentLoopError {
-            guard case .unresolvedDeniedSideEffects = error else {
-                return XCTFail("unexpected error: \(error)")
-            }
-        }
+        let final = try await loop.send(
+            "inspect the image and create image-backed.txt",
+            userMessage: UserMessagePayload(
+                text: "inspect the image and create image-backed.txt",
+                attachments: [artifactID],
+                to: agentID,
+                submissionID: submissionID))
+        XCTAssertEqual(final, "The image-backed write completed.")
         let responderCallCount = await responder.count()
-        XCTAssertEqual(responderCallCount, 0)
-        XCTAssertFalse(FileManager.default.fileExists(
-            atPath: workspace.appendingPathComponent(
-                "must-not-exist.txt").path))
+        XCTAssertEqual(responderCallCount, 1)
+        XCTAssertEqual(
+            try String(
+                contentsOf: workspace.appendingPathComponent(
+                    "image-backed.txt"),
+                encoding: .utf8),
+            "approved from image summary")
+        let invocations = await responder.invocations()
+        let invocation = try XCTUnwrap(invocations.first)
+        XCTAssertEqual(
+            invocation.sessionID,
+            SessionID(rawValue: "automatic-review-media"))
+        XCTAssertEqual(invocation.taskID, task.id)
+        XCTAssertEqual(invocation.toolCallID, "call-media-write")
+        XCTAssertEqual(invocation.toolName, "write_file")
+        XCTAssertEqual(
+            invocation.canonicalBusinessArguments,
+            #"{"content":"approved from image summary","path":"image-backed.txt"}"#)
+        XCTAssertFalse(invocation.canonicalBusinessArguments.contains(
+            AuthorizationSidecarCodec.reservedFieldName))
+        XCTAssertTrue(invocation.modelAuthorizationContextJSON.contains(
+            "current-user-image"))
+        XCTAssertTrue(invocation.modelAuthorizationContextJSON.contains(
+            rawSidecarSentinel))
+        XCTAssertFalse(invocation.modelAuthorizationContextJSON.contains(
+            "data:image"),
+            "the reviewer receives a model summary, not raw image bytes")
 
         let events = try await log.replayChecked()
+        let request = try XCTUnwrap(events.compactMap {
+            envelope -> PermissionRequestPayload? in
+            guard case .permissionRequest(let payload) = envelope.event,
+                  payload.context?.toolCallID == "call-media-write" else {
+                return nil
+            }
+            return payload
+        }.first)
+        let evidenceMetadata = try XCTUnwrap(
+            request.context?.reviewInvocationEvidence)
+        XCTAssertEqual(evidenceMetadata.status, .valid)
+        XCTAssertEqual(evidenceMetadata.sourceGenerationID,
+                       invocation.sourceGenerationID)
+        XCTAssertEqual(evidenceMetadata.toolSnapshotID,
+                       invocation.toolSnapshotID)
+        XCTAssertEqual(
+            evidenceMetadata.modelAuthorizationContextDigest,
+            invocation.modelAuthorizationContextDigest)
         let resolution = try XCTUnwrap(events.compactMap {
             envelope -> PermissionResolvedPayload? in
             guard case .permissionResolved(let payload) = envelope.event,
@@ -706,14 +783,25 @@ final class DurableMultimodalAgentLoopTests: XCTestCase {
             }
             return payload
         }.first)
-        XCTAssertEqual(
-            resolution.failureKind,
-            .mediaAuthorizationUnsupported)
-        XCTAssertEqual(resolution.source, .automaticReviewerFailure)
-        XCTAssertEqual(resolution.decision, .deny)
+        XCTAssertEqual(resolution.source, .automaticReviewer)
+        XCTAssertEqual(resolution.decision, .allow)
+        XCTAssertNil(resolution.failureKind)
+        XCTAssertTrue(events.contains { envelope in
+            guard case .toolExecutionSettled(let payload) = envelope.event else {
+                return false
+            }
+            return payload.toolCallID == "call-media-write"
+                && payload.outcome == .succeeded
+        })
+        let durableBytes = try events.map {
+            String(decoding: try JSONEncoder().encode($0), as: UTF8.self)
+        }.joined(separator: "\n")
+        XCTAssertFalse(durableBytes.contains(
+            AuthorizationSidecarCodec.reservedFieldName))
+        XCTAssertFalse(durableBytes.contains(rawSidecarSentinel))
     }
 
-    func testHistoricalFCOImageDurablyDeniesAutomaticPermissionWithoutReporterOrExecutor()
+    func testHistoricalFCOImageUsesSidecarAndReachesAutomaticReviewer()
         async throws
     {
         let workspace = try makeWorkspace()
@@ -799,13 +887,15 @@ final class DurableMultimodalAgentLoopTests: XCTestCase {
 
         let secondSubmission = SubmissionID(
             rawValue: "submission-fco-media-second")
+        let rawSidecarSentinel =
+            "IMAGE_SIDECAR_RAW_SENTINEL_HISTORICAL_FCO"
         let secondTask = TaskContract(
             id: TaskID(rawValue: "task-fco-media-second"),
             kind: .root,
             issuer: nil,
             assignee: agentID,
             submissionID: secondSubmission,
-            objective: "Continue without changing files.",
+            objective: "Use the prior visual result and create after-fco.txt.",
             roleHint: "root",
             expectedDeliverable: "answer")
         try await log.append(.taskCreated(TaskCreatedPayload(
@@ -816,12 +906,16 @@ final class DurableMultimodalAgentLoopTests: XCTestCase {
                     .toolCalls([ToolCall(
                         id: "call-write-after-fco",
                         name: "write_file",
-                        arguments:
-                            #"{"path":"must-not-exist.txt","content":"blocked"}"#)]),
+                        arguments: automaticMediaWriteArguments(
+                            path: "after-fco.txt",
+                            content: "approved from prior visual result",
+                            evidenceReference:
+                                "tool-result:call-historical-media",
+                            evidenceSummary: rawSidecarSentinel))]),
                     .done(finishReason: "tool_calls"),
                 ],
                 [
-                    .textDelta("The write was denied."),
+                    .textDelta("The prior visual result was used for the approved write."),
                     .done(finishReason: "stop"),
                 ],
             ],
@@ -860,19 +954,15 @@ final class DurableMultimodalAgentLoopTests: XCTestCase {
             },
             taskAttempt: 1)
 
-        do {
-            _ = try await secondLoop.send(
-                "continue without changing files",
-                userMessage: UserMessagePayload(
-                    text: "continue without changing files",
-                    to: agentID,
-                    submissionID: secondSubmission))
-            XCTFail("a denied required write cannot complete the Cowork task")
-        } catch let error as AgentLoopError {
-            guard case .unresolvedDeniedSideEffects = error else {
-                return XCTFail("unexpected error: \(error)")
-            }
-        }
+        let final = try await secondLoop.send(
+            "use the prior visual result and create after-fco.txt",
+            userMessage: UserMessagePayload(
+                text: "use the prior visual result and create after-fco.txt",
+                to: agentID,
+                submissionID: secondSubmission))
+        XCTAssertEqual(
+            final,
+            "The prior visual result was used for the approved write.")
 
         let askRequest = try XCTUnwrap(secondProvider.requests.first)
         XCTAssertTrue(askRequest.messages.contains { message in
@@ -886,10 +976,30 @@ final class DurableMultimodalAgentLoopTests: XCTestCase {
         XCTAssertEqual(secondProvider.requests.count, 2)
         XCTAssertTrue(secondProvider.requests.allSatisfy { !$0.tools.isEmpty })
         let responderCallCount = await responder.count()
-        XCTAssertEqual(responderCallCount, 0)
-        XCTAssertFalse(FileManager.default.fileExists(
-            atPath: workspace.appendingPathComponent(
-                "must-not-exist.txt").path))
+        XCTAssertEqual(responderCallCount, 1)
+        XCTAssertEqual(
+            try String(
+                contentsOf: workspace.appendingPathComponent(
+                    "after-fco.txt"),
+                encoding: .utf8),
+            "approved from prior visual result")
+        let invocations = await responder.invocations()
+        let invocation = try XCTUnwrap(invocations.first)
+        XCTAssertEqual(
+            invocation.sessionID,
+            SessionID(rawValue: "automatic-review-fco-media"))
+        XCTAssertEqual(invocation.taskID, secondTask.id)
+        XCTAssertEqual(invocation.toolCallID, "call-write-after-fco")
+        XCTAssertEqual(invocation.toolName, "write_file")
+        XCTAssertEqual(
+            invocation.canonicalBusinessArguments,
+            #"{"content":"approved from prior visual result","path":"after-fco.txt"}"#)
+        XCTAssertTrue(invocation.modelAuthorizationContextJSON.contains(
+            "tool-result:call-historical-media"))
+        XCTAssertTrue(invocation.modelAuthorizationContextJSON.contains(
+            rawSidecarSentinel))
+        XCTAssertFalse(invocation.modelAuthorizationContextJSON.contains(
+            "data:image"))
 
         let events = try await log.replayChecked()
         let request = try XCTUnwrap(events.compactMap {
@@ -900,6 +1010,16 @@ final class DurableMultimodalAgentLoopTests: XCTestCase {
             }
             return payload
         }.first)
+        let evidenceMetadata = try XCTUnwrap(
+            request.context?.reviewInvocationEvidence)
+        XCTAssertEqual(evidenceMetadata.status, .valid)
+        XCTAssertEqual(evidenceMetadata.sourceGenerationID,
+                       invocation.sourceGenerationID)
+        XCTAssertEqual(evidenceMetadata.toolSnapshotID,
+                       invocation.toolSnapshotID)
+        XCTAssertEqual(
+            evidenceMetadata.modelAuthorizationContextDigest,
+            invocation.modelAuthorizationContextDigest)
         let resolution = try XCTUnwrap(events.compactMap {
             envelope -> PermissionResolvedPayload? in
             guard case .permissionResolved(let payload) = envelope.event,
@@ -909,22 +1029,27 @@ final class DurableMultimodalAgentLoopTests: XCTestCase {
             return payload
         }.first)
         XCTAssertEqual(resolution.requestId, request.requestId)
-        XCTAssertEqual(resolution.decision, .deny)
-        XCTAssertEqual(resolution.source, .automaticReviewerFailure)
-        XCTAssertEqual(resolution.reviewStatus, .failed)
-        XCTAssertEqual(
-            resolution.failureKind,
-            .mediaAuthorizationUnsupported)
-        XCTAssertFalse(events.contains { envelope in
+        XCTAssertEqual(resolution.decision, .allow)
+        XCTAssertEqual(resolution.source, .automaticReviewer)
+        XCTAssertEqual(resolution.reviewStatus, .allowed)
+        XCTAssertNil(resolution.failureKind)
+        XCTAssertTrue(events.contains { envelope in
             guard case .toolExecutionPrepared(let payload) = envelope.event
             else { return false }
             return payload.toolCallID == "call-write-after-fco"
         })
-        XCTAssertFalse(events.contains { envelope in
+        XCTAssertTrue(events.contains { envelope in
             guard case .toolExecutionSettled(let payload) = envelope.event
             else { return false }
             return payload.toolCallID == "call-write-after-fco"
+                && payload.outcome == .succeeded
         })
+        let durableBytes = try events.map {
+            String(decoding: try JSONEncoder().encode($0), as: UTF8.self)
+        }.joined(separator: "\n")
+        XCTAssertFalse(durableBytes.contains(
+            AuthorizationSidecarCodec.reservedFieldName))
+        XCTAssertFalse(durableBytes.contains(rawSidecarSentinel))
     }
 
     private var imageReference: ModelHistoryImageReference {

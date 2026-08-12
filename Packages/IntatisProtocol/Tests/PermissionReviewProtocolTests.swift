@@ -47,7 +47,28 @@ final class PermissionReviewProtocolTests: XCTestCase {
         XCTAssertNil(context.intent)
         XCTAssertNil(context.authorization)
         XCTAssertNil(context.executionID)
+        XCTAssertNil(context.reviewInvocationEvidence)
         XCTAssertNil(context.causalContext?.authorizationContext)
+    }
+
+    func testPermissionRequestContextRoundTripsOnlyInvocationEvidenceMetadata()
+        throws {
+        let metadata = PermissionReviewInvocationEvidenceMetadata(
+            sourceGenerationID: "provider-generation_test",
+            toolSnapshotID: "snapshot_test",
+            modelAuthorizationContextDigest: String(repeating: "a", count: 64))
+        let context = PermissionRequestContext(
+            reviewInvocationEvidence: metadata)
+
+        let data = try JSONEncoder().encode(context)
+        let decoded = try JSONDecoder().decode(
+            PermissionRequestContext.self,
+            from: data)
+        let json = String(decoding: data, as: UTF8.self)
+
+        XCTAssertEqual(decoded.reviewInvocationEvidence, metadata)
+        XCTAssertFalse(json.contains("canonicalBusinessArguments"))
+        XCTAssertFalse(json.contains("modelAuthorizationContextJSON"))
     }
 
     func testLegacyReviewTaskAndSettlementWithoutAuthorizationStillDecode() throws {

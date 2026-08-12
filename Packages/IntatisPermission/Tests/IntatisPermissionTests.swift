@@ -156,7 +156,7 @@ final class IntatisPermissionTests: XCTestCase {
         XCTAssertTrue(intent.isStructuredReadOnlyExecution)
         guard case .pass(let reason, let risk) = gate.evaluate(
             call(
-                "document_read",
+                "read_docx",
                 .exec,
                 paths: ["report.docx"],
                 intent: intent),

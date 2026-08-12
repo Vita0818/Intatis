@@ -44,89 +44,39 @@ struct ReadPDFArguments: Codable, Equatable, Sendable {
     }
 }
 
-struct DocumentReadOptions: Codable, Equatable, Sendable {
-    let includeHeaders: Bool?
-    let includeFooters: Bool?
-    let includeTables: Bool?
-    let slides: String?
-    let sheet: String?
-    let cellRange: String?
-    let includeFormulas: Bool?
-    let maximumCells: Int?
-    let xpath: String?
-    let expectedMatchCount: Int?
-    let spineStart: Int?
-    let spineCount: Int?
-    let includeMetadata: Bool?
-
-    enum CodingKeys: String, CodingKey {
-        case includeHeaders = "include_headers"
-        case includeFooters = "include_footers"
-        case includeTables = "include_tables"
-        case slides
-        case sheet
-        case cellRange = "cell_range"
-        case includeFormulas = "include_formulas"
-        case maximumCells = "maximum_cells"
-        case xpath
-        case expectedMatchCount = "expected_match_count"
-        case spineStart = "spine_start"
-        case spineCount = "spine_count"
-        case includeMetadata = "include_metadata"
-    }
-}
-
-struct DocumentReadArguments: Codable, Equatable, Sendable {
-    let format: DocumentFormat
-    let inputPath: String
-    let options: DocumentReadOptions?
+struct DocumentTextReadArguments: Codable, Equatable, Sendable {
+    let path: String
     let maxCharacters: Int?
 
     enum CodingKeys: String, CodingKey {
-        case format
-        case inputPath = "input_path"
-        case options
-        case maxCharacters = "max_characters"
+        case path, maxCharacters
     }
 
     static let schema = DocumentContractSchema.object(
         properties: [
-            "format": DocumentContractSchema.format(editableOnly: true),
-            "input_path": DocumentContractSchema.path,
-            "options": DocumentContractSchema.documentReadOptions,
-            "max_characters": DocumentContractSchema.integer(minimum: 1, maximum: 500_000),
+            "path": DocumentContractSchema.path,
+            "maxCharacters": DocumentContractSchema.integer(minimum: 1, maximum: 500_000),
         ],
-        required: ["format", "input_path"])
+        required: ["path"])
 
-    static func decodeValidated(_ args: ToolArgs) throws -> Self {
+    static func decodeValidated(_ args: ToolArgs, format: DocumentFormat) throws -> Self {
         let object = try DocumentContractValidation.rootObject(args)
-        try DocumentContractValidation.rejectPDFFormat(
-            object,
-            key: "format",
-            operation: "document_read")
         try DocumentContractValidation.rejectForbiddenExecutionControls(in: .object(object))
         try DocumentContractValidation.requireKeys(
             object,
-            allowed: ["format", "input_path", "options", "max_characters"],
-            required: ["format", "input_path"])
+            allowed: ["path", "maxCharacters"],
+            required: ["path"])
 
         let value: Self = try DocumentContractValidation.decode(args)
-        guard DocumentFormat.editableFormats.contains(value.format) else {
-            throw DocumentToolError(.unsupportedOperation, "document_read does not accept PDF")
-        }
         try DocumentContractValidation.validatePath(
-            value.inputPath,
-            extension: value.format,
-            field: "input_path")
+            value.path,
+            extension: format,
+            field: "path")
         try DocumentContractValidation.validateInteger(
             value.maxCharacters,
             minimum: 1,
             maximum: 500_000,
-            field: "max_characters")
-        try DocumentContractValidation.validateReadOptions(
-            value.options,
-            raw: object["options"],
-            format: value.format)
+            field: "maxCharacters")
         return value
     }
 }
@@ -665,23 +615,6 @@ private enum DocumentContractSchema {
         stringEnum(formats.map(\.rawValue))
     }
 
-    static let documentReadOptions = object(
-        properties: [
-            "include_headers": boolean,
-            "include_footers": boolean,
-            "include_tables": boolean,
-            "slides": pageSelection,
-            "sheet": string(minimumLength: 1, maximumLength: 255),
-            "cell_range": string(minimumLength: 2, maximumLength: 64),
-            "include_formulas": boolean,
-            "maximum_cells": integer(minimum: 1, maximum: 100_000),
-            "xpath": string(minimumLength: 1, maximumLength: 2_048),
-            "expected_match_count": integer(minimum: 1, maximum: 10_000),
-            "spine_start": integer(minimum: 1, maximum: 100_000),
-            "spine_count": integer(minimum: 1, maximum: 10_000),
-            "include_metadata": boolean,
-        ],
-        required: [])
 }
 
 // MARK: - Semantic validation
@@ -898,91 +831,6 @@ private enum DocumentContractValidation {
                 }
             }
         }
-    }
-
-    static func validateReadOptions(
-        _ options: DocumentReadOptions?,
-        raw: JSONValue?,
-        format: DocumentFormat
-    ) throws {
-        guard let raw else {
-            guard options == nil else {
-                throw DocumentToolError(.validationFailed, "options could not be decoded")
-            }
-            return
-        }
-        guard case .object(let object) = raw, let options else {
-            throw DocumentToolError(.validationFailed, "options must be an object")
-        }
-
-        let allowed: Set<String>
-        switch format {
-        case .docx:
-            allowed = ["include_headers", "include_footers", "include_tables"]
-        case .pptx:
-            allowed = ["slides"]
-            try validatePageSelection(options.slides, field: "options.slides")
-        case .xlsx:
-            allowed = ["sheet", "cell_range", "include_formulas", "maximum_cells"]
-            if let sheet = options.sheet {
-                guard !sheet.isEmpty, sheet.count <= 255 else {
-                    throw DocumentToolError(.validationFailed, "options.sheet is invalid")
-                }
-            }
-            if let range = options.cellRange {
-                guard options.sheet != nil else {
-                    throw DocumentToolError(
-                        .validationFailed,
-                        "options.cell_range requires an exact options.sheet")
-                }
-                try validateA1Range(range, field: "options.cell_range")
-            }
-            try validateInteger(
-                options.maximumCells,
-                minimum: 1,
-                maximum: 100_000,
-                field: "options.maximum_cells")
-        case .html:
-            allowed = ["xpath", "expected_match_count"]
-            if options.xpath == nil, options.expectedMatchCount != nil {
-                throw DocumentToolError(
-                    .validationFailed,
-                    "options.expected_match_count requires options.xpath")
-            }
-            if let xpath = options.xpath {
-                try validateXPath(xpath, field: "options.xpath")
-                guard options.expectedMatchCount != nil else {
-                    throw DocumentToolError(
-                        .validationFailed,
-                        "options.xpath requires an exact options.expected_match_count")
-                }
-            }
-            try validateInteger(
-                options.expectedMatchCount,
-                minimum: 1,
-                maximum: 10_000,
-                field: "options.expected_match_count")
-        case .epub:
-            allowed = ["spine_start", "spine_count", "include_metadata"]
-            if options.spineCount != nil, options.spineStart == nil {
-                throw DocumentToolError(
-                    .validationFailed,
-                    "options.spine_count requires options.spine_start")
-            }
-            try validateInteger(
-                options.spineStart,
-                minimum: 1,
-                maximum: 100_000,
-                field: "options.spine_start")
-            try validateInteger(
-                options.spineCount,
-                minimum: 1,
-                maximum: 10_000,
-                field: "options.spine_count")
-        case .pdf:
-            throw DocumentToolError(.unsupportedOperation, "document_read does not accept PDF")
-        }
-        try requireKeys(object, allowed: allowed, required: [])
     }
 
     static func validateOperationEnvelopes(_ raw: JSONValue?) throws {

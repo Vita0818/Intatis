@@ -13,12 +13,19 @@ public enum ToolCapability: String, Codable, Sendable, Hashable {
     case proposePatch = "propose_patch"
     case applyPatch = "apply_patch"
     case readPDF = "read_pdf"
-    case documentRead = "document_read"
+    case readDOCX = "read_docx"
+    case readPPTX = "read_pptx"
+    case readXLSX = "read_xlsx"
+    case readHTML = "read_html"
+    case readEPUB = "read_epub"
     case documentOCR = "document_ocr"
     case documentRender = "document_render"
     case documentExportPDF = "document_export_pdf"
     case documentWrite = "document_write"
-    // Legacy decode-only capabilities. Fresh leases must not issue them.
+    // Legacy capabilities. Fresh leases must not issue them. Cowork may map
+    // `documentRead` to the exact replacement readers when replaying an old
+    // default lease; the other cases remain decode-only.
+    case documentRead = "document_read"
     case readDocument = "read_document"
     case editPDF = "edit_pdf"
     case reconstructDocument = "reconstruct_document"
@@ -132,7 +139,11 @@ public struct CapabilityLease: Codable, Sendable, Hashable {
             .listWorkspace,
             .searchWorkspace,
             .readPDF,
-            .documentRead,
+            .readDOCX,
+            .readPPTX,
+            .readXLSX,
+            .readHTML,
+            .readEPUB,
             .documentOCR,
             .requestInformation,
             .replyMessage,

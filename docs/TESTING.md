@@ -2,7 +2,7 @@
 
 文档状态：当前验证矩阵
 最近核对：2026-08-11
-产品基线：v0.40（build 40）
+产品基线：v0.48（build 48）
 
 历史测试数量、性能数字和事故复验保留在 Git 历史及 dated reports；它们不能替代当前
 working tree 的验证。这里只记录现行命令、release gate 和最近一次真实结果。
@@ -27,11 +27,11 @@ scripts/check-version-consistency.sh
 
 必须同时满足：
 
-- `project.yml`：`MARKETING_VERSION=0.40`，`CURRENT_PROJECT_VERSION=40`；
-- macOS/iOS 参考 Info.plist：`0.40 (40)`；
+- `project.yml`：`MARKETING_VERSION=0.48`，`CURRENT_PROJECT_VERSION=48`；
+- macOS/iOS 参考 Info.plist：`0.48 (48)`；
 - 生成的 `Intatis.xcodeproj`：相同版本；
 - README、文档索引、CURRENT_STATE 和 PROJECT_MAP：相同当前基线；
-- 最终 App bundle：`CFBundleShortVersionString=0.40`、`CFBundleVersion=40`。
+- 最终 App bundle：`CFBundleShortVersionString=0.48`、`CFBundleVersion=48`。
 
 旧设计文档、依赖版本、协议 schema 和 dated reports 中的其他 v0.x 不属于该一致性检查。
 
@@ -57,31 +57,46 @@ swift test --filter IntatisCoworkTests
 swift test --filter IntatisSharedUITests
 ```
 
-修改 Cowork automatic permission authorization context 时，至少运行：
+修改 Cowork automatic permission sidecar / reviewer 时，至少运行：
 
 ```sh
 swift test --filter PermissionReviewProtocolTests
-swift test --filter PermissionAuthorizationContextReporterTests
+swift test --filter AuthorizationSidecarTests
+swift test --filter IntatisPermissionReviewerTests
 swift test --filter PermissionReviewControlPlaneTests
 swift test --filter AutomaticPermissionReviewTests
+swift test --filter DurableMultimodalAgentLoopTests
 ```
 
-必须覆盖 legitimate `continue`/省略指令映射、acting-provider request snapshot、唯一 output-only
-`submit_permission_authorization` function、无 prose/单 call/严格 arguments 验收、
-canonical current user message、earliest-cited→current evidence closure、intervening revoke/scope change、
-main/worker projection 隔离、同 assistant batch 多 call 独立报告、usage/no-history、legacy optional decode，
-以及 malformed/secret/unknown handle/timeout/cancel/unknown future event/缺 context 的 durable typed deny。
-另须证明 hard deny 与 manual flow 不触发 reporter，report 不能改变 exact authorization、gate、capability/
-workspace ceiling，reviewer provider 只在完整 host validation 后被调用。
+必须覆盖 provider-facing schema decoration（普通/strict/namespace/deferred/collision）：reserved sidecar 是 optional
+string property，不进入 JSON `required`，只有 deterministic gate 到达 automatic ask 时由宿主强制。还要覆盖
+sidecar 拆包与 canonical business args、同文案变化不改变 digest/intent/path/retry identity、executor 永不看到
+保留字段、同 batch 多 call 独立绑定、valid sidecar 出现在同 turn 下一次 acting request 但不进入 EventLog/durable
+model history、reviewer transient exact-args 不进入 permission lifecycle、stripped business call 仍服从既有
+bounded/secret-safe history/audit 规则、permission-request receipt round-trip、legacy optional decode，以及图片/PDF
+history 不触发 blanket deny 或 full-context resend。missing/malformed/secret-bearing sidecar 必须只写
+failed/runtimeFailed `tool_result`，产生 0 个 permission/review event、0 次 reviewer dispatch、0 次 denial-fuse
+消耗；必须有同 business args 的 missing → missing → valid 回归。binding mismatch 则单列为 typed fail closed。
+另须证明 hard deny、deterministic allow 与 manual flow 不调用 reviewer/不接收 transient input；reviewer prompt
+得到 complete safe args + complete string sidecar + mechanical host facts，并负断言 objective/role/deliverable/
+userGoal/raw user/assistant history/PDF marker 不存在；gate/lease/authorization 仍为 host authority；plain-text
+verdict 对旧 JSON、tool call、无 completion、非成功 finish、多/缺 marker、timeout/cancel/provider/persistence
+failure 全部 fail closed。还必须覆盖 manual/nonautomatic 保留字段在 business execution 前拒绝；automatic
+responder 缺 bound overload、active/cached duplicate 缺失或更换 invocation、recovered allow 再交付均拒绝；
+invocation-free host
+`agent.attach` 只能经 dedicated entry + exact prior durable events；live reviewer reason/provider diagnostic 不会
+回显 transient input 到 durable state；误注入 in-engine reviewer 的结果不能获得执行权。
 
 得到用户明确的真实网络与计费授权后，还应对当前 exact Agent route 运行：
 
 ```sh
-INTATIS_REAL_TOOL_SHAPE_DIAGNOSTIC=1 swift test --filter RealProviderSmokeTests/testRealAgentOutputFunctionShapeWhenEnabled
+INTATIS_REAL_TOOL_SHAPE_DIAGNOSTIC=1 swift test --filter RealProviderSmokeTests/testRealAgentAuthorizationSidecarShapeWhenEnabled
 ```
 
-该 smoke 只验证普通单 function 形状确实返回一个结构化 call；生产 reporter 仍须由上述离线测试覆盖
-host binding、secret scan、EventLog closure 与 fail-closed 语义。
+该 smoke 只验证当前 exact Agent route 接受 optional string sidecar property，并在 prompt 明示需要时返回
+可拆分的 valid sidecar + business arguments；ask-only host enforcement、binding、secret scan、durable isolation 与 fail-closed
+语义仍必须由上述离线测试覆盖。本轮尚未运行该真实 provider smoke，不能从 scripted provider 测试外推
+线上 route 的 sidecar compliance、token 或 latency。
 
 MCP、browser、managed terminal、OAuth、real provider 和设备测试中明确标为 opt-in 的项目，
 必须在具备相应 runtime/credential/网络的环境单独执行。
@@ -196,13 +211,14 @@ NSOpenPanel 只选择该目录；核对当前 session 的 `knowledge-access.plis
 Code session 并再次调用同一路径：不得再次出现授权面板。换 session、不同路径、root identity 漂移或
 撤权后仍必须重新授权；测试时不得打印 raw bookmark bytes。
 
-### 六工具文档链专项
+### 按格式拆分的文档链专项
 
 修改文档合同、固定 backend、staging/commit、registry、permission 或 lease 时，至少运行：
 
 ```sh
 swift build --target IntatisTools --disable-automatic-resolution
 swift build --target IntatisToolsTests --disable-automatic-resolution
+swift test --filter DocumentReadToolSplitTests
 swift test --filter DocumentToolContractTests
 swift test --filter DocumentInfrastructureTests
 swift test --filter PDFNativeDocumentServiceTests
@@ -211,6 +227,7 @@ swift test --filter DocumentFixedBackendsTests
 swift test --filter DocumentToolsIntegrationTests
 swift test --filter CapabilityLeaseTests
 swift test --filter ToolRegistryLeaseTests
+swift test --filter AgentLoopPolicyTests
 ```
 
 外层 managed sandbox 若阻止测试内的 Seatbelt/process spawn，可直接运行已构建的 XCTest bundle
@@ -230,13 +247,26 @@ INTATIS_REAL_DOCUMENT_RUNTIME_SMOKE=1 xcrun xctest \
   .build/out/Products/Debug/IntatisToolsTests.xctest
 ```
 
-第三项包含 DOCX write/read、LibreOffice PDF preview/export、PDF read/render，PPTX
+普通 reader 还必须对用户提供的外部 corpus 做 opt-in 验证；测试只把候选文档复制到临时
+workspace，不得修改源目录，也不得把个人绝对路径写进仓库：
+
+```sh
+INTATIS_REAL_DOCUMENT_CORPUS_ROOT=<external-corpus-root> \
+  swift test --filter DocumentToolsIntegrationTests/testInstalledDocumentRuntimeReadsUserCorpusWhenConfigured
+```
+
+第三个 runtime smoke 包含 DOCX write/read、LibreOffice PDF preview/export、PDF read/render，PPTX
 write/read/preview/export/PDF read，以及 XLSX write/Calc round-trip/formula-cache/preview/export；
-任一中途失败都不得把前面的 Python write 或直接无沙箱 LibreOffice 基准记为六工具链通过。
+任一中途失败都不得把前面的 Python write 或直接无沙箱 LibreOffice 基准记为整条文档链通过。
 专项至少证明：
 
-- 生产 registry 只有 `read_pdf`、`document_read`、`document_ocr`、`document_render`、
-  `document_export_pdf`、`document_write`，旧自动读取/PDF mutation/reconstruct 工具不可见；
+- production registry 暴露 `read_pdf`、`read_docx`、`read_pptx`、`read_xlsx`、`read_html`、
+  `read_epub`、`document_ocr`、`document_render`、`document_export_pdf`、`document_write`；
+  `document_read` 与旧自动读取/PDF mutation/reconstruct 工具不可见，standard/Cowork registry
+  分别为 v3；
+- 五个格式 reader 的 schema 只有 `path` 与可选 `maxCharacters`，格式由工具名固定；它们通过
+  exact one-format Docling high-level converter 返回有界 Markdown，不接受 `format`、`options`、
+  sheet/range/xpath/backend，不返回 raw Docling dict 或嵌入图片 data URI；
 - image-only PDF 返回 typed `ocr_required`；PDF 页面 PNG 的尺寸、SHA-256、字节数和 manifest
   一致，真实渲染页经视觉检查；
 - source/destination/辅助资产 CAS、默认 no-clobber、precommit cancellation、backend/validator failure
@@ -248,14 +278,25 @@ write/read/preview/export/PDF read，以及 XLSX write/Calc round-trip/formula-c
   formula 与 data-only 两种视图证明目标公式文本保留且存在可读非公式缓存；不能只断言转换成功；
 - 生成 PDF 经 strict pdfcpu validation 和 PDFKit reopen/render smoke；validator 不能被描述为视觉保真、
   任意无损往返或 secure redaction 证明；
-- EPUB read/write 的 Rust helper 必须通过 `cargo fmt -- --check`、`cargo check --locked`、
-  `cargo test --locked` 与 `cargo clippy --locked --all-targets -- -D warnings`；生产成功还要求正式
-  EPUBCheck artifact 与 round-trip corpus。EPUB render/export 在 full-spine gate 前必须从 schema 删除；
+- EPUB write 的 Rust helper 必须通过 `cargo fmt -- --check`、`cargo check --locked`、
+  `cargo test --locked` 与 `cargo clippy --locked --all-targets -- -D warnings`；普通 EPUB read 走与
+  其他格式一致的 Docling reader，不再经过 rbook。生产 write 成功还要求正式 EPUBCheck artifact
+  与 round-trip corpus。EPUB render/export 在 full-spine gate 前必须从 schema 删除；
 - stdout/stderr 限制不得误作生成文件限制；单文件、聚合生成字节与 entry 数预算必须在进程运行期及
   退出后都生效，不能只在 backend 完成后检查 staging；
-- read-only worker 只拿 `read_pdf`、`document_read`、`document_ocr`，且后两者只能通过 exact
-  `structured_read_only` 权限形状执行；read-write worker/coordinator 才拿 render/export/write。
+- read-only worker 只拿 `read_pdf`、五个 exact reader capability 与 `document_ocr`；五个普通 reader
+  只能通过 exact `structured_read_only + safeToReplay` 权限形状执行。首个 reader 解析失败必须写
+  failed/unknown settlement、允许同批后续 reader 继续并允许模型给出最终回答；既有 non-replayable
+  write 失败仍必须触发 manual reconciliation。read-write worker/coordinator 才拿 render/export/write。
   iOS target 依赖图仍不含 Tools/Permission/AgentKernel/Cowork/文档 runtime。
+
+2026-08-11 的本地回归中，外部 corpus opt-in 用例将 1 份稀疏 XLSX 与 3 份 PPTX 复制到临时
+workspace 后全部读取成功；完整 `IntatisToolsTests` 为 223 tests、0 failures、19 skipped，真实 core
+runtime 与 EPUB write/read smoke 各 1/1 通过。该结果证明当前开发机固定 runtime 上的读取链，不替代
+发行 runtime closure 或未来新增格式/文件变体的 corpus。相关 `AgentLoopPolicyTests` 36/36、
+capability/registry/mailbox 42/42、rbook fmt/check/test/clippy、SwiftPM build、macOS/iOS Debug unsigned
+build 与版本一致性门均通过。一次整仓 `swift test --disable-automatic-resolution` 在既有 SharedUI
+async waiter 中无进展并被人工中断为 130，因此不得把上述 focused 结果改写成当前整仓全绿。
 
 真实 runtime 验证报告必须记录 executable/package/model 的 exact version、artifact hash（若可用）、
 平台/架构与缺失项。开发机存在用户自建 runtime 只证明本机 smoke，不替代发行 closure、许可证/
@@ -361,7 +402,7 @@ recovery App metadata/architecture/signature/entitlements 重新验证；超时�
 
 发行脚本必须在输出 `dist/` 前完成：
 
-1. v0.40/build 40 一致性检查；
+1. v0.48/build 48 一致性检查；
 2. `IntatisMac` universal Release；
 3. Developer ID Application + secure timestamp + Hardened Runtime；
 4. signed entitlements 不含 App Sandbox；
@@ -548,9 +589,9 @@ INTATIS_REAL_MULTIMODAL_SMOKE=1 swift test \
   不得误触发tool-search capability错误；
 - projector image sidecar与messages严格等长，v2 direct/checkpoint不能降级为v1；compaction
   summarizer看见完整active window，成功checkpoint不保留任何旧图片ref，resume不偷回checkpoint前图片；
-- automatic Cowork authorization snapshot含user或FCO图片时durable media deny，文本reviewer没有allow
-  旁路；当前端到端回归分别直接覆盖user image与历史FCO image，并证明后者不启动reporter、reviewer或
-  executor；
+- automatic Cowork 不得因 acting request 含 user 或 FCO 图片而 blanket deny；端到端回归必须分别覆盖
+  当前 user image 与历史 FCO image，证明 same-call sidecar 可摘要媒体证据、reviewer 仍只接收文本摘要而
+  不重发完整像素/PDF，并且 valid allow 后只执行 exact reviewed business call；
 - Cowork Retry planner矩阵必须证明outbox canonicalization保持attempt 1、restored queued exact resume
   不递增、restored running durable requeue只对齐下一exact attempt、只有failed/cancelled whole-task
   retry递增，并且所有分支保持同一SubmissionID/冻结payload/附件IDs且不重复user event；
@@ -741,6 +782,26 @@ INTATIS_REAL_MULTIMODAL_SMOKE=1 swift test \
   provider外推。未重放当时实际分发的旧App制品，但已用exact旧源码编译fixture覆盖reader语义；
   `git diff --check`通过。
 
+2026-08-11 `v0.48 (48)` 版本推进、shipping target 构建与本机开发安装的直接证据：
+
+- `xcodegen generate` 通过；`scripts/check-version-consistency.sh` 通过并输出
+  `Intatis version is consistent: 0.48 (build 48)`；
+- `IntatisMac` unsigned universal Release 构建退出 0，最终 bundle 为 `0.48 (48)`，bundle
+  identifier 为 `com.Vita0818.IntatisMac`，可执行文件包含 `x86_64 arm64`；
+- `IntatisiOS` generic Simulator Debug unsigned 构建退出 0，最终 bundle 为 `0.48 (48)`；
+  两个构建只报告仓库既有 unused-result / deprecated API warnings；
+- staging App 使用 `IntatisMac.DeveloperID.entitlements` 完成 ad-hoc Hardened Runtime 签名；
+  embedded entitlements 为 audio input=true、JIT=false、library validation 未关闭，
+  `codesign --verify --deep --strict` 通过；
+- `/Applications/Intatis.app` 已原子替换为上述 `0.48 (48)` 构建，版本、bundle identifier、
+  双架构、entitlements 和可执行文件 SHA-256 均与 staging 副本一致，且无 quarantine
+  xattr。安装前的 `0.40 (40)` 保留在
+  `~/.Trash/Intatis-before-install-20260811-201644.app` 作为可恢复备份；
+- 本轮版本/安装没有再跑 SwiftPM 测试；同一业务工作树在版本变更前已有 focused
+  154/154、完整 SwiftPM 退出 0、Cowork 362/362 和 AgentKernel 210/210 证据。本轮未运行
+  Developer ID 正式签名、公证、staple、Gatekeeper、DMG/ZIP 打包或启动后 UI/真实 provider
+  smoke，因此这是本机开发安装证据，不是正式 release 证据。
+
 2026-08-08 `v0.40 (40)` 版本推进、shipping target 构建与本机开发安装的直接证据：
 
 - `xcodegen generate` 通过；`scripts/check-version-consistency.sh` 通过并输出
@@ -763,7 +824,40 @@ INTATIS_REAL_MULTIMODAL_SMOKE=1 swift test \
   正式签名、公证、staple、Gatekeeper 或 DMG/ZIP 打包，因此这是本机开发安装证据，不是正式
   release 证据。
 
-2026-08-08 Cowork automatic permission authorization context 修复的直接证据：
+> 以下 2026-08-08 与“authorization reporter 结构化交接”条目仅是 v0.47 历史验证记录；
+> Reporter 测试/真实 output-function smoke 已被 2026-08-11 same-call sidecar 流程替代，不能作为
+> 当前可运行 gate。当前 gate 见本文件顶部命令和后续 2026-08-11 sidecar 验证条目。
+
+2026-08-12 Cowork same-call permission sidecar corrective focused 直接证据：
+
+- `PermissionReviewControlPlaneTests`：47/47；覆盖完整 transient args/string sidecar + mechanical host facts、
+  objective/role/deliverable/userGoal/user/assistant/history/PDF marker 不进入 live prompt、delimiter injection、
+  secret input、live/cache/recovery invocation 复验、recovered allow 拒绝、dedicated host admission、伪造
+  agentAdmission kind 拒绝、固定 reviewer reason/provider diagnostic 与 durable non-echo；
+- `AgentLoopPolicyTests`：36/36；覆盖 ask-only sidecar enforcement、manual reserved-key 拒绝、safe structured
+  read failure 继续 batch、fresh-review fuse 与 in-engine reviewer 误配 fail closed；
+- `AutomaticPermissionReviewTests`：35/35；覆盖 production Orchestrator/control-plane 接线、optional string schema、
+  missing → missing → valid 的相同 business args 不触发 permission lifecycle/reviewer fuse、valid sidecar 只留
+  current-turn live history、automatic attach 专用入口、allow/deny/cancel/failure 和 Reporter 不再 dispatch；
+- `DurableMultimodalAgentLoopTests`：9/9；覆盖 user/FCO image 不再 blanket deny、sidecar 摘要媒体证据、
+  raw sidecar 不进入 durable history，以及 missing sidecar 不伪造可跨重启恢复的权限拒绝；
+- `AuthorizationSidecarTests`：9/9；`IntatisPermissionReviewerTests`：10/10；
+  `PermissionReviewProtocolTests`：12/12；分别覆盖 schema decoration/extraction/binding、plain-text verdict 与
+  legacy/additive receipt wire；
+- 以上合计 158 tests / 0 failures。`swift build --disable-sandbox --disable-automatic-resolution` 通过；
+  完整 `swift test --disable-sandbox --disable-automatic-resolution` 首次在 Codex 工作区沙箱内因既有
+  WebKit/Seatbelt/terminal 环境限制失败，并暴露、随后修复一个仍按旧 Reporter 行为编写的 reliability
+  fixture；在用户批准的工作区沙箱外以同一命令重跑 exit 0。独立 xctest 复核
+  2026-08-12 修正后再次运行完整 `swift test --disable-sandbox --disable-automatic-resolution`，结果 exit 0；
+  其中 `IntatisAgentKernelTests` 212/212、`OrchestrationReliabilityTests` 54/54。
+  `xcodegen generate` 与 `scripts/check-version-consistency.sh` 通过，后者输出
+  `Intatis version is consistent: 0.48 (build 48)`；`IntatisMac` macOS Debug unsigned 与
+  `IntatisiOS` generic Simulator Debug unsigned build 均 exit 0，仅有仓库既有 warnings。首次环境失败与
+  最终外层通过都属于本轮证据，不能只保留其一。未运行 opt-in 真实 provider sidecar smoke 或 UI/manual
+  switch smoke，因此线上 route compliance、token、latency 与交互仍未证明；route-derived input ceiling 与
+  `review_input_too_large` 仍未实现。
+
+2026-08-08 Cowork automatic permission authorization context 修复的历史直接证据：
 
 - `PermissionReviewProtocolTests`：11 tests / 0 failures；验证 additive optional wrapper、旧事件
   缺字段解码，以及协议没有增加 model-supplied author/latest-user/digest；
@@ -785,7 +879,7 @@ INTATIS_REAL_MULTIMODAL_SMOKE=1 swift test \
 - 本次未修改 App/UI、Xcode 工程或平台 target，因此未另跑 macOS/iOS App build；未执行真实
   provider/credential/network smoke，不能从 scripted provider 测试外推线上模型质量。
 
-2026-08-11 authorization reporter 结构化交接修补的直接证据：
+2026-08-11 authorization reporter 结构化交接修补的历史直接证据：
 
 - `PermissionAuthorizationContextReporterTests`：7 tests / 0 failures；验证唯一 output-only function
   schema、单 call/无 prose、strict host parse、canonical evidence closure，以及异常输出 fail closed；
@@ -1055,7 +1149,7 @@ INTATIS_REAL_MULTIMODAL_SMOKE=1 swift test \
 只有以下条件同时满足才能写 release GO：
 
 - 当前 working tree 相关 tests/builds 通过，已知失败有明确处置；
-- 最终 App/ZIP/DMG 元数据为 `0.40 (40)`；
+- 最终 App/ZIP/DMG 元数据为 `0.48 (48)`；
 - Developer ID、notarization、staple、codesign、Gatekeeper 全部通过；
 - NOTICE/ThirdPartyNotices 和最终 bundle resource/link inventory 一致；
 - 关键真实环境矩阵完成，未完成项以明确的风险接受记录处理。

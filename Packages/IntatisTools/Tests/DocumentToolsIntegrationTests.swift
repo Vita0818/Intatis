@@ -74,6 +74,11 @@ final class DocumentToolsIntegrationTests: XCTestCase {
             atPath: workspace.appendingPathComponent("runtime-smoke.epub").path))
         XCTAssertTrue(observation.text.contains(#""epubcheck":"5.3.0""#), observation.text)
         XCTAssertTrue(observation.text.contains(#""rbook":"0.7.10""#), observation.text)
+
+        let read = try await ReadEPUBTool().execute(
+            ToolArgs(raw: #"{"path":"runtime-smoke.epub"}"#),
+            in: context)
+        XCTAssertTrue(read.text.contains("Runtime smoke"), read.text)
     }
 
     func testInstalledDocumentRuntimeCoreToolChainWhenEnabled() async throws {
@@ -107,10 +112,18 @@ final class DocumentToolsIntegrationTests: XCTestCase {
             in: context)
         XCTAssertTrue(write.text.contains(#""operation":"document_write""#), write.text)
 
-        let read = try await DocumentReadTool().execute(
-            ToolArgs(raw: #"{"format":"docx","input_path":"runtime-smoke.docx"}"#),
+        let read = try await ReadDOCXTool().execute(
+            ToolArgs(raw: #"{"path":"runtime-smoke.docx"}"#),
             in: context)
         XCTAssertTrue(read.text.contains(marker), read.text)
+
+        let htmlMarker = "INTATIS HTML RUNTIME 18426"
+        try Data("<html><body><h1>\(htmlMarker)</h1></body></html>".utf8)
+            .write(to: workspace.appendingPathComponent("runtime-smoke.html"))
+        let htmlRead = try await ReadHTMLTool().execute(
+            ToolArgs(raw: #"{"path":"runtime-smoke.html"}"#),
+            in: context)
+        XCTAssertTrue(htmlRead.text.contains(htmlMarker), htmlRead.text)
 
         let docxDigest = try DocumentInputFile.freeze(
             path: "runtime-smoke.docx",
@@ -155,8 +168,8 @@ final class DocumentToolsIntegrationTests: XCTestCase {
             """),
             in: context)
         XCTAssertTrue(pptxWrite.text.contains(#""libreoffice":"26.8.0.0.beta1""#), pptxWrite.text)
-        let pptxRead = try await DocumentReadTool().execute(
-            ToolArgs(raw: #"{"format":"pptx","input_path":"runtime-smoke.pptx"}"#),
+        let pptxRead = try await ReadPPTXTool().execute(
+            ToolArgs(raw: #"{"path":"runtime-smoke.pptx"}"#),
             in: context)
         XCTAssertTrue(pptxRead.text.contains(slideMarker), pptxRead.text)
         let pptxDigest = try DocumentInputFile.freeze(
@@ -190,8 +203,9 @@ final class DocumentToolsIntegrationTests: XCTestCase {
             ToolArgs(raw: #"""
             {"format":"xlsx","mode":"create","output_path":"runtime-smoke.xlsx",
              "operations":[
-              {"kind":"cell.set","parameters":{"sheet":"Sheet","cell":"A1","value":2}},
-              {"kind":"cell.set","parameters":{"sheet":"Sheet","cell":"B1","value":"=A1*2"}}
+              {"kind":"cell.set","parameters":{"sheet":"Sheet","cell":"C3","value":2}},
+              {"kind":"cell.set","parameters":{"sheet":"Sheet","cell":"D3","value":"=C3*2"}},
+              {"kind":"cell.set","parameters":{"sheet":"Sheet","cell":"E3","value":"INTATIS SHEET RUNTIME 93715"}}
              ]}
             """#),
             in: context)
@@ -199,14 +213,10 @@ final class DocumentToolsIntegrationTests: XCTestCase {
             xlsxWrite.text.contains(#""xlsx_recalculation":"calc_roundtrip_cache_verified""#),
             xlsxWrite.text)
         XCTAssertTrue(xlsxWrite.text.contains(#""libreoffice":"26.8.0.0.beta1""#), xlsxWrite.text)
-        let xlsxRead = try await DocumentReadTool().execute(
-            ToolArgs(raw: #"""
-            {"format":"xlsx","input_path":"runtime-smoke.xlsx",
-             "options":{"sheet":"Sheet","cell_range":"A1:B1","include_formulas":false}}
-            """#),
+        let xlsxRead = try await ReadXLSXTool().execute(
+            ToolArgs(raw: #"{"path":"runtime-smoke.xlsx"}"#),
             in: context)
-        XCTAssertTrue(xlsxRead.text.contains(#""coordinate":"B1""#), xlsxRead.text)
-        XCTAssertTrue(xlsxRead.text.contains(#""data_type":"n","value":4"#), xlsxRead.text)
+        XCTAssertTrue(xlsxRead.text.contains("INTATIS SHEET RUNTIME 93715"), xlsxRead.text)
         let xlsxDigest = try DocumentInputFile.freeze(
             path: "runtime-smoke.xlsx",
             expectedFormat: .xlsx,
@@ -218,6 +228,61 @@ final class DocumentToolsIntegrationTests: XCTestCase {
             """),
             in: context)
         XCTAssertTrue(xlsxExport.text.contains(#""libreoffice":"26.8.0.0.beta1""#), xlsxExport.text)
+    }
+
+    func testInstalledDocumentRuntimeReadsUserCorpusWhenConfigured() async throws {
+        guard let rawRoot = ProcessInfo.processInfo.environment[
+            "INTATIS_REAL_DOCUMENT_CORPUS_ROOT"],
+              !rawRoot.isEmpty else {
+            throw XCTSkip(
+                "set INTATIS_REAL_DOCUMENT_CORPUS_ROOT to run the external document corpus smoke")
+        }
+        guard let runtime = intatisDocumentRuntimeRoot(),
+              fileManager.isExecutableFile(
+                  atPath: runtime.appendingPathComponent("bin/python3").path) else {
+            throw XCTSkip("fixed Python document runtime is not installed")
+        }
+
+        let sourceRoot = URL(fileURLWithPath: rawRoot, isDirectory: true)
+        let sourceFiles = try fileManager.contentsOfDirectory(
+            at: sourceRoot,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles])
+        let xlsxFiles = sourceFiles.filter { $0.pathExtension.lowercased() == "xlsx" }.sorted {
+            $0.lastPathComponent < $1.lastPathComponent
+        }
+        let pptxFiles = sourceFiles.filter { $0.pathExtension.lowercased() == "pptx" }.sorted {
+            $0.lastPathComponent < $1.lastPathComponent
+        }
+        XCTAssertFalse(xlsxFiles.isEmpty, "corpus must contain at least one XLSX")
+        XCTAssertGreaterThanOrEqual(pptxFiles.count, 3, "corpus must contain the three lecture PPTX files")
+        guard let xlsx = xlsxFiles.first, pptxFiles.count >= 3 else { return }
+
+        let workspace = try makeWorkspace()
+        defer { try? fileManager.removeItem(at: workspace) }
+        let context = ToolContext(
+            workspaceRoot: workspace,
+            documentBackend: DocumentBackendProcessRunner(timeoutSeconds: 300))
+
+        let xlsxName = "corpus.xlsx"
+        try fileManager.copyItem(
+            at: xlsx,
+            to: workspace.appendingPathComponent(xlsxName))
+        let xlsxRead = try await ReadXLSXTool().execute(
+            ToolArgs(raw: #"{"path":"corpus.xlsx","maxCharacters":500000}"#),
+            in: context)
+        try assertNonemptyMarkdown(xlsxRead, operation: "read_xlsx")
+
+        for (index, source) in pptxFiles.prefix(3).enumerated() {
+            let name = "corpus-\(index + 1).pptx"
+            try fileManager.copyItem(
+                at: source,
+                to: workspace.appendingPathComponent(name))
+            let read = try await ReadPPTXTool().execute(
+                ToolArgs(raw: "{\"path\":\"\(name)\",\"maxCharacters\":500000}"),
+                in: context)
+            try assertNonemptyMarkdown(read, operation: "read_pptx")
+        }
     }
 
     func testInstalledDocumentRuntimePDFCPUAndOCRWhenEnabled() async throws {
@@ -282,46 +347,60 @@ final class DocumentToolsIntegrationTests: XCTestCase {
         #endif
     }
 
-    func testStandardRegistryExposesOnlySixReplacementDocumentTools() throws {
+    func testStandardRegistryExposesSplitDocumentReaders() throws {
         let registry = ToolRegistry.standard()
         let names = Set(registry.descriptors().map(\.name))
 
         XCTAssertTrue([
             "read_pdf",
-            "document_read",
+            "read_docx",
+            "read_pptx",
+            "read_xlsx",
+            "read_html",
+            "read_epub",
             "document_ocr",
             "document_render",
             "document_export_pdf",
             "document_write",
         ].allSatisfy(names.contains))
         XCTAssertFalse(names.contains("read_document"))
+        XCTAssertFalse(names.contains("document_read"))
         XCTAssertFalse(names.contains("edit_pdf_pages"))
         XCTAssertFalse(names.contains("reconstruct_document_image"))
-        XCTAssertEqual(registry.registryVersion, "intatis.standard.v2")
+        XCTAssertEqual(registry.registryVersion, "intatis.standard.v3")
     }
 
     func testDescriptorsPermissionsAndTouchedPathsAreExact() throws {
         XCTAssertEqual(ReadPDFTool.descriptor.sideEffect, .readOnly)
-        XCTAssertEqual(DocumentReadTool.descriptor.sideEffect, .exec)
+        XCTAssertEqual(ReadDOCXTool.descriptor.sideEffect, .exec)
+        XCTAssertEqual(ReadPPTXTool.descriptor.sideEffect, .exec)
+        XCTAssertEqual(ReadXLSXTool.descriptor.sideEffect, .exec)
+        XCTAssertEqual(ReadHTMLTool.descriptor.sideEffect, .exec)
+        XCTAssertEqual(ReadEPUBTool.descriptor.sideEffect, .exec)
         XCTAssertEqual(DocumentOCRTool.descriptor.sideEffect, .exec)
         XCTAssertEqual(DocumentRenderTool.descriptor.sideEffect, .exec)
         XCTAssertEqual(DocumentExportPDFTool.descriptor.sideEffect, .exec)
         XCTAssertEqual(DocumentWriteTool.descriptor.sideEffect, .exec)
         XCTAssertEqual(ReadPDFTool.canonicalPermission, "document.read")
-        XCTAssertEqual(DocumentReadTool.canonicalPermission, "document.read")
+        XCTAssertEqual(ReadDOCXTool.canonicalPermission, "document.read")
+        XCTAssertEqual(ReadPPTXTool.canonicalPermission, "document.read")
+        XCTAssertEqual(ReadXLSXTool.canonicalPermission, "document.read")
+        XCTAssertEqual(ReadHTMLTool.canonicalPermission, "document.read")
+        XCTAssertEqual(ReadEPUBTool.canonicalPermission, "document.read")
         XCTAssertEqual(DocumentOCRTool.canonicalPermission, "document.ocr")
         XCTAssertEqual(DocumentRenderTool.canonicalPermission, "document.render")
         XCTAssertEqual(DocumentExportPDFTool.canonicalPermission, "document.export.pdf")
         XCTAssertEqual(DocumentWriteTool.canonicalPermission, "document.write")
 
         let digest = String(repeating: "a", count: 64)
-        let readArgs = ToolArgs(raw: #"{"format":"docx","input_path":"report.docx"}"#)
-        let readIntent = DocumentReadTool().permissionIntent(
+        let readArgs = ToolArgs(raw: #"{"path":"report.docx"}"#)
+        let readIntent = ReadDOCXTool().permissionIntent(
             readArgs,
             workspaceRoot: URL(fileURLWithPath: "/workspace"))
         XCTAssertTrue(readIntent.isStructuredReadOnlyExecution)
         XCTAssertTrue(readIntent.isReadOnlyWorkspaceCompatible)
         XCTAssertEqual(readIntent.dataEffects, [.read, .execute])
+        XCTAssertEqual(readIntent.replayPolicy, .safeToReplay)
 
         let renderArgs = ToolArgs(raw: """
         {"input_format":"html","input_path":"site/index.html",
@@ -439,7 +518,7 @@ final class DocumentToolsIntegrationTests: XCTestCase {
         #endif
     }
 
-    func testDocumentReadMapsFixedBackendMissingEnvelopeToTypedFailure() async throws {
+    func testDocumentReaderMapsFixedBackendMissingEnvelopeToTypedFailure() async throws {
         let workspace = try makeWorkspace()
         defer { try? fileManager.removeItem(at: workspace) }
         try Data("not parsed by the fake".utf8).write(
@@ -450,8 +529,8 @@ final class DocumentToolsIntegrationTests: XCTestCase {
             exitCode: 0))
 
         do {
-            _ = try await DocumentReadTool().execute(
-                ToolArgs(raw: #"{"format":"docx","input_path":"report.docx"}"#),
+            _ = try await ReadDOCXTool().execute(
+                ToolArgs(raw: #"{"path":"report.docx"}"#),
                 in: ToolContext(workspaceRoot: workspace, documentBackend: backend))
             XCTFail("missing backend should fail")
         } catch let error as DocumentToolError {
@@ -460,6 +539,23 @@ final class DocumentToolsIntegrationTests: XCTestCase {
         }
         let invocationCount = await backend.invocationCount()
         XCTAssertEqual(invocationCount, 1)
+    }
+
+    func testDocumentReaderPropagatesBackendTruncation() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? fileManager.removeItem(at: workspace) }
+        try Data("not parsed by the fake".utf8).write(
+            to: workspace.appendingPathComponent("report.docx"))
+        let backend = RecordingDocumentBackendRunner(result: ShellResult(
+            stdout: #"{"schema_version":1,"ok":true,"engine_versions":{},"result":{"format":"docx","markdown":"bounded","truncated":true},"warnings":[]}"#,
+            stderr: "",
+            exitCode: 0))
+
+        let observation = try await ReadDOCXTool().execute(
+            ToolArgs(raw: #"{"path":"report.docx"}"#),
+            in: ToolContext(workspaceRoot: workspace, documentBackend: backend))
+        XCTAssertTrue(observation.truncated)
+        XCTAssertTrue(observation.text.contains(#""truncated":true"#), observation.text)
     }
 
     func testExportAndWritePrecommitConflictsDoNotClobberOrInvokeBackend() async throws {
@@ -673,6 +769,25 @@ final class DocumentToolsIntegrationTests: XCTestCase {
             isDirectory: true)
         try fileManager.createDirectory(at: url, withIntermediateDirectories: false)
         return url
+    }
+
+    private func assertNonemptyMarkdown(
+        _ observation: ToolObservation,
+        operation: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws {
+        let value = try JSONDecoder().decode(
+            JSONValue.self,
+            from: Data(observation.text.utf8))
+        guard case .object(let root) = value,
+              root["operation"] == .string(operation),
+              case .object(let result)? = root["result"],
+              case .string(let markdown)? = result["markdown"] else {
+            return XCTFail("missing bounded Markdown result", file: file, line: line)
+        }
+        XCTAssertGreaterThan(markdown.trimmingCharacters(in: .whitespacesAndNewlines).count, 20)
+        XCTAssertFalse(markdown.contains("data:image/"), "reader must not return embedded image data")
     }
 
     private func assertDocumentError(

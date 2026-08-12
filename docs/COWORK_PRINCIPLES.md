@@ -2,7 +2,7 @@
 
 文档状态：当前 Cowork/AgentKernel 原则
 最近核对：2026-08-08
-产品基线：v0.40（build 40）
+产品基线：v0.48（build 48）
 
 本文提炼自仓内 v0.10 历史 Cowork 设计文档、`PER_AGENT_INFERENCE_PROFILES.md` 及
 项目操作规则。旧设计文档只保留迁移 provenance；本文件是当前原则基准，**不是**完成度
@@ -293,14 +293,23 @@ created automatically on GUI/CLI Cowork session startup when possible
 reserved identity, not a normal task/message/delegation target
 read-only profile and no tool capability lease
 no nested AgentLoop; reviewer receives no-tool provider judgement request
-automatic ask-class exact call first receives one same-acting-model report request exposing exactly one output-only submit_permission_authorization function; it is not registered or executed
-reporter does not depend on forced tool_choice or response_format; host accepts exactly one matching function call with no prose and strictly validates its arguments
-model report is untrusted interpretation; it cannot supply author, EventLog seq, binding, or permission decision
-host maps temporary user handles to canonical same-session EventLog messages and closes every visible user turn from earliest cited through current
-reviewer sees report, canonical latest instruction, and supporting user evidence as separate quoted blocks
-missing/malformed/secret/unbound/incomplete context durably denies before reviewer provider dispatch
-reporter is request-owned, per tool call, uncached, and absent from UI/model history/TaskGraph
+provider-facing business schemas expose one optional string authorization sidecar; the host requires it only when the deterministic gate reaches an automatic ask, and no second acting-model request exists
+host strips the sidecar before original business-schema validation, durable model history, authorization identity, EventLog, and executor
+sidecar is an untrusted compressed interpretation; it cannot supply host identity, binding, gate, risk, lease, authority, or permission decision
+host binds each sidecar independently to exact session/turn/task/call/tool/provider-generation/tool-snapshot/business digest
+reviewer sees complete safe canonical business arguments, complete string sidecar, and mechanical host authorization/gate/lease/action facts as separate quoted blocks; it never receives task objective/role/deliverable, userGoal, raw user/assistant history, PDF, or image bytes
+valid raw sidecar is retained only in the current turn's in-memory acting-model history as a formatting example; it is never durable, the reviewer transient exact-args copy is request-local/non-Codable, permission_request context stores only digest/count plus generation/snapshot/digest/status receipt, and durable history/audit use the stripped business call
+missing/malformed/secret-bearing context writes only a failed/runtimeFailed tool_result, creates no permission lifecycle, calls no reviewer, and consumes no denial fuse; the same business arguments may be corrected repeatedly until a valid sidecar reaches review
+an unbound or mismatched invocation is a separate authorization snapshot failure and remains typed fail closed
+manual/nonautomatic mode rejects the reserved field before business execution and never forwards it to a business tool
+automatic responders must implement the bound-invocation contract; active/cached duplicates revalidate the exact transient invocation and recovered allow is never redelivered
+the only invocation-free automatic review is a dedicated host agent-admission path which proves exact admission identity plus preceding durable attach/lease request events
+reviewer returns a short reason plus final-line ASCII ALLOW or DENY; JSON/function output is not a correctness dependency
+live bound reviewer reasons and provider diagnostics are not durable; fixed host-authored settlement/tool-result text prevents transient-input echo
 hard deny remains final before the reviewer can see anything
+shipping Cowork has no in-engine reviewer; an injected one is a misconfiguration whose result must fail closed even though the bad configuration may already have caused one extra call
+the live path currently has no fixed sidecar byte ceiling or review_input_too_large admission; future route-derived limits must reject whole inputs instead of truncating and continuing
+the model can still repeat sidecar semantics in ordinary assistant text, and malformed acting-provider diagnostics still rely on the generic bounded/secret sanitizer; the sole raw-sidecar exception is current-turn in-memory acting history, never durable state
 ```
 
 ## 6. 历史审计问题与当前回归点
@@ -406,10 +415,16 @@ session rename appends the EventLog settings transition before refreshing sessio
 agent-to-agent event records caller, target, task, and causal chain
 automatic permission reviewer cannot override hard deny
 automatic permission reviewer can be enabled/disabled without becoming a normal worker
-automatic model-authored ask-class review requires a complete host-validated authorizationContext; legacy decode does not authorize a new live call
-authorization report provenance, canonical user evidence, requestingAgent, and ResolvedToolAuthorization remain separate trust sources
-supporting user evidence always contains current submission and the full visible earliest-cited-to-current closure, including intervening revocation/scope changes
-one assistant batch with multiple ask-class calls receives one independently bound output-function report per call; report output is never reused across calls
+automatic model-authored ask-class review requires a complete same-generation string sidecar and exact canonical safe business arguments; legacy PermissionAuthorizationContext remains decode-only
+model sidecar, requestingAgent, internal TaskContract, deterministic gate, leases, and ResolvedToolAuthorization remain separate trust sources; only host facts carry authority, and semantic TaskContract/user-message fields never enter the live reviewer prompt
+no fixed user-message-count/character suffix or full provider snapshot is reconstructed for a live review; the acting model is responsible for its bounded semantic evidence summary
+one assistant batch with multiple calls carries one independently bound sidecar per call; sidecar text never changes business authorization identity or retry signature
+image/PDF/tool-result evidence may be summarized and cited in the sidecar, but complete PDF/image/transcript bytes are not resent merely for permission review and media presence is not a blanket deny
+manual/nonautomatic reserved-field injection is rejected before business execution; missing/malformed/secret-bearing sidecar failures remain correctable tool-input failures with no permission lifecycle or denial fuse
+automatic responder default fallback cannot drop transient invocation; active/cached/recovered duplicates revalidate exact invocation, and recovered automatic allow cannot be redelivered
+invocation-free automatic agent attach is accepted only through the dedicated host entry with exact durable admission evidence; a forged agentAdmission task kind is insufficient
+live reviewer reason/provider diagnostics cannot echo transient input into durable state because settlements use fixed host text
+shipping Cowork does not configure an in-engine reviewer; accidental injection is detected and denied before control-plane execution authority, though the misconfiguration may have caused one extra reviewer call
 permission request identity is first-write-wins and conflicting RequestID reuse fails closed
 permission settlement is first-terminal-wins under concurrency; exact duplicates are idempotent and conflicting terminals cannot overwrite the first
 legacy outcome/action/mode/correlation fields decode conservatively, while each new Chat/Code/Cowork turn records one semantic terminal turn outcome

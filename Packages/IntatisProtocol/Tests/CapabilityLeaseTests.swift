@@ -5,7 +5,11 @@ import IntatisCore
 
 final class CapabilityLeaseTests: XCTestCase {
     private static let documentCapabilities: Set<ToolCapability> = [
-        .documentRead,
+        .readDOCX,
+        .readPPTX,
+        .readXLSX,
+        .readHTML,
+        .readEPUB,
         .documentOCR,
         .documentRender,
         .documentExportPDF,
@@ -13,7 +17,11 @@ final class CapabilityLeaseTests: XCTestCase {
     ]
 
     private static let documentObservationCapabilities: Set<ToolCapability> = [
-        .documentRead,
+        .readDOCX,
+        .readPPTX,
+        .readXLSX,
+        .readHTML,
+        .readEPUB,
         .documentOCR,
     ]
 
@@ -24,6 +32,7 @@ final class CapabilityLeaseTests: XCTestCase {
     ]
 
     private static let legacyDocumentCapabilities: Set<ToolCapability> = [
+        .documentRead,
         .readDocument,
         .editPDF,
         .reconstructDocument,
@@ -91,6 +100,7 @@ final class CapabilityLeaseTests: XCTestCase {
         var payload = try XCTUnwrap(
             JSONSerialization.jsonObject(with: templateData) as? [String: Any])
         payload["tools"] = [
+            "document_read",
             "read_document",
             "edit_pdf",
             "reconstruct_document",
@@ -109,6 +119,33 @@ final class CapabilityLeaseTests: XCTestCase {
         ]
         for lease in freshLeases {
             XCTAssertTrue(lease.tools.isDisjoint(with: Self.legacyDocumentCapabilities))
+        }
+    }
+
+    func testSplitDocumentReadCapabilitiesEncodeWithConcreteToolNames() throws {
+        let expected: [ToolCapability: String] = [
+            .readDOCX: "read_docx",
+            .readPPTX: "read_pptx",
+            .readXLSX: "read_xlsx",
+            .readHTML: "read_html",
+            .readEPUB: "read_epub",
+        ]
+
+        for (capability, rawValue) in expected {
+            XCTAssertEqual(capability.rawValue, rawValue)
+            let encoded = try JSONEncoder().encode(capability)
+            XCTAssertEqual(try JSONDecoder().decode(ToolCapability.self, from: encoded), capability)
+        }
+    }
+
+    func testSplitDocumentReadToolsDeriveDocumentReadAction() {
+        for toolName in ["read_docx", "read_pptx", "read_xlsx", "read_html", "read_epub"] {
+            let intent = PermissionIntent.derived(
+                toolName: toolName,
+                sideEffect: .exec,
+                touchedPaths: ["document"],
+                risksNetwork: false)
+            XCTAssertEqual(intent.action, "document.read", toolName)
         }
     }
 

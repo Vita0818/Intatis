@@ -566,12 +566,12 @@ final class RealProviderSmokeTests: XCTestCase {
         XCTAssertFalse(report.responsePreview?.isEmpty ?? true)
     }
 
-    func testRealAgentOutputFunctionShapeWhenEnabled() async throws {
+    func testRealAgentAuthorizationSidecarShapeWhenEnabled() async throws {
         guard ProcessInfo.processInfo.environment[
             "INTATIS_REAL_TOOL_SHAPE_DIAGNOSTIC"
         ] == "1" else {
             throw XCTSkip(
-                "Set INTATIS_REAL_TOOL_SHAPE_DIAGNOSTIC=1 to verify that the configured Agent route calls one output-only function with structured arguments. This makes one billable request.")
+                "Set INTATIS_REAL_TOOL_SHAPE_DIAGNOSTIC=1 to verify that the configured Agent route emits a same-call authorization sidecar. This makes one billable request.")
         }
 
         let config = try CLIConfig.load()
@@ -580,7 +580,7 @@ final class RealProviderSmokeTests: XCTestCase {
             resolver: CLIExactSecretResolver(config: config))
         let route = try await registry.agentRuntimeRoute(
             model: ModelID(rawValue: config.model))
-        let parameters: JSONValue = .object([
+        let businessParameters: JSONValue = .object([
             "type": .string("object"),
             "properties": .object([
                 "status": .object([
@@ -591,16 +591,21 @@ final class RealProviderSmokeTests: XCTestCase {
             "additionalProperties": .bool(false),
         ])
 
-        func toolRequest(strict: Bool?) -> AgentRequest {
-            AgentRequest(
-                model: route.model,
-                messages: [.user(
-                    "Call diagnostic_noop exactly once with status OK. Emit no prose before or after the call.")],
-                tools: [ToolSpec(
+        func toolRequest(strict: Bool?) throws -> AgentRequest {
+            let decorated = try AuthorizationSidecarCodec.decorate(
+                ToolSpec(
                     name: "diagnostic_noop",
                     description: "A no-op diagnostic function.",
-                    parameters: parameters,
-                    strict: strict)],
+                    parameters: businessParameters,
+                    strict: strict))
+            return AgentRequest(
+                model: route.model,
+                messages: [.user("""
+                    Call diagnostic_noop exactly once with status OK. In the required
+                    __intatis_authorization_context field, explain that this is a
+                    user-requested provider-shape diagnostic and cite this user request.
+                    """)],
+                tools: [decorated],
                 reasoningEffort: config.reasoningEffort,
                 includeUsage: true)
         }
@@ -610,7 +615,7 @@ final class RealProviderSmokeTests: XCTestCase {
         var outputCalls: [ToolCall] = []
         do {
             for try await chunk in route.provider.stream(
-                toolRequest(strict: nil)) {
+                try toolRequest(strict: nil)) {
                 if case .textDelta(let delta) = chunk {
                     outputText += delta
                 }
@@ -622,22 +627,25 @@ final class RealProviderSmokeTests: XCTestCase {
             outputError = error
         }
 
-        print("[RealAgentToolShape] output_function="
+        print("[RealAgentToolShape] authorization_sidecar="
             + (outputError == nil ? "accepted" : "rejected"))
         XCTAssertNil(
             outputError,
             outputError?.localizedDescription
-                ?? "output function request failed")
-        XCTAssertTrue(
-            outputText.trimmingCharacters(
-                in: .whitespacesAndNewlines).isEmpty)
+                ?? "authorization sidecar request failed")
         XCTAssertEqual(outputCalls.count, 1)
         XCTAssertEqual(outputCalls.first?.name, "diagnostic_noop")
+        let call = try XCTUnwrap(outputCalls.first)
+        let extraction = AuthorizationSidecarCodec.extract(
+            from: call.arguments)
+        XCTAssertEqual(extraction.sidecarStatus, .valid)
+        XCTAssertNotNil(extraction.modelAuthorizationContext)
         let arguments = try XCTUnwrap(
-            outputCalls.first?.arguments.data(using: .utf8))
+            extraction.canonicalBusinessArguments?.data(using: .utf8))
         let object = try JSONSerialization.jsonObject(
             with: arguments) as? [String: Any]
         XCTAssertEqual(object?["status"] as? String, "OK")
+        _ = outputText
     }
 
     func testRealPermissionReviewControlPlaneWhenEnabled() async throws {

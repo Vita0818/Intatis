@@ -40,7 +40,7 @@ runtime scope, parser-hardening boundaries, and the complete license are in
 The macOS/Linux document-tool source tree contains a separately built,
 fixed-protocol Rust helper at `Packages/IntatisTools/Runtime/rbook-helper`.
 It uses **rbook 0.7.10** (`DevinSterling/rbook`) under the Apache License 2.0
-to implement the declared EPUB metadata/resource/spine/ToC read/write subset.
+to implement the declared EPUB metadata/resource/spine/ToC write subset.
 The helper is an `external-runtime` component: it remains behind Intatis'
 typed invocation, workspace lease, sandbox, staging, validation, and atomic
 commit boundaries, and is not linked into iOS.

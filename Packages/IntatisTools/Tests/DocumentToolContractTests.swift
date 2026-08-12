@@ -7,10 +7,10 @@ final class DocumentToolContractTests: XCTestCase {
     private let digestA = String(repeating: "a", count: 64)
     private let digestB = String(repeating: "b", count: 64)
 
-    func testSixSchemasAreClosedAndDoNotExposeExecutionControls() throws {
+    func testDocumentSchemasAreClosedAndDoNotExposeExecutionControls() throws {
         let schemas = [
             ReadPDFArguments.schema,
-            DocumentReadArguments.schema,
+            DocumentTextReadArguments.schema,
             DocumentOCRArguments.schema,
             DocumentRenderArguments.schema,
             DocumentExportPDFArguments.schema,
@@ -57,60 +57,32 @@ final class DocumentToolContractTests: XCTestCase {
         }
     }
 
-    func testDocumentReadUsesOnlyExactFormatSpecificOptions() throws {
-        let xlsx = try DocumentReadArguments.decodeValidated(ToolArgs(raw: #"""
-        {
-          "format":"xlsx",
-          "input_path":"data/book.xlsx",
-          "options":{
-            "sheet":"Summary",
-            "cell_range":"A1:F200",
-            "include_formulas":true,
-            "maximum_cells":1200
-          },
-          "max_characters":200000
-        }
-        """#))
-        XCTAssertEqual(xlsx.format, .xlsx)
-        XCTAssertEqual(xlsx.options?.sheet, "Summary")
-        XCTAssertEqual(xlsx.options?.cellRange, "A1:F200")
+    func testFixedFormatReadersUseOnlyPathAndCharacterBudget() throws {
+        let xlsx = try DocumentTextReadArguments.decodeValidated(
+            ToolArgs(raw: #"{"path":"data/book.xlsx","maxCharacters":200000}"#),
+            format: .xlsx)
+        XCTAssertEqual(xlsx.path, "data/book.xlsx")
+        XCTAssertEqual(xlsx.maxCharacters, 200_000)
 
-        let html = try DocumentReadArguments.decodeValidated(ToolArgs(raw: #"""
-        {
-          "format":"html",
-          "input_path":"site/index.html",
-          "options":{"xpath":"//main","expected_match_count":1}
-        }
-        """#))
-        XCTAssertEqual(html.options?.expectedMatchCount, 1)
+        let html = try DocumentTextReadArguments.decodeValidated(
+            ToolArgs(raw: #"{"path":"site/index.htm"}"#),
+            format: .html)
+        XCTAssertEqual(html.path, "site/index.htm")
 
         assertDocumentError(.validationFailed) {
-            _ = try DocumentReadArguments.decodeValidated(ToolArgs(raw: #"""
-            {
-              "format":"xlsx","input_path":"book.xlsx","options":{"cell_range":"A1:B2"}
-            }
-            """#))
+            _ = try DocumentTextReadArguments.decodeValidated(
+                ToolArgs(raw: #"{"path":"book.pptx"}"#),
+                format: .xlsx)
+        }
+        assertDocumentError(.unsupportedOperation) {
+            _ = try DocumentTextReadArguments.decodeValidated(
+                ToolArgs(raw: #"{"path":"book.xlsx","backend":"auto"}"#),
+                format: .xlsx)
         }
         assertDocumentError(.validationFailed) {
-            _ = try DocumentReadArguments.decodeValidated(ToolArgs(raw: #"""
-            {
-              "format":"docx","input_path":"book.docx","options":{"slides":"1-2"}
-            }
-            """#))
-        }
-        assertDocumentError(.unsupportedOperation) {
-            _ = try DocumentReadArguments.decodeValidated(ToolArgs(raw: #"""
-            {
-              "format":"pdf","input_path":"book.pdf"
-            }
-            """#))
-        }
-        assertDocumentError(.unsupportedOperation) {
-            _ = try DocumentReadArguments.decodeValidated(ToolArgs(raw: #"""
-            {
-              "format":"docx","input_path":"book.docx","backend":"auto"
-            }
-            """#))
+            _ = try DocumentTextReadArguments.decodeValidated(
+                ToolArgs(raw: #"{"path":"book.xlsx","options":{}}"#),
+                format: .xlsx)
         }
     }
 

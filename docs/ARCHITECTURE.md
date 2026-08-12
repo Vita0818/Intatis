@@ -2,7 +2,7 @@
 
 文档状态：当前架构规范
 最近核对：2026-08-11
-产品基线：v0.40（build 40）
+产品基线：v0.48（build 48）
 
 文中较早的 v0.x 只表示能力最初引入或兼容格式冻结的里程碑；除明确标为历史的段落外，
 当前架构判断以本文件、源码和 `project.yml` 为准。
@@ -180,50 +180,90 @@ kind 未注册即拒绝。AgentLoop 只接受本轮成功工具结果的 citatio
 幂等重复；fabricated/old-turn/cross-KB ID、hash/URI/snapshot 漂移或 final 前 purge 都拒绝。该机械
 Validator 不声称证明现实世界真伪或自然语言蕴含。
 
-## 2026-08-08 Cowork 自动权限审查授权上下文
+## 2026-08-11 Cowork single-pass permission sidecar
 
-automatic ask-class exact tool call 不再只把当前 `TaskContract.objective` 当作完整授权语义。
-在 ToolRegistry 已解析 exact registration/normalized arguments/intent/action preview/lease membership、
-deterministic gate 不是 hard deny，且 execution revalidation 通过后，`AgentLoop` 为该单一 tool call
-执行一次 request-owned 的授权上下文报告：
+automatic Cowork 不再在业务 tool call 之后二次调用 acting model。主模型第一次看到完整任务上下文时，
+如果选择业务 function call，可在同一个 arguments object 内同时输出 optional string
+`__intatis_authorization_context`。宿主仅在 deterministic gate 实际进入 Cowork automatic ask 时要求这条
+字符串存在；deterministic allow/deny 不依赖它。sidecar 只应简述相关用户意图、进展或证据，以及为什么
+这个 exact action 有必要。它是主模型的未信任语义解释，不是授权事实。
 
 ```text
-acting agent exact provider-facing request snapshot
-  + current assistant tool-call batch
-  + host-resolved exact action facts
-  + temporary handles for genuinely visible canonical user messages
-  -> same acting provider/model, exactly one output-only
-     submit_permission_authorization function and no business tools
-  -> exactly one matching function call with no prose
-  -> host strictly parses five-field untrusted
-     PermissionAuthorizationReport + user handles
-  -> host maps handles to same-session user_message EventLog seq
-  -> always include current submission and close every visible user turn
-     from the earliest cited instruction through the current instruction
-  -> PermissionReviewCausalContext.authorizationContext
-  -> PermissionReviewControlPlane independently replays/validates evidence
-  -> reviewer sees separate report / canonical latest instruction /
-     supporting-user-evidence blocks
+acting model request (once)
+  -> business tool name
+  + complete business arguments
+  + per-call __intatis_authorization_context
+  -> host uniquifies/binds call ID and splits the two views
+     -> stripped canonical business args
+        -> original schema validation
+        -> intent/path/network/action preview
+        -> ResolvedToolAuthorization + deterministic gate
+        -> executor (only after durable allow/revalidation/ticket)
+     -> canonical model sidecar
+        -> bind session/turn/task/call/tool/provider generation/tool snapshot
+  -> deterministic allow/deny: settle without reviewer
+  -> automatic ask: complete safe business args + complete sidecar
+     + mechanical host binding/gate/lease/action facts
+     -> request-local PermissionReviewInvocationInput
+     -> no-tools PermissionReviewControlPlane
+     -> short reason + final-line ASCII ALLOW or DENY
 ```
 
-`PermissionAuthorizationReport` 只由 requesting agent 的同一模型生成，字段为 authorization goal、
-current progress、latest-instruction interpretation、exact-action justification 和 scope assessment；它是
-未经信任的解释，不是授权。用户原文和 durable sequence 只来自 complete-known EventLog，模型只能返回
-本次请求的临时 handle；report author 使用既有 `requestingAgent`，exact action/session/task/turn/toolCall/
-arguments digest/gate/lease 使用既有 `ResolvedToolAuthorization` 与 review task 结构，协议不复制
-`latestUserInstruction`、`reportAuthor` 或 `bindingDigest`。
+provider-facing schema decoration 只发生在 request-owned `ToolSpec` copy；原 `ToolDescriptor`、registry
+fingerprint、strict、business `required` 与 `additionalProperties:false` 语义保持不变；reserved property 不加入
+JSON `required`。sidecar 在任何原业务 validation、durable model history、EventLog `tool_call`、authorization
+digest/intent/retry signature 与 executor 之前移除，因此修改自述不能改变动作身份或绕过真正 reviewer denial
+的 fuse。并行 batch 每个 call 各自携带并绑定 sidecar，不得按数组位置共享，也不得跨 call/cache 复用。
 
-报告请求的唯一 function 是输出信封，不进入 `ToolRegistry`、不获得执行 ticket、也不会产生副作用；宿主
-要求恰好一个同名 call、无 prose，并严格解析 arguments。该便携合同只依赖普通 function-tool 形状，不
-强制 `tool_choice` 或 `response_format`。请求不进入普通 `AgentLoop`、TaskGraph、scheduler、MessageBus、
-UI bubble 或后续 model history，也不跨 tool call 缓存；同一 assistant batch 的每个 automatic ask-class
-call 各自生成并绑定报告。manual
-permission、deterministic allow/deny 和 host-originated `agentAdmission` 不运行该 reporter。报告 generation、
-严格 JSON、secret scan、handle mapping、complete-known replay、evidence closure、budget、timeout 或 cancel
-任一步失败时，permission request 仍按既有 durable lifecycle 登记，但 control plane 在调用 reviewer provider
-前以 typed `authorization_context_unavailable` deny；不得切换人工 fallback，也不得放宽 gate/capability/
-workspace ceiling。旧 JSONL 缺少 additive optional wrapper 时继续解码；新的 live model-authored automatic
-request 缺少完整 wrapper 必须 fail closed。
+live reviewer input 是 non-Codable transient：control plane 的 active `Job` 保存完整 canonical safe business
+arguments 与 canonical sidecar，terminal 后释放。raw sidecar 永不落盘，reviewer transient exact-args 副本
+也不写 permission lifecycle event；只有 `permission_request.context` 保存 business digest/count 及 sidecar
+generation/snapshot/digest/status receipt，`PermissionReviewTask` 不复制该 receipt。valid sidecar 仅保留在
+当前 turn 的 acting-model 内存 conversation 中，使模型下一次调用仍能看到正确格式；durable model history、
+`.tool_call`、EventLog 和 executor 一律只看到 stripped business call。crash/recovery 不从 durable history
+重建 transient review input。旧的 full conversation/PDF/tool-output resend 路径已不存在。
+
+reviewer 的语义输入只来自完整 same-generation sidecar。宿主另外发送 exact business args 与机械事实：
+request/task/call/tool correlation、ResolvedToolAuthorization、gate、lease、intent、paths、side effect 等。
+live provider prompt 不发送 TaskContract objective/role/deliverable、causal userGoal、raw/current 用户指令、
+assistant/history、PDF 或图片原文。图片存在本身不再拒绝；主模型可以自行把相关文档/图片信息概括进
+sidecar，但宿主不再为审查重新选取、裁切或发送这些原始内容。
+
+missing/malformed/secret-bearing sidecar 是 acting-model tool-input error，而不是权限拒绝或 reviewer failure。
+宿主只写 failed/runtimeFailed `tool_result`，不创建 `permission_request` / `permission_resolved`、不调用 reviewer、
+不消耗 permission denial fuse；相同 business args 即使连续缺失，之后补成 valid sidecar 仍可进入 reviewer。
+`SideEffectEvidenceLedger` 只在当前 turn 内阻止模型把未执行 action 宣称为完成，restart 不恢复一条不存在的
+权限拒绝。sidecar 与 exact call/generation/business digest 无法绑定时则是独立的 authorization snapshot/
+binding failure，继续 typed fail closed。live AgentLoop 没有固定 sidecar byte ceiling，control plane 也没有
+`review_input_too_large` admission。manual/default responder 沿用旧入口，永远不收到 transient exact
+args/sidecar；manual/nonautomatic call 若仍携带保留字段，会在原业务执行前写入 redacted audit +
+`authorization_context_mode_mismatch` tool result，不会把它传给 MCP/executor。唯一允许无 sidecar 的
+automatic `agent.attach` 只能由 `Orchestrator` 通过
+`requestHostAgentAdmissionResolution` 进入，并同时验证 exact task kind/tool/action/policy/authorization/
+workspace identity 与 `permission_request` 前已经 durable 的 `agent_attach_requested + workspace_lease_requested`；
+仅伪造 `TaskContract.kind = agentAdmission` 不能绕过 transient contract。
+
+最终 reviewer 不依赖 JSON schema、function output、forced `tool_choice` 或 `response_format`。共享 parser 只
+接受 1–240 Character 非空 reason，且最后一个非空行是唯一 exact ASCII `ALLOW` / `DENY` marker；risk
+始终取 host deterministic gate。tool call、旧 JSON、code fence、多/缺 marker、无 completion marker、
+非成功 finish reason、timeout/cancel/provider/persistence failure 均 durable fail closed，不自动转人工。
+`PermissionAuthorizationReport` / `PermissionAuthorizationContext` 与相关 failure enum 只保留 legacy decode/
+reconciliation，不参与新 live allow 条件。
+
+`PermissionResponder` 的 bound-invocation overload 是 automatic 协议要求；未实现它的 automatic responder 默认
+拒绝，不能静默退回旧入口。live active duplicate 只有 request 与完整 transient invocation 都 exact 相同才可
+共享 owner generation；cached terminal 再请求时仍重新验证本次 invocation，缺失/变化一律拒绝；restart
+recovered automatic allow 不得重新交付。对于 live bound invocation，reviewer 自由文本 reason 与 provider
+diagnostic 都可能复述 exact args/sidecar，因此 durable settlement 和下游 tool-result 只采用固定宿主文案，
+不保存 model-authored reason 或序列化请求诊断。
+
+Cowork shipping `PermissionEngine` 不配置 in-engine reviewer；若错误注入并导致 `reviewerConsulted = true`，
+`AgentLoop` 会以 typed reviewer contract violation 拒绝，不能让该结果绕过 control plane。但 guard 发生在
+`decideDetailed` 返回后，所以误配本身仍可能多触发一次不应存在的 reviewer 调用；这是 P2 配置/egress 风险，
+不是 shipping 默认路径。sidecar 字段不落盘也不等于删除所有相同自然语言：acting model 若把相同内容写进
+普通 assistant text，该文本仍按既有消息/history 规则持久化；malformed acting-provider error preview 也仍由
+通用 bounded/URL/secret sanitizer 负责，本次机制没有建立一条可证明覆盖所有 provider 诊断形状的 sidecar-aware
+剥离路径。
 
 ## 2026-08-02 本地诊断导出架构
 
@@ -885,15 +925,15 @@ Provider HTTP transport 统一使用 `ProviderURLSession.noRedirect`：Foundatio
 | 用户意图 / 输入 | 应选工具 | 边界 |
 | --- | --- | --- |
 | 阅读已有可抽取文本层的 PDF | `read_pdf` | PDFKit 文本与 metadata 抽取，不执行 OCR；纯图像 PDF 返回 typed `ocr_required` |
-| 读取 DOCX/PPTX/XLSX/HTML/EPUB 的原生结构 | `document_read` | 固定格式后端；只读、有界输出；不接受 backend/命令/URL |
+| 读取 DOCX/PPTX/XLSX/HTML/EPUB 的普通内容 | `read_docx` / `read_pptx` / `read_xlsx` / `read_html` / `read_epub` | 每个工具固定一种格式；Docling 高层转换为有界 Markdown；不接受 format/options/backend/命令/URL |
 | 对 PDF 做用户明确要求的 OCR | `document_ocr` | 固定 Docling + Tesseract CLI 配置；不修改输入 PDF，不自动换引擎 |
 | 把 PDF 或文档页面渲染成 PNG bundle | `document_render` | 显式 workspace `output_dir`；页面与 manifest 作为目录整体原子提交 |
 | 把非 PDF 文档导出为新 PDF | `document_export_pdf` | PDF 输入拒绝；生成物经 strict pdfcpu 与 PDFKit smoke 验证后提交 |
 | 创建或修改 DOCX/PPTX/XLSX/HTML/EPUB | `document_write` | 只开放锁定成熟组件公开 API 已覆盖的 operation；PDF mutation 永久不在 P0 |
 
-这仍不是宿主按自然语言改写工具调用的路由器。模型从 provider request 的 exact tools list 选择工具；每个 executor 再按严格 schema、extension、operation allowlist 与 capability 做确定性 preflight。所有写入经过 staging、source/destination CAS、验证和原子提交，durable tool ticket、`manual_reconciliation` 与 `effectDisposition` 语义不变。
+这仍不是宿主按自然语言改写工具调用的路由器。模型从 provider request 的 exact tools list 选择工具；每个 executor 再按严格 schema、extension、operation allowlist 与 capability 做确定性 preflight。所有写入经过 staging、source/destination CAS、验证和原子提交。`manual_reconciliation` 只属于 replay policy 明确为 `requiresManualReconciliation` 的执行；五个 exact structured reader 为 `safeToReplay`，失败会结算为 observation 并允许后续读取继续。durable tool ticket 与 `effectDisposition` 语义保持不变。
 
-### Agent 文档工具链路（六工具固定合同；Code / Cowork / CLI）
+### Agent 文档工具链路（按格式与职责拆分；Code / Cowork / CLI）
 
 ```text
 provider tool_call -> AgentLoop schema validation
@@ -909,7 +949,11 @@ provider tool_call -> AgentLoop schema validation
 
 标准文档工具：
 - `read_pdf`：PDFKit 原生文本/metadata 抽取，支持 1-based 页选择与字符上限；不执行 OCR，纯图像 PDF 返回 `ocr_required`。
-- `document_read`：用固定 Python/rbook 后端读取 DOCX/PPTX/XLSX/HTML/EPUB；不接受 PDF，也不接受模型选择 backend。
+- `read_docx` / `read_pptx` / `read_xlsx` / `read_html` / `read_epub`：每个工具只接受
+  `path` 与可选 `maxCharacters`，format 由 concrete tool 固定；固定本地 Docling converter 只允许
+  该一种 `InputFormat`，显式关闭 remote services、external plugins、remote/local asset fetch 与图片
+  enrich，返回有界 Markdown。普通读取不再维护 python-docx/python-pptx/openpyxl/lxml/rbook 的
+  自写对象遍历或 native-structure JSON 投影，也不存在 backend fallback。
 - `document_ocr`：只接受 PDF；固定 Docling pipeline、显式 Tesseract CLI、语言/PSM/tessdata/model artifact 配置，并强制禁用 remote services 与 external plugins。
 - `document_render`：PDF 直接由 PDFKit 按固定 box/DPI/背景导出 PNG；其他格式先用唯一 renderer 生成临时 PDF，再转页面 PNG。页面、SHA-256/尺寸/字节 metadata 与 manifest 作为单一目录 bundle 提交。
 - `document_export_pdf`：DOCX/PPTX/XLSX 走 LibreOffice，HTML 走固定 WKWebView renderer；生成 PDF 固定经过 `pdfcpu --conf disable --offline validate --mode strict` 与 PDFKit reopen/render smoke。EPUB 在 full-spine corpus gate 通过前不进入该工具 schema，显式请求返回 `unsupported_operation`。
@@ -919,9 +963,12 @@ provider tool_call -> AgentLoop schema validation
   变量。Seatbelt 只允许该根内文件访问及 exact `OSL_PIPE_*` 本地 Unix socket 的 bind/connect，
   IP 网络与其他 socket 继续默认拒绝；调用结束必须清理 exact root。不得把该值退化为普通进程环境
   变量，也不得改回会超过 `sockaddr_un.sun_path` 的长 Darwin temp path。
-- `read_document`、`edit_pdf_pages`、`reconstruct_document_image` 已从生产 registry 与 fresh lease 下架；旧 capability raw value 只为历史日志解码保留，不能被模型发现或执行。P0 不包含任何 PDF mutation、annotation 或 secure redaction。
+- 聚合 `document_read`、`read_document`、`edit_pdf_pages`、`reconstruct_document_image` 已从生产
+  registry 与 fresh lease 下架。旧 `document_read` capability 可在恢复旧 session 时兼容映射到五个
+  replacement reader，但旧 concrete tool 永不重新注册；其余 legacy raw value 只解码、不执行。
+  P0 不包含任何 PDF mutation、annotation 或 secure redaction。
 
-相邻但不属于六工具合同的媒体/编译工具继续保留：
+相邻但职责独立的媒体/编译工具继续保留：
 - `compile_latex`：调用已安装的 `tectonic`、`latexmk`、`xelatex` 或 `pdflatex` 编译 `.tex`，并确认 PDF 产物存在。
 - `generate_image`：主 agent 从用户意图自主决定是否调用；model-facing schema 只包含 `prompt`、
   `outputPath`、可选 `size` 和 `count`，不暴露 provider/model 选择。宿主通过
@@ -937,11 +984,20 @@ provider tool_call -> AgentLoop schema validation
 
 设计取舍：
 - “structured runner”只是 host-owned 固定连接器：Swift 选择已审计 executable/operation，发送 versioned JSON request 或固定 argv，并控制环境、工作目录、精确输入/输出根、断网、timeout/cancel、process-tree cleanup、stdout/stderr cap，以及生成文件的单项/聚合/entry 预算；模型不能提交命令、executable、environment、临时目录或 fallback 顺序。
-- 文档语义由成熟组件拥有；Intatis 只做 strict schema、权限/路径校验、staging、固定调用、错误映射、验证和提交，不自行实现 PDF content stream、OOXML/EPUB serializer、OCR/layout/formula engine。
+- 普通读取语义由 Docling 高层 converter 拥有；Intatis 只做 strict schema、权限/路径校验、输入
+  snapshot、固定调用、输出预算与错误映射。显式 write/edit 仍保留按格式的 allowlisted operation
+  mapper、postcondition verifier、staging 与原子提交，但不与普通读取工具或读取输出协议混在一起。
+  Intatis 不自行实现 PDF content stream、OOXML/EPUB parser、OCR/layout/formula engine。
 - 缺少锁定 runtime、模型、helper、validator 或 exact version 时返回 typed `backend_missing` / `backend_version_mismatch`，不得自动切换组件。当前 runtime 分发、签名、公证、双架构 closure 与第三方 NOTICE 仍是独立发行工作，不因开发机可执行而视为完成。
 - PDFKit/WKWebView 是 Apple-native renderer 例外，不称为开源后端；pdfcpu 在本合同中只做 strict validate/info，不做 PDF 编辑。
-- read-only worker 获得 `read_pdf`、`document_read` 与 `document_ocr`。后两项虽然启动固定本地进程，仍以 host-authored `structured_read_only` intent 标记，只能声明 read/execute、不能声明网络、工作区写入或通用 shell；DeterministicPolicyGate 只为该 exact 形状进入正常 reviewer/permission 流。`document_render`、`document_export_pdf`、`document_write` 只向 read-write worker/coordinator 签发。每个工具仍独立经过权限门，工具数量拆分不改变 durable execution 模型。
-- process 启动前可证明的 schema/path/format/operation/目标冲突失败使用 no-effect rejection；进程开始后继续采用保守的副作用证据与 reconciliation 语义。
+- read-only worker 获得 `read_pdf`、五个固定格式 reader 与 `document_ocr`。process-backed reader/OCR
+  仍以 host-authored `structured_read_only` intent 标记，只能声明 read/execute、不能声明网络、工作区
+  写入或通用 shell；DeterministicPolicyGate 只为该 exact 形状进入正常 reviewer/permission 流。
+  `document_render`、`document_export_pdf`、`document_write` 只向 read-write worker/coordinator 签发。
+- 五个普通 reader 的 replay policy 是 `safeToReplay`：进程开始后的解析失败原子写入 failed
+  `tool_result` 与 failed/unknown settlement，作为 observation 返回主模型，并继续同批其他文件；
+  `SideEffectEvidenceLedger` 只对这个 host-authored exact shape 免除 unresolved-side-effect 阻断。
+  写入、网络、OCR 与其他 non-replayable process 的保守 reconciliation 语义不因此放宽。
 - `IntatisTools` 仍只进入 macOS/CLI workspace stack；iOS Chat target 不链接 Tools、Permission、AgentKernel、Cowork 或文档 runtime。
 
 ### Agent Git control 工具链路（Codex-aligned 本地 Git 控制面，Code / Cowork / CLI）
@@ -1087,8 +1143,8 @@ Cowork session open/new -> checked EventLog is canonical for settings, roster, l
        -> verify live AgentInferenceBinding == frozen TaskContract binding
        -> ProviderRegistry exact-resolves that agent's immutable profile/connection revision
        coordinator(canCoordinate=true) -> lease-based registry with workspace/doc/media/browser + coordination tools
-       read-only worker -> lease-based registry with read/list/search/read_pdf + reply/request-delegation tools only
-       read-write worker/coordinator -> may additionally receive the five split document process/write capabilities
+       read-only worker -> lease-based registry with read/list/search/read_pdf + five fixed-format readers + document_ocr + reply/request-delegation tools
+       read-write worker/coordinator -> may additionally receive document_render/document_export_pdf/document_write
   -> AgentLoop.send() 循环（Code 默认 maxIterations 50；Cowork 默认 64；host 显式配置可覆盖）
        ContextBuilder.initialMessages (RuntimeEnvironmentManifest + static system + history + scoped context + current user)
        stable Cowork @main:
@@ -1107,7 +1163,9 @@ Cowork session open/new -> checked EventLog is canonical for settings, roster, l
             askUser -> durable permission_request -> PermissionResponder
                 default -> UI 卡片/终端确认
                 Cowork auto -> PermissionReviewControlPlane FIFO/single-flight
-                  -> digest/count + bounded redacted action preview -> @permission-reviewer no-tool JSON decision + non-empty reason
+                  -> transient complete safe business args + same-call string sidecar + mechanical host facts
+                     （不含 objective/role/deliverable/userGoal/user transcript/history/PDF/image 原文）
+                  -> @permission-reviewer no-tools short reason + final-line ASCII ALLOW/DENY
                   -> durable permission_review_settled -> typed allow/deny/failure；异常只 deny 当前调用，不进入 UI fallback
             allow -> revalidate same authorization + capability/workspace/target identity
               -> durable tool_execution_prepared -> revalidate same snapshot/root identity -> executor
@@ -1204,7 +1262,7 @@ MessageBus.deliver -> Mediator.mediate
 - Cowork final turn 在发布正常完成答案前先校验 side-effect evidence；只有校验通过时，最终 `message_completed`、final assistant model-history item、agent idle 与 `turn_outcome(completed)` 才在一个 EventLog batch 中提交。failed/interrupted outcome 是权威终态：`CodeProjection` 会把旧日志中先写出的 completed 气泡纠正为失败/未完成，`AgentModelHistoryProjector` 保留真实 user/tool history，但不把该轮失效的 final assistant 回灌下一次 provider request；同一 TurnID 的冲突终态 fail closed。
 - root、delegation、mailbox wake、retry、agent attach/reviewer attach 与 crash requeue 都遵循 persistence-first admission：先写完执行所需的 roster/lease/task/queue 事件，再提交 registry/taskGraph/scheduler 内存状态。关键 admission 事件写入失败时不得运行 provider；已写入的半 admission task 立即补 `task_cancelled`，恢复时 orphan default lease 也不得进入可执行状态。
 - `AgentScheduler` 的 claim 是短临界区；长 AgentLoop 在独立 task 中运行。同一 assignee 同时最多一个 claim，不同 assignee 受 `maxConcurrentTasks` 限制。actor reentrancy 不得绕过该 single-flight/claim 规则。
-- 恢复期间 scheduler 保持暂停：先通过 `replayForProjectionChecked()` + `hasCompleteKnownHistory` 验证 session identity、已知事件 payload、从 seq 0 到 durable tail 的连续性、unknown future type 与 WAL recovery，再折叠 `tool_execution_prepared/settled`；unknown future event 或 seq gap 都不能支撑“没有发生”或先后顺序证明，锁/读取/损坏/不完整历史也不得退化为空投影。只有明确 eligible 的 non-root/CLI read-only crash-recovery task 可随 running task 以 `attempt + 1` 重排；Phase A GUI restored root submission 不得自动重排；write/exec/network/destructive 或消息/委派/spawn/remove 等协作副作用若 prepared 未 settled，任务必须以 `manual reconciliation required` 失败，禁止自动重放。whole-task 显式 retry 也必须经过同一 complete-known-history gate，不能因旧程序看不懂新事件、seq gap 或日志读取失败把 non-replayable 证据当空。created/assigned 半入队、超过 maxAttempts、缺关键 lease 的任务也明确失败；queued task、未消费 mailbox、task graph、lease history 与 token 用量从同一已验证事件快照重建。GUI/CLI 先恢复 `@main` 与 reviewer（CLI 仅在用户显式 `/default` 时允许人工模式），再启动 Goal recovery。GUI 只为新提交释放 startup gate，恢复出的 root tasks 继续被 scheduler 排除并显示 interrupted，直至精确 submission Retry；CLI 仍保留自己的显式 resume 边界。历史 active Goal 只 reconcile/checkpoint/audit 后 durable pause，不自动创建 continuation。
+- 恢复期间 scheduler 保持暂停：先通过 `replayForProjectionChecked()` + `hasCompleteKnownHistory` 验证 session identity、已知事件 payload、从 seq 0 到 durable tail 的连续性、unknown future type 与 WAL recovery，再折叠 `tool_execution_prepared/settled`；unknown future event 或 seq gap 都不能支撑“没有发生”或先后顺序证明，锁/读取/损坏/不完整历史也不得退化为空投影。只有明确 eligible 的 non-root/CLI read-only crash-recovery task 可随 running task 以 `attempt + 1` 重排；Phase A GUI restored root submission 不得自动重排；replay policy 为 `requiresManualReconciliation` 的 execution，或消息/委派/spawn/remove 等协作副作用若 prepared 未 settled，任务必须以 `manual reconciliation required` 失败，禁止自动重放。五个 exact `structured_read_only + safeToReplay` reader 不属于该集合。whole-task 显式 retry 也必须经过同一 complete-known-history gate，不能因旧程序看不懂新事件、seq gap 或日志读取失败把 non-replayable 证据当空。created/assigned 半入队、超过 maxAttempts、缺关键 lease 的任务也明确失败；queued task、未消费 mailbox、task graph、lease history 与 token 用量从同一已验证事件快照重建。GUI/CLI 先恢复 `@main` 与 reviewer（CLI 仅在用户显式 `/default` 时允许人工模式），再启动 Goal recovery。GUI 只为新提交释放 startup gate，恢复出的 root tasks 继续被 scheduler 排除并显示 interrupted，直至精确 submission Retry；CLI 仍保留自己的显式 resume 边界。历史 active Goal 只 reconcile/checkpoint/audit 后 durable pause，不自动创建 continuation。
 - Durable tool recovery 以具体 outcome 而不是工具类别单独判定：`ToolExecutionSettledPayload.effectDisposition` 是 additive optional 字段；新成功写路径显式记录 `.committed`，legacy nil+succeeded 仅兼容视为已完成效果并仍阻断 whole-task retry，legacy failed/cancelled/denied nil 则保持 uncertain。只有受信写路径产生、且与唯一 exact prepare payload/sequence 匹配的 `.notStarted` 能证明 declared side effect 未跨 mutation boundary。生产 Orchestrator 的 WorkTask adapter 在 admission lock 内把首个 WorkTask EventLog append 之前的 preflight/permission/frozen-contract/graph rejection 转为 typed no-effect，AgentLoop 以同一 batch 写 model-visible failure 与 `settled.failed/not_started` 并继续该 Agent turn；任意公共 manager 的同名错误不自动升级。append 或其后的 persistence/lost-ack 错误绝不进入该转换。`task_update` 按 PATCH 解释；与 authoritative task 完全相同的合同字段先归一为 no-op，真实合同变化仍拒绝。post-prepare 但 pre-executor 的 authorization/workspace rejection 和 cancellation也可写 no-effect settlement，但 cancellation 仍中断 turn。executor 已进入后的 cancel/timeout/普通 error 保持 non-replayable unresolved。Projection 对每个 execution ID 只接受首个 prepare；重复 prepare即使 payload 相同也保留首记录并永久 ambiguous，冲突 terminal 同样保留首记录并永久 ambiguous，完全相同的重复 terminal 才是幂等。ambiguous、settlement payload mismatch、顺序错误与 `succeeded + not_started` 矛盾均视为无有效 settlement并进入 uncertain。Orchestrator restore 在 complete-known history、无 current Goal、exact 唯一 prepare、没有 settlement/ambiguity且 expected revision 为 JSON safe integer时，仍可用 pre-prepare durable revision 严格大于 expected 的 stale proof补 no-effect；也可在唯一未脱敏 raw args、参数 digest、prepared authorization、agent/TaskContract/capability lease/run/WorkTask snapshot 全部精确一致时，证明旧 worker snapshot-field guard 或旧 in-progress frozen-contract guard 必然在 append 前拒绝。任何 current Goal 都不做该兼容修复；redacted/missing/mismatched identity 和自由文本错误都不能构成证明，也不得从 prepare 后状态推断。显式 unknown 继续 uncertain；显式 committed、legacy nil+succeeded 与其他可能已执行的 disposition 仍阻断 whole-task replay。
 - `GoalRuntimeController.start()` 与每次显式 continuation launch 都使用 `replayForProjectionChecked()` + `hasCompleteKnownHistory` 观察 EventLog；known-event 损坏、unknown future event 或 seq gap 不能退化成空 session，也不能支撑 absence/order proof。它检查 uncertain non-replayable 集合：无有效 settlement、显式 unknown、`succeeded + not_started` 矛盾，以及 legacy failed/cancelled/denied nil；known committed 与 legacy nil+succeeded 不属于 unknown，但仍由 whole-task replay guard 管理。没有 current Goal 时，只有 complete-known history 同时证明 exact TaskContract 在 prepare 前存在、prepare 带正 attempt、同 attempt terminal event 在 prepare 后发生，才允许 terminal AgentInvocation 的 ticket 与普通新工作隔离；orphan terminal、attempt mismatch、unscoped、missing/nonterminal 或 corrupt/incomplete history均 fail closed。存在任何 current Goal 时 uncertain 集合必须为空。冷启动 `start()` 是 reconcile-only：active Goal 先经过 scoped barrier，恢复/checkpoint并结算未审计 checkpoint，然后 durable 写 paused；已到 token budget 则写 budget-limited。任何取消、checkpoint、pause 或结算持久化失败都 fail closed，不创建 continuation。只有用户显式 Resume 或同进程的明确 Goal Edit/Resume 动作才进入 launch gate；launch 会再次结算遗漏 checkpoint 后创建下一 run。Goal mutation 与 ordinary turn 共享串行 mutation gate，stop 有独立 single-flight lock；shutdown 是终局 fence，不得在失败尾部 resume data plane 或接纳新 turn。Pause/Edit/Clear 必须先安全停止当前 run并成功 durable checkpoint，失败时控制面变更 fail closed；Goal Edit 成功会清空旧 latest audit、blocker fingerprint、consecutive blocked/no-progress streak。completed/blocked/budget-limited/usage-limited 不自动续跑；active Goal 的连续 no-progress run 达阈值后保持 active 但停止自动循环，等待用户 steering/resume；默认阈值为 2，blocked 则要求同一 normalized blocker 至少连续 3 个 run。
 - Goal continuation 每轮只由宿主建立一个 run；新建 Goal 会把该次 Send 冻结的 exact `@main` binding 保存为 additive optional `Goal.mainAgentInferenceBinding`，新式 Goal 的每次 continuation、Retry 与重启恢复都沿用这一值，legacy/model-created Goal 的 `nil` 只保留兼容语义。新 run 先原子 carry-forward 旧 run 的非终态 WorkTask，再向 `@main` 发送 `recordUserMessage=false` 的 scoped root invocation。carry-forward 会取消 source、为 target running run 分配新 WorkTask ID、重映射同批依赖并追加 `work_task_carried_forward`；session/Goal/run ownership 或外部非终态依赖不一致时 fail closed。scheduler barrier 与取消都只作用于同一 Goal/可选 run，并覆盖 queued、claimed、running execution；精确 Goal/run cancellation tombstone 在 root admission 入口、WorkTask carry-forward 后、admission lock 内和 durable queue append 后均检查，admission barrier 会等待在途创建，取消循环再 snapshot。已 durable 部分入队的 root task 必须先 settlement 为 cancelled，provider 才可保持未调用；terminal cancellation 落盘失败的 task 会被 quarantine 并从 result/idle waiters 的阻塞集合排除，但 tombstone 继续禁止 provider dispatch。run durable checkpoint 后才可 audit，每个 run 最多一次；production `settleGoalRunAudit` 在同一 admission lock/replay 下，以单个 append batch 提交 audit、run completed 与可选 Goal completed/blocked/budget-limited/usage-limited。verifier usage 以 scoped `turn_stats` 计入该 Goal/run。
@@ -1222,15 +1280,16 @@ MessageBus.deliver -> Mediator.mediate
 - Cowork session 可绑定一个或多个用户选择的工作目录；EventLog settings 只保存 secret-free path/agent/primary/future-profile/permission/token-budget metadata，bookmark bytes 只进入 session-owned capability plist。brand-new session 中，用户明确选择 primary workspace 后，固定七事件 bootstrap 同时记录 settings、`@main` 与 reviewer 的独立 leases/identities，不再让 reviewer 重复审批同一次选择；任何后续目录新增、普通 agent attach 或 spawn 仍依赖 workspace bookmark 与既有权限流，历史缺 main/reviewer 只能走上文专用 host recovery，不得复用 fresh bootstrap。
 - `@main` agent 不可被 remove。
 - Project Settings 新增目录只更新 project metadata；当前工具执行仍以 agent 单 `workspaceRoot` 为真实文件访问根。右侧 inspector 不提供 agent 删除或详情管理，按权限审查、未清理 agent 状态图标、Goal、Tasks 的顺序显示且不提供 Git UI；`@main` 与 `@permission-reviewer` 不可删除。
-- `@permission-reviewer` 是自动权限审查保留身份和独立控制面：GUI/CLI 默认启用；CLI `/auto` 只用于重新启用，只有用户明确 `/default` 才进入人工模式；不能作为普通 send/delegate/message/ask 目标，也不会暴露给 `list_agents`。review queue 不占普通 scheduler 槽，采用 64 项上限的 FIFO/single-flight，deadline 从 submit 计时；request/task/root/parent/attempt/toolCall、参数 digest/count、bounded redacted `PermissionActionPreview`、paths/network/side-effect/gate/lease/TaskContract/causal context 通过结构化任务传递，automatic-review payload/prompt 不含 raw args。exact model-authored automatic ask-class call 还必须携带完整 `authorizationContext`：acting agent 的同模型报告请求只暴露一个未注册、永不执行的 output-only `submit_permission_authorization` function；宿主只接受无 prose 的单个同名 call 并严格解析 arguments，其结果仍只是 untrusted interpretation。canonical latest/supporting user evidence 由宿主从 complete-known EventLog 解析并闭包覆盖中间用户指令；二者在 reviewer prompt 中分栏，缺失、冲突、secret-bearing 或不可证明时以 `authorization_context_unavailable` 在 reviewer provider 前 durable deny。reviewer 自身仍是无工具请求，只返回 `allow` / `deny` 和非空有界 reason，risk 不能低于 deterministic gate；单次 deadline 默认为 120 秒。模型请求默认不注入 `temperature`、output-token 或字符上限；只有显式 host policy 才传递对应控制，optional completion estimate 只用于 soft usage accounting。pre-submit caller cancel 直接返回 typed deny且不创建 review lifecycle；timeout、truncated、malformed、错误或多个 reporter function call、reviewer tool call、provider error、persistence failure、self-review、hard deny 与已登记 review 在 terminal-claim 前被观察到的 cancel 均产生 typed failure 并 durable deny 当前调用，不转 GUI 人工等待；claim 后 cancel 保留唯一 settlement 但 authorization delivery deny。provider error 的 durable reason 使用共享 diagnostic sanitizer 限长并移除 secret/完整 URL。review request/settled 必须 durable-first，`allow` 只有 settled 成功后才可生效。每次 provider dispatch 都创建 exact generation，production provider factory 冻结 reviewer identity/binding 而逐代重新 resolve wrapper；provider/timeout 竞争同代首 terminal，caller cancel 由同步 request token、actor path 与 settlement/delivery/admission 围栏共同处理，late/duplicate result 被丢弃。timeout/cancel 只影响当前 call；若已有 active generation 就只 retire 该代，后续 request 可 fresh review；legacy `provider_still_stopping` 只解码旧日志。Phase A 后 reviewer 未就绪由 unavailable responder deny 真实 ask-class tool，但不禁用 composer 或阻止普通主请求；Cowork 对话页不再常驻 reviewer 状态横幅，workspace reauthorization 与 automatic-review retry 只在异常时出现在 Project Settings 的 Recovery 区。Cancel task 只取消数据面任务并保留 reviewer，session stop/显式 disable 才 quiesce/shutdown 控制面。disable quiesce 后若 durable detach 失败，resume 也必须使用 fresh generation，旧 allow 无效。
-- `AgentLoop` 对 exact denial signature 的 fuse 区分 authoritative denial 与 typed transient reviewer infrastructure failure。前者继续只送审一次并缓存拒绝；后者只允许第一个 exact retry 生成 fresh RequestID/generation。首个失败调用没有执行权，fresh retry 也必须从 gate/authorization 重新开始；第二次失败不重新装填 fresh-review 额度。
+- `@permission-reviewer` 是自动权限审查保留身份和独立控制面：GUI/CLI 默认启用；CLI `/auto` 只重新启用，只有用户明确 `/default` 才进入人工模式；它不是普通 send/delegate/message/ask 目标，也不暴露给 `list_agents`。review queue 不占 scheduler 槽，使用 64 项上限 FIFO/single-flight，deadline 从 submit 计时。live exact model-authored ask 由 `PermissionReviewInvocationInput` 传递完整 canonical safe business arguments、完整 same-generation sidecar 与 session/turn/task/call/tool/generation/snapshot/digest binding；该值 non-Codable，只存在 request-local 调用与 active Job。`permission_request.context` 保存 host authorization、gate、leases、TaskContract、intent、preview、paths/network/side effect、business digest/count 与 sidecar receipt；`PermissionReviewTask` 保存既有 review facts，但不复制 receipt 或 raw transient。control plane 在 provider 前重算 args/context digest、canonical decode sidecar、核对 request receipt 与 exact authorization；不一致、secret-bearing、缺 transient（recovery）均 fail closed。active duplicate 必须携带与 owner 完全相同的 transient invocation；cached terminal 重新交付前仍复验本次 invocation，recovered automatic allow 永不重新交付。唯一无 invocation 的 automatic `agent.attach` 只能走专用 host-admission entry，并核对 exact admission identity 与先行 durable attach/lease request。reviewer 本身无 tools，只返回短 reason + final-line ASCII `ALLOW`/`DENY`；risk 固定为 gate risk。live bound review 的 model-authored reason/provider diagnostic 不进入 durable settlement 或 tool-result，只使用固定宿主文案。单次 deadline 默认 120 秒，模型请求默认不注入 temperature/output-token/字符上限；只有显式 host policy 才传。pre-submit cancel 不建 review lifecycle；tool call/无 completion/非成功 finish/malformed verdict/timeout/provider/persistence/self-review/cancel 均 typed deny，不转 GUI 人工。request/settled durable-first，allow 只有 settlement 成功并通过 delivery cancel fence、AgentLoop authorization/workspace revalidation 与 durable execution prepare 后生效。provider generation、timeout/cancel、late result、quiesce/resume、unavailable responder、UI recovery 与 session/task lifecycle 围栏保持既有语义；legacy `provider_still_stopping` 与 Reporter context 只解码旧日志。Cowork shipping engine 不注入 in-engine reviewer；误配时即使该 reviewer 已被额外调用，其结果也只能触发 typed fail-closed，不能取代 control plane。
+- 上述 `permission_request.context` / `PermissionReviewTask` 是宿主审计与一致性校验材料，不等于全部进入 reviewer provider prompt。live model-authored review 只投影 task ID/kind/issuer/assignee/parent 与 causal lineage 等机械关联；objective、roleHint、expectedDeliverable、userGoal、raw/current user instruction、assistant/history、PDF/image 原文均不发送。sidecar 是唯一的任务语义摘要。
+- `AgentLoop` 对 exact denial signature 的 fuse 区分 authoritative denial 与 typed transient reviewer infrastructure failure。前者继续只送审一次并缓存拒绝；后者只允许第一个 exact retry 生成 fresh RequestID/generation。首个失败调用没有执行权，fresh retry 也必须从 gate/authorization 重新开始；第二次失败不重新装填 fresh-review 额度。missing/malformed/secret-bearing sidecar 不属于 reviewer infrastructure failure，不进入该 fuse。
 - MessageBus 是唯一投递路径；Mediator 默认转发摘要不转发原始字节。
 - typed message 只有在 Mediator 允许且事件持久化成功后才进入 mailbox。新 mailbox delivery 的 `TaskContract.mailboxMessageIDs` 冻结 1–8 个 exact ID；ContextProjector 只呈现该集合，batch 还必须保持同 sender/recipient/Goal-run/authority class。ordinary message 是 one-way，使用 read-only workspace 且 communication `.none`，不暴露 ACK 工具；information request 只获得 `reply_message` + `.replyOnly`，并且必须以 `inReplyTo` 精确终结 frozen RequestID，同一请求只接受一个 terminal reply（exact duplicate 幂等、冲突 reply 拒绝）；information reply receipt 不暴露 `reply_message`，而只允许向原 sender 发起 `request_information`。若内容需要继续讨论，receipt 必须把 reply MessageID 作为 `based_on`，创建 fresh RequestID、保留原 `conversationID`，因此一次 `information_replied` 只关闭当前 correlation，不关闭长期对话。receipt/ordinary message 不发送礼貌 ACK。`request_delegation` 另只可在原 default ceiling 内获得最多一次、深度 1 的 delegation。未呈现或未成功完成的消息保持 pending；失败只能在同一 TaskID 上按 `maxAttempts` 有界重试，已耗尽的 poison ID 不得换新 TaskID 重置次数，也不得阻塞后来未绑定的 ID。成功时 `task_completed`、可选 candidate WorkTask progress 与 exact `agent_message_consumed` 在一个 EventLog batch 中提交，随后才 ack 内存 mailbox；Goal/run cancellation 只能 durable `agent_message_discarded` 后 ack。legacy nil correlation/binding 继续可解码，只按 exact causal/scope/时间 lineage 保守匹配，不能据此扩大 live follow-up 权限。
 - task-scoped capability/workspace lease 必须校验 task ID、工具/通信/委派 grant、workspace root、access 与 allow/deny path，并在 terminal state 撤销。WorkspaceLease 持久化 canonical root 的 device/inode identity；attach commit、权限等待后、durable prepare 后紧邻 executor、task lease 派生/retry 与 managed process 启动都必须重新核验，路径相同但目录身份改变或 legacy identity 缺失时 fail closed。retry 只能从原 lease audit history 克隆权限；历史缺失时 fail closed（当前拒绝 retry），禁止回退到 assignee 的默认 coordinator lease。
 - `ContextProjector` 对每类事件设 count/character budget，只取最近且与 task/agent 相关的内容；dynamic task/message/event data 通过 user-role `UNTRUSTED_CONTEXT_DATA` 块进入请求并转义边界文本，不得拼入 system role。Cowork system prompt 使用静态身份说明，不嵌入动态 agent name/workspace path；Orchestrator 的 attach/spawn 边界拒绝控制字符、空白、超长和非安全 ASCII agent 名。消息只有在实际投影后才可写入 consumed event。
 - 任何 model tool_call 到执行都必须过 PermissionEngine，无旁路；tool intent、permission resolution 与 execution prepare 任一关键审计写入失败时 executor 不得运行。
 - production `ToolRegistry.standard` 与 Cowork lease registry 不暴露 raw `run_shell`；`.runShell` 仅保留为旧 lease 的 read-only Git compatibility 信号。底层 `ProcessShellRunner` 仍以 Seatbelt/bwrap 做 workspace+network confinement，供隔离测试与未来签名 helper/XPC 演进；结构化 Git/browser/document backend 使用独立 runner，不得借此恢复模型任意 shell。
-- 自动权限审查不启动嵌套 AgentLoop；审查者 provider 只收到无工具 JSON 判断请求。`DeterministicPolicyGate` hard deny 仍在审查者之前终局。
+- 自动权限审查不启动嵌套 AgentLoop；审查者 provider 只收到无工具 plain-text verdict 请求。`DeterministicPolicyGate` hard deny 仍在审查者之前终局。
 
 ### macOS 应用级 session runtime 生命周期
 
@@ -1314,12 +1373,12 @@ schema v2只表示lineage已覆盖media-aware语义。EventLog checkpoint writer
 | `ContinuationRun` / `ContinuationRunCloseRequestedPayload` | 宿主推进普通 turn 或 durable Goal 的有界轮次/checkpoint/recovery 边界，以及模型/宿主关闭当前 run admission 的持久 claim | `continuation_run_created/started/checkpointed/close_requested/completed/cancelled/recovered` append-only 事件；close claim 由 `EventLog.claimContinuationRunClose` 在 complete-known history + 跨进程锁内 first-write | stable `run_` ID、session/可选 Goal、ordinal/status；close payload 的全部 identity/source 由 host 绑定，模型只能给 completed/stopped + reason；exact duplicate 幂等，冲突 durable history fail closed，首 claim 永久围栏该 RunID。host 只 drain exact run，不能在 AgentLoop 内递归续跑；恢复先兑现 close fence，再处理 mailbox/调度；普通 successful final 本身不伪造显式 claim |
 | `TaskFailureCode` / `TaskFailedPayload.failureCode` | 需要跨重启保真的结构化 invocation 失败分类；当前含 provider account hard usage limit | `task_failed` payload 的可选追加字段；旧 JSONL 缺字段解码为 nil | 只由 typed `ProviderUsageLimitError` 写 `provider_usage_limit`；restore 还要核对 TaskContract Goal/run scope、current non-completed Goal（包括 paused）与 run 未审计；不得从 `error` 文本、普通 429 或 `length/max_tokens` 猜测 |
 | `AgentMessagePayload` / `InformationRequestedPayload` / `InformationRepliedPayload` / consumed/discarded payloads | typed mailbox message 的 pending、一次请求/回复 correlation、成功呈现消费与取消丢弃生命周期 | send/request/reply 事件建立 pending；information request 使用 fresh RequestID，可选 `basedOn` 指向上一 reply，并以 stable `conversationID` 串联多轮；`agent_message_consumed` 或 `agent_message_discarded` 终结对应 message ID | 一个 request 只接受一个 terminal reply；reply receipt 不 ACK，实质追问创建 fresh request，不会因 `information_replied` 全局禁止后续通信。consumed 只能表示已投影且成功完成的 agent 轮次，并与 task completion 同批落盘；discarded 只表示其 Goal/run 已取消、消息未成功呈现。两者都必须 durable-first 才可 runtime ack；旧 run discarded message 不得在 restore 后复活；legacy 缺 correlation 字段继续解码为 nil |
-| `ToolCapability` / `CapabilityLease` / `WorkspaceLease` | Cowork agent 可用工具与工作区能力边界 | grant/revoke 事件 + 当前内存索引；历史 grant 保留供 retry/replay | coordinator 可用本地 Git control、remote Git control、文档/媒体读写、生图与网络/浏览器能力；`renameSession`、`submitGoalVerdict`、`controlRun` 只进入 exact `@main` default lease，不能沿 coordinator/worker/task/spawn 派生，且 run tools 还要求 exact root invocation；worker 默认无 `gitControl` / `gitRemote`、只读 PDF 且无 `browse_web`。task-scoped lease 绑定 task ID、终态撤销；WorkspaceLease 还执行 root/access/allow/deny path 并持久化 canonical root device/inode identity，跨权限等待/prepare/retry/process 边界复核；最终工具执行仍必须过 `PermissionEngine` |
-| `ResolvedToolAuthorization` / `PermissionActionPreview` / `PermissionApprovalResolution` | 从同一 registry registration 解析的 concrete tool、canonical permission、membership、lease/target/args identity、审查语义与 typed outcome | authorization 作为可选追加字段复制到 permission review/resolved 与 tool execution events；preview 只保存有界脱敏字段；旧 JSONL 缺字段继续解码 | live automatic review 必须有完整 snapshot，审查后与 executor 前复核同一 authorization；旧事件只用于兼容 replay，不能在 live 路径重新解释 alias 或扩大 membership。`write_file` / `apply_patch` 均为 `filesystem.edit`；automatic-review 只见 digest/count + preview，不能读取 raw args |
+| `ToolCapability` / `CapabilityLease` / `WorkspaceLease` | Cowork agent 可用工具与工作区能力边界 | grant/revoke 事件 + 当前内存索引；历史 grant 保留供 retry/replay | coordinator 可用本地 Git control、remote Git control、文档/媒体读写、生图与网络/浏览器能力；`renameSession`、`submitGoalVerdict`、`controlRun` 只进入 exact `@main` default lease，不能沿 coordinator/worker/task/spawn 派生，且 run tools 还要求 exact root invocation；worker 默认无 `gitControl` / `gitRemote`，可获得 `read_pdf`、五个 exact reader 与 `documentOCR`，且无 `browse_web`。task-scoped lease 绑定 task ID、终态撤销；WorkspaceLease 还执行 root/access/allow/deny path 并持久化 canonical root device/inode identity，跨权限等待/prepare/retry/process 边界复核；最终工具执行仍必须过 `PermissionEngine` |
+| `ResolvedToolAuthorization` / `PermissionActionPreview` / `PermissionApprovalResolution` | 从同一 registry registration 解析的 concrete tool、canonical permission、membership、lease/target/args identity、审查语义与 typed outcome | authorization 作为可选追加字段复制到 permission review/resolved 与 tool execution events；preview 只保存有界脱敏字段；旧 JSONL 缺字段继续解码 | live automatic review 必须有完整 snapshot，审查后与 executor 前复核同一 authorization；旧事件只用于兼容 replay，不能在 live 路径重新解释 alias 或扩大 membership。`write_file` / `apply_patch` 均为 `filesystem.edit`；reviewer 通过 non-Codable invocation 看 complete canonical safe business args，permission request 只额外持久化 digest/count + preview + sidecar receipt，普通 stripped business call 的 history/audit 仍服从既有规则 |
 | `ToolCallPayload` argument audit | 记录模型提议的工具名与可安全持久化的参数显示；count/redacted 提供最小审计，只有已验证且未脱敏/未截断的 canonical args 才可带 digest | `argsDigest` / `argsCharacterCount` / `argsRedacted` 为 additive optional fields；旧 JSONL 只有 `args` 仍可解码 | 新 writer 必须在 `.tool_call` append 前完成分类：unknown/invalid 与全部 `spawn_agent` inference-control calls 只落 bounded redacted placeholder，不写 raw-value digest；其他 schema-valid args 也 secret-scrub/限长。endpoint/header/api_key 及其可离线猜测 hash 不得通过失败或未知调用先进入 EventLog |
 | `PermissionReviewTask` / `PermissionReviewRequestedPayload` / `PermissionReviewSettledPayload` | reviewer 控制面工作单与 verdict | `permission_review_requested/settled` append-only 事件 | 结构化包含当前 task/attempt/tool/gate/lease/context、authorization、参数 digest/count 与 bounded redacted preview；reviewer 使用有界 FIFO/single-flight、submit-based deadline、单次 timeout/cancel 与可选 soft usage warning，模型参数/输出上限默认不注入；只返回 allow/deny + non-empty reason，risk 不得下调，异常为 typed failure；allow 必须 settled-first，恢复关闭 orphan request；旧 `permission_review` 保留兼容审计 |
 | `PermissionRequestPayload` / `PermissionResolvedPayload` / `PermissionApprovalResolution` | 人工或自动 approval 的 durable request identity、显式动作与首终态 | AgentLoop 先 batch 写 `permission_request + blocked`；`registerPermissionRequest` 为 reconnect/transport 提供 RequestID first-write CAS；`settlePermissionRequest` 写唯一 `permission_resolved` | approval mode 为 manual/automaticReviewer；action 为 approve/decline/cancelTurn。完整已知历史与跨进程锁内 first terminal 获胜；exact duplicate 幂等返回原 Envelope，冲突 request、tool、turn、tool-call、authorization、action/decision 或 terminal fail closed。Projection 按登记顺序 FIFO，解决任意项不改变其余相对顺序 |
-| `ToolExecutionPreparedPayload` / `ToolExecutionSettledPayload` | 副作用执行票据、completion evidence 与 crash reconciliation | `tool_execution_prepared/settled` append-only 事件；settled 可选 `effectDisposition` | prepare 必须在 executor 前并携带/复核与 review 相同 authorization；每个 execution ID 只允许一个 prepare，duplicate prepare/conflicting terminal 永久 ambiguous 并保留首记录。仅普通 read-only 默认 safe-to-replay；write/exec/network/destructive 和 collaboration/lifecycle 工具默认 requires-manual-reconciliation。新 success 显式 `.committed`；legacy nil+succeeded 只兼容为已完成并仍阻断 whole-task retry，legacy failure nil/显式 unknown/无效 settlement 保持 uncertain；只有 exact、无 ambiguity 的 typed `.notStarted` 证明副作用未开始，`succeeded + notStarted` 无效。SideEffectEvidenceLedger 从 permission/review/resolved/prepared/settled 恢复证据，只有匹配的 succeeded settlement 才能清除完成阻断 |
+| `ToolExecutionPreparedPayload` / `ToolExecutionSettledPayload` | 副作用执行票据、completion evidence 与 crash reconciliation | `tool_execution_prepared/settled` append-only 事件；settled 可选 `effectDisposition` | prepare 必须在 executor 前并携带/复核与 review 相同 authorization；每个 execution ID 只允许一个 prepare，duplicate prepare/conflicting terminal 永久 ambiguous 并保留首记录。replay policy 决定恢复语义，而非只按 `.exec` 粗分：五个 exact structured reader 是 `.safeToReplay`；写入、网络、destructive 与 collaboration/lifecycle 等不可重放工具保持 `.requiresManualReconciliation`。新 success 显式 `.committed`；legacy nil+succeeded 只兼容为已完成并仍阻断 whole-task retry，legacy failure nil/显式 unknown/无效 settlement 保持 uncertain；只有 exact、无 ambiguity 的 typed `.notStarted` 证明副作用未开始，`succeeded + notStarted` 无效。SideEffectEvidenceLedger 从 permission/review/resolved/prepared/settled 恢复证据，只有匹配的 succeeded settlement 才能清除完成阻断 |
 | `TaskContract` / `TaskReportPayload`（AgentInvocation execution layer） | 单次 root/child agent invocation 契约与结构化回报；不是用户可见 WorkTask | `task_created/assigned/queued/started/completed/failed/cancelled` 既有事件；queue/start/terminal 记录 attempt | 契约记录 kind、issuer/assignee/objective/roleHint/deliverable/lease、reply mode、timeout、maxAttempts，并以可选字段绑定 submission、WorkTask/ContinuationRun/Goal、exact inference binding 与 mailbox MessageIDs；`mailboxMessageIDs == nil` 仅表示 legacy/non-mailbox，new mailbox admission 必须冻结非空、去重、最多 8 项。Phase A root task 冻结 `submissionID`，main-hosted root admission 先要求 live `@main` 与 immutable submission 的 `mainAgentInferenceBinding` 全等，再把同一值冻结进 TaskContract；delegated/mailbox child 继承 submission scope。普通用户消息与每个 Goal run 均创建 root invocation。执行前 frozen binding 必须与 live roster 一致；完成只产生 candidate result；新 admission 使用当时 policy 并冻结 timeout，历史已落盘的 300 秒合同不得静默改写；追加字段保持旧 JSONL 可解码 |
 | `AgentScheduler` / `CoworkExecutionPolicy` / `AgentExecutionBudget` | claim、并发、恢复、取消/超时、attempt 与 token 预算 | scheduler 从 task/message events 重建；token 用量从 `turn_stats` 重算 | 默认同 agent single-flight、跨 agent 最多 4 个任务并行、新 admission 每次 invocation 600 秒、最多 3 attempts；CapabilityLease 的默认 delegation `maxDepth=1` 保持不变。仅 eligible non-root/CLI read-only crash recovery 增加 attempt；GUI restored root submission 保持 paused/interrupted 直至 exact Retry；session-lifetime 共享 token meter 在 provider dispatch 前预留 input estimate + output slice，响应/失败/超时按 reported 或估算 usage settle，配置切换不丢 outstanding reservation；预算明确是 soft；取消不自动 retry |
 | `ContextBundle.taskGroupEvents` | Cowork worker prompt 的共享任务状态摘要 | `ContextProjector` 从 task events 投影，随本轮模型请求临时进入 prompt，不单独持久化 | 只包含当前/父/兄弟/子/related task 的任务 ID、状态、agent 和关系；不得泄漏其他任务的 objective、expected deliverable、tool args、结果文本或私有路径 |
@@ -1343,7 +1402,8 @@ schema v2只表示lineage已覆盖media-aware语义。EventLog checkpoint writer
 - **Provider health check**：`ProviderRegistry.healthCheck(role:options:)` 复用当前 provider catalog、chat selection、secret resolver 与 `OpenAIWireProvider`，发起最小 chat/agent 流式请求，输出 `ProviderHealthReport`。chat 与 agent health check 均请求 `stream_options.include_usage`，并使用共享 `Usage` 合并规则处理 split usage chunk。报告显式区分 ok、timeout、partial stream、unknown endpoint、非法 provider URL、provider/transport/config 错误，并带 endpoint/model/wire/耗时/首 token/usage 与裁剪预览；兼容缺 `[DONE]` 但有 `finish_reason` 的 provider，只有完成信号缺失才标记 partial stream，并保留已收到的裁剪预览；macOS 与 iOS 设置页共用该 provider 层 API，只做不同布局，不写入 EventLog 或持久状态。
 - **Goal 输入命令**：`GoalInputParser` 在 UI/ViewModel 层识别行首 `/goal`，要求后面有目标文本。Chat / Code 保留 v0.12 legacy 语义：剥离命令前缀，把清洗文本送入 provider，并在 `UserMessagePayload.tags = ["Goal"]` / `goal` 保存标签元数据供 bubble 投影。Cowork 的同一语法已升级为 durable Goal authority：创建 `Goal` 与首个 `ContinuationRun` 后由 host 驱动 scoped root AgentInvocation，不把它当成普通标签消息；仍在 mention 路由前后解析以接受 `/goal @Agent ...` 与 `@Agent /goal ...` 作为请求上下文，但 Goal continuation 始终由 `@main` 主持，因此 Goal Send 也冻结当时的 next-main exact binding，不能把生命周期、模型选择或终态 authority 下放给 mentioned agent。
 - **工具执行反馈**：AgentLoop 对未知工具、权限拒绝、工具抛错分别写入结构化 `tool_result` observation，并在执行前追加 `agent_status(tool)`。模型给出的 raw arguments 在 `.tool_call` 持久化前先分类；unknown/invalid、作为 inference-control surface 的全部 `spawn_agent` inputs、含用户自定义标题的 `rename_session` inputs，以及永不允许落原文的 `write_stdin` inputs 只记录 bounded redacted placeholder + count/redacted，且不写 raw-value digest；`rename_session` 还在 authorization/prepare 前按结构化 `name` 做 secret scan。schema-valid 其他工具先 secret-scrub/限长，只有未脱敏/未截断的 canonical 参数才可附加 digest。稳定 `@main` 另把一次 assistant 返回的完整 function-call batch 作为一个 model-facing item 在任何工具执行前原子持久化；其参数只有在 registration/schema/secret/size 检查全部通过时才原样保留，否则写固定合法 JSON placeholder。每个已清洗、有界的 function output 与对应 audit result/execution settlement 同 batch，因而不存在“工具已经结算、模型历史还没写”的可取消窗口；含图output还必须与同turn/call的唯一`tool_result`及同`{callID, agent, taskID, attempt}`的唯一settlement精确绑定，stable Code工具票据使用model-history规范化的attempt 1。只有完整 direct output 存在时才去除 ContextBundle 里的同一 audit result。UI/audit `tool_call` / `tool_result` 仍是独立记录，不能反向冒充模型历史。同一 turn 内空或重复 call ID 会改写为唯一 turn-local ID，并在后续关联位置一致使用。随后，已知工具在权限判断和执行前会校验参数必须是 JSON object，并满足 descriptor schema 的 required 字段、基础类型、数字 `minimum`/`maximum` 约束、字符串 `minLength`/`maxLength` 约束与 `additionalProperties:false` 未知字段规则，`read_file.maxBytes` 当前要求 `>= 1`，标准工具 path/query/command/diff 字符串当前要求非空，required 为空的无参工具可把空参数 / `null` 归一为 `{}`，坏 JSON、非对象、缺 required 字段、基础类型错误、数值越界、字符串过短/过长或未知字段会写入 `invalid tool input:` 的 `tool_result`，不生成 `permission_request`，也不执行工具。当前 shipped tools schema 默认声明 `additionalProperties:false`，因此模型给出的额外字段不能被 `try?` 默认值吞掉后进入权限或工具执行。`CodeProjection` 根据 `tool_call_id` 将结果标题回填为 `result · <toolName>`，把 `tool error:` / `permission denied:` / `unknown tool:` / `invalid tool input:` 标成失败项，并通过 `RuntimeRecoveryAdvice` 派生恢复建议。GUI 与 CLI 均消费事件投影/observation，不解析 assistant transcript。
-- **Agent 文档/媒体工具**：`ToolRegistry.standard()` 暴露 PDF 阅读、PDF 页面编辑、文档照片/扫描件版面重建、LaTeX 编译和生图写入工作区。PDFKit 路径在 macOS 可直接工作；Linux 或无 PDFKit 平台会返回配置错误并提示使用外部 CLI 后端。shell-backed 文档重建和 LaTeX 编译不内置模型或 TeX 发行版，只调用已安装的成熟工具；缺少命令时返回可行动的配置错误。生图工具不直接知道 provider secret，只通过注入的 `ImageGenerationToolService` 使用现有 provider registry。
+- **Automatic permission sidecar durability**：Cowork automatic 收到 provider tool call 后，先从 arguments 顶层抽出 optional string `__intatis_authorization_context`，再 canonicalize business object。valid sidecar 只在当前 turn 的 acting-model 内存 conversation 中保留为格式示例；`message_completed`、durable `model_history_item(functionCallBatch)`、`.tool_call`、permission request、denial signature、durable ticket 与 executor 都只看到 stripped business view。outer JSON 无法解析时 durable history 只写固定合法 placeholder。valid automatic ask 的 `permission_request.context` 可写 generation/snapshot/context digest/status receipt；raw sidecar 永不落盘，reviewer transient exact-args 副本不进入 permission lifecycle。missing/malformed/secret-bearing sidecar 不建 `permission_request` / `permission_resolved`，只写 failed/runtimeFailed `tool_result`，不调用 reviewer、也不消耗 denial fuse；同 business args 补正后仍可进入 reviewer。binding 不一致另按 authorization snapshot failure typed fail closed。manual/nonautomatic 模式出现保留字段只写 redacted audit 并拒绝，不把字段交给业务工具。deterministic allow 仍执行拆包，但不要求 sidecar。该边界只覆盖保留字段：acting model 自行复述到普通 assistant text 的内容仍走普通消息持久化；malformed provider error preview 仍依赖通用 diagnostic sanitizer，而不是 sidecar codec。
+- **Agent 文档/媒体工具**：`ToolRegistry.standard()` 暴露 PDFKit `read_pdf`、五个 fixed-format Docling Markdown reader、显式 OCR/render/export/write、LaTeX 编译和生图写入工作区；不暴露 PDF mutation、聚合 `document_read` 或扫描件重建 wrapper。PDFKit 路径在 macOS 可直接工作；Linux 或无 PDFKit 平台会返回配置错误并提示使用受审查的外部后端。process-backed 文档工具和 LaTeX 编译不内置模型或 TeX 发行版，只调用已安装且版本锁定的成熟工具；缺少命令时返回可行动的配置错误。生图工具不直接知道 provider secret，只通过注入的 `ImageGenerationToolService` 使用现有 provider registry。
 - **Chat 托管网络搜索**：macOS/iOS/CLI Chat 不展示搜索按钮、菜单项、开关、状态或 provider/model 路由提示。每次 Send 只冻结用户当前选择的 exact Chat provider/model/variant/request adapter；`ProviderRegistry.chatRuntimeRoute()` 先验证普通 Chat adapter，再同时要求 exact model 的 `hosted_web_search` 声明与受审 adapter dialect。满足时向当前模型提供对应能力并保持 `tool_choice: auto`，由当前模型自行决定是否搜索；明确不支持、未声明、无法确认或尚未适配时，在同一 route 上静默发送普通 Chat，不提示、不切换模型，也不调用通用 Intatis search tool、`web_fetch`、`browser_search`、本地浏览器、MCP 或第三方搜索后端。OpenAI Responses `web_search` 与 OpenRouter `openrouter:web_search` 分别编码；unknown/compatible/legacy/custom 接入点默认不声明搜索。该能力不进入 PermissionEngine/AgentLoop，也不扩大 iOS linkage。只有当前模型实际返回结构化 URL annotation 时才保存 optional additive citations，并在持久化与 SwiftUI `Link` 前执行既有双重校验。provider-specific structured unsupported 在首个有效 payload 前可触发一次同路由普通 Chat 重发；裸 404、自由文本和 partial payload 不可触发。精确合同见 `docs/CHAT_HOSTED_SEARCH.md`。
 - **Agent 网络/浏览器工具**：`ToolRegistry.standard()` 暴露轻量 `web_fetch` 和 Playwright/CDP-backed `browser_*` 工具。浏览器工具依赖用户环境里已安装的 Node.js，并优先使用 Playwright + Chromium/Chrome/Edge channel；若 Playwright 不可解析，则通过 Node.js 内置 `WebSocket` 使用 Chrome DevTools Protocol 启动已安装 Chrome/Edge/Chromium。缺少后端时返回配置错误或 `browser_diagnostics` 的可行动诊断。profile/state/history/downloads 全部通过 `PathConfinement` 限定在 workspace `.intatis/browser/` 下，刷新、历史前进/后退、表单点击/输入/提交/下拉选择/按键/滚动/等待交互通过 locator 或当前焦点执行；click/download 的 CDP 路径使用真实鼠标事件，打开新页面的交互会跟随到新 tab/window 并把最终页面写回 state/history；截图只能写入工作区 PNG 路径，上传只能引用 workspace 内文件，显式下载只能写入 `.intatis/browser/downloads/<profile>`；`browser_profiles` 可报告 active browser / profile lock runtime marker 是否存在，但不得列内部 marker 文件名或读取内容；`browser_profile_delete` 只在目标 profile 与 `confirmProfile` 匹配时删除 `.intatis/browser/profiles/<profile>`、`downloads/<profile>`、`state/<profile>.json` 并剪除对应 history metadata，删除前如果发现 marker 只给概括性提示；profile 可能包含 cookies 与登录态，不能当成普通日志、artifact 或 secret-free 文本处理。
 - **macOS UI information architecture**：`IntatisMacRootView` 是 macOS Chat/Code/Cowork 的 shell。左侧继续由 `NavigationSplitView` 提供系统 sidebar 材质，内部使用一个连贯的自定义结构：`Intatis` 标题、带 SF Symbol 的 Chat/Code/Cowork 竖向三行导航、当前 mode 的 `Recent` session history/New 与底部 Settings；仅选中模式行使用 interactive Liquid Glass。Cowork New session 仍先要求用户选择主 workspace 并初始化 per-session project settings。主 thread header 显示 session durable display name（无 display name 时回退 immutable `SessionID`），不写死 Chat/Code/Cowork，也不承载 New/session/model 控件；Code/Cowork 使用紧凑 12pt 顶部留白，Cowork 不再在标题之前常驻 permission-reviewer 横幅。共享 `IntatisThreadComposer` 固定两排：第一排 model/profile 在左、最近一轮 Context/Input/Cached/Output/Time usage 在右；Chat/Code/Cowork 的选择器共用原生 `Menu` 语义与 40pt 高 interactive Liquid Glass 胶囊，关闭态只显示模型名，不显示 CPU/芯片图标、provider 或 variant/reasoning detail；弹出菜单内部仍按 provider 分组并保留 variant detail。第二排为 action、原生多行 `TextField`、可选 Cowork stop 与 Send；macOS Chat、Code 与 Cowork 复用同一个 shared paperclip/file-import/drop/draft-menu surface，Chat 不再显示独立提示词生图 action；iOS paperclip 仍是 Chat tools menu 而不是通用本地附件。action/stop/Send 使用同一个 40×40 原生圆形控件合同，输入容器单行最小高度同为 40，同行 spacing 为 8，外层保持 bottom alignment，因此多行输入只向上增长。没有 top accessories 时不创建空白第一排。消息本体不使用 agent 头像或通用 Agent badge，缺失的 agent 展示名回退 `Intatis`；正常完成的 assistant/agent 回复无外层卡片，通用 Agent message、`information_requested`、`information_replied` 与其他 agent-to-agent 记录沿用同一普通回答版式并以 exact `sender->recipient` 标识，用户消息、失败回复与 tool/error/permission/task 等结构化项保留容器；既有字体 token 不随本次视觉架构更新。Thread content 使用共享 responsive layout 计算 horizontal padding、显式 `contentWidth`、message gutter 与 bubble max width；对话行通过 `IntatisThreadBubbleRow` 在整行层面按 user trailing、assistant/agent leading 对齐。Chat 默认无右 inspector；Code/Cowork 的显隐都只由同一个稳定外层 `GeometryReader` 提供的未压缩 outer available width 与用户请求状态决定，不使用已经压缩后的 thread width 反推自身可见性。Code 继续用有界 `HStack` 展示 structured plan/workspace/Git-status-only/recent failure。Cowork 则把 rail 作为 detail 同一 canvas 上的 trailing overlay：不使用 divider 或整栏 `.bar` 背景，主 thread 复用一个固定 `ScrollView` 根并延伸至 detail 最右端，visible rail 固定 348pt、section 固定 318pt，正文通过 trailing scroll-content margin 给 cards 留位，使原生滚动条位于整个内容区最右端。rail subtree 由只含 rail input 的 Equatable boundary 隔离；每个 passive section 独立使用系统 `Glass.clear` 的稳定 backdrop，不用 `GlassEffectContainer` 组织这些必须保持固定位置的 status cards。第一位显示 compact pending permission 或最近权限结果，其后为 `Agents`、真实 `Goal`、真实 `Tasks`，不显示 Git。compact permission 只展示状态、tool、安全摘要与必要 action，不渲染 raw args 或默认详情；pending 且 outer width 足以容纳 rail 时临时固定为可见，窄到无法安全容纳时只在 composer 上方保留同一请求的完整 Material 权限卡兜底，二者不得重复。无 pending 时用户仍可隐藏 Cowork rail；任何窄屏或隐藏状态都不在 thread 顶部复制 Goal/Tasks，也不保留对应高度。Code/Cowork 的 bottom-anchor 恢复使用系统 `onScrollVisibilityChange`，不建立 GeometryReader/PreferenceKey 坐标回写；session controls 位于内容 header，不向 window toolbar 动态增删 item，也不嵌套 SwiftUI `.inspector` preference。Cowork header 不提供独立 MCP Content 快捷按钮，内容浏览位于 `Project Settings → MCP → Browse Content`；header 只用系统 compact 圆形 glass/bordered icon control 切换 status rail。Goal/Tasks 继续来自 durable projections；Cowork 的 Git UI 已移除，但本地 Git controls 仍只通过 Agent Git tools + PermissionEngine 执行。
@@ -1391,7 +1451,7 @@ schema v2只表示lineage已覆盖media-aware语义。EventLog checkpoint writer
   wire 调用 multipart `POST <baseURL>/images/edits` 并发送单个 `image[]`。两者只接受
   `data[].b64_json`，不跟随输出 URL；mask 与多参考图尚未进入 tool schema。
 - **provider config reference confinement**：从 provider JSON 产生的直接 `options.apiKey` secret ref 会绑定当前配置文件；历史 UserDefaults 中的 `providerConfig` 路径只有匹配 Intatis 自有候选或当前显式 `INTATIS_CONFIG` 时才可读取，其他路径由 resolver fail closed。
-- **Cowork automatic permission review**：brand-new GUI/CLI Cowork session 以一个本地 durable 七事件 bootstrap 同时记录 settings、fixed `@main` 与 `@permission-reviewer`；初始化不产生模型审批或 provider 请求。恢复的非空 session 先恢复 durable settings/roster；若缺失 `@main`，GUI 从 canonical settings 走 host-authorized exact historical-main recovery，随后才 replacement/retry reviewer，CLI 使用专用 `/agent restore-main`。审查者固定 read_only、无工具 lease、无通信/委派、`coordinationDepth=0`，不会启动嵌套 `AgentLoop`；`AgentPermissionResponder` 把宿主解析的 `ResolvedToolAuthorization`、参数 digest/count、有界秘密脱敏 action preview 与紧凑 causal/lease metadata 放入 untrusted block 后交给独立 FIFO/single-flight 控制面。审查者只返回 `{"decision":"allow|deny","reason":"non-empty bounded reason"}`，且 risk 不得低于 gate；pre-submit caller cancel 返回 typed deny且不创建 review lifecycle；不可解析输出、空 reason、tool call、timeout、provider error、settled persistence failure 与已登记 review 在 terminal-claim 前被观察到的 cancel durable deny 当前调用；claim 后 cancel 保留唯一 settlement 但 authorization delivery deny。Phase B 将 producer lifecycle 收窄到 request generation：factory 逐代 exact-resolve，provider/timeout race 与 provider-backed terminal claim 校验 exact generation，pre-dispatch terminal 从 running/no-generation 状态唯一 claim；retired producer 不持有 EventLog/actor/authorization，下一 request 不继承 process-lifetime quarantine。`ToolCallingProvider.stream` 必须立即返回 request-owned stream，并传播 consumer termination，shipped OpenAI/URLSession 路径符合；同步永久阻塞的任意第三方实现不在该契约内。GUI 不做隐式人工 fallback；Phase A 后 reviewer 未就绪不锁定 composer，普通请求继续，只有 ask-class tool fail closed；对话页不常驻 reviewer 横幅，异常恢复入口位于 Project Settings 的 Recovery 区。CLI `/auto` 重新启用，只有用户明确 `/default` 才移除审查者并恢复终端人工确认。
+- **Cowork automatic permission review**：brand-new GUI/CLI Cowork session 以一个本地 durable 七事件 bootstrap 同时记录 settings、fixed `@main` 与 `@permission-reviewer`；初始化不产生模型审批或 provider 请求。恢复的非空 session 先恢复 durable settings/roster；若缺失 `@main`，GUI 从 canonical settings 走 host-authorized exact historical-main recovery，随后才 replacement/retry reviewer，CLI 使用专用 `/agent restore-main`。审查者固定 read_only、无工具 lease、无通信/委派、`coordinationDepth=0`，不会启动嵌套 `AgentLoop`。live model-authored ask 通过 request-local `PermissionReviewInvocationInput` 交付完整 canonical safe business args、完整 same-generation string sidecar 与机械 host binding/gate/lease/action facts；不发送 TaskContract objective/role/deliverable、causal userGoal、用户/assistant transcript/history、PDF 或图片原文。审查者只返回短非空 reason，并在最后一个非空行输出 ASCII `ALLOW` 或 `DENY`；risk 始终由 host gate 决定。pre-submit caller cancel 返回 typed deny且不创建 review lifecycle；不可解析输出、空 reason、tool call、timeout、provider error、settled persistence failure 与已登记 review 在 terminal-claim 前被观察到的 cancel durable deny当前调用；claim 后 cancel 保留唯一 settlement 但 authorization delivery deny。provider factory 逐代 exact-resolve，provider/timeout race 与 terminal claim 校验 exact generation；retired producer 不持有 EventLog/actor/authorization，下一 request 不继承 process-lifetime quarantine。`ToolCallingProvider.stream` 必须立即返回 request-owned stream并传播 consumer termination。GUI 不做隐式人工 fallback；reviewer 未就绪不锁定 composer，普通请求继续，只有真正到达 ask 边界的工具 fail closed。CLI `/auto` 重新启用，只有用户明确 `/default` 才移除审查者并恢复终端人工确认。
 
 示例（不含明文 secret）：
 

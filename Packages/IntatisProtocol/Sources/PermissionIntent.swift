@@ -180,7 +180,9 @@ public struct PermissionIntent: Codable, Equatable, Sendable {
         case "read_file", "list_files", "search_text": return "filesystem.read"
         case "write_file", "apply_patch": return "filesystem.edit"
         case "read_pdf": return "document.read"
-        case "document_read": return "document.read"
+        case "document_read", // Legacy decode/history compatibility only.
+             "read_docx", "read_pptx", "read_xlsx", "read_html", "read_epub":
+            return "document.read"
         case "document_ocr": return "document.ocr"
         case "document_render": return "document.render"
         case "document_export_pdf": return "document.export.pdf"

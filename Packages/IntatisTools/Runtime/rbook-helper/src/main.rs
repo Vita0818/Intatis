@@ -23,7 +23,6 @@ const MAX_ZIP_ENTRIES: usize = 20_000;
 const MAX_ZIP_ENTRY_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_ZIP_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_OPERATIONS: usize = 1_000;
-const MAX_ITEMS: usize = 20_000;
 
 #[derive(Debug, Clone, Copy)]
 struct HelperError {
@@ -78,18 +77,6 @@ struct Request {
     expected_version: String,
     operation: String,
     payload: Value,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ReadPayload {
-    input_path: String,
-    maximum_characters: usize,
-    #[serde(default)]
-    spine_start: Option<usize>,
-    #[serde(default)]
-    spine_count: Option<usize>,
-    include_metadata: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -183,33 +170,6 @@ enum Postcondition {
     },
 }
 
-#[derive(Default)]
-struct CharacterBudget {
-    remaining: usize,
-    truncated: bool,
-}
-
-impl CharacterBudget {
-    fn new(maximum: usize) -> Self {
-        Self {
-            remaining: maximum,
-            truncated: false,
-        }
-    }
-
-    fn take(&mut self, value: &str) -> String {
-        let count = value.chars().count();
-        if count <= self.remaining {
-            self.remaining -= count;
-            return value.to_owned();
-        }
-        let retained: String = value.chars().take(self.remaining).collect();
-        self.remaining = 0;
-        self.truncated = true;
-        retained
-    }
-}
-
 fn default_true() -> bool {
     true
 }
@@ -274,90 +234,11 @@ fn run() -> HelperResult<Value> {
         return Err(HelperError::validation());
     }
     match request.operation.as_str() {
-        "read" => read_epub(
-            serde_json::from_value(request.payload).map_err(|_| HelperError::validation())?,
-        ),
         "write" => write_epub(
             serde_json::from_value(request.payload).map_err(|_| HelperError::validation())?,
         ),
         _ => Err(HelperError::unsupported_operation()),
     }
-}
-
-fn read_epub(payload: ReadPayload) -> HelperResult<Value> {
-    if !(1..=500_000).contains(&payload.maximum_characters) {
-        return Err(HelperError::validation());
-    }
-    let start = payload.spine_start.unwrap_or(1);
-    let count = payload.spine_count.unwrap_or(10_000);
-    if start == 0 || start > 100_000 || count == 0 || count > 10_000 {
-        return Err(HelperError::validation());
-    }
-    let input = canonical_input_file(&payload.input_path, "epub", MAX_EPUB_BYTES)?;
-    preflight_epub_archive(&input)?;
-    let epub = Epub::open(&input).map_err(|_| HelperError::validation())?;
-    let mut budget = CharacterBudget::new(payload.maximum_characters);
-    let mut metadata = Vec::new();
-    if payload.include_metadata {
-        for entry in epub.metadata().iter().take(MAX_ITEMS) {
-            if budget.remaining == 0 {
-                budget.truncated = true;
-                break;
-            }
-            metadata.push(json!({
-                "property": budget.take(entry.property().as_str()),
-                "value": budget.take(entry.value()),
-                "id": entry.id().map(|id| budget.take(id)),
-            }));
-        }
-    }
-
-    let spine_total = epub.spine().len();
-    let mut spine = Vec::new();
-    for (index, entry) in epub.spine().iter().enumerate().skip(start - 1).take(count) {
-        if spine.len() >= MAX_ITEMS || budget.remaining == 0 {
-            budget.truncated = true;
-            break;
-        }
-        let Some(resource) = entry.manifest_entry() else {
-            return Err(HelperError::validation());
-        };
-        let content = resource.read_str().map_err(|_| HelperError::validation())?;
-        spine.push(json!({
-            "index": index + 1,
-            "resource_id": budget.take(entry.idref()),
-            "href": budget.take(resource.href_raw().as_str()),
-            "media_type": budget.take(resource.media_type()),
-            "linear": entry.is_linear(),
-            "content": budget.take(&content),
-        }));
-    }
-
-    let mut toc = Vec::new();
-    if let Some(root) = epub.toc().contents() {
-        for entry in root.flatten().take(MAX_ITEMS) {
-            if budget.remaining == 0 {
-                budget.truncated = true;
-                break;
-            }
-            toc.push(json!({
-                "depth": entry.depth(),
-                "id": entry.id().map(|id| budget.take(id)),
-                "label": budget.take(entry.label()),
-                "href": entry.href_raw().map(|href| budget.take(href.as_str())),
-            }));
-        }
-    }
-
-    Ok(json!({
-        "format": "epub",
-        "spine_total": spine_total,
-        "spine_start": start,
-        "spine": spine,
-        "metadata": metadata,
-        "toc": toc,
-        "truncated": budget.truncated,
-    }))
 }
 
 fn write_epub(payload: WritePayload) -> HelperResult<Value> {
@@ -1220,27 +1101,11 @@ mod tests {
     }
 
     #[test]
-    fn create_read_and_edit_round_trip() {
+    fn create_and_edit_round_trip() {
         let directory = TestDirectory::new();
         let created = directory.path("created.epub");
         let result = write_epub(create_payload(&directory, &created)).expect("create EPUB");
         assert_eq!(result["verified"], true);
-        let read = read_epub(ReadPayload {
-            input_path: created.to_string_lossy().into_owned(),
-            maximum_characters: 20_000,
-            spine_start: Some(1),
-            spine_count: Some(1),
-            include_metadata: true,
-        })
-        .expect("read EPUB");
-        assert_eq!(read["spine_total"], 1);
-        assert!(
-            read["spine"][0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("Hello")
-        );
-
         let edited = directory.path("edited.epub");
         let edit = WritePayload {
             format: "epub".into(),

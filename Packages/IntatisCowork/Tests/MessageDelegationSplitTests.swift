@@ -156,7 +156,14 @@ final class MessageDelegationSplitTests: XCTestCase {
         XCTAssertFalse(capabilityLease.tools.contains(.applyPatch))
         XCTAssertFalse(capabilityLease.tools.contains(.browseWeb))
         XCTAssertTrue(capabilityLease.tools.contains(.readPDF))
-        XCTAssertTrue(capabilityLease.tools.contains(.documentRead))
+        XCTAssertTrue([
+            ToolCapability.readDOCX,
+            .readPPTX,
+            .readXLSX,
+            .readHTML,
+            .readEPUB,
+        ].allSatisfy(capabilityLease.tools.contains))
+        XCTAssertFalse(capabilityLease.tools.contains(.documentRead))
         XCTAssertTrue(capabilityLease.tools.contains(.documentOCR))
         XCTAssertFalse(capabilityLease.tools.contains(.documentRender))
         XCTAssertFalse(capabilityLease.tools.contains(.documentExportPDF))
@@ -164,7 +171,9 @@ final class MessageDelegationSplitTests: XCTestCase {
         let mailboxToolNames = Set(Orchestrator.toolRegistry(
             for: capabilityLease).descriptors().map(\.name))
         XCTAssertTrue(mailboxToolNames.contains("read_pdf"))
-        XCTAssertTrue(mailboxToolNames.contains("document_read"))
+        XCTAssertTrue(["read_docx", "read_pptx", "read_xlsx", "read_html", "read_epub"]
+            .allSatisfy(mailboxToolNames.contains))
+        XCTAssertFalse(mailboxToolNames.contains("document_read"))
         XCTAssertTrue(mailboxToolNames.contains("document_ocr"))
         XCTAssertFalse(mailboxToolNames.contains("document_render"))
         XCTAssertFalse(mailboxToolNames.contains("document_export_pdf"))
@@ -464,7 +473,9 @@ final class MessageDelegationSplitTests: XCTestCase {
         XCTAssertTrue(workerTools.contains("reply_message"))
         XCTAssertTrue(workerTools.contains("request_delegation"))
         XCTAssertTrue(workerTools.contains("read_pdf"))
-        XCTAssertTrue(workerTools.contains("document_read"))
+        XCTAssertTrue(["read_docx", "read_pptx", "read_xlsx", "read_html", "read_epub"]
+            .allSatisfy(workerTools.contains))
+        XCTAssertFalse(workerTools.contains("document_read"))
         XCTAssertTrue(workerTools.contains("document_ocr"))
         XCTAssertFalse(workerTools.contains("document_render"))
         XCTAssertFalse(workerTools.contains("document_export_pdf"))
@@ -502,7 +513,9 @@ final class MessageDelegationSplitTests: XCTestCase {
         XCTAssertTrue(coordinatorTools.contains("reply_message"))
         XCTAssertTrue(coordinatorTools.contains("delegate_task"))
         XCTAssertTrue(coordinatorTools.contains("ask_agent"))
-        XCTAssertTrue(coordinatorTools.contains("document_read"))
+        XCTAssertTrue(["read_docx", "read_pptx", "read_xlsx", "read_html", "read_epub"]
+            .allSatisfy(coordinatorTools.contains))
+        XCTAssertFalse(coordinatorTools.contains("document_read"))
         XCTAssertTrue(coordinatorTools.contains("document_ocr"))
         XCTAssertTrue(coordinatorTools.contains("document_render"))
         XCTAssertTrue(coordinatorTools.contains("document_export_pdf"))

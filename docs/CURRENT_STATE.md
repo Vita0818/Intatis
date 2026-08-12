@@ -2,28 +2,27 @@
 
 文档状态：当前源码摘要
 最近核对：2026-08-11
-产品基线：v0.40（build 40）
+产品基线：v0.48（build 48）
 
 ## 版本与发行状态
 
-- `HEAD` 与 `origin/main` 当前均为标题为 `v0.45` 的提交 `0f98fe9`。仓库没有 Git tag；该
-  commit 标题不是产品版本事实源，`project.yml` 把当前产品基线定义为 `0.40 (40)`。
-- `MARKETING_VERSION` / `CURRENT_PROJECT_VERSION` 已推进为 `0.40 (40)`。两个仓库参考
+- `HEAD` 与 `origin/main` 当前均为标题为 `v0.47` 的提交 `53f3320`。仓库没有 Git tag；该
+  commit 标题不是产品版本事实源，`project.yml` 把当前产品基线定义为 `0.48 (48)`。
+- `MARKETING_VERSION` / `CURRENT_PROJECT_VERSION` 已推进为 `0.48 (48)`。两个仓库参考
   Info.plist、README、文档入口和发行脚本使用同一基线。
-- 2026-08-08 已重新生成 Xcode 工程并通过 v0.40 版本一致性门；`IntatisMac` unsigned
+- 2026-08-11 已重新生成 Xcode 工程并通过 v0.48 版本一致性门；`IntatisMac` unsigned
   universal Release 与 `IntatisiOS` generic Simulator Debug 均构建通过，最终 bundle 均为
-  `0.40 (40)`，macOS 可执行文件包含 `x86_64 arm64`。
-- 本机 `/Applications/Intatis.app` 已安装上述当前工作树的 `0.40 (40)` ad-hoc Hardened
+  `0.48 (48)`，macOS 可执行文件包含 `x86_64 arm64`。
+- 本机 `/Applications/Intatis.app` 已安装上述当前工作树的 `0.48 (48)` ad-hoc Hardened
   Runtime 开发构建；bundle identifier 为 `com.Vita0818.IntatisMac`，严格 codesign 校验通过，
-  安装副本与已验证 staging 副本的可执行文件 SHA-256 一致，且无 quarantine xattr。安装前的
-  `0.36 (36)` 曾移至
-  `/Users/vita/.Trash/Intatis-before-install-20260808-163949.app`，随后已按用户要求永久删除；
-  Finder 复核废纸篓中名称含 `Intatis` 的项目数为 0，不再保留旧版备份。该本机安装不是
+  embedded entitlements 为 audio input=true、JIT=false 且 library validation 未关闭；安装副本与
+  已验证 staging 副本的可执行文件 SHA-256 一致，且无 quarantine xattr。安装前的
+  `0.40 (40)` 已移至 `~/.Trash/Intatis-before-install-20260811-201644.app` 作为可恢复备份。该本机安装不是
   Developer ID 公证发行产物。
 - macOS 只发行 `IntatisMac` Developer ID/direct-distribution 产品；不做 Mac App Store。
   `IntatisMacAppStore` 仍是 legacy source target，不进入默认构建、测试或 release gate。
 - 用户宿主终端已报告两个有效 codesigning identity，其中 Developer ID Application 可被发行
-  脚本选取；`Intatis-Notary` Keychain profile 也已配置。v0.40 最终 App/DMG 尚未完成 Apple
+  脚本选取；`Intatis-Notary` Keychain profile 也已配置。v0.48 最终 App/DMG 尚未完成 Apple
   notarization、staple 与 Gatekeeper 全链路，因此仍不得描述为正式 release。
 
 ## 当前产品面
@@ -54,17 +53,22 @@ macOS 是完整产品：Chat、Code、Cowork、Settings 和本地诊断导出。
 - Code 使用共享 headless `AgentRuntime.code`，提供工作区文件、patch、Git、managed
   terminal、Skills、外部 MCP、文档/媒体及浏览器工具。工具可见性、lease、权限和 durable
   execution ticket 在执行前逐层核对。
-- Code/Cowork/CLI 的文档面已收敛为六个 exact 工具：`read_pdf`、`document_read`、
-  `document_ocr`、`document_render`、`document_export_pdf`、`document_write`。旧
+- Code/Cowork/CLI 的普通文档读取已按格式拆成 `read_pdf`、`read_docx`、`read_pptx`、
+  `read_xlsx`、`read_html`、`read_epub`，另保留职责独立的 `document_ocr`、
+  `document_render`、`document_export_pdf`、`document_write`。聚合 `document_read` 已从
+  live registry 下架；旧 session 的同名 capability 只作为兼容授权映射到五个固定格式 reader，
+  不会重新暴露旧工具。旧
   `read_document` 自动 fallback、`edit_pdf_pages` 与 `reconstruct_document_image` 已从生产
   registry/fresh lease 下架；PDF P0 仅原生文本/metadata 读取、显式 OCR、页面 PNG 和新生成
   PDF 校验，不提供任何 PDF mutation。写入使用 source/destination snapshot、owner-only staging、
   CAS、格式语义验证与 file/directory 原子提交；模型不能选择 executable/backend/command/env 或
-  fallback。DOCX/PPTX/XLSX/HTML 的 common-operation 子集由 python-docx/python-pptx/openpyxl/lxml
-  负责，XLSX 在 openpyxl staging 后经固定 safe-profile LibreOffice Calc XLSX round-trip/save、formula + data-only
-  cache postcondition 与 PDF preview 验证；不能只凭转换退出码声称已重算。EPUB read/write 绑定仓内
-  可重复构建的 pinned rbook helper source
-  和正式 EPUBCheck，EPUB render/export 在 full-spine corpus gate 通过前不进入 model schema，并返回
+  fallback。五个非 PDF reader 只接受 `path` 与可选 `maxCharacters`，由宿主固定 exact 格式，
+  并把 Docling 高层转换得到的 Markdown 整体做字符预算后返回；旧的 DOCX/PPTX/XLSX/HTML
+  手写对象遍历与 native-structure 投影已删除。写入仍由
+  python-docx/python-pptx/openpyxl/lxml 的明确 operation 子集负责，XLSX 在 openpyxl staging 后经固定 safe-profile LibreOffice Calc XLSX round-trip/save、formula + data-only
+  cache postcondition 与 PDF preview 验证；不能只凭转换退出码声称已重算。EPUB 普通读取走固定
+  Docling 高层转换；写入绑定仓内可重复构建的 pinned rbook helper source 和正式 EPUBCheck。
+  rbook helper 的旧 read route 已删除。EPUB render/export 在 full-spine corpus gate 通过前不进入 model schema，并返回
   `unsupported_operation`。文档辅助资产会先冻结 digest/identity，backend 运行与提交锁内再次核对；
   staged commit 固定目标父目录 identity，生成物同时受单文件、总字节与 entry 数预算约束。当前开发机
   用户 runtime 已安装固定 Python Office/HTML/Docling 组件、Docling layout model、Tesseract、
@@ -88,10 +92,17 @@ macOS 是完整产品：Chat、Code、Cowork、Settings 和本地诊断导出。
   Darwin temp path 都不能满足 LibreOffice bootstrap/长度合同。真实 core smoke 已在同一 Seatbelt
   下跑通 DOCX write/read/preview/export/PDF read/render、PPTX write/read/preview/export/PDF read，
   以及 XLSX write、Calc round-trip、公式文本与 data-only cache `4`、preview/export；不会自动降级。
-  旧 26.2.4 runtime 已按用户授权移入废纸篓。生产 runner 的 EPUB write/EPUBCheck 和 strict
+  五个格式 reader 的真实 runtime smoke 均已通过；另以用户提供的外部 Intatis-test corpus 中
+  一份稀疏 XLSX 与三份 PPTX 运行只读复制后的回归，
+  4/4 通过，稀疏表不再进入 openpyxl `EmptyCell` 手写投影。结构化普通读取 intent 仍经进程权限
+  审查，但标记为 `safeToReplay`；解析失败会 durable settle 为 failed/unknown、返回模型并继续同批
+  后续文件，不再触发虚假的 manual reconciliation。当前 `maxCharacters` 只约束最终返回给模型的
+  Markdown；Docling 仍会先完成整份文档转换与 Markdown 导出。生产 runner 已有输入文件/归档展开
+  上限、超时、取消与进程清理，但尚无独立 RSS 内存上限，因此超大或极端复杂文档仍是明确的资源
+  边界，不能把字符裁切误写成峰值内存保证。旧 26.2.4 runtime 已按用户授权移入废纸篓。生产 runner 的 EPUB write/EPUBCheck 和 strict
   pdfcpu + Docling/Tesseract OCR smoke 也已分别通过。runtime 打包、双架构和其余发行许可闭包仍是
   独立工作。read-only Cowork worker 获得 in-process
-  `read_pdf` 以及固定、无持久写入的 `document_read` / `document_ocr`；render/export/write 只向
+  `read_pdf`、五个固定格式 reader 以及无持久写入的 `document_ocr`；render/export/write 只向
   read-write worker/coordinator 显式签发。iOS Chat 不链接任何文档 runtime。
 - Code/Cowork/CLI 的 `generate_image` 与 `edit_image` 已接入 macOS/CLI 高级配置顶层
   `image_model`。主 agent 根据用户意图决定是否调用普通工具；model-facing schema 不接受
@@ -114,8 +125,8 @@ macOS 是完整产品：Chat、Code、Cowork、Settings 和本地诊断导出。
   canonical binding；stable媒体completion batch还要求同turn/call的唯一`tool_result`与同
   `{callID, agent, taskID, attempt}`的唯一settlement，Code首轮工具票据复用model-history规范化的attempt 1。
   unsupported route、缺失/损坏blob或descriptor不一致均在下一次provider请求前typed fail closed。
-  自动Cowork ask-class授权快照若含图片则durable
-  `media_authorization_unsupported` deny，不把图片描述交给可返回allow的文本reviewer。上下文压缩的
+  automatic Cowork 不再因授权快照含 user/FCO 图片而 blanket deny；主模型可把与 exact action 相关的
+  图片/PDF证据压缩进 same-call sidecar，reviewer 不会因此收到完整像素或整份文档。上下文压缩的
   summarizer会看见完整active window中的用户/工具图片；checkpoint成功后所有旧原图只由摘要接替，
   replacement不保留attachment/ref，但ArtifactStore blob与审计事实不删除。
 - Cowork显式Retry由纯`SubmittedIntentRetryPlanner`按canonical task状态决定：outbox canonicalization
@@ -141,19 +152,36 @@ macOS 是完整产品：Chat、Code、Cowork、Settings 和本地诊断导出。
   当前窗口的只读对话选择；列表保留 session 历史上所有 durable agent，detached identity 继续
   可点击并由原状态图标显示已移除，当前选择不会跳回 `@main`。新窗口默认显示 `@main`，
   `@permission-reviewer` 等控制面 identity 仍为不可选择的状态项。
-- Cowork automatic ask-class 权限请求现已带 host-validated authorization context。请求工具的
-  acting agent 复用刚才的 exact provider/model 与 provider-facing conversation snapshot，另发一次
-  request-owned 报告请求；该请求只暴露一个未注册、永不执行的 output-only
-  `submit_permission_authorization` function，不依赖 forced `tool_choice` 或 `response_format`。宿主只接受
-  无 prose 的单个同名 call，并严格解析其中的五项语义报告和临时 user handles。宿主把 handles
-  映射到同 session canonical `user_message` sequence，无条件加入当前 submission，并从最早引用到
-  当前消息闭包覆盖所有可见用户指令，防止跳过中途撤销或缩窄。`PermissionReviewControlPlane` 再独立
-  验证 complete-known history、main/worker projection、current submission、report secret/shape 与 exact
-  authorization binding，最后把 untrusted report、canonical latest instruction 和 supporting evidence
-  分栏交给 reviewer。任何缺失、超预算、unknown future event、错误/多个 function call、混入 prose、
-  malformed/secret output、timeout 或 cancel
-  均在 reviewer provider 前以 `authorization_context_unavailable` durable deny；hard deny、manual flow、
-  host `agentAdmission`、CapabilityLease/WorkspaceLease 和 durable-first settlement 语义没有改变。
+- Cowork automatic 权限请求使用 single-pass same-call sidecar。provider-facing business schema 只增加
+  optional string `__intatis_authorization_context`；宿主仅在 deterministic gate 实际进入 automatic ask 时
+  要求它存在。acting model 在原业务 function call 中用这一句话概括为什么 exact action 服务当前任务，
+  不再二次调用 acting provider，也不复制 `request.messages`、完整 PDF/tool output 或全量图片。宿主在任何
+  原业务 schema 校验、durable model history、EventLog 或 executor 之前拆除 sidecar，只用 canonical
+  business arguments 计算 intent/path/network/action preview/authorization identity。valid sidecar 只在当前
+  turn 的 acting-model 内存 conversation 中保留，作为下一次 function call 的正确格式示例；durable history
+  仍只保存 stripped business call。automatic ask 的 reviewer 收到完整 canonical safe business arguments、
+  完整 same-generation sidecar，以及 request/task/call/tool、ResolvedToolAuthorization、gate、lease、intent
+  等机械宿主事实。live prompt 明确不发送 TaskContract objective/role/deliverable、causal userGoal、用户消息、
+  assistant/history、PDF 或图片原文。raw sidecar 与 reviewer transient exact-args 副本均不落 EventLog 或
+  permission lifecycle；`permission_request.context` 只保存 generation/snapshot/digest/status receipt。
+  missing/malformed/secret-bearing sidecar 是 acting-model tool-input failure：只追加 failed/runtimeFailed
+  `tool_result`，不创建 `permission_request` / `permission_resolved`、不调用 reviewer，也不消耗 permission
+  denial fuse；同一 business args 后续补正仍能进入 reviewer。side-effect evidence 只在当前 turn 内阻止模型
+  把未执行动作说成完成，restart 不恢复一条从未发生的权限拒绝。sidecar 与 exact call/generation/business
+  digest 无法绑定时则单独 typed fail closed。manual/nonautomatic flow 不接收 transient input，若模型仍发送
+  保留字段则在 business execution 前以 redacted audit + `authorization_context_mode_mismatch` 拒绝。图片存在
+  本身不再 blanket deny。最终 reviewer 仍无工具，只接受非空短 reason +
+  末个非空行 exact ASCII `ALLOW` / `DENY`；旧 JSON、tool call、无 completion marker、非成功 finish、
+  timeout/provider/cancel/persistence failure 均 fail closed，risk 始终来自 host gate。live bound review 的
+  model-authored reason 与 provider diagnostic 可能复述 transient input，因此 durable settlement/tool-result
+  只使用固定宿主文案。automatic responder 缺 bound-invocation overload、cached/active duplicate 缺失或更换
+  transient invocation、recovered automatic allow 再交付，以及 Cowork 误配 in-engine reviewer 均 fail closed。
+  唯一没有 acting-model invocation 的 automatic `agent.attach` 只能由 `Orchestrator` 通过 dedicated host-admission
+  entry 提交，并复核 exact task/tool/authorization/workspace identity 与先行 durable attach/lease events。
+  acting model 仍可把相同文字作为普通 assistant 文本输出并按既有消息规则持久化，malformed acting-provider
+  error preview 仍依赖通用 bounded/secret sanitizer。live 也没有固定 sidecar byte ceiling 或
+  `review_input_too_large` admission；未来只能从真实 route budget 推导整份拒绝上限。真实 provider sidecar
+  smoke 尚未运行。
 - Cowork final turn 现在先校验 side-effect evidence，再原子发布 final message/model-history、idle
   与 completed outcome；旧日志中 failed/interrupted turn 的先行完成气泡会被展示投影纠正，失效的
   final assistant 也不再进入下一次 provider history。exact `@main` root 另可见模型主动调用的
@@ -380,6 +408,37 @@ profiles 与外部 MCP client。macOS/Linux 的 stdio、sandbox、bwrap/guard �
 
 ## 最近验证状态
 
+- 2026-08-11 fixed-format document reader 拆分与瘦身 gate：完整 `IntatisToolsTests` 223/223
+  （19 skipped）、`AgentLoopPolicyTests` 36/36、`CapabilityLeaseTests` 7/7、
+  `ToolRegistryLeaseTests` 25/25、`MessageDelegationSplitTests` 10/10，均 0 failures。用户提供的
+  外部 Intatis-test 目录只作为输入；测试把 1 份稀疏 XLSX 与 3 份 PPTX 复制到临时
+  workspace 后运行，4/4 读取成功且不修改原目录。installed core runtime 与 EPUB write/read smoke
+  各 1/1 通过；rbook write-only helper 的 fmt/check/test/clippy 全门通过（7 unit + 2 integration）。
+  `swift build --disable-automatic-resolution`、版本一致性检查、macOS `IntatisMac` Debug unsigned 与
+  iOS generic Simulator Debug unsigned build 均退出 0，仅报告仓库既有 warning。一次整仓
+  `swift test --disable-automatic-resolution` 在完成 Tools 后挂于既有 SharedUI async waiter，采样后
+  人工中断为 130；不能记为本轮全量通过，也未观察到 document reader 相关 failure。
+- 2026-08-12 Cowork single-pass permission sidecar corrective gate：
+  `PermissionReviewControlPlaneTests` 47/47、`AgentLoopPolicyTests` 36/36、
+  `AutomaticPermissionReviewTests` 35/35、`DurableMultimodalAgentLoopTests` 9/9、
+  `AuthorizationSidecarTests` 9/9、`IntatisPermissionReviewerTests` 10/10、
+  `PermissionReviewProtocolTests` 12/12，合计 158 tests / 0 failures。覆盖 same-call string sidecar 拆包与
+  绑定、ask-only host requirement、valid sidecar 的 current-turn in-memory formatting example、raw/transient
+  durable isolation、missing → missing → corrected same-args 调用可达 reviewer、tool-input failure 不消耗
+  permission denial fuse、live reviewer prompt 不含 user/task semantic narrative、manual 保留字段拒绝、
+  dedicated host admission、active/cached/recovered invocation 复验、固定宿主 reason/provider-failure 文案及
+  in-engine reviewer 误配 fail closed。上述 158 计数只代表 focused offline suites；
+  更广的构建/测试证据如下：
+  `swift build --disable-sandbox --disable-automatic-resolution` 通过。完整
+  `swift test --disable-sandbox --disable-automatic-resolution` 首次在 Codex 工作区沙箱内因既有 WebKit/
+  Seatbelt/terminal 环境限制失败，并暴露、随后修复一个仍按旧 Reporter 行为编写的 reliability fixture；
+  在用户批准的工作区沙箱外以同一命令重跑 exit 0；2026-08-12 修正后再次运行完整
+  `swift test --disable-sandbox --disable-automatic-resolution` 也为 exit 0，其中
+  `IntatisAgentKernelTests` 212/212、`OrchestrationReliabilityTests` 54/54。
+  `xcodegen generate` 通过；`scripts/check-version-consistency.sh` 输出
+  `Intatis version is consistent: 0.48 (build 48)`；`IntatisMac` macOS universal Release unsigned 与
+  `IntatisiOS` generic Simulator Debug unsigned build 均 exit 0，仅有仓库既有 warnings。未运行真实
+  provider sidecar smoke 或 UI/manual switch smoke。
 - 2026-08-11 model-driven Knowledge live acceptance：OpenRouter 最小 smoke 1/1，embedding 为
   1536 维并报告 input/total token 7，reranker 返回完整 permutation、有限 score 和 search unit 1；
   8-query 冻结集的 dense baseline 为 MRR/nDCG@5/Recall@5 = 1.000/1.000/1.000，configured reranker
@@ -485,6 +544,12 @@ profiles 与外部 MCP client。macOS/Linux 的 stdio、sandbox、bwrap/guard �
    baseline 的质量 uplift，nDCG@5 反而从 1.000 降至 0.990。它仍需要更难、更大、独立标注的领域集合
    做模型选择；large-corpus latency/memory/disk/cost ceiling、Intel/最低 macOS 与 Linux provider matrix
    仍为 `UNKNOWN`。provider usage 可报告 token/search units，但没有 versioned price evidence 时不推算金额。
+6. Cowork sidecar 的 focused offline gate 已通过，但仍有明确 P2/信任边界：单字符串是 acting model 的
+   未信任解释，可能遗漏或编造语义；acting model 也可在普通 assistant 文本自行复述它并按既有消息规则
+   持久化。malformed acting-provider error preview 仍依赖通用 sanitizer；live 没有固定 input ceiling，未来
+   必须从 exact route budget 推导并整份 fail closed。若错误注入 in-engine reviewer，当前会在其返回后拒绝，
+   因而仍可能多一次不应存在的调用；shipping 默认没有该配置。真实 provider route compliance 仍是
+   `UNKNOWN`。
 
 ## 文档治理
 

@@ -137,7 +137,8 @@ private enum DocumentToolSupport {
         action: String,
         paths: [String],
         operation: String,
-        format: DocumentFormat
+        format: DocumentFormat,
+        replayPolicy: ToolExecutionReplayPolicy = .requiresManualReconciliation
     ) -> PermissionIntent {
         PermissionIntent(
             action: action,
@@ -152,7 +153,7 @@ private enum DocumentToolSupport {
             ],
             dataEffects: [.read, .execute],
             risks: [.processExecution],
-            replayPolicy: .requiresManualReconciliation)
+            replayPolicy: replayPolicy)
     }
 
     static func writeIntent(
@@ -488,113 +489,63 @@ private enum DocumentToolSupport {
     }
 }
 
-// MARK: - document_read
+// MARK: - Fixed-format text readers
 
-public struct DocumentReadTool: Tool {
-    public init() {}
-
-    public static let canonicalPermission: String? = "document.read"
-    public static let descriptor = ToolDescriptor(
-        name: "document_read",
-        description: "Read the declared native structure of a DOCX, PPTX, XLSX, HTML, or EPUB workspace file using its single fixed local parser. PDF is intentionally handled by read_pdf or document_ocr. No fallback backend is attempted.",
-        sideEffect: .exec,
-        parameters: DocumentReadArguments.schema)
-
-    public func validateArguments(_ args: ToolArgs) throws {
-        _ = try DocumentReadArguments.decodeValidated(args)
+private enum DocumentTextReadSupport {
+    static func value(_ args: ToolArgs, format: DocumentFormat) throws -> DocumentTextReadArguments {
+        try DocumentTextReadArguments.decodeValidated(args, format: format)
     }
 
-    public func touchedPaths(_ args: ToolArgs) -> [String] {
-        (try? DocumentReadArguments.decodeValidated(args)).map { [$0.inputPath] } ?? []
+    static func touchedPaths(_ args: ToolArgs, format: DocumentFormat) -> [String] {
+        (try? value(args, format: format)).map { [$0.path] } ?? []
     }
 
-    public func permissionIntent(_ args: ToolArgs, workspaceRoot: URL) -> PermissionIntent {
-        guard let value = try? DocumentReadArguments.decodeValidated(args) else {
+    static func permissionIntent(
+        _ args: ToolArgs,
+        format: DocumentFormat,
+        toolName: String,
+        sideEffect: SideEffect
+    ) -> PermissionIntent {
+        guard let value = try? value(args, format: format) else {
             return PermissionIntent.derived(
-                toolName: Self.descriptor.name,
-                sideEffect: Self.descriptor.sideEffect,
-                touchedPaths: touchedPaths(args),
+                toolName: toolName,
+                sideEffect: sideEffect,
+                touchedPaths: touchedPaths(args, format: format),
                 risksNetwork: false)
         }
         return DocumentToolSupport.processReadIntent(
-            action: "document.read",
-            paths: [value.inputPath],
-            operation: "read_native_structure",
-            format: value.format)
+            action: "document.read.\(format.rawValue)",
+            paths: [value.path],
+            operation: "read_bounded_markdown",
+            format: format,
+            replayPolicy: .safeToReplay)
     }
 
-    public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {
-        let value = try DocumentReadArguments.decodeValidated(args)
+    static func execute(
+        _ args: ToolArgs,
+        format: DocumentFormat,
+        operation: String,
+        context: ToolContext
+    ) async throws -> ToolObservation {
+        let value = try value(args, format: format)
         let snapshot = try DocumentInputFile.freeze(
-            path: value.inputPath,
-            expectedFormat: value.format,
+            path: value.path,
+            expectedFormat: format,
             workspace: context.workspaceRoot)
-        let maximumCharacters = value.maxCharacters ?? 200_000
-        let envelope: DocumentBackendEnvelope
-        if value.format == .epub {
-            var payload: [String: JSONValue] = [
+        let envelope = try await DocumentPythonBackend.run(
+            operation: "read",
+            payload: .object([
+                "format": .string(format.rawValue),
                 "input_path": .string(snapshot.url.path),
-                "maximum_characters": .number(Double(maximumCharacters)),
-            ]
-            if let start = value.options?.spineStart {
-                payload["spine_start"] = .number(Double(start))
-            }
-            if let count = value.options?.spineCount {
-                payload["spine_count"] = .number(Double(count))
-            }
-            payload["include_metadata"] = .bool(value.options?.includeMetadata ?? true)
-            envelope = try await RBookDocumentBackend.run(
-                operation: "read",
-                payload: .object(payload),
-                reviewedInputPaths: [value.inputPath],
-                in: context)
-        } else {
-            var payload: [String: JSONValue] = [
-                "format": .string(value.format.rawValue),
-                "input_path": .string(snapshot.url.path),
-                "maximum_characters": .number(Double(maximumCharacters)),
-                "maximum_items": .number(20_000),
-            ]
-            switch value.format {
-            case .docx:
-                payload["include_headers"] = .bool(value.options?.includeHeaders ?? true)
-                payload["include_footers"] = .bool(value.options?.includeFooters ?? true)
-                payload["include_tables"] = .bool(value.options?.includeTables ?? true)
-            case .pptx:
-                if let pages = try DocumentPageSelection.parse(
-                    value.options?.slides,
-                    maximumCount: 10_000) {
-                    payload["slides"] = .array(pages.map { .number(Double($0)) })
-                }
-            case .xlsx:
-                if let sheet = value.options?.sheet { payload["sheet"] = .string(sheet) }
-                if let range = value.options?.cellRange { payload["range"] = .string(range) }
-                payload["data_only"] = .bool(!(value.options?.includeFormulas ?? true))
-                payload["maximum_cells"] = .number(Double(value.options?.maximumCells ?? 10_000))
-            case .html:
-                if let xpath = value.options?.xpath { payload["xpath"] = .string(xpath) }
-            case .epub, .pdf:
-                break
-            }
-            envelope = try await DocumentPythonBackend.run(
-                operation: "read",
-                payload: .object(payload),
-                readableWorkspacePaths: [value.inputPath],
-                in: context)
-            if value.format == .html,
-               let expected = value.options?.expectedMatchCount,
-               case .object(let result)? = envelope.result,
-               case .array(let items)? = result["items"],
-               items.count != expected {
-                throw DocumentToolError(
-                    .validationFailed,
-                    "HTML XPath result count changed from the exact requested count")
-            }
-        }
+                "maximum_characters": .number(Double(value.maxCharacters ?? 200_000)),
+                "maximum_file_bytes": .number(Double(snapshot.identity.byteCount)),
+            ]),
+            readableWorkspacePaths: [value.path],
+            in: context)
         try DocumentInputFile.verifyUnchanged(snapshot)
         return try DocumentToolSupport.observation(
-            operation: "document_read",
-            format: value.format,
+            operation: operation,
+            format: format,
             result: envelope.result,
             engineVersions: envelope.engineVersions,
             warnings: envelope.warnings,
@@ -604,6 +555,76 @@ public struct DocumentReadTool: Tool {
                 return truncated
             }())
     }
+}
+
+public struct ReadDOCXTool: Tool {
+    public init() {}
+    public static let canonicalPermission: String? = "document.read"
+    public static let descriptor = ToolDescriptor(
+        name: "read_docx",
+        description: "Read one DOCX workspace file as bounded Markdown with the fixed local Docling DOCX converter. The format and backend are fixed; no fallback, edit, rendering, or OCR is attempted.",
+        sideEffect: .exec,
+        parameters: DocumentTextReadArguments.schema)
+    public func validateArguments(_ args: ToolArgs) throws { _ = try DocumentTextReadSupport.value(args, format: .docx) }
+    public func touchedPaths(_ args: ToolArgs) -> [String] { DocumentTextReadSupport.touchedPaths(args, format: .docx) }
+    public func permissionIntent(_ args: ToolArgs, workspaceRoot: URL) -> PermissionIntent { DocumentTextReadSupport.permissionIntent(args, format: .docx, toolName: Self.descriptor.name, sideEffect: Self.descriptor.sideEffect) }
+    public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation { try await DocumentTextReadSupport.execute(args, format: .docx, operation: Self.descriptor.name, context: context) }
+}
+
+public struct ReadPPTXTool: Tool {
+    public init() {}
+    public static let canonicalPermission: String? = "document.read"
+    public static let descriptor = ToolDescriptor(
+        name: "read_pptx",
+        description: "Read one PPTX workspace file as bounded Markdown with the fixed local Docling PPTX converter. The format and backend are fixed; no fallback, edit, rendering, or OCR is attempted.",
+        sideEffect: .exec,
+        parameters: DocumentTextReadArguments.schema)
+    public func validateArguments(_ args: ToolArgs) throws { _ = try DocumentTextReadSupport.value(args, format: .pptx) }
+    public func touchedPaths(_ args: ToolArgs) -> [String] { DocumentTextReadSupport.touchedPaths(args, format: .pptx) }
+    public func permissionIntent(_ args: ToolArgs, workspaceRoot: URL) -> PermissionIntent { DocumentTextReadSupport.permissionIntent(args, format: .pptx, toolName: Self.descriptor.name, sideEffect: Self.descriptor.sideEffect) }
+    public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation { try await DocumentTextReadSupport.execute(args, format: .pptx, operation: Self.descriptor.name, context: context) }
+}
+
+public struct ReadXLSXTool: Tool {
+    public init() {}
+    public static let canonicalPermission: String? = "document.read"
+    public static let descriptor = ToolDescriptor(
+        name: "read_xlsx",
+        description: "Read one XLSX workspace file as bounded Markdown with the fixed local Docling XLSX converter. The format and backend are fixed; no fallback, edit, recalculation, or formula execution is attempted.",
+        sideEffect: .exec,
+        parameters: DocumentTextReadArguments.schema)
+    public func validateArguments(_ args: ToolArgs) throws { _ = try DocumentTextReadSupport.value(args, format: .xlsx) }
+    public func touchedPaths(_ args: ToolArgs) -> [String] { DocumentTextReadSupport.touchedPaths(args, format: .xlsx) }
+    public func permissionIntent(_ args: ToolArgs, workspaceRoot: URL) -> PermissionIntent { DocumentTextReadSupport.permissionIntent(args, format: .xlsx, toolName: Self.descriptor.name, sideEffect: Self.descriptor.sideEffect) }
+    public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation { try await DocumentTextReadSupport.execute(args, format: .xlsx, operation: Self.descriptor.name, context: context) }
+}
+
+public struct ReadHTMLTool: Tool {
+    public init() {}
+    public static let canonicalPermission: String? = "document.read"
+    public static let descriptor = ToolDescriptor(
+        name: "read_html",
+        description: "Read one local HTML workspace file as bounded Markdown with the fixed local Docling HTML converter. The format and backend are fixed; no fallback, script execution, network access, or rendering is attempted.",
+        sideEffect: .exec,
+        parameters: DocumentTextReadArguments.schema)
+    public func validateArguments(_ args: ToolArgs) throws { _ = try DocumentTextReadSupport.value(args, format: .html) }
+    public func touchedPaths(_ args: ToolArgs) -> [String] { DocumentTextReadSupport.touchedPaths(args, format: .html) }
+    public func permissionIntent(_ args: ToolArgs, workspaceRoot: URL) -> PermissionIntent { DocumentTextReadSupport.permissionIntent(args, format: .html, toolName: Self.descriptor.name, sideEffect: Self.descriptor.sideEffect) }
+    public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation { try await DocumentTextReadSupport.execute(args, format: .html, operation: Self.descriptor.name, context: context) }
+}
+
+public struct ReadEPUBTool: Tool {
+    public init() {}
+    public static let canonicalPermission: String? = "document.read"
+    public static let descriptor = ToolDescriptor(
+        name: "read_epub",
+        description: "Read one EPUB workspace file as bounded Markdown with the fixed local Docling EPUB converter. The format and backend are fixed; no fallback, edit, rendering, or network access is attempted.",
+        sideEffect: .exec,
+        parameters: DocumentTextReadArguments.schema)
+    public func validateArguments(_ args: ToolArgs) throws { _ = try DocumentTextReadSupport.value(args, format: .epub) }
+    public func touchedPaths(_ args: ToolArgs) -> [String] { DocumentTextReadSupport.touchedPaths(args, format: .epub) }
+    public func permissionIntent(_ args: ToolArgs, workspaceRoot: URL) -> PermissionIntent { DocumentTextReadSupport.permissionIntent(args, format: .epub, toolName: Self.descriptor.name, sideEffect: Self.descriptor.sideEffect) }
+    public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation { try await DocumentTextReadSupport.execute(args, format: .epub, operation: Self.descriptor.name, context: context) }
 }
 
 // MARK: - document_ocr

@@ -224,6 +224,34 @@ with warnings.catch_warnings():
         }
     }
 
+    func testOOXMLPreflightRejectsPackageWhoseContentsDoNotMatchRequestedFormat() throws {
+        guard FileManager.default.isExecutableFile(atPath: "/usr/bin/python3") else {
+            throw XCTSkip("system Python is unavailable for ZIP fixture creation")
+        }
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("intatis-ooxml-format-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let disguisedPPTX = root.appendingPathComponent("slides.docx")
+        try runPython(
+            executable: URL(fileURLWithPath: "/usr/bin/python3"),
+            arguments: [
+                "-c",
+                "import sys, zipfile; zipfile.ZipFile(sys.argv[1], 'w').writestr('ppt/presentation.xml', b'<p:presentation/>')",
+                disguisedPPTX.path,
+            ])
+
+        let envelope = try runBackend(
+            runtime: URL(fileURLWithPath: "/usr/bin/python3"),
+            operation: "read",
+            payload: .object([
+                "format": .string("docx"),
+                "input_path": .string(disguisedPPTX.path),
+            ]))
+        XCTAssertFalse(envelope.ok)
+        XCTAssertEqual(envelope.code, DocumentToolErrorCode.validationFailed.rawValue)
+    }
+
     func testFixedWritersCreateAndEditSupportedNativeFormats() throws {
         let runtime = try requireFixedRuntime()
         let root = FileManager.default.temporaryDirectory
@@ -274,12 +302,12 @@ with warnings.catch_warnings():
         let xlsxOperations = [
             operation("cell.set", [
                 "sheet": .string("Sheet"),
-                "cell": .string("A1"),
-                "value": .string("hello"),
+                "cell": .string("C3"),
+                "value": .string("sparse workbook marker"),
             ]),
             operation("style.set", [
                 "sheet": .string("Sheet"),
-                "range": .string("A1:A1"),
+                "range": .string("C3:C3"),
                 "bold": .bool(true),
             ]),
         ]
@@ -294,6 +322,22 @@ with warnings.catch_warnings():
             runVerify(runtime: runtime, format: "xlsx", input: xlsx, operations: xlsxOperations),
             format: "xlsx",
             count: 2)
+        let sparseRead = try runBackend(
+            runtime: runtime,
+            operation: "read",
+            payload: .object([
+                "format": .string("xlsx"),
+                "input_path": .string(xlsx.path),
+                "maximum_characters": .number(100_000),
+                "maximum_file_bytes": .number(512 * 1_024 * 1_024),
+            ]))
+        XCTAssertTrue(sparseRead.ok, sparseRead.summary ?? "sparse XLSX read failed")
+        guard case .object(let sparseResult)? = sparseRead.result,
+              case .string(let sparseMarkdown)? = sparseResult["markdown"] else {
+            return XCTFail("sparse XLSX Markdown result is incomplete")
+        }
+        XCTAssertTrue(sparseMarkdown.contains("sparse workbook marker"), sparseMarkdown)
+        XCTAssertEqual(sparseRead.engineVersions["openpyxl"], "3.1.5")
 
         let html = root.appendingPathComponent("created.htm")
         let htmlOperations = [operation("xpath.append", [
@@ -954,7 +998,7 @@ with zipfile.ZipFile(source, 'r') as incoming, zipfile.ZipFile(destination, 'w')
         XCTAssertFalse(FileManager.default.fileExists(atPath: closedOutput.path))
     }
 
-    func testReadDOCXHonorsHeaderFooterAndTableProjectionFlags() throws {
+    func testReadDOCXReturnsBoundedMarkdownAndRejectsProjectionControls() throws {
         let runtime = try requireFixedRuntime()
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("intatis-docx-read-flags-\(UUID().uuidString)", isDirectory: true)
@@ -993,43 +1037,34 @@ with zipfile.ZipFile(source, 'r') as incoming, zipfile.ZipFile(destination, 'w')
             payload: .object([
                 "format": .string("docx"),
                 "input_path": .string(document.path),
-                "include_headers": .bool(false),
-                "include_footers": .bool(false),
-                "include_tables": .bool(false),
+                "maximum_characters": .number(100_000),
+                "maximum_file_bytes": .number(512 * 1_024 * 1_024),
             ]))
-        XCTAssertTrue(projected.ok, projected.summary ?? "DOCX projection failed")
+        XCTAssertTrue(projected.ok, projected.summary ?? "DOCX Markdown read failed")
         guard case .object(let result)? = projected.result,
-              case .array(let paragraphs)? = result["paragraphs"],
-              case .array(let sections)? = result["sections"],
-              case .object(let firstSection)? = sections.first else {
-            return XCTFail("DOCX projection result is incomplete")
+              case .string(let markdown)? = result["markdown"] else {
+            return XCTFail("DOCX Markdown result is incomplete")
         }
-        XCTAssertTrue(paragraphs.contains { value in
-            guard case .object(let paragraph) = value else { return false }
-            return paragraph["text"] == .string("body value")
-        })
-        XCTAssertEqual(result["tables"], .array([]))
-        XCTAssertEqual(firstSection["header"], .string(""))
-        XCTAssertEqual(firstSection["footer"], .string(""))
+        XCTAssertTrue(markdown.contains("body value"), markdown)
+        XCTAssertTrue(markdown.contains("table value"), markdown)
         XCTAssertEqual(result["truncated"], .bool(false))
 
-        let defaults = try runBackend(
+        let bounded = try runBackend(
             runtime: runtime,
             operation: "read",
             payload: .object([
                 "format": .string("docx"),
                 "input_path": .string(document.path),
+                "maximum_characters": .number(10),
+                "maximum_file_bytes": .number(512 * 1_024 * 1_024),
             ]))
-        XCTAssertTrue(defaults.ok, defaults.summary ?? "default DOCX projection failed")
-        guard case .object(let defaultResult)? = defaults.result,
-              case .array(let tables)? = defaultResult["tables"],
-              case .array(let defaultSections)? = defaultResult["sections"],
-              case .object(let defaultSection)? = defaultSections.first else {
-            return XCTFail("default DOCX projection result is incomplete")
+        XCTAssertTrue(bounded.ok, bounded.summary ?? "bounded DOCX read failed")
+        guard case .object(let boundedResult)? = bounded.result,
+              case .string(let boundedMarkdown)? = boundedResult["markdown"] else {
+            return XCTFail("bounded DOCX result is incomplete")
         }
-        XCTAssertEqual(tables.count, 1)
-        XCTAssertEqual(defaultSection["header"], .string("header value"))
-        XCTAssertEqual(defaultSection["footer"], .string("footer value"))
+        XCTAssertLessThanOrEqual(boundedMarkdown.count, 10)
+        XCTAssertEqual(boundedResult["truncated"], .bool(true))
 
         let invalid = try runBackend(
             runtime: runtime,

@@ -22,16 +22,18 @@ fn invoke(operation: &str, request: Value) -> Value {
 #[test]
 fn emits_fixed_validation_envelope_for_unknown_fields() {
     let response = invoke(
-        "read",
+        "write",
         json!({
             "schema_version": 1,
             "engine": "rbook",
             "expected_version": "0.7.10",
-            "operation": "read",
+            "operation": "write",
             "payload": {
-                "input_path": "/tmp/book.epub",
-                "maximum_characters": 10,
-                "include_metadata": true,
+                "format": "epub",
+                "mode": "create",
+                "output_path": "/tmp/book.epub",
+                "operations": [],
+                "allowed_asset_paths": [],
                 "unexpected": true
             }
         }),
@@ -46,12 +48,12 @@ fn emits_fixed_validation_envelope_for_unknown_fields() {
 #[test]
 fn distinguishes_version_and_operation_failures() {
     let version = invoke(
-        "read",
+        "write",
         json!({
             "schema_version": 1,
             "engine": "rbook",
             "expected_version": "0.7.9",
-            "operation": "read",
+            "operation": "write",
             "payload": {}
         }),
     );

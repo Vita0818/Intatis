@@ -66,6 +66,7 @@ current_documents=(
     COWORK_PRINCIPLES.md
     PER_AGENT_INFERENCE_PROFILES.md
     CURRENT_UI_COLOR_SYSTEM.md
+    CHAT_HOSTED_SEARCH.md
 )
 for document in "${current_documents[@]}"; do
     require_marker "$project_root/docs/$document" \

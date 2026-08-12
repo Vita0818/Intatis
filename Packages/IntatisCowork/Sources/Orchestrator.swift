@@ -984,7 +984,26 @@ public actor Orchestrator {
             return false
         }
 
-        let reviewedResolution = await activePermissionResponder().requestResolution(request)
+        let permissionResponder = activePermissionResponder()
+        let reviewedResolution: PermissionApprovalResolution
+        switch permissionResponder.approvalMode {
+        case .manual:
+            reviewedResolution = await permissionResponder.requestResolution(request)
+        case .automaticReviewer:
+            if let automaticResponder = permissionResponder as? AgentPermissionResponder {
+                reviewedResolution = await automaticResponder
+                    .requestHostAgentAdmissionResolution(request)
+            } else {
+                reviewedResolution = PermissionApprovalResolution(
+                    decision: .deny,
+                    reason: "automatic agent admission reviewer is unavailable",
+                    risk: assessment.risk,
+                    source: .automaticReviewerFailure,
+                    reviewStatus: .failed,
+                    failureKind: .authorizationContextUnavailable,
+                    failureSource: .reviewerFailed)
+            }
+        }
         // A responder may finish concurrently with caller cancellation. Never
         // let a direct host admission path treat that stale allow as authority;
         // AgentLoop has its own equivalent post-review cancellation fence.
@@ -8868,7 +8887,11 @@ public actor Orchestrator {
             .listWorkspace,
             .searchWorkspace,
             .readPDF,
-            .documentRead,
+            .readDOCX,
+            .readPPTX,
+            .readXLSX,
+            .readHTML,
+            .readEPUB,
             .documentOCR,
             .readWorkTasks,
             .readGoal,
@@ -10970,8 +10993,30 @@ public actor Orchestrator {
         if lease.tools.contains(.readPDF) {
             register([ReadPDFTool()], granting: [.readPDF])
         }
-        if lease.tools.contains(.documentRead) {
-            register([DocumentReadTool()], granting: [.documentRead])
+        if lease.tools.contains(.readDOCX) {
+            register([ReadDOCXTool()], granting: [.readDOCX])
+        } else if lease.tools.contains(.documentRead) {
+            register([ReadDOCXTool()], granting: [.documentRead])
+        }
+        if lease.tools.contains(.readPPTX) {
+            register([ReadPPTXTool()], granting: [.readPPTX])
+        } else if lease.tools.contains(.documentRead) {
+            register([ReadPPTXTool()], granting: [.documentRead])
+        }
+        if lease.tools.contains(.readXLSX) {
+            register([ReadXLSXTool()], granting: [.readXLSX])
+        } else if lease.tools.contains(.documentRead) {
+            register([ReadXLSXTool()], granting: [.documentRead])
+        }
+        if lease.tools.contains(.readHTML) {
+            register([ReadHTMLTool()], granting: [.readHTML])
+        } else if lease.tools.contains(.documentRead) {
+            register([ReadHTMLTool()], granting: [.documentRead])
+        }
+        if lease.tools.contains(.readEPUB) {
+            register([ReadEPUBTool()], granting: [.readEPUB])
+        } else if lease.tools.contains(.documentRead) {
+            register([ReadEPUBTool()], granting: [.documentRead])
         }
         if lease.tools.contains(.documentOCR) {
             register([DocumentOCRTool()], granting: [.documentOCR])
@@ -11152,7 +11197,7 @@ public actor Orchestrator {
         }
         return ToolRegistry(
             registrations: registrations,
-            registryVersion: "intatis.cowork.v2")
+            registryVersion: "intatis.cowork.v3")
     }
 
     private static func canCoordinate(_ lease: CapabilityLease) -> Bool {

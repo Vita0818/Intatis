@@ -11,7 +11,7 @@
   no universal signed helper binary is claimed to be bundled
 
 The helper does not copy rbook source. It calls rbook's public Rust API for a
-closed EPUB2/EPUB3 subset and keeps permission review, path authorization,
+closed EPUB2/EPUB3 write subset and keeps permission review, path authorization,
 resource limits, staged output, EPUBCheck validation, and commit ownership in
 Intatis.
 
@@ -92,7 +92,7 @@ round-trip, ZIP-safety, and postcondition tests.
 
 ## Local security and semantic boundary
 
-The helper accepts only `read` and `write` under its exact schema/version
+The helper accepts only `write` under its exact schema/version
 envelope. It implements bounded spine/metadata/ToC projection and the declared
 `metadata.set`, `resource.add`, `spine.append`, and `toc.add` operations. It
 rejects command/environment injection, remote or active resource content,

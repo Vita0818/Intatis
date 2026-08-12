@@ -57,6 +57,24 @@ public struct AgentPermissionResponder: PermissionResponder {
         await controlPlane.submitResolution(request)
     }
 
+    public func requestResolution(
+        _ request: PermissionRequestPayload,
+        invocation: PermissionReviewInvocationInput
+    ) async -> PermissionApprovalResolution {
+        await controlPlane.submitResolution(
+            request,
+            invocation: invocation)
+    }
+
+    /// Dedicated host-only entry for the synthetic `agent.attach` admission
+    /// transaction. Ordinary model-authored tools must use the bound invocation
+    /// overload above and cannot obtain this exemption from request fields.
+    func requestHostAgentAdmissionResolution(
+        _ request: PermissionRequestPayload
+    ) async -> PermissionApprovalResolution {
+        await controlPlane.submitHostAgentAdmissionResolution(request)
+    }
+
     public func health() async -> PermissionReviewControlPlaneHealth {
         await controlPlane.health()
     }

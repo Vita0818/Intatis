@@ -26,7 +26,7 @@ private final class CapturingCannedChat: ChatProvider, @unchecked Sendable {
         captured.append(request)
         lock.unlock()
         return AsyncThrowingStream { continuation in
-            continuation.yield(.delta(#"{"decision":"allow","risk":"low","reason":"ok"}"#))
+            continuation.yield(.delta("The bounded write matches the user's request.\nALLOW"))
             continuation.yield(.done)
             continuation.finish()
         }
@@ -45,6 +45,47 @@ private func writeCall() -> ToolCallContext {
 
 final class IntatisPermissionReviewerTests: XCTestCase {
 
+    func testTextVerdictParserAcceptsBoundedReasonAndCaseInsensitiveASCIIMarker() throws {
+        let parsed = try XCTUnwrap(PermissionReviewTextVerdictParser.parse(
+            "The requested write is scoped to the selected workspace.\naLlOw\n\n"))
+
+        XCTAssertEqual(parsed.decision, .allow)
+        XCTAssertEqual(parsed.reason, "The requested write is scoped to the selected workspace.")
+    }
+
+    func testTextVerdictParserAcceptsDeny() throws {
+        let parsed = try XCTUnwrap(PermissionReviewTextVerdictParser.parse(
+            "The action is unrelated to the user's request.\nDENY"))
+
+        XCTAssertEqual(parsed.decision, .deny)
+        XCTAssertEqual(parsed.reason, "The action is unrelated to the user's request.")
+    }
+
+    func testTextVerdictParserRejectsMalformedOutputs() {
+        let tooLongReason = String(
+            repeating: "x",
+            count: PermissionReviewTextVerdictParser.maximumReasonCharacterCount + 1)
+        let malformed = [
+            "",
+            "ALLOW",
+            "A reason without a verdict",
+            "ALLOW\nA reason after the marker",
+            "reason\nALLOW\nDENY",
+            "reason\nALLOW.",
+            "reason\n ALLOW",
+            "reason\n\u{0410}LLOW", // Cyrillic A, not ASCII A.
+            #"{"reason":"ok","decision":"allow"}"# + "\nALLOW",
+            #"Sure: {"reason":"ok","decision":"allow"}"# + "\nALLOW",
+            "```text\nreason\n```\nALLOW",
+            "reason with an inline ``` fence\nALLOW",
+            tooLongReason + "\nALLOW",
+        ]
+
+        for output in malformed {
+            XCTAssertNil(PermissionReviewTextVerdictParser.parse(output), output)
+        }
+    }
+
     func testReviewerDoesNotInventSamplingParameters() async throws {
         let provider = CapturingCannedChat()
         let reviewer = ModelPermissionReviewer(
@@ -59,49 +100,69 @@ final class IntatisPermissionReviewerTests: XCTestCase {
 
         let request = try XCTUnwrap(provider.requests.first)
         XCTAssertNil(request.temperature)
+        let prompt = request.messages.map(\.content).joined(separator: "\n")
+        XCTAssertFalse(prompt.contains(#""decision""#))
+        XCTAssertTrue(prompt.contains("Do not return JSON"))
+        XCTAssertTrue(prompt.contains("final non-empty line"))
+        XCTAssertTrue(prompt.contains("ALLOW"))
+        XCTAssertTrue(prompt.contains("DENY"))
     }
 
     func testReviewerParsesAllow() async {
         let r = ModelPermissionReviewer(
-            provider: CannedChat(text: #"{"decision":"allow","risk":"low","reason":"ok"}"#),
+            provider: CannedChat(text: "The write is scoped and requested.\nALLOW"),
             model: ModelID(rawValue: "rev"))
         let out = await r.review(writeCall(), reviewCtx(), gateReason: "write", risk: .low)
         XCTAssertEqual(out.decision, .allow)
-        XCTAssertEqual(out.reason, "ok")
+        XCTAssertEqual(out.reason, "The write is scoped and requested.")
+        XCTAssertEqual(out.risk, .low)
     }
 
-    func testReviewerParsesDenyWithSurroundingProse() async {
+    func testReviewerParsesDenyAndKeepsHostRisk() async {
         let r = ModelPermissionReviewer(
-            provider: CannedChat(text: "Sure: {\"decision\":\"deny\",\"risk\":\"high\",\"reason\":\"unrelated\"} ."),
+            provider: CannedChat(text: "The action is unrelated to the user's request.\nDENY"),
             model: ModelID(rawValue: "rev"))
         let out = await r.review(writeCall(), reviewCtx(), gateReason: "write", risk: .medium)
         XCTAssertEqual(out.decision, .deny)
-        XCTAssertEqual(out.risk, .high)
+        XCTAssertEqual(out.reason, "The action is unrelated to the user's request.")
+        XCTAssertEqual(out.risk, .medium)
     }
 
     func testReviewerUnparseableAsksUser() async {
-        let r = ModelPermissionReviewer(provider: CannedChat(text: "no json here"), model: ModelID(rawValue: "rev"))
+        let r = ModelPermissionReviewer(
+            provider: CannedChat(text: "A reason without a final verdict"),
+            model: ModelID(rawValue: "rev"))
         let out = await r.review(writeCall(), reviewCtx(), gateReason: "write", risk: .medium)
         XCTAssertEqual(out.decision, .askUser)
+        XCTAssertEqual(out.risk, .medium)
+    }
+
+    func testReviewerRejectsLegacyJSON() async {
+        let r = ModelPermissionReviewer(
+            provider: CannedChat(text: #"{"decision":"allow","risk":"low","reason":"ok"}"#),
+            model: ModelID(rawValue: "rev"))
+        let out = await r.review(writeCall(), reviewCtx(), gateReason: "write", risk: .high)
+        XCTAssertEqual(out.decision, .askUser)
+        XCTAssertEqual(out.risk, .high)
     }
 
     func testEngineWriteUsesConfiguredModelReviewer() async {
         let reviewer = ModelPermissionReviewer(
-            provider: CannedChat(text: #"{"decision":"allow","risk":"low","reason":"fine"}"#),
+            provider: CannedChat(text: "The write is necessary and bounded.\nALLOW"),
             model: ModelID(rawValue: "rev"))
         let engine = PermissionEngine(reviewer: reviewer)
         let decision = await engine.decideDetailed(
             writeCall(),
             reviewCtx(profile: .reviewed))
         XCTAssertEqual(decision.outcome.decision, .allow)
-        XCTAssertEqual(decision.outcome.reason, "fine")
+        XCTAssertEqual(decision.outcome.reason, "The write is necessary and bounded.")
         XCTAssertTrue(decision.reviewerConsulted)
     }
 
     func testHardDenyNeverReachesReviewer() async {
         // The reviewer would say allow, but a sensitive read is a hard deny at the
         // gate — it returns `deny`, never `pass`, so the reviewer is not consulted.
-        let reviewer = ModelPermissionReviewer(provider: CannedChat(text: #"{"decision":"allow"}"#),
+        let reviewer = ModelPermissionReviewer(provider: CannedChat(text: "Looks safe.\nALLOW"),
                                                model: ModelID(rawValue: "rev"))
         let engine = PermissionEngine(reviewer: reviewer)
         let sensitive = ToolCallContext(toolName: "read_file", sideEffect: .readOnly,

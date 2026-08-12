@@ -3,7 +3,7 @@
 文档状态：当前开源复用政策
 生效日期：2026-07-12
 最近核对：2026-08-05
-产品基线：v0.40（build 40）
+产品基线：v0.48（build 48）
 
 ## 项目立场
 
@@ -423,7 +423,8 @@ external-runtime 以独立 helper/process/service 运行上游实现
   许可证 Apache-2.0。只读审计 checkout 固定在
   `d440c7cf35db2fd31e938c0555448dbaec5437d0`，但可重复构建身份以
   `Cargo.lock` 与 registry checksum 为准。
-- helper 只暴露版本化 `json-v1` 的 EPUB read/write 子集；不接受模型
+- helper 只暴露版本化 `json-v1` 的 EPUB write 子集；普通 EPUB read 已由固定
+  Docling high-level converter 承担，不再经过 rbook helper。helper 不接受模型
   command、backend、环境变量或网络地址。它仍位于 Intatis 的
   PermissionEngine、CapabilityLease、WorkspaceLease、sandbox、staging、
   EPUBCheck 和原子提交之后，不进入 iOS target。

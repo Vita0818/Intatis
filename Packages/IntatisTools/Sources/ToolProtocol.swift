@@ -1746,7 +1746,8 @@ public struct ToolRegistry: Sendable {
             GitWorktreeCreateTool(), GitWorktreeRemoveTool(),
             GitRemotesTool(), GitFetchTool(), GitPullFastForwardTool(),
             GitPushTool(), GitSwitchBranchTool(),
-            ReadPDFTool(), DocumentReadTool(), DocumentOCRTool(), DocumentRenderTool(),
+            ReadPDFTool(), ReadDOCXTool(), ReadPPTXTool(), ReadXLSXTool(),
+            ReadHTMLTool(), ReadEPUBTool(), DocumentOCRTool(), DocumentRenderTool(),
             DocumentExportPDFTool(), DocumentWriteTool(),
             CompileLaTeXTool(), GenerateImageTool(), EditImageTool(),
             WebFetchTool(), BrowserDiagnosticsTool(), BrowserProfilesTool(), BrowserProfileDeleteTool(), BrowserHistoryTool(),
@@ -1765,7 +1766,7 @@ public struct ToolRegistry: Sendable {
         // group. Keep the replacement identity explicit so a durable
         // authorization issued for the old catalog can never validate against
         // this one.
-        return ToolRegistry(tools, registryVersion: "intatis.standard.v2")
+        return ToolRegistry(tools, registryVersion: "intatis.standard.v3")
     }
 }
 

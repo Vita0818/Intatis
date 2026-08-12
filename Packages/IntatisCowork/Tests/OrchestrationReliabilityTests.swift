@@ -209,11 +209,8 @@ private final class ReliabilityWriteThenFinalProvider: ToolCallingProvider, @unc
                 continuation.yield(.toolCalls([ToolCall(
                     id: "phase-c-cancel-all-write",
                     name: "write_file",
-                    arguments: #"{"path":"phase-c.txt","content":"must not run"}"#)]))
+                    arguments: #"{"__intatis_authorization_context":"The user requested the exact bounded phase-c.txt write, and this call is the next required step.","content":"must not run","path":"phase-c.txt"}"#)]))
                 continuation.yield(.done(finishReason: "tool_calls"))
-            } else if requestNumber == 2 {
-                continuation.yield(.textDelta(#"{"report":{"authorization_goal":"Complete the exact requested Cowork task.","current_progress":"The bounded file write is ready for permission review.","latest_instruction_interpretation":"Write only the requested file in the current workspace.","current_action_justification":"The proposed write is the next required action.","scope_assessment":"The action remains within the current workspace and task."},"supporting_user_handles":["U1"]}"#))
-                continuation.yield(.done(finishReason: "stop"))
             } else {
                 continuation.yield(.textDelta("continued after reviewer shutdown"))
                 continuation.yield(.done(finishReason: "stop"))
@@ -2600,7 +2597,7 @@ final class OrchestrationReliabilityTests: XCTestCase {
         let reviewerProvider = ReliabilityDelayedProvider(
             agent: Orchestrator.automaticPermissionReviewerID,
             delayNanoseconds: 5_000_000_000,
-            response: #"{"decision":"allow","reason":"late allow"}"#,
+            response: "late allow\nALLOW",
             probe: reviewerProbe)
         let orchestrator = Orchestrator(
             log: log,
@@ -2650,8 +2647,8 @@ final class OrchestrationReliabilityTests: XCTestCase {
         XCTAssertTrue(projection.completedTasks.isEmpty)
         XCTAssertEqual(
             mainProvider.requestCount,
-            2,
-            "reviewer shutdown must not release a denial that lets the cancelled turn continue after its request-owned authorization report")
+            1,
+            "reviewer shutdown must not release a denial that lets the cancelled turn continue after its same-generation authorization sidecar")
         XCTAssertFalse(FileManager.default.fileExists(
             atPath: workspace.appendingPathComponent("phase-c.txt").path))
     }

@@ -19,10 +19,10 @@ struct DocumentBackendEnvelope: Decodable, Sendable {
     }
 }
 
-/// Thin bridge into the pinned Python document libraries. Parsing, OOXML,
-/// layout, and OCR semantics remain in the selected mature components; this
-/// program only validates a versioned request, invokes one fixed route, bounds
-/// projection size, and emits a versioned JSON envelope.
+/// Pinned Python document boundary. Ordinary DOCX/PPTX/XLSX/HTML/EPUB reads
+/// delegate conversion to Docling and only return bounded Markdown. The longer
+/// allowlisted adapters below remain for explicit write verification and OCR;
+/// they are not part of the ordinary read path.
 enum DocumentPythonBackend {
     static let schemaVersion = 1
     static let pinnedVersions: [String: String] = [
@@ -268,7 +268,7 @@ def require_request():
         raise ToolFailure('validation_failed', 'invalid request fields')
     if value['schema_version'] != SCHEMA_VERSION:
         raise ToolFailure('backend_version_mismatch', 'request schema mismatch')
-    if value['operation'] not in {'read', 'validate', 'ocr', 'write', 'verify_write', 'prepare_html_render'}:
+    if value['operation'] not in {'read', 'ocr', 'write', 'verify_write', 'prepare_html_render'}:
         raise ToolFailure('unsupported_operation', 'unsupported fixed Python route')
     if os.environ.get('INTATIS_DOCUMENT_OPERATION') != value['operation']:
         raise ToolFailure('validation_failed', 'operation binding mismatch')
@@ -413,6 +413,18 @@ def preflight_ooxml(path, format_name, preserving_xlsx=False, inspect_xlsx_formu
                 if entry.file_size > 1024 * 1024:
                     if entry.compress_size == 0 or entry.file_size / entry.compress_size > MAXIMUM_OOXML_COMPRESSION_RATIO:
                         raise ToolFailure('validation_failed', 'OOXML package compression ratio exceeds its fixed boundary')
+            main_parts = {
+                'docx': 'word/document.xml',
+                'pptx': 'ppt/presentation.xml',
+                'xlsx': 'xl/workbook.xml',
+            }
+            expected_main_part = main_parts.get(format_name)
+            present_main_parts = {part for part in main_parts.values() if part in seen}
+            if (expected_main_part is None or expected_main_part not in present_main_parts
+                    or present_main_parts != {expected_main_part}):
+                raise ToolFailure(
+                    'validation_failed',
+                    'OOXML package does not match the requested document format')
             if preserving_xlsx:
                 reject_xlsx_preservation_hazards(member_names, archive)
             elif inspect_xlsx_formulas:
@@ -452,190 +464,99 @@ class Budget:
         self.used_characters += len(encoded)
         return encoded
 
-def read_docx(payload):
-    path = safe_input(payload, '.docx')
-    preflight_ooxml(path, 'docx')
-    versions = require_versions(['python-docx'])
-    from docx import Document
-    include_headers = payload.get('include_headers', True)
-    include_footers = payload.get('include_footers', True)
-    include_tables = payload.get('include_tables', True)
-    require_boolean(include_headers, 'include_headers')
-    require_boolean(include_footers, 'include_footers')
-    require_boolean(include_tables, 'include_tables')
-    maximum_characters, maximum_items = bounds(payload)
-    budget = Budget(maximum_characters, maximum_items)
-    document = Document(str(path))
-    paragraphs = []
-    for index, paragraph in enumerate(document.paragraphs):
-        text = budget.text(paragraph.text)
-        if text is None:
-            break
-        runs = []
-        for run_index, run in enumerate(paragraph.runs):
-            run_text = budget.text(run.text)
-            if run_text is None:
-                break
-            runs.append({'index': run_index, 'text': run_text, 'bold': run.bold,
-                         'italic': run.italic, 'underline': run.underline})
-        paragraphs.append({'index': index, 'text': text,
-                           'style': paragraph.style.name if paragraph.style else None,
-                           'runs': runs})
-    tables = []
-    if include_tables:
-        for table_index, table in enumerate(document.tables):
-            rows = []
-            for row in table.rows:
-                values = []
-                for cell in row.cells:
-                    text = budget.text(cell.text)
-                    if text is None:
-                        break
-                    values.append(text)
-                rows.append(values)
-                if budget.truncated:
-                    break
-            tables.append({'index': table_index, 'rows': rows})
-            if budget.truncated:
-                break
-    sections = []
-    for index, section in enumerate(document.sections):
-        header = budget.text('\n'.join(p.text for p in section.header.paragraphs)) if include_headers else ''
-        footer = budget.text('\n'.join(p.text for p in section.footer.paragraphs)) if include_footers else ''
-        sections.append({
-            'index': index,
-            'width_emu': int(section.page_width),
-            'height_emu': int(section.page_height),
-            'header': header,
-            'footer': footer,
-        })
-    props = document.core_properties
-    result = {'format': 'docx', 'paragraphs': paragraphs, 'tables': tables,
-              'sections': sections,
-              'core_properties': {'title': props.title, 'subject': props.subject,
-                                  'author': props.author, 'keywords': props.keywords},
-              'truncated': budget.truncated}
-    return result, versions, []
+def read_markdown(payload):
+    allowed_keys = {'format', 'input_path', 'maximum_characters', 'maximum_file_bytes'}
+    if set(payload) - allowed_keys or not {'format', 'input_path'} <= set(payload):
+        raise ToolFailure('validation_failed', 'document read payload fields are invalid')
+    format_name = payload.get('format')
+    suffixes = {
+        'docx': '.docx',
+        'pptx': '.pptx',
+        'xlsx': '.xlsx',
+        'html': {'.html', '.htm'},
+        'epub': '.epub',
+    }
+    if not isinstance(format_name, str) or format_name not in suffixes:
+        raise ToolFailure('unsupported_operation', 'format has no fixed Docling reader')
+    path = safe_input(payload, suffixes[format_name])
+    if format_name in {'docx', 'pptx', 'xlsx'}:
+        preflight_ooxml(path, format_name)
 
-def read_pptx(payload):
-    path = safe_input(payload, '.pptx')
-    preflight_ooxml(path, 'pptx')
-    versions = require_versions(['python-pptx'])
-    from pptx import Presentation
-    maximum_characters, maximum_items = bounds(payload)
-    budget = Budget(maximum_characters, maximum_items)
-    presentation = Presentation(str(path))
-    slides = []
-    requested = payload.get('slides')
-    requested = set(int(v) for v in requested) if isinstance(requested, list) else None
-    for ordinal, slide in enumerate(presentation.slides, start=1):
-        if requested is not None and ordinal not in requested:
-            continue
-        shapes = []
-        for shape_index, shape in enumerate(slide.shapes):
-            entry = {'index': shape_index, 'name': shape.name,
-                     'shape_type': str(shape.shape_type)}
-            if getattr(shape, 'has_text_frame', False):
-                entry['text'] = budget.text(shape.text)
-            if getattr(shape, 'has_table', False):
-                entry['table'] = [[budget.text(cell.text) for cell in row.cells]
-                                  for row in shape.table.rows]
-            if getattr(shape, 'has_chart', False):
-                entry['chart_type'] = str(shape.chart.chart_type)
-                entry['chart_series_count'] = len(shape.chart.series)
-            shapes.append(entry)
-            if budget.truncated:
-                break
-        slides.append({'page': ordinal, 'shapes': shapes})
-        if budget.truncated:
-            break
-    return {'format': 'pptx', 'slide_count': len(presentation.slides),
-            'slides': slides, 'truncated': budget.truncated}, versions, []
+    format_dependencies = {
+        'docx': ['python-docx', 'lxml'],
+        'pptx': ['python-pptx', 'lxml'],
+        'xlsx': ['openpyxl'],
+        'html': ['lxml'],
+        'epub': ['lxml'],
+    }
+    versions = require_versions(
+        ['docling', 'docling-core', 'docling-parse'] + format_dependencies[format_name])
+    from docling.datamodel.backend_options import (
+        EpubBackendOptions, HTMLBackendOptions, MsExcelBackendOptions,
+        MsPowerpointBackendOptions, MsWordBackendOptions)
+    from docling.datamodel.base_models import ConversionStatus, InputFormat
+    from docling.datamodel.pipeline_options import ConvertPipelineOptions
+    from docling.document_converter import (
+        DocumentConverter, EpubFormatOption, ExcelFormatOption, HTMLFormatOption,
+        PowerpointFormatOption, WordFormatOption)
 
-def read_xlsx(payload):
-    path = safe_input(payload, '.xlsx')
-    preflight_ooxml(path, 'xlsx')
-    versions = require_versions(['openpyxl'])
-    from openpyxl import load_workbook
-    from openpyxl.utils.cell import range_boundaries
-    maximum_characters, maximum_items = bounds(payload)
-    maximum_cells = min(int(payload.get('maximum_cells', 10000)), 50000)
-    budget = Budget(maximum_characters, maximum_items)
-    workbook = load_workbook(str(path), read_only=True,
-                             data_only=bool(payload.get('data_only', False)),
-                             keep_links=False)
-    requested_sheet = payload.get('sheet')
-    names = [requested_sheet] if requested_sheet else list(workbook.sheetnames)
-    sheets = []
-    for name in names:
-        if name not in workbook.sheetnames:
-            raise ToolFailure('validation_failed', 'requested worksheet does not exist')
-        sheet = workbook[name]
-        cell_range = payload.get('range')
-        if cell_range:
-            min_col, min_row, max_col, max_row = range_boundaries(cell_range)
-        else:
-            min_col, min_row = 1, 1
-            max_col, max_row = sheet.max_column, sheet.max_row
-            if max_col * max_row > maximum_cells:
-                raise ToolFailure('unsupported_feature', 'large worksheet requires an explicit range')
-        if (max_col - min_col + 1) * (max_row - min_row + 1) > maximum_cells:
-            raise ToolFailure('validation_failed', 'requested range exceeds the cell limit')
-        rows = []
-        for row in sheet.iter_rows(min_row=min_row, max_row=max_row,
-                                   min_col=min_col, max_col=max_col):
-            values = []
-            for cell in row:
-                value = cell.value
-                if isinstance(value, (str, int, float, bool)) or value is None:
-                    rendered = value
-                else:
-                    rendered = str(value)
-                if isinstance(rendered, str):
-                    rendered = budget.text(rendered)
-                values.append({'coordinate': cell.coordinate, 'value': rendered,
-                               'data_type': cell.data_type})
-            rows.append(values)
-            if budget.truncated:
-                break
-        sheets.append({'name': name, 'range': cell_range, 'rows': rows})
-        if budget.truncated:
-            break
-    workbook.close()
-    return {'format': 'xlsx', 'sheet_names': list(workbook.sheetnames),
-            'sheets': sheets, 'truncated': budget.truncated}, versions, []
-
-def read_html(payload):
-    versions = require_versions(['lxml'])
-    from lxml import etree, html
-    path = safe_input(payload, {'.html', '.htm'})
-    maximum_characters, maximum_items = bounds(payload)
-    budget = Budget(maximum_characters, maximum_items)
-    parser = etree.HTMLParser(no_network=True, recover=False, huge_tree=False)
-    tree = etree.parse(str(path), parser)
-    if bool(payload.get('require_self_contained', False)):
-        validate_self_contained_html(
-            tree,
-            path,
-            payload.get('allowed_asset_paths', []))
-    expression = payload.get('xpath') or '/*'
-    if not isinstance(expression, str) or not expression:
-        raise ToolFailure('validation_failed', 'xpath must be a non-empty string')
-    selected = tree.xpath(expression)
-    if len(selected) > maximum_items:
-        raise ToolFailure('validation_failed', 'xpath result exceeds the item limit')
-    items = []
-    for index, value in enumerate(selected):
-        if isinstance(value, etree._Element):
-            text = budget.text(''.join(value.itertext()))
-            items.append({'index': index, 'tag': value.tag,
-                          'attributes': dict(value.attrib), 'text': text})
-        else:
-            items.append({'index': index, 'value': budget.text(value)})
-        if budget.truncated:
-            break
-    return {'format': 'html', 'xpath': expression, 'items': items,
-            'truncated': budget.truncated}, versions, []
+    formats = {
+        'docx': (InputFormat.DOCX, '.docx', WordFormatOption,
+                 MsWordBackendOptions(enable_remote_fetch=False,
+                                      enable_local_fetch=False,
+                                      render_chart_images=False)),
+        'pptx': (InputFormat.PPTX, '.pptx', PowerpointFormatOption,
+                 MsPowerpointBackendOptions(enable_remote_fetch=False,
+                                            enable_local_fetch=False,
+                                            render_chart_images=False)),
+        'xlsx': (InputFormat.XLSX, '.xlsx', ExcelFormatOption,
+                 MsExcelBackendOptions(enable_remote_fetch=False,
+                                       enable_local_fetch=False,
+                                       render_chart_images=False)),
+        'html': (InputFormat.HTML, {'.html', '.htm'}, HTMLFormatOption,
+                 HTMLBackendOptions(enable_remote_fetch=False,
+                                    enable_local_fetch=False,
+                                    render_page=False,
+                                    fetch_images=False)),
+        'epub': (InputFormat.EPUB, '.epub', EpubFormatOption,
+                 EpubBackendOptions(enable_remote_fetch=False,
+                                    enable_local_fetch=False,
+                                    fetch_images=False,
+                                    max_total_bytes=512 * 1024 * 1024,
+                                    max_file_bytes=256 * 1024 * 1024,
+                                    max_member_count=20000)),
+    }
+    input_format, _, option_type, backend_options = formats[format_name]
+    maximum_characters = int(payload.get('maximum_characters', 200000))
+    maximum_file_bytes = int(payload.get('maximum_file_bytes', 512 * 1024 * 1024))
+    if not 1 <= maximum_characters <= 500000 or not 1 <= maximum_file_bytes <= 512 * 1024 * 1024:
+        raise ToolFailure('validation_failed', 'document read bounds are invalid')
+    pipeline_options = ConvertPipelineOptions(
+        document_timeout=240.0,
+        enable_remote_services=False,
+        allow_external_plugins=False,
+        do_picture_classification=False,
+        do_picture_description=False,
+        do_chart_extraction=False)
+    converter = DocumentConverter(
+        allowed_formats=[input_format],
+        format_options={input_format: option_type(
+            pipeline_options=pipeline_options,
+            backend_options=backend_options)})
+    conversion = converter.convert(
+        str(path),
+        raises_on_error=True,
+        max_num_pages=100000,
+        max_file_size=maximum_file_bytes)
+    if conversion.status != ConversionStatus.SUCCESS or conversion.errors:
+        raise ToolFailure('backend_failed', 'fixed Docling conversion did not complete')
+    markdown = conversion.document.export_to_markdown(
+        image_placeholder='<!-- image omitted -->',
+        traverse_pictures=False)
+    truncated = len(markdown) > maximum_characters
+    return {'format': format_name,
+            'markdown': markdown[:maximum_characters],
+            'truncated': truncated}, versions, []
 
 def validate_self_contained_html(tree, input_path, allowed_asset_paths):
     from urllib.parse import urlsplit
@@ -2486,28 +2407,6 @@ def verify_native_write(payload):
         return verify_html_write(input_path, operations, allowed_assets)
     raise ToolFailure('unsupported_operation', 'format has no fixed Python write verifier')
 
-def validate_native(payload):
-    format_name = payload.get('format')
-    if format_name == 'docx':
-        result, versions, warnings = read_docx({**payload, 'maximum_characters': 1,
-                                               'maximum_items': 1})
-    elif format_name == 'pptx':
-        result, versions, warnings = read_pptx({**payload, 'maximum_characters': 1,
-                                               'maximum_items': 1})
-    elif format_name == 'xlsx':
-        result, versions, warnings = read_xlsx({**payload, 'maximum_characters': 1,
-                                               'maximum_items': 1,
-                                               'maximum_cells': 1,
-                                               'sheet': None, 'range': 'A1'})
-    elif format_name == 'html':
-        result, versions, warnings = read_html({**payload, 'maximum_characters': 1,
-                                               'maximum_items': 1, 'xpath': '/*',
-                                               'require_self_contained': bool(payload.get('require_self_contained', False)),
-                                               'allowed_asset_paths': payload.get('allowed_asset_paths', [])})
-    else:
-        raise ToolFailure('unsupported_operation', 'format has no fixed Python validator')
-    return {'format': format_name, 'valid': True}, versions, warnings
-
 def contiguous_page_runs(pages):
     runs = []
     for page in pages:
@@ -2616,19 +2515,7 @@ def run_ocr(payload):
 def main():
     operation, payload = require_request()
     if operation == 'read':
-        format_name = payload.get('format')
-        if format_name == 'docx':
-            result, versions, warnings = read_docx(payload)
-        elif format_name == 'pptx':
-            result, versions, warnings = read_pptx(payload)
-        elif format_name == 'xlsx':
-            result, versions, warnings = read_xlsx(payload)
-        elif format_name == 'html':
-            result, versions, warnings = read_html(payload)
-        else:
-            raise ToolFailure('unsupported_operation', 'format has no fixed Python reader')
-    elif operation == 'validate':
-        result, versions, warnings = validate_native(payload)
+        result, versions, warnings = read_markdown(payload)
     elif operation == 'ocr':
         result, versions, warnings = run_ocr(payload)
     elif operation == 'write':

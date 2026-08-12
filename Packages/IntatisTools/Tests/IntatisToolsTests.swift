@@ -1694,10 +1694,17 @@ final class IntatisToolsTests: XCTestCase {
         XCTAssertTrue(pdf.contains("never performs OCR"))
         XCTAssertTrue(pdf.contains("document_ocr"))
 
-        let document = DocumentReadTool.descriptor.description
-        XCTAssertTrue(document.contains("single fixed local parser"))
-        XCTAssertTrue(document.contains("PDF is intentionally handled"))
-        XCTAssertTrue(document.contains("No fallback backend"))
+        let readers = [
+            ReadDOCXTool.descriptor,
+            ReadPPTXTool.descriptor,
+            ReadXLSXTool.descriptor,
+            ReadHTMLTool.descriptor,
+            ReadEPUBTool.descriptor,
+        ]
+        for reader in readers {
+            XCTAssertTrue(reader.description.contains("fixed local Docling"), reader.name)
+            XCTAssertTrue(reader.description.contains("no fallback"), reader.name)
+        }
 
         let ocr = DocumentOCRTool.descriptor.description
         XCTAssertTrue(ocr.contains("explicit offline OCR"))
@@ -3929,8 +3936,8 @@ final class IntatisToolsTests: XCTestCase {
 
     func testStandardRegistry() {
         let reg = ToolRegistry.standard()
-        XCTAssertEqual(reg.registryVersion, "intatis.standard.v2")
-        XCTAssertEqual(reg.descriptors().count, 62)
+        XCTAssertEqual(reg.registryVersion, "intatis.standard.v3")
+        XCTAssertEqual(reg.descriptors().count, 66)
         XCTAssertNotNil(reg.tool(named: "read_file"))
         XCTAssertNotNil(reg.tool(named: "apply_patch"))
         XCTAssertNil(reg.tool(named: "run_shell"))
@@ -3959,7 +3966,12 @@ final class IntatisToolsTests: XCTestCase {
         XCTAssertNotNil(reg.tool(named: "git_push"))
         XCTAssertNotNil(reg.tool(named: "git_switch"))
         XCTAssertNotNil(reg.tool(named: "read_pdf"))
-        XCTAssertNotNil(reg.tool(named: "document_read"))
+        XCTAssertNotNil(reg.tool(named: "read_docx"))
+        XCTAssertNotNil(reg.tool(named: "read_pptx"))
+        XCTAssertNotNil(reg.tool(named: "read_xlsx"))
+        XCTAssertNotNil(reg.tool(named: "read_html"))
+        XCTAssertNotNil(reg.tool(named: "read_epub"))
+        XCTAssertNil(reg.tool(named: "document_read"))
         XCTAssertNotNil(reg.tool(named: "document_ocr"))
         XCTAssertNotNil(reg.tool(named: "document_render"))
         XCTAssertNotNil(reg.tool(named: "document_export_pdf"))
