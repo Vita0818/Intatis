@@ -13,6 +13,20 @@ private let workTaskStringArraySchema: JSONValue = .object([
     "items": workTaskStringSchema,
 ])
 
+private let workTaskEvidenceArraySchema: JSONValue = .object([
+    "type": .string("array"),
+    "items": .object([
+        "type": .string("object"),
+        "properties": .object([
+            "kind": workTaskStringSchema,
+            "reference": workTaskStringSchema,
+            "summary": workTaskStringSchema,
+        ]),
+        "required": .array([.string("kind"), .string("reference"), .string("summary")]),
+        "additionalProperties": .bool(false),
+    ]),
+])
+
 private func encodeWorkTaskToolResult<T: Encodable>(_ value: T) throws -> String {
     let encoder = JSONEncoder()
     encoder.dateEncodingStrategy = .iso8601
@@ -202,19 +216,7 @@ public struct TaskUpdateTool: Tool {
                     ]),
                 ]),
                 "result": .object(["type": .string("string")]),
-                "evidence": .object([
-                    "type": .string("array"),
-                    "items": .object([
-                        "type": .string("object"),
-                        "properties": .object([
-                            "kind": workTaskStringSchema,
-                            "reference": workTaskStringSchema,
-                            "summary": workTaskStringSchema,
-                        ]),
-                        "required": .array([.string("kind"), .string("reference"), .string("summary")]),
-                        "additionalProperties": .bool(false),
-                    ]),
-                ]),
+                "evidence": workTaskEvidenceArraySchema,
                 "retry": .object(["type": .string("boolean")]),
             ]),
             "required": .array([.string("task_id"), .string("expected_revision")]),
@@ -337,6 +339,60 @@ public struct TaskUpdateTool: Tool {
                 rawID: request.taskID.rawValue,
                 underlyingError: error)
         }
+    }
+}
+
+/// Capability-projected model surface for an ordinary worker. The stable
+/// provider-facing name is preserved, while manager-only contract and graph
+/// fields are absent from the schema and therefore fail before authorization.
+struct OwnedWorkTaskUpdateTool: Tool {
+    init() {}
+
+    static let descriptor = ToolDescriptor(
+        name: "task_update",
+        description: "Update only the current WorkTask assigned to you. Use task_get to obtain its latest authoritative revision, then send only progress_note, a permitted status transition, result, or evidence. The host still verifies current ownership, binding, revision, and status transition. Contract fields, owner, dependencies, priority, retry, and cancellation are manager-only.",
+        sideEffect: .write,
+        parameters: .object([
+            "type": .string("object"),
+            "properties": .object([
+                "task_id": .object([
+                    "type": .string("string"),
+                    "minLength": .number(1),
+                    "description": .string("Durable WorkTask ID, normally wt_…. Do not pass an AgentInvocation task_… ID."),
+                ]),
+                "expected_revision": .object([
+                    "type": .string("integer"),
+                    "minimum": .number(0),
+                ]),
+                "progress_note": .object(["type": .string("string")]),
+                "status": .object([
+                    "type": .string("string"),
+                    "enum": .array([
+                        .string(WorkTaskStatus.inProgress.rawValue),
+                        .string(WorkTaskStatus.blocked.rawValue),
+                        .string(WorkTaskStatus.completed.rawValue),
+                        .string(WorkTaskStatus.failed.rawValue),
+                    ]),
+                ]),
+                "result": .object(["type": .string("string")]),
+                "evidence": workTaskEvidenceArraySchema,
+            ]),
+            "required": .array([.string("task_id"), .string("expected_revision")]),
+            "additionalProperties": .bool(false),
+        ]))
+
+    func permissionIntent(_ args: ToolArgs, workspaceRoot: URL) -> PermissionIntent {
+        TaskUpdateTool().permissionIntent(args, workspaceRoot: workspaceRoot)
+    }
+
+    func permissionActionPreview(
+        _ args: ToolArgs
+    ) -> PermissionActionPreview? {
+        TaskUpdateTool().permissionActionPreview(args)
+    }
+
+    func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {
+        try await TaskUpdateTool().execute(args, in: context)
     }
 }
 

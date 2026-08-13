@@ -1426,6 +1426,67 @@ final class ToolRegistryLeaseTests: XCTestCase {
         XCTAssertFalse(toolNames.contains("update_goal"))
     }
 
+    func testWorkerTaskUpdateSchemaExposesOnlyOwnedProgressAndSettlementFields() throws {
+        let workerRegistry = Orchestrator.toolRegistry(
+            for: .worker(taskID: TaskID(rawValue: "task_worker")))
+        let workerRegistration = try XCTUnwrap(
+            workerRegistry.registration(named: "task_update"))
+        let workerSchemaData = try JSONEncoder().encode(
+            workerRegistration.descriptor.parameters)
+        let workerSchema = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: workerSchemaData) as? [String: Any])
+        let workerProperties = try XCTUnwrap(
+            workerSchema["properties"] as? [String: Any])
+
+        XCTAssertEqual(workerRegistry.registryVersion, "intatis.cowork.v3")
+        XCTAssertEqual(
+            workerRegistration.grantingCapabilities,
+            [.updateOwnedWorkTask])
+        XCTAssertEqual(
+            Set(workerProperties.keys),
+            Set([
+                "task_id", "expected_revision", "progress_note",
+                "status", "result", "evidence",
+            ]))
+        XCTAssertEqual(
+            workerSchema["required"] as? [String],
+            ["task_id", "expected_revision"])
+        XCTAssertEqual(workerSchema["additionalProperties"] as? Bool, false)
+        let workerStatus = try XCTUnwrap(
+            workerProperties["status"] as? [String: Any])
+        XCTAssertEqual(
+            Set(workerStatus["enum"] as? [String] ?? []),
+            Set([
+                WorkTaskStatus.inProgress.rawValue,
+                WorkTaskStatus.blocked.rawValue,
+                WorkTaskStatus.completed.rawValue,
+                WorkTaskStatus.failed.rawValue,
+            ]))
+
+        let managerRegistry = Orchestrator.toolRegistry(
+            for: .coordinator(taskID: TaskID(rawValue: "task_manager")))
+        let managerRegistration = try XCTUnwrap(
+            managerRegistry.registration(named: "task_update"))
+        let managerSchemaData = try JSONEncoder().encode(
+            managerRegistration.descriptor.parameters)
+        let managerSchema = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: managerSchemaData) as? [String: Any])
+        let managerProperties = try XCTUnwrap(
+            managerSchema["properties"] as? [String: Any])
+
+        XCTAssertEqual(
+            managerRegistration.grantingCapabilities,
+            [.manageWorkTasks])
+        XCTAssertEqual(
+            Set(managerProperties.keys),
+            Set([
+                "task_id", "expected_revision", "title", "description",
+                "acceptance_criteria", "expected_artifacts", "owner",
+                "depends_on", "priority", "progress_note", "status",
+                "result", "evidence", "retry",
+            ]))
+    }
+
     func testCoordinatorLeaseCanExposeDelegationTools() {
         let registry = Orchestrator.toolRegistry(for: .coordinator(taskID: TaskID(rawValue: "task_coord")))
         let toolNames = Set(registry.descriptors().map(\.name))

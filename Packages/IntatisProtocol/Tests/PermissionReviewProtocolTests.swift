@@ -125,6 +125,31 @@ final class PermissionReviewProtocolTests: XCTestCase {
         XCTAssertEqual(failureKind, .providerStillStopping)
     }
 
+    func testLegacyMalformedVerdictAndTypedReviewerDiagnosticsRemainCodable() throws {
+        let kinds: [PermissionApprovalFailureKind] = [
+            .malformedVerdict,
+            .reviewerIncompleteResponse,
+            .reviewerNonSuccessFinish,
+            .reviewerVerdictMissingMarker,
+            .reviewerVerdictMultipleMarkers,
+            .reviewerVerdictNotFinal,
+            .reviewerVerdictMissingReason,
+            .reviewerVerdictStructuredOutput,
+        ]
+
+        for kind in kinds {
+            let data = try JSONEncoder().encode(kind)
+            XCTAssertEqual(
+                try JSONDecoder().decode(PermissionApprovalFailureKind.self, from: data),
+                kind)
+        }
+        XCTAssertEqual(
+            try JSONDecoder().decode(
+                PermissionApprovalFailureKind.self,
+                from: Data(#""malformed_verdict""#.utf8)),
+            .malformedVerdict)
+    }
+
     func testAuthorizationContextRoundTripsWithoutModelSuppliedBindingFields() throws {
         let causal = PermissionReviewCausalContext(
             userGoal: "Update the report",

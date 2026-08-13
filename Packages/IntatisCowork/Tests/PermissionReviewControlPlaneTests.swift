@@ -1159,14 +1159,15 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
         XCTAssertEqual(resolution.decision, .deny)
         XCTAssertEqual(resolution.source, .automaticReviewerFailure)
         XCTAssertEqual(resolution.reviewStatus, .failed)
-        XCTAssertEqual(resolution.failureKind, .malformedVerdict)
-        XCTAssertTrue(resolution.reason?.contains("malformed plain-text verdict") == true)
+        XCTAssertEqual(resolution.failureKind, .reviewerVerdictMissingMarker)
+        XCTAssertTrue(resolution.reason?.contains("did not end with one exact") == true)
         let settled = await log.replay().compactMap { envelope -> PermissionReviewSettledPayload? in
             if case .permissionReviewSettled(let payload) = envelope.event { return payload }
             return nil
         }
         XCTAssertEqual(settled.last?.status, .failed)
-        XCTAssertTrue(settled.last?.reason.contains("malformed plain-text verdict") == true)
+        XCTAssertEqual(settled.last?.failureKind, .reviewerVerdictMissingMarker)
+        XCTAssertTrue(settled.last?.reason.contains("did not end with one exact") == true)
         XCTAssertFalse(settled.last?.reason.contains("tool call") == true)
     }
 
@@ -1210,8 +1211,178 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
         XCTAssertEqual(resolution.decision, .deny)
         XCTAssertEqual(resolution.source, .automaticReviewerFailure)
         XCTAssertEqual(resolution.reviewStatus, .failed)
-        XCTAssertEqual(resolution.failureKind, .malformedVerdict)
-        XCTAssertTrue(resolution.reason?.contains("malformed plain-text verdict") == true)
+        XCTAssertEqual(resolution.failureKind, .reviewerVerdictMissingReason)
+        XCTAssertTrue(resolution.reason?.contains("without a nonempty reason") == true)
+    }
+
+    func testReviewerVerdictDiagnosticsAreTypedAndDoNotPersistRawOutput() async throws {
+        let (log, workspace) = try makeLogAndWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let cases: [(id: String, output: String, kind: PermissionApprovalFailureKind)] = [
+            (
+                "missing_marker",
+                "RAW_REVIEW_MISSING_MARKER",
+                .reviewerVerdictMissingMarker
+            ),
+            (
+                "multiple_markers",
+                "RAW_REVIEW_MULTIPLE_MARKERS\nALLOW\nDENY",
+                .reviewerVerdictMultipleMarkers
+            ),
+            (
+                "marker_not_final",
+                "RAW_REVIEW_NOT_FINAL\nALLOW\nRAW_TRAILING_TEXT",
+                .reviewerVerdictNotFinal
+            ),
+            (
+                "missing_reason",
+                "ALLOW",
+                .reviewerVerdictMissingReason
+            ),
+            (
+                "structured_output",
+                #"{"marker":"RAW_REVIEW_STRUCTURED","decision":"allow"}"#,
+                .reviewerVerdictStructuredOutput
+            ),
+            (
+                "code_fenced_output",
+                "```text\nRAW_REVIEW_CODE_FENCED\nALLOW\n```",
+                .reviewerVerdictStructuredOutput
+            ),
+        ]
+        let provider = ReviewScriptedProvider(cases.map { item in
+            [
+                .textDelta(item.output),
+                .done(finishReason: "stop"),
+            ]
+        })
+        let responder = makeResponder(
+            log: log,
+            workspace: workspace,
+            provider: provider)
+
+        for item in cases {
+            let resolution = await responder.requestResolution(
+                permissionRequest(id: "req_\(item.id)"))
+            XCTAssertEqual(resolution.decision, .deny, item.id)
+            XCTAssertEqual(resolution.source, .automaticReviewerFailure, item.id)
+            XCTAssertEqual(resolution.reviewStatus, .failed, item.id)
+            XCTAssertEqual(resolution.failureKind, item.kind, item.id)
+        }
+
+        let events = await log.replay()
+        let settlements = events.compactMap {
+            envelope -> PermissionReviewSettledPayload? in
+            guard case .permissionReviewSettled(let payload) = envelope.event else {
+                return nil
+            }
+            return payload
+        }
+        XCTAssertEqual(
+            Array(settlements.suffix(cases.count)).map(\.failureKind),
+            cases.map { Optional($0.kind) })
+        let durableText = try events.map {
+            String(decoding: try Envelope.makeEncoder().encode($0), as: UTF8.self)
+        }.joined(separator: "\n")
+        for rawMarker in [
+            "RAW_REVIEW_MISSING_MARKER",
+            "RAW_REVIEW_MULTIPLE_MARKERS",
+            "RAW_REVIEW_NOT_FINAL",
+            "RAW_TRAILING_TEXT",
+            "RAW_REVIEW_STRUCTURED",
+            "RAW_REVIEW_CODE_FENCED",
+        ] {
+            XCTAssertFalse(durableText.contains(rawMarker), rawMarker)
+        }
+    }
+
+    func testReviewerAcceptsLongReasonAndKeepsLiveSettlementHostOwned() async throws {
+        let (log, workspace) = try makeLogAndWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let reason = String(repeating: "x", count: 1_000)
+        let provider = ReviewControlPlaneProvider(chunks: [
+            .textDelta("\(reason)\nALLOW"),
+            .done(finishReason: "stop"),
+        ])
+        let responder = makeResponder(log: log, workspace: workspace, provider: provider)
+
+        let resolution = await responder.requestResolution(
+            permissionRequest(id: "req_long_reason"))
+
+        XCTAssertEqual(resolution.decision, .allow)
+        XCTAssertNil(resolution.failureKind)
+        XCTAssertEqual(
+            resolution.reason,
+            "automatic reviewer allowed the bound tool invocation")
+        let events = await log.replay()
+        let settled = try XCTUnwrap(events.compactMap {
+            envelope -> PermissionReviewSettledPayload? in
+            guard case .permissionReviewSettled(let payload) = envelope.event else {
+                return nil
+            }
+            return payload
+        }.last)
+        XCTAssertEqual(settled.status, .allowed)
+        XCTAssertEqual(settled.reason, resolution.reason)
+        XCTAssertLessThan(settled.reason.count, reason.count)
+    }
+
+    func testReviewerScansSensitiveMaterialAfterFormerReasonLimitBeforeBounding() async throws {
+        let (log, workspace) = try makeLogAndWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+        let reason = String(repeating: "x", count: 300) + " " + secret
+        let provider = ReviewControlPlaneProvider(chunks: [
+            .textDelta("\(reason)\nALLOW"),
+            .done(finishReason: "stop"),
+        ])
+        let responder = makeResponder(log: log, workspace: workspace, provider: provider)
+
+        let resolution = await responder.requestResolution(
+            permissionRequest(id: "req_long_secret_reason"))
+
+        XCTAssertEqual(resolution.decision, .deny)
+        XCTAssertEqual(resolution.failureKind, .reviewerContractViolation)
+        XCTAssertTrue(resolution.reason?.contains("secret-bearing reason") == true)
+        let events = await log.replay()
+        let durableText = try events.map {
+            String(decoding: try Envelope.makeEncoder().encode($0), as: UTF8.self)
+        }.joined(separator: "\n")
+        XCTAssertFalse(durableText.contains(secret))
+        XCTAssertFalse(durableText.contains(String(repeating: "x", count: 300)))
+    }
+
+    func testReviewerTransportFailuresAreDistinctFromTextFormatFailures() async throws {
+        let incomplete = try makeLogAndWorkspace()
+        defer { try? FileManager.default.removeItem(at: incomplete.1) }
+        let incompleteProvider = ReviewControlPlaneProvider(chunks: [
+            .textDelta("valid reason\nALLOW"),
+        ])
+        let incompleteResolution = await makeResponder(
+            log: incomplete.0,
+            workspace: incomplete.1,
+            provider: incompleteProvider).requestResolution(
+                permissionRequest(id: "req_incomplete_transport"))
+        XCTAssertEqual(
+            incompleteResolution.failureKind,
+            .reviewerIncompleteResponse)
+
+        let nonSuccess = try makeLogAndWorkspace()
+        defer { try? FileManager.default.removeItem(at: nonSuccess.1) }
+        let nonSuccessProvider = ReviewControlPlaneProvider(chunks: [
+            .textDelta("valid reason\nALLOW"),
+            .done(finishReason: "length"),
+        ])
+        let nonSuccessResolution = await makeResponder(
+            log: nonSuccess.0,
+            workspace: nonSuccess.1,
+            provider: nonSuccessProvider).requestResolution(
+                permissionRequest(id: "req_non_success_finish"))
+        XCTAssertEqual(
+            nonSuccessResolution.failureKind,
+            .reviewerNonSuccessFinish)
+        XCTAssertTrue(
+            nonSuccessResolution.reason?.contains("output-token limit") == true)
     }
 
     func testReviewerCannotDowngradeDeterministicGateRisk() async throws {
@@ -1643,7 +1814,14 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
         let reviewerSystemPrompt = try XCTUnwrap(reviewerRequest.messages.first?.content)
         XCTAssertTrue(reviewerSystemPrompt.contains("automatic permission reviewer"))
         XCTAssertTrue(reviewerSystemPrompt.contains("ALLOW or DENY"))
+        XCTAssertTrue(reviewerSystemPrompt.contains("This length is guidance only"))
         XCTAssertFalse(reviewerSystemPrompt.contains("ask_user"))
+        let reviewerPrompt = reviewerRequest.messages
+            .compactMap(\.content).joined(separator: "\n")
+        XCTAssertEqual(
+            reviewerPrompt.components(
+                separatedBy: PermissionReviewTextVerdictParser.modelOutputContract).count - 1,
+            2)
         let lifecycle = await log.replay().compactMap { envelope -> String? in
             switch envelope.event {
             case .permissionReviewRequested(let payload):

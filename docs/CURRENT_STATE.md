@@ -182,9 +182,11 @@ macOS 是完整产品：Chat、Code、Cowork、Settings 和本地诊断导出。
   把未执行动作说成完成，restart 不恢复一条从未发生的权限拒绝。sidecar 与 exact call/generation/business
   digest 无法绑定时则单独 typed fail closed。manual/nonautomatic flow 不接收 transient input，若模型仍发送
   保留字段则在 business execution 前以 redacted audit + `authorization_context_mode_mismatch` 拒绝。图片存在
-  本身不再 blanket deny。最终 reviewer 仍无工具，只接受非空短 reason +
-  末个非空行 exact ASCII `ALLOW` / `DENY`；旧 JSON、tool call、无 completion marker、非成功 finish、
-  timeout/provider/cancel/persistence failure 均 fail closed，risk 始终来自 host gate。live bound review 的
+  本身不再 blanket deny。最终 reviewer 仍无工具，只接受非空 plain-text reason +
+  末个非空行唯一 exact ASCII `ALLOW` / `DENY`。共享 prompt 建议 reason 约 240 Character，但 parser 不再
+  因超长单独拒绝；宿主先扫描完整 reason 的敏感信息，再有界化任何需要交付的摘要。旧 JSON/code fence、
+  缺失/重复/非末行 marker、空 reason、tool call、无 completion marker、非成功 finish、
+  timeout/provider/cancel/persistence failure 均以 secret-free 细分类型 fail closed，risk 始终来自 host gate。live bound review 的
   model-authored reason 与 provider diagnostic 可能复述 transient input，因此 durable settlement/tool-result
   只使用固定宿主文案。automatic responder 缺 bound-invocation overload、cached/active duplicate 缺失或更换
   transient invocation、recovered automatic allow 再交付，以及 Cowork 误配 in-engine reviewer 均 fail closed。
@@ -210,7 +212,12 @@ macOS 是完整产品：Chat、Code、Cowork、Settings 和本地诊断导出。
   不终结长期协作。失败只在同一 TaskID 上有界重试；task completion、candidate progress 与 consumed
   IDs 同批落盘后才 ack。legacy nil binding 的歧义或耗尽 lineage 保持 pending/fail closed，新消息仍
   可独立投递。WorkTask 工具的 reviewer preview 已补齐 bounded semantic fields，并明确 `wt_…`、
-  AgentInvocation `task_…` 与 latest revision 的边界。
+  AgentInvocation `task_…` 与 latest revision 的边界。普通 worker 的同名 `task_update` 现由
+  `update_owned_work_task` capability 投影为窄业务 schema，只提供 `task_id`、
+  `expected_revision`、`progress_note`、允许的 `status`、`result` 与 `evidence`；manager 的完整
+  合同、owner、DAG、priority、retry/cancel 更新面保持不变。worker 未知/管理字段由 closed schema
+  在授权与执行前拒绝，宿主仍继续核对当前 binding、owner、revision 与真实状态转换；automatic
+  模式既有的 request-owned authorization sidecar 装饰不变，不属于 WorkTask 业务字段。
 - Cowork 中每个 agent 的文件、Git、文档、浏览器文件与 terminal 工具仍只作用于自己的单一
   `workspaceRoot`。具有 `spawn_agent` 的 coordinator 提示词会在预知目标位于根外或收到
   out-of-workspace denial 后停止直接重试，改为按目标绝对目录创建默认只读的子 agent，再用
@@ -420,6 +427,20 @@ profiles 与外部 MCP client。macOS/Linux 的 stdio、sandbox、bwrap/guard �
 
 ## 最近验证状态
 
+- 2026-08-13 Permission Reviewer plain-text verdict 格式修复：240 Character 从有效性硬上限改为共享
+  prompt 的简洁度建议；241/500/1000 Character 的非敏感 `ALLOW` 与 `DENY` reason 均保留原决定。
+  完整 reason 在任何摘要截断前先做敏感信息检查；live bound settlement 继续只写固定宿主文案。
+  缺失/重复/非末行 marker、空 reason、JSON/code fence、无 completion 与非成功 finish 分别保留 typed、
+  secret-free failure kind，旧 `malformed_verdict` / `provider_still_stopping` 继续可解码。
+  `PermissionReviewProtocolTests` 13/13、`IntatisPermissionReviewerTests` 14/14、
+  `PermissionReviewControlPlaneTests` 51/51，合计 78/78、0 failures。未运行全量 test、macOS/iOS app
+  build、真实 provider 或 GUI smoke。
+- 2026-08-12 Cowork ordinary-worker WorkTask update 收窄：worker 继续使用稳定的 `task_update`
+  名称与既有执行/权限/持久化链，但业务字段仅保留当前任务的进度、允许状态、结果和证据；
+  manager 的完整更新字段未收窄。`ToolRegistryLeaseTests` 26/26、`WorkTaskRuntimeTests` 22/22，
+  另有 closed-schema pre-permission/execution gate 1/1，相关合计 49/49、0 failures；
+  `swift build --disable-automatic-resolution` 通过。未运行全量 test、macOS/iOS app build、真实
+  provider 或 GUI smoke。
 - 2026-08-12 Cowork dependent-call / `task_create` owner corrective gate：Code/Cowork 共享 `RuntimeEnvironmentManifest`、`task_create` descriptor/schema 与 bundled `cowork-agent-orchestration` Skill 现在共同声明 multi-call batch 非事务且不提供并发保证，只 batch 任意 host order 下仍正确的独立 calls；identity/ID/attachment/state 依赖必须等待成功 ToolResult 后跨轮使用。`task_create.owner` 保持业务可选，但只能引用较早成功 `list_agents` / `spawn_agent` ToolResult 已确认的 attached data-plane agent；多 worker 使用 ownerless creates → await → spawns → await → delegate confirmed pairs。production Orchestrator manager 将 create 的 capability/run/title/owner/dependency/graph rejection 只在首次 WorkTask EventLog append 前转换成 typed `not_started`；append 后 lost-ack 注入仍保持 unknown/manual。缺失 host-bound WorkTask manager 时 create/update 也不再伪报成功，而是返回明确的 pre-execution `not_started` rejection。Skill quick validation、独立真实 6-task/6-agent 反向 exercise、Context/Skill/schema/manager/owner-preflight/post-append 与 AgentLoop notStarted-vs-unknown focused tests 均通过；相关四组测试合计 111/111。未运行真实 provider 或 GUI smoke。
 - 2026-08-11 fixed-format document reader 拆分与瘦身 gate：完整 `IntatisToolsTests` 223/223
   （19 skipped）、`AgentLoopPolicyTests` 36/36、`CapabilityLeaseTests` 7/7、

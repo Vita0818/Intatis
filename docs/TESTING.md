@@ -439,6 +439,9 @@ recovery App metadata/architecture/signature/entitlements 重新验证；超时�
   coordinator 能力，工具缺失/扩展拒绝只报告 blocker，直接越界仍 fail closed；
 - runtime stop 先 drain provider/tool/process，再释放 waiter/subscription/scope；
 - Cowork worker 默认无 coordinator tools，reviewer/verifier 不进入普通 scheduler；
+- ordinary worker 的 `task_update` closed business schema 只含当前任务的 ID/revision、进度、允许状态、
+  结果与证据，manager 的完整 schema 不受影响；两者仍保留同一稳定工具名，worker 管理字段在权限/执行前
+  拒绝，automatic request-owned authorization sidecar 装饰仍独立保留；
 - iOS target closure 不出现 Tools/Permission/AgentKernel/Cowork/MCP。
 
 精确不变量见 `docs/DO_NOT_BREAK.md`。
@@ -1054,6 +1057,21 @@ INTATIS_REAL_MULTIMODAL_SMOKE=1 swift test \
   `audio/transcriptions`，因此录音设备、具体 provider 方言、模型可用性、计费与运行态像素仍为
   `UNKNOWN`，需要下一步手动 smoke；本轮未执行签名、公证、staple、Gatekeeper 或发行打包。
 
+2026-08-13 Permission Reviewer plain-text verdict 格式修复的直接证据：
+
+- `PermissionReviewTextVerdictParser` 对 241/500/1000 Character 的非敏感 reason 不因长度改判，仍要求
+  非空 plain text 与唯一 final-line ASCII `ALLOW` / `DENY`；system/user prompt 都引用同一份合同；
+- 完整长 reason 在任何摘要截断前先经过敏感信息检查，尾部 token fixture 会 fail closed 且不进入
+  EventLog；live bound settlement 仍使用固定宿主文案；
+- 缺 marker、多个 marker、marker 后有文本、空 reason、JSON/code fence、无 completion marker 与
+  非成功 finish reason 分别验证 secret-free typed diagnosis；旧 `malformed_verdict` 与
+  `provider_still_stopping` 仍可解码；
+- 聚焦命令
+  `swift test --disable-automatic-resolution --filter 'IntatisPermissionReviewerTests|PermissionReviewProtocolTests|PermissionReviewControlPlaneTests'`
+  通过：`PermissionReviewProtocolTests` 13/13、`IntatisPermissionReviewerTests` 14/14、
+  `PermissionReviewControlPlaneTests` 51/51，合计 78/78、0 failures；完成相关 package Debug 编译。
+  未运行全量 test、macOS/iOS app build、真实 reviewer provider、credential/network 或 GUI smoke。
+
 2026-08-12 Cowork dependent-call / `task_create` owner 修正的直接证据：
 
 - `intatis-skill-creator/scripts/quick_validate.py`：`Skill is valid`；另用真实失败形态“同一 response 中 6 个 `task_create(owner=future)` + 6 个 `spawn_agent`”做独立只读 exercise，三层合同唯一导向 ownerless create → wait → spawn → wait → delegate confirmed pairs；
@@ -1062,6 +1080,20 @@ INTATIS_REAL_MULTIMODAL_SMOKE=1 swift test \
 - `WorkTaskRuntimeTests.testTaskCreateDescriptorRequiresConfirmedAttachedOwnerWithoutMakingItRequired`、`testMutatingWorkTaskToolsRejectMissingHostManagerAsNotStarted`、`testOrchestratorManagerProvesUnattachedCreateOwnerBeforeMutation`、`testCreatePostAppendFailureIsNotMisclassifiedAsNoEffect`：4/4；分别验证 provider-visible business schema、缺失 host manager 不伪报成功、owner-preflight EventLog 零变化/typed no-effect，以及 append 后 lost acknowledgement 仍保留 unknown；
 - `AgentLoopPolicyTests.testRejectedWithoutSideEffectSettlesAndReturnsRecoveryToModel` 与 `testNonReplayableToolFailureLeavesExecutionUnsettledForManualReconciliation`：2/2；验证 typed no-effect 写 `failed/not_started` 并继续模型轮次，普通 non-replayable error 仍留 unresolved/manual；
 - 相关整类组合 gate 最终为 `IntatisSkillsTests.xctest` 29/29、`WorkTaskRuntimeTests` 22/22、`AgentLoopPolicyTests` 37/37、`ContextProjectionTests` 23/23，合计 111/111；均完成相应 package Debug 编译。未运行全量 test、macOS/iOS app build、真实 provider 或 GUI smoke。
+
+2026-08-12 Cowork ordinary-worker WorkTask update 收窄的直接证据：
+
+- `ToolRegistryLeaseTests.testWorkerTaskUpdateSchemaExposesOnlyOwnedProgressAndSettlementFields`：
+  worker 的 exact property set 为 `task_id/expected_revision/progress_note/status/result/evidence`，
+  `additionalProperties=false`，status 只含 `in_progress/blocked/completed/failed`；同一测试同时确认
+  manager 的 14 个完整字段与各自 capability grant 均保持不变；
+- `WorkTaskRuntimeTests.testMutatingWorkTaskToolsRejectMissingHostManagerAsNotStarted`：worker 窄入口仍
+  委托既有宿主执行链，缺失 host-bound manager 时与完整入口一样 fail closed，不伪报成功；
+- `IntatisAgentKernelTests.testUnknownToolArgumentsDoNotRequestPermissionOrExecuteTool`：1/1；确认 closed
+  schema 的未知字段不会产生 permission request，也不会进入 executor；
+- `ToolRegistryLeaseTests` 26/26、`WorkTaskRuntimeTests` 22/22，加上述内核 gate 合计 49/49、
+  0 failures；`swift build --disable-automatic-resolution` 通过。未运行全量 test、macOS/iOS app
+  build、真实 provider 或 GUI smoke。
 
 2026-08-12 `permission_reviewer_model` 独立控制面 route 的直接证据：
 

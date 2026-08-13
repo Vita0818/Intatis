@@ -11186,7 +11186,7 @@ public actor Orchestrator {
             ], granting: [.manageWorkTasks])
         } else {
             if lease.tools.contains(.updateOwnedWorkTask) {
-                register([TaskUpdateTool()], granting: [.updateOwnedWorkTask])
+                register([OwnedWorkTaskUpdateTool()], granting: [.updateOwnedWorkTask])
             }
             if lease.tools.contains(.readWorkTasks) {
                 register([TaskGetTool(), TaskListTool()], granting: [.readWorkTasks])

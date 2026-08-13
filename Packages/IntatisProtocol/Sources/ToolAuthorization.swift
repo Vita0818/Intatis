@@ -766,6 +766,15 @@ public enum PermissionApprovalFailureKind: String, Codable, Equatable, Sendable 
     case callerCancelled = "caller_cancelled"
     case reviewerTimedOut = "reviewer_timed_out"
     case reviewerCancelled = "reviewer_cancelled"
+    case reviewerIncompleteResponse = "reviewer_incomplete_response"
+    case reviewerNonSuccessFinish = "reviewer_non_success_finish"
+    case reviewerVerdictMissingMarker = "reviewer_verdict_missing_marker"
+    case reviewerVerdictMultipleMarkers = "reviewer_verdict_multiple_markers"
+    case reviewerVerdictNotFinal = "reviewer_verdict_not_final"
+    case reviewerVerdictMissingReason = "reviewer_verdict_missing_reason"
+    case reviewerVerdictStructuredOutput = "reviewer_verdict_structured_output"
+    /// Legacy coarse diagnosis retained for old EventLog decoding and any
+    /// future parser failure that cannot be classified more narrowly.
     case malformedVerdict = "malformed_verdict"
     case reviewerContractViolation = "reviewer_contract_violation"
     case providerFailure = "provider_failure"

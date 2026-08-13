@@ -221,6 +221,16 @@ final class WorkTaskRuntimeTests: XCTestCase {
             XCTAssertEqual(rejection.code, "work_task_manager_unavailable")
             XCTAssertTrue(rejection.message.contains("task_update rejected before WorkTask execution started"))
         }
+
+        do {
+            _ = try await OwnedWorkTaskUpdateTool().execute(
+                ToolArgs(raw: #"{"task_id":"wt_missing","expected_revision":1,"progress_note":"No manager"}"#),
+                in: context)
+            XCTFail("worker task_update must not report success without its host manager")
+        } catch let rejection as ToolExecutionRejectedWithoutSideEffect {
+            XCTAssertEqual(rejection.code, "work_task_manager_unavailable")
+            XCTAssertTrue(rejection.message.contains("task_update rejected before WorkTask execution started"))
+        }
     }
 
     func testWorkTaskPermissionPreviewsExposeBoundedSemanticFields() throws {

@@ -45,7 +45,7 @@ private func writeCall() -> ToolCallContext {
 
 final class IntatisPermissionReviewerTests: XCTestCase {
 
-    func testTextVerdictParserAcceptsBoundedReasonAndCaseInsensitiveASCIIMarker() throws {
+    func testTextVerdictParserAcceptsReasonAndCaseInsensitiveASCIIMarker() throws {
         let parsed = try XCTUnwrap(PermissionReviewTextVerdictParser.parse(
             "The requested write is scoped to the selected workspace.\naLlOw\n\n"))
 
@@ -61,10 +61,40 @@ final class IntatisPermissionReviewerTests: XCTestCase {
         XCTAssertEqual(parsed.reason, "The action is unrelated to the user's request.")
     }
 
+    func testTextVerdictParserAcceptsLongReasonsWithoutChangingDecision() throws {
+        for length in [241, 500, 1_000] {
+            let reason = String(repeating: "x", count: length)
+            for (marker, expectedDecision) in [
+                ("ALLOW", PermissionDecision.allow),
+                ("DENY", PermissionDecision.deny),
+            ] {
+                let parsed = try XCTUnwrap(
+                    PermissionReviewTextVerdictParser.parse("\(reason)\n\(marker)"))
+                XCTAssertEqual(parsed.decision, expectedDecision)
+                XCTAssertEqual(parsed.reason, reason)
+            }
+        }
+    }
+
+    func testTextVerdictParserReturnsSecretFreeStructuralDiagnostics() {
+        let cases: [(String, PermissionReviewTextVerdictParseFailure)] = [
+            ("reason without a verdict", .missingVerdictMarker),
+            ("reason\nALLOW\nDENY", .multipleVerdictMarkers),
+            ("reason\nALLOW\ntrailing text", .verdictMarkerNotFinal),
+            ("ALLOW", .missingReason),
+            (#"{"reason":"structured","decision":"allow"}"#, .structuredOutput),
+            ("```text\nreason\nALLOW\n```", .structuredOutput),
+        ]
+
+        for (output, expected) in cases {
+            XCTAssertEqual(
+                PermissionReviewTextVerdictParser.parseResult(output),
+                .failure(expected),
+                output)
+        }
+    }
+
     func testTextVerdictParserRejectsMalformedOutputs() {
-        let tooLongReason = String(
-            repeating: "x",
-            count: PermissionReviewTextVerdictParser.maximumReasonCharacterCount + 1)
         let malformed = [
             "",
             "ALLOW",
@@ -78,7 +108,6 @@ final class IntatisPermissionReviewerTests: XCTestCase {
             #"Sure: {"reason":"ok","decision":"allow"}"# + "\nALLOW",
             "```text\nreason\n```\nALLOW",
             "reason with an inline ``` fence\nALLOW",
-            tooLongReason + "\nALLOW",
         ]
 
         for output in malformed {
@@ -103,9 +132,49 @@ final class IntatisPermissionReviewerTests: XCTestCase {
         let prompt = request.messages.map(\.content).joined(separator: "\n")
         XCTAssertFalse(prompt.contains(#""decision""#))
         XCTAssertTrue(prompt.contains("Do not return JSON"))
-        XCTAssertTrue(prompt.contains("final non-empty line"))
+        XCTAssertTrue(prompt.contains("final nonempty line"))
         XCTAssertTrue(prompt.contains("ALLOW"))
         XCTAssertTrue(prompt.contains("DENY"))
+        XCTAssertTrue(prompt.contains("This length is guidance only"))
+        XCTAssertEqual(
+            prompt.components(
+                separatedBy: PermissionReviewTextVerdictParser.modelOutputContract).count - 1,
+            2)
+    }
+
+    func testReviewerAcceptsLongReasonButReturnsOnlyBoundedSummary() async {
+        let reason = String(repeating: "x", count: 1_000)
+        let reviewer = ModelPermissionReviewer(
+            provider: CannedChat(text: "\(reason)\nALLOW"),
+            model: ModelID(rawValue: "rev"))
+
+        let outcome = await reviewer.review(
+            writeCall(),
+            reviewCtx(),
+            gateReason: "write",
+            risk: .low)
+
+        XCTAssertEqual(outcome.decision, .allow)
+        XCTAssertTrue(outcome.reason.hasPrefix(String(repeating: "x", count: 240)))
+        XCTAssertEqual(outcome.reason.count, 243)
+        XCTAssertTrue(outcome.reason.hasSuffix("..."))
+    }
+
+    func testReviewerScansCompleteLongReasonForSensitiveMaterialBeforeBounding() async {
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+        let reason = String(repeating: "x", count: 300) + " " + secret
+        let reviewer = ModelPermissionReviewer(
+            provider: CannedChat(text: "\(reason)\nALLOW"),
+            model: ModelID(rawValue: "rev"))
+
+        let outcome = await reviewer.review(
+            writeCall(),
+            reviewCtx(),
+            gateReason: "write",
+            risk: .low)
+
+        XCTAssertEqual(outcome.decision, .askUser)
+        XCTAssertFalse(outcome.reason.contains(secret))
     }
 
     func testReviewerParsesAllow() async {

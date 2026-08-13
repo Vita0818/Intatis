@@ -308,7 +308,7 @@ an unbound or mismatched invocation is a separate authorization snapshot failure
 manual/nonautomatic mode rejects the reserved field before business execution and never forwards it to a business tool
 automatic responders must implement the bound-invocation contract; active/cached duplicates revalidate the exact transient invocation and recovered allow is never redelivered
 the only invocation-free automatic review is a dedicated host agent-admission path which proves exact admission identity plus preceding durable attach/lease request events
-reviewer returns a short reason plus final-line ASCII ALLOW or DENY; JSON/function output is not a correctness dependency
+reviewer returns a nonempty plain-text reason plus one final-line ASCII ALLOW or DENY; concise length is prompt guidance rather than a verdict-validity ceiling, and the complete reason is checked for sensitive material before any retained summary is bounded; JSON/function output is not a correctness dependency
 live bound reviewer reasons and provider diagnostics are not durable; fixed host-authored settlement/tool-result text prevents transient-input echo
 hard deny remains final before the reviewer can see anything
 shipping Cowork has no in-engine reviewer; an injected one is a misconfiguration whose result must fail closed even though the bad configuration may already have caused one extra call
