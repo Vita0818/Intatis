@@ -373,13 +373,13 @@ final class PermissionSettlementTransactionTests: XCTestCase {
                 replayPolicy:
                     sideEffect == .readOnly
                         ? .safeToReplay
-                        : .requiresManualReconciliation),
+                        : .doNotReplay),
             sideEffect: sideEffect,
             risksNetwork: true,
             replayPolicy:
                 sideEffect == .readOnly
                     ? .safeToReplay
-                    : .requiresManualReconciliation,
+                    : .doNotReplay,
             mcp: mcp)
     }
 }

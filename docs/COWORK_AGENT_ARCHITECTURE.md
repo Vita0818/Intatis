@@ -148,7 +148,6 @@ Delegation should be explicit:
 ```swift
 enum DelegationGrant {
     case none
-    case requestOnly
     case granted(DelegationBudget)
 }
 ```
@@ -156,7 +155,7 @@ enum DelegationGrant {
 Default should usually be:
 
 ```text
-ordinary execution task: requestOnly
+ordinary execution task: none
 explicit coordination task: granted(...)
 high-risk task: none
 ```
@@ -228,14 +227,13 @@ Suggested operations:
 
 ```text
 delegate_task
-request_delegation
 ```
 
-A child agent should generally not directly spawn or attach another agent. It may request delegation, and the orchestrator decides whether to approve it based on the current task contract and capability lease.
+A worker does not receive delegation or spawn authority. If it needs help, it reports that need in its result; a coordinator may then explicitly call `spawn_agent` and/or `delegate_task`.
 
 ## 4. Delegation Model
 
-Any agent may propose delegation if its lease allows `requestOnly`, but actual workspace expansion and agent creation must be mediated.
+Only an agent with an explicit granted delegation lease may call `delegate_task`; workspace expansion and agent creation remain separate `spawn_agent` admission.
 
 Flow:
 
@@ -274,7 +272,7 @@ Task M:
   roleHint = macOS Swift file counter
   workspace = Apps/IntatisMac
   expectedDeliverable = count + path list
-  delegation = requestOnly
+  delegation = none
   relatedAgent = @ios-counter
 
 Task I:
@@ -282,7 +280,7 @@ Task I:
   roleHint = iOS Swift file counter
   workspace = Apps/IntatisiOS
   expectedDeliverable = count + path list
-  delegation = requestOnly
+  delegation = none
   relatedAgent = @macos-counter
 ```
 
@@ -344,7 +342,6 @@ MessageBus          stores and routes agent messages
 ContextProjector    builds scoped context views for each agent/task
 CapabilityService   creates per-task capability leases
 WorkspaceLease      controls directory access
-DelegationService   mediates delegation requests
 Orchestrator        handles root task planning and result synthesis
 ```
 
@@ -354,7 +351,7 @@ Orchestrator        handles root task planning and result synthesis
 2. Replace global `priorHistory()` with `contextProjection(for: agentID, taskID)`.
 3. Replace synchronous `Orchestrator.ask()` execution with mailbox + scheduler.
 4. Replace `coordinationDepth` as a semantic role mechanism with `CapabilityLease.delegation`.
-5. Replace direct `spawn_agent` with `request_delegation` or `delegate_task`.
+5. Keep `spawn_agent` and `delegate_task` as separate explicit calls; delegation never creates an agent implicitly.
 6. Split `ask_agent` into communication and delegation operations.
 7. Add graph-level cycle detection and self-call guards.
 8. Add tests for task-scoped context and capability leases.

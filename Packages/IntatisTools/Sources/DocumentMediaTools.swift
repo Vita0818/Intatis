@@ -299,7 +299,7 @@ public struct EditImageTool: Tool {
             ],
             dataEffects: [.read, .mutate, .network],
             risks: [.workspaceMutation, .networkAccess, .modelCost],
-            replayPolicy: .requiresManualReconciliation)
+            replayPolicy: .doNotReplay)
     }
 
     public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {

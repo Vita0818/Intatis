@@ -1057,9 +1057,9 @@ enum ChatSessionAutoTitleService {
         do {
             for try await chunk in stream {
                 try Task.checkCancellation()
-                guard !sawDone else { return .rejected }
                 switch chunk {
                 case .delta(let text):
+                    guard !sawDone else { return .rejected }
                     raw += text
                     guard raw.count <= 120 else { return .rejected }
                 case .usage:
@@ -1067,6 +1067,7 @@ enum ChatSessionAutoTitleService {
                 case .citation:
                     return .rejected
                 case .done:
+                    guard !sawDone else { return .rejected }
                     sawDone = true
                 }
             }

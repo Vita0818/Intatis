@@ -36,7 +36,7 @@ public struct RuntimeEnvironmentManifest: Equatable, Sendable {
     public static let cowork = RuntimeEnvironmentManifest(mode: .cowork)
 
     fileprivate var systemPrompt: String {
-        """
+        var prompt = """
         You are running inside Intatis, an Apple-first local AI workbench, in \(mode.rawValue) mode.
         Intatis gives you model-visible tools for workspace, network, browser, document, Git, goal, task, message, and agent operations when the current lease allows them.
         Every external action must be performed through a tool call. A capability is available only when its tool appears in the authoritative API tools list for this request.
@@ -50,8 +50,22 @@ public struct RuntimeEnvironmentManifest: Equatable, Sendable {
         WorkTask IDs and AgentInvocation task IDs are different namespaces. Use the WorkTask ID returned by task_create/task_get/task_list for task_get or task_update, and use only the latest authoritative revision when updating it. If a WorkTask is already terminal with durable result and evidence, do not overwrite it merely to restate an agent report.
         Treat a tool action as completed only after receiving its ToolResult. Permission, scheduling, persistence, recovery, WorkTask readiness, and terminal state are owned by Intatis.
         Multiple tool calls emitted in one assistant response are neither a transaction nor a concurrency guarantee. Do not use a multi-call response to request or assume parallel execution. Batch only mutually independent calls that remain correct in any host-controlled execution order. If one call needs an identity, ID, attachment, state change, or other output produced by another call, wait for the prerequisite's successful ToolResult and issue the dependent call in a later tool-call round using only confirmed values. Never reference a planned or future object as if it already exists.
-        A failed, denied, or proven-no-effect side-effecting tool call remains unresolved until the matching requested action has a successful host settlement. Do not replace that evidence with a natural-language completion claim.
         """
+        if mode == .code {
+            prompt += """
+
+
+            On the first user turn of the current session, after finishing the turn's substantive
+            work and verification or establishing a genuine blocker, call `rename_session`
+            exactly once if it appears in the authoritative API tools list. Give the session a
+            concise, specific title that describes the task or verified result. Do not use a date,
+            time, SessionID, or a generic placeholder such as "New chat", "Untitled", or
+            "Session". After the successful ToolResult, make no further tool calls and return the
+            final response. On later turns, do not rename automatically unless the user explicitly
+            asks to rename the session.
+            """
+        }
+        return prompt
     }
 }
 
@@ -211,6 +225,17 @@ public struct ContextBuilder: Sendable {
             genuine blocker remains; never claim completion from plans, prose, or unverified
             child reports.
 
+            On the first user turn of the current session, after finishing the turn's substantive
+            work and verification or establishing a genuine blocker, call `rename_session`
+            exactly once if it appears in the authoritative API tools list. Give the session a
+            concise, specific title that describes the task or verified result. Do not use a date,
+            time, SessionID, or a generic placeholder such as "New chat", "Untitled", or
+            "Session". Treat `rename_session` as the last non-run-control tool call: after its
+            successful ToolResult, make no ordinary work, task, message, or agent calls. If
+            `finish_run` or `stop_run` is advertised and appropriate, call it only after
+            `rename_session` succeeds, then return the final response. On later turns, do not
+            rename automatically unless the user explicitly asks to rename the session.
+
             When finish_run is advertised, call it once the exact current request has a verified
             deliverable and no further run-scoped work is useful. When stop_run is advertised,
             call it only when no further useful progress is possible or a genuine blocker must be
@@ -234,7 +259,7 @@ public struct ContextBuilder: Sendable {
             When task_get/task_list are available, use them for authoritative WorkTask state.
             When task_update is available, update only your invocation-bound WorkTask's progress,
             result, evidence, or permitted status; do not change its dependencies.
-            If you need help, report that need to the assigning agent or user, or use request_delegation when that tool is available.
+            If you need help, report that need in your response to the assigning agent or user.
             Use reply_message only once for the exact frozen information request ID. An information
             reply requires no acknowledgment; a genuine continuation must use a fresh
             request_information correlation with based_on set to the reply Message ID when that

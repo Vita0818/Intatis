@@ -215,7 +215,7 @@ final class ThreadLayoutTests: XCTestCase {
                         access: .readWrite)],
                     dataEffects: [.mutate],
                     risks: [.workspaceMutation],
-                    replayPolicy: .requiresManualReconciliation)))
+                    replayPolicy: .doNotReplay)))
 
         let renderedDetails = PermissionReviewPresentation.details(for: request)
             .map(\.text)

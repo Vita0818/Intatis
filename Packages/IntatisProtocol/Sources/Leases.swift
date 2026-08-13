@@ -38,7 +38,6 @@ public enum ToolCapability: String, Codable, Sendable, Hashable {
     case sendMessage = "send_message"
     case requestInformation = "request_information"
     case replyMessage = "reply_message"
-    case requestDelegation = "request_delegation"
     case delegateTask = "delegate_task"
     case attachWorkspace = "attach_workspace"
     case readWorkTasks = "read_work_tasks"
@@ -63,7 +62,6 @@ public struct DelegationBudget: Codable, Sendable, Hashable {
 
 public enum DelegationGrant: Codable, Sendable, Hashable {
     case none
-    case requestOnly
     case granted(DelegationBudget)
 }
 
@@ -150,7 +148,6 @@ public struct CapabilityLease: Codable, Sendable, Hashable {
             .documentOCR,
             .requestInformation,
             .replyMessage,
-            .requestDelegation,
             .readWorkTasks,
             .updateBoundWorkTask,
             .readGoal,
@@ -174,7 +171,7 @@ public struct CapabilityLease: Codable, Sendable, Hashable {
             taskID: taskID,
             tools: tools,
             communication: .replyOnly,
-            delegation: .requestOnly)
+            delegation: .none)
     }
 
     public static func coordinator(taskID: TaskID? = nil,
@@ -185,7 +182,6 @@ public struct CapabilityLease: Codable, Sendable, Hashable {
             .sendMessage,
             .requestInformation,
             .replyMessage,
-            .requestDelegation,
             .delegateTask,
             .attachWorkspace,
             .manageWorkTasks,

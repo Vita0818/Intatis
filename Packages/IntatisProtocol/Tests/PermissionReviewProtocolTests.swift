@@ -195,7 +195,7 @@ final class PermissionReviewProtocolTests: XCTestCase {
             metadata: ["operation": .string("apply_unified_diff")],
             dataEffects: [.mutate],
             risks: [.workspaceMutation],
-            replayPolicy: .requiresManualReconciliation)
+            replayPolicy: .doNotReplay)
         let gate = PermissionReviewGateSnapshot(
             decision: .ask,
             risk: .medium,
@@ -239,7 +239,7 @@ final class PermissionReviewProtocolTests: XCTestCase {
             intent: intent,
             sideEffect: .write,
             risksNetwork: false,
-            replayPolicy: .requiresManualReconciliation,
+            replayPolicy: .doNotReplay,
             deterministicGate: gate,
             capabilityLeaseFingerprint: String(repeating: "c", count: 64),
             workspaceID: WorkspaceID(rawValue: "workspace-roundtrip"),
@@ -361,7 +361,7 @@ final class PermissionReviewProtocolTests: XCTestCase {
             metadata: ["operation": .string("overwrite")],
             dataEffects: [.mutate],
             risks: [.workspaceMutation],
-            replayPolicy: .requiresManualReconciliation)
+            replayPolicy: .doNotReplay)
         let task = PermissionReviewTask(
             id: reviewID,
             sessionID: SessionID(rawValue: "sess_roundtrip"),

@@ -649,7 +649,7 @@ public struct DynamicMCPTool: Tool, Sendable {
             risks: entry.policy.risksNetwork
                 ? [.networkAccess]
                 : [.processExecution],
-            replayPolicy: .requiresManualReconciliation)
+            replayPolicy: .doNotReplay)
     }
 
     public func execute(

@@ -600,7 +600,7 @@ private func appendReliabilityTaskWithSettledSideEffect(
         assignee: agent,
         objective: "do not replay an already completed side effect",
         roleHint: "root coordinator",
-        expectedDeliverable: "manual reconciliation",
+        expectedDeliverable: "start a new run",
         workspaceID: workspaceLease.workspaceID,
         workspaceLeaseID: workspaceLease.id,
         capabilityLeaseID: capabilityLease.id,
@@ -2594,7 +2594,7 @@ final class OrchestrationReliabilityTests: XCTestCase {
             assignee: main,
             objective: "do not duplicate the interrupted write",
             roleHint: "root coordinator",
-            expectedDeliverable: "manual reconciliation",
+            expectedDeliverable: "start a new run",
             workspaceID: workspaceLease.workspaceID,
             workspaceLeaseID: workspaceLease.id,
             capabilityLeaseID: capabilityLease.id,
@@ -2660,7 +2660,7 @@ final class OrchestrationReliabilityTests: XCTestCase {
         let projection = CoworkProjection.build(from: events)
         XCTAssertEqual(projection.tasks[taskID]?.status, .failed)
         XCTAssertEqual(projection.tasks[taskID]?.attempt, 1)
-        XCTAssertTrue(projection.tasks[taskID]?.error?.contains("manual reconciliation required") == true)
+        XCTAssertTrue(projection.tasks[taskID]?.error?.contains("start a new run") == true)
         let queuedAttempts = events.compactMap { envelope -> Int? in
             guard case .taskQueued(let payload) = envelope.event,
                   payload.contract.id == taskID else { return nil }
@@ -2696,7 +2696,7 @@ final class OrchestrationReliabilityTests: XCTestCase {
         let projection = CoworkProjection.build(from: events)
         XCTAssertEqual(projection.tasks[taskID]?.status, .failed)
         XCTAssertEqual(projection.tasks[taskID]?.attempt, 1)
-        XCTAssertTrue(projection.tasks[taskID]?.error?.contains("side effect already succeeded") == true)
+        XCTAssertTrue(projection.tasks[taskID]?.error?.contains("start a new run") == true)
         let queuedAttempts = events.compactMap { envelope -> Int? in
             guard case .taskQueued(let payload) = envelope.event,
                   payload.contract.id == taskID else { return nil }
@@ -2722,7 +2722,7 @@ final class OrchestrationReliabilityTests: XCTestCase {
             assignee: main,
             objective: "do not retry an uncertain write",
             roleHint: "root coordinator",
-            expectedDeliverable: "manual reconciliation",
+            expectedDeliverable: "start a new run",
             workspaceID: workspaceLease.workspaceID,
             workspaceLeaseID: workspaceLease.id,
             capabilityLeaseID: capabilityLease.id,
@@ -2792,9 +2792,9 @@ final class OrchestrationReliabilityTests: XCTestCase {
         let result = await restored.retry(failedView)
 
         guard case .failed(let message) = result else {
-            return XCTFail("Retry must be blocked pending reconciliation.")
+            return XCTFail("Retry must be blocked starting a new run.")
         }
-        XCTAssertTrue(message.contains("manual reconciliation required"))
+        XCTAssertTrue(message.contains("start a new run"))
         XCTAssertTrue(provider.requests.isEmpty)
         let queuedAttempts = await log.replay().compactMap { envelope -> Int? in
             guard case .taskQueued(let payload) = envelope.event,
@@ -2831,7 +2831,7 @@ final class OrchestrationReliabilityTests: XCTestCase {
             guard case .failed(let message) = result else {
                 return XCTFail("Retry must be blocked after a settled non-replayable execution.")
             }
-            XCTAssertTrue(message.contains("side effect already succeeded"))
+            XCTAssertTrue(message.contains("start a new run"))
             XCTAssertTrue(provider.requests.isEmpty)
             let queuedAttempts = await log.replay().compactMap { envelope -> Int? in
                 guard case .taskQueued(let payload) = envelope.event,

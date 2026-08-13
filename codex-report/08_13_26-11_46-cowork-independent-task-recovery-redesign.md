@@ -7,14 +7,16 @@
 
 ## 1. 结论
 
-事故的第一次失败是 provider TLS validation failure；第二次失败来自 Intatis 自己：旧 WorkTask 被绑定在旧 Run，新的 Run 无权继续它，而委派又在完整预检前先写入了 agent-to-agent message。宿主随后把这次内部半提交误判为需要人工对账，导致当前 Turn 和新 Run 再次失败。
+事故的第一次失败是 provider TLS validation failure；第二次失败来自 Intatis 自己：旧 WorkTask 被绑定在旧 Run，新的 Run 无权继续它，而委派又在完整预检前先写入了 agent-to-agent message。宿主随后把这次内部半提交升级成整轮终止错误，导致当前 Turn 和新 Run 再次失败。
 
-本次只落地四项修正：
+本次最终落地六项修正：
 
 1. WorkTask 改为当前 Cowork Session 内的独立工作记录，不属于 Run、Goal、Agent 或 Turn。
 2. provider、网络和运行时中断把当前 Run 终结为 `interrupted`；用户明确取消才是 `cancelled`。
 3. Continue / Resume 使用新 Run；旧 Run 不复活，原 WorkTaskID 不复制。
-4. 内部委派先完成全部预检，再用现有 EventLog batch 一次提交；预检失败是确定的 `not_started`，不留半条消息，也不进入通用人工对账。
+4. 内部委派先完成全部预检，再用现有 EventLog batch 一次提交；预检失败是确定的 `not_started`，不留半条消息。
+5. `spawn_agent` 删除 raw `model` 参数；省略 `inference_profile_id` 时继承当前 agent 的 exact binding，显式填写时只接受宿主批准的 profile ID。
+6. 删除请求委派工具及其 capability、event、mailbox authority；普通工具错误结算后回给模型继续，不再升级成通用整轮终止错误。
 
 没有增加 Conversation、TaskSpace、TaskAttempt、owner/claim/receipt、Run 血缘字段、reconciler agent 或新的恢复服务。
 
@@ -60,9 +62,12 @@ Goal 本身的目标、预算、暂停和 verifier 状态机继续独立存在�
 
 这不妨碍同一当前版本 Session 的进程重启恢复：当前 EventLog 仍会重放，悬空的 active Run 会被终结为 `interrupted`，但不会恢复原调用栈或复活同一个 Run。
 
-### 2.5 外部副作用对账不在范围内
+### 2.5 工具失败与重放边界
 
-本次只修复 Intatis 完全控制的内部 admission。文件系统、Git、managed terminal、网络、MCP 等外部工具继续使用既有 durable execution 与 unknown-effect 规则；没有新增 effect probe、后台对账队列、自动修复器或全局重试策略。
+- 实时 executor error 写 `tool_result` 与 `tool_execution_settled(failed, unknown)`，作为 observation 返回同一 Agent turn。
+- executor-entered cancellation 写 `cancelled/unknown` 后结束当前 turn。
+- `doNotReplay` 只禁止旧 task attempt 自动重放，不生成单独的恢复状态或终止错误。
+- 用户继续工作时创建新 Run；不恢复旧 Run，不新增 effect probe、后台队列、修复器或对账角色。
 
 ## 3. 最终模型
 
@@ -165,7 +170,7 @@ Orchestrator 先在 admission lock 外完成可能异步等待、但不写内部
 
 因此预检失败时，EventLog 不会留下 message、lease、invocation、queue 或 WorkTask 半状态。
 
-生产 `BusMessenger` 把这种提交前拒绝转换为 `ToolExecutionRejectedWithoutSideEffect`。AgentLoop 使用既有 `failed/not_started` settlement 把错误回灌给同一 Turn，不触发 manual reconciliation，也不自动终止 Run。
+生产 `BusMessenger` 把这种提交前拒绝转换为 `ToolExecutionRejectedWithoutSideEffect`。AgentLoop 使用既有 `failed/not_started` settlement 把错误回灌给同一 Turn，不自动终止 Run。
 
 ### 4.6 委派目标与幂等身份
 
@@ -173,7 +178,7 @@ Orchestrator 先在 admission lock 外完成可能异步等待、但不写内部
 - 省略 `to` 或使用 `auto` 时，只从现有 idle attached workers 中选择；没有可用 worker就拒绝，并提示先在较早 tool-call round 使用 `spawn_agent`。
 - `delegate_task` 不再隐式 proposed/spawn worker，不增加角色。
 - executor 接收既有 durable `executionID`，从它确定同一 invocation TaskID；相同执行身份命中已存在 invocation，不再创建第二个 invocation 或重复 admission batch。
-- 未提交的 preflight 可安全重新执行；append 后丢失确认仍按既有 unknown-effect 规则处理，不伪造 not_started。
+- 未提交的 preflight 可安全重新执行；append 后丢失确认结算为 unknown，不伪造 not_started，也不自动重放旧 attempt。
 - delegate 工具只接受当前 snake_case 参数；没有为旧工具调用保留新增的 camelCase alias。
 
 ## 5. 行为合同
@@ -198,9 +203,10 @@ Orchestrator 先在 admission lock 外完成可能异步等待、但不写内部
 5. 委派的第一次 durable write 是完整 admission batch。
 6. batch 前拒绝必须证明 `not_started`；batch 后未知不能按错误字符串猜测为安全重试。
 7. worker 更新权只来自 current AgentInvocation binding。
-8. `delegate_task` 不创建 worker；`spawn_agent` 是独立且显式的动作。
-9. 不新增 receipt、claim、TaskAttempt、TaskSpace、Conversation 或通用 reconciler。
+8. `delegate_task` 不创建 worker；`spawn_agent` 是独立且显式的动作，且不接受 raw model。
+9. 不存在请求委派工具、capability、event 或 mailbox authority；不新增 receipt、TaskAttempt、TaskSpace、Conversation 或通用 reconciler。
 10. 本次不提供旧版本 Session migration 或双读/双写。
+11. 普通工具错误必须结算并返回模型；`doNotReplay` 只控制旧 attempt 的自动重放。
 
 ## 7. 事故回归覆盖
 
@@ -215,30 +221,27 @@ Orchestrator 先在 admission lock 外完成可能异步等待、但不写内部
 - 启动重放把悬空 active Run 写成 interrupted；显式 Resume 创建不同 RunID。
 - interrupted Run 不能重新 running。
 - GoalVerifier completion 不依赖 WorkTask terminal。
+- `spawn_agent` schema 不含 `model`，仍含可选 `inference_profile_id`。
+- worker 工具面不含请求委派工具，mailbox 只有 ordinary/information request/information reply 三类 authority。
+- non-replayable executor error 结算为 failed/unknown 并允许模型继续输出；执行中取消结算为 cancelled/unknown。
 
 ## 8. 验证状态
 
-已通过：
+本轮最终代码已通过：
 
-- `swift build`
-- `IntatisProtocolTests`：107/107
-- `IntatisConversationTests`：212/212
-- `IntatisAgentKernelTests`：220/220
-- `IntatisCoworkTests`：364/364
-- `IntatisSkillsTests`：29/29
-- `IntatisToolsTests`：227/227，另有 19 个显式 opt-in skip
-- `TaskGoalProtocolTests`：12/12
-- `TaskGoalProjectionTests`：7/7
-- `WorkTaskRuntimeTests`：21/21
-- `AgentInvocationNonRecursiveTests`：11/11
-- `GoalRuntimeControllerTests`：33/33
-- `PerAgentInferenceProfileTests`：21/21
-- `OrchestrationReliabilityTests`：44/44
-- `PermissionReviewControlPlaneTests` + `RunControlTests`：58/58
+- SwiftPM 全部相关 test products 编译。
+- `IntatisProtocolTests`：107/107。
+- `IntatisAgentKernelTests`：220/220。
+- `IntatisCoworkTests`：364/364。
+- `ToolExecutionProtocolTests`：5/5。
+- `SpawnAgentPermissionTests`：11/11。
+- `AgentLoopPolicyTests`：37/37。
+- `CapabilityLeaseTests`：7/7。
+- `MessageDelegationSplitTests`：9/9。
+- `OrchestrationReliabilityTests`：44/44。
+- `IntatisMac` Debug、`CODE_SIGNING_ALLOWED=NO` 构建通过；只有仓库既有 warnings。
 
-一次整仓 `swift test` 在 Tools 227/227 与 Skills 29/29 后，于既有 SharedUI async waiter 中超过 60 秒无输出，人工中止（exit 130）；因此不把整仓 suite 记为通过。随后受影响模块和 Cowork 全 target 均独立通过。
-
-未运行真实 provider、credential/network、GUI、macOS App 或 iOS App smoke。
+未把整仓 `swift test` 记为本轮通过；未运行真实 provider、credential/network、GUI 交互或 iOS App smoke。
 
 ## 9. 修改范围
 
@@ -248,11 +251,16 @@ Orchestrator 先在 admission lock 外完成可能异步等待、但不写内部
 - `Packages/IntatisProtocol/Sources/ContinuationRun.swift`
 - `Packages/IntatisProtocol/Sources/Event.swift`
 - `Packages/IntatisProtocol/Sources/Envelope.swift`
+- `Packages/IntatisProtocol/Sources/ToolExecution.swift`
+- `Packages/IntatisProtocol/Sources/Leases.swift`
 - `Packages/IntatisProtocol/Sources/TaskGoalEvents.swift`
 - `Packages/IntatisConversation/Sources/*Projection.swift`
+- `Packages/IntatisAgentKernel/Sources/AgentLoop.swift`
+- `Packages/IntatisAgentKernel/Sources/ContextBuilder.swift`
 - `Packages/IntatisCowork/Sources/Orchestrator.swift`
 - `Packages/IntatisCowork/Sources/MessageBus.swift`
 - `Packages/IntatisCowork/Sources/CommunicationDelegationTools.swift`
+- `Packages/IntatisCowork/Sources/CoordinatorTools.swift`
 - `Packages/IntatisCowork/Sources/WorkTaskTools.swift`
 - `Packages/IntatisCowork/Sources/GoalRuntimeController.swift`
 - `Packages/IntatisCowork/Sources/GoalVerifierControlPlane.swift`
@@ -261,7 +269,7 @@ Orchestrator 先在 admission lock 外完成可能异步等待、但不写内部
 - `Packages/IntatisSharedUI/Sources/CoworkViews.swift`
 - 对应 Protocol、Conversation、Cowork 测试
 
-工作树中同时存在用户原有的 hosted web search 等改动；本次没有回退、覆盖或纳入该功能的设计结论。
+本轮开始时工作树为空；本轮没有暂存或提交文件。
 
 ## 10. 完成记录
 
@@ -277,16 +285,15 @@ Orchestrator 先在 admission lock 外完成可能异步等待、但不写内部
 
 ### VALIDATION_RESULT
 
-- 编译与测试结果见第 8 节；Cowork 全 target 为 364/364。
-- `git diff --check`：通过。
-- 旧合同扫描未发现相关符号残留于实现；第 4.1 节只保留一处 capability rename 说明。
-- 工作树审计确认用户原有 hosted web search 改动仍保留；本次未回退、暂存或提交这些改动。
+- 编译、构建与定向测试结果见第 8 节。
+- 最终 `git diff --check` 与旧合同残留扫描见本轮交付记录。
+- 本轮未暂存、提交或推送。
 
 ### UNCERTAINTIES
 
 - 未为旧版本 Session 设计或验证迁移路径；这是明确非目标，不是待补架构。
-- 外部工具真正的 unknown-effect 体验继续沿用现有策略；本次没有扩大其自动恢复范围。
+- durable settlement 仍可记录既有的 `effectDisposition = unknown` 作为执行审计事实，但它不再生成额外恢复对象、面向用户的通用错误或整轮终止。
 
 ### NEXT_RECOMMENDED_ACTION
 
-本重构完成后不再增加 Task 层级或通用 reconciliation。后续只根据真实失败补窄测试或修复，不预建新对象、字段、角色或服务。
+发布此版本后新建 Cowork Session 做真实 provider smoke；后续只根据真实失败补窄测试或修复，不预建新对象、字段、角色或服务。

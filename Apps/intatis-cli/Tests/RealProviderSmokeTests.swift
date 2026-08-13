@@ -756,7 +756,7 @@ final class RealProviderSmokeTests: XCTestCase {
                 access: .readWrite)],
             dataEffects: [.mutate],
             risks: [.workspaceMutation],
-            replayPolicy: .requiresManualReconciliation)
+            replayPolicy: .doNotReplay)
         let authorization = ResolvedToolAuthorization(
             authorizationID: "real-permission-review-smoke",
             registryVersion: "intatis.real-smoke.v1",
@@ -785,7 +785,7 @@ final class RealProviderSmokeTests: XCTestCase {
             intent: intent,
             sideEffect: .write,
             risksNetwork: false,
-            replayPolicy: .requiresManualReconciliation,
+            replayPolicy: .doNotReplay,
             deterministicGate: gate)
         let context = PermissionRequestContext(
             normalizedArgs: arguments,
@@ -796,7 +796,7 @@ final class RealProviderSmokeTests: XCTestCase {
             gate: gate,
             authorization: authorization,
             replayPolicy:
-                ToolExecutionReplayPolicy.requiresManualReconciliation.rawValue)
+                ToolExecutionReplayPolicy.doNotReplay.rawValue)
         return PermissionRequestPayload(
             requestId: RequestID.new(),
             agent: agent,

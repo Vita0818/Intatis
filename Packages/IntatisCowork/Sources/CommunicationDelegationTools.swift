@@ -32,7 +32,7 @@ public struct SendMessageTool: Tool {
             dataEffects: [.none],
             controlEffects: [.message],
             risks: [.controlPlaneMutation],
-            replayPolicy: .requiresManualReconciliation)
+            replayPolicy: .doNotReplay)
     }
 
     public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {
@@ -91,7 +91,7 @@ public struct RequestInformationTool: Tool {
             dataEffects: [.none],
             controlEffects: [.message],
             risks: [.controlPlaneMutation],
-            replayPolicy: .requiresManualReconciliation)
+            replayPolicy: .doNotReplay)
     }
 
     public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {
@@ -142,7 +142,7 @@ public struct ReplyMessageTool: Tool {
             dataEffects: [.none],
             controlEffects: [.message],
             risks: [.controlPlaneMutation],
-            replayPolicy: .requiresManualReconciliation)
+            replayPolicy: .doNotReplay)
     }
 
     public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {
@@ -155,53 +155,6 @@ public struct ReplyMessageTool: Tool {
             content: a.content,
             inReplyTo: a.inReplyTo),
             successPrefix: "replied to @")
-    }
-}
-
-public struct RequestDelegationTool: Tool {
-    public init() {}
-
-    public static let descriptor = ToolDescriptor(
-        name: "request_delegation",
-        description: "Ask the assigning agent or orchestrator for additional help without spawning agents or creating tasks.",
-        sideEffect: .readOnly,
-        parameters: .object([
-            "type": .string("object"),
-            "properties": .object([
-                "objective": .object(["type": .string("string")]),
-                "reason": .object(["type": .string("string")]),
-            ]),
-            "required": .array([.string("objective"), .string("reason")]),
-            "additionalProperties": .bool(false),
-        ])
-    )
-
-    struct Args: Decodable { let objective: String; let reason: String }
-
-    public func permissionIntent(_ args: ToolArgs, workspaceRoot: URL) -> PermissionIntent {
-        let value = try? args.decode(Args.self)
-        return PermissionIntent(
-            action: "task.delegation.request",
-            resources: [PermissionResource(kind: .task, value: "current")],
-            metadata: [
-                "objectiveLength": .number(Double(value?.objective.count ?? 0)),
-                "reasonLength": .number(Double(value?.reason.count ?? 0)),
-            ],
-            dataEffects: [.none],
-            controlEffects: [.message],
-            risks: [.controlPlaneMutation],
-            replayPolicy: .requiresManualReconciliation)
-    }
-
-    public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {
-        let a = try args.decode(Args.self)
-        guard let messenger = context.messenger else {
-            throw IntatisError.io("agent messaging is not available in this session")
-        }
-        return try Self.checked(await messenger.requestDelegation(
-            objective: a.objective,
-            reason: a.reason),
-            successPrefix: "delegation request delivered to @")
     }
 }
 
@@ -321,7 +274,7 @@ public struct DelegateTaskTool: Tool {
             dataEffects: [.none],
             controlEffects: [.delegateTask, .grantCapability],
             risks: [.controlPlaneMutation, .capabilityGrant, .modelCost],
-            replayPolicy: .requiresManualReconciliation)
+            replayPolicy: .doNotReplay)
     }
 
     public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {

@@ -63,7 +63,7 @@ public struct CreateGoalTool: Tool {
             dataEffects: [.none],
             controlEffects: [.createGoal],
             risks: [.controlPlaneMutation, .modelCost],
-            replayPolicy: .requiresManualReconciliation)
+            replayPolicy: .doNotReplay)
     }
 
     public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {
@@ -158,7 +158,7 @@ public struct UpdateGoalTool: Tool {
             dataEffects: [.none],
             controlEffects: [.submitGoalVerdict],
             risks: [.controlPlaneMutation],
-            replayPolicy: .requiresManualReconciliation)
+            replayPolicy: .doNotReplay)
     }
 
     public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {

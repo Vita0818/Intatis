@@ -196,7 +196,6 @@ final class CoworkEndToEndTests: XCTestCase {
         for lease in [macOSLease, iOSLease] {
             XCTAssertFalse(lease.tools.contains(.delegateTask))
             XCTAssertFalse(lease.tools.contains(.attachWorkspace))
-            XCTAssertTrue(lease.tools.contains(.requestDelegation))
         }
 
         await orch.runSchedulerUntilIdle()
@@ -376,7 +375,7 @@ final class CoworkEndToEndTests: XCTestCase {
         XCTAssertTrue(tools.contains("read_pdf"), file: file, line: line)
         XCTAssertTrue(tools.contains("list_files"), file: file, line: line)
         XCTAssertTrue(tools.contains("search_text"), file: file, line: line)
-        XCTAssertTrue(tools.contains("request_delegation"), file: file, line: line)
+        XCTAssertFalse(tools.contains("request_delegation"), file: file, line: line)
         XCTAssertTrue(tools.contains("reply_message"), file: file, line: line)
         XCTAssertFalse(tools.contains("edit_pdf_pages"), file: file, line: line)
         XCTAssertFalse(tools.contains("compile_latex"), file: file, line: line)

@@ -168,8 +168,6 @@ public struct Envelope: Codable, Equatable, Sendable {
             return .informationRequested(try c.decode(InformationRequestedPayload.self, forKey: .payload))
         case .informationReplied:
             return .informationReplied(try c.decode(InformationRepliedPayload.self, forKey: .payload))
-        case .delegationRequested:
-            return .delegationRequested(try c.decode(DelegationRequestedPayload.self, forKey: .payload))
         case .delegationApproved:
             return .delegationApproved(try c.decode(DelegationApprovedPayload.self, forKey: .payload))
         case .delegationRejected:
@@ -388,7 +386,6 @@ public struct Envelope: Codable, Equatable, Sendable {
         case .agentToAgentMessage(let p): try c.encode(p, forKey: .payload)
         case .informationRequested(let p): try c.encode(p, forKey: .payload)
         case .informationReplied(let p):   try c.encode(p, forKey: .payload)
-        case .delegationRequested(let p):  try c.encode(p, forKey: .payload)
         case .delegationApproved(let p):   try c.encode(p, forKey: .payload)
         case .delegationRejected(let p):   try c.encode(p, forKey: .payload)
         case .taskDelegated(let p):        try c.encode(p, forKey: .payload)

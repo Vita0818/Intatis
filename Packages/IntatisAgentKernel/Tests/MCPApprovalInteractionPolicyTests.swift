@@ -258,11 +258,11 @@ final class MCPApprovalInteractionPolicyTests: XCTestCase {
                 ],
                 dataEffects: [.destructive],
                 replayPolicy:
-                    .requiresManualReconciliation),
+                    .doNotReplay),
             sideEffect: .destructive,
             risksNetwork: true,
             replayPolicy:
-                .requiresManualReconciliation,
+                .doNotReplay,
             mcp: mcp)
     }
 }

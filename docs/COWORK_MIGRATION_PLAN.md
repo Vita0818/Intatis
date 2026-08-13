@@ -109,7 +109,6 @@ Introduce:
 send_message
 request_information
 reply_message
-request_delegation
 delegate_task
 ```
 

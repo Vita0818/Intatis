@@ -46,10 +46,16 @@ macOS 是完整产品：Chat、Code、Cowork、Settings 和本地诊断导出。
   completed Chat 回合，不写入消息历史、turn stats 或 busy/Stop 状态；每进程、每 session 最多
   三个逻辑 generation，前两次可精确返回 `NO_TITLE`，第三次必须给出标题。输出通过严格 stream、
   长度、格式、路径/长标识与敏感内容验收后，才在跨进程锁内执行 Chat-only set-if-absent rename。
+  stream 只接受一个完成标记与正常 EOF；usage 是元数据，可出现在完成标记前或后，以兼容官方
+  provider 的尾随 usage chunk，但完成后的正文、citation 或重复完成标记仍会拒绝整次标题。
   手工 Rename 永远优先，自动命名不改变 recent-session 排序；生成、验收或 EventLog append 前的
   失败、取消、超时与旧/歧义历史均静默保留默认名称。若 rename 已 append、仅 projection/通知失败，
-  EventLog 中标题已是 canonical truth，UI 可在刷新或重启后恢复。Code/Cowork 仍只使用既有显式
-  Rename/`rename_session` 路径。
+  EventLog 中标题已是 canonical truth，UI 可在刷新或重启后恢复。
+- Code 与 Cowork 不增加宿主自动命名触发器。Code system prompt 与 Cowork coordinator/exact `@main`
+  system prompt 要求模型在当前 session 第一轮用户任务完成验证或确认真实 blocker 后，若 authoritative
+  tool list 含 `rename_session`，以具体任务/结果标题调用一次；标题不得使用日期、时间、SessionID 或
+  泛化占位词。后续轮次只在用户明确要求时改名。Cowork worker 不收到该指令；exact `@main` 把
+  `rename_session` 作为最后一个非 run-control tool，若还需 `finish_run` / `stop_run`，只能在改名成功后调用。
 - Code 使用共享 headless `AgentRuntime.code`，提供工作区文件、patch、Git、managed
   terminal、Skills、外部 MCP、文档/媒体、浏览器，以及与浏览器独立的 provider-hosted search
   工具。工具可见性、lease、权限和 durable execution ticket 在执行前逐层核对。
@@ -96,7 +102,7 @@ macOS 是完整产品：Chat、Code、Cowork、Settings 和本地诊断导出。
   一份稀疏 XLSX 与三份 PPTX 运行只读复制后的回归，
   4/4 通过，稀疏表不再进入 openpyxl `EmptyCell` 手写投影。结构化普通读取 intent 仍经进程权限
   审查，但标记为 `safeToReplay`；解析失败会 durable settle 为 failed/unknown、返回模型并继续同批
-  后续文件，不再触发虚假的 manual reconciliation。当前 `maxCharacters` 只约束最终返回给模型的
+  后续文件，不会升级成整个 turn 的终止错误。当前 `maxCharacters` 只约束最终返回给模型的
   Markdown；Docling 仍会先完成整份文档转换与 Markdown 导出。生产 runner 已有输入文件/归档展开
   上限、超时、取消与进程清理，但尚无独立 RSS 内存上限，因此超大或极端复杂文档仍是明确的资源
   边界，不能把字符裁切误写成峰值内存保证。旧 26.2.4 runtime 已按用户授权移入废纸篓。生产 runner 的 EPUB write/EPUBCheck 和 strict
@@ -169,7 +175,10 @@ macOS 是完整产品：Chat、Code、Cowork、Settings 和本地诊断导出。
   deterministic allow/deny 忽略它。acting model 在原业务 function call 中用这一句话概括为什么 exact action 服务当前任务，
   不再二次调用 acting provider，也不复制 `request.messages`、完整 PDF/tool output 或全量图片。宿主在任何
   原业务 schema 校验、durable model history、EventLog 或 executor 之前拆除 sidecar，只用 canonical
-  business arguments 计算 intent/path/network/action preview/authorization identity。valid sidecar 只在当前
+  business arguments 计算 intent/path/network/action preview。sidecar 的 business digest 始终绑定这份 stripped
+  canonical arguments；`ResolvedToolAuthorization.normalizedArgumentsDigest` 则独立绑定 registration 的
+  `authorizationArgumentIdentity`，允许知识库等工具使用 host-resolved identity。两个 digest 各自复核自己的
+  canonical representation，不再互相比较。valid sidecar 只在当前
   turn 的 acting-model 内存 conversation 中保留，作为下一次 function call 的正确格式示例；durable history
   仍只保存 stripped business call。automatic ask 的 reviewer 收到完整 canonical safe business arguments、
   完整 same-generation sidecar，以及 request/task/call/tool、ResolvedToolAuthorization、gate、lease、intent
@@ -178,9 +187,10 @@ macOS 是完整产品：Chat、Code、Cowork、Settings 和本地诊断导出。
   permission lifecycle；`permission_request.context` 只保存 generation/snapshot/digest/status receipt。
   missing/malformed/secret-bearing sidecar 是 acting-model tool-input failure：只追加 failed/runtimeFailed
   `tool_result`，不创建 `permission_request` / `permission_resolved`、不调用 reviewer，也不消耗 permission
-  denial fuse；同一 business args 后续补正仍能进入 reviewer。side-effect evidence 只在当前 turn 内阻止模型
-  把未执行动作说成完成，restart 不恢复一条从未发生的权限拒绝。sidecar 与 exact call/generation/business
-  digest 无法绑定时则单独 typed fail closed。manual/nonautomatic flow 不接收 transient input，若模型仍发送
+  denial fuse；同一 business args 后续补正仍能进入 reviewer。failed/denied tool result 作为 observation 返回
+  当前模型轮次，不再登记、恢复或在 final 前检查副作用完成 ledger，也不会把随后正常的 final cast 成整轮失败。
+  sidecar 与 exact call/generation/business digest 无法绑定时仍单独 typed fail closed。manual/nonautomatic flow
+  不接收 transient input，若模型仍发送
   保留字段则在 business execution 前以 redacted audit + `authorization_context_mode_mismatch` 拒绝。图片存在
   本身不再 blanket deny。最终 reviewer 仍无工具，只接受非空 plain-text reason +
   末个非空行唯一 exact ASCII `ALLOW` / `DENY`。共享 prompt 建议 reason 约 240 Character，但 parser 不再
@@ -196,22 +206,24 @@ macOS 是完整产品：Chat、Code、Cowork、Settings 和本地诊断导出。
   error preview 仍依赖通用 bounded/secret sanitizer。live 也没有固定 sidecar byte ceiling 或
   `review_input_too_large` admission；未来只能从真实 route budget 推导整份拒绝上限。真实 provider sidecar
   smoke 尚未运行。
-- Cowork final turn 现在先校验 side-effect evidence，再原子发布 final message/model-history、idle
-  与 completed outcome；旧日志中 failed/interrupted turn 的先行完成气泡会被展示投影纠正，失效的
+- Cowork final turn 在 provider 正常完成且没有 tool call 时，原子发布 final message/model-history、idle
+  与 completed outcome；不存在基于既往 tool denial/failure 的二次副作用完成拦截。旧日志中其他原因造成的
+  failed/interrupted turn，其先行完成气泡仍会被展示投影纠正，失效的
   final assistant 也不再进入下一次 provider history。exact `@main` root 另可见模型主动调用的
   `finish_run` / `stop_run`：参数只有有界 reason，session/run/Goal/submission/root TaskID 全由宿主绑定；
   close installation 先形成 actor-local admission/authorization tombstone，EventLog 对每个 RunID 安装
   first-write durable claim 后才等待既有 admission 并 drain 同 run 的其余 task/message，恢复也先兑现该
   fence。普通自然语言 final 不伪造显式 claim；root failure/timeout、用户取消与 session shutdown 分别
   保留 runtime/user/hostLifecycle source，并在 provider/tool cleanup 前关闭精确 run。
-- mailbox wake contract 冻结 1–8 个 exact MessageID，并按 ordinary message、information request、
-  information reply receipt 与 delegation request 分配不同窄 authority。ordinary message 是 one-way、
+- mailbox wake contract 冻结 1–8 个 exact MessageID，并只按 ordinary message、information request、
+  information reply receipt 三类分配窄 authority。ordinary message 是 one-way、
   无通信工具；information request 只允许对 frozen RequestID 做一次 `reply_message(inReplyTo:)`；
   reply receipt 不允许 ACK，但允许在确有新问题时用 `request_information(based_on:)` 建立 fresh
   RequestID，并保留同一 conversation root。这样 `information_replied` 只终结一个 correlation，
   不终结长期协作。失败只在同一 TaskID 上有界重试；task completion、candidate progress 与 consumed
   IDs 同批落盘后才 ack。legacy nil binding 的歧义或耗尽 lineage 保持 pending/fail closed，新消息仍
-  可独立投递。WorkTask 工具的 reviewer preview 已补齐 bounded semantic fields，并明确 `wt_…`、
+  可独立投递。委派只由 coordinator 显式调用 `delegate_task`，worker 不再拥有请求委派工具或对应
+  mailbox authority。WorkTask 工具的 reviewer preview 已补齐 bounded semantic fields，并明确 `wt_…`、
   AgentInvocation `task_…` 与 latest revision 的边界。普通 worker 的同名 `task_update` 现由
   `update_bound_work_task` capability 投影为窄业务 schema，只提供 `task_id`、
   `expected_revision`、`progress_note`、允许的 `status`、`result` 与 `evidence`；manager 的完整
@@ -222,7 +234,11 @@ macOS 是完整产品：Chat、Code、Cowork、Settings 和本地诊断导出。
   `workspaceRoot`。具有 `spawn_agent` 的 coordinator 提示词会在预知目标位于根外或收到
   out-of-workspace denial 后停止直接重试，改为按目标绝对目录创建默认只读的子 agent，再用
   `delegate_task` 交付目录内工作；确需修改时才请求 `read_write`。工具不可用或扩展被拒时只报告
-  所需目录/访问级别的 blocker，不伪称完成；Code 与普通 worker 不宣称该恢复能力。
+  所需目录/访问级别的 blocker，不伪称完成；Code 与普通 worker 不宣称该恢复能力。`spawn_agent`
+  schema 不再接受 raw `model`：省略 `inference_profile_id` 时继承调用者 exact binding，显式填写时只
+  接受 host-approved profile ID。普通工具 executor error 会结算为 failed/unknown observation 并返回
+  同一 turn，不再升级成通用整轮终止；旧 task attempt 的 `doNotReplay` 边界只禁止自动重放，继续时
+  由用户创建新 Run。
 - Cowork coordinator 的固定提示词以主动执行为默认：每轮先建立 execution objective、交付物、约束
   与验证方式，检查 catalog 并激活/读取明确相关的 exact Skills；非简单任务维护最小 WorkTask DAG，
   在开始时识别适合并行、专业复核、多模态或独立 workspace 的分支并在收益成立时尽早委派，child
@@ -443,6 +459,14 @@ profiles 与外部 MCP client。macOS/Linux 的 stdio、sandbox、bwrap/guard �
 
 ## 最近验证状态
 
+- 2026-08-13 AuthorizationSidecar 绑定域分离与副作用完成 cast 删除：business-args digest 只核对
+  stripped canonical business arguments，custom authorization identity digest 只核对宿主授权快照；两者
+  不再交叉比较。AgentLoop 已删除 denied/failed side-effect ledger、EventLog restore、final completion
+  guard 与对应 error/prompt。权限拒绝和真实 tool outcome 仍持久化，但普通失败 observation 不再把随后
+  正常 final 改判失败。`AuthorizationSidecarTests` 12/12、`IntatisAgentKernelTests` 220/220、
+  `IntatisConversationTests` 212/212、`IntatisCoworkTests` 365/365，全部 0 failures；`swift build
+  --disable-automatic-resolution` 与 `IntatisMac` macOS Debug unsigned build 通过。未运行真实 provider、
+  credential/network、GUI、iOS App、签名或发行 smoke；详见 `docs/TESTING.md`。
 - 2026-08-13 Cowork Session 内独立 WorkTask / Run 中断 / 原子委派重构：WorkTask 已删除
   Run、Goal、agent owner 字段和跨 Run dependency/carry-forward 路径；Goal 与 WorkTask 状态不再
   相互传播。provider、网络和 runtime 中断把旧 Run 终结为 `interrupted`，显式 Resume 创建新

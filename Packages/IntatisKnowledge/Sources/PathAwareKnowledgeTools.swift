@@ -486,7 +486,7 @@ private struct PathAwareBuildKnowledgeTool: Tool {
             ],
             dataEffects: [.read, .mutate, .network],
             risks: [.workspaceMutation, .networkAccess, .modelCost],
-            replayPolicy: .requiresManualReconciliation)
+            replayPolicy: .doNotReplay)
     }
 
     func permissionIntent(_ args: ToolArgs,

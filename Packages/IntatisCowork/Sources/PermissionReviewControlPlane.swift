@@ -1588,15 +1588,11 @@ public actor PermissionReviewControlPlane {
                 return "transient review input invocation binding is inconsistent; automatic mode denied the request"
             }
             guard invocation.businessArgumentsDigest
-                    == authorization.normalizedArgumentsDigest,
-                  invocation.businessArgumentsCharacterCount
-                    == authorization.normalizedArgumentsCharacterCount,
-                  invocation.businessArgumentsDigest
                     == ToolRegistry.authorizationDigest(
                         invocation.canonicalBusinessArguments),
                   invocation.businessArgumentsCharacterCount
                     == invocation.canonicalBusinessArguments.count else {
-                return "transient review input does not match the authorized business arguments; automatic mode denied the request"
+                return "transient review input does not match the canonical business arguments; automatic mode denied the request"
             }
             guard invocation.modelAuthorizationContextDigest
                     == ToolRegistry.authorizationDigest(
@@ -1646,7 +1642,7 @@ public actor PermissionReviewControlPlane {
               task.sideEffect == .write,
               task.gate.policyVersion == "intatis.workspace-admission.v1",
               task.replayPolicy
-                == ToolExecutionReplayPolicy.requiresManualReconciliation.rawValue,
+                == ToolExecutionReplayPolicy.doNotReplay.rawValue,
               let taskID = task.taskID,
               task.toolCallID == "agent-attach:\(request.requestId.rawValue)",
               task.executionID == "agent-admission:\(taskID.rawValue)",

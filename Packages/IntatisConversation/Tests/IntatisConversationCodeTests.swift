@@ -67,14 +67,14 @@ final class IntatisConversationCodeTests: XCTestCase {
                 text: "Actually complete",
                 submissionID: otherSubmissionID))),
             env(6, .error(.init(
-                code: "unresolved_denied_side_effects",
-                message: "A requested update never succeeded.",
+                code: "provider_runtime_failure",
+                message: "The provider stopped after emitting partial output.",
                 submissionID: submissionID))),
             env(7, .turnOutcome(.init(
                 turnID: TurnID(rawValue: "turn_failed_projection"),
                 outcome: .failed,
                 failureSource: .runtimeFailed,
-                reason: "unresolved side effect",
+                reason: "provider runtime failure",
                 submissionID: submissionID,
                 taskID: taskID,
                 agentID: agent))),
@@ -89,11 +89,11 @@ final class IntatisConversationCodeTests: XCTestCase {
         XCTAssertEqual(
             invalidated?.recoveryAdvice?.title,
             "Response was not accepted as complete")
-        XCTAssertTrue(invalidated?.recoveryAdvice?.detail.contains("unresolved side effect") == true)
+        XCTAssertTrue(invalidated?.recoveryAdvice?.detail.contains("provider runtime failure") == true)
         XCTAssertEqual(unaffected?.complete, true)
         XCTAssertEqual(unaffected?.isFailure, false)
         XCTAssertTrue(projection.items.contains {
-            $0.kind == .error && $0.body.contains("requested update never succeeded")
+            $0.kind == .error && $0.body.contains("provider stopped")
         })
     }
 

@@ -1392,7 +1392,7 @@ public struct ExecCommandTool: Tool {
             ],
             dataEffects: effects,
             risks: risks,
-            replayPolicy: .requiresManualReconciliation)
+            replayPolicy: .doNotReplay)
     }
 
     public func execute(_ args: ToolArgs,
@@ -1472,7 +1472,7 @@ public struct WriteStdinTool: Tool {
             ],
             dataEffects: [.execute],
             risks: [.processExecution],
-            replayPolicy: .requiresManualReconciliation)
+            replayPolicy: .doNotReplay)
     }
 
     public func permissionActionPreview(_ args: ToolArgs) -> PermissionActionPreview? {

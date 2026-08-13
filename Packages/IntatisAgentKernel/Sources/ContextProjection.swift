@@ -700,24 +700,6 @@ public struct ContextProjector: Sendable {
                     recipient: payload.to,
                     taskID: payload.taskID,
                     content: payload.content)
-            case .delegationRequested(let payload) where payload.requester == agentID:
-                guard isRelevant(payload.parentTaskID, taskContract: taskContract, relevantTaskIDs: relevantTaskIDs) else {
-                    return nil
-                }
-                guard isWithinTaskWindow(
-                    sequence: envelope.seq,
-                    taskID: payload.parentTaskID,
-                    taskContract: taskContract,
-                    taskAnchor: taskAnchor) else {
-                    return nil
-                }
-                return ContextEventSummary(
-                    seq: envelope.seq,
-                    kind: "delegation_requested",
-                    sender: payload.requester,
-                    recipient: payload.recipient,
-                    taskID: payload.parentTaskID,
-                    content: "\(payload.objective) — \(payload.reason)")
             case .messageCompleted(let payload) where payload.agent == agentID:
                 guard isWithinTaskWindow(
                     sequence: envelope.seq,
@@ -862,8 +844,6 @@ public struct ContextProjector: Sendable {
                 return allows(taskID: payload.taskID)
             case .informationReplied(let payload):
                 return allows(taskID: payload.taskID)
-            case .delegationRequested(let payload):
-                return allows(taskID: payload.parentTaskID)
             case .taskCreated(let payload):
                 return allows(taskID: payload.contract.id)
             case .taskAssigned(let payload):

@@ -46,7 +46,6 @@ final class CapabilityLeaseTests: XCTestCase {
         XCTAssertTrue(lease.tools.contains(.searchWorkspace))
         XCTAssertTrue(lease.tools.contains(.readPDF))
         XCTAssertTrue(Self.documentObservationCapabilities.isSubset(of: lease.tools))
-        XCTAssertTrue(lease.tools.contains(.requestDelegation))
         XCTAssertFalse(lease.tools.contains(.hostedWebSearch))
         XCTAssertTrue(lease.tools.isDisjoint(with: Self.documentMutationCapabilities))
         XCTAssertTrue(lease.tools.isDisjoint(with: Self.legacyDocumentCapabilities))
@@ -56,7 +55,7 @@ final class CapabilityLeaseTests: XCTestCase {
         XCTAssertFalse(lease.tools.contains(.browseWeb))
         XCTAssertFalse(lease.tools.contains(.gitControl))
         XCTAssertFalse(lease.tools.contains(.gitRemote))
-        XCTAssertEqual(lease.delegation, .requestOnly)
+        XCTAssertEqual(lease.delegation, .none)
     }
 
     func testCoordinatorLeaseGrantsDelegationTools() {

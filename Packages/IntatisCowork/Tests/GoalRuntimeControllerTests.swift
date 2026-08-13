@@ -1978,7 +1978,7 @@ final class GoalRuntimeControllerTests: XCTestCase {
                 agent: Orchestrator.mainAgentID,
                 tool: "write_file",
                 sideEffect: .write,
-                replayPolicy: .requiresManualReconciliation)
+                replayPolicy: .doNotReplay)
             var events: [Event] = []
             if scenario.recordsTask {
                 events.append(.taskCreated(TaskCreatedPayload(contract: contract)))
@@ -1987,7 +1987,7 @@ final class GoalRuntimeControllerTests: XCTestCase {
                 ? .taskFailed(TaskFailedPayload(
                     taskID: taskID,
                     agent: Orchestrator.mainAgentID,
-                    error: "manual reconciliation required",
+                    error: "interrupted non-replayable tool call",
                     attempt: scenario.terminalAttempt))
                 : nil
             if scenario.terminalBeforePrepare, let terminalEvent {
@@ -2054,7 +2054,7 @@ final class GoalRuntimeControllerTests: XCTestCase {
                 agent: Orchestrator.mainAgentID,
                 tool: "write_file",
                 sideEffect: .write,
-                replayPolicy: .requiresManualReconciliation)
+                replayPolicy: .doNotReplay)
             try await log.append([
                 .goalCreated(GoalCreatedPayload(goal: goal)),
                 .toolExecutionPrepared(prepared),
@@ -2115,7 +2115,7 @@ final class GoalRuntimeControllerTests: XCTestCase {
             agent: Orchestrator.mainAgentID,
             tool: "write_file",
             sideEffect: .write,
-            replayPolicy: .requiresManualReconciliation)
+            replayPolicy: .doNotReplay)
         try await log.append([
             .goalCreated(GoalCreatedPayload(goal: goal)),
             .toolExecutionPrepared(prepared),
@@ -2291,7 +2291,7 @@ final class GoalRuntimeControllerTests: XCTestCase {
             agent: Orchestrator.mainAgentID,
             tool: "write_file",
             sideEffect: .write,
-            replayPolicy: .requiresManualReconciliation)
+            replayPolicy: .doNotReplay)
         try await unsafeLog.append([
             .goalCreated(GoalCreatedPayload(goal: unsafeGoal)),
             .continuationRunCreated(ContinuationRunCreatedPayload(run: unsafeCreatedRun)),

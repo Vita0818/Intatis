@@ -27,7 +27,7 @@ final class PermissionProjectionTests: XCTestCase {
             resources: [PermissionResource(kind: .workspacePath, value: "a.txt", access: .readWrite)],
             dataEffects: [.mutate],
             risks: [.workspaceMutation],
-            replayPolicy: .requiresManualReconciliation)
+            replayPolicy: .doNotReplay)
         return ResolvedToolAuthorization(
             authorizationID: "authorization_projection",
             registryVersion: "test.v1",
@@ -47,7 +47,7 @@ final class PermissionProjectionTests: XCTestCase {
             intent: intent,
             sideEffect: .write,
             risksNetwork: false,
-            replayPolicy: .requiresManualReconciliation)
+            replayPolicy: .doNotReplay)
     }
 
     private func reviewRequested(_ requestID: String) -> PermissionReviewRequestedPayload {

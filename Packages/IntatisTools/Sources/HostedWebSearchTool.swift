@@ -63,7 +63,7 @@ public struct HostedWebSearchTool: Tool {
             ],
             dataEffects: [.network],
             risks: [.networkAccess, .modelCost],
-            replayPolicy: .requiresManualReconciliation)
+            replayPolicy: .doNotReplay)
     }
 
     public func execute(

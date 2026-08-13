@@ -124,7 +124,7 @@ public struct TaskCreateTool: Tool {
             dataEffects: [.none],
             controlEffects: [.createTask],
             risks: [.controlPlaneMutation],
-            replayPolicy: .requiresManualReconciliation)
+            replayPolicy: .doNotReplay)
     }
 
     public func permissionActionPreview(
@@ -248,7 +248,7 @@ public struct TaskUpdateTool: Tool {
             dataEffects: [.none],
             controlEffects: [cancelling ? .cancelTask : .updateTask],
             risks: [.controlPlaneMutation],
-            replayPolicy: .requiresManualReconciliation)
+            replayPolicy: .doNotReplay)
     }
 
     public func permissionActionPreview(

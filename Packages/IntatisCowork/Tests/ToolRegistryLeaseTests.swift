@@ -1319,7 +1319,7 @@ final class ToolRegistryLeaseTests: XCTestCase {
             taskID: granted.taskID,
             tools: granted.tools,
             communication: granted.communication,
-            delegation: .requestOnly)
+            delegation: .none)
         XCTAssertThrowsError(try registry.resolveAuthorization(
             toolName: "delegate_task",
             intent: delegate.permissionIntent(delegateArgs, workspaceRoot: root),

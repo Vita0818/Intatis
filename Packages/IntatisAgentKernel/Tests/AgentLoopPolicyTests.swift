@@ -486,7 +486,7 @@ private struct PolicyStaleThenSuccessfulTaskUpdateTool: Tool {
             dataEffects: [.none],
             controlEffects: [.updateTask],
             risks: [.controlPlaneMutation],
-            replayPolicy: .requiresManualReconciliation)
+            replayPolicy: .doNotReplay)
     }
 
     func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {
@@ -1158,7 +1158,7 @@ final class AgentLoopPolicyTests: XCTestCase {
         XCTAssertEqual(reviewContext.capabilityLease, capability)
         XCTAssertEqual(reviewContext.workspaceLease, workspaceLease)
         XCTAssertEqual(reviewContext.taskContract, contract)
-        XCTAssertEqual(reviewContext.replayPolicy, ToolExecutionReplayPolicy.requiresManualReconciliation.rawValue)
+        XCTAssertEqual(reviewContext.replayPolicy, ToolExecutionReplayPolicy.doNotReplay.rawValue)
         XCTAssertEqual(reviewContext.gate?.decision, .pass)
         let authorization = try XCTUnwrap(reviewContext.authorization)
         XCTAssertEqual(authorization.registryVersion, "test.cowork.v1")
@@ -1396,7 +1396,7 @@ final class AgentLoopPolicyTests: XCTestCase {
         XCTAssertEqual(settlements.last?.effectDisposition, .committed)
     }
 
-    func testNonReplayableToolFailureLeavesExecutionUnsettledForManualReconciliation() async throws {
+    func testNonReplayableToolFailureSettlesAndReturnsFailureToModel() async throws {
         let (workspace, log) = try makeWorkspaceAndLog("uncertain-side-effect")
         defer { try? FileManager.default.removeItem(at: workspace) }
         let taskID = TaskID(rawValue: "task-uncertain-side-effect")
@@ -1407,13 +1407,19 @@ final class AgentLoopPolicyTests: XCTestCase {
             objective: "Run an uncertain write.",
             roleHint: "worker",
             expectedDeliverable: "result")
-        let provider = PolicyScriptedProvider([[
-            .toolCalls([ToolCall(
-                id: "uncertain-call",
-                name: "uncertain_write",
-                arguments: "{}")]),
-            .done(finishReason: "tool_calls"),
-        ]])
+        let provider = PolicyScriptedProvider([
+            [
+                .toolCalls([ToolCall(
+                    id: "uncertain-call",
+                    name: "uncertain_write",
+                    arguments: "{}")]),
+                .done(finishReason: "tool_calls"),
+            ],
+            [
+                .textDelta("The tool failed; no result was claimed."),
+                .done(finishReason: "stop"),
+            ],
+        ])
         let loop = makeLoop(
             workspace: workspace,
             log: log,
@@ -1422,34 +1428,28 @@ final class AgentLoopPolicyTests: XCTestCase {
             context: ContextBuilder(taskContract: contract),
             taskAttempt: 1)
 
-        do {
-            _ = try await loop.send("Run it.")
-            XCTFail("An uncertain non-replayable failure must stop the task.")
-        } catch let error as AgentLoopError {
-            guard case .toolExecutionRequiresManualReconciliation(
-                tool: "uncertain_write",
-                executionID: _,
-                reason: _) = error else {
-                return XCTFail("Unexpected AgentLoopError: \(error)")
-            }
-        }
+        let answer = try await loop.send("Run it.")
+
+        XCTAssertEqual(answer, "The tool failed; no result was claimed.")
 
         let events = await log.replay()
         let projection = CoworkProjection.build(from: events)
-        let execution = try XCTUnwrap(projection.unresolvedNonReplayableToolExecutions.first)
-        XCTAssertEqual(execution.prepared.taskID, taskID)
-        XCTAssertEqual(execution.prepared.attempt, 1)
-        XCTAssertEqual(execution.prepared.tool, "uncertain_write")
-        XCTAssertFalse(events.contains { envelope in
-            if case .toolExecutionSettled(let payload) = envelope.event {
-                return payload.executionID == execution.id
-            }
-            return false
-        })
+        XCTAssertTrue(projection.unresolvedNonReplayableToolExecutions.isEmpty)
+        let settlement = try XCTUnwrap(events.compactMap { envelope -> ToolExecutionSettledPayload? in
+            guard case .toolExecutionSettled(let payload) = envelope.event,
+                  payload.toolCallID == "uncertain-call" else { return nil }
+            return payload
+        }.first)
+        XCTAssertEqual(settlement.taskID, taskID)
+        XCTAssertEqual(settlement.attempt, 1)
+        XCTAssertEqual(settlement.tool, "uncertain_write")
+        XCTAssertEqual(settlement.outcome, .failed)
+        XCTAssertEqual(settlement.effectDisposition, .unknown)
         XCTAssertTrue(events.contains { envelope in
             guard case .toolResult(let payload) = envelope.event else { return false }
             return payload.toolCallId == "uncertain-call"
-                && payload.observation.contains("manual reconciliation required")
+                && payload.observation.contains("lost its completion acknowledgement")
+                && !payload.observation.contains("reconciliation")
         })
     }
 
@@ -1534,8 +1534,8 @@ final class AgentLoopPolicyTests: XCTestCase {
         XCTAssertEqual(successfulSettlement.outcome, .succeeded)
         XCTAssertEqual(successfulSettlement.effectDisposition, .committed)
         XCTAssertFalse(events.contains { envelope in
-            guard case .error(let payload) = envelope.event else { return false }
-            return payload.code == "manual_reconciliation"
+            if case .error = envelope.event { return true }
+            return false
         })
     }
 
@@ -1592,7 +1592,7 @@ final class AgentLoopPolicyTests: XCTestCase {
             .contains { $0.id == prepared.executionID })
     }
 
-    func testCancelledNonReplayableToolLeavesExecutionUnsettledForManualReconciliation() async throws {
+    func testCancelledNonReplayableToolSettlesCancelledWithoutGenericReconciliationError() async throws {
         let (workspace, log) = try makeWorkspaceAndLog("cancelled-uncertain-side-effect")
         defer { try? FileManager.default.removeItem(at: workspace) }
         let taskID = TaskID(rawValue: "task-cancelled-uncertain-side-effect")
@@ -1630,20 +1630,21 @@ final class AgentLoopPolicyTests: XCTestCase {
         }
 
         let events = await log.replay()
-        let projection = CoworkProjection.build(from: events)
-        let unresolved = try XCTUnwrap(projection.unresolvedNonReplayableToolExecutions.first)
-        XCTAssertEqual(unresolved.prepared.taskID, taskID)
-        XCTAssertEqual(unresolved.prepared.tool, "cancellable_uncertain_write")
-        XCTAssertFalse(events.contains { envelope in
-            if case .toolExecutionSettled(let payload) = envelope.event {
-                return payload.executionID == unresolved.id
-            }
-            return false
-        })
+        XCTAssertTrue(CoworkProjection.build(from: events)
+            .unresolvedNonReplayableToolExecutions.isEmpty)
+        let settled = try XCTUnwrap(events.compactMap { envelope -> ToolExecutionSettledPayload? in
+            guard case .toolExecutionSettled(let payload) = envelope.event,
+                  payload.toolCallID == "cancelled-uncertain-call" else { return nil }
+            return payload
+        }.first)
+        XCTAssertEqual(settled.taskID, taskID)
+        XCTAssertEqual(settled.tool, "cancellable_uncertain_write")
+        XCTAssertEqual(settled.outcome, .cancelled)
+        XCTAssertEqual(settled.effectDisposition, .unknown)
         XCTAssertTrue(events.contains { envelope in
             guard case .toolResult(let payload) = envelope.event else { return false }
             return payload.toolCallId == "cancelled-uncertain-call"
-                && payload.observation.contains("manual reconciliation required")
+                && payload.observation == "tool cancelled after execution started"
         })
     }
 
@@ -2022,14 +2023,11 @@ final class AgentLoopPolicyTests: XCTestCase {
             rootTaskID: taskID,
             taskAttempt: 1)
 
-        do {
-            _ = try await loop.send("Exercise the double-reviewer guard.")
-            XCTFail("A Cowork in-engine reviewer must not bypass the control plane.")
-        } catch let error as AgentLoopError {
-            guard case .unresolvedDeniedSideEffects = error else {
-                return XCTFail("Unexpected AgentLoopError: \(error)")
-            }
-        }
+        let answer = try await loop.send(
+            "Exercise the double-reviewer guard.")
+        XCTAssertEqual(
+            answer,
+            "The misconfigured action was not executed.")
 
         let capturedRequests = await responder.requests()
         XCTAssertTrue(capturedRequests.isEmpty)
@@ -2201,7 +2199,7 @@ final class AgentLoopPolicyTests: XCTestCase {
             atPath: workspace.appendingPathComponent("never-written.txt").path))
     }
 
-    func testRepeatedDeniedCoworkActionIsReportedOnce() async throws {
+    func testRepeatedDeniedCoworkActionDoesNotOverrideFinalResponse() async throws {
         let (workspace, log) = try makeWorkspaceAndLog("deduplicated-denial-evidence")
         defer { try? FileManager.default.removeItem(at: workspace) }
         let taskID = TaskID(rawValue: "task-deduplicated-denial-evidence")
@@ -2238,16 +2236,9 @@ final class AgentLoopPolicyTests: XCTestCase {
             rootTaskID: taskID,
             taskAttempt: 1)
 
-        do {
-            _ = try await loop.send("Attempt the same denied write twice.")
-            XCTFail("A denied Cowork side effect cannot be reported as completed.")
-        } catch let error as AgentLoopError {
-            guard case .unresolvedDeniedSideEffects(let actions) = error else {
-                return XCTFail("Unexpected AgentLoopError: \(error)")
-            }
-            XCTAssertEqual(actions.count, 1)
-            XCTAssertEqual(actions.first?.contains("blocked.txt"), true)
-        }
+        let answer = try await loop.send(
+            "Attempt the same denied write twice.")
+        XCTAssertEqual(answer, "The write remained blocked.")
 
         let approvalRequests = await responder.requests()
         XCTAssertEqual(approvalRequests.count, 1)
@@ -2260,7 +2251,7 @@ final class AgentLoopPolicyTests: XCTestCase {
             }
             return false
         })
-        XCTAssertFalse(events.contains {
+        XCTAssertTrue(events.contains {
             if case .messageCompleted = $0.event { return true }
             return false
         })
@@ -2268,14 +2259,8 @@ final class AgentLoopPolicyTests: XCTestCase {
             guard case .turnOutcome(let payload) = envelope.event else { return nil }
             return payload
         }
-        XCTAssertEqual(outcomes.map(\.outcome), [.failed])
+        XCTAssertEqual(outcomes.map(\.outcome), [.completed])
         XCTAssertEqual(outcomes.first?.taskID, taskID)
-        XCTAssertTrue(events.contains {
-            if case .error(let payload) = $0.event {
-                return payload.code == "unresolved_denied_side_effects"
-            }
-            return false
-        })
     }
 
     func testRepeatedIdenticalUnleasedToolCallTerminatesWithoutReviewer() async throws {
@@ -2324,7 +2309,7 @@ final class AgentLoopPolicyTests: XCTestCase {
             atPath: workspace.appendingPathComponent("blocked.txt").path))
     }
 
-    func testInvalidCoworkWriteCannotBeReportedAsCompleted() async throws {
+    func testInvalidCoworkWriteFailureDoesNotOverrideFinalResponse() async throws {
         let (workspace, log) = try makeWorkspaceAndLog("invalid-write-completion")
         defer { try? FileManager.default.removeItem(at: workspace) }
         let taskID = TaskID(rawValue: "task-invalid-write-completion")
@@ -2353,15 +2338,8 @@ final class AgentLoopPolicyTests: XCTestCase {
                 runtimeEnvironment: .cowork),
             taskAttempt: 1)
 
-        do {
-            _ = try await loop.send("Create it.")
-            XCTFail("Invalid mutating input cannot count as execution evidence.")
-        } catch let error as AgentLoopError {
-            guard case .unresolvedDeniedSideEffects(let actions) = error else {
-                return XCTFail("Unexpected AgentLoopError: \(error)")
-            }
-            XCTAssertTrue(actions.contains { $0.contains("invalid.txt") })
-        }
+        let answer = try await loop.send("Create it.")
+        XCTAssertEqual(answer, "I created invalid.txt.")
         XCTAssertFalse(FileManager.default.fileExists(
             atPath: workspace.appendingPathComponent("invalid.txt").path))
     }
@@ -2430,7 +2408,7 @@ final class AgentLoopPolicyTests: XCTestCase {
         XCTAssertTrue(provider.requests.isEmpty)
     }
 
-    func testRestoredCoworkTaskCannotCompleteAfterAllowedWriteWithoutExecutionSettlement() async throws {
+    func testPriorAllowedWriteHistoryDoesNotBlockNewFinalResponse() async throws {
         let (workspace, log) = try makeWorkspaceAndLog("restore-permission-resolved-window")
         defer { try? FileManager.default.removeItem(at: workspace) }
         let taskID = TaskID(rawValue: "task-restore-permission-resolved")
@@ -2482,20 +2460,13 @@ final class AgentLoopPolicyTests: XCTestCase {
                 runtimeEnvironment: .cowork),
             taskAttempt: 2)
 
-        do {
-            _ = try await loop.send("Resume the task.")
-            XCTFail("A prior allow without successful settlement is not completion evidence.")
-        } catch let error as AgentLoopError {
-            guard case .unresolvedDeniedSideEffects(let actions) = error else {
-                return XCTFail("Unexpected AgentLoopError: \(error)")
-            }
-            XCTAssertTrue(actions.contains { $0.contains("pending.txt") })
-        }
+        let answer = try await loop.send("Resume the task.")
+        XCTAssertEqual(answer, "The file is complete.")
         XCTAssertFalse(FileManager.default.fileExists(
             atPath: workspace.appendingPathComponent("pending.txt").path))
     }
 
-    func testRestoredCoworkTaskCannotCompleteAfterReviewSettledBeforePermissionResolved() async throws {
+    func testPriorReviewSettlementDoesNotBlockNewFinalResponse() async throws {
         let (workspace, log) = try makeWorkspaceAndLog("restore-review-settled-window")
         defer { try? FileManager.default.removeItem(at: workspace) }
         let taskID = TaskID(rawValue: "task-restore-review-settled")
@@ -2550,18 +2521,11 @@ final class AgentLoopPolicyTests: XCTestCase {
                 runtimeEnvironment: .cowork),
             taskAttempt: 2)
 
-        do {
-            _ = try await loop.send("Resume the task.")
-            XCTFail("A settled review alone is not execution evidence.")
-        } catch let error as AgentLoopError {
-            guard case .unresolvedDeniedSideEffects(let actions) = error else {
-                return XCTFail("Unexpected AgentLoopError: \(error)")
-            }
-            XCTAssertTrue(actions.contains { $0.contains("pending.txt") })
-        }
+        let answer = try await loop.send("Resume the task.")
+        XCTAssertEqual(answer, "The file is complete.")
     }
 
-    func testRestoredSuccessfulSettlementClearsPriorPermissionEvidence() async throws {
+    func testPriorSuccessfulSettlementHistoryDoesNotBlockNewFinalResponse() async throws {
         let (workspace, log) = try makeWorkspaceAndLog("restore-successful-settlement")
         defer { try? FileManager.default.removeItem(at: workspace) }
         let taskID = TaskID(rawValue: "task-restore-success")

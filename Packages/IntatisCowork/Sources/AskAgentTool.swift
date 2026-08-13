@@ -40,7 +40,7 @@ public struct AskAgentTool: Tool {
             dataEffects: [.none],
             controlEffects: [.createTask, .message],
             risks: [.controlPlaneMutation, .modelCost],
-            replayPolicy: .requiresManualReconciliation)
+            replayPolicy: .doNotReplay)
     }
 
     public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {

@@ -1547,7 +1547,7 @@ private final class BuildFixture {
             ],
             dataEffects: [.read, .mutate],
             risks: [.workspaceMutation],
-            replayPolicy: .requiresManualReconciliation)
+            replayPolicy: .doNotReplay)
         let authorizationIdentity = try! KnowledgeBuildAuthorizationIdentity.canonical(
             draftRoot: draft,
             storeRoot: store,
@@ -1577,7 +1577,7 @@ private final class BuildFixture {
             intent: intent,
             sideEffect: .write,
             risksNetwork: embeddingModel.runtimeBindingKind == .remote,
-            replayPolicy: .requiresManualReconciliation,
+            replayPolicy: .doNotReplay,
             deterministicGate: deterministicGate,
             workspaceID: workspaceLease.workspaceID,
             workspaceTaskID: workspaceLease.taskID,

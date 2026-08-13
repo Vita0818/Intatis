@@ -1933,7 +1933,7 @@ final class AutomaticPermissionReviewTests: XCTestCase {
         XCTAssertEqual(proposedWorkspace.access, .readWrite)
         XCTAssertFalse(proposedCapability.tools.contains(.delegateTask))
         XCTAssertFalse(proposedCapability.tools.contains(.attachWorkspace))
-        XCTAssertEqual(proposedCapability.delegation, .requestOnly)
+        XCTAssertEqual(proposedCapability.delegation, .none)
 
         let authorization = try XCTUnwrap(reviewTask.authorization)
         XCTAssertEqual(
@@ -1986,7 +1986,6 @@ final class AutomaticPermissionReviewTests: XCTestCase {
             [
                 "name": "coordinator-admission",
                 "path": childWorkspace.path,
-                "model": "child-model",
                 "canCoordinate": true,
             ],
             reference: "current coordinator creation request",
@@ -2857,7 +2856,7 @@ final class AutomaticPermissionReviewTests: XCTestCase {
             "the valid successful call must remain a valid example in same-turn acting history")
     }
 
-    func testSecretSidecarIsToolInputFailureWhileUnboundContextIsTypedDenial()
+    func testSecretSidecarFailsWhileCustomAuthorizationIdentityRemainsBound()
         async throws {
         let log = try autoReviewTempLog()
         let ws = try autoReviewWorkspace()
@@ -2884,18 +2883,18 @@ final class AutomaticPermissionReviewTests: XCTestCase {
                         name: "write_file",
                         arguments: secretArguments),
                     ToolCall(
-                        id: "write-unbound-sidecar",
+                        id: "write-custom-identity",
                         name: AutoReviewBindingTransformTool.descriptor.name,
                         arguments: autoReviewArguments(
                             ["value": "bounded"],
-                            reference: "current binding test request",
+                            reference: "current custom identity binding request",
                             justification:
                                 "The exact test call is the requested bounded action.")),
                 ]),
                 .done(finishReason: "tool_calls"),
             ],
             [
-                .textDelta("Neither invalid authorization context was executed."),
+                .textDelta("The secret-bearing call was rejected and the bound call completed."),
                 .done(finishReason: "stop"),
             ],
         ])
@@ -2906,9 +2905,9 @@ final class AutomaticPermissionReviewTests: XCTestCase {
             id: taskID,
             issuer: main,
             assignee: assignee,
-            objective: "Exercise secret and binding failures.",
+            objective: "Exercise secret rejection and custom identity binding.",
             roleHint: "worker",
-            expectedDeliverable: "typed denials")
+            expectedDeliverable: "one input failure and one successful call")
         let loop = AgentLoop(
             log: log,
             provider: provider,
@@ -2931,19 +2930,22 @@ final class AutomaticPermissionReviewTests: XCTestCase {
             rootTaskID: taskID,
             taskAttempt: 1)
 
-        do {
-            _ = try await loop.send("Exercise both invalid sidecars.")
-            XCTFail("Invalid automatic-review evidence must block completion.")
-        } catch let error as AgentLoopError {
-            guard case .unresolvedDeniedSideEffects = error else {
-                return XCTFail("Unexpected AgentLoopError: \(error)")
-            }
-        }
+        let answer = try await loop.send(
+            "Exercise secret rejection and custom identity binding.")
+        XCTAssertEqual(
+            answer,
+            "The secret-bearing call was rejected and the bound call completed.")
 
         let capturedInvocations = await responder.invocations()
         let bindingExecutionCount = await bindingProbe.executionCount()
-        XCTAssertTrue(capturedInvocations.isEmpty)
-        XCTAssertEqual(bindingExecutionCount, 0)
+        XCTAssertEqual(capturedInvocations.count, 1)
+        XCTAssertEqual(bindingExecutionCount, 1)
+        XCTAssertEqual(
+            capturedInvocations.first?.canonicalBusinessArguments,
+            #"{"value":"bounded"}"#)
+        XCTAssertEqual(
+            capturedInvocations.first?.businessArgumentsDigest,
+            ToolRegistry.authorizationDigest(#"{"value":"bounded"}"#))
         XCTAssertFalse(FileManager.default.fileExists(
             atPath: ws.appendingPathComponent("must-not-exist.txt").path))
         XCTAssertFalse(provider.requests.dropFirst().contains { request in
@@ -2956,30 +2958,24 @@ final class AutomaticPermissionReviewTests: XCTestCase {
         })
 
         let events = await log.replay()
-        let invalidCallIDs = [
-            "write-secret-sidecar",
-            "write-unbound-sidecar",
-        ]
-        for callID in invalidCallIDs {
-            XCTAssertFalse(events.contains { envelope in
-                guard case .permissionRequest(let payload) = envelope.event else {
-                    return false
-                }
-                return payload.context?.toolCallID == callID
-            })
-            XCTAssertFalse(events.contains { envelope in
-                guard case .permissionReviewRequested(let payload) = envelope.event else {
-                    return false
-                }
-                return payload.task.toolCallID == callID
-            })
-            XCTAssertFalse(events.contains { envelope in
-                guard case .permissionReviewSettled(let payload) = envelope.event else {
-                    return false
-                }
-                return payload.authorization?.toolCallID == callID
-            })
-        }
+        XCTAssertFalse(events.contains { envelope in
+            guard case .permissionRequest(let payload) = envelope.event else {
+                return false
+            }
+            return payload.context?.toolCallID == "write-secret-sidecar"
+        })
+        XCTAssertFalse(events.contains { envelope in
+            guard case .permissionReviewRequested(let payload) = envelope.event else {
+                return false
+            }
+            return payload.task.toolCallID == "write-secret-sidecar"
+        })
+        XCTAssertFalse(events.contains { envelope in
+            guard case .permissionReviewSettled(let payload) = envelope.event else {
+                return false
+            }
+            return payload.authorization?.toolCallID == "write-secret-sidecar"
+        })
 
         let secretCallEnvelope = try XCTUnwrap(events.first { envelope in
             guard case .toolCall(let payload) = envelope.event else {
@@ -3012,46 +3008,45 @@ final class AutomaticPermissionReviewTests: XCTestCase {
             "authorization_context_secret_bearing:"))
         XCTAssertEqual(secretResultEnvelope.seq, secretCallEnvelope.seq + 1)
 
-        let unboundResolvedEnvelope = try XCTUnwrap(events.first { envelope in
+        let customResolvedEnvelope = try XCTUnwrap(events.first { envelope in
             guard case .permissionResolved(let payload) = envelope.event else {
                 return false
             }
-            return payload.toolCallID == "write-unbound-sidecar"
+            return payload.toolCallID == "write-custom-identity"
         })
-        let unboundResultEnvelope = try XCTUnwrap(events.first { envelope in
+        let customResultEnvelope = try XCTUnwrap(events.first { envelope in
             guard case .toolResult(let payload) = envelope.event else {
                 return false
             }
-            return payload.toolCallId == "write-unbound-sidecar"
+            return payload.toolCallId == "write-custom-identity"
         })
-        guard case .permissionResolved(let unboundResolved) =
-            unboundResolvedEnvelope.event,
-            case .toolResult(let unboundResult) = unboundResultEnvelope.event else {
-            return XCTFail("Expected a typed binding denial")
+        guard case .permissionResolved(let customResolved) =
+            customResolvedEnvelope.event,
+            case .toolResult(let customResult) = customResultEnvelope.event else {
+            return XCTFail("Expected an allowed custom-identity execution")
         }
-        XCTAssertNil(unboundResolved.requestId)
-        XCTAssertNil(unboundResolved.reviewTaskID)
-        XCTAssertEqual(unboundResolved.decision, .deny)
-        XCTAssertEqual(unboundResolved.source, .automaticReviewerFailure)
-        XCTAssertEqual(unboundResolved.reviewStatus, .failed)
+        XCTAssertNotNil(customResolved.requestId)
+        XCTAssertEqual(customResolved.decision, .allow)
+        XCTAssertEqual(customResolved.source, .automaticReviewer)
+        XCTAssertEqual(customResolved.reviewStatus, .allowed)
+        XCTAssertNil(customResolved.failureKind)
+        XCTAssertNil(customResolved.failureSource)
+        let customAuthorization = try XCTUnwrap(
+            customResolved.authorization)
         XCTAssertEqual(
-            unboundResolved.failureKind,
-            .authorizationSnapshotInvalid)
-        XCTAssertEqual(unboundResolved.failureSource, .reviewerFailed)
+            customAuthorization.normalizedArgumentsDigest,
+            ToolRegistry.authorizationDigest("host-transformed-identity"))
+        XCTAssertNotEqual(
+            customAuthorization.normalizedArgumentsDigest,
+            capturedInvocations.first?.businessArgumentsDigest)
+        XCTAssertEqual(customResolved.intent, customAuthorization.intent)
+        XCTAssertEqual(customAuthorization.taskID, taskID)
         XCTAssertEqual(
-            unboundResolved.intent,
-            unboundResolved.authorization?.intent)
-        XCTAssertEqual(unboundResolved.authorization?.taskID, taskID)
-        XCTAssertEqual(
-            unboundResolved.authorization?.toolCallID,
-            "write-unbound-sidecar")
-        XCTAssertEqual(unboundResolved.turnID, unboundResult.turnID)
-        XCTAssertEqual(unboundResult.outcome, .denied)
-        XCTAssertEqual(unboundResult.failureSource, .reviewerFailed)
-        XCTAssertNil(unboundResult.permissionRequestID)
-        XCTAssertEqual(
-            unboundResultEnvelope.seq,
-            unboundResolvedEnvelope.seq + 1)
+            customAuthorization.toolCallID,
+            "write-custom-identity")
+        XCTAssertEqual(customResolved.turnID, customResult.turnID)
+        XCTAssertEqual(customResult.outcome, .succeeded)
+        XCTAssertNil(customResult.failureSource)
         let durableBytes = try events.map {
             String(decoding: try Envelope.makeEncoder().encode($0), as: UTF8.self)
         }.joined(separator: "\n")
@@ -3277,10 +3272,7 @@ final class AutomaticPermissionReviewTests: XCTestCase {
                 "write timed-out.txt",
                 id: "submission_timed_out_write"))
         let firstPath = ws.appendingPathComponent("timed-out.txt")
-        guard case .failed(let firstFailure) = first else {
-            return XCTFail("the invocation whose required write timed out must fail")
-        }
-        XCTAssertTrue(firstFailure.contains("required side effects remain denied or failed"))
+        XCTAssertEqual(first, .sent)
         XCTAssertFalse(FileManager.default.fileExists(atPath: firstPath.path))
 
         let second = await orch.send(
@@ -3432,10 +3424,7 @@ final class AutomaticPermissionReviewTests: XCTestCase {
             userMessage: autoReviewUserMessage(
                 "write fallback.txt",
                 id: "submission_fallback_write"))
-        guard case .failed(let failure) = sendResult else {
-            return XCTFail("a denied required write must fail the invocation")
-        }
-        XCTAssertTrue(failure.contains("required side effects remain denied or failed"))
+        XCTAssertEqual(sendResult, .sent)
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: ws.appendingPathComponent("fallback.txt").path))
         let reviews = await log.replay().compactMap { envelope -> PermissionReviewPayload? in
@@ -3447,7 +3436,7 @@ final class AutomaticPermissionReviewTests: XCTestCase {
         XCTAssertEqual(reviews.last?.decision, .deny)
     }
 
-    func testReviewerDenyUsesBoundedHostReasonAndDeniedWriteCannotCompleteInvocation() async throws {
+    func testReviewerDenyUsesBoundedHostReasonAndFinalCanCompleteInvocation() async throws {
         let log = try autoReviewTempLog()
         let ws = try autoReviewWorkspace()
         defer { try? FileManager.default.removeItem(at: ws) }
@@ -3464,7 +3453,7 @@ final class AutomaticPermissionReviewTests: XCTestCase {
                     justification:
                         "The exact denied.txt write is the proposed action for review."))]),
              .done(finishReason: "tool_calls")],
-            [.textDelta("Created denied.txt successfully."), .done(finishReason: "stop")],
+            [.textDelta("The denied write was not executed."), .done(finishReason: "stop")],
         ])
         let reviewerProvider = AutoReviewCapturingProvider([
             .textDelta(
@@ -3497,10 +3486,7 @@ final class AutomaticPermissionReviewTests: XCTestCase {
                 id: "submission_denied_write"))
         XCTAssertTrue(attached)
         XCTAssertEqual(enabled, AutomaticPermissionReviewResult.enabled(reviewer))
-        guard case .failed(let failure) = sent else {
-            return XCTFail("a denied required write must fail the invocation")
-        }
-        XCTAssertTrue(failure.contains("required side effects remain denied or failed"))
+        XCTAssertEqual(sent, .sent)
 
         XCTAssertFalse(FileManager.default.fileExists(
             atPath: ws.appendingPathComponent("denied.txt").path))
@@ -3534,22 +3520,21 @@ final class AutomaticPermissionReviewTests: XCTestCase {
         XCTAssertTrue(mainProvider.requests.last?.messages.contains {
             $0.content == observation
         } == true)
-        XCTAssertFalse(events.contains { envelope in
+        XCTAssertTrue(events.contains { envelope in
             if case .taskCompleted(let payload) = envelope.event {
                 return payload.agent == main
             }
             return false
         })
-        XCTAssertTrue(events.contains { envelope in
+        XCTAssertFalse(events.contains { envelope in
             if case .taskFailed(let payload) = envelope.event {
                 return payload.agent == main
-                    && payload.error.contains("required side effects remain denied or failed")
             }
             return false
         })
     }
 
-    func testSuccessfulEquivalentEditClearsEarlierDeniedWriteEvidence() async throws {
+    func testDeniedWriteCanBeFollowedByApprovedEquivalentEdit() async throws {
         let log = try autoReviewTempLog()
         let ws = try autoReviewWorkspace()
         defer { try? FileManager.default.removeItem(at: ws) }
@@ -3698,10 +3683,7 @@ final class AutomaticPermissionReviewTests: XCTestCase {
             userMessage: autoReviewUserMessage(
                 "write .env",
                 id: "submission_hard_deny"))
-        guard case .failed(let failure) = sendResult else {
-            return XCTFail("a hard-denied required write must fail the invocation")
-        }
-        XCTAssertTrue(failure.contains("required side effects remain denied or failed"))
+        XCTAssertEqual(sendResult, .sent)
 
         XCTAssertTrue(reviewerProvider.requests.isEmpty)
         XCTAssertFalse(FileManager.default.fileExists(atPath: ws.appendingPathComponent(".env").path))

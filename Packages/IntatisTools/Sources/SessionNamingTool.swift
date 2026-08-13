@@ -53,7 +53,7 @@ public struct RenameSessionTool: Tool {
             dataEffects: [.none],
             controlEffects: [],
             risks: [.controlPlaneMutation],
-            replayPolicy: .requiresManualReconciliation)
+            replayPolicy: .doNotReplay)
     }
 
     public func permissionActionPreview(_ args: ToolArgs) -> PermissionActionPreview? {

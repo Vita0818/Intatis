@@ -547,8 +547,8 @@ public struct KnowledgeBundleBuildService: Sendable {
                 == KnowledgeBuildAuthorizationIdentity.digest(authorizationIdentity),
               authorization.normalizedArgumentsCharacterCount
                 == authorizationIdentity.count,
-              authorization.replayPolicy == .requiresManualReconciliation,
-              authorization.intent.replayPolicy == .requiresManualReconciliation,
+              authorization.replayPolicy == .doNotReplay,
+              authorization.intent.replayPolicy == .doNotReplay,
               authorization.deterministicGate?.decision != .deny,
               authorization.deterministicGate != nil else {
             throw KnowledgeDomainError(

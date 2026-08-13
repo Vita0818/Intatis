@@ -163,10 +163,8 @@ private func askArgs(to: String, question: String) -> String {
 
 private func spawnArgs(name: String,
                        path: String,
-                       model: String? = nil,
                        canCoordinate: Bool? = nil) -> String {
     var object: [String: Any] = ["name": name, "path": path]
-    if let model { object["model"] = model }
     if let canCoordinate { object["canCoordinate"] = canCoordinate }
     return String(decoding: try! JSONSerialization.data(withJSONObject: object), as: UTF8.self)
 }
@@ -204,9 +202,7 @@ final class AgentInvocationNonRecursiveTests: XCTestCase {
         XCTAssertTrue(mainAttached)
 
         let sent = await orch.send("Delegate without naming a worker.", to: main)
-        guard case .failed = sent else {
-            return XCTFail("delegate_task must fail when no worker is already attached")
-        }
+        XCTAssertEqual(sent, .sent)
 
         let mainFollowup = try XCTUnwrap(mainProvider.requests.last)
         let delegateResult = try XCTUnwrap(mainFollowup.messages.first {
@@ -259,9 +255,7 @@ final class AgentInvocationNonRecursiveTests: XCTestCase {
         XCTAssertTrue(workerAttached)
 
         let result = await orch.send("Try a reviewed automatic delegation.", to: main)
-        guard case .failed = result else {
-            return XCTFail("A denied required delegation must fail its calling task.")
-        }
+        XCTAssertEqual(result, .sent)
         let approvals = await responder.requests()
         let delegateApproval = try XCTUnwrap(approvals.first { $0.tool == "delegate_task" })
         XCTAssertEqual(
@@ -415,8 +409,7 @@ final class AgentInvocationNonRecursiveTests: XCTestCase {
                          name: "spawn_agent",
                          arguments: spawnArgs(
                             name: worker.rawValue,
-                            path: wsWorker.path,
-                            model: "m"))
+                            path: wsWorker.path))
             ]), .done(finishReason: "tool_calls")],
             [.toolCalls([
                 ToolCall(id: "delegate",
@@ -630,7 +623,7 @@ final class AgentInvocationNonRecursiveTests: XCTestCase {
         })
     }
 
-    func testAskAgentMediatorFailureCannotSettleSucceededOrCompleteCallingTask() async throws {
+    func testAskAgentMediatorFailureStaysFailedObservationWhileCallerCompletes() async throws {
         let log = try nonRecursiveLog()
         let wsMain = try nonRecursiveWorkspace("main-\(UUID().uuidString)")
         let wsWorker = try nonRecursiveWorkspace("worker-\(UUID().uuidString)")
@@ -650,6 +643,8 @@ final class AgentInvocationNonRecursiveTests: XCTestCase {
                         to: recipient.rawValue,
                         question: "Do not forward this secret marker ghp_abcdef1234567890"))
             ]), .done(finishReason: "tool_calls")],
+            [.textDelta("The requested message could not be delivered."),
+             .done(finishReason: "stop")],
         ])
         let unusedProvider = NonRecursiveProvider([
             [.textDelta("must not run"), .done(finishReason: "stop")],
@@ -686,19 +681,25 @@ final class AgentInvocationNonRecursiveTests: XCTestCase {
             to: worker.rawValue,
             objective: "Ask the recipient the supplied question.")
 
-        XCTAssertTrue(result.contains("status=failed") || result.contains("error:"), result)
-        XCTAssertEqual(workerProvider.requests.count, 1)
+        XCTAssertTrue(result.contains("status: completed"), result)
+        XCTAssertTrue(
+            result.contains("The requested message could not be delivered."),
+            result)
+        XCTAssertEqual(workerProvider.requests.count, 2)
         XCTAssertTrue(unusedProvider.requests.isEmpty)
 
         let events = await log.replay()
-        let failedTask = try XCTUnwrap(events.compactMap { envelope -> TaskFailedPayload? in
-            guard case .taskFailed(let payload) = envelope.event,
+        let completedTask = try XCTUnwrap(events.compactMap {
+            envelope -> TaskCompletedPayload? in
+            guard case .taskCompleted(let payload) = envelope.event,
                   payload.agent == self.worker else { return nil }
             return payload
         }.last)
         XCTAssertFalse(events.contains { envelope in
-            guard case .taskCompleted(let payload) = envelope.event else { return false }
-            return payload.taskID == failedTask.taskID
+            guard case .taskFailed(let payload) = envelope.event else {
+                return false
+            }
+            return payload.taskID == completedTask.taskID
         })
 
         let prepared = events.compactMap { envelope -> ToolExecutionPreparedPayload? in
@@ -707,8 +708,8 @@ final class AgentInvocationNonRecursiveTests: XCTestCase {
             return payload
         }
         XCTAssertEqual(prepared.count, 1)
-        XCTAssertEqual(prepared.first?.taskID, failedTask.taskID)
-        XCTAssertEqual(prepared.first?.replayPolicy, .requiresManualReconciliation)
+        XCTAssertEqual(prepared.first?.taskID, completedTask.taskID)
+        XCTAssertEqual(prepared.first?.replayPolicy, .doNotReplay)
         XCTAssertFalse(events.contains { envelope in
             guard case .toolExecutionSettled(let payload) = envelope.event else { return false }
             return payload.toolCallID == "ask-blocked" && payload.outcome == .succeeded
@@ -735,6 +736,8 @@ final class AgentInvocationNonRecursiveTests: XCTestCase {
                         to: recipient.rawValue,
                         question: "Return one concise status line."))
             ]), .done(finishReason: "tool_calls")],
+            [.textDelta("The requested answer could not be delivered."),
+             .done(finishReason: "stop")],
         ])
         let recipientProvider = NonRecursiveProvider([
             [.textDelta("secret answer ghp_abcdef1234567890"), .done(finishReason: "stop")],
@@ -778,8 +781,11 @@ final class AgentInvocationNonRecursiveTests: XCTestCase {
             to: worker.rawValue,
             objective: "Ask the recipient for the status line.")
 
-        XCTAssertTrue(result.contains("status=failed") || result.contains("error:"), result)
-        XCTAssertEqual(workerProvider.requests.count, 1)
+        XCTAssertTrue(result.contains("status: completed"), result)
+        XCTAssertTrue(
+            result.contains("The requested answer could not be delivered."),
+            result)
+        XCTAssertEqual(workerProvider.requests.count, 2)
         XCTAssertEqual(recipientProvider.requests.count, 1)
         XCTAssertTrue(unusedProvider.requests.isEmpty)
 
@@ -795,7 +801,7 @@ final class AgentInvocationNonRecursiveTests: XCTestCase {
             guard case .toolExecutionSettled(let payload) = envelope.event else { return false }
             return payload.toolCallID == "ask-blocked-answer" && payload.outcome == .succeeded
         })
-        XCTAssertFalse(events.contains { envelope in
+        XCTAssertTrue(events.contains { envelope in
             guard case .taskCompleted(let payload) = envelope.event else { return false }
             return payload.agent == self.worker
         })

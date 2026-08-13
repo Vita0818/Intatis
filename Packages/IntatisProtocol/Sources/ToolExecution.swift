@@ -2,28 +2,26 @@ import Foundation
 import IntatisCore
 
 /// Recovery contract for a tool execution that was prepared durably before the
-/// executor was invoked. The default is deliberately conservative: only
-/// read-only tools are replayable, and collaboration/lifecycle tools require
-/// reconciliation even when an older descriptor classified them as read-only.
+/// executor was invoked. Only explicitly replay-safe observations may be run
+/// again automatically after an interrupted attempt.
 public enum ToolExecutionReplayPolicy: String, Codable, Equatable, Sendable {
     case safeToReplay = "safe_to_replay"
-    case requiresManualReconciliation = "requires_manual_reconciliation"
+    case doNotReplay = "do_not_replay"
 
     public static func conservative(for sideEffect: SideEffect,
                                     tool: String) -> ToolExecutionReplayPolicy {
         guard sideEffect == .readOnly,
-              !manualReconciliationToolNames.contains(tool) else {
-            return .requiresManualReconciliation
+              !nonReplayableToolNames.contains(tool) else {
+            return .doNotReplay
         }
         return .safeToReplay
     }
 
-    private static let manualReconciliationToolNames: Set<String> = [
+    private static let nonReplayableToolNames: Set<String> = [
         "ask_agent",
         "send_message",
         "request_information",
         "reply_message",
-        "request_delegation",
         "delegate_task",
         "spawn_agent",
         "remove_agent",
@@ -45,7 +43,7 @@ public enum ToolExecutionOutcome: String, Codable, Equatable, Sendable {
 /// failed, cancelled, or denied outcome must be treated as unknown.
 public enum ToolExecutionEffectDisposition: String, Codable, Equatable, Sendable {
     /// The executor may have been entered, but the declared side effect is
-    /// proven not to have started and therefore cannot need reconciliation.
+    /// proven not to have started.
     case notStarted = "not_started"
     /// The declared side effect is known to have committed.
     case committed
@@ -94,8 +92,8 @@ public struct ToolExecutionPreparedPayload: Codable, Equatable, Sendable {
     /// run. Replaying the *whole task* would therefore repeat this call even
     /// when a later settled record proves that the call succeeded. Only tools
     /// explicitly classified as safe-to-replay may be crossed by task replay.
-    public var requiresTaskReplayReconciliation: Bool {
-        replayPolicy == .requiresManualReconciliation
+    public var blocksTaskReplay: Bool {
+        replayPolicy == .doNotReplay
     }
 }
 

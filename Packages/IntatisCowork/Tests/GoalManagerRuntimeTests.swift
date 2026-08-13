@@ -83,6 +83,7 @@ final class GoalManagerRuntimeTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: workspace) }
         let provider = GoalManagerProvider(responses: [
             [createGoalToolCall("implicit"), .done(finishReason: "tool_calls")],
+            [.textDelta("implicit Goal creation rejected"), .done(finishReason: "stop")],
             [createGoalToolCall("explicit"), .done(finishReason: "tool_calls")],
             [.textDelta("explicit created"), .done(finishReason: "stop")],
         ])
@@ -99,10 +100,13 @@ final class GoalManagerRuntimeTests: XCTestCase {
         XCTAssertTrue(attached)
 
         let implicitResult = await orchestrator.send("Create a goal implicitly.", to: main)
-        guard case .failed(let implicitFailure) = implicitResult else {
-            return XCTFail("implicit create_goal should fail the invocation")
-        }
-        XCTAssertTrue(implicitFailure.contains("explicit user or host Goal intent"))
+        XCTAssertEqual(implicitResult, .sent)
+        let implicitEvents = await log.replay()
+        XCTAssertTrue(implicitEvents.contains { envelope in
+            guard case .toolResult(let payload) = envelope.event,
+                  payload.toolCallId == "implicit" else { return false }
+            return payload.observation.contains("explicit user or host Goal intent")
+        })
         let goalAfterImplicitCall = await orchestrator.currentGoalSnapshot()
         XCTAssertNil(goalAfterImplicitCall)
 

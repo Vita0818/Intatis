@@ -111,7 +111,7 @@ final class CoworkProjectionTests: XCTestCase {
         let capabilityLease = CapabilityLease(
             id: CapabilityLeaseID(rawValue: "clease_projection"),
             taskID: contract.id,
-            tools: [.readWorkspace, .searchWorkspace, .requestDelegation])
+            tools: [.readWorkspace, .searchWorkspace])
         let envelopes: [Envelope] = [
             env(0, .agentAttached(AgentAttachedPayload(
                 agent: worker,

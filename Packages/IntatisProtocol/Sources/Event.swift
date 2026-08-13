@@ -612,7 +612,6 @@ public enum Event: Equatable, Sendable {
     case agentToAgentMessage(AgentToAgentMessagePayload)
     case informationRequested(InformationRequestedPayload)
     case informationReplied(InformationRepliedPayload)
-    case delegationRequested(DelegationRequestedPayload)
     case delegationApproved(DelegationApprovedPayload)
     case delegationRejected(DelegationRejectedPayload)
     case taskDelegated(TaskDelegatedPayload)
@@ -740,7 +739,6 @@ public enum Event: Equatable, Sendable {
         case agentToAgentMessage = "agent_to_agent_message"
         case informationRequested = "information_requested"
         case informationReplied = "information_replied"
-        case delegationRequested = "delegation_requested"
         case delegationApproved = "delegation_approved"
         case delegationRejected = "delegation_rejected"
         case taskDelegated = "task_delegated"
@@ -861,7 +859,6 @@ public enum Event: Equatable, Sendable {
         case .agentToAgentMessage: return .agentToAgentMessage
         case .informationRequested: return .informationRequested
         case .informationReplied:   return .informationReplied
-        case .delegationRequested:  return .delegationRequested
         case .delegationApproved:   return .delegationApproved
         case .delegationRejected:   return .delegationRejected
         case .taskDelegated:        return .taskDelegated

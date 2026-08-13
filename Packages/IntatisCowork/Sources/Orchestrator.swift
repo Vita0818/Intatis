@@ -38,11 +38,9 @@ private struct DelegationAuthorizationArguments: Decodable {
 
 private struct SpawnAuthorizationArguments: Decodable {
     var inferenceProfileID: String?
-    var model: String?
 
     private enum CodingKeys: String, CodingKey {
         case inferenceProfileID = "inference_profile_id"
-        case model
     }
 }
 
@@ -838,7 +836,7 @@ public actor Orchestrator {
             dataEffects: [.none],
             controlEffects: [.attachWorkspace, .grantCapability],
             risks: [.controlPlaneMutation, .capabilityGrant, .workspaceExpansion],
-            replayPolicy: .requiresManualReconciliation)
+            replayPolicy: .doNotReplay)
         let attachGate = PermissionReviewGateSnapshot(
             decision: assessment.canAskUser ? .ask : .deny,
             risk: assessment.risk,
@@ -873,7 +871,7 @@ public actor Orchestrator {
             intent: attachIntent,
             sideEffect: .write,
             risksNetwork: false,
-            replayPolicy: .requiresManualReconciliation,
+            replayPolicy: .doNotReplay,
             deterministicGate: attachGate,
             capabilityLeaseFingerprint: ToolRegistry.authorizationFingerprint(
                 proposedLeases.capability),
@@ -913,7 +911,7 @@ public actor Orchestrator {
                     relatedAgents: admissionContract.relatedAgents),
                 authorization: attachAuthorization,
                 executionID: "agent-admission:\(admissionTaskID.rawValue)",
-                replayPolicy: ToolExecutionReplayPolicy.requiresManualReconciliation.rawValue))
+                replayPolicy: ToolExecutionReplayPolicy.doNotReplay.rawValue))
         let agentMetadata = taskMetadata(
             contract: admissionContract,
             rootTaskID: admissionRootTaskID,
@@ -2669,11 +2667,11 @@ public actor Orchestrator {
                 return execution.prepared.attempt == nil
                     || execution.prepared.attempt == previousAttempt
             }
-            let requiresManualReconciliation = view.status == .running
+            let replayBlocked = view.status == .running
                 && !interruptedSideEffects.isEmpty
             let attempt = view.status == .running
                 && !exhaustedRunningAttempt
-                && !requiresManualReconciliation
+                && !replayBlocked
                 ? previousAttempt + 1
                 : previousAttempt
             let recoveredCausalParentID: TaskID? = {
@@ -2703,14 +2701,10 @@ public actor Orchestrator {
                 recoveryFailures.append((
                     scheduled,
                     "task admission was interrupted before it reached the durable queue"))
-            } else if requiresManualReconciliation {
-                let details = interruptedSideEffects
-                    .map(Self.executionReconciliationDetail)
-                    .sorted()
-                    .joined(separator: ", ")
+            } else if replayBlocked {
                 recoveryFailures.append((
                     scheduled,
-                    "manual reconciliation required before replaying non-replayable side effects: \(details)"))
+                    "task was interrupted after a non-replayable tool call; start a new run"))
             } else if exhaustedRunningAttempt {
                 recoveryFailures.append((scheduled, "task exceeded retry attempts during crash recovery"))
             } else if restoredStatus == .queued {
@@ -3333,11 +3327,11 @@ public actor Orchestrator {
               currentAttempt < Int.max else {
             return .rejected("Task has an invalid current attempt \(String(describing: currentRecord.attempt)).")
         }
-        if let reconciliationFailure = await retryReconciliationFailure(
+        if let replayBlockReason = await taskReplayBlockReason(
             taskID: taskID,
             attempt: currentAttempt
         ) {
-            return .rejected(reconciliationFailure)
+            return .rejected(replayBlockReason)
         }
         let nextAttempt = currentAttempt + 1
         guard nextAttempt <= maxAttempts else {
@@ -3412,7 +3406,7 @@ public actor Orchestrator {
         return .admitted(contract.id)
     }
 
-    private func retryReconciliationFailure(taskID: TaskID, attempt: Int) async -> String? {
+    private func taskReplayBlockReason(taskID: TaskID, attempt: Int) async -> String? {
         let events: [Envelope]
         do {
             let replay = try await log.replayForProjectionChecked()
@@ -3421,37 +3415,14 @@ public actor Orchestrator {
             }
             events = replay.envelopes
         } catch {
-            return "retry denied because durable side-effect history could not be verified: \(error.localizedDescription)"
+            return "retry denied because durable tool history could not be verified; start a new run: \(error.localizedDescription)"
         }
         let projection = CoworkProjection.build(from: events)
         let nonReplayable = projection.startedNonReplayableToolExecutions(
             taskID: taskID,
             attempt: attempt)
         guard !nonReplayable.isEmpty else { return nil }
-        let details = nonReplayable
-            .map(Self.executionReconciliationDetail)
-            .sorted()
-            .joined(separator: ", ")
-        return "manual reconciliation required before replaying non-replayable side effects: \(details)"
-    }
-
-    private static func executionReconciliationDetail(_ execution: CoworkToolExecutionView) -> String {
-        let state: String
-        if let settled = execution.settled {
-            switch settled.outcome {
-            case .succeeded:
-                state = "side effect already succeeded"
-            case .failed:
-                state = "executor reported failure after starting"
-            case .cancelled:
-                state = "executor was cancelled after starting"
-            case .denied:
-                state = "execution outcome is denied but the executor boundary was already prepared"
-            }
-        } else {
-            state = "outcome unknown"
-        }
-        return "\(execution.prepared.tool) [\(execution.prepared.executionID); \(state)]"
+        return "this task attempt crossed a non-replayable tool boundary; start a new run instead of retrying it"
     }
 
     @discardableResult
@@ -4488,109 +4459,6 @@ public actor Orchestrator {
         return "replied to @\(to.rawValue) (reply_id: \(payload.replyID.rawValue))"
     }
 
-    func requestDelegation(from: AgentID, objective: String, reason: String, parentTaskID: TaskID? = nil) async -> String {
-        guard let parentTaskID,
-              let currentTask = taskGraph.node(parentTaskID),
-              let recipient = currentTask.issuer else {
-            return "error: delegation request has no assigning agent"
-        }
-        if let cancellationFailure = communicationCancellationFailure(taskID: parentTaskID) {
-            return "error: \(cancellationFailure)"
-        }
-        guard let lease = existingCapabilityLease(for: from, taskID: parentTaskID) else {
-            return "error: delegation lease unavailable"
-        }
-        guard lease.tools.contains(.requestDelegation) else {
-            return "error: requesting delegation is not granted for the current task"
-        }
-        switch lease.delegation {
-        case .requestOnly, .granted:
-            break
-        case .none:
-            return "error: requesting delegation is not granted for the current task"
-        }
-
-        await acquireAdmissionLock()
-        if let cancellationFailure = communicationCancellationFailure(taskID: parentTaskID) {
-            releaseAdmissionLock()
-            return "error: \(cancellationFailure)"
-        }
-        guard let currentTask = taskGraph.node(parentTaskID),
-              let currentRecipient = currentTask.issuer,
-              currentRecipient == recipient else {
-            releaseAdmissionLock()
-            return "error: delegation request has no assigning agent"
-        }
-        guard let currentLease = existingCapabilityLease(for: from, taskID: parentTaskID) else {
-            releaseAdmissionLock()
-            return "error: delegation lease unavailable"
-        }
-        guard currentLease.tools.contains(.requestDelegation) else {
-            releaseAdmissionLock()
-            return "error: requesting delegation is not granted for the current task"
-        }
-        switch currentLease.delegation {
-        case .requestOnly, .granted:
-            break
-        case .none:
-            releaseAdmissionLock()
-            return "error: requesting delegation is not granted for the current task"
-        }
-
-        let trimmedObjective = objective.trimmingCharacters(in: .whitespacesAndNewlines)
-        let trimmedReason = reason.trimmingCharacters(in: .whitespacesAndNewlines)
-        let requestID = RequestID.new()
-        let messageID = MessageID(rawValue: requestID.rawValue)
-        let objectiveText = trimmedObjective.isEmpty ? "Additional help requested." : trimmedObjective
-        let reasonText = trimmedReason.isEmpty ? "No reason supplied." : trimmedReason
-        let content = "Delegation requested for: \(objectiveText)\nReason: \(reasonText)"
-        guard let message = await bus.sendMessage(
-            from: from,
-            to: recipient,
-            content: content,
-            taskID: parentTaskID,
-            messageID: messageID) else {
-            releaseAdmissionLock()
-            return "your delegation request was blocked by the mediator"
-        }
-        try? await log.append(.delegationRequested(DelegationRequestedPayload(
-            requestID: requestID,
-            requester: from,
-            recipient: recipient,
-            objective: objectiveText,
-            reason: reasonText,
-            parentTaskID: parentTaskID,
-            metadata: CoworkEventMetadata(
-                taskID: parentTaskID,
-                parentTaskID: parentTaskID,
-                sender: from,
-                recipient: recipient,
-                agentID: from,
-                scope: .task,
-                visibility: .task))))
-        let pendingMessage = PendingAgentMessage(
-            id: message.messageId,
-            sender: from,
-            recipient: recipient,
-            content: message.content,
-            kind: "request_delegation",
-            taskID: parentTaskID,
-            causalParentID: parentTaskID)
-        _ = scheduler.enqueueMessage(pendingMessage)
-        if let cancellationFailure = await settleLateCancelledCommunication(
-            pendingMessage,
-            taskID: parentTaskID) {
-            releaseAdmissionLock()
-            return "error: \(cancellationFailure)"
-        }
-        releaseAdmissionLock()
-        await enqueueMailboxWakeTask(
-            sender: from,
-            recipient: recipient,
-            requestedMessageIDs: [pendingMessage.id])
-        return "delegation request delivered to @\(recipient.rawValue)"
-    }
-
     private func enqueuePendingMailboxWakeIfNeeded(for recipient: AgentID,
                                                    fallbackSender: AgentID? = nil) async {
         guard let pendingMessage = scheduler.peekMessage(for: recipient) else { return }
@@ -4820,7 +4688,7 @@ public actor Orchestrator {
         case .failed, .cancelled:
             guard !mailboxTaskAttemptIsExhausted(task, record: record),
                   let attempt = record.attempt,
-                  await retryReconciliationFailure(
+                  await taskReplayBlockReason(
                       taskID: task.contract.id,
                       attempt: attempt) == nil else {
                 return .exhausted
@@ -4910,7 +4778,7 @@ public actor Orchestrator {
             }
         }
         guard hasPendingBinding else { return false }
-        return await retryReconciliationFailure(
+        return await taskReplayBlockReason(
             taskID: task.contract.id,
             attempt: attempt) == nil
     }
@@ -4932,8 +4800,6 @@ public actor Orchestrator {
             continuationRunID: causalContract?.continuationRunID,
             authorityClass: {
                 switch message.kind {
-                case "request_delegation":
-                    return .delegationRequest
                 case AgentCommunicationKind.requestInformation.rawValue:
                     return .informationRequest
                 case AgentCommunicationKind.replyMessage.rawValue:
@@ -6551,7 +6417,6 @@ public actor Orchestrator {
                        currentTaskID: TaskID? = nil,
                        name: String,
                        path: String,
-                       model: String,
                        inferenceProfileID: String? = nil,
                        agentInferenceBinding: AgentInferenceBinding? = nil,
                        authorization: ResolvedToolAuthorization? = nil,
@@ -6612,6 +6477,10 @@ public actor Orchestrator {
         guard !requiresInferenceBindings || selectedBinding != nil else {
             return "error: spawn target has no exact inference profile binding"
         }
+        guard let selectedModel = selectedBinding?.modelID
+            ?? registry.agent(requestedBy)?.model else {
+            return "error: spawning agent is not attached"
+        }
         let assessment = assessWorkspaceAttach(url)
         guard assessment.canAskUser, let canonical = assessment.canonical else {
             return "error: \(assessment.reason)"
@@ -6620,7 +6489,7 @@ public actor Orchestrator {
         let proposedAgent = Agent(
             name: id,
             workspaceRoot: canonical,
-            model: selectedBinding?.modelID ?? ModelID(rawValue: model),
+            model: selectedModel,
             agentInferenceBinding: selectedBinding,
             profile: .reviewed,
             coordinationDepth: coordinationDepth)
@@ -6907,8 +6776,7 @@ public actor Orchestrator {
         let manager = OrchestratorManager(
             orchestrator: self,
             requester: agent.name,
-            currentTaskID: taskContract?.id,
-            defaultModel: agent.model.rawValue)
+            currentTaskID: taskContract?.id)
         let workTaskManager = OrchestratorWorkTaskManager(
             orchestrator: self,
             currentWorkTaskID: taskContract?.workTaskID,
@@ -7281,10 +7149,6 @@ public actor Orchestrator {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let binding: AgentInferenceBinding?
         if let requestedProfileID, !requestedProfileID.isEmpty {
-            guard arguments.model == nil else {
-                throw IntatisError.permissionDenied(
-                    "spawn_agent cannot combine a raw model with inference_profile_id")
-            }
             let profileID = InferenceProfileID(rawValue: requestedProfileID)
             guard let approved = availableInferenceProfiles[profileID] else {
                 throw IntatisError.permissionDenied(
@@ -7292,12 +7156,6 @@ public actor Orchestrator {
             }
             binding = approved
         } else {
-            if requiresInferenceBindings,
-               let rawModel = arguments.model,
-               rawModel != requester.model.rawValue {
-                throw IntatisError.permissionDenied(
-                    "raw model selection is not allowed; choose a host-approved inference_profile_id")
-            }
             binding = requester.agentInferenceBinding
         }
         if requiresInferenceBindings, binding == nil {
@@ -8099,17 +7957,6 @@ public actor Orchestrator {
                     inReplyTo: payload.inReplyTo,
                     conversationID: payload.conversationID,
                     createdAt: payload.metadata?.createdAt ?? envelope.ts)
-            case .delegationRequested(let payload):
-                let messageID = MessageID(rawValue: payload.requestID.rawValue)
-                guard payload.recipient == agent,
-                      pendingIDs.contains(messageID),
-                      var message = details[messageID] else { continue }
-                message.kind = "request_delegation"
-                message.sender = payload.requester
-                message.recipient = agent
-                message.taskID = payload.parentTaskID
-                message.causalParentID = payload.parentTaskID
-                details[messageID] = message
             default:
                 break
             }
@@ -8166,36 +8013,24 @@ public actor Orchestrator {
             allowedTools.insert(.replyMessage)
         case .informationReply:
             allowedTools.insert(.requestInformation)
-        case .delegationRequest:
-            allowedTools.insert(.delegateTask)
         case .ordinaryMessage:
             break
         }
         let tools = defaultLease?.tools.intersection(allowedTools) ?? []
         let communication: CommunicationGrant
         switch (authorityClass, defaultLease?.communication) {
-        case (_, nil), (_, .some(.none)), (.ordinaryMessage, _), (.delegationRequest, _):
+        case (_, nil), (_, .some(.none)), (.ordinaryMessage, _):
             communication = .none
         case (.informationRequest, .some(_)):
             communication = .replyOnly
         case (.informationReply, .some(_)):
             communication = .selectedAgents([issuer])
         }
-        let delegation: DelegationGrant
-        if authorityClass == .delegationRequest,
-           tools.contains(.delegateTask),
-           case .some(.granted(let budget)) = defaultLease?.delegation,
-           budget.maxTasks > 0,
-           budget.maxDepth > 0 {
-            delegation = .granted(DelegationBudget(maxTasks: 1, maxDepth: 1))
-        } else {
-            delegation = .none
-        }
         let capabilityLease = CapabilityLease(
             taskID: taskID,
             tools: tools,
             communication: communication,
-            delegation: delegation,
+            delegation: .none,
             expiresAtTaskCompletion: true,
             mcpGrants: [])
         let workspaceLease = workspaceLeaseForTask(
@@ -8216,8 +8051,6 @@ public actor Orchestrator {
             authorityInstruction = "Answer each exact information request at most once with reply_message(inReplyTo: request Message ID)."
         case .informationReply:
             authorityInstruction = "This is a reply receipt and requires no acknowledgment. If genuinely needed, continue the conversation only by opening a new request_information with based_on set to the reply Message ID."
-        case .delegationRequest:
-            authorityInstruction = "Handle only the bounded delegation request with the explicitly exposed authority."
         case .ordinaryMessage:
             authorityInstruction = "This one-way message requires no acknowledgment."
         }
@@ -8235,9 +8068,7 @@ public actor Orchestrator {
             goalID: scopeContract?.goalID,
             submissionID: scopeContract?.submissionID,
             objective: objective,
-            roleHint: authorityClass == .delegationRequest
-                ? "bounded delegation-request responder"
-                : "correlation-bound mailbox responder",
+            roleHint: "correlation-bound mailbox responder",
             expectedDeliverable: "Handle only the frozen messages and report the communication outcome.",
             workspaceID: workspaceLease.workspaceID,
             workspaceLeaseID: workspaceLease.id,
@@ -8251,7 +8082,7 @@ public actor Orchestrator {
                 "Do not mutate WorkTasks, Goals, the workspace, Git state, or agent roster.",
                 "A reply closes only its exact request correlation; a genuine follow-up must create a fresh request correlation using based_on.",
                 "Never acknowledge an information reply with reply_message.",
-                "Use only the task-scoped communication/delegation authority explicitly exposed by the host.",
+                "Use only the task-scoped communication authority explicitly exposed by the host.",
             ],
             replyMode: TaskReplyMode.none,
             executionTimeoutSeconds: executionPolicy.taskTimeoutSeconds,
@@ -8414,12 +8245,7 @@ public actor Orchestrator {
                 maxTasks: max(0, parentBudget.maxTasks - 1),
                 maxDepth: max(0, parentBudget.maxDepth - 1)))
         } else {
-            switch parentCapabilityLease.delegation {
-            case .none:
-                delegation = .none
-            case .requestOnly, .granted:
-                delegation = .requestOnly
-            }
+            delegation = .none
         }
 
         let capabilityLease = CapabilityLease(
@@ -10389,7 +10215,7 @@ public actor Orchestrator {
         switch lease.delegation {
         case .granted:
             hasDelegationGrant = true
-        case .none, .requestOnly:
+        case .none:
             hasDelegationGrant = false
         }
 
@@ -10416,12 +10242,6 @@ public actor Orchestrator {
                 [ReplyMessageTool()],
                 granting: [.replyMessage],
                 communication: .reply)
-        }
-        if lease.tools.contains(.requestDelegation), lease.delegation != .none {
-            register(
-                [RequestDelegationTool()],
-                granting: [.requestDelegation],
-                delegation: .requestOrGranted)
         }
         if lease.tools.contains(.delegateTask), hasDelegationGrant {
             register(
@@ -10514,7 +10334,6 @@ private enum MailboxDeliveryAuthorityClass: Sendable, Hashable {
     case ordinaryMessage
     case informationRequest
     case informationReply
-    case delegationRequest
 }
 
 private struct MailboxDeliveryBatchKey: Sendable, Hashable {
@@ -10657,10 +10476,6 @@ struct BusMessenger: AgentMessenger {
         await orchestrator.replyMessage(from: from, to: agent, content: content, inReplyTo: inReplyTo, taskID: currentTaskID)
     }
 
-    func requestDelegation(objective: String, reason: String) async -> String {
-        await orchestrator.requestDelegation(from: from, objective: objective, reason: reason, parentTaskID: currentTaskID)
-    }
-
     func delegateTask(authorization: ResolvedToolAuthorization,
                       executionID: String,
                       to agent: String?,
@@ -10714,18 +10529,15 @@ struct OrchestratorRunController: RunController {
 }
 
 /// Coordinator seam handed to each agent's loop; routes lifecycle calls through
-/// the orchestrator actor (and thus its registry + event log). `defaultModel` is
-/// the spawning agent's model, used when the tool call omits one.
+/// the orchestrator actor (and thus its registry + event log).
 struct OrchestratorManager: AgentManager {
     let orchestrator: Orchestrator
     let requester: AgentID
     let currentTaskID: TaskID?
-    let defaultModel: String
 
     func spawnAgent(authorization: ResolvedToolAuthorization?,
                     name: String,
                     path: String,
-                    model: String?,
                     inferenceProfileID: String?,
                     requestedAccess: WorkspaceAccess,
                     canCoordinate: Bool) async -> String {
@@ -10734,7 +10546,6 @@ struct OrchestratorManager: AgentManager {
             currentTaskID: currentTaskID,
             name: name,
             path: path,
-            model: model ?? defaultModel,
             inferenceProfileID: inferenceProfileID,
             authorization: authorization,
             requestedAccess: requestedAccess,

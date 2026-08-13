@@ -418,7 +418,7 @@ final class DocumentToolsIntegrationTests: XCTestCase {
         XCTAssertEqual(renderIntent.action, "document.render")
         XCTAssertEqual(renderIntent.dataEffects, [.read, .execute, .mutate])
         XCTAssertEqual(renderIntent.risks, [.processExecution, .workspaceMutation])
-        XCTAssertEqual(renderIntent.replayPolicy, .requiresManualReconciliation)
+        XCTAssertEqual(renderIntent.replayPolicy, .doNotReplay)
         XCTAssertEqual(renderIntent.resources, [
             PermissionResource(kind: .workspacePath, value: "site/index.html", access: .readOnly),
             PermissionResource(kind: .workspacePath, value: "site/logo.png", access: .readOnly),

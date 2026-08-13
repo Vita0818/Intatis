@@ -292,7 +292,7 @@ public struct DeterministicPolicyGate: Sendable {
               call.intent.controlEffects.isEmpty,
               call.intent.risks == [.controlPlaneMutation],
               call.intent.suggestedPersistentRules.isEmpty,
-              call.intent.replayPolicy == .requiresManualReconciliation,
+              call.intent.replayPolicy == .doNotReplay,
               call.intent.resources == [PermissionResource(
                   kind: .tool,
                   value: "current_session")]

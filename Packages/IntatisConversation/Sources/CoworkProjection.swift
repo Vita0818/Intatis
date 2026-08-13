@@ -161,7 +161,6 @@ public struct CoworkProjection: Equatable, Sendable {
     /// from reordering the UI and avoids sorting the roster on every fold.
     public private(set) var historicalAgentOrder: [AgentID] = []
     public private(set) var mailboxes: [AgentID: CoworkMailboxView] = [:]
-    public private(set) var pendingDelegations: [RequestID: DelegationRequestedPayload] = [:]
     public private(set) var rejectedDelegations: [DelegationRejectedPayload] = []
     public private(set) var workspaceLeases: [WorkspaceLeaseID: WorkspaceLease] = [:]
     public private(set) var capabilityLeases: [CapabilityLeaseID: CapabilityLease] = [:]
@@ -228,7 +227,7 @@ public struct CoworkProjection: Equatable, Sendable {
 
     public var unresolvedNonReplayableToolExecutions: [CoworkToolExecutionView] {
         unresolvedToolExecutions.filter {
-            $0.prepared.requiresTaskReplayReconciliation
+            $0.prepared.blocksTaskReplay
         }
     }
 
@@ -239,7 +238,7 @@ public struct CoworkProjection: Equatable, Sendable {
     public var uncertainNonReplayableToolExecutions: [CoworkToolExecutionView] {
         toolExecutions.values
             .filter { execution in
-                guard execution.prepared.requiresTaskReplayReconciliation else {
+                guard execution.prepared.blocksTaskReplay else {
                     return false
                 }
                 guard let settled = execution.validatedSettlement else {
@@ -260,14 +259,15 @@ public struct CoworkProjection: Equatable, Sendable {
             }
     }
 
-    /// Every non-replayable executor boundary that may have produced an effect.
-    /// A settled success or legacy/unknown disposition remains blocking because
+    /// Every non-replayable executor boundary whose settlement does not prove
+    /// `notStarted`. A settled success or legacy/unknown disposition remains
+    /// blocking because
     /// replaying the enclosing task starts again from its first model/tool step.
     /// Only a validated settlement proving the side effect never started is exempt.
     public var startedNonReplayableToolExecutions: [CoworkToolExecutionView] {
         toolExecutions.values
             .filter { execution in
-                guard execution.prepared.requiresTaskReplayReconciliation else {
+                guard execution.prepared.blocksTaskReplay else {
                     return false
                 }
                 guard let settled = execution.validatedSettlement else {
@@ -386,17 +386,9 @@ public struct CoworkProjection: Equatable, Sendable {
             var mailbox = mailboxes[payload.to, default: CoworkMailboxView()]
             Self.appendUnique(payload.replyID, to: &mailbox.pendingMessages)
             mailboxes[payload.to] = mailbox
-        case .delegationRequested(let payload):
-            pendingDelegations[payload.requestID] = payload
         case .delegationApproved(let payload):
-            if let requestID = payload.requestID {
-                pendingDelegations.removeValue(forKey: requestID)
-            }
             upsertTask(payload.contract, status: .assigned)
         case .delegationRejected(let payload):
-            if let requestID = payload.requestID {
-                pendingDelegations.removeValue(forKey: requestID)
-            }
             rejectedDelegations.append(payload)
         case .taskCreated(let payload):
             upsertTask(payload.contract, status: .created)

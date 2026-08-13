@@ -122,7 +122,7 @@ public struct ConversationProjection: Equatable, Sendable {
              .agentToAgentMessage, .permissionReview,
              .permissionReviewRequested, .permissionReviewSettled,
              .informationRequested, .informationReplied,
-             .delegationRequested, .delegationApproved, .delegationRejected, .taskDelegated,
+             .delegationApproved, .delegationRejected, .taskDelegated,
              .workspaceLeaseRequested, .workspaceLeaseGranted, .workspaceLeaseDenied, .workspaceLeaseRevoked,
              .capabilityLeaseCreated, .capabilityLeaseRevoked,
              .taskCreated, .taskAssigned, .taskQueued, .taskStarted, .taskCompleted, .taskFailed, .taskCancelled, .taskRejected,

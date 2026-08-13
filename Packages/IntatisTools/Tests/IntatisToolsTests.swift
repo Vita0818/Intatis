@@ -1780,7 +1780,7 @@ final class IntatisToolsTests: XCTestCase {
 
         XCTAssertEqual(intent.action, "media.edit")
         XCTAssertEqual(intent.dataEffects, [.read, .mutate, .network])
-        XCTAssertEqual(intent.replayPolicy, .requiresManualReconciliation)
+        XCTAssertEqual(intent.replayPolicy, .doNotReplay)
         XCTAssertEqual(intent.resources, [
             PermissionResource(kind: .workspacePath,
                                value: "source.webp",
@@ -4059,7 +4059,7 @@ final class IntatisToolsTests: XCTestCase {
         XCTAssertEqual(write.metadata["byteCount"], .number(5))
         XCTAssertEqual(write.resources.first?.kind, .workspacePath)
         XCTAssertEqual(write.resources.first?.access, .readWrite)
-        XCTAssertEqual(write.replayPolicy, .requiresManualReconciliation)
+        XCTAssertEqual(write.replayPolicy, .doNotReplay)
 
         let git = GitFetchTool().permissionIntent(
             ToolArgs(raw: #"{"remote":"origin","branch":"main","prune":false}"#),

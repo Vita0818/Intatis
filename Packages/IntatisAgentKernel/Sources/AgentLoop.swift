@@ -63,9 +63,7 @@ public enum AgentLoopError: Error, Sendable, Equatable, LocalizedError {
     case responseEndedWithoutCompletionMarker
     case completionExpectedToolCalls(finishReason: String)
     case incompleteFinishReason(String)
-    case toolExecutionRequiresManualReconciliation(tool: String, executionID: String, reason: String)
     case repeatedDeniedToolCall(tool: String)
-    case unresolvedDeniedSideEffects([String])
     case invalidEvidenceCitation(String)
     case mediaOutputUnsupported(String)
     case mediaOutputInvalid(String)
@@ -80,12 +78,8 @@ public enum AgentLoopError: Error, Sendable, Equatable, LocalizedError {
             return "Agent response finished with \(finishReason) but provided no tool calls."
         case .incompleteFinishReason(let finishReason):
             return "Agent response ended incompletely with finish reason \(finishReason)."
-        case .toolExecutionRequiresManualReconciliation(let tool, let executionID, let reason):
-            return "Tool \(tool) may have produced a side effect before it failed (execution \(executionID)); manual reconciliation is required before retrying. \(reason)"
         case .repeatedDeniedToolCall(let tool):
             return "Agent repeatedly retried the identical denied tool call \(tool); the task was stopped to protect the automatic permission reviewer."
-        case .unresolvedDeniedSideEffects(let actions):
-            return "Agent invocation cannot complete because required side effects remain denied or failed: \(actions.joined(separator: "; "))."
         case .invalidEvidenceCitation(let reason):
             return "Agent invocation contains an invalid knowledge evidence citation: \(reason)"
         case .mediaOutputUnsupported(let reason):
@@ -181,209 +175,6 @@ private actor ToolDenialCircuitBreaker {
         denials[signature] = DenialState(
             attempts: 1,
             permitsFreshReview: permitsOneFreshReview)
-    }
-}
-
-/// Host-derived completion evidence for Cowork. A model cannot turn a denied
-/// mutating/network/exec action into a successful invocation merely by ending
-/// its response. A later successful execution against the same capability and
-/// resources clears the outstanding denial.
-private actor SideEffectEvidenceLedger {
-    private struct Key: Hashable {
-        var authority: String
-        var resources: [String]
-    }
-
-    private var unresolved: [Key: String] = [:]
-
-    /// Rebuilds completion evidence from the append-only log for the current
-    /// Cowork task. This closes the crash window between a durable permission
-    /// decision and a durable successful tool settlement: a restarted
-    /// invocation cannot simply claim completion while an earlier required
-    /// side effect for the same task still lacks host-derived success evidence.
-    func restore(from envelopes: [Envelope],
-                 taskID: TaskID,
-                 throughAttempt: Int?) {
-        for envelope in envelopes {
-            switch envelope.event {
-            case .permissionRequest(let payload):
-                guard let context = payload.context,
-                      let authorization = context.authorization,
-                      Self.belongsToCurrentTask(
-                        authorization: authorization,
-                        taskID: taskID,
-                        throughAttempt: throughAttempt)
-                else { continue }
-                recordDenied(
-                    tool: payload.tool,
-                    intent: context.intent ?? authorization.intent,
-                    authorization: authorization)
-
-            case .permissionReviewRequested(let payload):
-                guard let authorization = payload.task.authorization,
-                      Self.belongsToCurrentTask(
-                        authorization: authorization,
-                        taskID: taskID,
-                        throughAttempt: throughAttempt)
-                else { continue }
-                recordDenied(
-                    tool: payload.task.tool,
-                    intent: payload.task.intent ?? authorization.intent,
-                    authorization: authorization)
-
-            case .permissionReviewSettled(let payload):
-                guard let authorization = payload.authorization,
-                      Self.belongsToCurrentTask(
-                        authorization: authorization,
-                        taskID: taskID,
-                        throughAttempt: throughAttempt)
-                else { continue }
-                recordDenied(
-                    tool: payload.tool,
-                    intent: authorization.intent,
-                    authorization: authorization)
-
-            case .permissionResolved(let payload):
-                guard let authorization = payload.authorization,
-                      Self.belongsToCurrentTask(
-                        authorization: authorization,
-                        taskID: taskID,
-                        throughAttempt: throughAttempt)
-                else { continue }
-                recordDenied(
-                    tool: payload.tool,
-                    intent: payload.intent ?? authorization.intent,
-                    authorization: authorization)
-
-            case .toolExecutionPrepared(let payload):
-                guard Self.belongsToCurrentTask(
-                    payloadTaskID: payload.taskID,
-                    payloadAttempt: payload.attempt,
-                    authorization: payload.authorization,
-                    taskID: taskID,
-                    throughAttempt: throughAttempt),
-                    let intent = payload.intent ?? payload.authorization?.intent
-                else { continue }
-                recordDenied(
-                    tool: payload.tool,
-                    intent: intent,
-                    authorization: payload.authorization)
-
-            case .toolExecutionSettled(let payload):
-                guard Self.belongsToCurrentTask(
-                    payloadTaskID: payload.taskID,
-                    payloadAttempt: payload.attempt,
-                    authorization: payload.authorization,
-                    taskID: taskID,
-                    throughAttempt: throughAttempt),
-                    let intent = payload.intent ?? payload.authorization?.intent
-                else { continue }
-                if payload.outcome == .succeeded,
-                   let authorization = payload.authorization {
-                    recordSucceeded(intent: intent, authorization: authorization)
-                } else {
-                    recordDenied(
-                        tool: payload.tool,
-                        intent: intent,
-                        authorization: payload.authorization)
-                }
-
-            default:
-                continue
-            }
-        }
-    }
-
-    func recordDenied(tool: String,
-                      intent: PermissionIntent,
-                      authorization: ResolvedToolAuthorization?) {
-        guard Self.requiresExecutionEvidence(intent) else { return }
-        let key = Self.key(intent: intent, authorization: authorization)
-        unresolved[key] = Self.description(tool: tool, intent: intent)
-    }
-
-    func recordSucceeded(intent: PermissionIntent,
-                         authorization: ResolvedToolAuthorization) {
-        guard Self.requiresExecutionEvidence(intent) else { return }
-        let succeededKey = Self.key(
-            intent: intent,
-            authorization: authorization)
-        unresolved.removeValue(forKey: succeededKey)
-        // A malformed mutating call may not expose a usable resource yet. A
-        // later successful action in the same canonical permission family is
-        // the strongest host-derived remediation available for that wildcard.
-        unresolved.removeValue(forKey: Key(
-            authority: succeededKey.authority,
-            resources: []))
-    }
-
-    func unresolvedDescriptions() -> [String] {
-        Array(Set(unresolved.values)).sorted()
-    }
-
-    private static func requiresExecutionEvidence(_ intent: PermissionIntent) -> Bool {
-        if intent.isStructuredReadOnlyExecution,
-           intent.replayPolicy == .safeToReplay {
-            return false
-        }
-        return !intent.controlEffects.isEmpty || intent.dataEffects.contains { effect in
-            effect != .none && effect != .read
-        }
-    }
-
-    private static func key(intent: PermissionIntent,
-                            authorization: ResolvedToolAuthorization?) -> Key {
-        let capabilities = authorization?.requiredCapabilities.map(\.rawValue).sorted() ?? []
-        let semanticAction: String
-        if let canonicalPermission = authorization?.canonicalPermission {
-            semanticAction = canonicalPermission
-        } else if authorization?.requiredCapabilities.contains(.applyPatch) == true
-            || intent.action == "filesystem.write"
-            || intent.action == "filesystem.patch" {
-            semanticAction = "filesystem.edit"
-        } else {
-            semanticAction = intent.action
-        }
-        let authority = capabilities.isEmpty
-            ? "action:\(semanticAction)"
-            : "capabilities:\(capabilities.joined(separator: ","))|action:\(semanticAction)"
-        let resources = intent.resources.map { resource in
-            "\(resource.kind.rawValue):\(resource.value):\(resource.access?.rawValue ?? "")"
-        }.sorted()
-        return Key(authority: authority, resources: resources)
-    }
-
-    private static func belongsToCurrentTask(
-        authorization: ResolvedToolAuthorization,
-        taskID: TaskID,
-        throughAttempt: Int?
-    ) -> Bool {
-        belongsToCurrentTask(
-            payloadTaskID: authorization.taskID,
-            payloadAttempt: authorization.attempt,
-            authorization: authorization,
-            taskID: taskID,
-            throughAttempt: throughAttempt)
-    }
-
-    private static func belongsToCurrentTask(
-        payloadTaskID: TaskID?,
-        payloadAttempt: Int?,
-        authorization: ResolvedToolAuthorization?,
-        taskID: TaskID,
-        throughAttempt: Int?
-    ) -> Bool {
-        guard (payloadTaskID ?? authorization?.taskID) == taskID else { return false }
-        guard let throughAttempt else { return true }
-        guard let eventAttempt = payloadAttempt ?? authorization?.attempt else { return true }
-        return eventAttempt <= throughAttempt
-    }
-
-    private static func description(tool: String, intent: PermissionIntent) -> String {
-        let resources = intent.resources.map(\.value).sorted().joined(separator: ", ")
-        return resources.isEmpty
-            ? "\(tool) (\(intent.action))"
-            : "\(tool) (\(intent.action)) on \(resources)"
     }
 }
 
@@ -833,17 +624,8 @@ public struct AgentLoop: Sendable {
             resolvedSkillActivation:
                 resolvedSkillActivation)
         let denialCircuitBreaker = ToolDenialCircuitBreaker()
-        let sideEffectEvidence = SideEffectEvidenceLedger()
         var usedToolCallIDs = Set<String>()
         var syntheticToolCallOrdinal = 0
-        if context.runtimeEnvironment.mode == .cowork,
-           let taskID = context.taskContract?.id,
-           let recoveredModelHistoryEvents {
-            await sideEffectEvidence.restore(
-                from: recoveredModelHistoryEvents,
-                taskID: taskID,
-                throughAttempt: taskAttempt)
-        }
 
         for iteration in 0..<maxIterations {
             try Task.checkCancellation()
@@ -1071,14 +853,6 @@ public struct AgentLoop: Sendable {
                                 registry: toolSnapshot.registry))))
                 }
             }
-            if pendingToolCalls.isEmpty,
-               context.runtimeEnvironment.mode == .cowork {
-                let unresolved = await sideEffectEvidence.unresolvedDescriptions()
-                if !unresolved.isEmpty {
-                    throw AgentLoopError.unresolvedDeniedSideEffects(unresolved)
-                }
-            }
-
             if pendingToolCalls.isEmpty {
                 await appendTurnStats(start: start, firstTokenAt: firstTokenAt, usage: usage)
                 turnStatsAppended = true
@@ -1094,9 +868,7 @@ public struct AgentLoop: Sendable {
                 try Task.checkCancellation()
                 // Final transcript/model-history publication and the
                 // authoritative successful turn terminal are one EventLog
-                // transaction. A Cowork turn that fails its host-derived
-                // side-effect evidence check above can therefore never leave
-                // a normal completed answer in front of a failed outcome.
+                // transaction.
                 try await log.append(completedResponseEvents)
                 await toolOutputDeliveryLedger.remove(turnID: turnID)
                 return assistantText  // final answer
@@ -1114,7 +886,6 @@ public struct AgentLoop: Sendable {
                 preparedPermissionToolCalls,
                 turnID: turnID,
                 denialCircuitBreaker: denialCircuitBreaker,
-                sideEffectEvidence: sideEffectEvidence,
                 modelHistoryScope: modelHistoryScope,
                 registry: toolSnapshot.registry,
                 mcpAvailability:
@@ -1843,12 +1614,8 @@ public struct AgentLoop: Sendable {
             code = "incomplete_tool_calls"
         case .incompleteFinishReason:
             code = "incomplete_response"
-        case .toolExecutionRequiresManualReconciliation:
-            code = "manual_reconciliation"
         case .repeatedDeniedToolCall:
             code = "repeated_denied_tool_call"
-        case .unresolvedDeniedSideEffects:
-            code = "unresolved_denied_side_effects"
         case .invalidEvidenceCitation:
             code = "invalid_evidence_citation"
         case .mediaOutputUnsupported:
@@ -1996,7 +1763,6 @@ public struct AgentLoop: Sendable {
                               _ preparedCalls: [PreparedPermissionToolCall],
                               turnID: TurnID,
                               denialCircuitBreaker: ToolDenialCircuitBreaker,
-                              sideEffectEvidence: SideEffectEvidenceLedger,
                               modelHistoryScope: ModelHistoryRecordingScope?,
                               registry: ToolRegistry,
                               mcpAvailability:
@@ -2015,7 +1781,6 @@ public struct AgentLoop: Sendable {
                     preparedCall,
                     turnID: turnID,
                     denialCircuitBreaker: denialCircuitBreaker,
-                    sideEffectEvidence: sideEffectEvidence,
                     modelHistoryScope: modelHistoryScope,
                     registry: registry,
                     mcpAvailability:
@@ -2035,7 +1800,6 @@ public struct AgentLoop: Sendable {
                         preparedCall,
                         turnID: turnID,
                         denialCircuitBreaker: denialCircuitBreaker,
-                        sideEffectEvidence: sideEffectEvidence,
                         modelHistoryScope: modelHistoryScope,
                         registry: registry,
                         mcpAvailability:
@@ -2296,7 +2060,6 @@ public struct AgentLoop: Sendable {
                          _ preparedCall: PreparedPermissionToolCall,
                          turnID: TurnID,
                          denialCircuitBreaker: ToolDenialCircuitBreaker,
-                         sideEffectEvidence: SideEffectEvidenceLedger,
                          modelHistoryScope: ModelHistoryRecordingScope?,
                          registry: ToolRegistry,
                          mcpAvailability:
@@ -2421,14 +2184,6 @@ public struct AgentLoop: Sendable {
                 observation: invalidObservation.text,
                 modelHistoryScope: modelHistoryScope)
             await denialCircuitBreaker.recordDenial(signature: denialSignature)
-            await sideEffectEvidence.recordDenied(
-                tool: descriptor.name,
-                intent: invalidInputIntent(
-                    registration: registration,
-                    descriptor: descriptor,
-                    rawArguments: toolCall.arguments,
-                    workspaceRoot: effectiveWorkspaceRoot),
-                authorization: nil)
             return invalidObservation
         }
 
@@ -2466,10 +2221,6 @@ public struct AgentLoop: Sendable {
                 modelHistoryScope: modelHistoryScope)
             await denialCircuitBreaker.recordDenial(
                 signature: descriptor.name + "\u{001F}" + normalizedArguments)
-            await sideEffectEvidence.recordDenied(
-                tool: descriptor.name,
-                intent: baseIntent,
-                authorization: nil)
             return ToolObservation(text: message)
         }
         let sessionID = await log.sessionID
@@ -2512,10 +2263,6 @@ public struct AgentLoop: Sendable {
             if repeatedAttempt >= 3 {
                 throw AgentLoopError.repeatedDeniedToolCall(tool: descriptor.name)
             }
-            await sideEffectEvidence.recordDenied(
-                tool: descriptor.name,
-                intent: baseIntent,
-                authorization: nil)
             return ToolObservation(text: message)
         }
 
@@ -2558,10 +2305,6 @@ public struct AgentLoop: Sendable {
                 observation: message,
                 modelHistoryScope: modelHistoryScope)
             await denialCircuitBreaker.recordDenial(signature: denialSignature)
-            await sideEffectEvidence.recordDenied(
-                tool: descriptor.name,
-                intent: baseIntent,
-                authorization: nil)
             return ToolObservation(text: message)
         }
         let intent = preparation.intent
@@ -2604,10 +2347,6 @@ public struct AgentLoop: Sendable {
                 modelHistoryScope: modelHistoryScope)
             await denialCircuitBreaker.recordDenial(
                 signature: descriptor.name + "\u{001F}" + normalizedArguments)
-            await sideEffectEvidence.recordDenied(
-                tool: descriptor.name,
-                intent: intent,
-                authorization: nil)
             return ToolObservation(text: message)
         }
         if let leaseFailure = workspaceLeaseFailure(
@@ -2636,10 +2375,6 @@ public struct AgentLoop: Sendable {
                 observation: message,
                 modelHistoryScope: modelHistoryScope)
             await denialCircuitBreaker.recordDenial(signature: denialSignature)
-            await sideEffectEvidence.recordDenied(
-                tool: descriptor.name,
-                intent: intent,
-                authorization: authorization)
             return ToolObservation(text: message)
         }
         let callContext = ToolCallContext(
@@ -2693,10 +2428,6 @@ public struct AgentLoop: Sendable {
                 modelHistoryScope: modelHistoryScope)
             await denialCircuitBreaker.recordDenial(
                 signature: denialSignature)
-            await sideEffectEvidence.recordDenied(
-                tool: descriptor.name,
-                intent: intent,
-                authorization: authorization)
             return ToolObservation(text: reason)
         }
         let outcome = MCPApprovalInteractionPolicy.decide(
@@ -2737,10 +2468,6 @@ public struct AgentLoop: Sendable {
                 observation: message,
                 modelHistoryScope: modelHistoryScope)
             await denialCircuitBreaker.recordDenial(signature: denialSignature)
-            await sideEffectEvidence.recordDenied(
-                tool: descriptor.name,
-                intent: intent,
-                authorization: authorization)
             return ToolObservation(text: message)
         }
         try Task.checkCancellation()
@@ -2766,10 +2493,6 @@ public struct AgentLoop: Sendable {
                     toolCall: toolCall,
                     observation: sidecarFailure,
                     modelHistoryScope: modelHistoryScope)
-                await sideEffectEvidence.recordDenied(
-                    tool: descriptor.name,
-                    intent: intent,
-                    authorization: authorization)
                 return ToolObservation(text: sidecarFailure)
             }
             let canonicalContext = preparedCall.modelAuthorizationContext
@@ -2778,6 +2501,8 @@ public struct AgentLoop: Sendable {
                         .canonicalAuthorizationContext($0)
                 }
             let binding = preparedCall.binding
+            let canonicalBusinessArgumentsDigest =
+                ToolRegistry.authorizationDigest(normalizedArguments)
             let secretBearingBusinessArguments = descriptor.name == "write_stdin"
                 || SecretScanner.containsSecret(normalizedArguments)
                 || PermissionReviewTextSanitizer.containsSensitiveMaterial(
@@ -2798,7 +2523,7 @@ public struct AgentLoop: Sendable {
                       binding.toolCallID == toolCall.id,
                       binding.toolName == descriptor.name,
                       binding.canonicalBusinessArgumentsDigest
-                        == authorization.normalizedArgumentsDigest {
+                        == canonicalBusinessArgumentsDigest {
                 reviewInvocation = PermissionReviewInvocationInput(
                     sessionID: binding.sessionID,
                     turnID: binding.turnID,
@@ -2809,9 +2534,9 @@ public struct AgentLoop: Sendable {
                     toolSnapshotID: binding.registrySnapshotID,
                     canonicalBusinessArguments: normalizedArguments,
                     businessArgumentsDigest:
-                        authorization.normalizedArgumentsDigest,
+                        canonicalBusinessArgumentsDigest,
                     businessArgumentsCharacterCount:
-                        authorization.normalizedArgumentsCharacterCount,
+                        normalizedArguments.count,
                     modelAuthorizationContextJSON: canonicalContext,
                     modelAuthorizationContextDigest: sidecarDigest)
                 evidenceFailure = nil
@@ -2850,10 +2575,6 @@ public struct AgentLoop: Sendable {
                 await denialCircuitBreaker.recordDenial(
                     signature: denialSignature,
                     permitsOneFreshReview: true)
-                await sideEffectEvidence.recordDenied(
-                    tool: descriptor.name,
-                    intent: intent,
-                    authorization: authorization)
                 return ToolObservation(text: evidenceFailure)
             }
         }
@@ -2888,10 +2609,6 @@ public struct AgentLoop: Sendable {
             await denialCircuitBreaker.recordDenial(
                 signature: denialSignature,
                 permitsOneFreshReview: settled.permitsOneFreshReview)
-            await sideEffectEvidence.recordDenied(
-                tool: descriptor.name,
-                intent: intent,
-                authorization: authorization)
             return ToolObservation(text: message)
         }
 
@@ -2928,10 +2645,6 @@ public struct AgentLoop: Sendable {
                 observation: message,
                 modelHistoryScope: modelHistoryScope)
             await denialCircuitBreaker.recordDenial(signature: denialSignature)
-            await sideEffectEvidence.recordDenied(
-                tool: descriptor.name,
-                intent: intent,
-                authorization: authorization)
             return ToolObservation(text: message)
         }
 
@@ -2965,10 +2678,6 @@ public struct AgentLoop: Sendable {
                 observation: message,
                 modelHistoryScope: modelHistoryScope)
             await denialCircuitBreaker.recordDenial(signature: denialSignature)
-            await sideEffectEvidence.recordDenied(
-                tool: descriptor.name,
-                intent: intent,
-                authorization: authorization)
             return ToolObservation(text: message)
         }
 
@@ -2986,8 +2695,8 @@ public struct AgentLoop: Sendable {
             authorization: authorization,
             replayPolicy: replayPolicy)
         // This record is the durable boundary: if it cannot be written, the
-        // executor is never invoked. An unresolved non-replayable record after
-        // a crash forces reconciliation instead of blindly replaying the task.
+        // executor is never invoked. An interrupted non-replayable call blocks
+        // automatic replay of the old task attempt.
         try await log.append(.toolExecutionPrepared(prepared))
 
         if let authorizationFailure = await authorizationRevalidationFailure(
@@ -3028,10 +2737,6 @@ public struct AgentLoop: Sendable {
                 observation: message,
                 modelHistoryScope: modelHistoryScope)
             await denialCircuitBreaker.recordDenial(signature: denialSignature)
-            await sideEffectEvidence.recordDenied(
-                tool: descriptor.name,
-                intent: intent,
-                authorization: authorization)
             return ToolObservation(text: message)
         }
 
@@ -3070,10 +2775,6 @@ public struct AgentLoop: Sendable {
                 observation: message,
                 modelHistoryScope: modelHistoryScope)
             await denialCircuitBreaker.recordDenial(signature: denialSignature)
-            await sideEffectEvidence.recordDenied(
-                tool: descriptor.name,
-                intent: intent,
-                authorization: authorization)
             return ToolObservation(text: message)
         }
 
@@ -3115,28 +2816,26 @@ public struct AgentLoop: Sendable {
                 toolCall: toolCall,
                 observation: message,
                 modelHistoryScope: modelHistoryScope)
-            await sideEffectEvidence.recordDenied(
-                tool: descriptor.name,
-                intent: intent,
-                authorization: authorization)
             throw CancellationError()
         }
         do {
             observation = try await registration.execute(args, in: toolContext)
         } catch is CancellationError {
-            let message = replayPolicy == .requiresManualReconciliation
-                ? "tool cancelled; manual reconciliation required because the side effect may already have occurred"
-                : "tool cancelled after execution started; execution outcome is unresolved"
-            // The executor boundary has been crossed. Even a cancellation from
-            // a nominally replayable tool is not proof that its work stopped,
-            // so leave the durable ticket unresolved.
+            let message = "tool cancelled after execution started"
             try await appendToolCompletion(
-                [.toolResult(ToolResultPayload(
-                    toolCallId: toolCall.id,
-                    observation: message,
-                    outcome: .failed,
-                    failureSource: .turnCancelled,
-                    turnID: turnID))],
+                [
+                    .toolResult(ToolResultPayload(
+                        toolCallId: toolCall.id,
+                        observation: message,
+                        outcome: .failed,
+                        failureSource: .turnCancelled,
+                        turnID: turnID)),
+                    .toolExecutionSettled(ToolExecutionSettledPayload(
+                        prepared: prepared,
+                        outcome: .cancelled,
+                        effectDisposition: .unknown,
+                        reason: message)),
+                ],
                 toolCall: toolCall,
                 observation: message,
                 modelHistoryScope: modelHistoryScope)
@@ -3165,10 +2864,6 @@ public struct AgentLoop: Sendable {
                 toolCall: toolCall,
                 observation: message,
                 modelHistoryScope: modelHistoryScope)
-            await sideEffectEvidence.recordDenied(
-                tool: descriptor.name,
-                intent: intent,
-                authorization: authorization)
             await denialCircuitBreaker.recordDenial(signature: denialSignature)
             return ToolObservation(text: message)
         } catch let rejection as ToolExecutionRejectedWithoutSideEffect {
@@ -3190,34 +2885,9 @@ public struct AgentLoop: Sendable {
                 toolCall: toolCall,
                 observation: message,
                 modelHistoryScope: modelHistoryScope)
-            await sideEffectEvidence.recordDenied(
-                tool: descriptor.name,
-                intent: intent,
-                authorization: authorization)
             return ToolObservation(text: message)
         } catch {
             let underlying = RuntimeErrorPresentation.message(for: error)
-            if replayPolicy == .requiresManualReconciliation {
-                let message = "tool error: \(underlying); manual reconciliation required because the side effect may already have occurred"
-                // Deliberately leave the execution ticket unresolved. A network,
-                // process, or collaboration tool can commit its side effect and
-                // still throw locally (for example after a timeout), so `failed`
-                // is not proof that replay is safe.
-                try await appendToolCompletion(
-                    [.toolResult(ToolResultPayload(
-                        toolCallId: toolCall.id,
-                        observation: message,
-                        outcome: .failed,
-                        failureSource: .runtimeFailed,
-                        turnID: turnID))],
-                    toolCall: toolCall,
-                    observation: message,
-                    modelHistoryScope: modelHistoryScope)
-                throw AgentLoopError.toolExecutionRequiresManualReconciliation(
-                    tool: descriptor.name,
-                    executionID: executionID,
-                    reason: underlying)
-            }
             let message = "tool error: \(underlying)"
             try await appendToolCompletion(
                 [
@@ -3236,10 +2906,6 @@ public struct AgentLoop: Sendable {
                 toolCall: toolCall,
                 observation: message,
                 modelHistoryScope: modelHistoryScope)
-            await sideEffectEvidence.recordDenied(
-                tool: descriptor.name,
-                intent: intent,
-                authorization: authorization)
             return ToolObservation(text: message)
         }
 
@@ -3268,13 +2934,9 @@ public struct AgentLoop: Sendable {
                 observation: observation.text,
                 modelHistoryScope: modelHistoryScope)
             // MCP `isError` is a typed tool failure, not proof that a remote
-            // side effect never crossed its commit boundary. Keep mutating
-            // completion evidence unresolved and let the model recover from
-            // the durable failed tool result without replaying automatically.
-            await sideEffectEvidence.recordDenied(
-                tool: descriptor.name,
-                intent: intent,
-                authorization: authorization)
+            // effect never crossed its commit boundary. The durable unknown
+            // disposition prevents replay of that old execution while the
+            // model can continue from the failed tool result in this turn.
             try Task.checkCancellation()
             return observation
         }
@@ -3304,10 +2966,7 @@ public struct AgentLoop: Sendable {
             observation: observation.text,
             toolSearchOutput: observation.toolSearchOutput,
             modelHistoryScope: modelHistoryScope)
-        await sideEffectEvidence.recordSucceeded(
-            intent: intent,
-            authorization: authorization)
-        // Persist completed side effects before surfacing a concurrent cancel.
+        // Persist completed execution before surfacing a concurrent cancel.
         try Task.checkCancellation()
         return observation
     }

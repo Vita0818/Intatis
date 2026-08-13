@@ -113,7 +113,7 @@ struct PhaseCPermissionFixtureView: View {
                         access: .readWrite)],
                     dataEffects: [.mutate],
                     risks: [.workspaceMutation],
-                    replayPolicy: .requiresManualReconciliation)),
+                    replayPolicy: .doNotReplay)),
             approvalMode: approvalMode)
     }
 

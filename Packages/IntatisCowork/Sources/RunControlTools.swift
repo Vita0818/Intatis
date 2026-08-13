@@ -22,7 +22,7 @@ private func runCloseIntent(
         dataEffects: [.none],
         controlEffects: [.closeRun],
         risks: [.controlPlaneMutation],
-        replayPolicy: .requiresManualReconciliation)
+        replayPolicy: .doNotReplay)
 }
 
 private func executeRunClose(

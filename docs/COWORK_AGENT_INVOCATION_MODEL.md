@@ -143,7 +143,7 @@ Example:
 ```text
 AgentIdentity(id: @macos-counter)
 TaskContract.roleHint: "macOS Swift file counter"
-CapabilityLease.delegation: none or requestOnly
+CapabilityLease.delegation: none
 ```
 
 The agent is not permanently a worker. In this task, it is assigned a counting role with no direct delegation power.
@@ -230,7 +230,6 @@ enum ToolCapability: String, Codable, Sendable {
     case canApplyPatch
     case canSendMessage
     case canRequestInformation
-    case canRequestDelegation
     case canDelegateTask
     case canAttachWorkspace
 }
@@ -241,7 +240,7 @@ Required policy:
 ```text
 ordinary counting task should not receive spawn/delegate capability
 explicit coordination task may receive delegation capability
-worker may have requestDelegation, but must not directly receive spawn_agent
+worker receives neither delegation nor spawn capability and reports blockers in its result
 workspace expansion is never read-only
 attach workspace must pass through the permission system
 ```
@@ -251,7 +250,6 @@ Delegation grant examples:
 ```swift
 enum DelegationGrant: Codable, Sendable {
     case none
-    case requestOnly
     case granted(DelegationBudget)
 }
 ```
@@ -260,11 +258,8 @@ Interpretation:
 
 ```text
 none
-    The agent may not create or request downstream work.
-
-requestOnly
-    The agent may ask the issuer or orchestrator for help. It cannot create a
-    task, spawn an agent, or attach a workspace directly.
+    The agent may not create downstream work. It reports any need for help in
+    its result.
 
 granted
     The agent may delegate within an explicit budget. The TaskGraph, Scheduler,
@@ -338,7 +333,6 @@ reply_message
 Delegation operations:
 
 ```text
-request_delegation
 delegate_task
 ```
 
@@ -363,10 +357,7 @@ Delegation examples:
 
 ```text
 @main -> delegate_task(@macos-counter, TaskContract(...))
-@macos-counter -> request_delegation(@main, "Need a separate docs counter")
 ```
-
-`request_delegation` is not permission to spawn. It records intent and lets the issuer, orchestrator, permission system, and scheduler decide whether new work is allowed.
 
 ## 8. Scheduler and Non-recursive Execution
 
@@ -667,6 +658,6 @@ attach workspace is not treated as read-only
 worker prompt does not advertise coordinator powers
 TaskContract appears in generated context
 agent-to-agent event records sender, recipient, taskID, and causalParentID
-requestDelegation does not expose spawn_agent
+worker tool surface exposes neither delegation nor spawn_agent
 coordinationDepth limit remains only as a safety fuse
 ```

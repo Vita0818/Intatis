@@ -150,7 +150,7 @@ final class IntatisPermissionTests: XCTestCase {
             ],
             dataEffects: [.read, .execute],
             risks: [.processExecution],
-            replayPolicy: .requiresManualReconciliation)
+            replayPolicy: .doNotReplay)
 
         XCTAssertTrue(intent.isReadOnlyWorkspaceCompatible)
         XCTAssertTrue(intent.isStructuredReadOnlyExecution)
@@ -180,7 +180,7 @@ final class IntatisPermissionTests: XCTestCase {
             ],
             dataEffects: [.read, .execute, .mutate],
             risks: [.processExecution, .workspaceMutation],
-            replayPolicy: .requiresManualReconciliation)
+            replayPolicy: .doNotReplay)
         XCTAssertFalse(mutating.isReadOnlyWorkspaceCompatible)
         XCTAssertFalse(mutating.isStructuredReadOnlyExecution)
 
@@ -227,7 +227,7 @@ final class IntatisPermissionTests: XCTestCase {
             dataEffects: [.none],
             controlEffects: [],
             risks: [.controlPlaneMutation],
-            replayPolicy: .requiresManualReconciliation)
+            replayPolicy: .doNotReplay)
         guard case .allow(_, let risk) = gate.evaluate(
             call("rename_session", .write, intent: intent),
             ctx(profile: .reviewed)) else {
@@ -243,7 +243,7 @@ final class IntatisPermissionTests: XCTestCase {
             dataEffects: [.none],
             controlEffects: [],
             risks: [.controlPlaneMutation],
-            replayPolicy: .requiresManualReconciliation)
+            replayPolicy: .doNotReplay)
         guard case .pass = gate.evaluate(
             call("rename_session", .write, intent: intent),
             ctx(profile: .reviewed)) else {
@@ -258,7 +258,7 @@ final class IntatisPermissionTests: XCTestCase {
             dataEffects: [.none],
             controlEffects: [],
             risks: [.controlPlaneMutation],
-            replayPolicy: .requiresManualReconciliation)
+            replayPolicy: .doNotReplay)
         guard case .deny = gate.evaluate(
             call("rename_session", .write, intent: intent),
             ctx(profile: .locked)) else {
@@ -311,7 +311,7 @@ final class IntatisPermissionTests: XCTestCase {
                 dataEffects: [.none],
                 controlEffects: [.createAgent, .grantCapability],
                 risks: [.controlPlaneMutation, .capabilityGrant],
-                replayPolicy: .requiresManualReconciliation)
+                replayPolicy: .doNotReplay)
         }
         guard case .pass(let reason, _) = gate.evaluate(
             call("spawn_agent", .write, intent: spawnIntent(.readOnly)),
@@ -348,7 +348,7 @@ final class IntatisPermissionTests: XCTestCase {
                 dataEffects: [.none],
                 controlEffects: [controlEffect],
                 risks: [.controlPlaneMutation],
-                replayPolicy: .requiresManualReconciliation)
+                replayPolicy: .doNotReplay)
             guard case .pass(let reason, _) = gate.evaluate(
                 call(action, .write, intent: intent),
                 ctx(profile: .readOnly)) else {

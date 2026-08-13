@@ -290,8 +290,9 @@ write/read/preview/export/PDF read，以及 XLSX write/Calc round-trip/formula-c
   退出后都生效，不能只在 backend 完成后检查 staging；
 - read-only worker 只拿 `read_pdf`、五个 exact reader capability 与 `document_ocr`；五个普通 reader
   只能通过 exact `structured_read_only + safeToReplay` 权限形状执行。首个 reader 解析失败必须写
-  failed/unknown settlement、允许同批后续 reader 继续并允许模型给出最终回答；既有 non-replayable
-  write 失败仍必须触发 manual reconciliation。read-write worker/coordinator 才拿 render/export/write。
+  failed/unknown settlement、允许同批后续 reader 继续并允许模型给出最终回答；其他 executor error
+  同样必须把 failed/unknown observation 返回模型，不得升级成通用整轮终止。read-write
+  worker/coordinator 才拿 render/export/write。
   iOS target 依赖图仍不含 Tools/Permission/AgentKernel/Cowork/文档 runtime。
 
 2026-08-11 的本地回归中，外部 corpus opt-in 用例将 1 份稀疏 XLSX 与 3 份 PPTX 复制到临时
@@ -321,7 +322,8 @@ swift test
 completed segment、歧义 fail closed、user/assistant 正文字段合计 6,000 个 Swift
 `Character` 上下文预算（JSON 编码开销不计入）、前三次 attempt/`NO_TITLE`、single-flight/pending/timeout、官方 provider 在首个
 response byte 前至多一次 transport retry 且不额外消耗逻辑 attempt、收到 byte 后不 retry、严格
-done/EOF 与格式/敏感内容 validator、Chat-only EventLog set-if-absent、手工 Rename 竞争、跨 runtime
+done/EOF（usage 可位于唯一 done 前或后；done 后正文/citation/重复 done 拒绝）与格式/敏感内容
+validator、Chat-only EventLog set-if-absent、手工 Rename 竞争、跨 runtime
 attempt ledger、pre-stream cancel 不计次、ineligible 后消费较新 pending、recent 排序不变、Chat
 消息/error/busy 隔离、官方 provider request-owned stream termination，以及 shutdown cancel+await。
 
@@ -329,6 +331,20 @@ macOS/iOS host 另须确认 verified commit 发布时 EventLog 与读回 project
 revision+seq 被丢弃；iOS 在 A→B 后收到 A commit 只更新 A row/header，不改变 B；目标依赖图仍是
 7-product Chat 子集。真实 provider smoke 要另外记录 provider/model、是否首轮命名、15 秒可见性与
 失败静默；单元测试和编译不能替代该联网产品验收。
+
+2026-08-13 Chat/iOS 自动标题尾随 usage 修复与 Code/Cowork 首轮 prompt-only rename 的直接证据：
+
+- `ChatSessionAutoTitleTests` 24/24、`ChatAutoTitleViewModelTests` 3/3、
+  `ContextProjectionTests` 23/23，均为 0 failures；
+- `swift build --disable-automatic-resolution`、`IntatisMac` macOS Debug unsigned build 与
+  `IntatisiOS` generic Simulator Debug unsigned build 均退出 0；iOS 增量复核明确输出
+  `BUILD SUCCEEDED`，首次构建仅出现仓库既有 warning 与一条 exit-code-0 Swift driver 噪声诊断；
+- 一次完整 `swift test --disable-automatic-resolution` 已完成 `IntatisToolsTests` 227/227
+  （19 个显式 opt-in smoke skipped）、`IntatisSkillsTests` 29/29，并在 SharedUI 中再次完成本次
+  `ChatAutoTitleViewModelTests` 3/3；随后 SharedUI 后续用例连续约 90 秒无输出，人工中止为 130，
+  因此不得记为整仓全绿；
+- 未运行真实 provider、credential/network 或 GUI/iOS 手动 smoke；prompt-only rename 的线上模型
+  遵循度仍须用真实 Code/Cowork 首轮分别验收，且本次没有增加 host 自动触发器。
 
 ## Apple App 构建
 
@@ -437,6 +453,10 @@ recovery App metadata/architecture/signature/entitlements 重新验证；超时�
 - Cowork coordinator prompt 在 `spawn_agent` 可用时把预知的根外目录或 out-of-workspace denial
   路由为 exact-directory child + `delegate_task`，默认只读、写入显式；Code/worker prompt 不宣称
   coordinator 能力，工具缺失/扩展拒绝只报告 blocker，直接越界仍 fail closed；
+- Code system prompt 与 Cowork coordinator/exact `@main` prompt 只在 session 第一轮用户任务完成验证或
+  确认真实 blocker 后、且 authoritative list 含 `rename_session` 时要求调用一次具体标题；不得新增宿主
+  自动 trigger。worker 与共享 Cowork runtime prompt 不得出现该要求，后续轮次只响应用户明确改名。
+  Cowork 提示必须保持 `rename_session` 最后一个非 run-control call，再进入既有 `finish_run` / `stop_run`；
 - runtime stop 先 drain provider/tool/process，再释放 waiter/subscription/scope；
 - Cowork worker 默认无 coordinator tools，reviewer/verifier 不进入普通 scheduler；
 - ordinary worker 的 `task_update` closed business schema 只含当前任务的 ID/revision、进度、允许状态、
@@ -532,7 +552,7 @@ routing options、结构化 unsupported 同路由一次降级、裸 404 拒绝�
 Code/Cowork/CLI 的显式 `hosted_web_search` 包装至少追加验证：
 
 - `HostedWebSearchToolTests`：descriptor 只有 required `query`，`strict:true`、
-  `additionalProperties:false`、network/model-cost intent、manual reconciliation；空白/超长输入在
+  `additionalProperties:false`、network/model-cost intent、`doNotReplay`；空白/超长输入在
   provider 前失败，service 收到 trim 后 query，standard registry 无 service 时不广告工具。
 - `ProviderHostedWebSearchToolServiceTests`：专用请求使用 route 中 exact model/provider/options、
   `tool_choice:required` 与 unsupported fail-closed；文本/citation 去重与 output bound 正确，缺 completion
@@ -1121,6 +1141,30 @@ INTATIS_REAL_MULTIMODAL_SMOKE=1 swift test \
 - `swift build` 与 `git diff --check` 通过。一次整仓 `swift test` 在 Tools/Skills 通过后，于既有
   SharedUI async waiter 中超过 60 秒无输出并人工中止（exit 130），因此不记为完整 suite 通过；
   未运行真实 provider、credential/network、GUI、macOS App 或 iOS App smoke。
+
+2026-08-13 AuthorizationSidecar 绑定域分离与副作用完成 cast 删除的直接证据：
+
+- `AgentLoop` 现在只用 stripped canonical business arguments 自身重算并核对
+  `businessArgumentsDigest` / Character count；工具自定义的 `authorizationArgumentIdentity` 继续独立生成
+  `ResolvedToolAuthorization.normalizedArgumentsDigest` / count。两组摘要各自闭环验证，不再互相比较；
+  `PermissionReviewControlPlaneTests.testCustomAuthorizationIdentityDoesNotConflictWithBusinessArguments`
+  与 `AutomaticPermissionReviewTests.testSecretSidecarFailsWhileCustomAuthorizationIdentityRemainsBound`
+  覆盖 custom identity 与业务 JSON 摘要明确不同但仍可合法审查、执行的回归；
+- 已删除 `SideEffectEvidenceLedger`、其 EventLog restore、全部 denied/failed/succeeded 记账、final 前
+  unresolved 检查，以及 `toolExecutionRequiresManualReconciliation` /
+  `unresolvedDeniedSideEffects` 两个 AgentLoop error 和对应 model-facing prompt。普通权限拒绝或 executor
+  失败仍写 typed `tool_result` 并回到同一模型 turn，但不会再被二次 cast 成“整轮不能完成”；
+- hard permission deny、`ToolDenialCircuitBreaker`、durable execution ticket、
+  `effectDisposition`、`.doNotReplay` 与旧 attempt crash-replay guard 均保留；这些机制分别约束当前调用能否
+  执行或旧 attempt 能否自动重放，不得重新组合成 final-completion gate；
+- `AuthorizationSidecarTests` 12/12、`AgentLoopPolicyTests` 37/37、
+  `AutomaticPermissionReviewTests` 39/39、`PermissionReviewControlPlaneTests` 52/52、
+  `AgentInvocationNonRecursiveTests` 11/11、`PerAgentInferenceProfileTests` 21/21 均通过；
+  模块级完整结果为 `IntatisAgentKernelTests` 220/220、`IntatisConversationTests` 212/212、
+  `IntatisCoworkTests` 365/365，全部 0 failures；
+- `swift build --disable-automatic-resolution` 与 `IntatisMac` macOS Debug unsigned build 通过；Mac 构建只有
+  仓内既有 unused-result / deprecated `onChange` warnings。未运行真实 provider、credential/network、
+  GUI、iOS App、签名、公证或发行打包 smoke。
 
 2026-08-12 Cowork ordinary-worker WorkTask update 收窄的直接证据：
 

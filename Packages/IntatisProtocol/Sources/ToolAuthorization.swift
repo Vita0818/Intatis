@@ -17,7 +17,6 @@ public enum ToolCommunicationRequirement: String, Codable, Equatable, Sendable {
 
 public enum ToolDelegationRequirement: String, Codable, Equatable, Sendable {
     case none
-    case requestOrGranted = "request_or_granted"
     case granted
 }
 

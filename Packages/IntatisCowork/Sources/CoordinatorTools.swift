@@ -28,8 +28,6 @@ public struct SpawnAgentTool: Tool {
                                  "description": .string("short agent name, e.g. reviewer")]),
                 "path": .object(["type": .string("string"),
                                  "description": .string("absolute path to the agent's workspace folder")]),
-                "model": .object(["type": .string("string"),
-                                  "description": .string("deprecated compatibility field; cannot change the parent profile")]),
                 "inference_profile_id": .object([
                     "type": .string("string"),
                     "description": .string("optional host-approved inference profile ID; recommended default is omission, which inherits your exact revision"),
@@ -50,13 +48,12 @@ public struct SpawnAgentTool: Tool {
     struct Args: Decodable {
         let name: String
         let path: String
-        let model: String?
         let inferenceProfileID: String?
         let requestedAccess: WorkspaceAccess?
         let canCoordinate: Bool?
 
         private enum CodingKeys: String, CodingKey {
-            case name, path, model, requestedAccess, canCoordinate
+            case name, path, requestedAccess, canCoordinate
             case inferenceProfileID = "inference_profile_id"
         }
     }
@@ -95,10 +92,8 @@ public struct SpawnAgentTool: Tool {
                 PermissionResource(kind: .workspace, value: targetURL.path, access: requestedAccess),
             ],
             metadata: [
-                // Raw model/profile strings are untrusted model output. The
-                // Orchestrator replaces these booleans with an exact
-                // host-catalog binding only after schema and catalog checks.
-                "modelCompatibilityFieldPresent": .bool(value.model != nil),
+                // The Orchestrator replaces the optional catalog ID with an
+                // exact host-approved binding after schema and catalog checks.
                 "inferenceProfileSelectionRequested": .bool(
                     value.inferenceProfileID?.trimmingCharacters(
                         in: .whitespacesAndNewlines).isEmpty == false),
@@ -115,7 +110,7 @@ public struct SpawnAgentTool: Tool {
             dataEffects: [.none],
             controlEffects: [.createAgent, .attachWorkspace, .grantCapability],
             risks: risks,
-            replayPolicy: .requiresManualReconciliation)
+            replayPolicy: .doNotReplay)
     }
 
     public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {
@@ -127,7 +122,6 @@ public struct SpawnAgentTool: Tool {
             authorization: context.authorization,
             name: a.name,
             path: a.path,
-            model: a.model,
             inferenceProfileID: a.inferenceProfileID,
             requestedAccess: a.requestedAccess ?? .readOnly,
             canCoordinate: a.canCoordinate ?? false)
@@ -234,7 +228,7 @@ public struct RemoveAgentTool: Tool {
             dataEffects: [.none],
             controlEffects: [.removeAgent],
             risks: [.controlPlaneMutation],
-            replayPolicy: .requiresManualReconciliation)
+            replayPolicy: .doNotReplay)
     }
 
     public func execute(_ args: ToolArgs, in context: ToolContext) async throws -> ToolObservation {

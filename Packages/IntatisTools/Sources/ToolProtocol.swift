@@ -401,7 +401,6 @@ public protocol AgentMessenger: Sendable {
     func replyMessage(to agent: String,
                       content: String,
                       inReplyTo: String) async -> String
-    func requestDelegation(objective: String, reason: String) async -> String
     func delegateTask(authorization: ResolvedToolAuthorization,
                       executionID: String,
                       to agent: String?,
@@ -427,7 +426,6 @@ public protocol AgentManager: Sendable {
     func spawnAgent(authorization: ResolvedToolAuthorization?,
                     name: String,
                     path: String,
-                    model: String?,
                     inferenceProfileID: String?,
                     requestedAccess: WorkspaceAccess,
                     canCoordinate: Bool) async -> String
@@ -1598,8 +1596,6 @@ public struct ToolRegistry: Sendable {
         switch grant {
         case .none:
             return "none"
-        case .requestOnly:
-            return "request-only"
         case .granted(let budget):
             return "granted:\(budget.maxTasks):\(budget.maxDepth)"
         }
@@ -1631,9 +1627,6 @@ public struct ToolRegistry: Sendable {
     ) -> Bool {
         switch requirement {
         case .none:
-            return true
-        case .requestOrGranted:
-            if case .none = grant { return false }
             return true
         case .granted:
             if case .granted = grant { return true }

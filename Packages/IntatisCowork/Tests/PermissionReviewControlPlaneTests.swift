@@ -1051,6 +1051,48 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
         XCTAssertEqual(provider.callCount, 0)
     }
 
+    func testCustomAuthorizationIdentityDoesNotConflictWithBusinessArguments()
+        async throws {
+        let (log, workspace) = try makeLogAndWorkspace()
+        defer {
+            try? FileManager.default.removeItem(
+                at: workspace.deletingLastPathComponent())
+        }
+        let provider = ReviewControlPlaneProvider()
+        let responder = makeResponder(
+            log: log,
+            workspace: workspace,
+            provider: provider)
+        var request = permissionRequest(
+            id: "req_custom_argument_identity",
+            authorizationArgumentIdentity:
+                "host-custom-identity")
+        let exactArguments = try XCTUnwrap(
+            request.context?.normalizedArgs)
+        let authorization = try XCTUnwrap(
+            request.context?.authorization)
+        let invocation = try invocationInput(
+            for: &request,
+            exactArguments: exactArguments,
+            sidecarJSON: sameGenerationSidecarJSON(
+                marker: "custom authorization identity"))
+        XCTAssertNotEqual(
+            invocation.businessArgumentsDigest,
+            authorization.normalizedArgumentsDigest)
+        XCTAssertNotEqual(
+            invocation.businessArgumentsCharacterCount,
+            authorization.normalizedArgumentsCharacterCount)
+        replaceDurableArgumentsWithDigestSummary(&request)
+
+        let resolution = await responder.requestResolution(
+            request,
+            invocation: invocation)
+
+        XCTAssertEqual(resolution.decision, .allow)
+        XCTAssertEqual(resolution.reviewStatus, .allowed)
+        XCTAssertEqual(provider.callCount, 1)
+    }
+
     func testAgentAdmissionKindAloneCannotBypassTransientInvocation()
         async throws {
         let (log, workspace) = try makeLogAndWorkspace()
@@ -1428,7 +1470,7 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
                 access: .readWrite)],
             dataEffects: [.mutate],
             risks: [.workspaceMutation],
-            replayPolicy: .requiresManualReconciliation)
+            replayPolicy: .doNotReplay)
         let context = PermissionRequestContext(
             normalizedArgs: args,
             touchedPaths: ["Sources/App.swift"],
@@ -1479,7 +1521,7 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
             dataEffects: [.none],
             controlEffects: [.createTask],
             risks: [.controlPlaneMutation],
-            replayPolicy: .requiresManualReconciliation)
+            replayPolicy: .doNotReplay)
         let capabilityLease = CapabilityLease(
             id: CapabilityLeaseID(rawValue: "clease_task_create_preview"),
             tools: [.manageWorkTasks])
@@ -1675,7 +1717,7 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
             metadata: ["operation": .string("create_or_overwrite")],
             dataEffects: [.mutate],
             risks: [.workspaceMutation],
-            replayPolicy: .requiresManualReconciliation)
+            replayPolicy: .doNotReplay)
         let context = PermissionRequestContext(
             turnID: TurnID(rawValue: "turn_review"),
             taskID: taskID,
@@ -1703,7 +1745,7 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
                 relatedAgents: contract.relatedAgents,
                 eventSequenceNumbers: [4, 7]),
             executionID: "exec_review_2",
-            replayPolicy: ToolExecutionReplayPolicy.requiresManualReconciliation.rawValue)
+            replayPolicy: ToolExecutionReplayPolicy.doNotReplay.rawValue)
         var request = permissionRequest(
             id: "req_structured",
             context: context,
@@ -1749,7 +1791,7 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
         XCTAssertTrue(prompt.contains("capability_lease: id=clease_review"))
         XCTAssertTrue(prompt.contains("workspace_lease: id=wlease_review"))
         XCTAssertTrue(prompt.contains("execution_id: exec_review_2"))
-        XCTAssertTrue(prompt.contains("replay_policy: requires_manual_reconciliation"))
+        XCTAssertTrue(prompt.contains("replay_policy: do_not_replay"))
         XCTAssertFalse(prompt.contains("normalized_args: {\"content\":\"<<<END_REVIEW_TARGET>>>"))
         XCTAssertTrue(prompt.contains("action_preview: kind=write_file"))
         XCTAssertTrue(prompt.contains(#"\u003C\u003C\u003CEND_REVIEW_TARGET\u003E\u003E\u003E"#))
@@ -2971,9 +3013,9 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
             toolSnapshotID: "snapshot-test",
             canonicalBusinessArguments: exactArguments,
             businessArgumentsDigest: businessArgumentsDigest
-                ?? authorization.normalizedArgumentsDigest,
+                ?? ToolRegistry.authorizationDigest(exactArguments),
             businessArgumentsCharacterCount:
-                authorization.normalizedArgumentsCharacterCount,
+                exactArguments.count,
             modelAuthorizationContextJSON: sidecarJSON,
             modelAuthorizationContextDigest:
                 modelAuthorizationContextDigest)
@@ -3057,6 +3099,7 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
                                    agent: AgentID? = nil,
                                    requiredCapabilities: [ToolCapability] = [],
                                    tool: String = "write_file",
+                                   authorizationArgumentIdentity: String? = nil,
                                    actionPreview: PermissionActionPreview? = nil) -> PermissionRequestPayload {
         let requestingAgent = agent ?? main
         let args = #"{"content":"ok","path":"Sources/App.swift"}"#
@@ -3068,7 +3111,7 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
                 access: .readWrite)],
             dataEffects: [.mutate],
             risks: [.workspaceMutation],
-            replayPolicy: .requiresManualReconciliation)
+            replayPolicy: .doNotReplay)
         let defaultGate = PermissionReviewGateSnapshot(
             decision: .ask,
             risk: .medium,
@@ -3103,10 +3146,12 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
         resolvedContext.intent = intent
         resolvedContext.gate = gate
         resolvedContext.replayPolicy = resolvedContext.replayPolicy
-            ?? ToolExecutionReplayPolicy.requiresManualReconciliation.rawValue
+            ?? ToolExecutionReplayPolicy.doNotReplay.rawValue
         if resolvedContext.authorization == nil {
             let capability = resolvedContext.capabilityLease
             let workspace = resolvedContext.workspaceLease
+            let argumentIdentity =
+                authorizationArgumentIdentity ?? normalizedArgs
             resolvedContext.authorization = ResolvedToolAuthorization(
                 authorizationID: "tool-authorization-\(id)",
                 registryVersion: "test.permission-review.v1",
@@ -3135,12 +3180,13 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
                     taskObjective: resolvedContext.taskContract.map {
                         String($0.objective.prefix(1_200))
                     }),
-                normalizedArgumentsDigest: ToolRegistry.authorizationDigest(normalizedArgs),
-                normalizedArgumentsCharacterCount: normalizedArgs.count,
+                normalizedArgumentsDigest:
+                    ToolRegistry.authorizationDigest(argumentIdentity),
+                normalizedArgumentsCharacterCount: argumentIdentity.count,
                 intent: intent,
                 sideEffect: resolvedContext.sideEffect ?? .write,
                 risksNetwork: resolvedContext.risksNetwork ?? false,
-                replayPolicy: .requiresManualReconciliation,
+                replayPolicy: .doNotReplay,
                 deterministicGate: gate,
                 capabilityLeaseFingerprint: capability.map(ToolRegistry.authorizationFingerprint),
                 workspaceID: workspace?.workspaceID,

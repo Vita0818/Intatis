@@ -9,10 +9,10 @@ final class ToolExecutionProtocolTests: XCTestCase {
             .safeToReplay)
         XCTAssertEqual(
             ToolExecutionReplayPolicy.conservative(for: .write, tool: "write_file"),
-            .requiresManualReconciliation)
+            .doNotReplay)
         XCTAssertEqual(
             ToolExecutionReplayPolicy.conservative(for: .readOnly, tool: "ask_agent"),
-            .requiresManualReconciliation)
+            .doNotReplay)
 
         let read = ToolExecutionPreparedPayload(
             executionID: "read",
@@ -24,8 +24,8 @@ final class ToolExecutionProtocolTests: XCTestCase {
             toolCallID: "write-call",
             tool: "write_file",
             sideEffect: .write)
-        XCTAssertFalse(read.requiresTaskReplayReconciliation)
-        XCTAssertTrue(write.requiresTaskReplayReconciliation)
+        XCTAssertFalse(read.blocksTaskReplay)
+        XCTAssertTrue(write.blocksTaskReplay)
     }
 
     func testPrepareAndSettledEventsRoundTripWithStableWireTypes() throws {
@@ -37,7 +37,7 @@ final class ToolExecutionProtocolTests: XCTestCase {
             resources: [PermissionResource(kind: .workspacePath, value: "a.swift", access: .readWrite)],
             dataEffects: [.mutate],
             risks: [.workspaceMutation],
-            replayPolicy: .requiresManualReconciliation)
+            replayPolicy: .doNotReplay)
         let prepared = ToolExecutionPreparedPayload(
             executionID: "exec_1",
             taskID: taskID,
@@ -103,7 +103,7 @@ final class ToolExecutionProtocolTests: XCTestCase {
     }
 
     func testLegacySettledExecutionWithoutEffectDispositionDecodesConservatively() throws {
-        let json = #"{"executionID":"exec_legacy","toolCallID":"call_legacy","tool":"task_update","sideEffect":"write","replayPolicy":"requires_manual_reconciliation","outcome":"failed","reason":"expected revision 1, actual 2"}"#
+        let json = #"{"executionID":"exec_legacy","toolCallID":"call_legacy","tool":"task_update","sideEffect":"write","replayPolicy":"do_not_replay","outcome":"failed","reason":"expected revision 1, actual 2"}"#
 
         let payload = try JSONDecoder().decode(
             ToolExecutionSettledPayload.self,
@@ -111,6 +111,6 @@ final class ToolExecutionProtocolTests: XCTestCase {
 
         XCTAssertEqual(payload.outcome, .failed)
         XCTAssertNil(payload.effectDisposition)
-        XCTAssertTrue(payload.prepared.requiresTaskReplayReconciliation)
+        XCTAssertTrue(payload.prepared.blocksTaskReplay)
     }
 }

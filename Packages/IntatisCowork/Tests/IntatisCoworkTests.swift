@@ -114,9 +114,8 @@ private func askArgs(to: String, question: String) -> String {
     String(decoding: try! JSONSerialization.data(withJSONObject: ["to": to, "question": question]), as: UTF8.self)
 }
 
-private func spawnArgs(name: String, path: String, model: String? = nil, canCoordinate: Bool? = nil) -> String {
+private func spawnArgs(name: String, path: String, canCoordinate: Bool? = nil) -> String {
     var object: [String: Any] = ["name": name, "path": path]
-    if let model { object["model"] = model }
     if let canCoordinate { object["canCoordinate"] = canCoordinate }
     return String(decoding: try! JSONSerialization.data(withJSONObject: object), as: UTF8.self)
 }
@@ -670,7 +669,7 @@ final class IntatisCoworkTests: XCTestCase {
         }
         let mainProvider = ScriptedProvider([
             [.toolCalls([ToolCall(id: "spawn", name: "spawn_agent",
-                                  arguments: spawnArgs(name: worker.rawValue, path: wsWorker.path, model: "m"))]),
+                                  arguments: spawnArgs(name: worker.rawValue, path: wsWorker.path))]),
              .done(finishReason: "tool_calls")],
             [.textDelta("worker ready"), .done(finishReason: "stop")],
         ])
@@ -732,7 +731,6 @@ final class IntatisCoworkTests: XCTestCase {
             [.toolCalls([ToolCall(id: "spawn", name: "spawn_agent",
                                   arguments: spawnArgs(name: lead.rawValue,
                                                        path: wsLead.path,
-                                                       model: "m",
                                                        canCoordinate: true))]),
              .done(finishReason: "tool_calls")],
             [.textDelta("lead ready"), .done(finishReason: "stop")],
@@ -832,7 +830,7 @@ final class IntatisCoworkTests: XCTestCase {
 
     func testSpawnAgentIntentIsControlPlaneAndDefaultsToReadOnly() throws {
         let root = URL(fileURLWithPath: "/workspace")
-        let args = ToolArgs(raw: #"{"name":"counter","path":"/workspace","model":"m","canCoordinate":false}"#)
+        let args = ToolArgs(raw: #"{"name":"counter","path":"/workspace","canCoordinate":false}"#)
         let tool = SpawnAgentTool()
         let intent = tool.permissionIntent(args, workspaceRoot: root)
 

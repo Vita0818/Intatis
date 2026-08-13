@@ -163,6 +163,11 @@ final class ContextProjectionTests: XCTestCase {
         XCTAssertTrue(coordinator.contains("Keep advancing the request until the outcome is verified"))
         XCTAssertTrue(coordinator.contains("When finish_run is advertised"))
         XCTAssertTrue(coordinator.contains("host to the current ContinuationRun"))
+        XCTAssertTrue(coordinator.contains("first user turn of the current session"))
+        XCTAssertTrue(coordinator.contains("call `rename_session`"))
+        XCTAssertTrue(coordinator.contains("last non-run-control tool call"))
+        XCTAssertTrue(coordinator.contains("date,"))
+        XCTAssertTrue(coordinator.contains("`rename_session` succeeds"))
         XCTAssertTrue(coordinator.contains("mailbox replies as correlation-scoped"))
         XCTAssertTrue(coordinator.contains("based_on set to that reply Message ID"))
 
@@ -175,6 +180,7 @@ final class ContextProjectionTests: XCTestCase {
             IntatisBundledSkills.coworkAgentOrchestrationName))
         XCTAssertFalse(worker.contains("system:bundle-"))
         XCTAssertFalse(worker.contains("Proactively drive the user's requested outcome"))
+        XCTAssertFalse(worker.contains("rename_session"))
         XCTAssertTrue(worker.contains("reply requires no acknowledgment"))
         XCTAssertTrue(worker.contains("request_information correlation"))
     }
@@ -653,6 +659,15 @@ final class ContextProjectionTests: XCTestCase {
             XCTAssertTrue(systemPrompt.contains("successful ToolResult"), modeName)
             XCTAssertTrue(systemPrompt.contains("planned or future object"), modeName)
             XCTAssertTrue(systemPrompt.contains("Mode-specific instructions."), modeName)
+            if runtime.mode == .code {
+                XCTAssertTrue(systemPrompt.contains("first user turn of the current session"), modeName)
+                XCTAssertTrue(systemPrompt.contains("call `rename_session`"), modeName)
+                XCTAssertTrue(systemPrompt.contains("exactly once if it appears"), modeName)
+                XCTAssertTrue(systemPrompt.contains("date,"), modeName)
+                XCTAssertTrue(systemPrompt.contains("On later turns, do not rename automatically"), modeName)
+            } else {
+                XCTAssertFalse(systemPrompt.contains("rename_session"), modeName)
+            }
         }
     }
 

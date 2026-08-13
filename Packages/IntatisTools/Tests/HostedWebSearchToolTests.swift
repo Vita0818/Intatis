@@ -48,7 +48,7 @@ final class HostedWebSearchToolTests: XCTestCase {
         XCTAssertEqual(intent.action, "network.search")
         XCTAssertEqual(intent.dataEffects, [.network])
         XCTAssertEqual(intent.risks, [.networkAccess, .modelCost])
-        XCTAssertEqual(intent.replayPolicy, .requiresManualReconciliation)
+        XCTAssertEqual(intent.replayPolicy, .doNotReplay)
         XCTAssertEqual(
             intent.resources,
             [PermissionResource(

@@ -179,7 +179,6 @@ enum ToolCapability {
     case applyPatch
     case sendMessage
     case requestInformation
-    case requestDelegation
     case delegateTask
     case attachWorkspace
 }
@@ -218,12 +217,9 @@ Delegation should be explicit.
 ```swift
 enum DelegationGrant {
     case none
-    case requestOnly
     case granted(DelegationBudget)
 }
 ```
-
-`requestOnly` means the agent may ask the orchestrator for help, but cannot create tasks or agents directly.
 
 `granted` means it may delegate within a specified budget.
 
@@ -260,7 +256,7 @@ Your allowed capabilities are: <capabilities>.
 Your delegation permission is: <delegation>.
 Do not perform unrelated parts of the global task.
 Do not create or call other agents unless your capability lease explicitly allows it.
-If you need help and only have requestOnly delegation, ask the orchestrator instead of spawning or directly delegating.
+If you need help without delegation capability, report the blocker in your response. Only an agent with an explicit coordinator lease may use `delegate_task`.
 ```
 
 This prompt should be generated from state, not hand-written per scenario.

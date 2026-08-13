@@ -733,6 +733,7 @@ final class ChatSessionAutoTitleTests: XCTestCase {
             .usage(Usage(promptTokens: 1)),
             .delta("输入框布局优化"),
             .done,
+            .usage(Usage(totalTokens: 2)),
         ])])
         let validResult = await ChatSessionAutoTitleService.generate(
             prepared: prepared,
@@ -754,7 +755,7 @@ final class ChatSessionAutoTitleTests: XCTestCase {
         let malformed: [[ChatChunk]] = [
             [.delta("没有完成标记")],
             [.delta("重复完成"), .done, .done],
-            [.delta("完成后输出"), .done, .usage(Usage(totalTokens: 1))],
+            [.delta("完成后输出"), .done, .delta("额外正文")],
             [.delta("带引用"), .citation(.init(
                 url: "https://example.com", title: "source")), .done],
             [.delta(String(repeating: "a", count: 121)), .done],

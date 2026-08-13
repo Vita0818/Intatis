@@ -1015,9 +1015,7 @@ final class PerAgentInferenceProfileTests: XCTestCase {
         XCTAssertTrue(attached)
 
         let result = await orchestrator.send("Reject raw route configuration.", to: main)
-        guard case .failed = result else {
-            return XCTFail("invalid spawn_agent input must fail the invocation")
-        }
+        XCTAssertEqual(result, .sent)
         let events = await environment.log.replay()
         let durableCall = try XCTUnwrap(events.compactMap { envelope -> ToolCallPayload? in
             guard case .toolCall(let payload) = envelope.event,
@@ -1119,7 +1117,7 @@ final class PerAgentInferenceProfileTests: XCTestCase {
         XCTAssertNil(childAttachment.previousAgentInferenceBinding)
     }
 
-    func testSpawnRejectsRawModelChangeAndUnapprovedProfileBeforeAdmission() async throws {
+    func testSpawnRejectsRemovedRawModelFieldAndUnapprovedProfileBeforeAdmission() async throws {
         let environment = try PerAgentProfileEnvironment("spawn-unapproved-routes")
         defer { environment.remove() }
         let parentBinding = perAgentBinding(
@@ -1170,14 +1168,8 @@ final class PerAgentInferenceProfileTests: XCTestCase {
 
         let rawResult = await orchestrator.send("Try an unapproved raw model.", to: main)
         let unknownResult = await orchestrator.send("Try an unknown profile.", to: main)
-        guard case .failed(let rawFailure) = rawResult else {
-            return XCTFail("raw model route change must fail the invocation")
-        }
-        guard case .failed(let unknownFailure) = unknownResult else {
-            return XCTFail("unknown profile route must fail the invocation")
-        }
-        XCTAssertTrue(rawFailure.contains("required side effects remain denied or failed"))
-        XCTAssertTrue(unknownFailure.contains("required side effects remain denied or failed"))
+        XCTAssertEqual(rawResult, .sent)
+        XCTAssertEqual(unknownResult, .sent)
 
         let agents = await orchestrator.agentList()
         XCTAssertEqual(agents.map(\.name), [main])
@@ -1195,12 +1187,17 @@ final class PerAgentInferenceProfileTests: XCTestCase {
             guard case .agentSpawnRequested(let payload) = envelope.event else { return false }
             return payload.agent == rawChildID || payload.agent == unknownChildID
         })
+        XCTAssertTrue(events.contains { envelope in
+            guard case .toolResult(let payload) = envelope.event,
+                  payload.toolCallId == "spawn-raw-model" else { return false }
+            return payload.observation.contains("unknown field(s): model")
+        })
         let denials = events.compactMap { envelope -> PermissionResolvedPayload? in
             guard case .permissionResolved(let payload) = envelope.event,
                   payload.tool == "spawn_agent" else { return nil }
             return payload
         }
-        XCTAssertEqual(denials.count, 2)
+        XCTAssertEqual(denials.count, 1)
         XCTAssertTrue(denials.allSatisfy { $0.decision == .deny })
         XCTAssertTrue(denials.allSatisfy { $0.source == .authorizationRevalidation })
         XCTAssertTrue(denials.allSatisfy { $0.failureKind == .authorizationSnapshotInvalid })
@@ -1264,12 +1261,7 @@ final class PerAgentInferenceProfileTests: XCTestCase {
         await gate.release(.allow)
         let result = await sendTask.value
 
-        guard case .failed(let failure) = result else {
-            return XCTFail("catalog mutation after review snapshot must fail the invocation")
-        }
-        XCTAssertTrue(
-            failure.contains("required side effects remain denied or failed"),
-            "unexpected failure: \(failure)")
+        XCTAssertEqual(result, .sent)
         let agents = await orchestrator.agentList()
         XCTAssertEqual(agents.map(\.name), [main])
         XCTAssertEqual(agents.first?.agentInferenceBinding, parentBinding)
@@ -1351,12 +1343,7 @@ final class PerAgentInferenceProfileTests: XCTestCase {
         await resolutionGate.release()
         let result = await sendTask.value
 
-        guard case .failed(let failure) = result else {
-            return XCTFail("catalog revocation during profile resolution must fail the invocation")
-        }
-        XCTAssertTrue(
-            failure.contains("required side effects remain denied or failed"),
-            "unexpected failure: \(failure)")
+        XCTAssertEqual(result, .sent)
         let agentsAfterRevocation = await orchestrator.agentList()
         XCTAssertEqual(agentsAfterRevocation.map(\.name), [main])
         let events = await environment.log.replay()
@@ -1450,9 +1437,8 @@ final class PerAgentInferenceProfileTests: XCTestCase {
             hostAuthorized: true)
         await mediatorGate.release()
 
-        guard case .failed = await sendTask.value else {
-            return XCTFail("catalog mutation after review must fail the delegation")
-        }
+        let sendResult = await sendTask.value
+        XCTAssertEqual(sendResult, .sent)
         let liveWorker = await orchestrator.agentList().first { $0.name == worker }
         XCTAssertEqual(liveWorker?.agentInferenceBinding, workerBinding)
         XCTAssertTrue(workerProvider.requests.isEmpty)
@@ -1511,11 +1497,10 @@ final class PerAgentInferenceProfileTests: XCTestCase {
             coordinationDepth: Agent.defaultCoordinationDepth))
         XCTAssertTrue(mainAttached)
 
-        guard case .failed = await orchestrator.send(
+        let sendResult = await orchestrator.send(
             "Do not create a worker implicitly.",
-            to: main) else {
-            return XCTFail("delegation without an attached worker must fail")
-        }
+            to: main)
+        XCTAssertEqual(sendResult, .sent)
         let remainingAgents = await orchestrator.agentNames()
         XCTAssertEqual(remainingAgents, [main])
         let events = await environment.log.replay()

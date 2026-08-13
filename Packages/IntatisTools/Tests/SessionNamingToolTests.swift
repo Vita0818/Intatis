@@ -66,7 +66,7 @@ final class SessionNamingToolTests: XCTestCase {
         XCTAssertEqual(intent.dataEffects, [.none])
         XCTAssertEqual(intent.controlEffects, [])
         XCTAssertEqual(intent.risks, [.controlPlaneMutation])
-        XCTAssertEqual(intent.replayPolicy, .requiresManualReconciliation)
+        XCTAssertEqual(intent.replayPolicy, .doNotReplay)
 
         let preview = try XCTUnwrap(tool.permissionActionPreview(args))
         XCTAssertEqual(preview.kind, "rename_session")

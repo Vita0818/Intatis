@@ -1396,10 +1396,10 @@ public struct AgentModelHistoryProjector: Sendable {
     }
 
     /// `turn_outcome` is the authoritative terminal for a model turn. Older
-    /// AgentLoop builds could append a final assistant item before discovering
-    /// unresolved Cowork side effects and then write a failed outcome. Keep
-    /// the real user/tool transcript, but never feed that invalidated final
-    /// answer into a later provider request.
+    /// AgentLoop builds could append a final assistant item before a later
+    /// runtime failure wrote a failed outcome. Keep the real user/tool
+    /// transcript, but never feed that invalidated final answer into a later
+    /// provider request.
     private static func terminalOutcomesByTurn(
         events: [Envelope]
     ) throws -> [TurnID: TurnOutcomePayload] {

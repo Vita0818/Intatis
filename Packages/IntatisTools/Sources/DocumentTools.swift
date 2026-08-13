@@ -138,7 +138,7 @@ private enum DocumentToolSupport {
         paths: [String],
         operation: String,
         format: DocumentFormat,
-        replayPolicy: ToolExecutionReplayPolicy = .requiresManualReconciliation
+        replayPolicy: ToolExecutionReplayPolicy = .doNotReplay
     ) -> PermissionIntent {
         PermissionIntent(
             action: action,
@@ -179,7 +179,7 @@ private enum DocumentToolSupport {
             ],
             dataEffects: [.read, .execute, .mutate],
             risks: [.processExecution, .workspaceMutation],
-            replayPolicy: .requiresManualReconciliation)
+            replayPolicy: .doNotReplay)
     }
 
     struct FrozenAuxiliaryInputs: Sendable {
