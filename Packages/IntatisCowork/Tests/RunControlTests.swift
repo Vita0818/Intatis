@@ -334,7 +334,7 @@ final class RunControlTests: XCTestCase {
             return payload
         }
         let claim = try XCTUnwrap(claims.first)
-        XCTAssertEqual(claim.requestedOutcome, .cancelled)
+        XCTAssertEqual(claim.requestedOutcome, .interrupted)
         XCTAssertEqual(claim.source, .hostLifecycle)
     }
 

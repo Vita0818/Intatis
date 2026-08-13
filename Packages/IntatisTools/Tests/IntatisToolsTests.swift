@@ -3936,7 +3936,7 @@ final class IntatisToolsTests: XCTestCase {
 
     func testStandardRegistry() {
         let reg = ToolRegistry.standard()
-        XCTAssertEqual(reg.registryVersion, "intatis.standard.v3")
+        XCTAssertEqual(reg.registryVersion, "intatis.standard.v4")
         XCTAssertEqual(reg.descriptors().count, 66)
         XCTAssertNotNil(reg.tool(named: "read_file"))
         XCTAssertNotNil(reg.tool(named: "apply_patch"))

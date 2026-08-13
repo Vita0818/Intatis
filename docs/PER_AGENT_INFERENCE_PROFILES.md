@@ -147,7 +147,7 @@ Catalog 编译阶段采用浅覆盖，顺序固定为：
 
 委派给已有 agent 时不复制或改写目标 agent 的 binding。权限目标包含目标 agent 当前 exact binding、host-approved catalog snapshot 与 agent/lease fingerprint 的安全快照。执行器取得同一 target reservation 后，host rebind 必须把它视为 busy fence；即使 Mediator 或 exact resolver 发生异步等待，也必须在最终 admission lock 内再次复核 authorization、caller leases、catalog、target binding/model/workspace/fingerprint，且生成的 `TaskContract` binding 必须等于 reviewed binding，之后才可持久化/入队。任一变化都 fail closed 且不产生 worker provider request。
 
-`create_proposed` 委派也不能在 allow 后丢掉原授权再调用通用 spawn。相同 authorization 必须贯穿 spawn resolver 前后与最终 task admission；新 worker 只接受 reviewed inherited binding，并以 materialized target fingerprint/owner 复核。若后续 mediation/admission 失败，本次新建 worker 要回滚，不能留下可被其他调用接管的半授权 agent。
+`delegate_task` 不创建或 proposed 新 worker。显式 target 与 automatic target 都必须解析为已经 attached 的 data-plane agent；automatic 只在现有 idle workers 中选择。需要新 worker 时，coordinator 必须先单独调用 `spawn_agent`，等待成功 ToolResult 后再在后续 tool-call round 委派。
 
 ### 6.4 Rebind
 

@@ -225,68 +225,6 @@ private actor PerAgentDelegationMediatorGate: ForwardingReviewer {
     }
 }
 
-private actor PerAgentNthTargetResolutionGate {
-    private let target: AgentID
-    private let suspendedResolution: Int
-    private let mainProvider: ToolCallingProvider
-    private let targetProvider: ToolCallingProvider
-    private var targetResolutionCount = 0
-    private var entered = false
-    private var released = false
-    private var enteredWaiters: [CheckedContinuation<Void, Never>] = []
-    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
-
-    init(
-        target: AgentID,
-        suspendedResolution: Int,
-        mainProvider: ToolCallingProvider,
-        targetProvider: ToolCallingProvider
-    ) {
-        self.target = target
-        self.suspendedResolution = suspendedResolution
-        self.mainProvider = mainProvider
-        self.targetProvider = targetProvider
-    }
-
-    func resolve(_ agent: Agent) async throws -> ResolvedInferenceProfile {
-        guard let binding = agent.agentInferenceBinding else {
-            throw InferenceCatalogError.unresolvedProfile
-        }
-        if agent.name == target {
-            targetResolutionCount += 1
-            if targetResolutionCount == suspendedResolution {
-                entered = true
-                let waiters = enteredWaiters
-                enteredWaiters.removeAll()
-                for waiter in waiters { waiter.resume() }
-                if !released {
-                    await withCheckedContinuation { continuation in
-                        releaseWaiters.append(continuation)
-                    }
-                }
-            }
-        }
-        return ResolvedInferenceProfile(
-            binding: binding,
-            model: binding.modelID,
-            provider: agent.name == target ? targetProvider : mainProvider)
-    }
-
-    func waitUntilEntered() async {
-        if entered { return }
-        await withCheckedContinuation { continuation in
-            enteredWaiters.append(continuation)
-        }
-    }
-
-    func release() {
-        released = true
-        let waiters = releaseWaiters
-        releaseWaiters.removeAll()
-        for waiter in waiters { waiter.resume() }
-    }
-}
-
 private actor PerAgentMutableInferenceResolver {
     private let provider: ToolCallingProvider
     private var isAvailable = true
@@ -1531,92 +1469,69 @@ final class PerAgentInferenceProfileTests: XCTestCase {
         })
     }
 
-    func testCreateProposedDelegationRevalidatesAuthorizationAfterSuspendedSpawnResolution() async throws {
-        let environment = try PerAgentProfileEnvironment("delegate-proposed-route-race")
+    func testAutomaticDelegationDoesNotProposeWorkerWhenNoneIsAttached() async throws {
+        let environment = try PerAgentProfileEnvironment("delegate-no-attached-worker")
         defer { environment.remove() }
-        let inheritedBinding = perAgentBinding(
-            profile: "delegate-proposed-inherited",
-            connection: "delegate-proposed-route",
-            model: "delegate-proposed-model",
+        let mainBinding = perAgentBinding(
+            profile: "delegate-main-only",
+            connection: "delegate-main-route",
+            model: "delegate-main-model",
             variant: "medium")
-        let proposedWorker = AgentID(rawValue: "worker-1")
-        let objective = "Create one worker only while its reviewed route remains approved."
         let mainProvider = PerAgentSpawnScriptedProvider([
             [.toolCalls([ToolCall(
-                id: "delegate-proposed-route-race",
+                id: "delegate-without-attached-worker",
                 name: "delegate_task",
                 arguments: try spawnArguments([
-                    "objective": objective,
+                    "objective": "Use only a worker that is already attached.",
                 ]))]), .done(finishReason: "tool_calls")],
-            [.textDelta("proposed route mutation rejected"), .done(finishReason: "stop")],
+            [.textDelta("no worker was admitted"), .done(finishReason: "stop")],
         ])
-        let workerProvider = PerAgentProfileProvider()
-        let resolutionGate = PerAgentNthTargetResolutionGate(
-            target: proposedWorker,
-            // AgentLoop exact-resolves before review, after review, and after
-            // durable prepare. The fourth resolution is the executor's
-            // create_proposed spawn boundary that must retain the same auth.
-            suspendedResolution: 4,
-            mainProvider: mainProvider,
-            targetProvider: workerProvider)
         let orchestrator = Orchestrator(
             log: environment.log,
             allowsShell: false,
             responder: FixedResponder(.allow),
-            availableInferenceProfiles: [inheritedBinding],
+            availableInferenceProfiles: [mainBinding],
             requiresInferenceBindings: true,
             resolvedInferenceFor: { agent in
-                try await resolutionGate.resolve(agent)
+                guard let binding = agent.agentInferenceBinding else {
+                    throw InferenceCatalogError.unresolvedProfile
+                }
+                return ResolvedInferenceProfile(
+                    binding: binding,
+                    model: binding.modelID,
+                    provider: mainProvider)
             },
-            providerFor: { agent in
-                if agent.name == proposedWorker { return workerProvider }
-                return mainProvider
-            })
+            providerFor: { _ in mainProvider })
         let mainAttached = await orchestrator.attach(Agent(
             name: main,
             workspaceRoot: environment.mainWorkspace,
-            model: inheritedBinding.modelID,
-            agentInferenceBinding: inheritedBinding,
+            model: mainBinding.modelID,
+            agentInferenceBinding: mainBinding,
             profile: .reviewed,
             coordinationDepth: Agent.defaultCoordinationDepth))
         XCTAssertTrue(mainAttached)
 
-        let sendTask = Task {
-            await orchestrator.send("Create an exact-bound worker.", to: self.main)
-        }
-        await resolutionGate.waitUntilEntered()
-        let eventsBeforeMutation = await environment.log.replay()
-        XCTAssertTrue(eventsBeforeMutation.contains { envelope in
-            guard case .toolExecutionPrepared(let payload) = envelope.event else { return false }
-            return payload.tool == "delegate_task"
-        })
-        await orchestrator.updateAvailableInferenceProfiles([], hostAuthorized: true)
-        await resolutionGate.release()
-
-        guard case .failed = await sendTask.value else {
-            return XCTFail("catalog mutation during authorized spawn resolution must fail closed")
+        guard case .failed = await orchestrator.send(
+            "Do not create a worker implicitly.",
+            to: main) else {
+            return XCTFail("delegation without an attached worker must fail")
         }
         let remainingAgents = await orchestrator.agentNames()
-        XCTAssertFalse(remainingAgents.contains(proposedWorker))
-        XCTAssertTrue(workerProvider.requests.isEmpty)
+        XCTAssertEqual(remainingAgents, [main])
         let events = await environment.log.replay()
         XCTAssertFalse(events.contains { envelope in
-            guard case .agentSpawnRequested(let payload) = envelope.event else { return false }
-            return payload.agent == proposedWorker
+            switch envelope.event {
+            case .agentSpawnRequested, .agentSpawned, .delegationApproved, .taskDelegated:
+                return true
+            default:
+                return false
+            }
         })
         XCTAssertFalse(events.contains { envelope in
-            guard case .taskCreated(let payload) = envelope.event else { return false }
-            return payload.contract.assignee == proposedWorker
-        })
-        let reviewedAuthorization = try XCTUnwrap(events.compactMap { envelope -> ResolvedToolAuthorization? in
             guard case .permissionRequest(let payload) = envelope.event,
-                  payload.tool == "delegate_task" else { return nil }
-            return payload.context?.authorization
-        }.last)
-        XCTAssertEqual(reviewedAuthorization.targetAgentInferenceBinding, inheritedBinding)
-        XCTAssertEqual(
-            reviewedAuthorization.intent.metadata["targetResolution"],
-            .string("create_proposed"))
+                  payload.tool == "delegate_task" else { return false }
+            return true
+        })
     }
 
     func testHostRebindRejectsBusyAgentAndOnlyFutureTasksUseDurableBinding() async throws {

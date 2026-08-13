@@ -31,6 +31,14 @@ private final class LeaseCapturingProvider: ToolCallingProvider, @unchecked Send
     }
 }
 
+private struct LeaseHostedWebSearchService:
+    HostedWebSearchToolService
+{
+    func search(query: String) async throws -> ToolObservation {
+        ToolObservation(text: "hosted: \(query)")
+    }
+}
+
 private final class LeaseKnowledgeCallingProvider: ToolCallingProvider, @unchecked Sendable {
     private let lock = NSLock()
     private var capturedRequests: [AgentRequest] = []
@@ -282,6 +290,39 @@ final class ToolRegistryLeaseTests: XCTestCase {
             agentID: Orchestrator.mainAgentID)
         XCTAssertNil(capabilityOnly.tool(named: "search_knowledge"))
         XCTAssertNil(capabilityOnly.registration(named: "search_knowledge"))
+    }
+
+    func testHostedSearchRequiresSeparateLeaseCapabilityAndBoundService() {
+        let service = LeaseHostedWebSearchService()
+        let hostedOnly = Orchestrator.toolRegistry(
+            for: CapabilityLease(tools: [.hostedWebSearch]),
+            hostedWebSearch: service)
+
+        XCTAssertEqual(hostedOnly.registryVersion, "intatis.cowork.v4")
+        XCTAssertEqual(
+            hostedOnly.descriptors().map(\.name),
+            ["hosted_web_search"])
+        XCTAssertEqual(
+            hostedOnly.registration(named: "hosted_web_search")?
+                .grantingCapabilities,
+            [.hostedWebSearch])
+        XCTAssertNil(hostedOnly.tool(named: "browser_search"))
+        XCTAssertNil(hostedOnly.tool(named: "web_fetch"))
+
+        let browserOnly = Orchestrator.toolRegistry(
+            for: CapabilityLease(tools: [.browseWeb]),
+            hostedWebSearch: service)
+        XCTAssertNil(browserOnly.tool(named: "hosted_web_search"))
+        XCTAssertNotNil(browserOnly.tool(named: "browser_search"))
+
+        let unbound = Orchestrator.toolRegistry(
+            for: CapabilityLease(tools: [.hostedWebSearch]))
+        XCTAssertNil(unbound.tool(named: "hosted_web_search"))
+
+        let readOnlyWorker = Orchestrator.toolRegistry(
+            for: .worker(workspaceAccess: .readOnly),
+            hostedWebSearch: service)
+        XCTAssertNil(readOnlyWorker.tool(named: "hosted_web_search"))
     }
 
     func testOptInCoworkAugmenterAddsExactDurableCapabilityAndDrainsAfterRun() async throws {
@@ -911,8 +952,8 @@ final class ToolRegistryLeaseTests: XCTestCase {
         XCTAssertEqual(patchAuthorization.canonicalPermission, "filesystem.edit")
         XCTAssertEqual(writeAuthorization.actionPreview?.fields["content"], "a")
         XCTAssertTrue(patchAuthorization.actionPreview?.fields["diff"]?.contains("Add File: b.txt") == true)
-        XCTAssertEqual(writeAuthorization.concreteToolID, "intatis.cowork.v3/write_file")
-        XCTAssertEqual(patchAuthorization.concreteToolID, "intatis.cowork.v3/apply_patch")
+        XCTAssertEqual(writeAuthorization.concreteToolID, "intatis.cowork.v4/write_file")
+        XCTAssertEqual(patchAuthorization.concreteToolID, "intatis.cowork.v4/apply_patch")
         XCTAssertNotEqual(writeAuthorization.concreteToolID, patchAuthorization.concreteToolID)
         XCTAssertFalse(writeAuthorization.descriptorFingerprint.isEmpty)
         XCTAssertFalse(patchAuthorization.descriptorFingerprint.isEmpty)
@@ -934,7 +975,7 @@ final class ToolRegistryLeaseTests: XCTestCase {
         let registry = Orchestrator.toolRegistry(
             for: CapabilityLease(tools: Set(expected.map { $0.0 })))
 
-        XCTAssertEqual(registry.registryVersion, "intatis.cowork.v3")
+        XCTAssertEqual(registry.registryVersion, "intatis.cowork.v4")
         XCTAssertEqual(Set(registry.descriptors().map(\.name)), Set(expected.map { $0.1 }))
         for (capability, name) in expected {
             XCTAssertEqual(
@@ -1116,7 +1157,7 @@ final class ToolRegistryLeaseTests: XCTestCase {
                 }
             }
 
-        let wrongConcreteTool = try replacing("concreteToolID", with: "intatis.cowork.v3/other")
+        let wrongConcreteTool = try replacing("concreteToolID", with: "intatis.cowork.v4/other")
         XCTAssertThrowsError(try registry.validateAuthorizationSnapshot(
             wrongConcreteTool,
             toolName: "write_file",
@@ -1349,7 +1390,7 @@ final class ToolRegistryLeaseTests: XCTestCase {
         let registry = Orchestrator.toolRegistry(for: .worker(taskID: TaskID(rawValue: "task_worker")))
         let toolNames = Set(registry.descriptors().map(\.name))
 
-        XCTAssertEqual(registry.registryVersion, "intatis.cowork.v3")
+        XCTAssertEqual(registry.registryVersion, "intatis.cowork.v4")
         XCTAssertTrue(toolNames.contains("read_file"))
         XCTAssertTrue(toolNames.contains("read_pdf"))
         XCTAssertTrue(toolNames.contains("list_files"))
@@ -1426,7 +1467,7 @@ final class ToolRegistryLeaseTests: XCTestCase {
         XCTAssertFalse(toolNames.contains("update_goal"))
     }
 
-    func testWorkerTaskUpdateSchemaExposesOnlyOwnedProgressAndSettlementFields() throws {
+    func testWorkerTaskUpdateSchemaExposesOnlyBoundProgressAndSettlementFields() throws {
         let workerRegistry = Orchestrator.toolRegistry(
             for: .worker(taskID: TaskID(rawValue: "task_worker")))
         let workerRegistration = try XCTUnwrap(
@@ -1438,10 +1479,10 @@ final class ToolRegistryLeaseTests: XCTestCase {
         let workerProperties = try XCTUnwrap(
             workerSchema["properties"] as? [String: Any])
 
-        XCTAssertEqual(workerRegistry.registryVersion, "intatis.cowork.v3")
+        XCTAssertEqual(workerRegistry.registryVersion, "intatis.cowork.v4")
         XCTAssertEqual(
             workerRegistration.grantingCapabilities,
-            [.updateOwnedWorkTask])
+            [.updateBoundWorkTask])
         XCTAssertEqual(
             Set(workerProperties.keys),
             Set([
@@ -1481,9 +1522,9 @@ final class ToolRegistryLeaseTests: XCTestCase {
             Set(managerProperties.keys),
             Set([
                 "task_id", "expected_revision", "title", "description",
-                "acceptance_criteria", "expected_artifacts", "owner",
-                "depends_on", "priority", "progress_note", "status",
-                "result", "evidence", "retry",
+                "acceptance_criteria", "expected_artifacts", "depends_on",
+                "priority", "progress_note", "status", "result",
+                "evidence", "retry",
             ]))
     }
 

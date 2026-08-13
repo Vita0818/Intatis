@@ -76,7 +76,6 @@ private actor RuntimeCancellationRecorder {
 
 private actor RuntimeGoalHookRecorder {
     enum Event: Equatable, Sendable {
-        case carryForward(GoalID, ContinuationRunID)
         case send(GoalID, ContinuationRunID)
         case wait(GoalID, ContinuationRunID?)
         case consumeUsageLimit(GoalID, ContinuationRunID)
@@ -276,64 +275,18 @@ private func waitForRuntimeProjection(
     throw GoalRuntimeTestFailure.timedOut(label)
 }
 
-private func appendCompletedRuntimeWorkTask(
+private func appendCompletedRuntimeValidationEvidence(
     log: EventLog,
     goalID: GoalID,
     runID: ContinuationRunID
 ) async -> Bool {
-    let evidence = TaskEvidence(
-        kind: "test",
-        reference: "test://pass",
-        summary: "Focused verification passed.")
     let invocationID = TaskID.new()
-    var graph = WorkTaskGraph()
-    let initial = WorkTask(
-        runID: runID,
-        goalID: goalID,
-        title: "Verify feature",
-        description: "Run focused verification",
-        acceptanceCriteria: ["Tests pass"],
-        expectedArtifacts: ["Tests"],
-        status: .ready)
-    let admitted: WorkTask
-    switch graph.add(initial) {
-    case .success(let value): admitted = value
-    case .failure: return false
-    }
-    let started: WorkTask
-    switch graph.transition(
-        taskID: admitted.id,
-        to: .inProgress,
-        expectedRevision: admitted.revision,
-        owner: Orchestrator.mainAgentID) {
-    case .success(let value): started = value
-    case .failure: return false
-    }
-    let linked: WorkTask
-    switch graph.linkInvocation(
-        taskID: started.id,
-        invocationID: invocationID,
-        expectedRevision: started.revision) {
-    case .success(let value): linked = value
-    case .failure: return false
-    }
-    let completed: WorkTask
-    switch graph.transition(
-        taskID: linked.id,
-        to: .completed,
-        expectedRevision: linked.revision,
-        result: "Focused verification passed",
-        evidence: [evidence]) {
-    case .success(let value): completed = value
-    case .failure: return false
-    }
     do {
         let contract = TaskContract(
             id: invocationID,
             kind: .root,
             issuer: nil,
             assignee: Orchestrator.mainAgentID,
-            workTaskID: completed.id,
             continuationRunID: runID,
             goalID: goalID,
             objective: "Run focused verification",
@@ -356,12 +309,6 @@ private func appendCompletedRuntimeWorkTask(
             tool: "git_status",
             sideEffect: .readOnly)
         try await log.append([
-            .workTaskCreated(WorkTaskCreatedPayload(task: admitted)),
-            .workTaskStarted(WorkTaskStartedPayload(task: started)),
-            .workTaskInvocationLinked(WorkTaskInvocationLinkedPayload(
-                task: linked,
-                invocationID: invocationID)),
-            .workTaskCompleted(WorkTaskCompletedPayload(task: completed)),
             .taskCreated(TaskCreatedPayload(contract: contract, metadata: metadata)),
             .taskAssigned(TaskAssignedPayload(contract: contract, metadata: metadata)),
             .taskQueued(TaskQueuedPayload(
@@ -520,7 +467,7 @@ final class GoalRuntimeControllerTests: XCTestCase {
         await controller.shutdown()
     }
 
-    func testPausedInterruptedRunIsCancelledAndRecoveredWithoutExecuting() async throws {
+    func testPausedInterruptedRunBecomesInterruptedWithoutExecuting() async throws {
         let log = try runtimeLog("paused-interrupted-recovery")
         let sessionID = await log.sessionID
         let activeGoal = Goal(sessionID: sessionID, objective: "Remain paused after restart")
@@ -536,8 +483,6 @@ final class GoalRuntimeControllerTests: XCTestCase {
             .goalCreated(GoalCreatedPayload(goal: activeGoal)),
             .continuationRunCreated(ContinuationRunCreatedPayload(run: createdRun)),
             .continuationRunStarted(ContinuationRunStartedPayload(run: runningRun)),
-            // Legacy crash window: paused was durable before the run reached a
-            // safe checkpoint.
             .goalPaused(GoalPausedPayload(goal: pausedGoal)),
         ])
 
@@ -567,7 +512,7 @@ final class GoalRuntimeControllerTests: XCTestCase {
 
         let projection = CoworkProjection.build(from: await log.replay())
         XCTAssertEqual(projection.goals[activeGoal.id]?.status, .paused)
-        XCTAssertEqual(projection.continuationRuns[createdRun.id]?.status, .checkpointed)
+        XCTAssertEqual(projection.continuationRuns[createdRun.id]?.status, .interrupted)
         let cancellationCallCount = await cancellationCalls.value()
         let sendCallCount = await sendCalls.value()
         XCTAssertEqual(cancellationCallCount, 1)
@@ -719,44 +664,6 @@ final class GoalRuntimeControllerTests: XCTestCase {
         await controller.shutdown()
     }
 
-    func testPauseDuringCarryForwardCannotAdmitRootInvocation() async throws {
-        let log = try runtimeLog("pause-before-root-admission")
-        let sessionID = await log.sessionID
-        let carryForwardBarrier = RuntimeAsyncBarrier()
-        let sendCalls = RuntimeCallCounter()
-        let verifier = RuntimeVerifierProvider([
-            continuingRuntimeAudit(objective: "Pause before admission"),
-        ])
-        let controller = GoalRuntimeController(
-            sessionID: sessionID,
-            log: log,
-            verifierProvider: { verifier },
-            verifierModel: { ModelID(rawValue: "verifier") },
-            sendOperation: { _, _, _, _, _, _, _, _ in
-                await sendCalls.increment()
-                return .sent
-            },
-            carryForwardWorkTasks: { _, _ in
-                await carryForwardBarrier.wait()
-                return []
-            })
-
-        let goal = try await controller.createGoal(objective: "Pause before admission")
-        await carryForwardBarrier.waitUntilEntered()
-        let pauseTask = Task { try await controller.pauseCurrentGoal() }
-        try await Task.sleep(nanoseconds: 20_000_000)
-        await carryForwardBarrier.release()
-        let paused = try await pauseTask.value
-
-        XCTAssertEqual(paused.status, .paused)
-        let sendCallCount = await sendCalls.value()
-        XCTAssertEqual(sendCallCount, 0)
-        let projection = CoworkProjection.build(from: await log.replay())
-        XCTAssertEqual(projection.goals[goal.id]?.status, .paused)
-        XCTAssertEqual(projection.continuationRuns.values.filter {
-            $0.goalID == goal.id && $0.status == .checkpointed
-        }.count, 1)
-    }
 
     func testPauseRacingDurableRootAdmissionCancelsBeforeProviderExecution() async throws {
         let log = try runtimeLog("pause-during-root-admission")
@@ -1343,18 +1250,18 @@ final class GoalRuntimeControllerTests: XCTestCase {
 
         let afterRelease = await log.replay()
         let afterProjection = CoworkProjection.build(from: afterRelease)
-        XCTAssertEqual(afterProjection.continuationRuns[createdRun.id]?.status, .completed)
+        XCTAssertEqual(afterProjection.continuationRuns[createdRun.id]?.status, .interrupted)
         XCTAssertEqual(afterProjection.goals[goal.id]?.status, .paused)
         XCTAssertEqual(afterProjection.continuationRuns.count, 1)
         XCTAssertEqual(verifier.callCount(), 0)
         XCTAssertTrue(afterRelease.contains { envelope in
-            guard case .continuationRunRecovered(let payload) = envelope.event else { return false }
+            guard case .continuationRunInterrupted(let payload) = envelope.event else { return false }
             return payload.run.id == createdRun.id
                 && payload.run.progressSummary == "Recovered after runtime interruption"
         })
-        XCTAssertTrue(afterRelease.contains { envelope in
-            guard case .goalAuditCompleted(let payload) = envelope.event else { return false }
-            return payload.runID == createdRun.id
+        XCTAssertFalse(afterRelease.contains { envelope in
+            if case .goalAuditCompleted = envelope.event { return true }
+            return false
         })
         await controller.shutdown()
     }
@@ -1416,7 +1323,7 @@ final class GoalRuntimeControllerTests: XCTestCase {
         await controller.shutdown()
     }
 
-    func testEachNewGoalRunCarriesTasksBeforeSendAndUsesMatchingScopedBarrier() async throws {
+    func testEachNewGoalRunUsesMatchingScopedBarrier() async throws {
         let log = try runtimeLog("run-hook-order")
         let sessionID = await log.sessionID
         let hookRecorder = RuntimeGoalHookRecorder()
@@ -1437,10 +1344,6 @@ final class GoalRuntimeControllerTests: XCTestCase {
             },
             waitForGoalSchedulerIdle: { goalID, runID in
                 await hookRecorder.record(.wait(goalID, runID))
-            },
-            carryForwardWorkTasks: { goalID, runID in
-                await hookRecorder.record(.carryForward(goalID, runID))
-                return []
             })
 
         let created = try await controller.createGoal(
@@ -1457,7 +1360,6 @@ final class GoalRuntimeControllerTests: XCTestCase {
 
         let expectedEvents: [RuntimeGoalHookRecorder.Event] = runs.flatMap { run in
             [
-                .carryForward(created.id, run.id),
                 .send(created.id, run.id),
                 .wait(created.id, run.id),
             ]
@@ -1837,7 +1739,7 @@ final class GoalRuntimeControllerTests: XCTestCase {
                     recordUserMessage: recordUserMessage,
                     explicitGoalIntent: explicitGoalIntent)
                 guard let goalID, let runID,
-                      await appendCompletedRuntimeWorkTask(
+                      await appendCompletedRuntimeValidationEvidence(
                         log: log,
                         goalID: goalID,
                         runID: runID) else {
@@ -1857,7 +1759,7 @@ final class GoalRuntimeControllerTests: XCTestCase {
         let completed = try XCTUnwrap(projection.goals[created.id])
         XCTAssertTrue(completed.latestAudit?.isCompletionProof == true)
         XCTAssertEqual(projection.continuationRuns.values.filter { $0.goalID == created.id }.count, 1)
-        XCTAssertTrue(projection.workTasks.values.allSatisfy { $0.status == .completed })
+        XCTAssertTrue(projection.workTasks.isEmpty)
         let calls = await recorder.calls()
         XCTAssertEqual(calls.count, 1)
         XCTAssertEqual(calls[0].target, Orchestrator.mainAgentID)
@@ -2319,7 +2221,7 @@ final class GoalRuntimeControllerTests: XCTestCase {
         }
     }
 
-    func testRecoveryCheckpointsActiveRunButUnresolvedNonReplayableToolStopsRecovery() async throws {
+    func testRecoveryInterruptsActiveRunButUnresolvedNonReplayableToolStopsRecovery() async throws {
         let activeLog = try runtimeLog("recover-active")
         let activeSession = await activeLog.sessionID
         let activeGoal = Goal(sessionID: activeSession, objective: "Recover active Goal")
@@ -2351,15 +2253,16 @@ final class GoalRuntimeControllerTests: XCTestCase {
             })
         let activeStartupSafe = await activeController.start()
         XCTAssertTrue(activeStartupSafe)
-        let recoveredProjection = try await waitForRuntimeProjection(
+        let interruptedProjection = try await waitForRuntimeProjection(
             activeLog,
             label: "active recovery") {
-                $0.continuationRuns[createdRun.id]?.status == .completed
+                $0.continuationRuns[createdRun.id]?.status == .interrupted
                     && $0.goals[activeGoal.id]?.status == .paused
             }
-        XCTAssertTrue(recoveredProjection.continuationRuns[createdRun.id]?.progressSummary?
-            .contains("Recovered checkpoint had no durable Goal audit") == true)
-        XCTAssertEqual(recoveredProjection.continuationRuns.count, 1)
+        XCTAssertEqual(
+            interruptedProjection.continuationRuns[createdRun.id]?.progressSummary,
+            "Recovered after runtime interruption")
+        XCTAssertEqual(interruptedProjection.continuationRuns.count, 1)
         XCTAssertEqual(activeVerifier.callCount(), 0)
 
         _ = try await activeController.resumeCurrentGoal()
@@ -2417,7 +2320,7 @@ final class GoalRuntimeControllerTests: XCTestCase {
         XCTAssertFalse(unsafeStartupSafe)
         try await Task.sleep(nanoseconds: 100_000_000)
         let unsafeProjection = CoworkProjection.build(from: await unsafeLog.replay())
-        XCTAssertEqual(unsafeProjection.continuationRuns[unsafeCreatedRun.id]?.status, .running)
+        XCTAssertEqual(unsafeProjection.continuationRuns[unsafeCreatedRun.id]?.status, .interrupted)
         XCTAssertEqual(unsafeProjection.continuationRuns.count, 1)
         XCTAssertTrue(unsafeProjection.unresolvedNonReplayableToolExecutions.count == 1)
         let unsafeCalls = await unsafeRecorder.calls()

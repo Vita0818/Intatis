@@ -571,6 +571,12 @@ func runExecCommand(
                 .agentRuntimeRoute(
                     model: ModelID(
                         rawValue: config.model))
+        let hostedWebSearch = live.capabilityLease.tools.contains(
+            .hostedWebSearch)
+            ? route.hostedWebSearch.map {
+                ProviderHostedWebSearchToolService(route: $0)
+            }
+            : nil
         let skillSnapshot =
             try await SkillCatalogService.shared.snapshot(
                 configuration: .standard(
@@ -583,7 +589,8 @@ func runExecCommand(
                         .skillCatalogMetadataBudget)
         let baseRegistry = skillSnapshot.augmenting(
             ToolRegistry.standard(
-                includesTerminal: true))
+                includesTerminal: true,
+                hostedWebSearch: hostedWebSearch))
         let consent = arguments.flags
             .contains("yes")
             ? MCPCLIConsentConfirmation(

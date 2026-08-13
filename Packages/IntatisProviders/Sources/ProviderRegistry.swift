@@ -9,15 +9,34 @@ public struct ResolvedInferenceProfile: Sendable {
     public let model: ModelID
     public let provider: ToolCallingProvider
     public let modelContextPolicy: AgentModelContextPolicy
+    public let hostedWebSearch: ResolvedHostedWebSearchRoute?
 
     public init(binding: AgentInferenceBinding,
                 model: ModelID,
                 provider: ToolCallingProvider,
-                modelContextPolicy: AgentModelContextPolicy = .unspecified) {
+                modelContextPolicy: AgentModelContextPolicy = .unspecified,
+                hostedWebSearch: ResolvedHostedWebSearchRoute? = nil) {
         self.binding = binding
         self.model = model
         self.provider = provider
         self.modelContextPolicy = modelContextPolicy
+        self.hostedWebSearch = hostedWebSearch
+    }
+}
+
+/// One provider-hosted search route frozen with the exact agent model route.
+/// It is intentionally separate from browser, URL-fetch, and MCP tools.
+public struct ResolvedHostedWebSearchRoute: Sendable {
+    public let provider: ChatProvider
+    public let model: ModelID
+    public let configuration: ChatWebSearchConfiguration
+
+    public init(provider: ChatProvider,
+                model: ModelID,
+                configuration: ChatWebSearchConfiguration) {
+        self.provider = provider
+        self.model = model
+        self.configuration = configuration
     }
 }
 
@@ -29,15 +48,18 @@ public struct ResolvedAgentRuntimeRoute: Sendable {
     public let provider: ToolCallingProvider
     public let model: ModelID
     public let modelContextPolicy: AgentModelContextPolicy
+    public let hostedWebSearch: ResolvedHostedWebSearchRoute?
 
     public init(
         provider: ToolCallingProvider,
         model: ModelID,
-        modelContextPolicy: AgentModelContextPolicy
+        modelContextPolicy: AgentModelContextPolicy,
+        hostedWebSearch: ResolvedHostedWebSearchRoute? = nil
     ) {
         self.provider = provider
         self.model = model
         self.modelContextPolicy = modelContextPolicy
+        self.hostedWebSearch = hostedWebSearch
     }
 }
 
@@ -220,18 +242,10 @@ public actor ProviderRegistry {
             throw IntatisError.config("unknown endpoint '\(ref.endpoint)'")
         }
         let apiKey = try await resolver.secret(for: endpoint.apiKeyRef)
-        switch endpoint.wire {
-        case .openai:
-            return OpenAIWireProvider(
-                endpoint: endpoint,
-                apiKey: apiKey,
-                http: http,
-                runtimePolicy: .agentStreaming,
-                toolCallingCapabilities:
-                    toolCallingCapabilities(
-                        endpoint: endpoint,
-                        model: ref.model))
-        }
+        return makeAgentWireProvider(
+            endpoint: endpoint,
+            model: ref.model,
+            apiKey: apiKey)
     }
 
     /// Resolves an exact immutable profile revision. No current/default profile
@@ -307,13 +321,28 @@ public actor ProviderRegistry {
                     provider: resolved.provider,
                     model: resolved.model,
                     modelContextPolicy:
-                        resolved.modelContextPolicy)
+                        resolved.modelContextPolicy,
+                    hostedWebSearch:
+                        resolved.hostedWebSearch)
             }
         }
-        return ResolvedAgentRuntimeRoute(
-            provider: try await agentProvider(for: legacyRef),
+        guard let endpoint = config.endpoint(id: legacyRef.endpoint) else {
+            throw IntatisError.config(
+                "unknown endpoint '\(legacyRef.endpoint)'")
+        }
+        let apiKey = try await resolver.secret(for: endpoint.apiKeyRef)
+        let provider = makeAgentWireProvider(
+            endpoint: endpoint,
             model: legacyRef.model,
-            modelContextPolicy: .unspecified)
+            apiKey: apiKey)
+        return ResolvedAgentRuntimeRoute(
+            provider: provider,
+            model: legacyRef.model,
+            modelContextPolicy: .unspecified,
+            hostedWebSearch: hostedWebSearchRoute(
+                endpoint: endpoint,
+                model: legacyRef.model,
+                provider: provider))
     }
 
     public func agentModel() -> ModelID {
@@ -347,10 +376,29 @@ public actor ProviderRegistry {
                 profile.modelID.rawValue:
                     profile.declaredCapabilities,
             ])
-        let provider: ToolCallingProvider
-        switch connection.wire {
+        let wireProvider = makeAgentWireProvider(
+            endpoint: endpoint,
+            model: profile.modelID,
+            apiKey: apiKey)
+        return ResolvedInferenceProfile(
+            binding: resolution.binding,
+            model: profile.modelID,
+            provider: wireProvider,
+            modelContextPolicy: profile.modelContextPolicy,
+            hostedWebSearch: hostedWebSearchRoute(
+                endpoint: endpoint,
+                model: profile.modelID,
+                provider: wireProvider))
+    }
+
+    private func makeAgentWireProvider(
+        endpoint: ProviderEndpoint,
+        model: ModelID,
+        apiKey: String
+    ) -> OpenAIWireProvider {
+        switch endpoint.wire {
         case .openai:
-            provider = OpenAIWireProvider(
+            return OpenAIWireProvider(
                 endpoint: endpoint,
                 apiKey: apiKey,
                 http: http,
@@ -358,13 +406,29 @@ public actor ProviderRegistry {
                 toolCallingCapabilities:
                     toolCallingCapabilities(
                         endpoint: endpoint,
-                        model: profile.modelID))
+                        model: model))
         }
-        return ResolvedInferenceProfile(
-            binding: resolution.binding,
-            model: profile.modelID,
+    }
+
+    private func hostedWebSearchRoute(
+        endpoint: ProviderEndpoint,
+        model: ModelID,
+        provider: ChatProvider
+    ) -> ResolvedHostedWebSearchRoute? {
+        guard endpoint.capabilities(for: model)
+                .contains(.hostedWebSearch),
+              let dialect = endpoint.requestAdapter(for: model)
+                .hostedWebSearchDialect() else {
+            return nil
+        }
+        return ResolvedHostedWebSearchRoute(
             provider: provider,
-            modelContextPolicy: profile.modelContextPolicy)
+            model: model,
+            configuration: ChatWebSearchConfiguration(
+                dialect: dialect,
+                contextSize: .medium,
+                unsupportedBehavior: .failClosed,
+                toolChoice: .required))
     }
 
     private func toolCallingCapabilities(

@@ -367,7 +367,7 @@ final class DocumentToolsIntegrationTests: XCTestCase {
         XCTAssertFalse(names.contains("document_read"))
         XCTAssertFalse(names.contains("edit_pdf_pages"))
         XCTAssertFalse(names.contains("reconstruct_document_image"))
-        XCTAssertEqual(registry.registryVersion, "intatis.standard.v3")
+        XCTAssertEqual(registry.registryVersion, "intatis.standard.v4")
     }
 
     func testDescriptorsPermissionsAndTouchedPathsAreExact() throws {

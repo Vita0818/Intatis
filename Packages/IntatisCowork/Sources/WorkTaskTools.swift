@@ -34,11 +34,6 @@ private func encodeWorkTaskToolResult<T: Encodable>(_ value: T) throws -> String
     return String(decoding: try encoder.encode(value), as: UTF8.self)
 }
 
-private func normalizedWorkTaskAgentID(_ raw: String) -> AgentID {
-    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-    return AgentID(rawValue: trimmed.hasPrefix("@") ? String(trimmed.dropFirst()) : trimmed)
-}
-
 private func joinedWorkTaskPreviewValues(_ values: [String]?) -> String {
     values?.joined(separator: ", ") ?? ""
 }
@@ -78,7 +73,7 @@ public struct TaskCreateTool: Tool {
 
     public static let descriptor = ToolDescriptor(
         name: "task_create",
-        description: "Create one durable WorkTask in the current ContinuationRun. Returns the stable task_id, host-computed status, and revision. Use concise acceptance criteria and real dependencies; this is a control-plane change, not a workspace write. owner is optional; when present it must name a currently attached data-plane agent confirmed by a successful list_agents or spawn_agent ToolResult received in an earlier tool-call round. Never name a planned or future agent. When creating before spawn or delegation, omit owner; the host initially assigns the current caller and delegate_task can later transfer ownership atomically.",
+        description: "Create one durable WorkTask in the current Cowork Session. Returns the stable task_id, host-computed status, and revision. Use concise acceptance criteria and existing Session WorkTask dependencies; this is a control-plane change, not a workspace write.",
         sideEffect: .write,
         parameters: .object([
             "type": .string("object"),
@@ -91,11 +86,6 @@ public struct TaskCreateTool: Tool {
                     "type": .string("array"),
                     "items": workTaskStringSchema,
                     "description": .string("Existing durable WorkTask IDs confirmed by earlier successful task_create, task_get, or task_list results. Never reference a WorkTask that is only planned or created by another call in the same assistant response."),
-                ]),
-                "owner": .object([
-                    "type": .string("string"),
-                    "minLength": .number(1),
-                    "description": .string("Optional currently attached data-plane agent. Confirm it with a successful list_agents or spawn_agent ToolResult received in an earlier tool-call round. Never use a planned or future agent name. Omit owner when creating before spawn/delegation; the current caller becomes the initial owner."),
                 ]),
                 "priority": .object([
                     "type": .string("string"),
@@ -112,11 +102,10 @@ public struct TaskCreateTool: Tool {
         var acceptanceCriteria: [String]?
         var expectedArtifacts: [String]?
         var dependsOn: [String]?
-        var owner: String?
         var priority: WorkTaskPriority?
 
         enum CodingKeys: String, CodingKey {
-            case title, description, owner, priority
+            case title, description, priority
             case acceptanceCriteria = "acceptance_criteria"
             case expectedArtifacts = "expected_artifacts"
             case dependsOn = "depends_on"
@@ -127,10 +116,9 @@ public struct TaskCreateTool: Tool {
         let value = try? args.decode(Args.self)
         return PermissionIntent(
             action: "task.create",
-            resources: [PermissionResource(kind: .task, value: "current-run")],
+            resources: [PermissionResource(kind: .task, value: "current-session")],
             metadata: [
                 "title": value.map { .string(String($0.title.prefix(160))) } ?? .null,
-                "owner": value?.owner.map(JSONValue.string) ?? .null,
                 "dependencyCount": .number(Double(value?.dependsOn?.count ?? 0)),
             ],
             dataEffects: [.none],
@@ -148,7 +136,6 @@ public struct TaskCreateTool: Tool {
             fields: [
                 "title": value.title,
                 "description": value.description,
-                "owner": value.owner ?? "unassigned",
                 "acceptance_criteria": joinedWorkTaskPreviewValues(value.acceptanceCriteria),
                 "expected_artifacts": joinedWorkTaskPreviewValues(value.expectedArtifacts),
                 "depends_on": joinedWorkTaskPreviewValues(value.dependsOn),
@@ -167,7 +154,6 @@ public struct TaskCreateTool: Tool {
             acceptanceCriteria: value.acceptanceCriteria ?? [],
             expectedArtifacts: value.expectedArtifacts ?? [],
             dependsOn: (value.dependsOn ?? []).map { WorkTaskID(rawValue: $0) },
-            owner: value.owner.map(normalizedWorkTaskAgentID),
             priority: value.priority ?? .normal)
         return ToolObservation(text: try encodeWorkTaskToolResult(
             await manager.createWorkTask(request)))
@@ -179,7 +165,7 @@ public struct TaskUpdateTool: Tool {
 
     public static let descriptor = ToolDescriptor(
         name: "task_update",
-        description: "Patch a durable WorkTask (normally wt_…), never an AgentInvocation TaskID (task_…). Use task_get/task_list to obtain the WorkTask ID and its latest authoritative revision before updating. expected_revision is required; send only fields that must change and omit repeated contract fields. Workers may update progress/status/result/evidence on their assigned task but cannot change its contract. Do not redundantly settle an already-terminal WorkTask. Only an explicit completed update with a non-empty result, and evidence when acceptance criteria exist, settles a WorkTask. AgentInvocation completion alone never does.",
+        description: "Patch a durable WorkTask (normally wt_…), never an AgentInvocation TaskID (task_…). Use task_get/task_list to obtain the WorkTask ID and its latest authoritative revision before updating. expected_revision is required; send only fields that must change and omit repeated contract fields. Workers may update progress/status/result/evidence only on the WorkTask bound to their current invocation and cannot change its contract. Do not redundantly settle an already-terminal WorkTask. Only an explicit completed update with a non-empty result, and evidence when acceptance criteria exist, settles a WorkTask. AgentInvocation completion alone never does.",
         sideEffect: .write,
         parameters: .object([
             "type": .string("object"),
@@ -197,7 +183,6 @@ public struct TaskUpdateTool: Tool {
                 "description": workTaskStringSchema,
                 "acceptance_criteria": workTaskStringArraySchema,
                 "expected_artifacts": workTaskStringArraySchema,
-                "owner": .object(["type": .string("string")]),
                 "depends_on": workTaskStringArraySchema,
                 "priority": .object([
                     "type": .string("string"),
@@ -230,7 +215,6 @@ public struct TaskUpdateTool: Tool {
         var description: String?
         var acceptanceCriteria: [String]?
         var expectedArtifacts: [String]?
-        var owner: String?
         var dependsOn: [String]?
         var priority: WorkTaskPriority?
         var progressNote: String?
@@ -240,7 +224,7 @@ public struct TaskUpdateTool: Tool {
         var retry: Bool?
 
         enum CodingKeys: String, CodingKey {
-            case title, description, owner, priority, status, result, evidence, retry
+            case title, description, priority, status, result, evidence, retry
             case taskID = "task_id"
             case expectedRevision = "expected_revision"
             case acceptanceCriteria = "acceptance_criteria"
@@ -276,7 +260,6 @@ public struct TaskUpdateTool: Tool {
         if value.description != nil { changedFields.append("description") }
         if value.acceptanceCriteria != nil { changedFields.append("acceptance_criteria") }
         if value.expectedArtifacts != nil { changedFields.append("expected_artifacts") }
-        if value.owner != nil { changedFields.append("owner") }
         if value.dependsOn != nil { changedFields.append("depends_on") }
         if value.priority != nil { changedFields.append("priority") }
         if value.progressNote != nil { changedFields.append("progress_note") }
@@ -300,15 +283,6 @@ public struct TaskUpdateTool: Tool {
 
     static func decodeRequest(_ args: ToolArgs) throws -> WorkTaskUpdateRequest {
         let value = try args.decode(Args.self)
-        let owner: WorkTaskOwnerUpdate
-        if let rawOwner = value.owner {
-            let normalized = rawOwner.trimmingCharacters(in: .whitespacesAndNewlines)
-            owner = normalized.isEmpty || ["none", "unassigned"].contains(normalized.lowercased())
-                ? .unassigned
-                : .agent(normalizedWorkTaskAgentID(normalized))
-        } else {
-            owner = .unchanged
-        }
         return WorkTaskUpdateRequest(
             taskID: WorkTaskID(rawValue: value.taskID),
             expectedRevision: value.expectedRevision,
@@ -316,7 +290,6 @@ public struct TaskUpdateTool: Tool {
             description: value.description,
             acceptanceCriteria: value.acceptanceCriteria,
             expectedArtifacts: value.expectedArtifacts,
-            owner: owner,
             dependsOn: value.dependsOn?.map { WorkTaskID(rawValue: $0) },
             priority: value.priority,
             progressNote: value.progressNote,
@@ -345,12 +318,12 @@ public struct TaskUpdateTool: Tool {
 /// Capability-projected model surface for an ordinary worker. The stable
 /// provider-facing name is preserved, while manager-only contract and graph
 /// fields are absent from the schema and therefore fail before authorization.
-struct OwnedWorkTaskUpdateTool: Tool {
+struct BoundWorkTaskUpdateTool: Tool {
     init() {}
 
     static let descriptor = ToolDescriptor(
         name: "task_update",
-        description: "Update only the current WorkTask assigned to you. Use task_get to obtain its latest authoritative revision, then send only progress_note, a permitted status transition, result, or evidence. The host still verifies current ownership, binding, revision, and status transition. Contract fields, owner, dependencies, priority, retry, and cancellation are manager-only.",
+        description: "Update only the WorkTask bound to your current AgentInvocation. Use task_get to obtain its latest authoritative revision, then send only progress_note, a permitted status transition, result, or evidence. The host verifies the current invocation binding, revision, and status transition. Contract fields, dependencies, priority, retry, and cancellation are manager-only.",
         sideEffect: .write,
         parameters: .object([
             "type": .string("object"),
@@ -451,12 +424,11 @@ public struct TaskListTool: Tool {
 
     public static let descriptor = ToolDescriptor(
         name: "task_list",
-        description: "List the authoritative WorkTask projection in stable creation order. Use this instead of guessing state from old chat text. run_id accepts current, goal, or an explicit run_* ID; status and owner are optional filters. Goal-history access remains host-authorized.",
+        description: "List the authoritative WorkTask projection for the current Cowork Session in stable creation order. Use this instead of guessing state from old chat text. status is an optional filter.",
         sideEffect: .readOnly,
         parameters: .object([
             "type": .string("object"),
             "properties": .object([
-                "run_id": workTaskStringSchema,
                 "status": .object([
                     "type": .string("array"),
                     "items": .object([
@@ -472,27 +444,19 @@ public struct TaskListTool: Tool {
                         ]),
                     ]),
                 ]),
-                "owner": .object(["type": .string("string")]),
             ]),
             "required": .array([]),
             "additionalProperties": .bool(false),
         ]))
 
     private struct Args: Decodable {
-        var runID: String?
         var status: [WorkTaskStatus]?
-        var owner: String?
-        enum CodingKeys: String, CodingKey {
-            case status, owner
-            case runID = "run_id"
-        }
     }
 
     public func permissionIntent(_ args: ToolArgs, workspaceRoot: URL) -> PermissionIntent {
-        let value = try? args.decode(Args.self)
         return PermissionIntent(
             action: "task.list",
-            resources: [PermissionResource(kind: .task, value: value?.runID ?? "current-run")],
+            resources: [PermissionResource(kind: .task, value: "current-session")],
             dataEffects: [.read],
             replayPolicy: .safeToReplay)
     }
@@ -502,22 +466,8 @@ public struct TaskListTool: Tool {
         guard let manager = context.workTaskManager else {
             return ToolObservation(text: "WorkTask management is not available in this session")
         }
-        let normalizedRun = value.runID?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let normalizedOwner = value.owner?.trimmingCharacters(in: .whitespacesAndNewlines)
         let request = WorkTaskListRequest(
-            runID: normalizedRun.flatMap {
-                $0.isEmpty || $0.lowercased() == "current" || $0.lowercased() == "goal"
-                    ? nil
-                    : ContinuationRunID(rawValue: $0)
-            },
-            includeGoalHistory: normalizedRun?.lowercased() == "goal",
-            statuses: Set(value.status ?? []),
-            owner: normalizedOwner.flatMap {
-                $0.isEmpty || $0.lowercased() == "any" || $0.lowercased() == "unassigned"
-                    ? nil
-                    : normalizedWorkTaskAgentID($0)
-            },
-            unassignedOnly: normalizedOwner?.lowercased() == "unassigned")
+            statuses: Set(value.status ?? []))
         struct Response: Encodable { var tasks: [WorkTaskDetail] }
         return ToolObservation(text: try encodeWorkTaskToolResult(
             Response(tasks: await manager.listWorkTasks(request))))

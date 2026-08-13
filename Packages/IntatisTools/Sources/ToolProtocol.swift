@@ -403,11 +403,12 @@ public protocol AgentMessenger: Sendable {
                       inReplyTo: String) async -> String
     func requestDelegation(objective: String, reason: String) async -> String
     func delegateTask(authorization: ResolvedToolAuthorization,
+                      executionID: String,
                       to agent: String?,
                       workTaskID: WorkTaskID?,
                       objective: String?,
                       roleHint: String?,
-                      expectedDeliverable: String?) async -> String
+                      expectedDeliverable: String?) async throws -> String
 }
 
 /// Host-bound control-plane seam for the exact ContinuationRun that owns an
@@ -1734,7 +1735,10 @@ public struct ToolRegistry: Sendable {
     /// stays implemented for isolated tests/future helper processes but is not
     /// model-exposed because arbitrary commands cannot declare exact touched
     /// paths for WorkspaceLease denied-pattern enforcement.
-    public static func standard(includesTerminal: Bool = false) -> ToolRegistry {
+    public static func standard(
+        includesTerminal: Bool = false,
+        hostedWebSearch: (any HostedWebSearchToolService)? = nil
+    ) -> ToolRegistry {
         var tools: [any Tool] = [
             ReadFileTool(), ListFilesTool(), SearchTextTool(), WriteFileTool(),
             ApplyPatchTool(), GitStatusTool(), GitDiffTool(),
@@ -1762,11 +1766,19 @@ public struct ToolRegistry: Sendable {
             tools.append(ExecCommandTool())
             tools.append(WriteStdinTool())
         }
+        var registrations = tools.map { ToolRegistration(tool: $0) }
+        if let hostedWebSearch {
+            registrations.append(ToolRegistration(
+                tool: HostedWebSearchTool(service: hostedWebSearch),
+                grantingCapabilities: [.hostedWebSearch]))
+        }
         // The document surface changed incompatibly from the legacy aggregate
-        // group. Keep the replacement identity explicit so a durable
-        // authorization issued for the old catalog can never validate against
-        // this one.
-        return ToolRegistry(tools, registryVersion: "intatis.standard.v3")
+        // group, and provider-hosted search adds a distinct network tool.
+        // Keep the replacement identity explicit so a durable authorization
+        // issued for an old catalog can never validate against this one.
+        return ToolRegistry(
+            registrations: registrations,
+            registryVersion: "intatis.standard.v4")
     }
 }
 

@@ -55,13 +55,33 @@ public struct ChatWebSearchConfiguration: Equatable, Sendable {
         case low, medium, high
     }
 
+    /// Chat may preserve its transparent-search behavior by retrying one
+    /// ordinary request when an endpoint rejects the hosted-search shape.
+    /// Explicit agent tools must fail closed instead of returning an ordinary
+    /// model answer under a successful search-tool result.
+    public enum UnsupportedBehavior: Equatable, Sendable {
+        case retryOrdinaryChat
+        case failClosed
+    }
+
+    public enum ToolChoice: String, Equatable, Sendable {
+        case automatic = "auto"
+        case required
+    }
+
     public var dialect: ChatHostedWebSearchDialect
     public var contextSize: ContextSize
+    public var unsupportedBehavior: UnsupportedBehavior
+    public var toolChoice: ToolChoice
 
     public init(dialect: ChatHostedWebSearchDialect,
-                contextSize: ContextSize = .medium) {
+                contextSize: ContextSize = .medium,
+                unsupportedBehavior: UnsupportedBehavior = .retryOrdinaryChat,
+                toolChoice: ToolChoice = .automatic) {
         self.dialect = dialect
         self.contextSize = contextSize
+        self.unsupportedBehavior = unsupportedBehavior
+        self.toolChoice = toolChoice
     }
 }
 

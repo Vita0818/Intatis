@@ -1,7 +1,7 @@
-# Chat 托管网络搜索产品合同
+# Chat 与 Agent 托管网络搜索产品合同
 
 文档状态：当前产品合同与实现说明
-最近核对：2026-08-08
+最近核对：2026-08-13
 产品基线：v0.48（build 48）
 
 ## 一句话定义
@@ -63,9 +63,10 @@ OpenAI-compatible 接入点。
 | OpenRouter server tools | `openrouter:web_search` | OpenRouter adapter 与对应 stream/citation decoder 已实现，且当前 exact route 可使用该 server tool |
 | `@ai-sdk/openai-compatible`、legacy 或其他 custom adapter | 默认无托管搜索 | 只有新增并审查对应 dialect 后才可启用，不能因“OpenAI-compatible”自动继承 |
 
-上表描述的是 provider-hosted 能力，不是 Intatis Tool。现有 `Capability.toolSearch` 表示 MCP deferred
-`tool_search` 合同，不得复用为 Chat 网络搜索能力；后续实现应使用独立的
-`hosted_web_search` capability 语义，避免混淆两类工具。
+上表描述的是 Chat 的 provider-hosted 能力，不是 Chat 中的 Intatis Tool。现有
+`Capability.toolSearch` 表示 MCP deferred `tool_search` 合同，不得复用为网络搜索能力。
+Code/Cowork 另有一个显式 `hosted_web_search` Intatis Tool 包装同一类 provider-hosted wire；它与
+Chat 的透明能力、MCP `tool_search`、`browser_search`、`web_fetch` 各自独立。
 
 新增厂商或模型接入点时，必须同时提供 dialect encoder、stream/citation decoder、能力声明来源
 和请求 fixture。只增加 endpoint URL、provider 名称或 `responsesEndpoint` 不能自动获得搜索能力。
@@ -105,8 +106,8 @@ OpenAI-compatible 接入点。
 - 不为每条消息强制执行网络搜索。
 - 不在不支持时显示提示、警告或搜索错误。
 - 不使用 `web_search_model` 切换隐藏模型或执行 fallback。
-- 不注册通用 Intatis 搜索工具，也不调用 `web_fetch`、`browser_search`、本地浏览器、shell、MCP
-  或第三方搜索后端作为 Chat fallback。
+- Chat 不注册或调用 Intatis 搜索工具，也不调用 `hosted_web_search`、`web_fetch`、
+  `browser_search`、本地浏览器、shell、MCP 或第三方搜索后端作为 fallback。
 - 不按关键词预分类是否搜索，不选择“相似”模型，不从 URL 或名称猜测支持情况。
 - 不为了规避 provider 路由错误而放松用户的严格 routing options。
 - 不实现任何两模型搜索编排。
@@ -114,7 +115,28 @@ OpenAI-compatible 接入点。
 因此，macOS/iOS Chat 仍是无 Intatis Tools、无 PermissionEngine 的产品面；托管搜索只是在当前
 exact provider wire 上向当前模型提供的一项可选能力。
 
-## 当前实现（2026-08-05）
+## Code/Cowork 的显式工具边界
+
+- `hosted_web_search` 是普通 Agent Tool，schema 只有 required string `query`，`strict:true` 且
+  `additionalProperties:false`；模型不能选择 engine、provider、model、adapter、result count、URL
+  fetcher 或浏览器 profile。
+- 工具只在三个条件同时成立时可见：当前 exact agent route 的 model metadata 明确声明
+  `hosted_web_search`、exact adapter 有受审 dialect、当前 `CapabilityLease` 含独立的
+  `ToolCapability.hostedWebSearch`。fresh read-write Code/Cowork lease 会获得该 capability；read-only、
+  reviewer、旧 durable lease 或不支持的 route 不会被静默扩权。
+- 工具通过 `ToolRegistry`、schema/secret validation、`CapabilityLease`、`WorkspaceLease`、三层权限门、
+  durable execution ticket、executor 与 `tool_result`，不是绕过 AgentLoop 的隐藏 provider 请求。
+- executor 冻结并复用调用 agent 的同一个 exact provider/model/options route，发起一个专用
+  provider-hosted search 请求。该请求只有一个 hosted search tool，因此使用
+  `tool_choice: required`；Chat 的透明请求继续使用 `auto`。
+- 工具路径禁止 ordinary-model fallback：provider 明确拒绝 hosted-search shape 时 typed fail closed，
+  不能把普通模型回答伪装成搜索结果。它也不会改走 `browser_search`、`web_fetch`、MCP、shell、
+  本地浏览器或另一个模型。
+- provider 返回的回答与去重 citation 被格式化成有界 ToolObservation；工具不打开来源 URL。
+  OpenRouter `openrouter:web_search` 未暴露 engine 参数，因此遵守其服务端默认 engine 选择；
+  Intatis 不在本工具内另行选择搜索后端。
+
+## 当前实现（2026-08-13）
 
 - `ChatViewModel` 与 CLI Chat 每次 Send 都调用 `ProviderRegistry.chatRuntimeRoute()`；该方法只读取
   当前 `models.chat` endpoint/model（CLI 的本轮 model override 也保持同一 endpoint），完全忽略
@@ -127,8 +149,8 @@ exact provider wire 上向当前模型提供的一项可选能力。
   `web_search` encoder 已独立实现并有 request fixture，但 `@ai-sdk/openai` 的普通 Chat adapter
   仍未实现，因此 exact route 会继续在网络前返回既有 config error，而不会被误报成“仅搜索不支持”。
 - Responses builder 按 dialect 分别编码 OpenAI `web_search` 与 OpenRouter
-  `openrouter:web_search`，两者都使用 `tool_choice: auto`，并保留 exact model/variant options 与
-  provider routing 限制。
+  `openrouter:web_search`；Chat 使用 `tool_choice: auto`，显式 Agent Tool 使用 `required`，两条路径都
+  保留 exact model/variant options 与 provider routing 限制。
 - provider 只有返回受审结构化 code/type + `tools`/`tool_choice` parameter（或明确的结构化
   web-search unsupported code），且尚未接受任何有效 Responses payload 时，才会在同一路由重发
   一次普通 Chat。裸 404、自由文本和 partial payload 后失败不会触发重放。
@@ -136,4 +158,8 @@ exact provider wire 上向当前模型提供的一项可选能力。
   JSON 时也不会擅自删除用户原字段。无效 legacy 值不阻止普通 Chat，有效 legacy 值也不再把
   隐藏搜索模型追加到用户可见模型列表。
 - 离线 provider/request、capability、fallback 与 ChatLoop citation tests 已覆盖本文核心矩阵；
+  Agent Tool 另由 `HostedWebSearchToolTests`、`ProviderHostedWebSearchToolServiceTests`、
+  `InferenceCatalogStoreResolverTests` 与 `ToolRegistryLeaseTests` 覆盖 exact route、strict schema、
+  fail-closed 与 lease 隔离。SwiftPM build、macOS Debug unsigned App build、iOS generic Simulator Debug
+  unsigned build 均已通过；完整 `swift test` 仍受既有 SharedUI suite 静默停滞影响，不能记为全量通过。
   真实厂商 smoke 仍属于独立的环境验证，不改变默认 fail-closed 语义。

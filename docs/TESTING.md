@@ -1,7 +1,7 @@
 # TESTING
 
 文档状态：当前验证矩阵
-最近核对：2026-08-11
+最近核对：2026-08-13
 产品基线：v0.48（build 48）
 
 历史测试数量、性能数字和事故复验保留在 Git 历史及 dated reports；它们不能替代当前
@@ -495,7 +495,7 @@ bounded visible page 的量级。`heap`/`vmmap` 会短暂停顿目标进程，�
 避免把外部采样暂停误计为产品 heartbeat incident。该 offline fixture 只证明 presentation
 pipeline，不替代真实 EventLog I/O、provider、VoiceOver、最低支持设备或多小时运行。
 
-## Chat 托管搜索验收矩阵
+## Chat 与 Agent 托管搜索验收矩阵
 
 `docs/CHAT_HOSTED_SEARCH.md` 是当前产品合同。相关业务源码修改至少必须用离线 request fixture
 和 Chat integration tests 证明：
@@ -518,8 +518,8 @@ pipeline，不替代真实 EventLog I/O、provider、VoiceOver、最低支持设
 - typed provider-specific “hosted search unsupported” 在任何有效 payload 前只允许在同一
   provider/model/variant 上一次普通 Chat 重发。任意 404、自由文本匹配、不同 provider/model
   fallback、partial payload 后重放必须被测试拒绝。
-- unsupported/unknown 分支不产生 toast、banner、错误卡、状态、提示词或 Settings 项，也不注册/
-  调用通用 Intatis search tool、`web_fetch`、`browser_search`、MCP、shell 或本地浏览器。
+- Chat unsupported/unknown 分支不产生 toast、banner、错误卡、状态、提示词或 Settings 项，也不
+  注册/调用 Agent `hosted_web_search`、`web_fetch`、`browser_search`、MCP、shell 或本地浏览器。
 - macOS/iOS 共用相同 planner 语义；iOS target closure 仍没有 Tools、Permission、AgentKernel、
   Cowork 或 MCP。Chat cancellation、TurnID、EventLog 与旧 citation decode 不因分支改变。
 
@@ -528,6 +528,35 @@ adapter/capability 矩阵。2026-08-05 已新增并通过 provider focused tests
 当前 route/legacy route ignore、compatible 静默普通 Chat、OpenAI/OpenRouter tool shape、strict
 routing options、结构化 unsupported 同路由一次降级、裸 404 拒绝降级、partial payload 后禁止重放
 及 citation 安全解析。macOS/iOS app build 与完整回归结果以本文件“最近一次真实结果”为准。
+
+Code/Cowork/CLI 的显式 `hosted_web_search` 包装至少追加验证：
+
+- `HostedWebSearchToolTests`：descriptor 只有 required `query`，`strict:true`、
+  `additionalProperties:false`、network/model-cost intent、manual reconciliation；空白/超长输入在
+  provider 前失败，service 收到 trim 后 query，standard registry 无 service 时不广告工具。
+- `ProviderHostedWebSearchToolServiceTests`：专用请求使用 route 中 exact model/provider/options、
+  `tool_choice:required` 与 unsupported fail-closed；文本/citation 去重与 output bound 正确，缺 completion
+  marker 或 cancellation 不返回成功 ToolObservation。
+- Provider route/request fixtures：OpenAI `web_search` 与 OpenRouter `openrouter:web_search` 仍分 dialect；
+  exact agent metadata 缺 capability、compatible/legacy/unknown adapter 时 route 不携带 search service；
+  exact profile revision 能原子携带同 provider/model 的 optional search route。工具模式明确拒绝
+  ordinary-model fallback，而 Chat 模式继续保持受限的一次 fallback。
+- `CapabilityLeaseTests` / `ToolRegistryLeaseTests`：fresh read-write lease 有独立
+  `ToolCapability.hostedWebSearch`，read-only/reviewer/旧 lease 无；concrete tool 必须同时有 lease 与
+  bound service，且不得因此出现 `browser_search` / `web_fetch`。registry identity 固定为
+  `intatis.standard.v4` / `intatis.cowork.v4`。
+- 至少构建 SwiftPM 全图，并编译 macOS Code/Cowork 与 CLI composition root；iOS 继续不链接
+  Tools/Permission/AgentKernel/Cowork。真实 provider smoke 必须显式 opt in 并记录 exact
+  provider/model/dialect、tool choice、是否返回 citation、usage/cost 与失败形状，不得隐式读取凭据或
+  消费额度。
+
+2026-08-13 本地已通过 `swift build`、`swift test --filter HostedWebSearch`、
+`swift test --filter HostedSearch`、`swift test --filter CapabilityLeaseTests` 与
+`swift test --filter ToolRegistryLeaseTests`，以及 `IntatisMac` macOS Debug unsigned build 与
+`IntatisiOS` generic Simulator Debug unsigned build。另尝试完整 `swift test`：
+`IntatisToolsTests` 227/227（19 个显式 opt-in smoke skipped）与 `IntatisSkillsTests` 29/29 通过，随后
+在 SharedUI `testSelectedAgentUpdateRestartsRichRenderingDwell` 连续约两分钟无输出并以 130 中止；同一
+exact test 单独重跑 1/1 通过。不得把该运行记为完整 suite 通过。未运行真实 provider/key smoke。
 
 ## macOS Chat/Cowork composer 图片附件验收矩阵
 
@@ -1072,18 +1101,30 @@ INTATIS_REAL_MULTIMODAL_SMOKE=1 swift test \
   `PermissionReviewControlPlaneTests` 51/51，合计 78/78、0 failures；完成相关 package Debug 编译。
   未运行全量 test、macOS/iOS app build、真实 reviewer provider、credential/network 或 GUI smoke。
 
-2026-08-12 Cowork dependent-call / `task_create` owner 修正的直接证据：
+2026-08-13 Cowork Session 内独立 WorkTask / Run 中断 / 原子委派重构的直接证据：
 
-- `intatis-skill-creator/scripts/quick_validate.py`：`Skill is valid`；另用真实失败形态“同一 response 中 6 个 `task_create(owner=future)` + 6 个 `spawn_agent`”做独立只读 exercise，三层合同唯一导向 ownerless create → wait → spawn → wait → delegate confirmed pairs；
-- `ContextProjectionTests.testFirstAgentRequestDeclaresIntatisRuntimeAndToolProtocol`：1/1；同时验证 Code 与 Cowork 每次 request 收到 multi-call 非 transaction/concurrency guarantee、只 batch independent calls、依赖 successful ToolResult 后跨轮和 future-object 禁令；
-- `IntatisSkillsTests.testProductBundleDiscoversCoworkOrchestrationAsSystemSkill`：1/1；验证真实 bundled activation prompt 包含 currently-attached owner、stage barrier 与同批 future owner + spawn 禁令；
-- `WorkTaskRuntimeTests.testTaskCreateDescriptorRequiresConfirmedAttachedOwnerWithoutMakingItRequired`、`testMutatingWorkTaskToolsRejectMissingHostManagerAsNotStarted`、`testOrchestratorManagerProvesUnattachedCreateOwnerBeforeMutation`、`testCreatePostAppendFailureIsNotMisclassifiedAsNoEffect`：4/4；分别验证 provider-visible business schema、缺失 host manager 不伪报成功、owner-preflight EventLog 零变化/typed no-effect，以及 append 后 lost acknowledgement 仍保留 unknown；
-- `AgentLoopPolicyTests.testRejectedWithoutSideEffectSettlesAndReturnsRecoveryToModel` 与 `testNonReplayableToolFailureLeavesExecutionUnsettledForManualReconciliation`：2/2；验证 typed no-effect 写 `failed/not_started` 并继续模型轮次，普通 non-replayable error 仍留 unresolved/manual；
-- 相关整类组合 gate 最终为 `IntatisSkillsTests.xctest` 29/29、`WorkTaskRuntimeTests` 22/22、`AgentLoopPolicyTests` 37/37、`ContextProjectionTests` 23/23，合计 111/111；均完成相应 package Debug 编译。未运行全量 test、macOS/iOS app build、真实 provider 或 GUI smoke。
+- `TaskGoalProtocolTests` 12/12 与 `TaskGoalProjectionTests` 7/7：验证 WorkTask schema/事件不含
+  Run、Goal、agent owner，dependency 只在当前 Session graph 内成立，`interrupted` Run 为 terminal；
+- `WorkTaskRuntimeTests` 21/21：包含 `testTaskCreateDescriptorIsSessionScopedAndHasNoOwnerField`、
+  `testDelegationPreflightFailureWritesNoPartialFacts`、stale revision 与 post-append lost-ack 边界；
+- `AgentInvocationNonRecursiveTests` 11/11：验证 `delegate_task` 只接受已 attached worker，省略 target
+  只选择现有 idle worker，缺 target/Mediator deny 不留下 message、delegation、lease、queue 或隐式 worker；
+- `GoalRuntimeControllerTests` 33/33：验证恢复把悬空 active Run 写成 `interrupted`，显式 Resume 创建
+  不同 RunID，且 Run/Goal/invocation terminal 不传播 WorkTask 状态；
+- `PerAgentInferenceProfileTests.testAutomaticDelegationDoesNotProposeWorkerWhenNoneIsAttached` 1/1：
+  验证 automatic delegation 不再 proposed/spawn worker；
+- `IntatisProtocolTests` 107/107、`IntatisConversationTests` 212/212、`IntatisAgentKernelTests`
+  220/220、`IntatisCoworkTests` 364/364、`IntatisSkillsTests` 29/29、`IntatisToolsTests`
+  227/227（另有 19 个显式 opt-in skip）均通过；Cowork 内另确认 `PerAgentInferenceProfileTests`
+  21/21、`OrchestrationReliabilityTests` 44/44、`PermissionReviewControlPlaneTests` +
+  `RunControlTests` 58/58；
+- `swift build` 与 `git diff --check` 通过。一次整仓 `swift test` 在 Tools/Skills 通过后，于既有
+  SharedUI async waiter 中超过 60 秒无输出并人工中止（exit 130），因此不记为完整 suite 通过；
+  未运行真实 provider、credential/network、GUI、macOS App 或 iOS App smoke。
 
 2026-08-12 Cowork ordinary-worker WorkTask update 收窄的直接证据：
 
-- `ToolRegistryLeaseTests.testWorkerTaskUpdateSchemaExposesOnlyOwnedProgressAndSettlementFields`：
+- `ToolRegistryLeaseTests.testWorkerTaskUpdateSchemaExposesOnlyBoundProgressAndSettlementFields`：
   worker 的 exact property set 为 `task_id/expected_revision/progress_note/status/result/evidence`，
   `additionalProperties=false`，status 只含 `in_progress/blocked/completed/failed`；同一测试同时确认
   manager 的 14 个完整字段与各自 capability grant 均保持不变；

@@ -623,7 +623,7 @@ final class IntatisCoworkTests: XCTestCase {
         XCTAssertFalse(systemPrompt.lowercased().contains("you can delegate freely"))
     }
 
-    func testSecretQuestionIsBlockedBeforeReachingPeer() async throws {
+    func testSecretQuestionIsBlockedBeforeReachingPeerWithoutPartialMessageFacts() async throws {
         let log = try tempLog()
         let wsA = try tempWorkspace(), wsB = try tempWorkspace()
         let provA = ScriptedProvider([
@@ -644,10 +644,18 @@ final class IntatisCoworkTests: XCTestCase {
         let events = await log.replay()
         let a2a = events.filter { if case .agentToAgentMessage = $0.event { return true } else { return false } }
         XCTAssertTrue(a2a.isEmpty, "secret content must not be forwarded")
-        let denies = events.compactMap { e -> PermissionReviewPayload? in
-            if case .permissionReview(let p) = e.event, p.decision == .deny { return p } else { return nil }
+        let mediationAudits = events.compactMap { e -> PermissionReviewPayload? in
+            if case .permissionReview(let payload) = e.event { return payload }
+            return nil
         }
-        XCTAssertFalse(denies.isEmpty)
+        let results = events.compactMap { event -> ToolResultPayload? in
+            if case .toolResult(let payload) = event.event { return payload }
+            return nil
+        }
+        XCTAssertTrue(mediationAudits.isEmpty, "Mediator rejection must not append communication audit facts")
+        XCTAssertTrue(results.contains {
+            $0.observation.contains("blocked by the mediator")
+        })
     }
 
     func testMainCanSpawnWorkerButSpawnedWorkerHasNoCoordinatorTools() async throws {

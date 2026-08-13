@@ -81,15 +81,12 @@ final class TaskGoalProtocolTests: XCTestCase {
             recordedAt: now)
         let task = WorkTask(
             id: WorkTaskID(rawValue: "wt_roundtrip"),
-            runID: runID,
-            goalID: goalID,
             title: "Protocol",
             description: "Implement durable protocol",
             acceptanceCriteria: ["round trips"],
             expectedArtifacts: ["WorkTask.swift"],
             status: .completed,
             priority: .high,
-            owner: AgentID(rawValue: "worker"),
             progressNote: "done",
             result: "implemented",
             evidence: [evidence],
@@ -143,7 +140,6 @@ final class TaskGoalProtocolTests: XCTestCase {
         var graph = WorkTaskGraph()
         XCTAssertSuccess(graph.add(WorkTask(
             id: id,
-            runID: runID,
             title: "Verify",
             description: "Run tests",
             acceptanceCriteria: ["tests pass"],
@@ -182,40 +178,30 @@ final class TaskGoalProtocolTests: XCTestCase {
         XCTAssertTrue(completed.hasValidCompletionEvidence)
     }
 
-    func testWorkTaskGraphRejectsMissingSelfCrossRunCycleAndStaleRevision() throws {
+    func testWorkTaskGraphRejectsMissingSelfCycleAndStaleRevision() throws {
         let aID = WorkTaskID(rawValue: "wt_a")
         let bID = WorkTaskID(rawValue: "wt_b")
         var graph = WorkTaskGraph()
 
         XCTAssertFailure(graph.add(WorkTask(
             id: WorkTaskID(rawValue: "wt_missing"),
-            runID: runID,
             title: "missing",
             description: "missing",
             dependsOn: [aID])), kind: .missingDependency)
         XCTAssertFailure(graph.add(WorkTask(
             id: WorkTaskID(rawValue: "wt_self"),
-            runID: runID,
             title: "self",
             description: "self",
             dependsOn: [WorkTaskID(rawValue: "wt_self")])), kind: .selfDependency)
 
         XCTAssertSuccess(graph.add(WorkTask(
             id: aID,
-            runID: runID,
             title: "A",
             description: "first",
             status: .ready,
             createdAt: now)))
-        XCTAssertFailure(graph.add(WorkTask(
-            id: WorkTaskID(rawValue: "wt_cross"),
-            runID: ContinuationRunID(rawValue: "run_2"),
-            title: "cross",
-            description: "cross",
-            dependsOn: [aID])), kind: .crossRunDependency)
         XCTAssertSuccess(graph.add(WorkTask(
             id: bID,
-            runID: runID,
             title: "B",
             description: "second",
             dependsOn: [aID],
@@ -224,14 +210,12 @@ final class TaskGoalProtocolTests: XCTestCase {
         let unordered = WorkTaskGraph.validating([
             WorkTask(
                 id: bID,
-                runID: runID,
                 title: "B",
                 description: "second",
                 dependsOn: [aID],
                 createdAt: now),
             WorkTask(
                 id: aID,
-                runID: runID,
                 title: "A",
                 description: "first",
                 status: .ready,
@@ -402,12 +386,9 @@ final class TaskGoalProtocolTests: XCTestCase {
     func testAllTaskGoalRunEventsRoundTripWithStableTypeTags() throws {
         let task = WorkTask(
             id: WorkTaskID(rawValue: "wt_event"),
-            runID: runID,
-            goalID: goalID,
             title: "Event",
             description: "Round trip",
             status: .inProgress,
-            owner: AgentID(rawValue: "worker"),
             createdAt: now,
             revision: 1)
         let evidence = TaskEvidence(kind: "test", reference: "swift test", summary: "passed", recordedAt: now)
@@ -428,7 +409,6 @@ final class TaskGoalProtocolTests: XCTestCase {
         let events: [(Event, String)] = [
             (.workTaskCreated(.init(task: task)), "work_task_created"),
             (.workTaskUpdated(.init(task: task, previousRevision: 0)), "work_task_updated"),
-            (.workTaskOwnerChanged(.init(task: task, previousOwner: nil)), "work_task_owner_changed"),
             (.workTaskDependencyChanged(.init(task: task, previousDependencies: [])), "work_task_dependency_changed"),
             (.workTaskReady(.init(task: task)), "work_task_ready"),
             (.workTaskStarted(.init(task: task)), "work_task_started"),
@@ -439,7 +419,6 @@ final class TaskGoalProtocolTests: XCTestCase {
             (.workTaskCancelled(.init(task: task, reason: "cancelled")), "work_task_cancelled"),
             (.workTaskInvocationLinked(.init(task: task, invocationID: TaskID(rawValue: "task_1"))), "work_task_invocation_linked"),
             (.workTaskEvidenceAdded(.init(task: task, evidence: evidence)), "work_task_evidence_added"),
-            (.workTaskCarriedForward(.init(task: task, sourceTaskID: WorkTaskID(rawValue: "wt_old"), sourceRunID: ContinuationRunID(rawValue: "run_old"))), "work_task_carried_forward"),
             (.goalCreated(.init(goal: goal)), "goal_created"),
             (.goalEdited(.init(goal: goal, previousRevision: 0)), "goal_edited"),
             (.goalPaused(.init(goal: goal)), "goal_paused"),
@@ -464,8 +443,8 @@ final class TaskGoalProtocolTests: XCTestCase {
                 reason: "verified",
                 requestedAt: now)), "continuation_run_close_requested"),
             (.continuationRunCompleted(.init(run: run)), "continuation_run_completed"),
+            (.continuationRunInterrupted(.init(run: run, reason: "runtime")), "continuation_run_interrupted"),
             (.continuationRunCancelled(.init(run: run, reason: "user")), "continuation_run_cancelled"),
-            (.continuationRunRecovered(.init(run: run, recoveredAt: now)), "continuation_run_recovered"),
         ]
 
         for (index, pair) in events.enumerated() {

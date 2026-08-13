@@ -1471,11 +1471,11 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
         let provider = ReviewControlPlaneProvider()
         let responder = makeResponder(log: log, workspace: workspace, provider: provider)
         let args = """
-        {"title":"Audit mailbox","description":"Create one bounded audit task","owner":"worker","depends_on":["wt_parent"]}
+        {"title":"Audit mailbox","description":"Create one bounded audit task","depends_on":["wt_parent"]}
         """
         let intent = PermissionIntent(
             action: "task.create",
-            resources: [PermissionResource(kind: .task, value: "current-run")],
+            resources: [PermissionResource(kind: .task, value: "current-session")],
             dataEffects: [.none],
             controlEffects: [.createTask],
             risks: [.controlPlaneMutation],
@@ -1510,7 +1510,7 @@ final class PermissionReviewControlPlaneTests: XCTestCase {
             .messages.compactMap(\.content).joined(separator: "\n")
         XCTAssertTrue(prompt.contains("tool: task_create"))
         XCTAssertTrue(prompt.contains("action_preview: kind=task_create"))
-        XCTAssertTrue(prompt.contains("owner=worker"))
+        XCTAssertFalse(prompt.contains("owner="))
         XCTAssertTrue(prompt.contains("depends_on=wt_parent"))
         XCTAssertTrue(prompt.contains(
             AuthorizationSidecarCodec.reservedFieldName) == false)

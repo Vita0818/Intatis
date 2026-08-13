@@ -23,21 +23,22 @@ AgentLoop must never directly recurse into another AgentLoop.
 
 含义：一个 agent 可在一个任务里 coordinate、在另一个任务里 count files、在第三个任务里 review code。其当前行为由它收到的 task contract 与 capability lease 决定，而非硬编码类型。
 
-## 2. 四层工作模型与五大协作抽象
+## 2. 独立工作记录、执行边界与五大协作抽象
 
-Cowork 的用户目标、可见计划、宿主续跑和单次 agent 执行是四个不同层级，不得再用同一个 `Task` 词汇或同一终态代替：
+Cowork 的用户目标、Session 计划、宿主执行窗口和单次 agent 执行是四套独立事实，不得把它们画成永久所有权层级，也不得用同一个 `Task` 词汇或同一终态代替：
 
 ```text
-Goal             用户拥有、可跨多轮/重启持续的最终目标
-WorkTask         Goal 或普通 run 内用户可见、可验证的计划 DAG 节点
-ContinuationRun  宿主为一次推进/恢复建立的有界执行轮次
+Goal             可选的持续目标；拥有自己的状态机与 verifier
+WorkTask         当前 Cowork Session 内用户可见、可验证的计划 DAG 节点
+ContinuationRun  宿主一次有界执行窗口；中断后不复活
 AgentInvocation  现有 TaskContract + TaskGraph + AgentScheduler 的一次 agent 执行
 ```
 
 - `AgentInvocation` 完成只产生候选结果，不能自动把关联 `WorkTask` 标成完成。
 - `WorkTask` 完成必须由 `task_update` 显式提交 result，并在有 acceptance criteria 时提交 evidence；依赖、revision 与状态转换由 `WorkTaskGraph` 校验。
 - `Goal` 完成必须经过独立 `GoalVerifier` 对 success criteria 与 host-derived `validationEvidence` 的审计；WorkTask result/evidence 只是 agent-reported，不能由 main/worker、`TaskContract` 终态、WorkTask 数量或 UI 文案自行宣告完成。
-- `ContinuationRun` 是 host-driven continuation 的 checkpoint/recovery 边界，不是递归 `AgentLoop`。一个 Goal 可跨多个 run；一个 WorkTask 可关联多个 invocation。
+- `ContinuationRun` 是 host-driven execution/checkpoint 边界，不是递归 `AgentLoop`。provider/runtime interruption 终结为 `interrupted`；Continue/Resume 创建新 Run。同一 Session 的 WorkTask 可跨多个 Run，并关联多个先后 invocation。
+- `WorkTask` 不含 Run、Goal、Agent 或 Turn ownership；Goal/Run/Turn/invocation 的终态不传播 WorkTask 状态，Goal 与 WorkTask 也不互相推导终态。
 - `TaskContract` 这个既有源码类型保留兼容，但在产品/架构语义里称为 **AgentInvocation execution contract**；不得把它重新投影成 Goal 或 WorkTask。
 
 上述四层与以下五个协作抽象正交。Cowork 仍围绕这些边界构建：
@@ -154,7 +155,7 @@ failed | cancelled -> queued  only through an explicit bounded retry attempt
 
 恢复时不能默认把所有 running 任务整段重放。每个实际 tool executor 调用前必须先持久化 execution ticket，结果持久化后再 settle；只有明确 eligible 的 non-root/CLI recovery task 内的普通 read-only 调用可自动重放；GUI restored root 不适用。write/exec/network/destructive 与通信、委派、spawn/remove 等协作副作用处于“prepared 但未 settled”时，任务必须进入人工对账失败态，不能自动增加 attempt。只有明确 eligible 的 non-root/CLI read-only running task 才可在新 attempt 的 queue 事件成功落盘后重排；Phase A GUI restored root submission 始终 paused/interrupted，必须 exact Retry；半完成 admission、耗尽 attempts 或缺失关键 lease 也必须明确失败。执行应有 bounded timeout/cancel、attempt 和明确标为 soft 的 session token budget；模型缺完成标记、迭代耗尽或不完整 finish reason 都是失败。
 
-这里的判断单位是“这一次具体调用是否可能已经产生副作用”，不是只看工具静态类别。write 类工具继续默认 non-replayable；只有拥有 mutation boundary 的受信实现或 prepare 前 durable state 能证明该边界未被跨越时，才能追加可选 `effectDisposition=not_started` 的失败/取消 settlement。typed ordinary failure 可作为 observation 回灌同一 Agent turn；pre-executor cancellation 结算后仍中断 turn；legacy repair 只对账 EventLog，不存在当前 turn。新成功 settlement 必须显式标为 `committed`；legacy nil+succeeded 仅兼容成已完成效果并继续阻断 whole-task retry。当前精确 live case 是 production Orchestrator 的 `task_create` / `task_update`：只有 admission lock 内且首个 WorkTask EventLog append 前的拒绝可证明 no-effect；create 包括 unattached owner / dependency / graph 等 preflight，update 包括 stale revision / frozen contract 等 preflight。公共 manager 的同名错误、普通 error、timeout、executor 内 cancellation、append/persistence/lost-ack、legacy failure nil/unknown 都不能套用。Projection 对 execution ID 坚持一次 prepare：第二个 prepare 即使相同也永久 ambiguous，冲突 terminal 同样保留首记录并永久 ambiguous；只有完全相同 terminal 可幂等，`succeeded + not_started` 是无效矛盾并进入 uncertain。旧日志修复必须先由 `replayForProjectionChecked()` + `hasCompleteKnownHistory` 证明历史完整，并且只能发生在无 current Goal、exact 唯一 prepare、没有任何 settlement/ambiguity、JSON safe integer 与 prepare 前 monotonic revision proof 同时成立时，不得解析自由文本或用 prepare 后状态猜测。Goal startup/进程内 launch、Orchestrator restore 与 whole-task retry 都必须使用同一 complete-known-history gate；unknown future type 或 seq gap 不能支持 absence/order proof。任务级确定错误应局部终结，不应无条件升级成整个 session 不可输入；无 Goal 的隔离仍须证明 exact contract-before-prepare、正 attempt 与 exact-attempt terminal-after-prepare，无法归属、损坏/不完整历史、非终态任务与任何 current Goal 的 uncertain 副作用保持 fail closed。
+这里的判断单位是“这一次具体调用是否可能已经跨过 mutation boundary”，不是只看工具静态类别。write 类工具继续默认 non-replayable；只有受信实现能在第一次 durable mutation 前证明拒绝时，才可结算 `effectDisposition=not_started`。当前 production 窄例外包括 `task_create` / `task_update` 的首个 WorkTask append 前预检，以及 `delegate_task` 在完整原子 admission batch 前的 agent/lease/authorization/Mediator/WorkTask/graph/scheduler 预检；这些失败作为 observation 回灌同一 Agent turn，不进入人工对账。batch/append 已开始、persistence/lost-ack、普通 timeout/error、executor-entered cancellation 和外部工具未知结果仍保持 unknown/manual，禁止按错误字符串或通用 error case 猜测安全重试。新成功 settlement 必须显式标为 `committed`；Projection 对 execution ID 坚持一次 prepare、首 terminal 和冲突 fail-closed。Goal startup、Orchestrator restore 与 whole-task retry都必须使用 complete-known-history gate；unknown future type 或 seq gap 不能支持 absence/order proof。
 
 Permission Reviewer 是独立控制面，不是普通 worker：使用结构化 `PermissionReviewTask`、有界 FIFO/single-flight 与独立 timeout/cancellation，不占数据面 scheduler 槽，也不得递归运行 `AgentLoop`。模型请求默认不得硬编码 `temperature`、output-token 或字符上限；只有用户/host 显式策略或真实上游/上下文约束存在时才可传递和执行对应控制。deadline 从 submit 计时，queue full/timeout fail closed；自动模式只有 `allow` / `deny`。pre-submit caller cancel 直接返回 typed deny且不创建 review lifecycle；timeout、truncated、malformed、tool call、provider/persistence failure 与已登记 review 在 terminal-claim 前被观察到的 cancel durable deny 当前调用，不得隐式切到 GUI 人工 fallback；claim 后 cancel 保留唯一 settlement 但最终授权交付 deny。review request 与 verdict 都必须 durable-first；`allow` 只有 settled audit 成功后才可返回，自审或 hard deny 都不得放行，恢复时 orphan request 必须显式关闭。每个 provider dispatch 使用 exact `{reviewTaskID, nonce}` generation；provider/timeout 竞争同代首 terminal，provider-backed terminal claim 必须匹配该 generation，pre-dispatch terminal 则从 running/no-generation 状态唯一 claim。caller cancel 由同步 request token、actor path 与 settlement/delivery/admission 围栏共同处理。timeout/cancel 只影响当前 call；若已有 active generation 就只 retire 该代，下一 request fresh-resolve provider wrapper；旧代 late/duplicate result 无 EventLog/health/authorization 能力。provider factory 冻结 reviewer identity/exact binding，且不得捕获 Orchestrator；`ToolCallingProvider.stream` 必须立即返回 request-owned stream，并传播 consumer termination，同步永久阻塞实现不在契约内。累计 token 仅可作为 soft warning/度量，默认不得用不可恢复的 session-lifetime cap 永久关闭 reviewer。用户取消当前数据面任务不得顺带关闭常驻 reviewer；只有 session stop、显式 disable 或控制面自身安全故障才进入 quiesce/shutdown。停用 reviewer 先 quiesce，再持久化 revoke/detach；迟到 allow 或落盘失败不得被误报成成功停用，detach 失败 resume 后仍必须用 fresh generation。terminal claim 后 cancel/quiesce 可使最终 authorization delivery deny，但不得重写唯一 reviewer settlement 或执行工具。reviewer 只可在 deterministic gate 的最大权限边界内收窄，不能批准真正越权；人工模式只能由用户显式切换。legacy `provider_still_stopping` 只作旧 EventLog 解码，不得重新成为 live permission-review state。
 
@@ -166,7 +167,7 @@ Goal 生命周期必须由 host 串行化：start、ordinary turn、Goal mutatio
 
 ContinuationRun 还必须有模型可表达、宿主可强制执行的终止边界。只有 exact `@main` root 可见 `finish_run` / `stop_run`，且模型只能提供 completed/stopped 意图与有界 reason；所有 session/run/Goal/submission/root identity 和 source 必须从当前 invocation 注入。close installation 在 EventLog await 前先形成 actor-local admission/authorization tombstone；EventLog 再在完整已知历史与跨进程锁内对 exact RunID 安装 first-write durable close claim，且 claim 必须先于等待既有 admission、provider/tool cleanup 与 exact-run drain 落盘。Orchestrator 随后只 drain 同 run 的其余 task/message，恢复也不得复活。该 claim 不替代 run checkpoint/completed/cancelled 状态机，也不影响其他 run。普通 final 文本不能被 host 猜测成显式 claim；root failure/timeout 使用 runtime source，用户取消使用 user source，session lifecycle shutdown 使用 hostLifecycle source。
 
-模型可见的 agent/task/message/goal/run/session 操作与文件、网络、文档工具遵循同一个 ToolCall 协议。WorkTask CRUD、Goal create/update、run close 与 session rename 都必须先过 schema、lease（Cowork）与 PermissionEngine；`task_get/update` 使用 durable WorkTask ID（正常为 `wt_…`）和最新 authoritative revision，不能把 AgentInvocation `task_…` ID 或旧 revision 当成 WorkTask authority，也不能重复 settle 已 terminal 的 WorkTask。WorkTask permission preview 只提供 bounded、脱敏的语义字段，完整执行参数继续由 digest/count 和 immutable authorization 绑定。`rename_session` 与 exact host-bound run close 的低风险 intent 可由 deterministic gate 放行，但 near-miss、错误 invocation scope 与 locked 状态不能借此绕过。worker 默认只能读取 Goal/相关 WorkTask，并更新自己当前绑定的 WorkTask，不能改 DAG/owner/priority/retry/cancel、提交 Goal verdict、关闭 run 或改 session 名称。一个外部 ToolCall 只能有一个权限决定；`spawn_agent` / 原子 `delegate_task` 获准后，内部 roster、lease、mailbox、task graph 与 scheduler admission 必须作为 executor 的 durable transaction 完成，不能再次递归进入 PermissionEngine。Code 与 Cowork agent 共用 headless `AgentRuntime`；首个 system message 必须稳定声明 Intatis 模式、API tools 权威性、严格 JSON Schema 与 ToolResult 完成语义，动态 workspace/task/lease/goal/run 数据仍放在 user-role untrusted context。
+模型可见的 agent/task/message/goal/run/session 操作与文件、网络、文档工具遵循同一个 ToolCall 协议。WorkTask CRUD、Goal create/update、run close 与 session rename 都必须先过 schema、lease（Cowork）与 PermissionEngine；`task_get/update` 使用当前 Session 的 durable WorkTask ID（正常为 `wt_…`）和最新 authoritative revision，不能把 AgentInvocation `task_…` ID 或聊天历史快照当成 WorkTask authority，也不能重复 settle 已 terminal 的 WorkTask。WorkTask permission preview 只提供 bounded、脱敏的语义字段，完整执行参数继续由 digest/count 和 immutable authorization 绑定。worker 默认只能读取和更新自己当前 AgentInvocation 绑定的 WorkTask，不能改 DAG/priority/retry/cancel、提交 Goal verdict、关闭 run 或改 session 名称。一个外部 ToolCall 只能有一个权限决定；`spawn_agent` 是独立显式动作，`delegate_task` 只选择已 attached worker。获准后的内部 message、lease、AgentInvocation、WorkTask linkage 与 scheduler admission 必须在一个 EventLog batch 中提交，commit 后才更新内存，不能再次递归进入 PermissionEngine。Code 与 Cowork agent 共用 headless `AgentRuntime`；首个 system message 必须稳定声明 Intatis 模式、API tools 权威性、严格 JSON Schema 与 ToolResult 完成语义，动态 workspace/task/lease/goal/run 数据仍放在 user-role untrusted context。
 
 ### 2.3b Coordinator routing Skill
 
@@ -383,7 +384,7 @@ the model can still repeat sidecar semantics in ordinary assistant text, and mal
 6. Replace nested AgentLoop calls with scheduler/mailbox.
 7. Add task graph cycle detection.
 8. Expand semantic event schema and tests.
-9. Add Goal / WorkTask / ContinuationRun above the existing AgentInvocation layer without renaming old durable event types.
+9. Keep Goal, Session-scoped WorkTask, ContinuationRun and AgentInvocation as independent facts; never add ownership propagation between them.
 10. Add host-driven continuation and an independent GoalVerifier; never let an agent self-certify Goal completion.
 11. Add versioned immutable inference catalog + exact per-agent binding before adding multi-wire, route-lease or fallback policy; do not retrofit a mutable session-global model pointer into agent identity.
 12. Keep session state EventLog-first, `session.json` rebuildable, bookmark capability session-owned, legacy migration provenance-bound, and fresh bootstrap fixed at seven local events before changing composer/reviewer/lifecycle behavior.
@@ -447,16 +448,16 @@ Orchestrator restore, Goal startup/in-process launch, and whole-task retry requi
 legacy stale task_update repair requires no current Goal, one exact unambiguous prepare, no settlement, a JSON-safe expected revision, and durable pre-prepare revision proof
 no-Goal uncertain-ticket isolation requires exact contract/positive-attempt/terminal ordering; any current Goal requires an empty uncertain set
 cancel, timeout, maxIterations, missing completion marker, and incomplete finish reason never complete
-Goal / WorkTask / ContinuationRun IDs remain stable and all new events round-trip/replay without breaking legacy TaskContract JSON
+Goal / WorkTask / ContinuationRun IDs remain stable; a restarted active Run becomes interrupted and explicit Resume creates a different RunID
 exact @main root alone sees finish_run/stop_run; model supplies no identity, the in-flight close tombstone blocks reentrant admission/authorization, the first durable close claim precedes old-admission wait and fences only that RunID, restore drains it before dispatch, and an ordinary final does not forge a claim
-WorkTask DAG rejects missing/cross-run/self/cyclic dependencies, stale revisions, invalid transitions, and completion without required result/evidence
+WorkTask DAG is scoped only by the current Session and rejects missing/self/cyclic dependencies, stale revisions, invalid transitions, and completion without required result/evidence
 dependency replanning recomputes host-derived readiness atomically, and projection never trusts a DAG-inconsistent ready transition
-concurrent delegate_task(to:auto) reserves distinct eligible workers before any await and releases every reservation on every exit path
-task_create/update/get/list obey capability leases; a worker can update only its bound owned WorkTask and cannot rewrite the graph
-task_create owner is optional but, when supplied, names a currently attached data-plane agent confirmed by an earlier successful list_agents or spawn_agent ToolResult; multi-worker orchestration stages ownerless creates, then confirmed spawns, then delegation of confirmed pairs
+concurrent delegate_task(to:auto) chooses distinct eligible already-attached workers before any await and releases every reservation on every exit path; it never implicitly creates a worker
+task_create/update/get/list obey capability leases; a worker can update only its current invocation-bound WorkTask and cannot rewrite the graph
+WorkTask has no owner/run/goal field; spawn_agent and delegate_task are separate calls, and a target created by spawn becomes usable only after its successful ToolResult
 production task_create and task_update may prove only pre-first-WorkTask-append rejections not-started; append, persistence, and lost-ack failures remain unknown and require reconciliation
 write-capable WorkTask admission rejects overlapping expected-artifact ancestors/descendants and treats unknown write sets as workspace-wide
-delegate_task preserves the WorkTask/run/goal binding and records invocation linkage without treating its result as WorkTask completion
+delegate_task preserves the WorkTask ID, records an invocation linkage, and does not treat its result as WorkTask or Goal completion; all internal admission facts commit in one EventLog batch or not at all
 Cowork /goal creates a durable Goal; Chat/Code keep legacy Goal metadata behavior unless separately migrated
 ordinary natural-language Goal creation intent is narrow, deterministic, attachment-independent, and never bypasses schema/lease/permission/host authority
 ContinuationRun checkpoints/recovery are host-driven; restart never nests or recursively calls AgentLoop

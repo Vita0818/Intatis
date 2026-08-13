@@ -1502,20 +1502,7 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
     }
 
     private static func workTaskPresentation(from projection: CoworkProjection) -> CoworkWorkTaskSummary {
-        let selected: [WorkTask]
-        if let goalID = projection.currentGoalID {
-            selected = projection.workTasks.values.filter { $0.goalID == goalID }
-        } else if let run = projection.continuationRuns.values
-            .filter({ $0.goalID == nil })
-            .max(by: { $0.startedAt < $1.startedAt }) {
-            selected = projection.workTasks.values.filter { $0.runID == run.id }
-        } else {
-            selected = []
-        }
-        let ordered = selected.sorted { lhs, rhs in
-            let lhsRun = projection.continuationRuns[lhs.runID]?.ordinal ?? 0
-            let rhsRun = projection.continuationRuns[rhs.runID]?.ordinal ?? 0
-            if lhsRun != rhsRun { return lhsRun < rhsRun }
+        let ordered = projection.workTasks.values.sorted { lhs, rhs in
             if lhs.createdAt != rhs.createdAt { return lhs.createdAt < rhs.createdAt }
             return lhs.id.rawValue < rhs.id.rawValue
         }
@@ -1533,7 +1520,6 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                 title: task.title,
                 detail: task.description,
                 status: task.status.rawValue,
-                owner: task.owner.map { "@\($0.rawValue)" },
                 dependencySummary: dependencies.isEmpty
                     ? nil : dependencies.joined(separator: ", "),
                 statusReason: task.progressNote,

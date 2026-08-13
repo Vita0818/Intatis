@@ -376,7 +376,6 @@ public struct CoworkWorkTaskLine: Identifiable, Equatable, Sendable {
     public let title: String
     public let detail: String
     public let status: String
-    public let owner: String?
     public let dependencySummary: String?
     public let statusReason: String?
     public let acceptanceCriteria: [String]
@@ -389,7 +388,6 @@ public struct CoworkWorkTaskLine: Identifiable, Equatable, Sendable {
                 title: String,
                 detail: String = "",
                 status: String,
-                owner: String? = nil,
                 dependencySummary: String? = nil,
                 statusReason: String? = nil,
                 acceptanceCriteria: [String] = [],
@@ -401,7 +399,6 @@ public struct CoworkWorkTaskLine: Identifiable, Equatable, Sendable {
         self.title = title
         self.detail = detail
         self.status = status
-        self.owner = owner
         self.dependencySummary = dependencySummary
         self.statusReason = statusReason
         self.acceptanceCriteria = acceptanceCriteria
@@ -1134,7 +1131,7 @@ public struct CoworkShell: View {
     }
 
     private var workTasksSection: some View {
-        rightRailSection("Tasks", systemImage: "checklist") {
+        rightRailSection("Session Tasks", systemImage: "checklist") {
             workTasksContent
         }
         .accessibilityIdentifier("cowork.tasks.card")
@@ -2374,20 +2371,10 @@ private struct CoworkWorkTaskRow: View {
                         .font(.caption.bold())
                         .foregroundStyle(statusColor)
                         .lineLimit(1)
-                    if let owner = task.owner, !owner.isEmpty {
-                        Text("· \(displayOwner(owner))")
-                            .font(.caption)
-                            .foregroundStyle(style.tertiaryText)
-                            .lineLimit(1)
-                    }
                 }
             }
             Spacer(minLength: 0)
         }
-    }
-
-    private func displayOwner(_ owner: String) -> String {
-        owner.hasPrefix("@") ? owner : "@\(owner)"
     }
 
     @ViewBuilder private var taskMarker: some View {

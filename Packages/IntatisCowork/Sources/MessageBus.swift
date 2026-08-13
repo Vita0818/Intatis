@@ -14,6 +14,18 @@ public struct MessageBus: Sendable {
         self.mediator = mediator
     }
 
+    /// Runs mediator policy without writing an event. Callers that need a
+    /// larger atomic admission batch can include the existing message payload
+    /// in that batch after every other preflight check succeeds.
+    public func mediate(from: AgentID, to: AgentID, content: String) async -> String? {
+        switch await mediator.mediate(from: from, to: to, content: content) {
+        case .forward(let forwarded):
+            return forwarded
+        case .block:
+            return nil
+        }
+    }
+
     /// Mediate + log an `from → to` message. Returns the forwarded (possibly
     /// redacted) content, or `nil` if the mediator blocked it. Either way an audit
     /// record is appended.

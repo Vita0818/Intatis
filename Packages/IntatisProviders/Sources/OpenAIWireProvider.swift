@@ -325,6 +325,8 @@ public struct OpenAIWireProvider: ChatProvider {
                         } catch {
                             if !acceptedResponsePayload,
                                let webSearch = request.webSearch,
+                               webSearch.unsupportedBehavior
+                                   == .retryOrdinaryChat,
                                Self.isHostedWebSearchUnsupported(
                                    error,
                                    dialect: webSearch.dialect) {
@@ -571,10 +573,11 @@ public struct OpenAIWireProvider: ChatProvider {
         root["tools"] = .array([
             Self.hostedWebSearchToolJSON(webSearch),
         ])
-        // Search is a transparent Chat capability. Let the provider decide
-        // whether this prompt needs a hosted search instead of forcing one on
-        // every turn.
-        root["tool_choice"] = .string("auto")
+        // Transparent Chat uses `auto`; an explicit agent search tool uses
+        // `required` so a successful tool result cannot be an ordinary model
+        // answer that silently skipped the hosted search.
+        root["tool_choice"] = .string(
+            webSearch.toolChoice.rawValue)
         root.removeValue(forKey: "messages")
         root.removeValue(forKey: "n")
         root.removeValue(forKey: "parallel_tool_calls")

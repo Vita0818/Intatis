@@ -1,7 +1,7 @@
 # CURRENT_STATE
 
 文档状态：当前源码摘要
-最近核对：2026-08-11
+最近核对：2026-08-13
 产品基线：v0.48（build 48）
 
 ## 版本与发行状态
@@ -51,8 +51,8 @@ macOS 是完整产品：Chat、Code、Cowork、Settings 和本地诊断导出。
   EventLog 中标题已是 canonical truth，UI 可在刷新或重启后恢复。Code/Cowork 仍只使用既有显式
   Rename/`rename_session` 路径。
 - Code 使用共享 headless `AgentRuntime.code`，提供工作区文件、patch、Git、managed
-  terminal、Skills、外部 MCP、文档/媒体及浏览器工具。工具可见性、lease、权限和 durable
-  execution ticket 在执行前逐层核对。
+  terminal、Skills、外部 MCP、文档/媒体、浏览器，以及与浏览器独立的 provider-hosted search
+  工具。工具可见性、lease、权限和 durable execution ticket 在执行前逐层核对。
 - Code/Cowork/CLI 的普通文档读取已按格式拆成 `read_pdf`、`read_docx`、`read_pptx`、
   `read_xlsx`、`read_html`、`read_epub`，另保留职责独立的 `document_ocr`、
   `document_render`、`document_export_pdf`、`document_write`。聚合 `document_read` 已从
@@ -213,10 +213,10 @@ macOS 是完整产品：Chat、Code、Cowork、Settings 和本地诊断导出。
   IDs 同批落盘后才 ack。legacy nil binding 的歧义或耗尽 lineage 保持 pending/fail closed，新消息仍
   可独立投递。WorkTask 工具的 reviewer preview 已补齐 bounded semantic fields，并明确 `wt_…`、
   AgentInvocation `task_…` 与 latest revision 的边界。普通 worker 的同名 `task_update` 现由
-  `update_owned_work_task` capability 投影为窄业务 schema，只提供 `task_id`、
+  `update_bound_work_task` capability 投影为窄业务 schema，只提供 `task_id`、
   `expected_revision`、`progress_note`、允许的 `status`、`result` 与 `evidence`；manager 的完整
-  合同、owner、DAG、priority、retry/cancel 更新面保持不变。worker 未知/管理字段由 closed schema
-  在授权与执行前拒绝，宿主仍继续核对当前 binding、owner、revision 与真实状态转换；automatic
+  状态、DAG、priority、retry/cancel 更新面保持不变。worker 未知/管理字段由 closed schema
+  在授权与执行前拒绝，宿主仍继续核对当前 invocation binding、revision 与真实状态转换；automatic
   模式既有的 request-owned authorization sidecar 装饰不变，不属于 WorkTask 业务字段。
 - Cowork 中每个 agent 的文件、Git、文档、浏览器文件与 terminal 工具仍只作用于自己的单一
   `workspaceRoot`。具有 `spawn_agent` 的 coordinator 提示词会在预知目标位于根外或收到
@@ -352,7 +352,7 @@ profiles 与外部 MCP client。macOS/Linux 的 stdio、sandbox、bwrap/guard �
 - Provider catalog 保留 model options/variant/adapter 语义；credential 只从受控 reference
   懒加载，不进入 EventLog、projection、诊断包或文档。
 
-## Chat 托管搜索
+## Chat 与 Agent 托管搜索
 
 - 搜索只属于当前所选 exact Chat route。该 route 明确支持时，向当前模型
   提供厂商对应能力并以 `tool_choice: auto` 让它自行决定是否搜索；不支持、未知或未适配时，当前
@@ -366,7 +366,23 @@ profiles 与外部 MCP client。macOS/Linux 的 stdio、sandbox、bwrap/guard �
   默认关闭，因此不会再为了探测能力先发送可能失败的搜索请求。
 - 只有 provider-specific 结构化 unsupported code/parameter 且首个有效 payload 尚未被接受时，
   provider 才允许在同一 provider/model/variant 上重发一次普通 Chat；裸 404、自由文本和 partial
-  payload 都不会触发重放。完整合同与当前 adapter 边界见 `docs/CHAT_HOSTED_SEARCH.md`。
+  payload 都不会触发重放。
+- Code/Cowork/CLI 新增普通 Agent Tool `hosted_web_search`。它只有 required `query`，不接受 engine、
+  model、provider、结果数或浏览器参数；仅在 exact agent route 明确声明 provider-hosted search、
+  adapter dialect 已实现、当前 lease 含独立 `ToolCapability.hostedWebSearch` 时注册。fresh read-write
+  lease 获得该 capability；read-only/reviewer、旧 durable lease 和 unsupported route 不会被扩权。
+- 该工具复用调用 agent 同一个 exact provider/model/options，专用请求使用
+  `tool_choice: required`，并在 hosted shape 被拒绝时 fail closed；不会退回普通模型回答，也不会调用
+  `browser_search`、`web_fetch`、MCP、shell、本地浏览器、第二模型或隐藏搜索后端。调用仍经过
+  strict schema、secret scan、ToolRegistry、lease、权限三层门、durable ticket 与 ToolResult。
+- production registry identity 已因新增独立工具推进为 `intatis.standard.v4` / `intatis.cowork.v4`。
+  `swift build`、hosted-search focused tests、`CapabilityLeaseTests` 7/7、`ToolRegistryLeaseTests` 27/27、
+  macOS Debug unsigned App build 与 iOS generic Simulator Debug unsigned build 已通过。另一次完整
+  `swift test` 在 `IntatisToolsTests` 227/227（19 opt-in skipped）与 `IntatisSkillsTests` 29/29 通过后，
+  于既有 SharedUI 时序测试 `testSelectedAgentUpdateRestartsRichRenderingDwell` 静默停滞并被中止；该 exact
+  test 随后单独运行 1/1 通过，因此本轮不把完整 suite 记为通过。尚未使用真实 provider/key 消费额度
+  做 live smoke。
+  完整合同与当前 adapter 边界见 `docs/CHAT_HOSTED_SEARCH.md`。
 
 ## UI 与内容渲染
 
@@ -427,6 +443,16 @@ profiles 与外部 MCP client。macOS/Linux 的 stdio、sandbox、bwrap/guard �
 
 ## 最近验证状态
 
+- 2026-08-13 Cowork Session 内独立 WorkTask / Run 中断 / 原子委派重构：WorkTask 已删除
+  Run、Goal、agent owner 字段和跨 Run dependency/carry-forward 路径；Goal 与 WorkTask 状态不再
+  相互传播。provider、网络和 runtime 中断把旧 Run 终结为 `interrupted`，显式 Resume 创建新
+  RunID。`delegate_task` 只使用已经 attached 的 data-plane worker；纯 Mediator/exact-provider 检查在
+  admission lock 外等待，随后在 lock 内重新复核全部可变状态并以一个 EventLog batch 提交 message、
+  delegation、lease、invocation、queue 与必要的 WorkTask linkage。提交前拒绝保持 EventLog 零变化并
+  结算 `not_started`。当前验证：`IntatisProtocolTests` 107/107、`IntatisConversationTests` 212/212、
+  `IntatisAgentKernelTests` 220/220、`IntatisCoworkTests` 364/364、`IntatisSkillsTests` 29/29、
+  `IntatisToolsTests` 227/227（另有 19 个显式 opt-in skip），`swift build` 通过。整仓
+  `swift test` 仍受既有 SharedUI async waiter 停滞影响，未记为全量通过；详见 `docs/TESTING.md`。
 - 2026-08-13 Permission Reviewer plain-text verdict 格式修复：240 Character 从有效性硬上限改为共享
   prompt 的简洁度建议；241/500/1000 Character 的非敏感 `ALLOW` 与 `DENY` reason 均保留原决定。
   完整 reason 在任何摘要截断前先做敏感信息检查；live bound settlement 继续只写固定宿主文案。
@@ -441,7 +467,6 @@ profiles 与外部 MCP client。macOS/Linux 的 stdio、sandbox、bwrap/guard �
   另有 closed-schema pre-permission/execution gate 1/1，相关合计 49/49、0 failures；
   `swift build --disable-automatic-resolution` 通过。未运行全量 test、macOS/iOS app build、真实
   provider 或 GUI smoke。
-- 2026-08-12 Cowork dependent-call / `task_create` owner corrective gate：Code/Cowork 共享 `RuntimeEnvironmentManifest`、`task_create` descriptor/schema 与 bundled `cowork-agent-orchestration` Skill 现在共同声明 multi-call batch 非事务且不提供并发保证，只 batch 任意 host order 下仍正确的独立 calls；identity/ID/attachment/state 依赖必须等待成功 ToolResult 后跨轮使用。`task_create.owner` 保持业务可选，但只能引用较早成功 `list_agents` / `spawn_agent` ToolResult 已确认的 attached data-plane agent；多 worker 使用 ownerless creates → await → spawns → await → delegate confirmed pairs。production Orchestrator manager 将 create 的 capability/run/title/owner/dependency/graph rejection 只在首次 WorkTask EventLog append 前转换成 typed `not_started`；append 后 lost-ack 注入仍保持 unknown/manual。缺失 host-bound WorkTask manager 时 create/update 也不再伪报成功，而是返回明确的 pre-execution `not_started` rejection。Skill quick validation、独立真实 6-task/6-agent 反向 exercise、Context/Skill/schema/manager/owner-preflight/post-append 与 AgentLoop notStarted-vs-unknown focused tests 均通过；相关四组测试合计 111/111。未运行真实 provider 或 GUI smoke。
 - 2026-08-11 fixed-format document reader 拆分与瘦身 gate：完整 `IntatisToolsTests` 223/223
   （19 skipped）、`AgentLoopPolicyTests` 36/36、`CapabilityLeaseTests` 7/7、
   `ToolRegistryLeaseTests` 25/25、`MessageDelegationSplitTests` 10/10，均 0 failures。用户提供的

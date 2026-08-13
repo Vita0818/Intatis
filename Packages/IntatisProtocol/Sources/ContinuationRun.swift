@@ -6,27 +6,28 @@ public enum ContinuationRunStatus: String, Codable, Sendable, Hashable {
     case running
     case checkpointed
     case completed
+    case interrupted
     case cancelled
 
     public var isTerminal: Bool {
-        self == .completed || self == .cancelled
+        self == .completed || self == .interrupted || self == .cancelled
     }
 
-    public func canTransition(to next: ContinuationRunStatus,
-                              isRecovery: Bool = false) -> Bool {
+    public func canTransition(to next: ContinuationRunStatus) -> Bool {
         if self == next { return true }
         switch (self, next) {
         case (.created, .running),
+             (.created, .checkpointed),
+             (.created, .interrupted),
              (.created, .cancelled),
              (.running, .checkpointed),
              (.running, .completed),
+             (.running, .interrupted),
              (.running, .cancelled),
-             (.checkpointed, .running),
              (.checkpointed, .completed),
+             (.checkpointed, .interrupted),
              (.checkpointed, .cancelled):
             return true
-        case (.created, .checkpointed):
-            return isRecovery
         default:
             return false
         }
@@ -86,7 +87,6 @@ public struct ContinuationRun: Codable, Sendable, Hashable, Identifiable {
     }
 
     public func transitioning(to status: ContinuationRunStatus,
-                              isRecovery: Bool = false,
                               progressSummary: String? = nil,
                               at date: Date = Date()) -> Result<ContinuationRun, ContinuationRunViolation> {
         guard ordinal >= 0 else {
@@ -95,7 +95,7 @@ public struct ContinuationRun: Codable, Sendable, Hashable, Identifiable {
                 message: "continuation run ordinal cannot be negative",
                 runID: id))
         }
-        guard self.status.canTransition(to: status, isRecovery: isRecovery) else {
+        guard self.status.canTransition(to: status) else {
             return .failure(ContinuationRunViolation(
                 kind: .invalidStatusTransition,
                 message: "invalid continuation run status transition \(self.status.rawValue) -> \(status.rawValue)",

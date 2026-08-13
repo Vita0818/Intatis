@@ -32,6 +32,9 @@ public enum ToolCapability: String, Codable, Sendable, Hashable {
     case compileLaTeX = "compile_latex"
     case generateMedia = "generate_media"
     case browseWeb = "browse_web"
+    /// Provider-hosted model search. This is intentionally independent from
+    /// browser profiles, URL fetching, and local/MCP search implementations.
+    case hostedWebSearch = "hosted_web_search"
     case sendMessage = "send_message"
     case requestInformation = "request_information"
     case replyMessage = "reply_message"
@@ -39,7 +42,7 @@ public enum ToolCapability: String, Codable, Sendable, Hashable {
     case delegateTask = "delegate_task"
     case attachWorkspace = "attach_workspace"
     case readWorkTasks = "read_work_tasks"
-    case updateOwnedWorkTask = "update_owned_work_task"
+    case updateBoundWorkTask = "update_bound_work_task"
     case manageWorkTasks = "manage_work_tasks"
     case readGoal = "read_goal"
     case createGoal = "create_goal"
@@ -149,7 +152,7 @@ public struct CapabilityLease: Codable, Sendable, Hashable {
             .replyMessage,
             .requestDelegation,
             .readWorkTasks,
-            .updateOwnedWorkTask,
+            .updateBoundWorkTask,
             .readGoal,
         ]
         if workspaceAccess == .readWrite {
@@ -164,6 +167,7 @@ public struct CapabilityLease: Codable, Sendable, Hashable {
                 .compileLaTeX,
                 .generateMedia,
                 .browseWeb,
+                .hostedWebSearch,
             ])
         }
         return CapabilityLease(

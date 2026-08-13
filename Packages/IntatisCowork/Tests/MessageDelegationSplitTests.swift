@@ -148,7 +148,7 @@ final class MessageDelegationSplitTests: XCTestCase {
         XCTAssertEqual(capabilityLease.delegation, .none)
         XCTAssertTrue(capabilityLease.mcpGrants.isEmpty)
         XCTAssertFalse(capabilityLease.tools.contains(.manageWorkTasks))
-        XCTAssertFalse(capabilityLease.tools.contains(.updateOwnedWorkTask))
+        XCTAssertFalse(capabilityLease.tools.contains(.updateBoundWorkTask))
         XCTAssertFalse(capabilityLease.tools.contains(.delegateTask))
         XCTAssertFalse(capabilityLease.tools.contains(.runShell))
         XCTAssertFalse(capabilityLease.tools.contains(.gitControl))

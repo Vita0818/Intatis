@@ -237,16 +237,15 @@ public struct DelegateTaskTool: Tool {
         name: "delegate_task",
         description: "Run one ready durable WorkTask by ID. The WorkTask remains the source of truth, "
             + "and the invocation report is only a candidate result until task_update explicitly settles it. "
-            + "Legacy unscoped calls may provide objective instead. If 'to' names an attached agent it is reused; "
-            + "if that name does not exist, or 'to' is omitted/'auto', Intatis reuses an idle worker "
-            + "or atomically creates a worker in your current workspace. knowledge_access may explicitly grant only this task search, build, or build_and_search Knowledge tools. Returns invocation task_id, agent_id, and the mediated Task Report.",
+            + "Unscoped calls may provide objective instead. 'to' must name an attached agent; if omitted or 'auto', Intatis selects an available attached worker. "
+            + "Create an agent in an earlier tool-call round when no suitable worker exists. knowledge_access may explicitly grant only this task search, build, or build_and_search Knowledge tools. Returns invocation task_id, agent_id, and the mediated Task Report.",
         sideEffect: .write,
         parameters: .object([
             "type": .string("object"),
             "properties": .object([
                 "to": .object(["type": .string("string"), "description": .string("target agent name")]),
                 "work_task_id": .object(["type": .string("string"), "description": .string("ready durable WorkTask ID")]),
-                "objective": .object(["type": .string("string"), "description": .string("legacy unscoped invocation objective")]),
+                "objective": .object(["type": .string("string"), "description": .string("unscoped invocation objective")]),
                 "role_hint": .object(["type": .string("string")]),
                 "expected_deliverable": .object(["type": .string("string")]),
                 "knowledge_access": .object([
@@ -258,9 +257,6 @@ public struct DelegateTaskTool: Tool {
                     ]),
                     "description": .string("optional task-scoped Knowledge capability grant"),
                 ]),
-                // Compatibility aliases for previously emitted tool calls.
-                "roleHint": .object(["type": .string("string")]),
-                "expectedDeliverable": .object(["type": .string("string")]),
             ]),
             "required": .array([]),
             "additionalProperties": .bool(false),
@@ -282,8 +278,6 @@ public struct DelegateTaskTool: Tool {
             case roleHint = "role_hint"
             case expectedDeliverable = "expected_deliverable"
             case knowledgeAccess = "knowledge_access"
-            case legacyRoleHint = "roleHint"
-            case legacyExpectedDeliverable = "expectedDeliverable"
         }
 
         init(from decoder: Decoder) throws {
@@ -292,9 +286,7 @@ public struct DelegateTaskTool: Tool {
             workTaskID = try container.decodeIfPresent(WorkTaskID.self, forKey: .workTaskID)
             objective = try container.decodeIfPresent(String.self, forKey: .objective)
             roleHint = try container.decodeIfPresent(String.self, forKey: .roleHint)
-                ?? container.decodeIfPresent(String.self, forKey: .legacyRoleHint)
             expectedDeliverable = try container.decodeIfPresent(String.self, forKey: .expectedDeliverable)
-                ?? container.decodeIfPresent(String.self, forKey: .legacyExpectedDeliverable)
             knowledgeAccess = try container.decodeIfPresent(
                 DelegatedKnowledgeAccess.self,
                 forKey: .knowledgeAccess)
@@ -323,12 +315,11 @@ public struct DelegateTaskTool: Tool {
             metadata: [
                 "objectiveLength": .number(Double(value?.objective?.count ?? 0)),
                 "roleHint": value?.roleHint.map(JSONValue.string) ?? .null,
-                "mayCreateWorker": .bool(true),
                 "knowledgeAccess": value?.knowledgeAccess
                     .map { .string($0.rawValue) } ?? .null,
             ],
             dataEffects: [.none],
-            controlEffects: [.delegateTask, .createAgent, .attachWorkspace, .grantCapability],
+            controlEffects: [.delegateTask, .grantCapability],
             risks: [.controlPlaneMutation, .capabilityGrant, .modelCost],
             replayPolicy: .requiresManualReconciliation)
     }
@@ -340,7 +331,7 @@ public struct DelegateTaskTool: Tool {
         }
         guard a.workTaskID != nil
                 || !(a.objective?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true) else {
-            throw IntatisError.decoding("delegate_task requires work_task_id or a legacy objective")
+            throw IntatisError.decoding("delegate_task requires work_task_id or an unscoped objective")
         }
         guard let authorization = context.authorization,
               authorization.toolName == Self.descriptor.name,
@@ -352,8 +343,15 @@ public struct DelegateTaskTool: Tool {
             throw IntatisError.permissionDenied(
                 "delegate_task requires a concrete host-resolved target authorization")
         }
-        return try Self.checked(await messenger.delegateTask(
+        guard let executionID = context.executionID,
+              !executionID.isEmpty else {
+            throw ToolExecutionRejectedWithoutSideEffect(
+                code: "delegation_execution_id_missing",
+                message: "delegate_task was rejected before admission because its durable execution identity is unavailable")
+        }
+        return try Self.checked(try await messenger.delegateTask(
             authorization: authorization,
+            executionID: executionID,
             to: concreteTarget,
             workTaskID: a.workTaskID,
             objective: a.objective,

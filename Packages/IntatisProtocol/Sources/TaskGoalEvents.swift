@@ -19,15 +19,6 @@ public struct WorkTaskUpdatedPayload: Codable, Equatable, Sendable {
     }
 }
 
-public struct WorkTaskOwnerChangedPayload: Codable, Equatable, Sendable {
-    public var task: WorkTask
-    public var previousOwner: AgentID?
-    public init(task: WorkTask, previousOwner: AgentID? = nil) {
-        self.task = task
-        self.previousOwner = previousOwner
-    }
-}
-
 public struct WorkTaskDependencyChangedPayload: Codable, Equatable, Sendable {
     public var task: WorkTask
     public var previousDependencies: [WorkTaskID]
@@ -99,19 +90,6 @@ public struct WorkTaskEvidenceAddedPayload: Codable, Equatable, Sendable {
     public init(task: WorkTask, evidence: TaskEvidence) {
         self.task = task
         self.evidence = evidence
-    }
-}
-
-public struct WorkTaskCarriedForwardPayload: Codable, Equatable, Sendable {
-    public var task: WorkTask
-    public var sourceTaskID: WorkTaskID
-    public var sourceRunID: ContinuationRunID
-    public init(task: WorkTask,
-                sourceTaskID: WorkTaskID,
-                sourceRunID: ContinuationRunID) {
-        self.task = task
-        self.sourceTaskID = sourceTaskID
-        self.sourceRunID = sourceRunID
     }
 }
 
@@ -293,7 +271,7 @@ public struct ContinuationRunCompletedPayload: Codable, Equatable, Sendable {
     public init(run: ContinuationRun) { self.run = run }
 }
 
-public struct ContinuationRunCancelledPayload: Codable, Equatable, Sendable {
+public struct ContinuationRunInterruptedPayload: Codable, Equatable, Sendable {
     public var run: ContinuationRun
     public var reason: String
     public init(run: ContinuationRun, reason: String) {
@@ -302,11 +280,11 @@ public struct ContinuationRunCancelledPayload: Codable, Equatable, Sendable {
     }
 }
 
-public struct ContinuationRunRecoveredPayload: Codable, Equatable, Sendable {
+public struct ContinuationRunCancelledPayload: Codable, Equatable, Sendable {
     public var run: ContinuationRun
-    public var recoveredAt: Date
-    public init(run: ContinuationRun, recoveredAt: Date = Date()) {
+    public var reason: String
+    public init(run: ContinuationRun, reason: String) {
         self.run = run
-        self.recoveredAt = recoveredAt
+        self.reason = reason
     }
 }

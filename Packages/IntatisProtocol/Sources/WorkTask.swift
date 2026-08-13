@@ -78,8 +78,6 @@ public struct TaskEvidence: Codable, Sendable, Hashable {
 /// invocations without deriving its completion state from any invocation.
 public struct WorkTask: Codable, Sendable, Hashable, Identifiable {
     public var id: WorkTaskID
-    public var runID: ContinuationRunID
-    public var goalID: GoalID?
 
     public var title: String
     public var description: String
@@ -88,7 +86,6 @@ public struct WorkTask: Codable, Sendable, Hashable, Identifiable {
 
     public var status: WorkTaskStatus
     public var priority: WorkTaskPriority
-    public var owner: AgentID?
     public var dependsOn: [WorkTaskID]
 
     public var progressNote: String?
@@ -102,15 +99,12 @@ public struct WorkTask: Codable, Sendable, Hashable, Identifiable {
     public var revision: Int
 
     public init(id: WorkTaskID = WorkTaskID.new(),
-                runID: ContinuationRunID,
-                goalID: GoalID? = nil,
                 title: String,
                 description: String,
                 acceptanceCriteria: [String] = [],
                 expectedArtifacts: [String] = [],
                 status: WorkTaskStatus = .pending,
                 priority: WorkTaskPriority = .normal,
-                owner: AgentID? = nil,
                 dependsOn: [WorkTaskID] = [],
                 progressNote: String? = nil,
                 result: String? = nil,
@@ -121,15 +115,12 @@ public struct WorkTask: Codable, Sendable, Hashable, Identifiable {
                 completedAt: Date? = nil,
                 revision: Int = 0) {
         self.id = id
-        self.runID = runID
-        self.goalID = goalID
         self.title = title
         self.description = description
         self.acceptanceCriteria = acceptanceCriteria
         self.expectedArtifacts = expectedArtifacts
         self.status = status
         self.priority = priority
-        self.owner = owner
         self.dependsOn = Self.unique(dependsOn)
         self.progressNote = progressNote
         self.result = result
@@ -169,7 +160,6 @@ public struct WorkTaskGraphViolation: Error, Codable, Sendable, Hashable,
         case missingTask = "missing_task"
         case missingDependency = "missing_dependency"
         case selfDependency = "self_dependency"
-        case crossRunDependency = "cross_run_dependency"
         case cycleDetected = "cycle_detected"
         case staleRevision = "stale_revision"
         case invalidRevision = "invalid_revision"
@@ -266,8 +256,8 @@ public struct WorkTaskGraph: Codable, Sendable, Hashable {
         return .success(.ready)
     }
 
-    /// Validates the entire graph, including identity consistency, references,
-    /// same-run confinement, and cycle freedom.
+    /// Validates the entire Session-scoped graph, including identity
+    /// consistency, references, and cycle freedom.
     public func validate() -> Result<Void, WorkTaskGraphViolation> {
         for (key, task) in tasks {
             guard key == task.id else {
@@ -303,17 +293,10 @@ public struct WorkTaskGraph: Codable, Sendable, Hashable {
                 }
             }
             for dependencyID in task.dependsOn {
-                guard let dependency = tasks[dependencyID] else {
+                guard tasks[dependencyID] != nil else {
                     return .failure(WorkTaskGraphViolation(
                         kind: .missingDependency,
                         message: "dependency does not exist: \(dependencyID.rawValue)",
-                        taskID: task.id,
-                        dependencyID: dependencyID))
-                }
-                guard dependency.runID == task.runID else {
-                    return .failure(WorkTaskGraphViolation(
-                        kind: .crossRunDependency,
-                        message: "dependency must belong to the same continuation run",
                         taskID: task.id,
                         dependencyID: dependencyID))
                 }
@@ -387,7 +370,7 @@ public struct WorkTaskGraph: Codable, Sendable, Hashable {
     }
 
     /// Replaces mutable fields using optimistic concurrency. The graph owns the
-    /// revision increment and rejects identity/run/goal rebinding.
+    /// revision increment and rejects identity rebinding.
     @discardableResult
     public mutating func update(_ proposed: WorkTask,
                                 expectedRevision: Int,
@@ -406,12 +389,10 @@ public struct WorkTaskGraph: Codable, Sendable, Hashable {
                 actualRevision: current.revision))
         }
         guard proposed.id == current.id,
-              proposed.runID == current.runID,
-              proposed.goalID == current.goalID,
               proposed.createdAt == current.createdAt else {
             return .failure(Self.violation(
                 .immutableIdentity, proposed.id,
-                "id, runID, goalID, and createdAt are immutable"))
+                "id and createdAt are immutable"))
         }
         var next = proposed
         next.dependsOn = Self.unique(next.dependsOn)
@@ -504,7 +485,6 @@ public struct WorkTaskGraph: Codable, Sendable, Hashable {
                                     to status: WorkTaskStatus,
                                     expectedRevision: Int,
                                     isRetry: Bool = false,
-                                    owner: AgentID? = nil,
                                     progressNote: String? = nil,
                                     result: String? = nil,
                                     evidence: [TaskEvidence]? = nil,
@@ -529,7 +509,6 @@ public struct WorkTaskGraph: Codable, Sendable, Hashable {
             }
         }
         proposed.status = status
-        if let owner { proposed.owner = owner }
         if let progressNote { proposed.progressNote = progressNote }
         if let result { proposed.result = result }
         if let evidence { proposed.evidence = evidence }

@@ -451,8 +451,6 @@ public struct CoworkProjection: Equatable, Sendable {
             applyWorkTaskSnapshot(
                 payload.task,
                 allowsDependencyReadinessRecompute: true)
-        case .workTaskOwnerChanged(let payload):
-            applyWorkTaskSnapshot(payload.task)
         case .workTaskDependencyChanged(let payload):
             applyWorkTaskSnapshot(
                 payload.task,
@@ -474,8 +472,6 @@ public struct CoworkProjection: Equatable, Sendable {
         case .workTaskInvocationLinked(let payload):
             applyWorkTaskSnapshot(payload.task)
         case .workTaskEvidenceAdded(let payload):
-            applyWorkTaskSnapshot(payload.task)
-        case .workTaskCarriedForward(let payload):
             applyWorkTaskSnapshot(payload.task)
         case .goalCreated(let payload):
             applyGoalSnapshot(payload.goal)
@@ -539,10 +535,10 @@ public struct CoworkProjection: Equatable, Sendable {
             }
         case .continuationRunCompleted(let payload):
             applyContinuationRunSnapshot(payload.run, requiredStatus: .completed)
+        case .continuationRunInterrupted(let payload):
+            applyContinuationRunSnapshot(payload.run, requiredStatus: .interrupted)
         case .continuationRunCancelled(let payload):
             applyContinuationRunSnapshot(payload.run, requiredStatus: .cancelled)
-        case .continuationRunRecovered(let payload):
-            applyContinuationRunSnapshot(payload.run, isRecovery: true)
         case .workspaceLeaseGranted(let payload):
             workspaceLeases[payload.lease.id] = payload.lease
             if let agent = payload.agent {
@@ -704,8 +700,6 @@ public struct CoworkProjection: Equatable, Sendable {
             return
         }
         guard snapshot.id == current.id,
-              snapshot.runID == current.runID,
-              snapshot.goalID == current.goalID,
               snapshot.createdAt == current.createdAt,
               snapshot.revision >= current.revision else { return }
         if snapshot.revision == current.revision {
@@ -775,7 +769,6 @@ public struct CoworkProjection: Equatable, Sendable {
 
     private mutating func applyContinuationRunSnapshot(
         _ snapshot: ContinuationRun,
-        isRecovery: Bool = false,
         requiredStatus: ContinuationRunStatus? = nil
     ) {
         if let requiredStatus, snapshot.status != requiredStatus { return }
@@ -787,7 +780,7 @@ public struct CoworkProjection: Equatable, Sendable {
               snapshot.sessionID == current.sessionID,
               snapshot.goalID == current.goalID,
               snapshot.ordinal == current.ordinal,
-              current.status.canTransition(to: snapshot.status, isRecovery: isRecovery) else {
+              current.status.canTransition(to: snapshot.status) else {
             return
         }
         continuationRuns[snapshot.id] = snapshot

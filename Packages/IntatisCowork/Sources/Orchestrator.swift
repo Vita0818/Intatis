@@ -46,24 +46,15 @@ private struct SpawnAuthorizationArguments: Decodable {
     }
 }
 
-/// Immutable executor-side snapshot for one already-reviewed delegation.
-/// `create_proposed` has no target fingerprint at review time, so its exact
-/// materialized identity is captured immediately after the authorized spawn
-/// transaction and carried through mediation to final task admission.
+/// Immutable executor-side snapshot for one already-reviewed delegation to an
+/// already attached data-plane agent.
 private struct AuthorizedDelegationAdmission: Sendable {
     var authorization: ResolvedToolAuthorization
     var target: AgentID
     var binding: AgentInferenceBinding?
     var targetFingerprint: String
-    var materializedProposedTarget: Bool
     var knowledgeCapabilities: Set<ToolCapability>
     var workspaceAccess: WorkspaceAccess
-}
-
-private struct MaterializedDelegationTarget: Sendable {
-    var agentID: AgentID
-    var binding: AgentInferenceBinding?
-    var fingerprint: String
 }
 
 public enum AutomaticPermissionReviewDisableResult: Equatable, Sendable {
@@ -210,6 +201,7 @@ private enum CoworkTaskTimeoutRace<Value: Sendable>: Sendable {
 private struct ResolvedAgentRuntimeInference: Sendable {
     let provider: ToolCallingProvider
     let modelContextPolicy: AgentModelContextPolicy
+    let hostedWebSearch: ResolvedHostedWebSearchRoute?
 }
 
 /// Races one request-owned operation against its deadline, then joins both
@@ -296,7 +288,6 @@ public actor Orchestrator {
         ) async throws -> AgentRequestToolSnapshot?
     public static let mainAgentID = AgentID(rawValue: "main")
     public static let automaticPermissionReviewerID = AgentID(rawValue: "permission-reviewer")
-    private static let carryForwardBlockerPrefix = "carry-forward blocked: "
 
     private struct GoalRunCancellationScope: Hashable, Sendable {
         var goalID: GoalID
@@ -673,7 +664,8 @@ public actor Orchestrator {
         guard let resolvedInferenceFor else {
             return ResolvedAgentRuntimeInference(
                 provider: try await providerFor(agent),
-                modelContextPolicy: .unspecified)
+                modelContextPolicy: .unspecified,
+                hostedWebSearch: nil)
         }
         guard let binding = agent.agentInferenceBinding,
               binding.modelID == agent.model else {
@@ -688,7 +680,8 @@ public actor Orchestrator {
         }
         return ResolvedAgentRuntimeInference(
             provider: resolved.provider,
-            modelContextPolicy: resolved.modelContextPolicy)
+            modelContextPolicy: resolved.modelContextPolicy,
+            hostedWebSearch: resolved.hostedWebSearch)
     }
 
     /// Provider-only compatibility view used by admission preflight paths.
@@ -2404,35 +2397,6 @@ public actor Orchestrator {
             resumeScheduler(suspension: restoreSuspension, ensureRunning: false)
             return
         }
-        // Older AgentLoop builds left every failed non-replayable tool ticket
-        // unresolved, including task_update requests that the built-in Cowork
-        // executor deterministically rejected before its first EventLog
-        // append. Repair only cases proven from exact durable arguments,
-        // authorization/lease identity, and the pre-prepare WorkTask snapshot.
-        // Persistence failures and every ambiguous side effect remain
-        // fail-closed.
-        let taskUpdateNoEffectSettlements = Self.provenTaskUpdateNoEffectSettlementEvents(
-            events: events,
-            projection: projection)
-        if !taskUpdateNoEffectSettlements.isEmpty {
-            do {
-                try await appendAdmissionEvents(taskUpdateNoEffectSettlements)
-                let replay = try await log.replayForProjectionChecked()
-                guard replay.hasCompleteKnownHistory else {
-                    throw EventLogError.unsupportedEventTypes
-                }
-                events = replay.envelopes
-                projection = CoworkProjection.build(from: events)
-                continuationRunCloseClaims = try Self.validatedContinuationRunCloseClaims(
-                    from: projection)
-            } catch {
-                workTaskRecoveryFailure =
-                    "proven no-effect task_update recovery could not be persisted: \(error.localizedDescription)"
-                releaseAdmissionLock()
-                resumeScheduler(suspension: restoreSuspension, ensureRunning: false)
-                return
-            }
-        }
         let auditedRunIDs = Set(events.compactMap { envelope -> ContinuationRunID? in
             guard case .goalAuditCompleted(let payload) = envelope.event else { return nil }
             return payload.runID
@@ -2878,215 +2842,6 @@ public actor Orchestrator {
         restoredPendingTaskIDs.formUnion(
             scheduler.queuedTasks().map { $0.contract.id })
         resumeScheduler(suspension: restoreSuspension, ensureRunning: false)
-    }
-
-    private static func hasLegacyWorkerProhibitedWorkTaskUpdateFields(
-        _ request: WorkTaskUpdateRequest
-    ) -> Bool {
-        request.title != nil
-            || request.description != nil
-            || request.acceptanceCriteria != nil
-            || request.expectedArtifacts != nil
-            || request.owner != .unchanged
-            || request.dependsOn != nil
-            || request.priority != nil
-            || request.isRetry
-            || request.status == .ready
-            || request.status == .cancelled
-    }
-
-    private static func hasLegacyFrozenWorkTaskContractFields(
-        _ request: WorkTaskUpdateRequest
-    ) -> Bool {
-        request.title != nil
-            || request.description != nil
-            || request.acceptanceCriteria != nil
-            || request.expectedArtifacts != nil
-            || request.owner != .unchanged
-            || request.dependsOn != nil
-            || request.priority != nil
-    }
-
-    /// Proves that a legacy built-in task_update request was rejected before
-    /// Orchestrator's first WorkTask EventLog append. The proof is intentionally
-    /// based on exact raw-argument identity and durable pre-prepare state; it
-    /// never parses a later free-form error message.
-    private static func legacyTaskUpdatePreflightNoEffectReason(
-        prepared: ToolExecutionPreparedPayload,
-        toolCallsBeforePrepare: [ToolCallPayload],
-        intent: PermissionIntent,
-        workTaskID: WorkTaskID,
-        expectedRevision: Int,
-        prefix: CoworkProjection
-    ) -> String? {
-        guard toolCallsBeforePrepare.count == 1,
-              let toolCall = toolCallsBeforePrepare.first,
-              toolCall.name == "task_update",
-              toolCall.agent == prepared.agent,
-              toolCall.argsRedacted == false,
-              let argumentDigest = toolCall.argsDigest,
-              ToolRegistry.authorizationDigest(toolCall.args) == argumentDigest,
-              let authorization = prepared.authorization,
-              intent.action == "task.update",
-              authorization.membership == .granted,
-              authorization.concreteToolID.hasSuffix("/task_update"),
-              authorization.toolName == "task_update",
-              authorization.canonicalAction == "task.update",
-              authorization.canonicalPermission == "task.update",
-              authorization.toolCallID == prepared.toolCallID,
-              authorization.agent == prepared.agent,
-              authorization.taskID == prepared.taskID,
-              authorization.intent == intent,
-              authorization.sideEffect == .write,
-              authorization.replayPolicy == .requiresManualReconciliation,
-              authorization.normalizedArgumentsDigest == argumentDigest,
-              let invocationTaskID = prepared.taskID,
-              let requestingAgent = prepared.agent,
-              let invocationContract = prefix.tasks[invocationTaskID]?.contract,
-              invocationContract.id == invocationTaskID,
-              invocationContract.assignee == requestingAgent,
-              invocationContract.continuationRunID
-                == prefix.workTasks[workTaskID]?.runID,
-              let capabilityLeaseID = authorization.capabilityLeaseID,
-              capabilityLeaseID == invocationContract.capabilityLeaseID,
-              let capabilityLease = prefix.capabilityLeases[capabilityLeaseID],
-              prefix.capabilityLeaseAgents[capabilityLeaseID] == requestingAgent,
-              capabilityLease.taskID == nil
-                || capabilityLease.taskID == invocationTaskID,
-              authorization.capabilityTaskID == capabilityLease.taskID,
-              let request = try? TaskUpdateTool.decodeRequest(
-                ToolArgs(raw: toolCall.args)),
-              request.taskID == workTaskID,
-              request.expectedRevision == expectedRevision,
-              let durableTaskBeforePrepare = prefix.workTasks[workTaskID] else {
-            return nil
-        }
-
-        guard durableTaskBeforePrepare.revision == expectedRevision else {
-            // A lower revision might advance to the requested revision while
-            // waiting for admission, so it cannot prove a no-effect outcome.
-            return nil
-        }
-
-        let isWorkerLease =
-            capabilityLease.tools.contains(.updateOwnedWorkTask)
-                && !capabilityLease.tools.contains(.manageWorkTasks)
-                && authorization.requiredCapabilities.contains(.updateOwnedWorkTask)
-        if isWorkerLease,
-           hasLegacyWorkerProhibitedWorkTaskUpdateFields(request) {
-            return "permission_denied: legacy worker task_update supplied frozen "
-                + "contract/control fields and was deterministically rejected before "
-                + "the WorkTask mutation boundary; no side effect was applied. "
-                + "Read task_get, then retry with only progress, status, result, and evidence."
-        }
-
-        let isManagerLease =
-            capabilityLease.tools.contains(.manageWorkTasks)
-                && authorization.requiredCapabilities.contains(.manageWorkTasks)
-        if isManagerLease,
-           durableTaskBeforePrepare.status == .inProgress,
-           hasLegacyFrozenWorkTaskContractFields(request) {
-            return "permission_denied: legacy manager task_update supplied fields from "
-                + "an in-progress WorkTask's frozen execution contract and was "
-                + "deterministically rejected before the WorkTask mutation boundary; "
-                + "no side effect was applied. Read task_get, then retry without contract fields."
-        }
-        return nil
-    }
-
-    /// Produces additive compatibility settlements for legacy unresolved
-    /// task_update failures whose lack of effect can be proven from durable
-    /// history alone.
-    static func provenTaskUpdateNoEffectSettlementEvents(
-        events: [Envelope],
-        projection: CoworkProjection
-    ) -> [Event] {
-        // A current Goal still follows the pre-existing automatic-continuation
-        // lifecycle on startup. Do not let this compatibility repair silently
-        // remove its only recovery fence until current-Goal reconciliation and
-        // explicit Resume semantics are implemented as their own migration.
-        guard projection.currentGoal == nil else { return [] }
-
-        let latestToolResultSeq = events.reduce(into: [String: Int]()) { result, envelope in
-            guard case .toolResult(let payload) = envelope.event else { return }
-            result[payload.toolCallId] = max(result[payload.toolCallId] ?? -1, envelope.seq)
-        }
-        let executionIDsWithSettlement = Set(events.compactMap { envelope -> String? in
-            guard case .toolExecutionSettled(let payload) = envelope.event else { return nil }
-            return payload.executionID
-        })
-        var prefix = CoworkProjection()
-        var toolCallsByID: [String: [ToolCallPayload]] = [:]
-        var recoveryEvents: [Event] = []
-
-        for envelope in events {
-            defer {
-                prefix.apply(envelope)
-                if case .toolCall(let payload) = envelope.event {
-                    toolCallsByID[payload.toolCallId, default: []].append(payload)
-                }
-            }
-            guard case .toolExecutionPrepared(let prepared) = envelope.event,
-                  let currentExecution = projection.toolExecutions[prepared.executionID],
-                  currentExecution.preparedSeq == envelope.seq,
-                  currentExecution.prepared == prepared,
-                  !currentExecution.hasAmbiguousDurableHistory,
-                  currentExecution.validatedSettlement == nil,
-                  !executionIDsWithSettlement.contains(prepared.executionID),
-                  prepared.tool == "task_update",
-                  prepared.sideEffect == .write,
-                  prepared.replayPolicy == .requiresManualReconciliation,
-                  let intent = prepared.intent,
-                  intent.controlEffects.contains(.updateTask)
-                    || intent.controlEffects.contains(.cancelTask),
-                  case .number(let rawExpectedRevision)? =
-                    intent.metadata["expectedRevision"],
-                  rawExpectedRevision.isFinite,
-                  rawExpectedRevision >= 0,
-                  rawExpectedRevision < 9_007_199_254_740_992,
-                  rawExpectedRevision.rounded(.towardZero) == rawExpectedRevision else {
-                continue
-            }
-            let taskResources = intent.resources.filter { $0.kind == .task }
-            guard taskResources.count == 1,
-                  !taskResources[0].value.isEmpty else { continue }
-            let workTaskID = WorkTaskID(rawValue: taskResources[0].value)
-            let expectedRevision = Int(rawExpectedRevision)
-            guard let durableTaskBeforePrepare = prefix.workTasks[workTaskID] else {
-                continue
-            }
-            let reason: String?
-            if durableTaskBeforePrepare.revision > expectedRevision {
-                // Optimistic concurrency alone proves the executor could not
-                // cross the mutation boundary, even for older logs that did
-                // not retain exact raw-argument identity.
-                reason = "stale_revision: WorkTask \(workTaskID.rawValue) expected revision "
-                    + "\(expectedRevision), but durable revision "
-                    + "\(durableTaskBeforePrepare.revision) was already committed before execution; "
-                    + "no side effect was applied. Read task_get before retrying."
-            } else {
-                reason = legacyTaskUpdatePreflightNoEffectReason(
-                    prepared: prepared,
-                    toolCallsBeforePrepare: toolCallsByID[prepared.toolCallID] ?? [],
-                    intent: intent,
-                    workTaskID: workTaskID,
-                    expectedRevision: expectedRevision,
-                    prefix: prefix)
-            }
-            guard let reason else { continue }
-
-            if (latestToolResultSeq[prepared.toolCallID] ?? -1) <= envelope.seq {
-                recoveryEvents.append(.toolResult(ToolResultPayload(
-                    toolCallId: prepared.toolCallID,
-                    observation: "tool error: \(reason)")))
-            }
-            recoveryEvents.append(.toolExecutionSettled(ToolExecutionSettledPayload(
-                prepared: prepared,
-                outcome: .failed,
-                effectDisposition: .notStarted,
-                reason: reason)))
-        }
-        return recoveryEvents
     }
 
     /// Atomically consumes one composer-frozen `@main` binding with the root
@@ -3742,7 +3497,7 @@ public actor Orchestrator {
                 // leaving mailbox/delegation admission open.
                 _ = try await closeRootRunIfNeeded(
                     for: runningTask,
-                    outcome: .cancelled,
+                    outcome: Self.cancellationRunOutcome(source: runCloseSource),
                     source: runCloseSource,
                     reason: normalizedReason)
             } catch {
@@ -3772,7 +3527,7 @@ public actor Orchestrator {
         do {
             _ = try await closeRootRunIfNeeded(
                 for: task,
-                outcome: .cancelled,
+                outcome: Self.cancellationRunOutcome(source: runCloseSource),
                 source: runCloseSource,
                 reason: reason)
         } catch {
@@ -4161,7 +3916,7 @@ public actor Orchestrator {
             do {
                 _ = try await closeRootRunIfNeeded(
                     for: scheduledTask(for: rootNode),
-                    outcome: .cancelled,
+                    outcome: Self.cancellationRunOutcome(source: runCloseSource),
                     source: runCloseSource,
                     reason: reason)
             } catch {
@@ -4191,7 +3946,7 @@ public actor Orchestrator {
             do {
                 _ = try await closeRootRunIfNeeded(
                     for: scheduledTask(for: rootNode),
-                    outcome: .cancelled,
+                    outcome: Self.cancellationRunOutcome(source: runCloseSource),
                     source: runCloseSource,
                     reason: reason)
             } catch {
@@ -5300,6 +5055,7 @@ public actor Orchestrator {
     func delegateAuthorizedTask(
         from: AgentID,
         authorization: ResolvedToolAuthorization,
+        executionID: String,
         to reviewedTarget: String,
         workTaskID: WorkTaskID? = nil,
         objective: String? = nil,
@@ -5324,10 +5080,6 @@ public actor Orchestrator {
         if let failure = authorizationRevalidationFailure(authorization) {
             return "error: \(failure)"
         }
-        guard case .string(let targetResolution)? =
-            authorization.intent.metadata["targetResolution"] else {
-            return "error: delegate_task authorization has no target resolution"
-        }
         guard let delegatedKnowledgeGrant = Self.delegatedKnowledgeGrant(
             from: authorization) else {
             return "error: delegate_task Knowledge capability authorization is invalid"
@@ -5341,7 +5093,7 @@ public actor Orchestrator {
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .nilIfEmpty
         guard let effectiveObjective = suppliedObjective ?? durableTask?.description.nilIfEmpty else {
-            return "error: delegate_task requires a ready WorkTask or a non-empty legacy objective"
+            return "error: delegate_task requires a ready WorkTask or a non-empty unscoped objective"
         }
 
         guard !automaticDelegationReservations.contains(target) else {
@@ -5355,43 +5107,13 @@ public actor Orchestrator {
         ) {
             return "error: \(failure)"
         }
-        let createdForDelegation: Bool
-        let targetFingerprint: String
-        switch targetResolution {
-        case "reuse_existing":
-            guard let existing = registry.agent(target) else {
-                return "error: reviewed delegation target is no longer attached"
-            }
-            guard case .string(let reviewedFingerprint)? =
-                    authorization.intent.metadata["targetFingerprint"],
-                  delegationTargetFingerprint(existing) == reviewedFingerprint else {
-                return "error: reviewed delegation target identity changed"
-            }
-            targetFingerprint = reviewedFingerprint
-            createdForDelegation = false
-        case "create_proposed":
-            guard let requester = registry.agent(from) else {
-                return "error: delegating agent is not attached"
-            }
-            let spawned = await spawnFromTool(
-                requestedBy: from,
-                currentTaskID: parentTaskID,
-                name: target.rawValue,
-                path: requester.workspaceRoot.path,
-                model: requester.model.rawValue,
-                agentInferenceBinding: authorization.targetAgentInferenceBinding,
-                delegationAuthorization: authorization,
-                canCoordinate: false)
-            guard spawned.hasPrefix("spawned @"),
-                  let materialized = registry.agent(target) else {
-                return spawned.lowercased().hasPrefix("error:")
-                    ? spawned
-                    : "error: reviewed delegation worker could not be created"
-            }
-            targetFingerprint = delegationTargetFingerprint(materialized)
-            createdForDelegation = true
-        default:
-            return "error: delegate_task target resolution is invalid"
+        guard let existing = registry.agent(target) else {
+            return "error: reviewed delegation target is no longer attached"
+        }
+        guard case .string(let targetFingerprint)? =
+                authorization.intent.metadata["targetFingerprint"],
+              delegationTargetFingerprint(existing) == targetFingerprint else {
+            return "error: reviewed delegation target identity changed"
         }
 
         let authorizedAdmission = AuthorizedDelegationAdmission(
@@ -5399,7 +5121,6 @@ public actor Orchestrator {
             target: target,
             binding: authorization.targetAgentInferenceBinding,
             targetFingerprint: targetFingerprint,
-            materializedProposedTarget: createdForDelegation,
             knowledgeCapabilities: delegatedKnowledgeGrant.capabilities,
             workspaceAccess: delegatedKnowledgeGrant.workspaceAccess)
 
@@ -5416,13 +5137,9 @@ public actor Orchestrator {
             },
             parentTaskID: parentTaskID,
             replyMode: .taskReport,
-            authorizedAdmission: authorizedAdmission)
+            authorizedAdmission: authorizedAdmission,
+            invocationTaskID: Self.delegationInvocationTaskID(executionID))
         guard let taskID = queued.taskID else {
-            if createdForDelegation {
-                _ = await detach(
-                    target,
-                    reason: "authorized delegate admission failed; worker rolled back")
-            }
             return queued.message
         }
         scheduledReplyTargets[taskID] = from
@@ -5448,13 +5165,12 @@ public actor Orchestrator {
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .nilIfEmpty
         guard let effectiveObjective = suppliedObjective ?? durableTask?.description.nilIfEmpty else {
-            return "error: delegate_task requires a ready WorkTask or a non-empty legacy objective"
+            return "error: delegate_task requires a ready WorkTask or a non-empty unscoped objective"
         }
         guard let resolution = await resolveDelegationTarget(
             requestedBy: from,
-            currentTaskID: parentTaskID,
             requestedTarget: requestedTarget) else {
-            return "error: no delegation worker is available and Intatis could not create one"
+            return "error: no available attached delegation worker; spawn one in an earlier tool-call round"
         }
         let target = resolution.agent
         defer {
@@ -5476,11 +5192,6 @@ public actor Orchestrator {
             parentTaskID: parentTaskID,
             replyMode: .taskReport)
         guard let taskID = queued.taskID else {
-            if resolution.createdForDelegation {
-                _ = await detach(
-                    target,
-                    reason: "automatic delegate admission failed; worker rolled back")
-            }
             return queued.message
         }
         scheduledReplyTargets[taskID] = from
@@ -5492,10 +5203,8 @@ public actor Orchestrator {
     }
 
     private func resolveDelegationTarget(requestedBy: AgentID,
-                                         currentTaskID: TaskID?,
                                          requestedTarget: String?) async -> (
         agent: AgentID,
-        createdForDelegation: Bool,
         automaticallyReserved: Bool
     )? {
         guard let requester = registry.agent(requestedBy) else { return nil }
@@ -5507,18 +5216,9 @@ public actor Orchestrator {
                   requestedID != Self.automaticPermissionReviewerID else { return nil }
             if let existing = registry.agent(requestedID),
                inferenceBindingIsReady(existing) {
-                return (requestedID, false, false)
+                return (requestedID, false)
             }
-            let spawned = await spawnFromTool(
-                requestedBy: requestedBy,
-                currentTaskID: currentTaskID,
-                name: normalized,
-                path: requester.workspaceRoot.path,
-                model: requester.model.rawValue,
-                canCoordinate: false)
-            return spawned.hasPrefix("spawned @") && registry.agent(requestedID) != nil
-                ? (requestedID, true, false)
-                : nil
+            return nil
         }
 
         if let idle = registry.all()
@@ -5535,24 +5235,9 @@ public actor Orchestrator {
             .sorted(by: { $0.name.rawValue < $1.name.rawValue })
             .first {
             automaticDelegationReservations.insert(idle.name)
-            return (idle.name, false, true)
+            return (idle.name, true)
         }
-
-        let generatedName = nextAutomaticWorkerName()
-        let generatedID = AgentID(rawValue: generatedName)
-        automaticDelegationReservations.insert(generatedID)
-        let spawned = await spawnFromTool(
-            requestedBy: requestedBy,
-            currentTaskID: currentTaskID,
-            name: generatedName,
-            path: requester.workspaceRoot.path,
-            model: requester.model.rawValue,
-            canCoordinate: false)
-        guard spawned.hasPrefix("spawned @"), registry.agent(generatedID) != nil else {
-            automaticDelegationReservations.remove(generatedID)
-            return nil
-        }
-        return (generatedID, true, true)
+        return nil
     }
 
     private func isAgentAvailableForDelegation(_ agentID: AgentID) -> Bool {
@@ -5567,16 +5252,8 @@ public actor Orchestrator {
         }
     }
 
-    private func nextAutomaticWorkerName() -> String {
-        for index in 1...taskGraph.policy.maxActiveAgentsPerThread {
-            let candidate = "worker-\(index)"
-            let candidateID = AgentID(rawValue: candidate)
-            if registry.agent(candidateID) == nil,
-               !automaticDelegationReservations.contains(candidateID) {
-                return candidate
-            }
-        }
-        return "worker-\(IDGen.random(prefix: "auto").suffix(8))"
+    private static func delegationInvocationTaskID(_ executionID: String) -> TaskID {
+        TaskID(rawValue: "task_delegate_" + executionID)
     }
 
     func enqueueDelegatedTask(from: AgentID,
@@ -5596,7 +5273,8 @@ public actor Orchestrator {
             expectedDeliverable: expectedDeliverable,
             parentTaskID: parentTaskID,
             replyMode: replyMode,
-            authorizedAdmission: nil)
+            authorizedAdmission: nil,
+            invocationTaskID: nil)
     }
 
     private func enqueueDelegatedTask(
@@ -5608,14 +5286,17 @@ public actor Orchestrator {
         expectedDeliverable: String? = nil,
         parentTaskID: TaskID? = nil,
         replyMode: TaskReplyMode = .taskReport,
-        authorizedAdmission: AuthorizedDelegationAdmission?
+        authorizedAdmission: AuthorizedDelegationAdmission?,
+        invocationTaskID: TaskID?
     ) async -> (taskID: TaskID?, message: String) {
         let normalizedName = Self.normalizedAgentName(toName)
         let to = AgentID(rawValue: normalizedName)
         guard to != Self.automaticPermissionReviewerID else {
             return (nil, "@\(Self.automaticPermissionReviewerID.rawValue) is reserved for automatic permission review")
         }
-        guard let toAgent = registry.agent(to) else { return (nil, "no such agent: \(toName)") }
+        guard let targetBeforeMediation = registry.agent(to) else {
+            return (nil, "no such agent: \(toName)")
+        }
         if let authorizedAdmission,
            let failure = finalDelegationAuthorizationFailure(
                authorizedAdmission,
@@ -5631,28 +5312,24 @@ public actor Orchestrator {
             parentTaskID: parentTaskID) {
             return (nil, "error: \(delegationFailure)")
         }
-        guard let mediatedObjective = await bus.deliver(
-            from: from,
-            to: to,
-            content: objective) else {
-            return (nil, "your delegated task was blocked by the mediator")
-        }
-
-        // Mediation is an actor-reentrant await. Resolve the exact target again
-        // outside the admission lock, then compare the same immutable route and
-        // authorization snapshot under the lock before any task fact is made
-        // durable or visible to the scheduler.
         if authorizedAdmission != nil, requiresInferenceBindings {
-            guard let targetBeforeAdmission = registry.agent(to) else {
-                return (nil, "error: reviewed delegation target is no longer attached")
-            }
             do {
-                _ = try await resolvedProvider(for: targetBeforeAdmission)
+                _ = try await resolvedProvider(for: targetBeforeMediation)
             } catch {
                 return (nil, "error: selected inference profile revision is unavailable or incompatible")
             }
         }
+        guard let mediatedObjective = await bus.mediate(
+            from: from,
+            to: to,
+            content: objective) else {
+            return (nil, "error: delegated task was blocked by the mediator")
+        }
 
+        // Mediation and exact provider resolution may suspend on external
+        // actors. Keep them outside the admission lock, then repeat every
+        // mutable-state check while holding the lock before the one EventLog
+        // batch. Authorized calls retain their target reservation throughout.
         await acquireAdmissionLock()
         defer { releaseAdmissionLock() }
         if workTaskID != nil, let workTaskRecoveryFailure {
@@ -5685,10 +5362,28 @@ public actor Orchestrator {
                   callerLease.tools.contains(.manageWorkTasks) else {
                 return (nil, "error: the current capability lease cannot delegate durable WorkTasks")
             }
-            guard task.status == .ready else {
-                return (nil, "error: WorkTask \(workTaskID.rawValue) is \(task.status.rawValue), not ready")
+            boundWorkTask = task
+        } else {
+            boundWorkTask = nil
+        }
+        let resolvedInvocationTaskID = invocationTaskID ?? TaskID.new()
+        if let existing = taskGraph.node(resolvedInvocationTaskID) {
+            guard existing.contract.issuer == from,
+                  existing.contract.assignee == to,
+                  existing.contract.parentTaskID == parentTaskID,
+                  existing.contract.workTaskID == workTaskID,
+                  existing.contract.objective == mediatedObjective else {
+                return (nil, "error: delegate execution identity is already bound to a different invocation")
             }
-            switch workTaskGraph.readiness(of: workTaskID) {
+            return (
+                existing.id,
+                "task already admitted: \(existing.id.rawValue)")
+        }
+        if let task = boundWorkTask {
+            guard task.status == .ready || task.status == .inProgress else {
+                return (nil, "error: WorkTask \(task.id.rawValue) is \(task.status.rawValue), not delegatable")
+            }
+            switch workTaskGraph.readiness(of: task.id) {
             case .success(.ready):
                 break
             case .success(.waitingFor(let dependencies)):
@@ -5700,19 +5395,15 @@ public actor Orchestrator {
             case .failure(let violation):
                 return (nil, "error: \(violation.message)")
             }
-            if let parentTaskID, let parent = taskGraph.node(parentTaskID)?.contract {
-                if let parentRunID = parent.continuationRunID, task.runID != parentRunID {
-                    return (nil, "error: WorkTask is outside the current ContinuationRun")
-                }
-                if let parentGoalID = parent.goalID, task.goalID != parentGoalID {
-                    return (nil, "error: WorkTask is outside the current Goal")
-                }
+            if let activeInvocationID = task.latestInvocationIDs.first(where: {
+                guard let node = taskGraph.node($0) else { return false }
+                return Self.isActiveTaskStatus(node.status)
+            }) {
+                return (nil, "error: WorkTask already has active invocation \(activeInvocationID.rawValue)")
             }
-            boundWorkTask = task
-        } else {
-            boundWorkTask = nil
         }
         let prepared = prepareDelegatedTask(
+            taskID: resolvedInvocationTaskID,
             issuer: from,
             assignee: currentTarget,
             workTask: boundWorkTask,
@@ -5760,34 +5451,6 @@ public actor Orchestrator {
         case .success(let accepted):
             admission = accepted
         case .failure(let violation):
-            try? await log.append(.error(ErrorPayload(
-                code: "task_graph_rejected",
-                message: violation.message)))
-            try? await log.append(.delegationRejected(DelegationRejectedPayload(
-                requester: from,
-                assignee: toAgent.name,
-                objective: contract.objective,
-                reason: violation.message,
-                violationKind: violation.kind.rawValue,
-                metadata: taskMetadata(
-                    contract: contract,
-                    rootTaskID: parentTaskID ?? contract.id,
-                    parentTaskID: parentTaskID,
-                    sender: from,
-                    recipient: toAgent.name))))
-            try? await log.append(.taskRejected(TaskRejectedPayload(
-                contract: contract,
-                requester: from,
-                assignee: toAgent.name,
-                objective: contract.objective,
-                reason: violation.message,
-                violationKind: violation.kind.rawValue,
-                metadata: taskMetadata(
-                    contract: contract,
-                    rootTaskID: parentTaskID ?? contract.id,
-                    parentTaskID: parentTaskID,
-                    sender: from,
-                    recipient: toAgent.name))))
             return (nil, Self.delegationRejectionMessage(for: violation))
         }
 
@@ -5818,80 +5481,84 @@ public actor Orchestrator {
         var preflightWorkTaskGraph = workTaskGraph
         var workTaskEvents: [Event] = []
         if let boundWorkTask {
-            let started: WorkTask
-            switch preflightWorkTaskGraph.transition(
-                taskID: boundWorkTask.id,
-                to: .inProgress,
-                expectedRevision: boundWorkTask.revision,
-                owner: currentTarget.name,
-                progressNote: "delegated to @\(currentTarget.name.rawValue)") {
-            case .success(let task):
-                started = task
-            case .failure(let violation):
-                return (nil, "error: WorkTask admission failed: \(violation.message)")
+            let taskToLink: WorkTask
+            if boundWorkTask.status == .ready {
+                switch preflightWorkTaskGraph.transition(
+                    taskID: boundWorkTask.id,
+                    to: .inProgress,
+                    expectedRevision: boundWorkTask.revision,
+                    progressNote: "delegated to @\(currentTarget.name.rawValue)") {
+                case .success(let started):
+                    taskToLink = started
+                    workTaskEvents.append(
+                        .workTaskStarted(WorkTaskStartedPayload(task: started)))
+                case .failure(let violation):
+                    return (nil, "error: WorkTask admission failed: \(violation.message)")
+                }
+            } else {
+                taskToLink = boundWorkTask
             }
             let linked: WorkTask
             switch preflightWorkTaskGraph.linkInvocation(
-                taskID: started.id,
+                taskID: taskToLink.id,
                 invocationID: contract.id,
-                expectedRevision: started.revision) {
+                expectedRevision: taskToLink.revision) {
             case .success(let task):
                 linked = task
             case .failure(let violation):
                 return (nil, "error: WorkTask invocation link failed: \(violation.message)")
             }
-            workTaskEvents = [
-                .workTaskStarted(WorkTaskStartedPayload(task: started)),
+            workTaskEvents.append(
                 .workTaskInvocationLinked(WorkTaskInvocationLinkedPayload(
                     task: linked,
-                    invocationID: contract.id)),
-            ]
+                    invocationID: contract.id)))
         }
         do {
             try await appendAdmissionEvents([
+                .agentToAgentMessage(AgentToAgentMessagePayload(
+                    from: from,
+                    to: currentTarget.name,
+                    content: mediatedObjective,
+                    mediated: true)),
+                .permissionReview(PermissionReviewPayload(
+                    agent: from,
+                    tool: "agent_forward",
+                    reviewerModel: "mediator",
+                    decision: .allow,
+                    risk: .low,
+                    reason: "forwarded after mediation")),
                 .delegationApproved(DelegationApprovedPayload(
-                contract: contract,
-                metadata: metadata)),
+                    contract: contract,
+                    metadata: metadata)),
                 .capabilityLeaseCreated(CapabilityLeaseCreatedPayload(
-                agent: currentTarget.name,
-                lease: prepared.capabilityLease,
-                metadata: metadata)),
+                    agent: currentTarget.name,
+                    lease: prepared.capabilityLease,
+                    metadata: metadata)),
                 .workspaceLeaseGranted(WorkspaceLeaseGrantedPayload(
-                agent: currentTarget.name,
-                lease: prepared.workspaceLease,
-                metadata: metadata)),
+                    agent: currentTarget.name,
+                    lease: prepared.workspaceLease,
+                    metadata: metadata)),
                 .taskCreated(TaskCreatedPayload(contract: contract, metadata: metadata)),
                 .taskAssigned(TaskAssignedPayload(contract: contract, metadata: metadata)),
                 .taskDelegated(TaskDelegatedPayload(contract: contract, metadata: metadata)),
                 .taskQueued(TaskQueuedPayload(
-                contract: contract,
-                rootTaskID: scheduled.rootTaskID,
-                parentTaskID: scheduled.parentTaskID,
-                issuer: scheduled.issuer,
-                assignee: scheduled.assignee,
-                causalParentID: scheduled.causalParentID,
-                hopCount: scheduled.hopCount,
-                visitedAgents: scheduled.visitedAgents,
-                attempt: 1,
+                    contract: contract,
+                    rootTaskID: scheduled.rootTaskID,
+                    parentTaskID: scheduled.parentTaskID,
+                    issuer: scheduled.issuer,
+                    assignee: scheduled.assignee,
+                    causalParentID: scheduled.causalParentID,
+                    hopCount: scheduled.hopCount,
+                    visitedAgents: scheduled.visitedAgents,
+                    attempt: 1,
                     reason: "delegation admitted",
                     metadata: metadata)),
             ] + workTaskEvents)
         } catch {
-            await persistUncommittedAdmissionCancellation(
-                task: scheduled,
-                reason: "delegated task admission could not be persisted: \(error.localizedDescription)",
-                metadata: metadata)
-            try? await log.append(.error(ErrorPayload(
-                code: "delegation_admission_persistence_failed",
-                message: error.localizedDescription)))
             return (nil, "error: delegated task admission could not be persisted")
         }
-        guard case .success = taskGraph.addTask(contract),
-              taskGraph.updateStatus(taskID: contract.id, status: .assigned),
-              scheduler.enqueue(scheduled, mode: .newTask).accepted,
-              taskGraph.updateStatus(taskID: contract.id, status: .queued) else {
-            return (nil, "error: delegated task admission could not be committed after persistence")
-        }
+        taskGraph = preflightGraph
+        scheduler = preflightScheduler
         capabilityLeases[prepared.capabilityLease.id] = prepared.capabilityLease
         workspaceLeases[prepared.workspaceLease.id] = prepared.workspaceLease
         workTaskGraph = preflightWorkTaskGraph
@@ -5938,14 +5605,14 @@ public actor Orchestrator {
                 code = "permission_denied"
                 recovery = "Use only a capability lease that can manage WorkTasks."
             case .notFound:
-                code = "owner_not_attached"
-                recovery = "Omit owner so the current caller owns the new WorkTask, or first confirm the agent with list_agents or a successful spawn_agent ToolResult and retry task_create in a later tool-call round."
+                code = "not_found"
+                recovery = "Refresh the current Session WorkTask state before retrying."
             case .decoding:
                 code = "invalid_create"
                 recovery = "Correct the task_create arguments and retry."
             case .config:
                 code = "invalid_state"
-                recovery = "Refresh the current run and WorkTask state before retrying."
+                recovery = "Refresh the current Session WorkTask state before retrying."
             case .provider:
                 code = "provider_error"
                 recovery = "Refresh the authoritative WorkTask state before retrying."
@@ -5965,10 +5632,7 @@ public actor Orchestrator {
             message: "task_create rejected without creating a WorkTask: \(error.localizedDescription). \(recovery)")
     }
 
-    func createWorkTask(requestedBy: AgentID,
-                        currentRunID: ContinuationRunID?,
-                        currentGoalID: GoalID?,
-                        canManage: Bool,
+    func createWorkTask(canManage: Bool,
                         request: WorkTaskCreateRequest,
                         provePreflightRejectionHasNoEffect: Bool = false) async throws -> WorkTaskDetail {
         await acquireAdmissionLock()
@@ -5981,9 +5645,6 @@ public actor Orchestrator {
             guard canManage else {
                 throw IntatisError.permissionDenied("the current capability lease cannot create WorkTasks")
             }
-            guard let currentRunID else {
-                throw IntatisError.config("task_create requires a current ContinuationRun")
-            }
             let title = request.title.trimmingCharacters(in: .whitespacesAndNewlines)
             let description = request.description.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !title.isEmpty, !description.isEmpty else {
@@ -5991,23 +5652,14 @@ public actor Orchestrator {
             }
             try requireValidWorkTaskGraph()
 
-            let owner = request.owner ?? requestedBy
-            guard owner != Self.automaticPermissionReviewerID,
-                  registry.agent(owner) != nil else {
-                throw IntatisError.notFound("WorkTask owner is not an attached data-plane agent")
-            }
-
             var preflight = workTaskGraph
             var proposed = WorkTask(
-                runID: currentRunID,
-                goalID: currentGoalID,
                 title: title,
                 description: description,
                 acceptanceCriteria: request.acceptanceCriteria,
                 expectedArtifacts: request.expectedArtifacts,
                 status: .pending,
                 priority: request.priority,
-                owner: owner,
                 dependsOn: request.dependsOn)
             switch preflight.add(proposed) {
             case .success:
@@ -6086,16 +5738,6 @@ public actor Orchestrator {
         if normalized.expectedArtifacts == current.expectedArtifacts {
             normalized.expectedArtifacts = nil
         }
-        switch normalized.owner {
-        case .unchanged:
-            break
-        case .unassigned where current.owner == nil:
-            normalized.owner = .unchanged
-        case .agent(let owner) where current.owner == owner:
-            normalized.owner = .unchanged
-        case .unassigned, .agent:
-            break
-        }
         if normalized.dependsOn == current.dependsOn {
             normalized.dependsOn = nil
         }
@@ -6149,11 +5791,9 @@ public actor Orchestrator {
             message: "task_update rejected without applying changes: \(error.localizedDescription). Call task_get for task_id \"\(request.taskID.rawValue)\", then retry with the authoritative revision and only the fields that must change.")
     }
 
-    func updateWorkTask(requestedBy: AgentID,
-                        currentWorkTaskID: WorkTaskID?,
-                        currentRunID: ContinuationRunID?,
+    func updateWorkTask(currentWorkTaskID: WorkTaskID?,
                         canManage: Bool,
-                        canUpdateOwned: Bool,
+                        canUpdateBound: Bool,
                         request: WorkTaskUpdateRequest,
                         provePreflightRejectionHasNoEffect: Bool = false) async throws -> WorkTaskDetail {
         await acquireAdmissionLock()
@@ -6168,31 +5808,27 @@ public actor Orchestrator {
             guard let current = workTaskGraph.task(request.taskID) else {
                 throw IntatisError.notFound("WorkTask \(request.taskID.rawValue)")
             }
-            guard current.runID == currentRunID else {
-                throw IntatisError.permissionDenied("only WorkTasks in the current ContinuationRun can be updated")
-            }
             let normalizedRequest =
                 Self.normalizingRepeatedWorkTaskContractFields(
                     request,
                     against: current)
             if !canManage {
-                guard canUpdateOwned,
-                      currentWorkTaskID == current.id,
-                      current.owner == requestedBy else {
-                    throw IntatisError.permissionDenied("workers may update only their assigned WorkTask")
+                guard canUpdateBound,
+                      currentWorkTaskID == current.id else {
+                    throw IntatisError.permissionDenied(
+                        "workers may update only the WorkTask bound to their current AgentInvocation")
                 }
                 guard normalizedRequest.title == nil,
                       normalizedRequest.description == nil,
                       normalizedRequest.acceptanceCriteria == nil,
                       normalizedRequest.expectedArtifacts == nil,
-                      normalizedRequest.owner == .unchanged,
                       normalizedRequest.dependsOn == nil,
                       normalizedRequest.priority == nil,
                       !normalizedRequest.isRetry,
                       normalizedRequest.status != .ready,
                       normalizedRequest.status != .cancelled else {
                     throw IntatisError.permissionDenied(
-                        "workers cannot change WorkTask graph, ownership, priority, retry, or cancellation state")
+                        "workers cannot change WorkTask graph, priority, retry, or cancellation state")
                 }
             }
             if current.status == .inProgress {
@@ -6208,9 +5844,6 @@ public actor Orchestrator {
                 }
                 if normalizedRequest.expectedArtifacts != nil {
                     changedContractFields.append("expected_artifacts")
-                }
-                if normalizedRequest.owner != .unchanged {
-                    changedContractFields.append("owner")
                 }
                 if normalizedRequest.dependsOn != nil {
                     changedContractFields.append("depends_on")
@@ -6229,7 +5862,6 @@ public actor Orchestrator {
                 || normalizedRequest.description != nil
                 || normalizedRequest.acceptanceCriteria != nil
                 || normalizedRequest.expectedArtifacts != nil
-                || normalizedRequest.owner != .unchanged
                 || normalizedRequest.dependsOn != nil
                 || normalizedRequest.priority != nil
                 || normalizedRequest.progressNote != nil
@@ -6249,18 +5881,6 @@ public actor Orchestrator {
             }
             if let artifacts = normalizedRequest.expectedArtifacts {
                 proposed.expectedArtifacts = artifacts
-            }
-            switch normalizedRequest.owner {
-            case .unchanged:
-                break
-            case .unassigned:
-                proposed.owner = nil
-            case .agent(let owner):
-                guard owner != Self.automaticPermissionReviewerID,
-                      registry.agent(owner) != nil else {
-                    throw IntatisError.notFound("WorkTask owner is not an attached data-plane agent")
-                }
-                proposed.owner = owner
             }
             if let dependencies = normalizedRequest.dependsOn {
                 proposed.dependsOn = dependencies
@@ -6341,232 +5961,7 @@ public actor Orchestrator {
         return workTaskDetail(updated)
     }
 
-    /// Host-only continuation primitive. This is intentionally module-internal
-    /// and is not registered as a model-visible tool.
-    func carryForwardNonterminalWorkTasks(
-        goalID: GoalID,
-        toRunID: ContinuationRunID
-    ) async throws -> [WorkTask] {
-        await acquireAdmissionLock()
-        defer { releaseAdmissionLock() }
-        try requireValidWorkTaskGraph()
-
-        let projection = CoworkProjection.build(from: await log.replay())
-        guard projection.currentGoalID == goalID,
-              let goal = projection.goals[goalID],
-              goal.status == .active else {
-            throw IntatisError.notFound("active current Goal \(goalID.rawValue)")
-        }
-        guard let targetRun = projection.continuationRuns[toRunID],
-              targetRun.sessionID == goal.sessionID,
-              targetRun.goalID == goalID,
-              targetRun.status == .running else {
-            throw IntatisError.config(
-                "carry-forward target ContinuationRun \(toRunID.rawValue) is not a running run of Goal \(goalID.rawValue)")
-        }
-
-        let sources = workTaskGraph.tasks.values
-            .filter {
-                $0.goalID == goalID
-                    && $0.runID != toRunID
-                    && !$0.status.isTerminal
-            }
-            .sorted {
-                if $0.createdAt == $1.createdAt {
-                    return $0.id.rawValue < $1.id.rawValue
-                }
-                return $0.createdAt < $1.createdAt
-            }
-        guard !sources.isEmpty else { return [] }
-        for source in sources {
-            guard let sourceRun = projection.continuationRuns[source.runID],
-                  sourceRun.sessionID == goal.sessionID,
-                  sourceRun.goalID == goalID else {
-                throw IntatisError.config(
-                    "carry-forward source WorkTask \(source.id.rawValue) is not attached to a durable run of Goal \(goalID.rawValue)")
-            }
-        }
-
-        let sourceIDs = Set(sources.map(\.id))
-        if let externalDependent = workTaskGraph.tasks.values
-            .filter({ task in
-                !sourceIDs.contains(task.id)
-                    && !task.status.isTerminal
-                    && task.dependsOn.contains(where: sourceIDs.contains)
-            })
-            .sorted(by: { $0.id.rawValue < $1.id.rawValue })
-            .first {
-            throw IntatisError.config(
-                "cannot carry forward Goal \(goalID.rawValue): nonterminal WorkTask "
-                    + externalDependent.id.rawValue
-                    + " outside the carry set depends on a source task")
-        }
-
-        // IDs are allocated before any graph mutation so every dependency and
-        // cancellation reason is derived from one stable source ordering.
-        var cloneIDs: [WorkTaskID: WorkTaskID] = [:]
-        for source in sources {
-            cloneIDs[source.id] = WorkTaskID.new()
-        }
-
-        let carriedAt = Date()
-        var plans: [(source: WorkTask, initial: WorkTask, blockers: [String])] = []
-        plans.reserveCapacity(sources.count)
-        for source in sources {
-            guard let cloneID = cloneIDs[source.id] else {
-                throw IntatisError.config("carry-forward clone ID allocation failed")
-            }
-            var mappedDependencies: [WorkTaskID] = []
-            var blockers: [String] = []
-            for dependencyID in source.dependsOn {
-                guard let dependency = workTaskGraph.task(dependencyID) else {
-                    throw WorkTaskGraphViolation(
-                        kind: .missingDependency,
-                        message: "dependency does not exist: \(dependencyID.rawValue)",
-                        taskID: source.id,
-                        dependencyID: dependencyID)
-                }
-                if sourceIDs.contains(dependencyID) {
-                    guard let mappedID = cloneIDs[dependencyID] else {
-                        throw IntatisError.config("carry-forward dependency mapping failed")
-                    }
-                    mappedDependencies.append(mappedID)
-                    continue
-                }
-                switch dependency.status {
-                case .completed:
-                    // Completion is already durable evidence; the new run does
-                    // not retain a cross-run edge to it.
-                    break
-                case .failed, .cancelled:
-                    blockers.append(
-                        "dependency \(dependency.id.rawValue) is \(dependency.status.rawValue)")
-                case .pending, .ready, .inProgress, .blocked:
-                    blockers.append(
-                        "dependency \(dependency.id.rawValue) is nonterminal but was not carried forward")
-                }
-            }
-            let clone = WorkTask(
-                id: cloneID,
-                runID: toRunID,
-                goalID: goalID,
-                title: source.title,
-                description: source.description,
-                acceptanceCriteria: source.acceptanceCriteria,
-                expectedArtifacts: source.expectedArtifacts,
-                status: .pending,
-                priority: source.priority,
-                owner: nil,
-                dependsOn: mappedDependencies,
-                createdAt: carriedAt,
-                updatedAt: carriedAt)
-            plans.append((source: source, initial: clone, blockers: blockers.sorted()))
-        }
-
-        var preflight = workTaskGraph
-        var events: [Event] = []
-        events.reserveCapacity(plans.count * 3)
-        for plan in plans {
-            let reason = "carried forward to WorkTask \(plan.initial.id.rawValue) in ContinuationRun \(toRunID.rawValue)"
-            switch preflight.transition(
-                taskID: plan.source.id,
-                to: .cancelled,
-                expectedRevision: plan.source.revision,
-                progressNote: reason) {
-            case .success(let cancelled):
-                events.append(.workTaskCancelled(WorkTaskCancelledPayload(
-                    task: cancelled,
-                    reason: reason)))
-            case .failure(let violation):
-                throw violation
-            }
-        }
-
-        switch WorkTaskGraph.validating(
-            Array(preflight.tasks.values) + plans.map { $0.initial }) {
-        case .success(let graph):
-            preflight = graph
-        case .failure(let violation):
-            throw violation
-        }
-        events.append(contentsOf: plans.map { plan in
-            .workTaskCarriedForward(WorkTaskCarriedForwardPayload(
-                task: plan.initial,
-                sourceTaskID: plan.source.id,
-                sourceRunID: plan.source.runID))
-        })
-
-        var carried: [WorkTask] = []
-        carried.reserveCapacity(plans.count)
-        for plan in plans {
-            let final: WorkTask
-            if !plan.blockers.isEmpty {
-                let blocker = Self.carryForwardBlockerPrefix
-                    + plan.blockers.joined(separator: "; ")
-                switch preflight.transition(
-                    taskID: plan.initial.id,
-                    to: .blocked,
-                    expectedRevision: plan.initial.revision,
-                    progressNote: blocker) {
-                case .success(let blocked):
-                    final = blocked
-                    events.append(.workTaskBlocked(WorkTaskBlockedPayload(
-                        task: blocked,
-                        blocker: blocker)))
-                case .failure(let violation):
-                    throw violation
-                }
-            } else {
-                switch preflight.readiness(of: plan.initial.id) {
-                case .success(.ready):
-                    switch preflight.transition(
-                        taskID: plan.initial.id,
-                        to: .ready,
-                        expectedRevision: plan.initial.revision) {
-                    case .success(let ready):
-                        final = ready
-                        events.append(.workTaskReady(WorkTaskReadyPayload(task: ready)))
-                    case .failure(let violation):
-                        throw violation
-                    }
-                case .success(.waitingFor):
-                    guard let pending = preflight.task(plan.initial.id) else {
-                        throw IntatisError.notFound("carried WorkTask \(plan.initial.id.rawValue)")
-                    }
-                    final = pending
-                case .success(.blockedBy(let dependencies)):
-                    let blocker = Self.carryForwardBlockerPrefix
-                        + "mapped dependency became terminal: "
-                        + dependencies.map(\.rawValue).sorted().joined(separator: ", ")
-                    switch preflight.transition(
-                        taskID: plan.initial.id,
-                        to: .blocked,
-                        expectedRevision: plan.initial.revision,
-                        progressNote: blocker) {
-                    case .success(let blocked):
-                        final = blocked
-                        events.append(.workTaskBlocked(WorkTaskBlockedPayload(
-                            task: blocked,
-                            blocker: blocker)))
-                    case .failure(let violation):
-                        throw violation
-                    }
-                case .failure(let violation):
-                    throw violation
-                }
-            }
-            carried.append(final)
-        }
-
-        try await appendAdmissionEvents(events)
-        workTaskGraph = preflight
-        return carried
-    }
-
-    func getWorkTask(requestedBy: AgentID,
-                     currentWorkTaskID: WorkTaskID?,
-                     currentRunID: ContinuationRunID?,
-                     currentGoalID: GoalID?,
+    func getWorkTask(currentWorkTaskID: WorkTaskID?,
                      canManage: Bool,
                      taskID: WorkTaskID) throws -> WorkTaskDetail {
         try requireValidWorkTaskGraph()
@@ -6575,54 +5970,29 @@ public actor Orchestrator {
         }
         guard canReadWorkTask(
             task,
-            requestedBy: requestedBy,
             currentWorkTaskID: currentWorkTaskID,
-            currentRunID: currentRunID,
-            currentGoalID: currentGoalID,
             canManage: canManage) else {
             throw IntatisError.permissionDenied("WorkTask is outside the caller's readable scope")
         }
         return workTaskDetail(task)
     }
 
-    func listWorkTasks(requestedBy: AgentID,
-                       currentWorkTaskID: WorkTaskID?,
-                       currentRunID: ContinuationRunID?,
-                       currentGoalID: GoalID?,
+    func listWorkTasks(currentWorkTaskID: WorkTaskID?,
                        canManage: Bool,
                        request: WorkTaskListRequest) throws -> [WorkTaskDetail] {
         try requireValidWorkTaskGraph()
         let visible: [WorkTask]
         if canManage {
-            if request.includeGoalHistory {
-                guard let currentGoalID else {
-                    throw IntatisError.permissionDenied("goal history requires a current Goal binding")
-                }
-                visible = workTaskGraph.tasks.values.filter { $0.goalID == currentGoalID }
-            } else if let explicitRunID = request.runID {
-                guard explicitRunID == currentRunID
-                    || (currentGoalID != nil && workTaskGraph.tasks.values.contains {
-                        $0.runID == explicitRunID && $0.goalID == currentGoalID
-                    }) else {
-                    throw IntatisError.permissionDenied("ContinuationRun is outside the current Goal scope")
-                }
-                visible = workTaskGraph.tasks.values.filter { $0.runID == explicitRunID }
-            } else {
-                guard let currentRunID else { return [] }
-                visible = workTaskGraph.tasks.values.filter { $0.runID == currentRunID }
-            }
+            visible = Array(workTaskGraph.tasks.values)
         } else {
             guard let currentWorkTaskID,
-                  let current = workTaskGraph.task(currentWorkTaskID),
-                  current.owner == requestedBy else { return [] }
+                  let current = workTaskGraph.task(currentWorkTaskID) else { return [] }
             let visibleIDs = Set([current.id] + current.dependsOn)
             visible = workTaskGraph.tasks.values.filter { visibleIDs.contains($0.id) }
         }
 
         return visible
             .filter { request.statuses.isEmpty || request.statuses.contains($0.status) }
-            .filter { request.owner == nil || $0.owner == request.owner }
-            .filter { !request.unassignedOnly || $0.owner == nil }
             .sorted {
                 if $0.createdAt == $1.createdAt { return $0.id.rawValue < $1.id.rawValue }
                 return $0.createdAt < $1.createdAt
@@ -6631,18 +6001,11 @@ public actor Orchestrator {
     }
 
     private func canReadWorkTask(_ task: WorkTask,
-                                 requestedBy: AgentID,
                                  currentWorkTaskID: WorkTaskID?,
-                                 currentRunID: ContinuationRunID?,
-                                 currentGoalID: GoalID?,
                                  canManage: Bool) -> Bool {
-        if canManage {
-            return task.runID == currentRunID
-                || (currentGoalID != nil && task.goalID == currentGoalID)
-        }
+        if canManage { return true }
         guard let currentWorkTaskID,
-              let current = workTaskGraph.task(currentWorkTaskID),
-              current.owner == requestedBy else { return false }
+              let current = workTaskGraph.task(currentWorkTaskID) else { return false }
         return task.id == current.id || current.dependsOn.contains(task.id)
     }
 
@@ -6676,11 +6039,6 @@ public actor Orchestrator {
         var events: [Event] = [.workTaskUpdated(WorkTaskUpdatedPayload(
             task: next,
             previousRevision: previous.revision))]
-        if previous.owner != next.owner {
-            events.append(.workTaskOwnerChanged(WorkTaskOwnerChangedPayload(
-                task: next,
-                previousOwner: previous.owner)))
-        }
         if previous.dependsOn != next.dependsOn {
             events.append(.workTaskDependencyChanged(WorkTaskDependencyChangedPayload(
                 task: next,
@@ -6728,9 +6086,7 @@ public actor Orchestrator {
             .sorted { $0.rawValue < $1.rawValue }
         for dependentID in dependentIDs {
             guard let current = graph.task(dependentID),
-                  current.status != .inProgress,
-                  !(current.status == .blocked
-                    && current.progressNote?.hasPrefix(Self.carryForwardBlockerPrefix) == true) else {
+                  current.status != .inProgress else {
                 continue
             }
             let target: (WorkTaskStatus, String?)?
@@ -6808,15 +6164,7 @@ public actor Orchestrator {
                 return true
             }
         }
-        guard let owner = task.owner,
-              let agent = registry.agent(owner),
-              agent.workspaceRoot.standardizedFileURL.path == workspacePath,
-              taskGraph.nodes.values.contains(where: {
-                  Self.isActiveTaskStatus($0.status) && $0.assignee == owner
-              }),
-              let leaseID = defaultCapabilityLeaseIDs[owner],
-              let lease = capabilityLeases[leaseID] else { return false }
-        return Self.hasWorkspaceMutationCapability(lease)
+        return false
     }
 
     private static func normalizedExpectedArtifactPaths(_ values: [String]) -> [[String]]? {
@@ -7207,7 +6555,6 @@ public actor Orchestrator {
                        inferenceProfileID: String? = nil,
                        agentInferenceBinding: AgentInferenceBinding? = nil,
                        authorization: ResolvedToolAuthorization? = nil,
-                       delegationAuthorization: ResolvedToolAuthorization? = nil,
                        requestedAccess: WorkspaceAccess = .readOnly,
                        canCoordinate: Bool = false) async -> String {
         if let validationError = Self.agentNameValidationError(name) {
@@ -7244,9 +6591,6 @@ public actor Orchestrator {
             return "error: active agent limit reached (\(taskGraph.policy.maxActiveAgentsPerThread))"
         }
         if registry.agent(id) != nil { return "error: an agent named @\(name) already exists" }
-        guard authorization == nil || delegationAuthorization == nil else {
-            return "error: spawn admission cannot combine two authorization snapshots"
-        }
         if let authorization {
             guard authorization.toolName == "spawn_agent",
                   authorization.agent == requestedBy,
@@ -7257,36 +6601,7 @@ public actor Orchestrator {
                 return "error: \(failure)"
             }
         }
-        if let delegationAuthorization {
-            guard delegationAuthorization.toolName == "delegate_task",
-                  delegationAuthorization.agent == requestedBy,
-                  delegationAuthorization.taskID == currentTaskID,
-                  case .string(let targetResolution)? =
-                    delegationAuthorization.intent.metadata["targetResolution"],
-                  targetResolution == "create_proposed",
-                  delegationAuthorization.intent.resources.first(where: {
-                      $0.kind == .agent
-                  })?.value == id.rawValue,
-                  automaticDelegationReservations.contains(id) else {
-                return "error: delegate_task spawn authorization binding is invalid"
-            }
-            if let failure = authorizationRevalidationFailure(
-                delegationAuthorization,
-                allowingDelegationReservationFor: id
-            ) {
-                return "error: \(failure)"
-            }
-            guard delegationAuthorization.capabilityLeaseID == lease.id,
-                  delegationAuthorization.capabilityLeaseFingerprint
-                    == ToolRegistry.authorizationFingerprint(lease),
-                  delegationAuthorization.workspaceLeaseID == parentWorkspaceLease.id,
-                  delegationAuthorization.workspaceLeaseFingerprint
-                    == ToolRegistry.authorizationFingerprint(parentWorkspaceLease) else {
-                return "error: delegate_task spawn lease derivation differs from authorization"
-            }
-        }
         let selectedBinding = authorization?.targetAgentInferenceBinding
-            ?? delegationAuthorization?.targetAgentInferenceBinding
             ?? agentInferenceBinding
             ?? registry.agent(requestedBy)?.agentInferenceBinding
         if let inferenceProfileID,
@@ -7378,18 +6693,6 @@ public actor Orchestrator {
         if let authorization,
            let failure = authorizationRevalidationFailure(authorization) {
             return "error: \(failure)"
-        }
-        if let delegationAuthorization,
-           let failure = authorizationRevalidationFailure(
-               delegationAuthorization,
-               allowingDelegationReservationFor: id
-           ) {
-            return "error: \(failure)"
-        }
-        if let delegationAuthorization,
-           proposedAgent.agentInferenceBinding
-                != delegationAuthorization.targetAgentInferenceBinding {
-            return "error: delegate_task spawn inference profile changed before admission"
         }
         guard let rootIdentity = proposedLeases.workspace.rootIdentity,
               rootIdentity.matchesCurrentDirectory(rootPath: proposedLeases.workspace.rootPath) else {
@@ -7608,12 +6911,9 @@ public actor Orchestrator {
             defaultModel: agent.model.rawValue)
         let workTaskManager = OrchestratorWorkTaskManager(
             orchestrator: self,
-            requester: agent.name,
             currentWorkTaskID: taskContract?.workTaskID,
-            currentRunID: taskContract?.continuationRunID,
-            currentGoalID: taskContract?.goalID,
             canManage: capabilityLease.tools.contains(.manageWorkTasks),
-            canUpdateOwned: capabilityLease.tools.contains(.updateOwnedWorkTask))
+            canUpdateBound: capabilityLease.tools.contains(.updateBoundWorkTask))
         let goalManager = OrchestratorGoalManager(
             orchestrator: self,
             explicitGoalIntent: explicitGoalIntent,
@@ -7651,11 +6951,15 @@ public actor Orchestrator {
             && taskContract?.issuer == nil
             && taskContract?.assignee == agent.name
             && taskContract?.continuationRunID != nil
+        let hostedWebSearch = runtimeInference.hostedWebSearch.map {
+            ProviderHostedWebSearchToolService(route: $0)
+        }
         let baseToolRegistry = Self.toolRegistry(
             for: capabilityLease,
             agentID: agent.name,
             includesTerminal: allowsShell,
-            canControlRun: canControlRun)
+            canControlRun: canControlRun,
+            hostedWebSearch: hostedWebSearch)
         let hostBaseRegistry =
             skillSnapshot?.augmenting(baseToolRegistry)
                 ?? baseToolRegistry
@@ -7858,8 +7162,7 @@ public actor Orchestrator {
             }
         let targetWasExplicit = suppliedTarget != nil
         let target: AgentID
-        let targetResolution: String
-        let targetFingerprint: String?
+        let targetFingerprint: String
         let targetModel: ModelID
         let targetInferenceBinding: AgentInferenceBinding?
         let targetWorkspace: String
@@ -7871,31 +7174,16 @@ public actor Orchestrator {
                   candidate != Self.automaticPermissionReviewerID else {
                 throw IntatisError.permissionDenied("requested delegation target is reserved")
             }
-            if let existing = registry.agent(candidate) {
-                target = candidate
-                targetResolution = "reuse_existing"
-                targetFingerprint = delegationTargetFingerprint(existing)
-                targetModel = existing.model
-                targetInferenceBinding = existing.agentInferenceBinding
-                targetWorkspace = existing.workspaceRoot.resolvingSymlinksInPath()
-                    .standardizedFileURL.path
-            } else {
-                if let validationError = Self.agentNameValidationError(candidate.rawValue) {
-                    throw IntatisError.permissionDenied(validationError)
-                }
-                try validateProposedDelegationTarget(
-                    requester: requester,
-                    requesterID: requesterID,
-                    taskID: request.invocation.taskID,
-                    target: candidate)
-                target = candidate
-                targetResolution = "create_proposed"
-                targetFingerprint = nil
-                targetModel = requester.model
-                targetInferenceBinding = requester.agentInferenceBinding
-                targetWorkspace = requester.workspaceRoot.resolvingSymlinksInPath()
-                    .standardizedFileURL.path
+            guard let existing = registry.agent(candidate) else {
+                throw IntatisError.notFound(
+                    "delegation target is not attached; spawn it in an earlier tool-call round")
             }
+            target = candidate
+            targetFingerprint = delegationTargetFingerprint(existing)
+            targetModel = existing.model
+            targetInferenceBinding = existing.agentInferenceBinding
+            targetWorkspace = existing.workspaceRoot.resolvingSymlinksInPath()
+                .standardizedFileURL.path
         } else if let idle = registry.all()
             .filter({ candidate in
                 candidate.name != requesterID
@@ -7910,26 +7198,14 @@ public actor Orchestrator {
             .sorted(by: { $0.name.rawValue < $1.name.rawValue })
             .first {
             target = idle.name
-            targetResolution = "reuse_existing"
             targetFingerprint = delegationTargetFingerprint(idle)
             targetModel = idle.model
             targetInferenceBinding = idle.agentInferenceBinding
             targetWorkspace = idle.workspaceRoot.resolvingSymlinksInPath()
                 .standardizedFileURL.path
         } else {
-            let candidate = AgentID(rawValue: nextAutomaticWorkerName())
-            try validateProposedDelegationTarget(
-                requester: requester,
-                requesterID: requesterID,
-                taskID: request.invocation.taskID,
-                target: candidate)
-            target = candidate
-            targetResolution = "create_proposed"
-            targetFingerprint = nil
-            targetModel = requester.model
-            targetInferenceBinding = requester.agentInferenceBinding
-            targetWorkspace = requester.workspaceRoot.resolvingSymlinksInPath()
-                .standardizedFileURL.path
+            throw IntatisError.notFound(
+                "no available attached delegation worker; spawn one in an earlier tool-call round")
         }
 
         if let failure = delegationFailure(
@@ -7955,7 +7231,6 @@ public actor Orchestrator {
                 value: "delegated_knowledge:\(knowledgeAccess.rawValue)",
                 access: requestedWorkspaceAccess))
         }
-        intent.metadata["targetResolution"] = .string(targetResolution)
         intent.metadata["targetWasExplicit"] = .bool(targetWasExplicit)
         intent.metadata["targetModel"] = .string(targetModel.rawValue)
         intent.metadata["targetWorkspace"] = .string(targetWorkspace)
@@ -7968,7 +7243,7 @@ public actor Orchestrator {
                 .sorted { $0.rawValue < $1.rawValue }
                 .map { .string($0.rawValue) })
         intent.metadata["canCoordinate"] = .bool(false)
-        intent.metadata["mayCreateWorker"] = .bool(targetResolution == "create_proposed")
+        intent.metadata.removeValue(forKey: "mayCreateWorker")
         intent.metadata.merge(Self.inferenceMetadata(targetInferenceBinding)) { _, profile in profile }
         if let targetInferenceBinding,
            let catalogBinding = availableInferenceProfiles[
@@ -7982,11 +7257,7 @@ public actor Orchestrator {
             // authorization change and must not cross this ToolCall.
             intent.metadata["targetInferenceCatalogFingerprint"] = .null
         }
-        if let targetFingerprint {
-            intent.metadata["targetFingerprint"] = .string(targetFingerprint)
-        } else {
-            intent.metadata.removeValue(forKey: "targetFingerprint")
-        }
+        intent.metadata["targetFingerprint"] = .string(targetFingerprint)
         if requiresInferenceBindings, targetInferenceBinding == nil {
             throw IntatisError.permissionDenied(
                 "delegation target has no exact inference profile binding")
@@ -8040,42 +7311,6 @@ public actor Orchestrator {
         return ToolAuthorizationPreparation(
             intent: intent,
             targetAgentInferenceBinding: binding)
-    }
-
-    private func validateProposedDelegationTarget(
-        requester: Agent,
-        requesterID: AgentID,
-        taskID: TaskID?,
-        target: AgentID
-    ) throws {
-        guard registry.agent(target) == nil else {
-            throw IntatisError.permissionDenied("proposed delegation target is already attached")
-        }
-        guard let capabilityLease = existingCapabilityLease(
-            for: requesterID,
-            taskID: taskID),
-            capabilityLease.tools.contains(.attachWorkspace),
-            case .granted = capabilityLease.delegation else {
-            throw IntatisError.permissionDenied(
-                "creating a delegation worker is not granted for the current task")
-        }
-        guard let workspaceLease = existingWorkspaceLease(
-            for: requesterID,
-            taskID: taskID),
-            workspaceLease.rootPath
-                == requester.workspaceRoot.resolvingSymlinksInPath().standardizedFileURL.path,
-            workspaceLease.rootIdentity?.matchesCurrentDirectory(
-                rootPath: workspaceLease.rootPath) == true else {
-            throw IntatisError.permissionDenied(
-                "creating a delegation worker requires the current reviewed workspace lease")
-        }
-        let activeAgentCount = registry.names.filter {
-            $0 != Self.automaticPermissionReviewerID
-        }.count
-        guard activeAgentCount < taskGraph.policy.maxActiveAgentsPerThread else {
-            throw IntatisError.permissionDenied(
-                "active agent limit reached (\(taskGraph.policy.maxActiveAgentsPerThread))")
-        }
     }
 
     private func delegationTargetFingerprint(_ agent: Agent) -> String {
@@ -8173,8 +7408,7 @@ public actor Orchestrator {
     /// the reviewer is awaiting its provider.
     private func authorizationRevalidationFailure(
         _ authorization: ResolvedToolAuthorization,
-        allowingDelegationReservationFor reservedTarget: AgentID? = nil,
-        materializedDelegationTarget: MaterializedDelegationTarget? = nil
+        allowingDelegationReservationFor reservedTarget: AgentID? = nil
     ) -> String? {
         if let taskID = authorization.taskID,
            let runID = taskContract(forCausalTaskID: taskID)?.continuationRunID {
@@ -8254,8 +7488,7 @@ public actor Orchestrator {
         }
         return semanticAuthorizationFailure(
             authorization,
-            allowingDelegationReservationFor: reservedTarget,
-            materializedDelegationTarget: materializedDelegationTarget)
+            allowingDelegationReservationFor: reservedTarget)
     }
 
     private func delegationInferenceCatalogAuthorizationFailure(
@@ -8287,10 +7520,8 @@ public actor Orchestrator {
         return nil
     }
 
-    /// Final executor-side check for an already-reviewed delegation. This is
-    /// deliberately distinct from proposed-target preflight: after an
-    /// authorized `create_proposed` spawn, the target must exist, but only as
-    /// the exact materialized child owned by this requester.
+    /// Final executor-side check for an already-reviewed delegation to an
+    /// attached target.
     private func finalDelegationAuthorizationFailure(
         _ admission: AuthorizedDelegationAdmission,
         expectedFrom: AgentID,
@@ -8318,16 +7549,9 @@ public actor Orchestrator {
         guard automaticDelegationReservations.contains(reservedTarget) else {
             return "reviewed delegation reservation was lost before task admission"
         }
-        let materializedTarget = admission.materializedProposedTarget
-            ? MaterializedDelegationTarget(
-                agentID: admission.target,
-                binding: admission.binding,
-                fingerprint: admission.targetFingerprint)
-            : nil
         if let failure = authorizationRevalidationFailure(
             authorization,
-            allowingDelegationReservationFor: reservedTarget,
-            materializedDelegationTarget: materializedTarget
+            allowingDelegationReservationFor: reservedTarget
         ) {
             return failure
         }
@@ -8337,17 +7561,10 @@ public actor Orchestrator {
               delegationTargetFingerprint(currentTarget) == admission.targetFingerprint else {
             return "reviewed delegation target route or identity changed before task admission"
         }
-        guard case .string(let resolution)? =
-                authorization.intent.metadata["targetResolution"],
-              (resolution == "create_proposed") == admission.materializedProposedTarget else {
-            return "delegate_task target resolution changed before task admission"
-        }
-        if !admission.materializedProposedTarget {
-            guard case .string(let reviewedFingerprint)? =
-                    authorization.intent.metadata["targetFingerprint"],
-                  reviewedFingerprint == admission.targetFingerprint else {
-                return "reviewed delegation target fingerprint changed before task admission"
-            }
+        guard case .string(let reviewedFingerprint)? =
+                authorization.intent.metadata["targetFingerprint"],
+              reviewedFingerprint == admission.targetFingerprint else {
+            return "reviewed delegation target fingerprint changed before task admission"
         }
         return nil
     }
@@ -8385,6 +7602,9 @@ public actor Orchestrator {
             }
             candidate = live
         } else {
+            if authorization.toolName == "delegate_task" {
+                return "reviewed delegation target is no longer attached"
+            }
             let workspacePath = authorization.intent.resources.first(where: {
                 $0.kind == .workspace
             })?.value ?? {
@@ -8415,8 +7635,7 @@ public actor Orchestrator {
 
     private func semanticAuthorizationFailure(
         _ authorization: ResolvedToolAuthorization,
-        allowingDelegationReservationFor reservedTarget: AgentID? = nil,
-        materializedDelegationTarget: MaterializedDelegationTarget? = nil
+        allowingDelegationReservationFor reservedTarget: AgentID? = nil
     ) -> String? {
         guard let from = authorization.agent else {
             return "authorization snapshot has no requesting agent"
@@ -8475,77 +7694,33 @@ public actor Orchestrator {
                 parentTaskID: authorization.taskID) {
                 return failure
             }
-            guard let requester = registry.agent(from) else {
+            guard registry.agent(from) != nil else {
                 return "delegating agent is not attached"
             }
-            guard case .string(let resolution)? = authorization.intent.metadata["targetResolution"],
-                  case .string(let reviewedWorkspace)? = authorization.intent.metadata["targetWorkspace"],
+            guard case .string(let reviewedWorkspace)? = authorization.intent.metadata["targetWorkspace"],
                   case .bool(let targetWasExplicit)? = authorization.intent.metadata["targetWasExplicit"] else {
-                return "delegation authorization has no host target resolution"
+                return "delegation authorization has no host target snapshot"
             }
-            switch resolution {
-            case "reuse_existing":
-                guard let existing = registry.agent(target) else {
-                    return "reviewed delegation target is no longer attached"
-                }
-                guard existing.agentInferenceBinding
-                        == authorization.targetAgentInferenceBinding else {
-                    return "reviewed delegation target inference profile changed"
-                }
-                guard existing.workspaceRoot.resolvingSymlinksInPath()
-                    .standardizedFileURL.path == reviewedWorkspace else {
-                    return "reviewed delegation target workspace changed"
-                }
-                guard case .string(let reviewedFingerprint)? =
-                    authorization.intent.metadata["targetFingerprint"],
-                    delegationTargetFingerprint(existing) == reviewedFingerprint else {
-                    return "reviewed delegation target identity changed"
-                }
-                if !targetWasExplicit,
-                   (!isAgentAvailableForDelegation(target)
-                    || (automaticDelegationReservations.contains(target)
-                        && reservedTarget != target)) {
-                    return "automatically selected delegation target is no longer available"
-                }
-            case "create_proposed":
-                guard requester.agentInferenceBinding
-                        == authorization.targetAgentInferenceBinding else {
-                    return "delegation worker inherited inference profile changed"
-                }
-                guard reviewedWorkspace == requester.workspaceRoot.resolvingSymlinksInPath()
-                    .standardizedFileURL.path else {
-                    return "proposed delegation workspace changed before execution"
-                }
-                if let materializedDelegationTarget {
-                    guard materializedDelegationTarget.agentID == target,
-                          materializedDelegationTarget.binding
-                            == authorization.targetAgentInferenceBinding,
-                          let existing = registry.agent(target),
-                          existing.agentInferenceBinding
-                            == materializedDelegationTarget.binding,
-                          existing.model
-                            == (materializedDelegationTarget.binding?.modelID
-                                ?? existing.model),
-                          existing.workspaceRoot.resolvingSymlinksInPath()
-                            .standardizedFileURL.path == reviewedWorkspace,
-                          delegationTargetFingerprint(existing)
-                            == materializedDelegationTarget.fingerprint,
-                          spawnedAgentOwners[target] == from else {
-                        return "materialized delegation target changed before task admission"
-                    }
-                } else {
-                    do {
-                        try validateProposedDelegationTarget(
-                            requester: requester,
-                            requesterID: from,
-                            taskID: authorization.taskID,
-                            target: target)
-                    } catch {
-                        return error.localizedDescription
-                    }
-                }
-            default:
-                return "delegation authorization target resolution is invalid"
+            guard let existing = registry.agent(target) else {
+                return "reviewed delegation target is no longer attached"
+            }
+            guard existing.agentInferenceBinding
+                    == authorization.targetAgentInferenceBinding else {
+                return "reviewed delegation target inference profile changed"
+            }
+            guard existing.workspaceRoot.resolvingSymlinksInPath()
+                .standardizedFileURL.path == reviewedWorkspace else {
+                return "reviewed delegation target workspace changed"
+            }
+            guard case .string(let reviewedFingerprint)? =
+                authorization.intent.metadata["targetFingerprint"],
+                delegationTargetFingerprint(existing) == reviewedFingerprint else {
+                return "reviewed delegation target identity changed"
+            }
+            if !targetWasExplicit,
+               automaticDelegationReservations.contains(target),
+               reservedTarget != target {
+                return "automatically selected delegation target is reserved by another invocation"
             }
             return nil
 
@@ -9087,7 +8262,8 @@ public actor Orchestrator {
             workspaceLease: workspaceLease)
     }
 
-    private func prepareDelegatedTask(issuer: AgentID,
+    private func prepareDelegatedTask(taskID: TaskID = TaskID.new(),
+                                      issuer: AgentID,
                                       assignee: Agent,
                                       workTask: WorkTask? = nil,
                                       objective: String,
@@ -9100,7 +8276,6 @@ public actor Orchestrator {
                                       workspaceAccessOverride: WorkspaceAccess? = nil) -> PreparedDelegatedTask {
         let trimmedObjective = objective.trimmingCharacters(in: .whitespacesAndNewlines)
         let relatedAgents = agentVisibleNames(excluding: assignee.name)
-        let taskID = TaskID.new()
         let defaultLease = defaultCapabilityLeaseIDs[assignee.name].flatMap { capabilityLeases[$0] }
         let defaultWorkspaceAccess = defaultWorkspaceLeaseIDs[assignee.name]
             .flatMap { workspaceLeases[$0]?.access } ?? .readOnly
@@ -9132,8 +8307,8 @@ public actor Orchestrator {
             assignee: assignee.name,
             parentTaskID: parentTaskID,
             workTaskID: workTask?.id,
-            continuationRunID: workTask?.runID ?? scopeContract?.continuationRunID,
-            goalID: workTask?.goalID ?? scopeContract?.goalID,
+            continuationRunID: scopeContract?.continuationRunID,
+            goalID: scopeContract?.goalID,
             submissionID: scopeContract?.submissionID,
             objective: trimmedObjective.isEmpty ? "Answer the assigned task." : trimmedObjective,
             roleHint: roleHint?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
@@ -9903,9 +9078,6 @@ public actor Orchestrator {
             }
             try await persistInvocationSettlement(
                 lifecycleEvent,
-                contract: task.contract,
-                workTaskProgressNote:
-                    "candidate result received from invocation \(task.contract.id.rawValue); awaiting explicit task settlement",
                 additionalEvents: consumptions.map {
                     .agentMessageConsumed($0.payload)
                 })
@@ -9967,10 +9139,7 @@ public actor Orchestrator {
                 metadata: metadata))
         do {
             try await persistInvocationSettlement(
-                lifecycleEvent,
-                contract: task.contract,
-                workTaskProgressNote:
-                    "candidate invocation \(task.contract.id.rawValue) failed: \(message); awaiting explicit task settlement")
+                lifecycleEvent)
         } catch {
             await recordTerminalPersistenceFailure(task: task, error: error)
             return false
@@ -10006,11 +9175,12 @@ public actor Orchestrator {
     private func finishCancelledTask(_ task: ScheduledTask,
                                      reason: String,
                                      metadata: CoworkEventMetadata) async -> Bool {
+        let runCloseSource = cancellationRunCloseSources[task.contract.id] ?? .runtime
         do {
             _ = try await closeRootRunIfNeeded(
                 for: task,
-                outcome: .cancelled,
-                source: cancellationRunCloseSources[task.contract.id] ?? .runtime,
+                outcome: Self.cancellationRunOutcome(source: runCloseSource),
+                source: runCloseSource,
                 reason: reason)
         } catch {
             await recordTerminalPersistenceFailure(task: task, error: error)
@@ -10033,10 +9203,7 @@ public actor Orchestrator {
                 metadata: metadata))
         do {
             try await persistInvocationSettlement(
-                lifecycleEvent,
-                contract: task.contract,
-                workTaskProgressNote:
-                    "candidate invocation \(task.contract.id.rawValue) was cancelled: \(reason); awaiting explicit task settlement")
+                lifecycleEvent)
         } catch {
             await recordTerminalPersistenceFailure(task: task, error: error)
             return false
@@ -10071,50 +9238,18 @@ public actor Orchestrator {
         }
     }
 
-    /// Persists execution settlement and its candidate-only WorkTask progress
-    /// snapshot under the same admission lock as every other WorkTask write.
-    /// This prevents an actor re-entry at the EventLog await from committing a
-    /// stale graph copy over a newer optimistic revision.
+    /// Persists execution settlement without mutating the independently
+    /// managed WorkTask bound to the invocation.
     private func persistInvocationSettlement(
         _ lifecycleEvent: Event,
-        contract: TaskContract,
-        workTaskProgressNote: String,
         additionalEvents: [Event] = []
     ) async throws {
         await acquireAdmissionLock()
         defer { releaseAdmissionLock() }
 
-        var preflightWorkTaskGraph = workTaskGraph
         var events = [lifecycleEvent]
-        if workTaskRecoveryFailure == nil,
-           let progressEvent = candidateWorkTaskProgressEvent(
-               for: contract,
-               note: workTaskProgressNote,
-               graph: &preflightWorkTaskGraph) {
-            events.append(progressEvent)
-        }
         events.append(contentsOf: additionalEvents)
         try await appendTaskLifecycleEvents(events)
-        workTaskGraph = preflightWorkTaskGraph
-    }
-
-    private func candidateWorkTaskProgressEvent(
-        for contract: TaskContract,
-        note: String,
-        graph: inout WorkTaskGraph
-    ) -> Event? {
-        guard let workTaskID = contract.workTaskID,
-              var current = graph.task(workTaskID),
-              !current.status.isTerminal else { return nil }
-        current.progressNote = note
-        switch graph.update(current, expectedRevision: current.revision) {
-        case .success(let updated):
-            return .workTaskProgressed(WorkTaskProgressedPayload(task: updated))
-        case .failure:
-            // Invocation settlement must remain durable even if a stale or
-            // externally settled WorkTask no longer accepts a progress note.
-            return nil
-        }
     }
 
     /// Closes an already-durable attach request after its exact inference
@@ -10242,7 +9377,7 @@ public actor Orchestrator {
             do {
                 _ = try await closeRootRunIfNeeded(
                     for: task,
-                    outcome: .cancelled,
+                    outcome: Self.cancellationRunOutcome(source: runCloseSource),
                     source: runCloseSource,
                     reason: reason)
             } catch {
@@ -10283,6 +9418,17 @@ public actor Orchestrator {
         rootInvocations.removeValue(forKey: task.contract.id)
         completeResultWaiters(task.contract.id)
         return true
+    }
+
+    private static func cancellationRunOutcome(
+        source: ContinuationRunCloseSource
+    ) -> ContinuationRunCloseOutcome {
+        switch source {
+        case .runtime, .hostLifecycle:
+            return .interrupted
+        case .mainAgent, .user:
+            return .cancelled
+        }
     }
 
     private func scheduledTask(for node: TaskNode) -> ScheduledTask {
@@ -11061,7 +10207,11 @@ public actor Orchestrator {
     public static func toolRegistry(for lease: CapabilityLease,
                                     agentID: AgentID? = nil,
                                     includesTerminal: Bool = true,
-                                    canControlRun: Bool = false) -> ToolRegistry {
+                                    canControlRun: Bool = false,
+                                    hostedWebSearch:
+                                        (any HostedWebSearchToolService)? = nil)
+        -> ToolRegistry
+    {
         var registrations: [ToolRegistration] = []
         func register(
             _ tools: [any Tool],
@@ -11168,6 +10318,12 @@ public actor Orchestrator {
         if lease.tools.contains(.generateMedia) {
             register([GenerateImageTool(), EditImageTool()], granting: [.generateMedia])
         }
+        if lease.tools.contains(.hostedWebSearch),
+           let hostedWebSearch {
+            register(
+                [HostedWebSearchTool(service: hostedWebSearch)],
+                granting: [.hostedWebSearch])
+        }
         if lease.tools.contains(.browseWeb) {
             register([
                 WebFetchTool(), BrowserDiagnosticsTool(), BrowserProfilesTool(),
@@ -11185,8 +10341,8 @@ public actor Orchestrator {
                 TaskCreateTool(), TaskUpdateTool(), TaskGetTool(), TaskListTool(),
             ], granting: [.manageWorkTasks])
         } else {
-            if lease.tools.contains(.updateOwnedWorkTask) {
-                register([OwnedWorkTaskUpdateTool()], granting: [.updateOwnedWorkTask])
+            if lease.tools.contains(.updateBoundWorkTask) {
+                register([BoundWorkTaskUpdateTool()], granting: [.updateBoundWorkTask])
             }
             if lease.tools.contains(.readWorkTasks) {
                 register([TaskGetTool(), TaskListTool()], granting: [.readWorkTasks])
@@ -11287,7 +10443,7 @@ public actor Orchestrator {
         }
         return ToolRegistry(
             registrations: registrations,
-            registryVersion: "intatis.cowork.v3")
+            registryVersion: "intatis.cowork.v4")
     }
 
     private static func canCoordinate(_ lease: CapabilityLease) -> Bool {
@@ -11506,23 +10662,39 @@ struct BusMessenger: AgentMessenger {
     }
 
     func delegateTask(authorization: ResolvedToolAuthorization,
+                      executionID: String,
                       to agent: String?,
                       workTaskID: WorkTaskID?,
                       objective: String?,
                       roleHint: String?,
-                      expectedDeliverable: String?) async -> String {
+                      expectedDeliverable: String?) async throws -> String {
         guard let agent else {
-            return "error: delegate_task authorization has no concrete target"
+            throw ToolExecutionRejectedWithoutSideEffect(
+                code: "delegation_target_missing",
+                message: "delegate_task was rejected before admission because authorization has no concrete target")
         }
-        return await orchestrator.delegateAuthorizedTask(
+        let result = await orchestrator.delegateAuthorizedTask(
             from: from,
             authorization: authorization,
+            executionID: executionID,
             to: agent,
             workTaskID: workTaskID,
             objective: objective,
             roleHint: roleHint,
             expectedDeliverable: expectedDeliverable,
             parentTaskID: currentTaskID)
+        guard result.hasPrefix("task_id=") else {
+            let message = result.hasPrefix("error:")
+                ? String(result.dropFirst("error:".count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                : result
+            throw ToolExecutionRejectedWithoutSideEffect(
+                code: "delegation_not_started",
+                message: message.isEmpty
+                    ? "delegate_task was rejected before admission"
+                    : message)
+        }
+        return result
     }
 }
 
@@ -11585,18 +10757,12 @@ struct OrchestratorManager: AgentManager {
 /// their own read or mutation scope through tool arguments.
 struct OrchestratorWorkTaskManager: WorkTaskManager {
     let orchestrator: Orchestrator
-    let requester: AgentID
     let currentWorkTaskID: WorkTaskID?
-    let currentRunID: ContinuationRunID?
-    let currentGoalID: GoalID?
     let canManage: Bool
-    let canUpdateOwned: Bool
+    let canUpdateBound: Bool
 
     func createWorkTask(_ request: WorkTaskCreateRequest) async throws -> WorkTaskDetail {
         try await orchestrator.createWorkTask(
-            requestedBy: requester,
-            currentRunID: currentRunID,
-            currentGoalID: currentGoalID,
             canManage: canManage,
             request: request,
             // Only the production adapter opts into Orchestrator's concrete
@@ -11608,11 +10774,9 @@ struct OrchestratorWorkTaskManager: WorkTaskManager {
 
     func updateWorkTask(_ request: WorkTaskUpdateRequest) async throws -> WorkTaskDetail {
         try await orchestrator.updateWorkTask(
-            requestedBy: requester,
             currentWorkTaskID: currentWorkTaskID,
-            currentRunID: currentRunID,
             canManage: canManage,
-            canUpdateOwned: canUpdateOwned,
+            canUpdateBound: canUpdateBound,
             request: request,
             // This adapter owns the concrete no-effect proof boundary:
             // Orchestrator classifies only failures raised before its first
@@ -11623,20 +10787,14 @@ struct OrchestratorWorkTaskManager: WorkTaskManager {
 
     func getWorkTask(_ taskID: WorkTaskID) async throws -> WorkTaskDetail {
         try await orchestrator.getWorkTask(
-            requestedBy: requester,
             currentWorkTaskID: currentWorkTaskID,
-            currentRunID: currentRunID,
-            currentGoalID: currentGoalID,
             canManage: canManage,
             taskID: taskID)
     }
 
     func listWorkTasks(_ request: WorkTaskListRequest) async throws -> [WorkTaskDetail] {
         try await orchestrator.listWorkTasks(
-            requestedBy: requester,
             currentWorkTaskID: currentWorkTaskID,
-            currentRunID: currentRunID,
-            currentGoalID: currentGoalID,
             canManage: canManage,
             request: request)
     }

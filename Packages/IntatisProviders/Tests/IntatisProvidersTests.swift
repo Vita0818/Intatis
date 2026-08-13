@@ -359,6 +359,56 @@ final class IntatisProvidersTests: XCTestCase {
         XCTAssertEqual(routing["only"] as? [String], ["provider-a"])
     }
 
+    func testExplicitHostedSearchFailsClosedWithoutOrdinaryRetry()
+        async throws
+    {
+        let http = SequencedHTTP(attempts: [
+            StreamAttempt(
+                chunks: [],
+                error: ProviderHTTPStatusError(
+                    statusCode: 400,
+                    body: Data(#"{"error":{"code":"unsupported_parameter","param":"tools[0].type","message":"not supported"}}"#.utf8),
+                    headers: [:],
+                    operation: "streaming request")),
+        ])
+        let provider = OpenAIWireProvider(
+            endpoint: ProviderEndpoint(
+                id: "router",
+                baseURL: URL(string: "https://router.example/v1")!,
+                apiKeyRef: KeychainRef(service: "s", account: "router"),
+                wire: .openai,
+                requestAdapter: .openRouter),
+            apiKey: "k",
+            http: http,
+            runtimePolicy: ProviderRuntimePolicy(
+                maxAttempts: 1,
+                requestTimeoutSeconds: 1,
+                initialRetryDelaySeconds: 0,
+                maxRetryDelaySeconds: 0))
+
+        do {
+            for try await _ in provider.stream(ChatRequest(
+                model: ModelID(rawValue: "m"),
+                messages: [ChatMessage(role: .user, content: "hi")],
+                webSearch: ChatWebSearchConfiguration(
+                    dialect: .openRouterServerTool,
+                    unsupportedBehavior: .failClosed,
+                    toolChoice: .required))) {}
+            XCTFail("explicit hosted search unexpectedly fell back")
+        } catch {
+            XCTAssertEqual(http.attemptCount, 1)
+            XCTAssertEqual(
+                http.recordedRequests.map { $0.url?.path },
+                ["/v1/responses"])
+            let body = try XCTUnwrap(
+                http.recordedRequests.first?.httpBody)
+            let object = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: body)
+                    as? [String: Any])
+            XCTAssertEqual(object["tool_choice"] as? String, "required")
+        }
+    }
+
     func testBareHostedSearch404DoesNotTriggerOrdinaryFallback()
         async throws
     {
@@ -1271,6 +1321,82 @@ final class IntatisProvidersTests: XCTestCase {
         XCTAssertEqual(chat.runtimePolicy.requestTimeoutSeconds, 120)
         XCTAssertEqual(agent.runtimePolicy, .agentStreaming)
         XCTAssertEqual(agent.runtimePolicy.requestTimeoutSeconds, 180)
+    }
+
+    func testAgentRuntimeRouteExposesExactProviderHostedSearchCapability()
+        async throws
+    {
+        let endpoint = ProviderEndpoint(
+            id: "router",
+            baseURL: URL(string: "https://router.example.test/v1")!,
+            apiKeyRef: KeychainRef(service: "s", account: "router"),
+            wire: .openai,
+            requestAdapter: .openRouter,
+            modelCapabilities: [
+                "agent-model": [.toolCalling, .hostedWebSearch],
+            ])
+        let registry = ProviderRegistry(
+            config: ProviderConfig(
+                endpoints: [endpoint],
+                models: ResolvedModels(
+                    chat: ModelRef(
+                        endpoint: "router",
+                        model: ModelID(rawValue: "chat-model")),
+                    agent: ModelRef(
+                        endpoint: "router",
+                        model: ModelID(rawValue: "agent-model")))),
+            resolver: StaticSecret(key: "k"),
+            http: FakeHTTP(chunks: []))
+
+        let route = try await registry.defaultAgentRuntimeRoute()
+        let hosted = try XCTUnwrap(route.hostedWebSearch)
+
+        XCTAssertEqual(route.model.rawValue, "agent-model")
+        XCTAssertEqual(hosted.model, route.model)
+        XCTAssertEqual(hosted.configuration.dialect, .openRouterServerTool)
+        XCTAssertEqual(hosted.configuration.contextSize, .medium)
+        XCTAssertEqual(
+            hosted.configuration.unsupportedBehavior,
+            .failClosed)
+        XCTAssertEqual(hosted.configuration.toolChoice, .required)
+        XCTAssertEqual(
+            try XCTUnwrap(route.provider as? OpenAIWireProvider)
+                .endpoint.id,
+            "router")
+        XCTAssertEqual(
+            try XCTUnwrap(hosted.provider as? OpenAIWireProvider)
+                .endpoint.id,
+            "router")
+    }
+
+    func testAgentRuntimeRouteDoesNotInferHostedSearchFromCompatibleWire()
+        async throws
+    {
+        let endpoint = ProviderEndpoint(
+            id: "compatible",
+            baseURL: URL(string: "https://compatible.example.test/v1")!,
+            apiKeyRef: KeychainRef(service: "s", account: "compatible"),
+            wire: .openai,
+            requestAdapter: .openAICompatible,
+            modelCapabilities: [
+                "agent-model": [.toolCalling, .hostedWebSearch],
+            ])
+        let registry = ProviderRegistry(
+            config: ProviderConfig(
+                endpoints: [endpoint],
+                models: ResolvedModels(
+                    chat: ModelRef(
+                        endpoint: "compatible",
+                        model: ModelID(rawValue: "chat-model")),
+                    agent: ModelRef(
+                        endpoint: "compatible",
+                        model: ModelID(rawValue: "agent-model")))),
+            resolver: StaticSecret(key: "k"),
+            http: FakeHTTP(chunks: []))
+
+        let route = try await registry.defaultAgentRuntimeRoute()
+
+        XCTAssertNil(route.hostedWebSearch)
     }
 
     func testRegistryUnknownEndpointThrows() async {

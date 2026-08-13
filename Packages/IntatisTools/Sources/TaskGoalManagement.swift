@@ -32,7 +32,6 @@ public struct WorkTaskCreateRequest: Equatable, Sendable {
     public var acceptanceCriteria: [String]
     public var expectedArtifacts: [String]
     public var dependsOn: [WorkTaskID]
-    public var owner: AgentID?
     public var priority: WorkTaskPriority
 
     public init(title: String,
@@ -40,22 +39,14 @@ public struct WorkTaskCreateRequest: Equatable, Sendable {
                 acceptanceCriteria: [String] = [],
                 expectedArtifacts: [String] = [],
                 dependsOn: [WorkTaskID] = [],
-                owner: AgentID? = nil,
                 priority: WorkTaskPriority = .normal) {
         self.title = title
         self.description = description
         self.acceptanceCriteria = acceptanceCriteria
         self.expectedArtifacts = expectedArtifacts
         self.dependsOn = dependsOn
-        self.owner = owner
         self.priority = priority
     }
-}
-
-public enum WorkTaskOwnerUpdate: Equatable, Sendable {
-    case unchanged
-    case unassigned
-    case agent(AgentID)
 }
 
 public struct WorkTaskUpdateRequest: Equatable, Sendable {
@@ -65,7 +56,6 @@ public struct WorkTaskUpdateRequest: Equatable, Sendable {
     public var description: String?
     public var acceptanceCriteria: [String]?
     public var expectedArtifacts: [String]?
-    public var owner: WorkTaskOwnerUpdate
     public var dependsOn: [WorkTaskID]?
     public var priority: WorkTaskPriority?
     public var progressNote: String?
@@ -80,7 +70,6 @@ public struct WorkTaskUpdateRequest: Equatable, Sendable {
                 description: String? = nil,
                 acceptanceCriteria: [String]? = nil,
                 expectedArtifacts: [String]? = nil,
-                owner: WorkTaskOwnerUpdate = .unchanged,
                 dependsOn: [WorkTaskID]? = nil,
                 priority: WorkTaskPriority? = nil,
                 progressNote: String? = nil,
@@ -94,7 +83,6 @@ public struct WorkTaskUpdateRequest: Equatable, Sendable {
         self.description = description
         self.acceptanceCriteria = acceptanceCriteria
         self.expectedArtifacts = expectedArtifacts
-        self.owner = owner
         self.dependsOn = dependsOn
         self.priority = priority
         self.progressNote = progressNote
@@ -106,27 +94,10 @@ public struct WorkTaskUpdateRequest: Equatable, Sendable {
 }
 
 public struct WorkTaskListRequest: Equatable, Sendable {
-    /// `nil` means the manager-bound current continuation run.
-    public var runID: ContinuationRunID?
-    /// Includes all runs belonging to the manager-bound Goal. Only a
-    /// coordinator/host-authorized adapter may honor this broader scope.
-    public var includeGoalHistory: Bool
     public var statuses: Set<WorkTaskStatus>
-    /// `nil` means any owner; an empty string is normalized to unassigned by
-    /// the Cowork adapter before this request is created.
-    public var owner: AgentID?
-    public var unassignedOnly: Bool
 
-    public init(runID: ContinuationRunID? = nil,
-                includeGoalHistory: Bool = false,
-                statuses: Set<WorkTaskStatus> = [],
-                owner: AgentID? = nil,
-                unassignedOnly: Bool = false) {
-        self.runID = runID
-        self.includeGoalHistory = includeGoalHistory
+    public init(statuses: Set<WorkTaskStatus> = []) {
         self.statuses = statuses
-        self.owner = owner
-        self.unassignedOnly = unassignedOnly
     }
 }
 

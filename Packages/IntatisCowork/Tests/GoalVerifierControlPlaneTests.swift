@@ -59,7 +59,7 @@ private final class GoalVerifierTestProvider: ToolCallingProvider, @unchecked Se
 
 final class GoalVerifierControlPlaneTests: XCTestCase {
     func testCompleteRequiresAndPreservesAuthoritativeEvidence() async throws {
-        let fixture = makeFixture(taskStatus: .completed, includeEvidence: true)
+        let fixture = makeFixture(includeValidationEvidence: true)
         let response = completeResponse(reference: "test://swift/goal-verifier")
         let provider = GoalVerifierTestProvider(chunks: [
             .textDelta(response),
@@ -89,7 +89,7 @@ final class GoalVerifierControlPlaneTests: XCTestCase {
     }
 
     func testFabricatedEvidenceDowngradesCompletionToContinue() async {
-        let fixture = makeFixture(taskStatus: .completed, includeEvidence: false)
+        let fixture = makeFixture(includeValidationEvidence: false)
         let provider = GoalVerifierTestProvider(chunks: [
             .textDelta(completeResponse(reference: "invented://evidence")),
             .done(finishReason: "stop"),
@@ -109,47 +109,8 @@ final class GoalVerifierControlPlaneTests: XCTestCase {
         })
     }
 
-    func testAgentReportedWorkTaskEvidenceCannotProveGoalWithoutHostValidation() async {
-        let fixture = makeFixture(
-            taskStatus: .completed,
-            includeEvidence: true,
-            includeValidationEvidence: false)
-        let provider = GoalVerifierTestProvider(chunks: [
-            .textDelta(completeResponse(reference: "test://swift/goal-verifier")),
-            .done(finishReason: "stop"),
-        ])
-        let verifier = GoalVerifierControlPlane(
-            provider: provider,
-            model: ModelID(rawValue: "m"))
-
-        let result = await verifier.verify(fixture.input)
-
-        XCTAssertFalse(fixture.input.workTasks[0].evidence.isEmpty)
-        XCTAssertTrue(fixture.input.validationEvidence.isEmpty)
-        XCTAssertEqual(result.audit.verdict, .continue)
-        XCTAssertEqual(result.failureKind, .hostValidation)
-        XCTAssertTrue(result.audit.requirements.allSatisfy { $0.status == .unproven })
-    }
-
-    func testNonterminalWorkTaskDowngradesOtherwiseProvenCompletion() async {
-        let fixture = makeFixture(taskStatus: .inProgress, includeEvidence: true)
-        let provider = GoalVerifierTestProvider(chunks: [
-            .textDelta(completeResponse(reference: "test://swift/goal-verifier")),
-            .done(finishReason: "stop"),
-        ])
-        let verifier = GoalVerifierControlPlane(
-            provider: provider,
-            model: ModelID(rawValue: "m"))
-
-        let result = await verifier.verify(fixture.input)
-
-        XCTAssertEqual(result.audit.verdict, .continue)
-        XCTAssertEqual(result.failureKind, .hostValidation)
-        XCTAssertTrue(result.audit.remainingWork.contains { $0.contains("Nonterminal WorkTasks") })
-    }
-
     func testMalformedOutputFailsSafeToContinue() async {
-        let fixture = makeFixture(taskStatus: .completed, includeEvidence: true)
+        let fixture = makeFixture(includeValidationEvidence: true)
         let provider = GoalVerifierTestProvider(chunks: [
             .textDelta("```json\n{\"verdict\":\"complete\"}\n```"),
             .done(finishReason: "stop"),
@@ -166,7 +127,7 @@ final class GoalVerifierControlPlaneTests: XCTestCase {
     }
 
     func testEmptyRequirementsCannotComplete() async {
-        let fixture = makeFixture(taskStatus: .completed, includeEvidence: true)
+        let fixture = makeFixture(includeValidationEvidence: true)
         let provider = GoalVerifierTestProvider(chunks: [
             .textDelta(#"{"verdict":"complete","requirements":[],"progress_made":true,"remaining_work":[],"blocker":null}"#),
             .done(finishReason: "stop"),
@@ -183,7 +144,7 @@ final class GoalVerifierControlPlaneTests: XCTestCase {
     }
 
     func testToolCallFailsSafeToContinue() async {
-        let fixture = makeFixture(taskStatus: .completed, includeEvidence: true)
+        let fixture = makeFixture(includeValidationEvidence: true)
         let provider = GoalVerifierTestProvider(chunks: [
             .toolCalls([ToolCall(id: "call_1", name: "run_shell", arguments: "{}")]),
             .textDelta(completeResponse(reference: "test://swift/goal-verifier")),
@@ -200,7 +161,7 @@ final class GoalVerifierControlPlaneTests: XCTestCase {
     }
 
     func testMissingCompletionMarkerFailsSafeToContinue() async {
-        let fixture = makeFixture(taskStatus: .completed, includeEvidence: true)
+        let fixture = makeFixture(includeValidationEvidence: true)
         let provider = GoalVerifierTestProvider(chunks: [
             .textDelta(completeResponse(reference: "test://swift/goal-verifier")),
         ])
@@ -215,7 +176,7 @@ final class GoalVerifierControlPlaneTests: XCTestCase {
     }
 
     func testProviderOutputLimitFinishReasonIsDistinctFromUsageLimit() async {
-        let fixture = makeFixture(taskStatus: .completed, includeEvidence: true)
+        let fixture = makeFixture(includeValidationEvidence: true)
         let provider = GoalVerifierTestProvider(chunks: [
             .textDelta("{\"verdict\":"),
             .usage(Usage(totalTokens: 512)),
@@ -233,7 +194,7 @@ final class GoalVerifierControlPlaneTests: XCTestCase {
     }
 
     func testProviderMaxTokensFinishReasonRemainsOutputLimit() async {
-        let fixture = makeFixture(taskStatus: .completed, includeEvidence: true)
+        let fixture = makeFixture(includeValidationEvidence: true)
         let provider = GoalVerifierTestProvider(chunks: [
             .textDelta("{\"verdict\":"),
             .done(finishReason: "max_tokens"),
@@ -249,7 +210,7 @@ final class GoalVerifierControlPlaneTests: XCTestCase {
     }
 
     func testExplicitOutputPolicyIsForwardedWithoutAnArbitraryClamp() async throws {
-        let fixture = makeFixture(taskStatus: .completed, includeEvidence: true)
+        let fixture = makeFixture(includeValidationEvidence: true)
         let provider = GoalVerifierTestProvider(chunks: [
             .textDelta(completeResponse(reference: "test://swift/goal-verifier")),
             .done(finishReason: "stop"),
@@ -273,7 +234,7 @@ final class GoalVerifierControlPlaneTests: XCTestCase {
     }
 
     func testProviderHardUsageLimitIsDistinctFromOutputLimit() async {
-        let fixture = makeFixture(taskStatus: .completed, includeEvidence: true)
+        let fixture = makeFixture(includeValidationEvidence: true)
         let provider = GoalVerifierTestProvider(
             chunks: [.usage(Usage(promptTokens: 80, totalTokens: 80))],
             terminalUsageLimit: ProviderUsageLimitError(
@@ -292,7 +253,7 @@ final class GoalVerifierControlPlaneTests: XCTestCase {
     }
 
     func testTimeoutReturnsWithoutWaitingForSlowProviderAndQuarantinesVerifier() async {
-        let fixture = makeFixture(taskStatus: .completed, includeEvidence: true)
+        let fixture = makeFixture(includeValidationEvidence: true)
         let provider = GoalVerifierTestProvider(
             chunks: [
                 .textDelta(completeResponse(reference: "test://swift/goal-verifier")),
@@ -319,7 +280,7 @@ final class GoalVerifierControlPlaneTests: XCTestCase {
     }
 
     func testCallerCancellationFailsSafeToContinue() async {
-        let fixture = makeFixture(taskStatus: .completed, includeEvidence: true)
+        let fixture = makeFixture(includeValidationEvidence: true)
         let provider = GoalVerifierTestProvider(
             chunks: [.done(finishReason: "stop")],
             delayNanoseconds: 2_000_000_000)
@@ -341,9 +302,7 @@ final class GoalVerifierControlPlaneTests: XCTestCase {
         var input: GoalVerificationInput
     }
 
-    private func makeFixture(taskStatus: WorkTaskStatus,
-                             includeEvidence: Bool,
-                             includeValidationEvidence: Bool? = nil) -> Fixture {
+    private func makeFixture(includeValidationEvidence: Bool) -> Fixture {
         let session = SessionID(rawValue: "goal-verifier-session")
         let goalID = GoalID(rawValue: "goal-verifier")
         let runID = ContinuationRunID(rawValue: "run-verifier")
@@ -362,23 +321,11 @@ final class GoalVerifierControlPlaneTests: XCTestCase {
             goalID: goalID,
             ordinal: 1,
             status: .checkpointed)
-        let task = WorkTask(
-            id: WorkTaskID(rawValue: "wt-verifier"),
-            runID: runID,
-            goalID: goalID,
-            title: "Implement verifier",
-            description: "Implement and test the independent verifier.",
-            acceptanceCriteria: ["Tests pass"],
-            status: taskStatus,
-            result: taskStatus == .completed ? "Implemented and tested." : nil,
-            evidence: includeEvidence ? [evidence] : [])
         return Fixture(input: GoalVerificationInput(
             goal: goal,
             run: run,
-            workTasks: [task],
             runHistory: ["Run 1 implemented the verifier."],
-            authoritativeWorkspaceSummary: "Verifier source and tests are present.",
-            validationEvidence: (includeValidationEvidence ?? includeEvidence) ? [evidence] : []))
+            validationEvidence: includeValidationEvidence ? [evidence] : []))
     }
 
     private func completeResponse(reference: String) -> String {

@@ -11,7 +11,7 @@ final class DocumentReadToolSplitTests: XCTestCase {
             XCTAssertNotNil(registry.tool(named: name), name)
         }
         XCTAssertNil(registry.tool(named: "document_read"))
-        XCTAssertEqual(registry.registryVersion, "intatis.standard.v3")
+        XCTAssertEqual(registry.registryVersion, "intatis.standard.v4")
     }
 
     func testReadersExposeOnlyPathAndCharacterBudget() throws {

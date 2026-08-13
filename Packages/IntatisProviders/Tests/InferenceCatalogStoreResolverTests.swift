@@ -294,6 +294,53 @@ final class InferenceCatalogStoreResolverTests: XCTestCase {
         XCTAssertNotEqual(low.binding.inferenceProfileRef, high.binding.inferenceProfileRef)
     }
 
+    func testExactAgentInferenceCarriesHostedSearchOnSameProfileRevision()
+        async throws
+    {
+        let profileID = InferenceProfileID(
+            rawValue: "hosted-search-profile")
+        let profile = InferenceProfileDraft(
+            inferenceProfileID: profileID,
+            inferenceConnectionID: InferenceConnectionID(
+                rawValue: "route"),
+            modelID: ModelID(rawValue: "search/model"),
+            declaredCapabilities: [
+                .chat,
+                .toolCalling,
+                .hostedWebSearch,
+            ],
+            safeRouteLabel: "Hosted search route")
+        let catalog = try InferenceCatalogReconciler.reconcile(
+            draft: makeDraft(
+                profiles: [profile],
+                requestAdapter: .openRouter))
+        let snapshot = try InferenceCatalogSnapshot(catalog: catalog)
+        let registry = makeRegistry(
+            snapshot: snapshot,
+            resolver: MutableInferenceSecretResolver(
+                values: ["ROUTE_KEY": "shared-secret"]),
+            http: InferenceCapturingHTTP())
+
+        let resolved = try await registry.agentInference(
+            for: XCTUnwrap(snapshot.currentProfileRef(for: profileID)))
+        let hosted = try XCTUnwrap(resolved.hostedWebSearch)
+
+        XCTAssertEqual(hosted.model, resolved.model)
+        XCTAssertEqual(hosted.model.rawValue, "search/model")
+        XCTAssertEqual(
+            hosted.configuration.dialect,
+            .openRouterServerTool)
+        XCTAssertEqual(
+            hosted.configuration.unsupportedBehavior,
+            .failClosed)
+        XCTAssertEqual(hosted.configuration.toolChoice, .required)
+        XCTAssertEqual(
+            try XCTUnwrap(resolved.provider as? OpenAIWireProvider)
+                .endpoint.id,
+            try XCTUnwrap(hosted.provider as? OpenAIWireProvider)
+                .endpoint.id)
+    }
+
     func testConcurrentExactProfilesNeverCrossTalkRequestOptions() async throws {
         let lowID = InferenceProfileID(rawValue: "low-concurrent")
         let highID = InferenceProfileID(rawValue: "high-concurrent")

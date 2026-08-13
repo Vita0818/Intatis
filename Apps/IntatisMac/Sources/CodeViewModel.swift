@@ -575,9 +575,16 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
                         catalogBudget:
                             route.modelContextPolicy
                                 .skillCatalogMetadataBudget)
+                let hostedWebSearch = capabilityLease.tools.contains(
+                    .hostedWebSearch)
+                    ? route.hostedWebSearch.map {
+                        ProviderHostedWebSearchToolService(route: $0)
+                    }
+                    : nil
                 let unaugmentedRegistry = skillSnapshot.augmenting(
                     ToolRegistry.standard(
-                        includesTerminal: allowsShell))
+                        includesTerminal: allowsShell,
+                        hostedWebSearch: hostedWebSearch))
                 let baseRegistry: ToolRegistry
                 if let augmenter =
                     self.internalToolRegistryAugmenter {
@@ -829,15 +836,27 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
             access: .readWrite)
         let allowsShell =
             PlatformProfile.current.allowsShell
+        let route =
+            try await registry.defaultAgentRuntimeRoute()
         let skillSnapshot =
             try await SkillCatalogService.shared.snapshot(
                 configuration: .standard(
                     workspaceRoot: workspaceRoot,
-                    access: AppConfig.skillRootAccess))
+                    access: AppConfig.skillRootAccess),
+                catalogBudget:
+                    route.modelContextPolicy
+                        .skillCatalogMetadataBudget)
+        let hostedWebSearch = capabilityLease.tools.contains(
+            .hostedWebSearch)
+            ? route.hostedWebSearch.map {
+                ProviderHostedWebSearchToolService(route: $0)
+            }
+            : nil
         let unaugmentedRegistry = skillSnapshot.augmenting(
             ToolRegistry.standard(
                 includesTerminal:
-                    allowsShell))
+                    allowsShell,
+                hostedWebSearch: hostedWebSearch))
         if let previous = mcpInternalToolRegistryLease {
             mcpInternalToolRegistryLease = nil
             try await previous.closeRequiringDrain()

@@ -389,9 +389,16 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
                         workspaceRoot: workspace,
                         model: route.model,
                         profile: .reviewed)
+                    let hostedWebSearch = codeMCPSession
+                        .capabilityLease.tools.contains(.hostedWebSearch)
+                        ? route.hostedWebSearch.map {
+                            ProviderHostedWebSearchToolService(route: $0)
+                        }
+                        : nil
                     let unaugmentedRegistry = skillSnapshot.augmenting(
                         ToolRegistry.standard(
-                            includesTerminal: true))
+                            includesTerminal: true,
+                            hostedWebSearch: hostedWebSearch))
                     let knowledgeLease:
                         HostToolRegistryAugmentationLease?
                     let baseRegistry: ToolRegistry
@@ -512,9 +519,16 @@ private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async
                             rootPath: workspace.path,
                             access: .readWrite,
                             expiresAtTaskCompletion: false)
+                    let hostedWebSearch = capabilityLease.tools.contains(
+                        .hostedWebSearch)
+                        ? route.hostedWebSearch.map {
+                            ProviderHostedWebSearchToolService(route: $0)
+                        }
+                        : nil
                     let unaugmentedRegistry = skillSnapshot.augmenting(
                         ToolRegistry.standard(
-                            includesTerminal: true))
+                            includesTerminal: true,
+                            hostedWebSearch: hostedWebSearch))
                     let knowledgeLease:
                         HostToolRegistryAugmentationLease?
                     let baseRegistry: ToolRegistry

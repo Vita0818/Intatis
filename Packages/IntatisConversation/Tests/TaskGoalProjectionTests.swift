@@ -231,7 +231,7 @@ final class TaskGoalProjectionTests: XCTestCase {
         XCTAssertEqual(accepted.currentGoal?.status, .completed)
     }
 
-    func testContinuationRunRecoveryCannotReopenTerminalRun() {
+    func testInterruptedContinuationRunCannotBeReopened() {
         let created = ContinuationRun(
             id: runID,
             sessionID: session,
@@ -240,28 +240,24 @@ final class TaskGoalProjectionTests: XCTestCase {
             startedAt: createdAt)
         var running = created
         running.status = .running
-        var checkpointed = running
-        checkpointed.status = .checkpointed
-        checkpointed.progressSummary = "safe checkpoint"
-        var recovered = checkpointed
-        recovered.status = .running
-        var completed = recovered
-        completed.status = .completed
-        completed.endedAt = createdAt.addingTimeInterval(5)
-        var invalidRecovery = completed
-        invalidRecovery.status = .running
-        invalidRecovery.endedAt = nil
+        var interrupted = running
+        interrupted.status = .interrupted
+        interrupted.progressSummary = "provider unavailable"
+        interrupted.endedAt = createdAt.addingTimeInterval(5)
+        var invalidRestart = interrupted
+        invalidRestart.status = .running
+        invalidRestart.endedAt = nil
 
         let projection = CoworkProjection.build(from: [
             envelope(0, .continuationRunCreated(.init(run: created))),
             envelope(1, .continuationRunStarted(.init(run: running))),
-            envelope(2, .continuationRunCheckpointed(.init(run: checkpointed))),
-            envelope(3, .continuationRunRecovered(.init(run: recovered, recoveredAt: createdAt))),
-            envelope(4, .continuationRunCompleted(.init(run: completed))),
-            envelope(5, .continuationRunRecovered(.init(run: invalidRecovery, recoveredAt: createdAt))),
+            envelope(2, .continuationRunInterrupted(.init(
+                run: interrupted,
+                reason: "provider unavailable"))),
+            envelope(3, .continuationRunStarted(.init(run: invalidRestart))),
         ])
 
-        XCTAssertEqual(projection.continuationRuns[runID], completed)
+        XCTAssertEqual(projection.continuationRuns[runID], interrupted)
     }
 
     func testEventLogReopenRebuildsTaskGoalRunProjection() async throws {
@@ -307,8 +303,6 @@ final class TaskGoalProjectionTests: XCTestCase {
     private func workTask(status: WorkTaskStatus, revision: Int) -> WorkTask {
         WorkTask(
             id: workTaskID,
-            runID: runID,
-            goalID: goalID,
             title: "Implement projection",
             description: "Fold durable Task/Goal events",
             acceptanceCriteria: ["recovery works"],

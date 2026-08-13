@@ -68,7 +68,7 @@ final class CoworkSemanticEventTests: XCTestCase {
         XCTAssertEqual(decoded, envelope)
     }
 
-    func testDelegationRejectedEventContainsReason() async throws {
+    func testDuplicateDelegationPreflightWritesNoRejectionEvent() async throws {
         let log = try semanticLog()
         let main = AgentID(rawValue: "main")
         let worker = AgentID(rawValue: "worker")
@@ -87,15 +87,29 @@ final class CoworkSemanticEventTests: XCTestCase {
         XCTAssertTrue(mainAttached)
         XCTAssertTrue(workerAttached)
 
-        _ = await orch.enqueueDelegatedTask(from: main, to: worker.rawValue, objective: "Duplicate me.")
-        _ = await orch.enqueueDelegatedTask(from: main, to: worker.rawValue, objective: "duplicate me.")
+        let admitted = await orch.enqueueDelegatedTask(
+            from: main,
+            to: worker.rawValue,
+            objective: "Duplicate me.")
+        let rejectedResult = await orch.enqueueDelegatedTask(
+            from: main,
+            to: worker.rawValue,
+            objective: "duplicate me.")
 
-        let rejected = await log.replay().compactMap {
+        let events = await log.replay()
+        let rejected = events.compactMap {
             if case .delegationRejected(let payload) = $0.event { return payload }
             return nil
         }
-        XCTAssertEqual(rejected.first?.violationKind, TaskGraphViolation.Kind.duplicateTask.rawValue)
-        XCTAssertEqual(rejected.first?.reason, "duplicate active task rejected")
+        let delegated = events.filter {
+            if case .taskDelegated = $0.event { return true }
+            return false
+        }
+        XCTAssertNotNil(admitted.taskID)
+        XCTAssertNil(rejectedResult.taskID)
+        XCTAssertFalse(rejectedResult.message.isEmpty)
+        XCTAssertTrue(rejected.isEmpty, "preflight rejection must not append an audit fact")
+        XCTAssertEqual(delegated.count, 1)
     }
 
     func testAgentMessageEventContainsSenderRecipientAndTaskMetadata() async throws {
