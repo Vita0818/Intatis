@@ -683,11 +683,11 @@ private func appendReliabilityTaskWithSettledSideEffect(
 
 
 final class OrchestrationReliabilityTests: XCTestCase {
-    func testDefaultExecutionPolicyAllowsTenMinuteCoworkInvocations() {
+    func testDefaultExecutionPolicyAllowsOneHourCoworkInvocations() {
         let policy = CoworkExecutionPolicy()
 
         XCTAssertEqual(policy.maxConcurrentTasks, 4)
-        XCTAssertEqual(policy.taskTimeoutSeconds, 600)
+        XCTAssertEqual(policy.taskTimeoutSeconds, 3_600)
         XCTAssertEqual(policy.maxAttempts, 3)
         XCTAssertNil(policy.tokenBudget)
     }
@@ -1280,7 +1280,7 @@ final class OrchestrationReliabilityTests: XCTestCase {
         }.first)
         XCTAssertNil(root.parentTaskID)
         XCTAssertNil(root.issuer)
-        XCTAssertEqual(root.executionTimeoutSeconds, 600)
+        XCTAssertEqual(root.executionTimeoutSeconds, 3_600)
         XCTAssertEqual(root.maxAttempts, 3)
         let projection = CoworkProjection.build(from: events)
         XCTAssertEqual(projection.tasks[root.id]?.status, .completed)

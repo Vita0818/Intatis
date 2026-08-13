@@ -1348,7 +1348,7 @@ private struct RendererThreadBurstFixtureView: View {
                 agentState: model.isWorking
                     ? AgentState.thinking.rawValue
                     : AgentState.idle.rawValue,
-                composerError: model.hasFailed ? model.status : nil,
+                errorTexts: model.hasFailed ? [model.status] : [],
                 threadStyle: style,
                 showsInspector: $showsInspector,
                 input: $input,

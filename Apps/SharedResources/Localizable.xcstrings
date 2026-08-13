@@ -6010,6 +6010,23 @@
         }
       }
     },
+    "Error Information" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Error Information"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "错误信息"
+          }
+        }
+      }
+    },
     "Exact absolute executable path" : {
       "extractionState" : "manual",
       "localizations" : {

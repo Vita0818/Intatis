@@ -967,8 +967,10 @@ struct CodeSessionView: View {
                   isWorking: vm.isWorking,
                   workspaceName: vm.workspaceName,
                   agentState: vm.agentState,
-                  composerError: vm.voiceInput.errorText
-                    ?? vm.composerError,
+                  errorTexts: [
+                    vm.voiceInput.errorText,
+                    vm.composerError,
+                  ].compactMap { $0 },
                   threadStyle: .intatisMac(scheme),
                   onShowSessions: onShowSessions,
                   onNewSession: onNewSession,
@@ -1144,11 +1146,13 @@ struct CoworkSessionView: View {
                         project: vm.project,
                         goal: vm.goal,
                         workTasks: vm.workTasks,
-                        composerError: vm.voiceInput.errorText
-                            ?? vm.composerError
-                            ?? vm.inferenceComposerError
-                            ?? vm.projectionError
-                            ?? vm.sessionStorageWarning,
+                        errorTexts: [
+                            vm.voiceInput.errorText,
+                            vm.composerError,
+                            vm.inferenceComposerError,
+                            vm.projectionError,
+                            vm.sessionStorageWarning,
+                        ].compactMap { $0 },
                         isWorking: isCoworkBusy,
                         isAcceptingSubmission: vm.isAcceptingSubmission,
                         hasDraftAttachments: !vm.draftAttachments.isEmpty,

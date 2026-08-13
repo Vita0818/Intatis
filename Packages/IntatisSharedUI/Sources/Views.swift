@@ -201,25 +201,14 @@ struct MessageRow: View {
         .standard(scheme)
     }
 
-    private var isUninterruptedAgentReply: Bool {
-        (message.role == .assistant || message.role == .agent)
-            && message.recoveryAdvice == nil
-    }
-
     @ViewBuilder var body: some View {
-        if isUninterruptedAgentReply {
-            messageBody
-                .padding(.vertical, 8)
-        } else {
+        if message.role == .user {
             messageBody
                 .padding(10)
-                .intatisContentSurface(cornerRadius: 10)
-                .overlay {
-                    if message.role == .user {
-                        RoundedRectangle(cornerRadius: 10)
-                            .stroke(style.accent.opacity(0.64), lineWidth: 1)
-                    }
-                }
+                .intatisLiquidGlass(cornerRadius: 10)
+        } else {
+            messageBody
+                .padding(.vertical, 8)
         }
     }
 

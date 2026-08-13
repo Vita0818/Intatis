@@ -25,6 +25,7 @@ private func intatisLocalizedAgentState(_ state: String) -> String {
 /// Tools/Permission/AgentKernel dependencies).
 public struct CodeShell: View {
     private let displayedItems: [CodeItem]
+    private let threadErrors: [IntatisThreadErrorEntry]
     private let presentationScope: IntatisThreadPresentationScope
     private let sessionTitle: String
     private let thinkingPhaseID: String
@@ -34,7 +35,6 @@ public struct CodeShell: View {
     private let isWorking: Bool
     private let workspaceName: String
     private let agentState: String
-    private let composerError: String?
     private let threadStyle: IntatisThreadStyle
     private let onShowSessions: (() -> Void)?
     private let onNewSession: (() -> Void)?
@@ -60,7 +60,7 @@ public struct CodeShell: View {
                 isWorking: Bool,
                 workspaceName: String,
                 agentState: String,
-                composerError: String? = nil,
+                errorTexts: [String] = [],
                 threadStyle: IntatisThreadStyle = .standard(.light),
                 splitLayout: IntatisSplitColumnLayout = .workspace,
                 onShowSessions: (() -> Void)? = nil,
@@ -74,7 +74,11 @@ public struct CodeShell: View {
                 onSend: @escaping () -> Void,
                 onCancelCurrent: (() -> Void)? = nil,
                 onResolve: @escaping (PermissionResponseAction) -> Void) {
-        self.displayedItems = IntatisExecutionTracePresentation.displayedItems(items)
+        self.displayedItems = IntatisThreadErrorPresentation.transcriptItems(
+            IntatisExecutionTracePresentation.displayedItems(items))
+        self.threadErrors = IntatisThreadErrorPresentation.errors(
+            items: items,
+            errorTexts: errorTexts)
         self.presentationScope = presentationScope
         self.sessionTitle = sessionTitle
         self.thinkingPhaseID = "\(thinkingScopeID):\(items.last?.id ?? "initial")"
@@ -84,7 +88,6 @@ public struct CodeShell: View {
         self.isWorking = isWorking
         self.workspaceName = workspaceName
         self.agentState = agentState
-        self.composerError = composerError
         self.threadStyle = threadStyle
         self.onShowSessions = onShowSessions
         self.onNewSession = onNewSession
@@ -134,7 +137,7 @@ public struct CodeShell: View {
                     agentState: agentState,
                     itemCount: displayedItems.count,
                     pending: pending,
-                    failedItems: failedItems,
+                    errors: threadErrors,
                     style: threadStyle)
                     .frame(width: inspectorLayout.inspectorWidth)
                     .frame(maxHeight: .infinity)
@@ -142,10 +145,6 @@ public struct CodeShell: View {
                     .accessibilityIdentifier("code.inspector")
             }
         }
-    }
-
-    private var failedItems: [CodeItem] {
-        Array(displayedItems.filter { $0.isFailure || $0.kind == .error }.suffix(4))
     }
 
     private func threadColumn(
@@ -438,12 +437,6 @@ public struct CodeShell: View {
 
     private func composerArea(layout: IntatisThreadContentLayout) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            if let composerError {
-                Text(composerError)
-                    .font(.caption)
-                    .foregroundStyle(threadStyle.error)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
             IntatisThreadComposer(
                 placeholder: IntatisLocalization.string("Message Coder..."),
                 input: $input,
@@ -508,28 +501,45 @@ struct CodeItemRow: View {
             bubble(title: item.title, body: item.body.isEmpty && !item.complete ? "…" : item.body,
                    isUser: false)
         case .toolCall:
-            card(
-                icon: "wrench.and.screwdriver",
-                title: IntatisLocalization.format("tool · %@", item.title),
-                body: item.body,
-                tint: .blue)
+            if item.isFailure || item.recoveryAdvice != nil {
+                EmptyView()
+            } else {
+                card(
+                    icon: "wrench.and.screwdriver",
+                    title: IntatisLocalization.format("tool · %@", item.title),
+                    body: item.body,
+                    tint: .blue)
+            }
         case .toolResult:
-            card(icon: item.isFailure ? "exclamationmark.triangle" : "arrow.turn.down.right",
-                 title: item.title,
-                 body: item.body,
-                 tint: item.isFailure ? .red : .gray)
+            if item.isFailure || item.recoveryAdvice != nil {
+                EmptyView()
+            } else {
+                card(
+                    icon: "arrow.turn.down.right",
+                    title: item.title,
+                    body: item.body,
+                    tint: .gray)
+            }
         case .patch:
-            card(
-                icon: "doc.badge.gearshape",
-                title: IntatisLocalization.format(
-                    "patch · %@",
-                    item.files.joined(separator: ", ")),
-                body: item.body,
-                tint: .purple)
+            if item.isFailure || item.recoveryAdvice != nil {
+                EmptyView()
+            } else {
+                card(
+                    icon: "doc.badge.gearshape",
+                    title: IntatisLocalization.format(
+                        "patch · %@",
+                        item.files.joined(separator: ", ")),
+                    body: item.body,
+                    tint: .purple)
+            }
         case .note:
-            Text(item.body).font(.caption).foregroundStyle(.secondary)
+            if item.isFailure || item.recoveryAdvice != nil {
+                EmptyView()
+            } else {
+                Text(item.body).font(.caption).foregroundStyle(.secondary)
+            }
         case .error:
-            card(icon: "exclamationmark.triangle", title: item.title, body: item.body, tint: .red)
+            EmptyView()
         case .agentToAgent:
             bubble(
                 title: item.title,
@@ -553,15 +563,11 @@ struct CodeItemRow: View {
                                             body: String,
                                             isUser: Bool,
                                             tags: [String]) -> some View {
-        if isUser || item.isFailure {
+        if isUser {
             bubbleBody(title: title, body: body, isUser: isUser, tags: tags)
                 .padding(.horizontal, 15)
                 .padding(.vertical, 11)
-                .intatisContentSurface(cornerRadius: 16)
-                .overlay {
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .stroke(bubbleStroke(isUser: isUser), lineWidth: 1)
-                }
+                .intatisLiquidGlass(cornerRadius: 16)
         } else {
             bubbleBody(title: title, body: body, isUser: false, tags: tags)
                 .padding(.vertical, 8)
@@ -621,15 +627,11 @@ struct CodeItemRow: View {
                     policy: .richText,
                     style: style)
             }
-            if let advice = item.recoveryAdvice {
-                IntatisRecoveryAdviceView(
-                    advice: advice,
-                    tint: item.isFailure ? style.error : style.accent,
-                    style: style)
-            }
             if isUser,
                let submissionID = item.submissionID,
-               let submissionStatus = item.submissionStatus {
+               let submissionStatus = item.submissionStatus,
+               submissionStatus != .failed,
+               item.submissionFailure == nil {
                 submissionStatusView(
                     id: submissionID,
                     status: submissionStatus,
@@ -698,21 +700,11 @@ struct CodeItemRow: View {
         }
     }
 
-    private func bubbleStroke(isUser: Bool) -> Color {
-        if isUser && item.isFailure { return style.error.opacity(0.48) }
-        if isUser { return style.accent.opacity(0.48) }
-        if item.isFailure { return style.error.opacity(0.36) }
-        return .clear
-    }
-
     private func card(icon: String, title: String, body: String, tint: Color) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             Label(title, systemImage: icon).font(.caption.bold()).foregroundStyle(tint)
             Text(body).font(.system(.caption, design: .monospaced))
                 .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
-            if let advice = item.recoveryAdvice {
-                IntatisRecoveryAdviceView(advice: advice, tint: tint, style: style)
-            }
         }
         .padding(11)
         .intatisContentSurface(cornerRadius: 8)
@@ -1266,7 +1258,7 @@ private struct CodeInspectorView: View {
     let agentState: String
     let itemCount: Int
     let pending: PendingPermission?
-    let failedItems: [CodeItem]
+    let errors: [IntatisThreadErrorEntry]
     let style: IntatisThreadStyle
 
     var body: some View {
@@ -1298,27 +1290,14 @@ private struct CodeInspectorView: View {
                         .foregroundStyle(style.tertiaryText)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-                inspectorSection(IntatisLocalization.string("Recent Failures")) {
-                    if failedItems.isEmpty {
-                        Text("No failed tool or runtime events in the current projection.")
-                            .font(.caption)
-                            .foregroundStyle(style.tertiaryText)
-                            .fixedSize(horizontal: false, vertical: true)
-                    } else {
-                        ForEach(failedItems) { item in
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(item.title)
-                                    .font(.caption.bold())
-                                    .foregroundStyle(style.primaryText)
-                                    .lineLimit(1)
-                                Text(item.body)
-                                    .font(.caption2)
-                                    .foregroundStyle(style.secondaryText)
-                                    .lineLimit(3)
-                            }
-                            .padding(.vertical, 3)
-                        }
+                if !errors.isEmpty {
+                    inspectorSection(IntatisLocalization.string("Error Information")) {
+                        IntatisThreadErrorList(
+                            errors: errors,
+                            style: style,
+                            onRetrySubmission: nil)
                     }
+                    .accessibilityIdentifier("code.error.card")
                 }
             }
             .padding(16)

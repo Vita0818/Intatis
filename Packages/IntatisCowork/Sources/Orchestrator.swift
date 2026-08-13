@@ -99,7 +99,7 @@ public struct CoworkExecutionPolicy: Equatable, Sendable {
     public var tokenBudget: Int?
 
     public init(maxConcurrentTasks: Int = 4,
-                taskTimeoutSeconds: Double = 600,
+                taskTimeoutSeconds: Double = 3_600,
                 maxAttempts: Int = 3,
                 tokenBudget: Int? = nil) {
         self.maxConcurrentTasks = max(1, maxConcurrentTasks)

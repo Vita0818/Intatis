@@ -402,8 +402,10 @@ profiles 与外部 MCP client。macOS/Linux 的 stdio、sandbox、bwrap/guard �
 
 ## UI 与内容渲染
 
-- macOS/iOS 当前使用系统语义表面和原生 Liquid Glass；正常 assistant/agent 正文直接落在
-  conversation canvas，结构化状态、用户消息、错误、权限、Goal/Task 使用 Material 边界。
+- macOS/iOS 当前使用系统语义表面和原生 Liquid Glass；只有用户消息保留外层对话气泡，
+  该气泡使用原生 `Glass.regular` 且不再叠加 accent 蓝色描边。assistant/agent/system 对话正文
+  （包括失败/中断回复）直接落在 conversation canvas；tool、error、permission、Goal/Task 等
+  专用结构化状态继续使用 Material 边界。
 - iOS 与 macOS 已统一品牌/session/Settings 的 serif 标题和系统 sans 正文/控件，两端使用
   model/usage + action/input/voice/Send-or-Stop 的两排 composer；voice 始终紧邻主操作左侧，
   不占用或复制唯一的 Send↔Stop 槽位。composer 的 compact secondary/voice control 另显式固定
@@ -433,6 +435,13 @@ profiles 与外部 MCP client。macOS/Linux 的 stdio、sandbox、bwrap/guard �
   `Project Settings → MCP → Browse Content`。右侧 status rail 显隐开关使用系统 compact 圆形
   glass/bordered icon control；这两项只改变 header chrome，不进入 rail overlay、固定宽度或
   render-boundary 输入。
+- Code/Cowork 的会话错误统一由 SharedUI presentation 收集：当前 bounded thread page 中的
+  `.error`、失败 execution row、`recoveryAdvice`、失败 submission，以及 Code 的 voice/composer
+  和 Cowork 的 voice/composer/inference/projection/session-storage 页面级错误都会进入同一列表；
+  相同规范化文案只显示一次。右侧 rail 最底部只生成一张沿用现有 section 样式的“错误信息”
+  圆角卡片，无错误时不渲染卡片或占位。失败 submission 的 Retry 一并迁入该卡片；主 thread
+  仅保留用户原文和已有 partial agent 正文，不再显示 `Needs attention`、错误行、失败 trace 或
+  恢复建议。该收口只生成 presentation copy，不修改 EventLog、projection 或 durable failure facts。
 - rail 现在是 thread 上不参与布局协商的 `.overlay(alignment: .trailing)`，并关闭 inspector
   transaction 的隐式动画。rail 由只包含 rail 输入的 Equatable render boundary 隔离；thread 的
   empty/loading/page/rich 状态不能重新物化 cards。每个 passive `Glass.clear` 都位于自己的稳定

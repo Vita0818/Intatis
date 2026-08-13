@@ -49,7 +49,7 @@ public struct IntatisThreadStyle {
 }
 
 /// User bubbles are already identified by their trailing alignment and
-/// Material surface, so repeating a sender label adds noise without adding
+/// Liquid Glass surface, so repeating a sender label adds noise without adding
 /// information. Other message roles keep their structured identity header.
 public enum IntatisMessageHeaderPolicy {
     public static func showsIdentity(for role: MessageRole) -> Bool {
@@ -58,6 +58,272 @@ public enum IntatisMessageHeaderPolicy {
             return false
         case .assistant, .agent, .system:
             return true
+        }
+    }
+}
+
+struct IntatisThreadErrorEntry: Identifiable, Equatable, Sendable {
+    let id: String
+    var title: String?
+    var details: [String]
+    var retrySubmissionID: SubmissionID?
+    fileprivate var titlePriority: Int
+}
+
+/// Collects every error source that would otherwise compete with the
+/// conversation, and produces the corresponding error-free transcript copy.
+/// Durable facts remain unchanged; this is only a SharedUI presentation rule.
+enum IntatisThreadErrorPresentation {
+    private struct Candidate {
+        let fingerprint: String
+        let entry: IntatisThreadErrorEntry
+    }
+
+    static func errors(
+        items: [CodeItem],
+        errorTexts: [String]
+    ) -> [IntatisThreadErrorEntry] {
+        var orderedFingerprints: [String] = []
+        var entriesByFingerprint: [String: IntatisThreadErrorEntry] = [:]
+
+        func insert(_ candidate: Candidate) {
+            let fingerprint = candidate.fingerprint
+            if var existing = entriesByFingerprint[fingerprint] {
+                if candidate.entry.titlePriority > existing.titlePriority {
+                    existing.title = candidate.entry.title
+                    existing.titlePriority = candidate.entry.titlePriority
+                }
+                for detail in candidate.entry.details
+                    where !existing.details.contains(where: {
+                        normalized($0) == normalized(detail)
+                    }) {
+                    existing.details.append(detail)
+                }
+                if existing.retrySubmissionID == nil {
+                    existing.retrySubmissionID =
+                        candidate.entry.retrySubmissionID
+                }
+                entriesByFingerprint[fingerprint] = existing
+                orderedFingerprints.removeAll { $0 == fingerprint }
+                orderedFingerprints.append(fingerprint)
+            } else {
+                entriesByFingerprint[fingerprint] = candidate.entry
+                orderedFingerprints.append(fingerprint)
+            }
+        }
+
+        for item in items {
+            if let candidate = candidate(for: item) {
+                insert(candidate)
+            }
+        }
+        for (index, errorText) in errorTexts.enumerated() {
+            guard cleaned(errorText) != nil else { continue }
+            if let candidate = makeCandidate(
+                id: "host-error-\(index)",
+                title: nil,
+                primaryDetail: errorText,
+                supportingDetails: [],
+                retrySubmissionID: nil,
+                titlePriority: 0) {
+                insert(candidate)
+            }
+        }
+
+        return orderedFingerprints.reversed().compactMap {
+            entriesByFingerprint[$0]
+        }
+    }
+
+    static func transcriptItems(_ items: [CodeItem]) -> [CodeItem] {
+        items.compactMap { source in
+            switch source.kind {
+            case .error:
+                return nil
+            case .toolCall, .toolResult, .patch, .note:
+                if source.isFailure || source.recoveryAdvice != nil {
+                    return nil
+                }
+            case .user, .agent, .agentToAgent:
+                break
+            }
+
+            var item = source
+            item.recoveryAdvice = nil
+            item.isFailure = false
+            if item.kind == .user,
+               item.submissionStatus == .failed
+                    || item.submissionFailure != nil {
+                item.submissionStatus = nil
+                item.submissionFailure = nil
+            }
+            return item
+        }
+    }
+
+    private static func candidate(for item: CodeItem) -> Candidate? {
+        let advice = item.recoveryAdvice
+
+        if item.kind == .user,
+           item.submissionStatus == .failed || item.submissionFailure != nil {
+            let failure = item.submissionFailure
+            return makeCandidate(
+                id: "submission-error-\(item.id)",
+                title: IntatisLocalization.string("Needs attention"),
+                primaryDetail: failure?.message
+                    ?? advice?.detail
+                    ?? IntatisLocalization.string("Needs attention"),
+                supportingDetails: [advice?.title, advice?.detail],
+                retrySubmissionID: failure?.retryable == true
+                    ? item.submissionID
+                    : nil,
+                titlePriority: 2)
+        }
+
+        if item.kind == .error {
+            return makeCandidate(
+                id: "runtime-error-\(item.id)",
+                title: item.title,
+                primaryDetail: item.body.isEmpty
+                    ? advice?.detail
+                    : item.body,
+                supportingDetails: [advice?.title, advice?.detail],
+                retrySubmissionID: nil,
+                titlePriority: 3)
+        }
+
+        // A user-cancelled submission is terminal state, not an error. Its
+        // status remains attached to the user row and must not manufacture a
+        // generic "You" entry in the right rail.
+        if item.isFailure, item.kind != .user {
+            let isConversationText = item.kind == .agent
+                || item.kind == .agentToAgent
+                || item.kind == .user
+            return makeCandidate(
+                id: "failed-item-\(item.id)",
+                title: item.title,
+                primaryDetail: isConversationText
+                    ? advice?.detail
+                    : (item.body.isEmpty ? advice?.detail : item.body),
+                supportingDetails: [advice?.title, advice?.detail],
+                retrySubmissionID: nil,
+                titlePriority: 2)
+        }
+
+        if let advice {
+            return makeCandidate(
+                id: "recovery-error-\(item.id)",
+                title: item.title.isEmpty ? advice.title : item.title,
+                primaryDetail: advice.detail,
+                supportingDetails: [advice.title],
+                retrySubmissionID: nil,
+                titlePriority: 1)
+        }
+
+        return nil
+    }
+
+    private static func makeCandidate(
+        id: String,
+        title: String?,
+        primaryDetail: String?,
+        supportingDetails: [String?],
+        retrySubmissionID: SubmissionID?,
+        titlePriority: Int
+    ) -> Candidate? {
+        let cleanTitle = cleaned(title)
+        let cleanPrimary = cleaned(primaryDetail)
+        let fallback = supportingDetails.compactMap(cleaned).first
+            ?? cleanTitle
+            ?? IntatisLocalization.string("Needs attention")
+        let fingerprint = normalized(cleanPrimary ?? fallback)
+        guard !fingerprint.isEmpty else { return nil }
+
+        var details: [String] = []
+        let normalizedTitle = cleanTitle.map(normalized)
+        for candidateValue in [cleanPrimary] + supportingDetails.map(cleaned) {
+            guard let value = candidateValue else { continue }
+            let normalizedValue = normalized(value)
+            if normalizedTitle.map({ $0 == normalizedValue }) == true
+                || details.contains(where: {
+                    normalized($0) == normalizedValue
+                }) {
+                continue
+            }
+            details.append(value)
+        }
+
+        return Candidate(
+            fingerprint: fingerprint,
+            entry: IntatisThreadErrorEntry(
+                id: id,
+                title: cleanTitle,
+                details: details,
+                retrySubmissionID: retrySubmissionID,
+                titlePriority: titlePriority))
+    }
+
+    private static func cleaned(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func normalized(_ value: String) -> String {
+        value
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
+            .lowercased()
+    }
+}
+
+struct IntatisThreadErrorList: View {
+    let errors: [IntatisThreadErrorEntry]
+    let style: IntatisThreadStyle
+    let onRetrySubmission: ((SubmissionID) -> Void)?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            ForEach(Array(errors.enumerated()), id: \.element.id) {
+                index, error in
+                if index > 0 {
+                    Divider().opacity(0.25)
+                }
+                errorRow(error)
+            }
+        }
+    }
+
+    private func errorRow(_ error: IntatisThreadErrorEntry) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            if error.title != nil || error.retrySubmissionID != nil {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    if let title = error.title {
+                        Text(title)
+                            .font(.caption.bold())
+                            .foregroundStyle(style.primaryText)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: 4)
+                    if let submissionID = error.retrySubmissionID,
+                       let onRetrySubmission {
+                        Button(IntatisLocalization.string("Retry")) {
+                            onRetrySubmission(submissionID)
+                        }
+                        .buttonStyle(.borderless)
+                        .font(.caption.bold())
+                        .accessibilityIdentifier(
+                            "submission.\(submissionID.rawValue).retry")
+                    }
+                }
+            }
+            ForEach(error.details, id: \.self) { detail in
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(style.secondaryText)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            }
         }
     }
 }

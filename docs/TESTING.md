@@ -346,6 +346,22 @@ revision+seq 被丢弃；iOS 在 A→B 后收到 A commit 只更新 A row/header
 - 未运行真实 provider、credential/network 或 GUI/iOS 手动 smoke；prompt-only rename 的线上模型
   遵循度仍须用真实 Code/Cowork 首轮分别验收，且本次没有增加 host 自动触发器。
 
+2026-08-13 Code/Cowork 会话错误统一右置的直接证据：`ThreadLayoutTests` 21/21、0 failures。
+测试复现失败 submission 与 `.error` 同时携带 `Task timed out after 600 seconds.` 的截图场景，
+确认只生成一项右栏错误、runtime title 优先且 exact Retry ID 保留；另覆盖失败 execution row、
+partial reply recovery、全部 host error strings、空来源不生成卡片、中央 transcript 仍保留用户原文与
+partial agent 正文。`swift build --disable-automatic-resolution`、`IntatisMac` macOS Debug unsigned
+build 与 `IntatisiOS` generic Simulator Debug unsigned build 均退出 0。未启动 App 或 fixture，卡片
+实际字高、长错误滚动、窄宽与 Light/Dark 像素仍需手动观察。
+
+2026-08-13 用户消息原生 Liquid Glass 气泡的直接证据：`ThreadLayoutTests` 18/18、0 failures；
+新增 source-shape 回归覆盖 macOS Chat、共享 iOS Chat 与 Code/Cowork，确认仅 user branch 使用
+`intatisLiquidGlass`，旧 `userSelectionStroke` / `bubbleStroke` / accent 蓝色 stroke 不再存在，
+failure 不参与气泡 admission。`swift build --disable-automatic-resolution`、`IntatisMac` macOS
+Debug unsigned build 与 `IntatisiOS` generic Simulator Debug unsigned build 均退出 0；构建只报告
+既有 `onChange(of:perform:)` deprecated warning。未启动 App 或 fixture，实际折射强度、长用户消息、
+Light/Dark、Reduce Transparency 与 Increase Contrast 仍需手动观察。
+
 ## Apple App 构建
 
 ```sh
@@ -480,8 +496,15 @@ recovery App metadata/architecture/signature/entitlements 重新验证；超时�
   且所有运行时操作禁用；`@permission-reviewer` 为 status-only；两个窗口选择互不覆盖；切走再
   返回仍恢复各 agent 自己的 Earlier/Newer/Latest boundary；查看 worker 时 composer 仍路由 `@main`；
 - long rich response、Markdown/table/code/math 和 plain-safe fallback；
+- macOS Chat、iOS Chat、Code、Cowork 仅用户消息显示 trailing 原生 regular Liquid Glass 气泡，
+  不出现旧 accent 蓝色描边；assistant/agent/system（包括失败/中断回复）直接位于 canvas，
+  正常 tool/permission/task 等专用结构化卡片仍保留各自容器；
 - composer 单行/多行、model menu、usage、Send/Stop；
 - Cowork wide rail、narrow permission fallback、Goal/Tasks/Agents；
+- Code/Cowork 当前 page 的 `.error`、失败 execution row、recovery advice、失败 submission 与全部
+  host 页面级错误只在右栏最底部同一张“错误信息”圆角卡片内显示；相同文案去重，Cowork Retry
+  仍可用。无错误时无卡片、无占位；主 thread/composer 不得再显示 `Needs attention`、timeout、
+  recovery advice、中央红框或另一张 `Recent Failures`；用户消息和 partial agent 正文必须保留；
 - wide rail 连续切换 agent、应用失焦/回焦、窗口移动与进入/退出全屏；系统日志中不得出现
   `IntatisThreadViewportFramesPreferenceKey tried to update multiple times per frame`，源码不得恢复
   viewport GeometryReader/PreferenceKey 坐标回写；

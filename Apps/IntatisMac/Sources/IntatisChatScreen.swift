@@ -447,11 +447,6 @@ struct IntatisMessageBubble: View {
 
     private var isUser: Bool { message.role == .user }
 
-    private var isUninterruptedAgentReply: Bool {
-        (message.role == .assistant || message.role == .agent)
-            && message.recoveryAdvice == nil
-    }
-
     private var roleLabel: String? {
         switch message.role {
         case .user:      return nil
@@ -477,15 +472,14 @@ struct IntatisMessageBubble: View {
     }
 
     @ViewBuilder private var bubble: some View {
-        if isUninterruptedAgentReply {
-            bubbleBody
-                .padding(.vertical, 8)
-        } else {
+        if isUser {
             bubbleBody
                 .padding(.horizontal, 15)
                 .padding(.vertical, 11)
-                .intatisContentSurface(cornerRadius: 16)
-                .overlay { userSelectionStroke }
+                .intatisLiquidGlass(cornerRadius: 16)
+        } else {
+            bubbleBody
+                .padding(.vertical, 8)
         }
     }
 
@@ -545,13 +539,6 @@ struct IntatisMessageBubble: View {
                         .foregroundStyle(IntatisTheme.softText(scheme))
                 }
             }
-        }
-    }
-
-    @ViewBuilder private var userSelectionStroke: some View {
-        if isUser {
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(IntatisTheme.selectedStroke(scheme), lineWidth: 1)
         }
     }
 

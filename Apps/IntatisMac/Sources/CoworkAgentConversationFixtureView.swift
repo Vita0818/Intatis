@@ -46,7 +46,7 @@ struct CoworkAgentConversationFixtureView: View {
                     mainAgentName: "main",
                     defaultModel: "fixture-model",
                     defaultPermission: "offline"),
-                composerError: nil,
+                errorTexts: [],
                 isWorking: controller.thread.page.isAgentWorking,
                 threadStyle: .intatisMac(colorScheme),
                 showsInspector: $showsInspector,

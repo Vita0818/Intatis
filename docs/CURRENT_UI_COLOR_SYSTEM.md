@@ -1,7 +1,7 @@
 # CURRENT_UI_COLOR_SYSTEM — 系统原生表面与 Liquid Glass 规范
 
 文档状态：当前 UI 实施规范
-最近核对日期：2026-08-04
+最近核对日期：2026-08-13
 产品基线：v0.48（build 48）
 
 > Intatis 不再把“系统外观”解释为固定的纯白和纯黑。页面、侧栏、内容层与控制层均使用 Apple 平台的动态语义资源；在支持的系统上，导航与交互控件采用原生 Liquid Glass。`docs/UI_COLOR_SYSTEM.md` 只保存上一版香槟金 / 暖中性色方案，不随当前方案修改。
@@ -10,9 +10,9 @@
 
 1. 不为浅色或深色模式声明固定 `.white`、`.black`、RGB、Hex 或取色器采样值。
 2. macOS detail 区使用系统 window surface；sidebar 交还 `NavigationSplitView` 自己渲染，不覆盖自定义底色。
-3. 普通 assistant / agent 正文（包括媒介化 Agent 通信）直接继承系统 conversation canvas，不额外叠 Material 或描边；用户消息、失败回复、数据卡片、权限提示、artifact、Goal / Task 等需要边界的结构化内容使用系统 `Material`。
-4. 功能层（导航、模式切换、composer、模型菜单、主要操作与紧凑交互控件）在 macOS 26 / iOS 26 采用原生 Liquid Glass。
-5. Liquid Glass 不铺满页面，也不作为长文本或数据内容的背景；玻璃只承担浮于内容之上的导航和交互功能。
+3. 除用户消息外的对话行（assistant / agent / system，包括失败 / 中断回复与媒介化 Agent 通信）直接继承系统 conversation canvas，不额外叠 Material、圆角或描边；用户消息是唯一对话气泡，使用原生 `Glass.regular`，不再叠加 accent 蓝色描边。tool、error、permission、artifact、Goal / Task 等专用结构化内容继续使用系统 `Material`。
+4. 功能层（导航、模式切换、composer、模型菜单、主要操作与紧凑交互控件）在 macOS 26 / iOS 26 采用原生 Liquid Glass；内容层只允许用户消息气泡与 Cowork 紧凑 trailing status rail 两类明确例外。
+5. Liquid Glass 不铺满页面或整段 transcript，也不作为一般长文本或数据卡片的默认背景；用户消息气泡只包裹该条用户输入，其他对话正文仍直接位于 canvas。
 6. 文本、分隔线、强调色与错误色使用系统语义资源：`.primary`、`.secondary`、系统 separator、`.accentColor`、`.red` 等。
 7. 颜色不是状态的唯一信息通道；状态同时保留文字、图标或结构提示。
 
@@ -24,8 +24,9 @@
 |---|---|---|
 | Window | SwiftUI `.windowBackground`；macOS 13 使用 `NSVisualEffectView.Material.windowBackground` 兼容 | macOS detail 根表面 |
 | Sidebar | `NavigationSplitView` 原生 sidebar | macOS 导航栏及其 vibrancy / active-window 行为 |
-| Conversation text | 继承 Window / 系统容器 canvas | 正常完成的 assistant / agent Markdown、公式与正文 |
-| Structured content | `.regularMaterial` + 系统 separator | 用户消息、失败回复、信息卡片、权限、artifact、Goal / Task 等内容 |
+| Conversation text | 继承 Window / 系统容器 canvas | assistant / agent / system 对话正文，包括失败 / 中断时已产生的正文、Markdown 与公式；Chat 的恢复建议仍跟随正文，Code/Cowork 的错误说明统一进入右栏 |
+| User message bubble | 原生 `Glass.regular`；防御性 fallback 为 `.regularMaterial` | 唯一带外层气泡的对话角色；保持 trailing 对齐、既有宽度与 gutter，不加 accent 描边 |
+| Structured content | `.regularMaterial` / 原生 glass + 系统 separator | 正常 tool、permission、artifact、Goal / Task 等专用内容卡片，以及 Code/Cowork 右栏唯一的条件式错误卡片 |
 | Functional glass | `glassEffect`、`GlassEffectContainer`、`.buttonStyle(.glass/.glassProminent)` | composer、模型菜单、主要按钮、操作组、agent pill 等 |
 | Fallback | `.regularMaterial` 或系统 bordered button | macOS 13–15、iOS 16–18 等不支持 Liquid Glass 的部署目标 |
 
@@ -41,7 +42,7 @@
 
 ### 3.2 Chat
 
-- 用户消息保留内容层 Material；正常完成的助手 / agent 回复没有外层卡片、底色或描边，Markdown、公式等直接显示在系统 canvas 上。失败 / 中断回复继续保留结构化容器与恢复建议。
+- 用户消息保持 trailing 对齐和既有宽度合同，但外层改为原生 `Glass.regular`，不再绘制蓝色细线；这是唯一对话气泡。assistant / agent / system 正文，包括失败 / 中断回复，都没有外层卡片、底色或描边，Markdown、公式与恢复建议直接显示在系统 canvas 上。
 - assistant / agent 名称右侧的消息时间属于三级只读元数据，不加 badge、图标、头像、玻璃或独立容器；它跟随系统本地化，24 小时内仅时间、7 天内星期加时间、更早为年月日加时间。
 - composer 固定为两排：第一排左侧是模型选择控件，右侧是 Context / Input / Cached / Output / Time 只读 usage；Chat/Code/Cowork 的选择器共用原生 `Menu` 语义与 40pt 高 interactive Liquid Glass 胶囊。选择按钮关闭态只显示模型名，不显示 CPU/芯片图标、provider 名或 variant/reasoning 辅助文字；弹出菜单内部仍按 provider 分组并保留 variant 明细。第二排从左到右是当前产品面已有的附件或图像 action、原生多行 `TextField`、voice、唯一主操作位；voice 始终紧邻主操作左侧。
 - composer 第二排的附件/图像 action、voice 与主操作使用 40×40 原生圆形 glass/bordered control，输入容器单行最小高度同为 40，同行 spacing 为 8；多行输入只向上增长，左右按钮保持底边对齐。主操作 idle 时是 Send，工作时在同一位置替换为 `Button(role: .destructive)` + `stop.fill` 的系统红色 Stop，不并排显示两个操作。voice 不占用该唯一槽位：第一次点击开始录音，第二次点击停止并转写，结果只进入可编辑草稿。
@@ -55,15 +56,15 @@
 
 ### 3.3 Code
 
-- 正常 agent 回复继承系统 canvas；用户消息、失败回复、Plan、Workspace、Recent Failures、权限提示和 artifact 属于结构化内容层，使用系统 Material。
+- 正常及失败 / 中断时已产生的 agent 对话正文继承系统 canvas；用户消息使用原生 `Glass.regular` 气泡。Plan、Workspace、权限提示和 artifact 仍属于专用结构化内容层，使用系统 Material。
 - Code 与 Cowork 共用名称右侧的低噪声消息时间；时间不参与 agent 状态、权限或任务完成语义。
 - header / workspace 操作与主要 CTA 属于功能层，使用原生 glass button。
-- Code inspector 是内容区内的系统风格 trailing status rail，使用稳定 outer width 决定显隐并继承系统 `.bar` / separator；不创建固定灰色或纯黑 / 纯白面板，也不向 window toolbar 动态增删 item。
+- Code inspector 是内容区内的系统风格 trailing status rail，使用稳定 outer width 决定显隐并继承系统 `.bar` / separator；不创建固定灰色或纯黑 / 纯白面板，也不向 window toolbar 动态增删 item。当前 page 的 runtime error、失败 trace、恢复建议、失败 submission 与全部 voice/composer 页面级错误经过去重后，只在 rail 最底部一张现有圆角 section 风格的“错误信息”卡片内显示；没有任何来源时完全不生成卡片。主 thread 与 composer 上方不得再出现同一错误，旧 `Recent Failures` section 不再存在。
 
 ### 3.4 Cowork
 
-- 正常 agent 回复与 Code 共用无外框正文渲染；通用 Agent message、`information_requested`、`information_replied` 与其他 agent-to-agent 正文也使用同一普通回答版式，身份只显示 exact `sender->recipient`。tool、error、permission 与 task 等结构化记录继续保留语义容器。
-- Cowork trailing status rail 是用户明确指定的紧凑玻璃状态层：待处理权限 / 最近权限结果置顶，其后依次为 Agents、Goal、Tasks；各 section 使用独立、稳定的系统原生 `Glass.clear` backdrop，不放进会融合或重组 shape 的 `GlassEffectContainer`。rail 作为 conversation detail 同一 canvas 上的 trailing overlay，不再使用 divider、整栏 `.bar` / Material 背板或固定灰底；主 thread 滚动容器延伸到 detail 最右侧，以 trailing scroll-content margin 给 cards 留位，原生滚动条保持在整个内容区最右端；rail 最右透明边缘不参与命中测试，不能遮挡滚动条交互。Cowork rail 不显示 Git。
+- 用户消息与 Code 共用原生 `Glass.regular` trailing 气泡；其余 agent 对话正文共用无外框渲染。通用 Agent message、`information_requested`、`information_replied` 与其他 agent-to-agent 正文也使用同一普通回答版式，身份只显示 exact `sender->recipient`。正常 tool、permission 与 task 等专用结构化记录继续保留语义容器；error、失败 trace 与 recovery 文案不再占用 thread 中央区域。
+- Cowork trailing status rail 是用户明确指定的紧凑玻璃状态层：待处理权限 / 最近权限结果置顶，其后依次为 Agents、Goal、Tasks；当前选中 agent page 的 runtime error、失败 trace、恢复建议、失败 submission 与全部 voice/composer/inference/projection/session-storage 页面级错误经过去重后，在最底部同一张“错误信息”圆角卡片内显示。没有任何来源时不生成卡片或占位；失败 submission 的 Retry 位于该卡片内，主 thread 与 composer 上方不再重复错误。各 section 使用独立、稳定的系统原生 `Glass.clear` backdrop，不放进会融合或重组 shape 的 `GlassEffectContainer`。rail 作为 conversation detail 同一 canvas 上的 trailing overlay，不再使用 divider、整栏 `.bar` / Material 背板或固定灰底；主 thread 滚动容器延伸到 detail 最右侧，以 trailing scroll-content margin 给 cards 留位，原生滚动条保持在整个内容区最右端；rail 最右透明边缘不参与命中测试，不能遮挡滚动条交互。Cowork rail 不显示 Git。
 - 有 pending permission 且窗口可安全容纳 rail 时，rail 临时固定可见；窗口窄到无法容纳 rail 时，只在 composer 上方保留同一个低对比 Material 权限卡作为安全兜底。两种布局不得同时显示权限卡，也不得在 thread 顶部复制 Goal/Tasks 或保留对应占位高度。
 - Cowork session header 不显示独立 MCP Content 快捷按钮；该浏览能力位于
   `Project Settings → MCP → Browse Content`。status rail 的显隐使用系统 compact 圆形
@@ -87,8 +88,8 @@
 
 - `Apps/IntatisMac/Sources/IntatisDesign.swift`：系统 window canvas、macOS 13 兼容表面、语义色与内容卡片。
 - `Apps/IntatisMac/Sources/IntatisMacRootView.swift`：系统 split-view sidebar 材质、title/竖向 icon mode/history/Settings 内部结构与 detail canvas。
-- `Packages/IntatisSharedUI/Sources/ThreadSurfaces.swift`：结构化内容 Material、30×30 sidebar New 圆形 glass control、原生圆形 icon controls、40pt composer/selection-menu 几何合同、两排 composer、首排 usage strip 与可选 accessories。
-- `Packages/IntatisSharedUI/Sources/Views.swift`：共享 Chat 消息和 composer；正常 assistant / agent 回复继承系统 canvas。
+- `Packages/IntatisSharedUI/Sources/ThreadSurfaces.swift`：用户消息原生 regular glass helper、结构化内容 Material、30×30 sidebar New 圆形 glass control、原生圆形 icon controls、40pt composer/selection-menu 几何合同、两排 composer、首排 usage strip 与可选 accessories。
+- `Packages/IntatisSharedUI/Sources/Views.swift`：共享 Chat 消息和 composer；仅用户消息使用 glass 气泡，其余对话角色继承系统 canvas。
 - `Packages/IntatisSharedUI/Sources/CodeViews.swift`、`CoworkViews.swift`、`ArtifactViews.swift`：各产品面的内容层 / 功能层映射。
 - `Apps/IntatisMac/Sources/IntatisChatScreen.swift`、`IntatisMacApp.swift`：macOS Chat、设置与 home CTA。
 - `Apps/IntatisiOS/Sources/IntatisiOSApp.swift`：iOS serif 标题角色、顶部 session header、
@@ -107,7 +108,7 @@ Apple 官方设计与 API 依据：
 - 浅色界面是系统当前解析出的 window / sidebar / Material 外观，而非固定纯白。
 - 深色界面是系统当前解析出的 window / sidebar / Material 外观，而非固定纯黑。
 - 侧栏保留系统材质，前台 / 后台窗口状态切换时能够跟随系统。
-- Liquid Glass 主要出现在导航和交互功能层；用户明确指定的 Cowork 紧凑 trailing status rail 是唯一内容层例外。正常 agent 正文仍直接位于系统 canvas，用户消息和其余结构化卡片使用 Material，页面与长 transcript 不整片玻璃化。
+- Liquid Glass 主要出现在导航和交互功能层；内容层例外只包括用户消息气泡与用户明确指定的 Cowork 紧凑 trailing status rail。仅用户消息有外层对话气泡且不得叠加 accent 蓝色描边；assistant / agent / system（包括失败 / 中断回复）直接位于系统 canvas。专用结构化卡片继续使用 Material，页面与长 transcript 不整片玻璃化。
 - 支持的系统上使用真实 `glassEffect` / glass button；旧系统 fallback 仍由系统语义 Material / control 渲染。
 - macOS Chat / Code / Cowork 与 iOS Chat 的 Light / Dark 运行态都经过视觉核对；不能只用源码搜索或固定像素值推断。
 - thread header 显示 session display name；Code / Cowork header 使用紧凑顶部留白且 Cowork 不常驻 permission-reviewer 横幅；消息无 agent 头像与通用 Agent badge；正常 agent 回复无外层卡片；agent 名称旁有本地化三级时间元数据；macOS sidebar 模式为带图标的竖向三行且仅选中行使用玻璃，Recent New `+` 为 30×30 原生圆形 glass；macOS composer 第一排保持 40pt、关闭态仅模型名的 model/profile glass 菜单左、usage 右，第二排保持已有 action 左、输入居中、voice 紧邻唯一 Send/Stop 左侧。iOS 顶部固定 sidebar/session/new，抽屉为 serif `Intatis`、选中 Chat、Recent/New 和底部 Settings，空页无 onboarding/建议卡；底部同样为 model/usage 第一排和 paperclip/input/voice/Send-or-Stop 第二排。两平台标题使用系统 serif、正文与控件使用系统 sans；两平台第二排 action/voice/stop/Send 与单行输入均为 40pt，输入变为多行时按钮底边不漂移；Cowork 宽屏 rail 第一位为权限审查、其后为 Agents/Goal/Tasks 且无 Git，pending 时 rail 固定；无法容纳 rail 时只显示一个权限兜底卡且不复制 Goal/Tasks。
@@ -298,3 +299,34 @@ rg -n 'glassEffect|GlassEffectContainer|buttonStyle\(\.glass|regularMaterial|win
 - draft/config focused tests、完整 SwiftPM tests、XcodeGen、macOS Debug 与 iOS Simulator Debug build
   已通过；本轮未启动 App、未请求真实麦克风权限，也未做 Light/Dark、窄宽、Dynamic Type、
   VoiceOver 或真实录音的运行态视觉检查，因此这些像素与交互结果仍为 `UNKNOWN`。
+
+## 21. 2026-08-13 用户消息原生 Liquid Glass 气泡
+
+- macOS Chat、共享 iOS Chat 与 Code/Cowork 共用消息行都收敛为同一角色规则：只有用户消息
+  带外层气泡，继续保持 trailing 对齐、原 `messageMaxWidth` 与 gutter；其他对话角色直接位于
+  conversation canvas。
+- 用户气泡复用 `ThreadSurfaces.swift` 已有的 `intatisLiquidGlass`，在当前 macOS 26 / iOS 26
+  产品面使用原生 `Glass.regular`。旧 `.regularMaterial` 用户表面及 accent 蓝色细线描边已删除，
+  没有新增颜色 token、自绘高光、渐变、阴影或玻璃组件。
+- assistant/agent/system 的普通、失败与中断回复不再因 failure/recovery 状态获得外层容器。
+  Chat recovery advice 仍跟随原消息正文；Code/Cowork recovery advice 与错误事实统一迁入右栏，
+  正常 tool、permission、artifact、Goal/Task 等专用结构化卡片保持不变。
+- `ThreadLayoutTests` 18/18、`swift build --disable-automatic-resolution`、IntatisMac macOS Debug
+  unsigned build 与 IntatisiOS generic Simulator Debug unsigned build 均通过。未启动 App 或 fixture；
+  实际折射强度、长用户消息、Light/Dark、Reduce Transparency 与 Increase Contrast 仍需运行态观察。
+
+## 22. 2026-08-13 Code/Cowork 会话错误统一右置
+
+- `ThreadSurfaces.swift` 只在 presentation 层收集当前 page 的 `.error`、失败 tool/patch/note、
+  `recoveryAdvice`、失败 submission，以及宿主传入的所有页面级错误字符串；规范化后相同文案
+  合并为一项。Code/Cowork 不再用 `??` 丢弃同时存在的后续错误。
+- Code inspector 与 Cowork Liquid Glass rail 都只在列表非空时于最底部生成一张“错误信息”卡片；
+  卡片内部可列出多项错误。Cowork 的 retryable submission 保留 exact `SubmissionID` 与 Retry，
+  不另造自动重试。
+- thread 使用错误清理后的 presentation copy：完整移除 error/失败 trace 行和 recovery 文案，
+  清除用户行的 `Needs attention`/timeout 状态，同时保留用户消息、正常消息及已产生的 partial agent
+  正文。EventLog、`CodeProjection`、submission failure 和 runtime error 的 durable 数据均未改动。
+- `ThreadLayoutTests` 21/21、`swift build --disable-automatic-resolution`、IntatisMac macOS Debug
+  unsigned build 与 IntatisiOS generic Simulator Debug unsigned build 均通过。测试直接复现同一 timeout
+  同时来自失败 submission 与 `.error` 的截图场景，确认右栏去重为一项并保留 Retry；未启动 App 或
+  fixture，长错误滚动、Light/Dark 与窄宽实际像素仍需手动观察。

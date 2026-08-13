@@ -2,6 +2,7 @@
 import AppKit
 import SwiftUI
 import XCTest
+import IntatisConversation
 import IntatisCore
 import IntatisProtocol
 @testable import IntatisSharedUI
@@ -82,7 +83,7 @@ private struct WorkspaceChromeStressHarness: View {
                 ],
                 pending: nil,
                 summary: CoworkStatusSummary(),
-                composerError: nil,
+                errorTexts: [],
                 isWorking: false,
                 showsInspector: Binding(
                     get: { model.coworkInspector },
@@ -195,6 +196,231 @@ final class ThreadLayoutTests: XCTestCase {
         XCTAssertTrue(IntatisMessageHeaderPolicy.showsIdentity(for: .assistant))
         XCTAssertTrue(IntatisMessageHeaderPolicy.showsIdentity(for: .agent))
         XCTAssertTrue(IntatisMessageHeaderPolicy.showsIdentity(for: .system))
+    }
+
+    func testOnlyUserConversationRowsUseNativeLiquidGlassBubble() throws {
+        let testFile = URL(fileURLWithPath: #filePath)
+        let packageRoot = testFile
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let repositoryRoot = packageRoot
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+
+        func sourceSlice(
+            _ source: String,
+            from startMarker: String,
+            to endMarker: String
+        ) throws -> Substring {
+            let start = try XCTUnwrap(source.range(of: startMarker))
+            let end = try XCTUnwrap(source.range(
+                of: endMarker,
+                range: start.upperBound..<source.endIndex))
+            return source[start.lowerBound..<end.lowerBound]
+        }
+
+        let sharedChatSource = try String(
+            contentsOf: packageRoot
+                .appendingPathComponent("Sources/Views.swift"),
+            encoding: .utf8)
+        let sharedMessageRow = try sourceSlice(
+            sharedChatSource,
+            from: "struct MessageRow: View",
+            to: "struct ComposerView: View")
+        XCTAssertTrue(sharedMessageRow.contains("if message.role == .user"))
+        XCTAssertTrue(sharedMessageRow.contains(
+            ".intatisLiquidGlass(cornerRadius: 10)"))
+        XCTAssertFalse(sharedMessageRow.contains(".intatisContentSurface("))
+        XCTAssertFalse(sharedMessageRow.contains("style.accent.opacity(0.64)"))
+        XCTAssertFalse(sharedMessageRow.contains("isUninterruptedAgentReply"))
+
+        let macChatSource = try String(
+            contentsOf: repositoryRoot
+                .appendingPathComponent(
+                    "Apps/IntatisMac/Sources/IntatisChatScreen.swift"),
+            encoding: .utf8)
+        let macMessageBubble = try sourceSlice(
+            macChatSource,
+            from: "struct IntatisMessageBubble: View",
+            to: "struct IntatisComposer: View")
+        XCTAssertTrue(macMessageBubble.contains("if isUser {"))
+        XCTAssertTrue(macMessageBubble.contains(
+            ".intatisLiquidGlass(cornerRadius: 16)"))
+        XCTAssertFalse(macMessageBubble.contains(".intatisContentSurface("))
+        XCTAssertFalse(macMessageBubble.contains("userSelectionStroke"))
+        XCTAssertFalse(macMessageBubble.contains("isUninterruptedAgentReply"))
+
+        let codeSource = try String(
+            contentsOf: packageRoot
+                .appendingPathComponent("Sources/CodeViews.swift"),
+            encoding: .utf8)
+        let codeBubbleContent = try sourceSlice(
+            codeSource,
+            from: "@ViewBuilder private func bubbleContent",
+            to: "private func bubbleBody")
+        XCTAssertTrue(codeBubbleContent.contains("if isUser {"))
+        XCTAssertTrue(codeBubbleContent.contains(
+            ".intatisLiquidGlass(cornerRadius: 16)"))
+        XCTAssertFalse(codeBubbleContent.contains("item.isFailure"))
+        XCTAssertFalse(codeBubbleContent.contains(".intatisContentSurface("))
+        XCTAssertFalse(codeSource.contains("private func bubbleStroke(isUser:"))
+    }
+
+    func testThreadErrorsCollectEveryConversationSourceAndLeaveTranscriptClean() throws {
+        let submissionID = SubmissionID(rawValue: "submission-timeout")
+        let timeout = "Task timed out after 600 seconds."
+        let items = [
+            CodeItem(
+                id: "user-timeout",
+                kind: .user,
+                title: "",
+                body: "Read the PDF",
+                isFailure: true,
+                submissionID: submissionID,
+                submissionStatus: .failed,
+                submissionFailure: SubmissionFailure(
+                    code: "timeout",
+                    message: timeout,
+                    retryable: true)),
+            CodeItem(
+                id: "partial-agent",
+                kind: .agent,
+                title: "main",
+                body: "Partial answer remains visible.",
+                complete: false,
+                isFailure: true,
+                recoveryAdvice: RuntimeRecoveryAdvice(
+                    title: "Response stopped before completion",
+                    detail: "Check endpoint compatibility before retrying.",
+                    retryable: true)),
+            CodeItem(
+                id: "runtime-timeout",
+                kind: .error,
+                title: "main",
+                body: timeout),
+            CodeItem(
+                id: "tool-failure",
+                kind: .toolResult,
+                title: "read_pdf",
+                body: "Tool error: document could not be decoded.",
+                isFailure: true,
+                recoveryAdvice: RuntimeRecoveryAdvice(
+                    title: "Inspect tool inputs and retry",
+                    detail: "Check the selected file before retrying.",
+                    retryable: true)),
+            CodeItem(
+                id: "normal-agent",
+                kind: .agent,
+                title: "main",
+                body: "Normal answer."),
+        ]
+
+        let errors = IntatisThreadErrorPresentation.errors(
+            items: items,
+            errorTexts: [
+                "Voice input failed.",
+                "Projection unavailable.",
+                "Projection unavailable.",
+            ])
+
+        XCTAssertEqual(errors.count, 5)
+        let timeoutError = try XCTUnwrap(errors.first(where: {
+            $0.details.contains(timeout)
+        }))
+        XCTAssertEqual(timeoutError.title, "main")
+        XCTAssertEqual(timeoutError.retrySubmissionID, submissionID)
+        XCTAssertTrue(errors.contains(where: {
+            $0.details.contains("Check endpoint compatibility before retrying.")
+        }))
+        XCTAssertTrue(errors.contains(where: {
+            $0.details.contains("Tool error: document could not be decoded.")
+        }))
+        XCTAssertTrue(errors.contains(where: {
+            $0.details.contains("Voice input failed.")
+        }))
+        XCTAssertTrue(errors.contains(where: {
+            $0.details.contains("Projection unavailable.")
+        }))
+
+        let transcript = IntatisThreadErrorPresentation.transcriptItems(items)
+        XCTAssertEqual(transcript.map(\.id), [
+            "user-timeout",
+            "partial-agent",
+            "normal-agent",
+        ])
+        let user = try XCTUnwrap(transcript.first)
+        XCTAssertNil(user.submissionStatus)
+        XCTAssertNil(user.submissionFailure)
+        XCTAssertNil(user.recoveryAdvice)
+        XCTAssertFalse(user.isFailure)
+        let partialAgent = try XCTUnwrap(transcript.dropFirst().first)
+        XCTAssertEqual(partialAgent.body, "Partial answer remains visible.")
+        XCTAssertNil(partialAgent.recoveryAdvice)
+        XCTAssertFalse(partialAgent.isFailure)
+    }
+
+    func testThreadErrorCardIsAbsentWhenEveryErrorSourceIsEmpty() {
+        let items = [
+            CodeItem(
+                id: "user",
+                kind: .user,
+                title: "",
+                body: "Hello"),
+            CodeItem(
+                id: "agent",
+                kind: .agent,
+                title: "main",
+                body: "Hello back"),
+        ]
+
+        XCTAssertTrue(IntatisThreadErrorPresentation.errors(
+            items: items,
+            errorTexts: ["  ", "\n"]).isEmpty)
+        XCTAssertEqual(
+            IntatisThreadErrorPresentation.transcriptItems(items),
+            items)
+
+        let cancelledSubmission = CodeItem(
+            id: "cancelled-user",
+            kind: .user,
+            title: "",
+            body: "Stop this request",
+            isFailure: true,
+            submissionID: SubmissionID(rawValue: "cancelled-submission"),
+            submissionStatus: .cancelled)
+        XCTAssertTrue(IntatisThreadErrorPresentation.errors(
+            items: [cancelledSubmission],
+            errorTexts: []).isEmpty)
+        XCTAssertEqual(
+            IntatisThreadErrorPresentation
+                .transcriptItems([cancelledSubmission])
+                .first?
+                .submissionStatus,
+            .cancelled)
+    }
+
+    func testWorkspaceShellsUseOneConditionalRightRailErrorList() throws {
+        let testFile = URL(fileURLWithPath: #filePath)
+        let packageRoot = testFile
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let codeSource = try String(
+            contentsOf: packageRoot
+                .appendingPathComponent("Sources/CodeViews.swift"),
+            encoding: .utf8)
+        let coworkSource = try String(
+            contentsOf: packageRoot
+                .appendingPathComponent("Sources/CoworkViews.swift"),
+            encoding: .utf8)
+
+        XCTAssertTrue(codeSource.contains("if !errors.isEmpty"))
+        XCTAssertTrue(codeSource.contains("IntatisThreadErrorList("))
+        XCTAssertFalse(codeSource.contains("Recent Failures"))
+        XCTAssertFalse(codeSource.contains(
+            "case .error:\n            card("))
+        XCTAssertTrue(coworkSource.contains("if !threadErrors.isEmpty"))
+        XCTAssertTrue(coworkSource.contains("IntatisThreadErrorList("))
+        XCTAssertFalse(coworkSource.contains("if let composerError"))
     }
 
     func testPermissionDetailsUseStructuredScopeWithoutRawArguments() {
@@ -340,6 +566,7 @@ final class ThreadLayoutTests: XCTestCase {
             permissionNotice: nil,
             goal: nil,
             workTasks: CoworkWorkTaskSummary(),
+            errors: [],
             colorScheme: .light)
         let afterSelection = CoworkStatusRailRenderSnapshot(
             agents: [],
@@ -347,6 +574,7 @@ final class ThreadLayoutTests: XCTestCase {
             permissionNotice: nil,
             goal: nil,
             workTasks: CoworkWorkTaskSummary(),
+            errors: [],
             colorScheme: .light)
         let changedRailState = CoworkStatusRailRenderSnapshot(
             agents: [],
@@ -359,10 +587,22 @@ final class ThreadLayoutTests: XCTestCase {
                     title: "Finished",
                     status: "completed"),
             ]),
+            errors: [],
+            colorScheme: .light)
+        let changedErrorState = CoworkStatusRailRenderSnapshot(
+            agents: [],
+            pending: nil,
+            permissionNotice: nil,
+            goal: nil,
+            workTasks: CoworkWorkTaskSummary(),
+            errors: IntatisThreadErrorPresentation.errors(
+                items: [],
+                errorTexts: ["Provider unavailable"]),
             colorScheme: .light)
 
         XCTAssertEqual(beforeSelection, afterSelection)
         XCTAssertNotEqual(beforeSelection, changedRailState)
+        XCTAssertNotEqual(beforeSelection, changedErrorState)
     }
 
     func testWorkspaceInspectorNeverProducesInvalidGeometry() {
