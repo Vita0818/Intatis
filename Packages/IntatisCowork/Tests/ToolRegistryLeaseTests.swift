@@ -1605,7 +1605,7 @@ final class ToolRegistryLeaseTests: XCTestCase {
         XCTAssertTrue(toolNames.contains("task_get"))
         XCTAssertTrue(toolNames.contains("task_list"))
         XCTAssertTrue(toolNames.contains("get_goal"))
-        XCTAssertTrue(toolNames.contains("create_goal"))
+        XCTAssertFalse(toolNames.contains("create_goal"))
         XCTAssertFalse(toolNames.contains("update_goal"))
     }
 
@@ -1670,7 +1670,7 @@ final class ToolRegistryLeaseTests: XCTestCase {
         XCTAssertTrue(toolNames.contains("remove_agent"))
         XCTAssertTrue(toolNames.contains("list_agents"))
         XCTAssertTrue(toolNames.contains("ask_agent"))
-        XCTAssertFalse(toolNames.contains("create_goal"), "only @main receives Goal creation authority")
+        XCTAssertFalse(toolNames.contains("create_goal"), "Goal creation is host-only")
         XCTAssertTrue(toolNames.contains("get_goal"))
 
         let systemPrompt = try XCTUnwrap(request.messages.first?.content)

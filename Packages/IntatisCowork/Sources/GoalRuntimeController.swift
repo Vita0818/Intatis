@@ -101,7 +101,6 @@ public actor GoalRuntimeController {
         UserMessagePayload?,
         GoalID?,
         ContinuationRunID?,
-        Bool,
         Bool
     ) async -> OrchestratorSendResult
 
@@ -164,7 +163,7 @@ public actor GoalRuntimeController {
         self.verifierProvider = verifierProvider
         self.verifierModel = verifierModel
         self.sendOperation = { text, target, images, userMessage, goalID, runID,
-            recordUserMessage, explicitGoalIntent in
+            recordUserMessage in
             await orchestrator.send(
                 text,
                 to: target,
@@ -172,8 +171,7 @@ public actor GoalRuntimeController {
                 userMessage: userMessage,
                 goalID: goalID,
                 continuationRunID: runID,
-                recordUserMessage: recordUserMessage,
-                explicitGoalIntent: explicitGoalIntent)
+                recordUserMessage: recordUserMessage)
         }
         self.waitForSchedulerIdle = {
             await orchestrator.runSchedulerUntilIdle()
@@ -489,8 +487,6 @@ public actor GoalRuntimeController {
                     successCriteria: Self.cleaned(successCriteria),
                     constraints: Self.cleaned(constraints),
                     tokenBudget: tokenBudget),
-                explicitGoalIntent: true,
-                canCreate: true,
                 mainAgentInferenceBinding: userMessage?.mainAgentInferenceBinding)
         } else {
             goal = Goal(
@@ -705,15 +701,13 @@ public actor GoalRuntimeController {
     }
 
     /// Runs a normal Cowork user turn inside a durable run scope. Normal turns
-    /// never create a Goal unless the caller separately supplied explicit Goal
-    /// intent to a model-visible create_goal tool.
+    /// never create a Goal; Goal creation is a separate explicit host action.
     @discardableResult
     public func sendUserTurn(_ text: String,
                              to target: AgentID? = nil,
                              images: [ImageAttachment] = [],
                              userMessage: UserMessagePayload? = nil,
-                             recordUserMessage: Bool = true,
-                             explicitGoalIntent: Bool = false) async -> OrchestratorSendResult {
+                             recordUserMessage: Bool = true) async -> OrchestratorSendResult {
         await acquireGoalMutationLock()
         defer { releaseGoalMutationLock() }
         guard !Task.isCancelled,
@@ -765,8 +759,7 @@ public actor GoalRuntimeController {
                 userMessage,
                 nil,
                 run.id,
-                recordUserMessage,
-                explicitGoalIntent)
+                recordUserMessage)
             await waitForSchedulerIdle()
             let closeReplay = try await log.replayForProjectionChecked()
             guard closeReplay.hasCompleteKnownHistory else {
@@ -1608,7 +1601,6 @@ public actor GoalRuntimeController {
             inferenceBoundUserMessage,
             startingGoal.id,
             running.id,
-            false,
             false)
         await waitForGoalSchedulerIdle(startingGoal.id, running.id)
 

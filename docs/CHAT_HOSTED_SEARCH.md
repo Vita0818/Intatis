@@ -1,7 +1,7 @@
 # Chat 与 Agent 托管网络搜索产品合同
 
 文档状态：当前产品合同与实现说明
-最近核对：2026-08-13
+最近核对：2026-08-14
 产品基线：v0.48（build 48）
 
 ## 一句话定义
@@ -98,6 +98,10 @@ Chat 的透明能力、MCP `tool_search`、`browser_search`、`web_fetch` 各自
 
 - 只有当前模型实际使用托管搜索且 provider 返回结构化 URL annotation 时才产生 citations。
 - citation 只接受带 host、无 user-info 的 HTTP(S) URL 并去重；不得从 Markdown 正文猜测来源。
+- provider annotation 若同时暴露 `content`、`start_index`、`end_index`，Intatis 必须和
+  `url`、`title` 一起接收；`web_search_call.action.sources` 另行暴露的 URL 也必须并入同一来源集。
+  流式增量、search-call item 与最终 response 中的同 URL 记录合并为信息更完整的一项，不能因为
+  较早记录只含 URL 就丢掉最终 evidence excerpt。
 - `message_completed.citations` 继续是 optional additive 字段，旧 EventLog 不受影响。
 - 没有搜索、模型未调用搜索或普通 Chat 降级时，citations 为空；UI 不显示空 Sources 区域。
 
@@ -132,11 +136,15 @@ exact provider wire 上向当前模型提供的一项可选能力。
 - 工具路径禁止 ordinary-model fallback：provider 明确拒绝 hosted-search shape 时 typed fail closed，
   不能把普通模型回答伪装成搜索结果。它也不会改走 `browser_search`、`web_fetch`、MCP、shell、
   本地浏览器或另一个模型。
-- provider 返回的回答与去重 citation 被格式化成有界 ToolObservation；工具不打开来源 URL。
+- provider 返回的 citation evidence 先进入同一次有界 ToolObservation，字段包括上游实际暴露的
+  URL、title、content excerpt 与 answer span；内层模型生成的回答只作为随后附带的
+  `Provider summary`。工具不打开来源 URL、不二次抓取、不再调用另一个模型，也不声称取得了
+  provider 没有向客户端暴露的搜索后端原始记录。所有来源在既有 50,000 Character 输出边界内
+  按返回顺序保留；超界时显式标记 truncated，不再使用独立的 24-source 提前截断。
   OpenRouter `openrouter:web_search` 未暴露 engine 参数，因此遵守其服务端默认 engine 选择；
   Intatis 不在本工具内另行选择搜索后端。
 
-## 当前实现（2026-08-13）
+## 当前实现（2026-08-14）
 
 - `ChatViewModel` 与 CLI Chat 每次 Send 都调用 `ProviderRegistry.chatRuntimeRoute()`；该方法只读取
   当前 `models.chat` endpoint/model（CLI 的本轮 model override 也保持同一 endpoint），完全忽略
@@ -151,6 +159,11 @@ exact provider wire 上向当前模型提供的一项可选能力。
 - Responses builder 按 dialect 分别编码 OpenAI `web_search` 与 OpenRouter
   `openrouter:web_search`；Chat 使用 `tool_choice: auto`，显式 Agent Tool 使用 `required`，两条路径都
   保留 exact model/variant options 与 provider routing 限制。
+- Responses citation decoder 同时接受 flat 与 nested `url_citation`，保留安全 URL、title、可选
+  content excerpt 和可选 start/end index，也接收 `web_search_call.action.sources` 中的 source URL；
+  stream annotation、search-call item、message item 与 completed response 先按 URL 合并，再把最终
+  完整 citation 交给 Chat 或 Agent。Agent 托管搜索把 evidence 放在 Provider summary 之前，因此
+  外层主模型在同一个 tool-result round 就能看到上游证据，不依赖内层摘要是否正确复述。
 - provider 只有返回受审结构化 code/type + `tools`/`tool_choice` parameter（或明确的结构化
   web-search unsupported code），且尚未接受任何有效 Responses payload 时，才会在同一路由重发
   一次普通 Chat。裸 404、自由文本和 partial payload 后失败不会触发重放。

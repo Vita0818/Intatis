@@ -106,6 +106,105 @@ private struct ModelHistoryStdinTool: Tool {
 final class ModelHistoryAgentLoopTests: XCTestCase {
     private let main = AgentID(rawValue: "main")
 
+    func testEmptyListFilesOutputPersistsAndContinuesTheTurn() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        try FileManager.default.createDirectory(
+            at: workspace.appendingPathComponent("empty", isDirectory: true),
+            withIntermediateDirectories: false)
+        let log = try EventLog(
+            session: SessionID(rawValue: "sess_model_history_empty_output"),
+            fileURL: workspace.appendingPathComponent("events.jsonl"))
+        let submissionID = SubmissionID(rawValue: "sub_empty_output")
+        let task = rootTask(
+            "task_empty_output",
+            submissionID,
+            "inspect the empty directory")
+        try await log.append([
+            .userMessage(UserMessagePayload(
+                text: "inspect the empty directory",
+                to: main,
+                submissionID: submissionID)),
+            .taskCreated(TaskCreatedPayload(contract: task)),
+        ])
+        let provider = ModelHistoryScriptedProvider([
+            [
+                .toolCalls([
+                    ToolCall(
+                        id: "call_empty_list",
+                        name: "list_files",
+                        arguments: #"{"path":"empty"}"#),
+                ]),
+                .done(finishReason: "tool_calls"),
+            ],
+            [
+                .textDelta("The directory is empty."),
+                .done(finishReason: "stop"),
+            ],
+        ])
+        let loop = makeLoop(
+            workspace: workspace,
+            log: log,
+            provider: provider,
+            registry: ToolRegistry([ListFilesTool()]),
+            task: task)
+
+        let result = try await loop.send(
+            "inspect the empty directory",
+            recordUserMessage: false,
+            submissionID: submissionID)
+
+        XCTAssertEqual(result, "The directory is empty.")
+        XCTAssertEqual(provider.requests.count, 2)
+        XCTAssertTrue(provider.requests[1].messages.contains(
+            .tool(id: "call_empty_list", content: "")))
+
+        let events = try await log.replayChecked()
+        let toolResult = try XCTUnwrap(events.compactMap {
+            envelope -> (Int, ToolResultPayload)? in
+            guard case .toolResult(let payload) = envelope.event,
+                  payload.toolCallId == "call_empty_list" else {
+                return nil
+            }
+            return (envelope.seq, payload)
+        }.first)
+        XCTAssertEqual(toolResult.1.observation, "")
+        XCTAssertEqual(toolResult.1.outcome, .succeeded)
+
+        let settlement = try XCTUnwrap(events.compactMap {
+            envelope -> (Int, ToolExecutionSettledPayload)? in
+            guard case .toolExecutionSettled(let payload) = envelope.event,
+                  payload.toolCallID == "call_empty_list" else {
+                return nil
+            }
+            return (envelope.seq, payload)
+        }.first)
+        XCTAssertEqual(settlement.1.outcome, .succeeded)
+        XCTAssertEqual(settlement.1.effectDisposition, .committed)
+
+        let historyOutput = try XCTUnwrap(events.compactMap {
+            envelope -> (Int, ModelHistoryItemPayload)? in
+            guard case .modelHistoryItem(let payload) = envelope.event,
+                  payload.kind == .functionCallOutput,
+                  payload.callID == "call_empty_list" else {
+                return nil
+            }
+            return (envelope.seq, payload)
+        }.first)
+        XCTAssertEqual(historyOutput.1.output, "")
+        XCTAssertNil(historyOutput.1.imageReferences)
+        XCTAssertEqual(settlement.0, toolResult.0 + 1)
+        XCTAssertEqual(historyOutput.0, settlement.0 + 1)
+
+        let outcomes = events.compactMap { envelope -> TurnOutcomePayload? in
+            guard case .turnOutcome(let payload) = envelope.event else {
+                return nil
+            }
+            return payload
+        }
+        XCTAssertEqual(outcomes.map(\.outcome), [.completed])
+    }
+
     func testFreshLoopReplaysDurableCallOutputAndFinalAnswerBeforeNextUser() async throws {
         let workspace = try makeWorkspace()
         defer { try? FileManager.default.removeItem(at: workspace) }

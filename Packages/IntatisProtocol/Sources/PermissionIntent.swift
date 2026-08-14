@@ -24,7 +24,6 @@ public enum PermissionControlEffect: String, Codable, Equatable, Sendable, Hasha
     case removeAgent = "remove_agent"
     case attachWorkspace = "attach_workspace"
     case grantCapability = "grant_capability"
-    case createGoal = "create_goal"
     case editGoal = "edit_goal"
     case pauseGoal = "pause_goal"
     case resumeGoal = "resume_goal"

@@ -482,13 +482,10 @@ public struct ModelHistoryItemPayload: Codable, Equatable, Sendable {
                   let callID,
                   !callID.trimmingCharacters(
                     in: .whitespacesAndNewlines).isEmpty,
-                  let output,
+                  output != nil,
                   toolSearchOutput == nil,
                   !hasReasoningFields else {
                 try invalid("function-call output fields are inconsistent")
-            }
-            if imageReferences == nil, output.isEmpty {
-                try invalid("text-only function-call output cannot be empty")
             }
 
         case .toolSearchOutput:

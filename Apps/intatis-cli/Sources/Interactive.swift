@@ -1427,9 +1427,6 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
             continue
         }
         guard await ensureGoalRuntimeStarted() else { continue }
-        let explicitGoalIntent = ExplicitGoalIntentClassifier
-            .classify(message)
-            .isExplicit
         for file in pending.textFiles { message += "\n\n[attached file: \(file.name)]\n\(file.content)" }
         let mainInferenceBinding: AgentInferenceBinding?
         if target == Orchestrator.mainAgentID {
@@ -1467,8 +1464,7 @@ private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REP
                 goal: parsedInput.goal,
                 submissionID: SubmissionID.new(),
                 mainAgentInferenceBinding: mainInferenceBinding,
-                turnID: TurnID.new()),
-            explicitGoalIntent: explicitGoalIntent)
+                turnID: TurnID.new()))
         spinner.stop()
         if let error = sendResult.errorMessage {
             errOut("error: \(error)\n")

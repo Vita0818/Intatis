@@ -44,9 +44,9 @@ public struct AgentRuntime: Sendable {
     public let reasoningEffort: ReasoningEffort?
     public let includeUsage: Bool
     public let maxIterations: Int
-    /// Exact model metadata frozen with this runtime. `.unspecified` keeps
-    /// automatic history compaction disabled; callers must never infer a
-    /// context window from a model identifier.
+    /// Exact model metadata frozen with this runtime. `.unspecified` resolves
+    /// through the product-wide context-window fallback; callers must never
+    /// infer a context window from a model identifier.
     public let modelContextPolicy: AgentModelContextPolicy
 
     public init(environment: RuntimeEnvironmentManifest,

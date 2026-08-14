@@ -17,7 +17,7 @@ final class AgentModelContextPolicyTests: XCTestCase {
         XCTAssertTrue(policy.isAutomaticCompactionEnabled)
     }
 
-    func testExplicitAutoCompactLimitIsClampedOnlyWhenRawWindowExists() {
+    func testExplicitAutoCompactLimitIsClampedAgainstResolvedWindow() {
         XCTAssertEqual(
             AgentModelContextPolicy(
                 contextWindowTokens: 100_000,
@@ -35,15 +35,23 @@ final class AgentModelContextPolicyTests: XCTestCase {
                 autoCompactTokenLimit: 42_000)
                 .resolvedAutoCompactTokenLimit,
             42_000)
+        XCTAssertEqual(
+            AgentModelContextPolicy(
+                autoCompactTokenLimit: 960_000)
+                .resolvedAutoCompactTokenLimit,
+            900_000)
     }
 
-    func testMissingRawMaximumAndOverrideDisablesAutomaticCompaction() {
+    func testUnspecifiedMetadataUsesProductDefaultWindow() {
         let policy = AgentModelContextPolicy.unspecified
 
-        XCTAssertNil(policy.resolvedContextWindowTokens)
-        XCTAssertNil(policy.resolvedAutoCompactTokenLimit)
-        XCTAssertNil(policy.hardUsableContextWindowTokens)
-        XCTAssertFalse(policy.isAutomaticCompactionEnabled)
+        XCTAssertEqual(policy.resolvedContextWindowTokens, 1_000_000)
+        XCTAssertEqual(policy.resolvedAutoCompactTokenLimit, 900_000)
+        XCTAssertEqual(policy.hardUsableContextWindowTokens, 950_000)
+        XCTAssertEqual(
+            policy.automaticCompactionTriggerTokens,
+            900_000)
+        XCTAssertTrue(policy.isAutomaticCompactionEnabled)
     }
 
     func testMaximumContextIsCodexFallbackForResolvedWindow() {
@@ -93,7 +101,10 @@ final class AgentModelContextPolicyTests: XCTestCase {
         ])
 
         XCTAssertEqual(policy, .unspecified)
-        XCTAssertFalse(policy.isAutomaticCompactionEnabled)
+        XCTAssertEqual(
+            policy.automaticCompactionTriggerTokens,
+            900_000)
+        XCTAssertTrue(policy.isAutomaticCompactionEnabled)
     }
 
     func testLegacyProfileDecodeDefaultsToUnspecifiedAndKeepsLegacyEncoding() throws {

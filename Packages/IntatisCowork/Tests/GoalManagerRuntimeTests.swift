@@ -65,66 +65,8 @@ private func goalManagerWorkspace() throws -> URL {
     return url
 }
 
-private func createGoalToolCall(_ id: String) -> AgentChunk {
-    .toolCalls([ToolCall(
-        id: id,
-        name: "create_goal",
-        arguments: """
-        {"objective":"Ship the durable Goal","success_criteria":["All checks pass"]}
-        """)])
-}
-
 final class GoalManagerRuntimeTests: XCTestCase {
     private let main = AgentID(rawValue: "main")
-
-    func testCreateGoalToolRequiresExplicitHostIntent() async throws {
-        let log = try goalManagerLog()
-        let workspace = try goalManagerWorkspace()
-        defer { try? FileManager.default.removeItem(at: workspace) }
-        let provider = GoalManagerProvider(responses: [
-            [createGoalToolCall("implicit"), .done(finishReason: "tool_calls")],
-            [.textDelta("implicit Goal creation rejected"), .done(finishReason: "stop")],
-            [createGoalToolCall("explicit"), .done(finishReason: "tool_calls")],
-            [.textDelta("explicit created"), .done(finishReason: "stop")],
-        ])
-        let orchestrator = Orchestrator(
-            log: log,
-            allowsShell: true,
-            responder: FixedResponder(.allow)) { _ in provider }
-        let attached = await orchestrator.attach(Agent(
-            name: main,
-            workspaceRoot: workspace,
-            model: ModelID(rawValue: "test"),
-            profile: .reviewed,
-            coordinationDepth: Agent.defaultCoordinationDepth))
-        XCTAssertTrue(attached)
-
-        let implicitResult = await orchestrator.send("Create a goal implicitly.", to: main)
-        XCTAssertEqual(implicitResult, .sent)
-        let implicitEvents = await log.replay()
-        XCTAssertTrue(implicitEvents.contains { envelope in
-            guard case .toolResult(let payload) = envelope.event,
-                  payload.toolCallId == "implicit" else { return false }
-            return payload.observation.contains("explicit user or host Goal intent")
-        })
-        let goalAfterImplicitCall = await orchestrator.currentGoalSnapshot()
-        XCTAssertNil(goalAfterImplicitCall)
-
-        let explicitResult = await orchestrator.send(
-            "The user explicitly requested Goal mode.",
-            to: main,
-            explicitGoalIntent: true)
-        XCTAssertEqual(explicitResult, .sent)
-        let current = await orchestrator.currentGoalSnapshot()
-        XCTAssertEqual(current?.objective, "Ship the durable Goal")
-
-        let replayed = await log.replay()
-        let createdEvents = replayed.filter {
-            if case .goalCreated = $0.event { return true }
-            return false
-        }
-        XCTAssertEqual(createdEvents.count, 1)
-    }
 
     func testGoalMutationsReplayAndParallelCurrentGoalIsRejected() async throws {
         let log = try goalManagerLog()
@@ -136,15 +78,11 @@ final class GoalManagerRuntimeTests: XCTestCase {
         let created = try await firstRuntime.createGoal(
             request: GoalCreateRequest(
                 objective: "Original objective",
-                successCriteria: ["Verified"]),
-            explicitGoalIntent: true,
-            canCreate: true)
+                successCriteria: ["Verified"]))
 
         do {
             _ = try await firstRuntime.createGoal(
-                request: GoalCreateRequest(objective: "Parallel objective"),
-                explicitGoalIntent: true,
-                canCreate: true)
+                request: GoalCreateRequest(objective: "Parallel objective"))
             XCTFail("expected parallel current Goal rejection")
         } catch {
             XCTAssertTrue(error.localizedDescription.contains("current Goal already exists"))
@@ -202,9 +140,7 @@ final class GoalManagerRuntimeTests: XCTestCase {
             allowsShell: false,
             responder: FixedResponder(.deny)) { _ in provider }
         let created = try await orchestrator.createGoal(
-            request: GoalCreateRequest(objective: "Wait for the external dependency"),
-            explicitGoalIntent: true,
-            canCreate: true)
+            request: GoalCreateRequest(objective: "Wait for the external dependency"))
         func checkpointedRun(ordinal: Int) async throws -> ContinuationRun {
             let createdRun = ContinuationRun(
                 sessionID: created.sessionID,
@@ -341,9 +277,7 @@ final class GoalManagerRuntimeTests: XCTestCase {
             allowsShell: false,
             responder: FixedResponder(.deny)) { _ in provider }
         let goal = try await orchestrator.createGoal(
-            request: GoalCreateRequest(objective: "Prove the durable Goal is complete"),
-            explicitGoalIntent: true,
-            canCreate: true)
+            request: GoalCreateRequest(objective: "Prove the durable Goal is complete"))
         let createdRun = ContinuationRun(
             sessionID: goal.sessionID,
             goalID: goal.id,
@@ -451,9 +385,7 @@ final class GoalManagerRuntimeTests: XCTestCase {
         XCTAssertTrue(workerAttached)
 
         let goal = try await orchestrator.createGoal(
-            request: GoalCreateRequest(objective: "Keep every child inside this run"),
-            explicitGoalIntent: true,
-            canCreate: true)
+            request: GoalCreateRequest(objective: "Keep every child inside this run"))
         let createdRun = ContinuationRun(
             sessionID: goal.sessionID,
             goalID: goal.id,

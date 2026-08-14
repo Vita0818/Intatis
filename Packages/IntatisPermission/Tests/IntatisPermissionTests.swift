@@ -332,7 +332,6 @@ final class IntatisPermissionTests: XCTestCase {
             ("task.update", .updateTask, PermissionResource(kind: .task, value: "wt_test")),
             ("task.cancel", .cancelTask, PermissionResource(kind: .task, value: "wt_test")),
             ("task.delegate", .delegateTask, PermissionResource(kind: .task, value: "wt_test")),
-            ("goal.create", .createGoal, PermissionResource(kind: .goal, value: "current")),
             ("goal.edit", .editGoal, PermissionResource(kind: .goal, value: "goal_test")),
             ("goal.pause", .pauseGoal, PermissionResource(kind: .goal, value: "goal_test")),
             ("goal.resume", .resumeGoal, PermissionResource(kind: .goal, value: "goal_test")),

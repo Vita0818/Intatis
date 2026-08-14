@@ -242,6 +242,12 @@ private final class CoworkAgentThreadUpdateHub {
 /// summary, and agent roster.
 @MainActor
 final class CoworkViewModel: ObservableObject, PermissionResponder {
+    private static let interruptedRunContinuationText =
+        "Continue the task that the previous run did not finish. "
+        + "First inspect the current workspace and existing tool results. "
+        + "Complete only the remaining work, and do not repeat operations "
+        + "that already succeeded."
+
     @Published private(set) var agents: [CoworkAgentInfo] = []
     @Published private(set) var summary = CoworkStatusSummary()
     @Published private(set) var project = CoworkProjectInfo()
@@ -2826,24 +2832,19 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                     }
                 }
             } else {
-                let explicitGoalIntent = ExplicitGoalIntentClassifier
-                    .classify(payload.text)
-                    .isExplicit
                 let result: OrchestratorSendResult
                 if let retryTask = submissionRetryTasks[submissionID] {
                     result = await orchestrator.retry(
                         retryTask,
                         userMessage: payload,
-                        recordUserMessage: false,
-                        explicitGoalIntent: explicitGoalIntent)
+                        recordUserMessage: false)
                     submissionRetryTasks.removeValue(forKey: submissionID)
                 } else {
                     result = await goalRuntime.sendUserTurn(
                         payload.text,
                         to: target,
                         userMessage: payload,
-                        recordUserMessage: false,
-                        explicitGoalIntent: explicitGoalIntent)
+                        recordUserMessage: false)
                 }
                 if let message = result.errorMessage {
                     executionFailure = await submissionExecutionFailure(
@@ -2995,6 +2996,13 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                     appendsQueuedStatus = shouldAppendQueuedStatus
                 case .retryTerminalTask(let attempt):
                     guard let task else { return }
+                    if try await self.requiresFreshRun(for: task) {
+                        try await self.enqueueInterruptedRunContinuation(
+                            from: payload)
+                        self.restoredSubmissionIDs.remove(submissionID)
+                        self.publishSubmissionThreadChange(submissionID)
+                        return
+                    }
                     self.submissionRetryTasks[submissionID] = task
                     retryAttempt = attempt
                     appendsQueuedStatus = true
@@ -3045,6 +3053,74 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                 "submission \(submissionID.rawValue) is correlated with multiple root tasks")
         }
         return matches.first
+    }
+
+    private func requiresFreshRun(
+        for task: CoworkTaskView
+    ) async throws -> Bool {
+        guard let runID = task.contract?.continuationRunID else {
+            return false
+        }
+        let projection = CoworkProjection.build(
+            from: try await log.replayChecked())
+        guard !projection.ambiguousContinuationRunCloseClaimIDs
+            .contains(runID) else {
+            throw IntatisError.decoding(
+                "continuation run \(runID.rawValue) has conflicting close claims")
+        }
+        guard let run = projection.continuationRuns[runID] else {
+            throw IntatisError.decoding(
+                "continuation run \(runID.rawValue) is missing from durable history")
+        }
+        guard run.status.isTerminal else {
+            throw IntatisError.decoding(
+                "continuation run \(runID.rawValue) is still \(run.status.rawValue)")
+        }
+        return true
+    }
+
+    private func enqueueInterruptedRunContinuation(
+        from original: UserMessagePayload
+    ) async throws {
+        let mainAgentID = AgentID(
+            rawValue: projectSettings.mainAgentName)
+        let target = original.to ?? mainAgentID
+        if target == mainAgentID,
+           original.mainAgentInferenceBinding == nil {
+            throw IntatisError.config(
+                "The interrupted @\(mainAgentID.rawValue) submission has no exact model binding to carry into a fresh run.")
+        }
+        let submissionID = SubmissionID.new()
+        let payload = UserMessagePayload(
+            text: Self.interruptedRunContinuationText,
+            to: target,
+            submissionID: submissionID,
+            mainAgentInferenceBinding:
+                original.mainAgentInferenceBinding,
+            turnID: TurnID.new())
+        let acceptance = try await submittedIntentStore.accept(
+            payload: payload)
+        submittedPayloads[submissionID] = payload
+        submissionAttempts[submissionID] = 1
+        switch acceptance {
+        case .canonical(_, let cleanupWarning):
+            canonicalSubmissionIDs.insert(submissionID)
+            outboxEntries.removeValue(forKey: submissionID)
+            if !submissionQueue.contains(submissionID) {
+                submissionQueue.append(submissionID)
+            }
+            composerError = nil
+            if let cleanupWarning {
+                sessionStorageWarning = cleanupWarning
+            }
+            scheduleSubmissionDrain()
+        case .outbox(let entry, let canonicalError):
+            outboxEntries[submissionID] = entry
+            composerError = IntatisLocalization.format(
+                "The continuation is safe in the local outbox: %@",
+                canonicalError)
+            rebuildOutboxThreadItems(publishesChanges: true)
+        }
     }
 
     private func submissionExecutionFailure(

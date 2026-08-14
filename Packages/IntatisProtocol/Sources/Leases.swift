@@ -44,7 +44,6 @@ public enum ToolCapability: String, Codable, Sendable, Hashable {
     case updateBoundWorkTask = "update_bound_work_task"
     case manageWorkTasks = "manage_work_tasks"
     case readGoal = "read_goal"
-    case createGoal = "create_goal"
     case submitGoalVerdict = "submit_goal_verdict"
     case renameSession = "rename_session"
     case controlRun = "control_run"
@@ -185,7 +184,6 @@ public struct CapabilityLease: Codable, Sendable, Hashable {
             .delegateTask,
             .attachWorkspace,
             .manageWorkTasks,
-            .createGoal,
         ])
         return CapabilityLease(
             taskID: taskID,

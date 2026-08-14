@@ -149,7 +149,6 @@ private struct RootInvocationContext: Sendable {
     var images: [ImageAttachment]
     var userMessage: UserMessagePayload?
     var recordUserMessage: Bool
-    var explicitGoalIntent: Bool
 }
 
 private struct AgentRunResult: Sendable {
@@ -2848,8 +2847,7 @@ public actor Orchestrator {
         userMessage: UserMessagePayload,
         goalID: GoalID?,
         continuationRunID: ContinuationRunID?,
-        recordUserMessage: Bool,
-        explicitGoalIntent: Bool
+        recordUserMessage: Bool
     ) async -> RootTaskCreationResult {
         guard let requiredBinding = userMessage.mainAgentInferenceBinding else {
             return .failed("The next @main submission has no frozen model binding.")
@@ -2988,8 +2986,7 @@ public actor Orchestrator {
         rootInvocations[contract.id] = RootInvocationContext(
             images: images,
             userMessage: userMessage,
-            recordUserMessage: recordUserMessage,
-            explicitGoalIntent: explicitGoalIntent)
+            recordUserMessage: recordUserMessage)
         _ = taskGraph.updateStatus(taskID: contract.id, status: .queued)
         return .created(contract.id)
     }
@@ -3022,8 +3019,7 @@ public actor Orchestrator {
                      userMessage: UserMessagePayload? = nil,
                      goalID: GoalID? = nil,
                      continuationRunID: ContinuationRunID? = nil,
-                     recordUserMessage: Bool = true,
-                     explicitGoalIntent: Bool = false) async -> OrchestratorSendResult {
+                     recordUserMessage: Bool = true) async -> OrchestratorSendResult {
         guard !Task.isCancelled,
               !isGoalRunCancellationRequested(
                 goalID: goalID,
@@ -3067,8 +3063,7 @@ public actor Orchestrator {
                 userMessage: userMessage,
                 goalID: goalID,
                 continuationRunID: continuationRunID,
-                recordUserMessage: recordUserMessage,
-                explicitGoalIntent: explicitGoalIntent) {
+                recordUserMessage: recordUserMessage) {
             case .created(let rootTaskID):
                 return await awaitRootTaskCompletion(rootTaskID)
             case .failed(let message):
@@ -3191,8 +3186,7 @@ public actor Orchestrator {
         rootInvocations[rootTaskID] = RootInvocationContext(
             images: images,
             userMessage: userMessage,
-            recordUserMessage: recordUserMessage,
-            explicitGoalIntent: explicitGoalIntent)
+            recordUserMessage: recordUserMessage)
         _ = taskGraph.updateStatus(taskID: rootTaskID, status: .queued)
         releaseAdmissionLock()
         return await awaitRootTaskCompletion(rootTaskID)
@@ -3202,8 +3196,7 @@ public actor Orchestrator {
     public func retry(_ task: CoworkTaskView,
                       images: [ImageAttachment] = [],
                       userMessage: UserMessagePayload? = nil,
-                      recordUserMessage: Bool = true,
-                      explicitGoalIntent: Bool = false) async -> OrchestratorSendResult {
+                      recordUserMessage: Bool = true) async -> OrchestratorSendResult {
         let requiredMainBinding = userMessage?.mainAgentInferenceBinding
         if let requiredMainBinding {
             guard (task.assignee ?? task.contract?.assignee) == Self.mainAgentID,
@@ -3253,8 +3246,7 @@ public actor Orchestrator {
         rootInvocations[admittedTaskID] = RootInvocationContext(
             images: images,
             userMessage: userMessage,
-            recordUserMessage: recordUserMessage,
-            explicitGoalIntent: explicitGoalIntent)
+            recordUserMessage: recordUserMessage)
         ensureSchedulerRunning()
         _ = await awaitSchedulerResult(admittedTaskID)
         if let failure = terminalPersistenceFailures[admittedTaskID] {
@@ -6061,16 +6053,7 @@ public actor Orchestrator {
     // MARK: - Durable Goal control plane
 
     func createGoal(request: GoalCreateRequest,
-                    explicitGoalIntent: Bool,
-                    canCreate: Bool,
                     mainAgentInferenceBinding: AgentInferenceBinding? = nil) async throws -> Goal {
-        guard canCreate else {
-            throw IntatisError.permissionDenied("the current capability lease cannot create Goals")
-        }
-        guard explicitGoalIntent else {
-            throw IntatisError.permissionDenied(
-                "create_goal requires explicit user or host Goal intent")
-        }
         let objective = request.objective.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !objective.isEmpty else {
             throw IntatisError.decoding("Goal objective must be non-empty")
@@ -6734,7 +6717,6 @@ public actor Orchestrator {
                      images: [ImageAttachment] = [],
                      userMessage: UserMessagePayload? = nil,
                      recordUserMessage: Bool = true,
-                     explicitGoalIntent: Bool = false,
                      taskContract: TaskContract? = nil,
                      rootTaskID: TaskID? = nil,
                      taskAttempt: Int? = nil) async throws -> AgentRunResult {
@@ -6784,8 +6766,6 @@ public actor Orchestrator {
             canUpdateBound: capabilityLease.tools.contains(.updateBoundWorkTask))
         let goalManager = OrchestratorGoalManager(
             orchestrator: self,
-            explicitGoalIntent: explicitGoalIntent,
-            canCreate: capabilityLease.tools.contains(.createGoal),
             canSubmitVerdict: agent.name == Self.mainAgentID
                 && capabilityLease.tools.contains(.submitGoalVerdict))
         let skillSnapshot: SkillSnapshot?
@@ -8119,7 +8099,6 @@ public actor Orchestrator {
             ?? CapabilityLease.worker(taskID: taskID, workspaceAccess: workspaceAccess)
         capabilityLease.tools.formUnion(additionalToolCapabilities)
         if assignee.name != Self.mainAgentID {
-            capabilityLease.tools.remove(.createGoal)
             capabilityLease.tools.remove(.submitGoalVerdict)
             capabilityLease.tools.remove(.renameSession)
             capabilityLease.tools.remove(.controlRun)
@@ -8188,7 +8167,6 @@ public actor Orchestrator {
             capabilityLease.tools.insert(.submitGoalVerdict)
             capabilityLease.tools.insert(.controlRun)
         } else {
-            capabilityLease.tools.remove(.createGoal)
             capabilityLease.tools.remove(.submitGoalVerdict)
             capabilityLease.tools.remove(.renameSession)
             capabilityLease.tools.remove(.controlRun)
@@ -8221,7 +8199,6 @@ public actor Orchestrator {
                 workspaceAccess: workspaceAccess == .readWrite ? .readWrite : .readOnly)
         let baselineTools = baseline.tools
         var tools = baselineTools.intersection(parentCapabilityLease.tools)
-        tools.remove(.createGoal)
         tools.remove(.submitGoalVerdict)
         tools.remove(.renameSession)
         tools.remove(.controlRun)
@@ -8341,7 +8318,6 @@ public actor Orchestrator {
                                                   for agentID: AgentID) -> CapabilityLease {
         guard agentID != mainAgentID else { return lease }
         var scoped = lease
-        scoped.tools.remove(.createGoal)
         scoped.tools.remove(.submitGoalVerdict)
         scoped.tools.remove(.renameSession)
         scoped.tools.remove(.controlRun)
@@ -8689,7 +8665,6 @@ public actor Orchestrator {
                     userMessage: invocation?.userMessage,
                     recordUserMessage: invocation?.recordUserMessage
                         ?? (task.contract.submissionID == nil),
-                    explicitGoalIntent: invocation?.explicitGoalIntent ?? false,
                     taskContract: task.contract,
                     rootTaskID: task.rootTaskID,
                     taskAttempt: task.attempt)
@@ -10177,9 +10152,6 @@ public actor Orchestrator {
         if lease.tools.contains(.readGoal) {
             register([GetGoalTool()], granting: [.readGoal])
         }
-        if lease.tools.contains(.createGoal) {
-            register([CreateGoalTool()], granting: [.createGoal])
-        }
         // Production invocations always supply an identity, so the terminal
         // Goal control is exposed only to exact @main. `nil` remains a narrow
         // construction seam for the isolated verifier/tool-registry tests.
@@ -10611,22 +10583,13 @@ struct OrchestratorWorkTaskManager: WorkTaskManager {
     }
 }
 
-/// Goal tool authority is bound by the host, never inferred from arguments.
-/// Ordinary model runtimes can create only under explicit Goal intent, read the
-/// current projection, and (with a dedicated verifier lease) submit a terminal
-/// candidate. User-owned edit/pause/resume/clear operations stay host-only.
+/// Goal tool authority is bound by the host, never inferred from model text.
+/// Model runtimes can read the current projection and, with a dedicated
+/// verifier lease, submit a terminal candidate. Goal creation and user-owned
+/// edit/pause/resume/clear operations stay host-only.
 private struct OrchestratorGoalManager: GoalManager {
     let orchestrator: Orchestrator
-    let explicitGoalIntent: Bool
-    let canCreate: Bool
     let canSubmitVerdict: Bool
-
-    func createGoal(_ request: GoalCreateRequest) async throws -> Goal {
-        try await orchestrator.createGoal(
-            request: request,
-            explicitGoalIntent: explicitGoalIntent,
-            canCreate: canCreate)
-    }
 
     func currentGoal() async throws -> Goal? {
         await orchestrator.currentGoalSnapshot()

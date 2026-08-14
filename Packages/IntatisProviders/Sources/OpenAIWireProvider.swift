@@ -101,19 +101,30 @@ public struct OpenAIWireProvider: ChatProvider {
                     var attempt = 1
                     while true {
                         let parser = SSEParser()
-                        var receivedResponseBytes = false
+                        var deliveredSemanticOutput = false
                         var sawCompletion = false
                         do {
                             for try await chunk in http.stream(urlRequest) {
-                                receivedResponseBytes = true
                                 for payload in parser.consume(chunk) {
-                                    if try emit(payload, to: continuation, sawCompletion: &sawCompletion) {
+                                    if try emit(
+                                        payload,
+                                        to: continuation,
+                                        sawCompletion: &sawCompletion,
+                                        deliveredSemanticOutput:
+                                            &deliveredSemanticOutput
+                                    ) {
                                         return
                                     }
                                 }
                             }
                             for payload in parser.flush() {
-                                if try emit(payload, to: continuation, sawCompletion: &sawCompletion) {
+                                if try emit(
+                                    payload,
+                                    to: continuation,
+                                    sawCompletion: &sawCompletion,
+                                    deliveredSemanticOutput:
+                                        &deliveredSemanticOutput
+                                ) {
                                     return
                                 }
                             }
@@ -128,7 +139,7 @@ public struct OpenAIWireProvider: ChatProvider {
                             if ProviderRuntime.shouldRetry(error: error,
                                                            attempt: attempt,
                                                            policy: runtimePolicy,
-                                                           receivedResponseBytes: receivedResponseBytes) {
+                                                           deliveredSemanticOutput: deliveredSemanticOutput) {
                                 attempt += 1
                                 try await ProviderRuntime.sleepBeforeRetry(
                                     nextAttempt: attempt,
@@ -164,9 +175,10 @@ public struct OpenAIWireProvider: ChatProvider {
                         let parser = SSEParser()
                         var completed = false
                         var emittedText = ""
-                        var emittedCitationURLs: Set<String> = []
-                        var receivedResponseBytes = false
+                        var citationOrder: [String] = []
+                        var citationsByURL: [String: MessageCitation] = [:]
                         var acceptedResponsePayload = false
+                        var deliveredSemanticOutput = false
 
                         func yieldMissingText(_ fullText: String) {
                             guard !fullText.isEmpty else { return }
@@ -174,20 +186,48 @@ public struct OpenAIWireProvider: ChatProvider {
                                 let suffix = String(fullText.dropFirst(emittedText.count))
                                 if !suffix.isEmpty {
                                     emittedText += suffix
+                                    deliveredSemanticOutput = true
                                     continuation.yield(.delta(suffix))
                                 }
                             } else if emittedText.isEmpty {
                                 emittedText = fullText
+                                deliveredSemanticOutput = true
                                 continuation.yield(.delta(fullText))
                             }
                         }
 
-                        func yieldMessageItem(_ item: [String: JSONValue]) {
+                        func recordCitation(_ citation: MessageCitation) {
+                            if let existing = citationsByURL[citation.url] {
+                                citationsByURL[citation.url] =
+                                    Self.mergingResponsesChatCitation(
+                                        existing,
+                                        with: citation)
+                            } else {
+                                citationOrder.append(citation.url)
+                                citationsByURL[citation.url] = citation
+                            }
+                        }
+
+                        func recordMessageItem(_ item: [String: JSONValue]) {
                             yieldMissingText(Self.responsesChatMessageText(item))
                             for citation in Self.responsesChatCitations(item) {
-                                if emittedCitationURLs.insert(citation.url).inserted {
-                                    continuation.yield(.citation(citation))
+                                recordCitation(citation)
+                            }
+                        }
+
+                        func recordOutputItem(_ item: [String: JSONValue]) {
+                            guard case .string(let itemType)? = item["type"] else {
+                                return
+                            }
+                            switch itemType {
+                            case "message":
+                                recordMessageItem(item)
+                            case "web_search_call":
+                                for citation in Self.responsesChatSearchCallSources(item) {
+                                    recordCitation(citation)
                                 }
+                            default:
+                                break
                             }
                         }
 
@@ -227,9 +267,11 @@ public struct OpenAIWireProvider: ChatProvider {
                                 throw IntatisError.decoding(
                                     "Responses stream event is missing its type.")
                             }
-                            // Even status-only Responses events prove that the
-                            // first request was accepted. Never replay the user
-                            // turn after this point.
+                            // A status-only event proves that hosted search was
+                            // accepted, so an unsupported-tool error must not
+                            // fall back to ordinary Chat. It has not delivered
+                            // semantic output, so a transient transport failure
+                            // may still reconnect through the separate fence.
                             acceptedResponsePayload = true
 
                             switch eventType {
@@ -237,6 +279,7 @@ public struct OpenAIWireProvider: ChatProvider {
                                 if case .string(let delta)? = event["delta"],
                                    !delta.isEmpty {
                                     emittedText += delta
+                                    deliveredSemanticOutput = true
                                     continuation.yield(.delta(delta))
                                 }
 
@@ -247,20 +290,17 @@ public struct OpenAIWireProvider: ChatProvider {
 
                             case "response.output_text.annotation.added":
                                 if case .object(let annotation)? = event["annotation"],
-                                   let citation = Self.responsesChatCitation(annotation),
-                                   emittedCitationURLs.insert(citation.url).inserted {
-                                    continuation.yield(.citation(citation))
+                                   let citation = Self.responsesChatCitation(annotation) {
+                                    recordCitation(citation)
                                 }
 
                             case "response.output_item.done":
                                 guard case .object(let item)? = event["item"],
-                                      case .string(let itemType)? = item["type"] else {
+                                      case .string(_)? = item["type"] else {
                                     throw IntatisError.decoding(
                                         "Responses output_item.done is missing a typed item.")
                                 }
-                                if itemType == "message" {
-                                    yieldMessageItem(item)
-                                }
+                                recordOutputItem(item)
 
                             case "response.completed":
                                 guard case .object(let response)? = event["response"],
@@ -271,16 +311,23 @@ public struct OpenAIWireProvider: ChatProvider {
                                 }
                                 if case .array(let output)? = response["output"] {
                                     for value in output {
-                                        guard case .object(let item) = value,
-                                              case .string("message")? = item["type"] else {
+                                        guard case .object(let item) = value else {
                                             continue
                                         }
-                                        yieldMessageItem(item)
+                                        recordOutputItem(item)
+                                    }
+                                }
+                                for url in citationOrder {
+                                    if let citation = citationsByURL[url] {
+                                        deliveredSemanticOutput = true
+                                        continuation.yield(.citation(citation))
                                     }
                                 }
                                 if let usage = Self.responsesChatUsage(response) {
+                                    deliveredSemanticOutput = true
                                     continuation.yield(.usage(usage))
                                 }
+                                deliveredSemanticOutput = true
                                 continuation.yield(.done)
                                 completed = true
                                 continuation.finish()
@@ -307,7 +354,6 @@ public struct OpenAIWireProvider: ChatProvider {
 
                         do {
                             for try await chunk in http.stream(urlRequest) {
-                                receivedResponseBytes = true
                                 for payload in parser.consume(chunk) {
                                     if try handle(payload) { return }
                                 }
@@ -344,7 +390,7 @@ public struct OpenAIWireProvider: ChatProvider {
                                 error: error,
                                 attempt: attempt,
                                 policy: runtimePolicy,
-                                receivedResponseBytes: receivedResponseBytes) {
+                                deliveredSemanticOutput: deliveredSemanticOutput) {
                                 attempt += 1
                                 try await ProviderRuntime.sleepBeforeRetry(
                                     nextAttempt: attempt,
@@ -467,9 +513,11 @@ public struct OpenAIWireProvider: ChatProvider {
     /// Returns true if the stream is finished (saw `[DONE]`).
     private func emit(_ payload: String,
                       to continuation: AsyncThrowingStream<ChatChunk, Error>.Continuation,
-                      sawCompletion: inout Bool) throws -> Bool {
+                      sawCompletion: inout Bool,
+                      deliveredSemanticOutput: inout Bool) throws -> Bool {
         if payload == "[DONE]" {
             if !sawCompletion {
+                deliveredSemanticOutput = true
                 continuation.yield(.done)
                 sawCompletion = true
             }
@@ -492,15 +540,18 @@ public struct OpenAIWireProvider: ChatProvider {
         if let choices = chunk.choices {
             for choice in choices {
                 if let content = choice.delta?.content, !content.isEmpty {
+                    deliveredSemanticOutput = true
                     continuation.yield(.delta(content))
                 }
             }
             if choices.contains(where: { $0.finish_reason != nil }), !sawCompletion {
+                deliveredSemanticOutput = true
                 continuation.yield(.done)
                 sawCompletion = true
             }
         }
         if let u = chunk.usage {
+            deliveredSemanticOutput = true
             continuation.yield(.usage(u.usage))
         }
         return false
@@ -677,6 +728,37 @@ public struct OpenAIWireProvider: ChatProvider {
         return citations
     }
 
+    private static func responsesChatSearchCallSources(
+        _ item: [String: JSONValue]
+    ) -> [MessageCitation] {
+        guard case .string("web_search_call")? = item["type"],
+              case .object(let action)? = item["action"] else {
+            return []
+        }
+        var rawURLs: [String] = []
+        if case .array(let sources)? = action["sources"] {
+            for source in sources {
+                guard case .object(let value) = source,
+                      case .string("url")? = value["type"],
+                      case .string(let rawURL)? = value["url"] else {
+                    continue
+                }
+                rawURLs.append(rawURL)
+            }
+        }
+        if case .string(let actionType)? = action["type"],
+           actionType == "open_page" || actionType == "find_in_page",
+           case .string(let rawURL)? = action["url"] {
+            rawURLs.append(rawURL)
+        }
+        return rawURLs.compactMap { rawURL in
+            responsesChatCitation([
+                "type": .string("url_citation"),
+                "url": .string(rawURL),
+            ])
+        }
+    }
+
     private static func responsesChatCitation(
         _ annotation: [String: JSONValue]
     ) -> MessageCitation? {
@@ -689,7 +771,10 @@ public struct OpenAIWireProvider: ChatProvider {
         } else {
             citation = annotation
         }
-        guard case .string(let rawURL)? = citation["url"],
+        func field(_ key: String) -> JSONValue? {
+            citation[key] ?? annotation[key]
+        }
+        guard case .string(let rawURL)? = field("url"),
               rawURL.count <= 4_096,
               let url = URL(string: rawURL),
               let scheme = url.scheme?.lowercased(),
@@ -701,7 +786,7 @@ public struct OpenAIWireProvider: ChatProvider {
             return nil
         }
         let rawTitle: String
-        if case .string(let value)? = citation["title"] {
+        if case .string(let value)? = field("title") {
             rawTitle = value
         } else {
             rawTitle = ""
@@ -713,7 +798,76 @@ public struct OpenAIWireProvider: ChatProvider {
         let title = compactTitle.isEmpty
             ? host
             : String(compactTitle.prefix(200))
-        return MessageCitation(url: url.absoluteString, title: title)
+        let content: String?
+        if case .string(let value)? = field("content"),
+           !value.isEmpty {
+            content = value
+        } else {
+            content = nil
+        }
+        return MessageCitation(
+            url: url.absoluteString,
+            title: title,
+            content: content,
+            startIndex: responsesChatCitationIndex(field("start_index")),
+            endIndex: responsesChatCitationIndex(field("end_index")))
+    }
+
+    private static func responsesChatCitationIndex(
+        _ value: JSONValue?
+    ) -> Int? {
+        guard case .number(let number)? = value,
+              number.isFinite,
+              number.rounded(.towardZero) == number,
+              number >= 0,
+              number <= Double(Int.max) else {
+            return nil
+        }
+        return Int(number)
+    }
+
+    private static func mergingResponsesChatCitation(
+        _ current: MessageCitation,
+        with update: MessageCitation
+    ) -> MessageCitation {
+        let title = responsesChatPreferredCitationTitle(
+            current,
+            update: update)
+        let content: String?
+        switch (current.content, update.content) {
+        case let (existing?, candidate?) where candidate.count > existing.count:
+            content = candidate
+        case let (existing?, _):
+            content = existing
+        case (nil, let candidate?):
+            content = candidate
+        case (nil, nil):
+            content = nil
+        }
+        return MessageCitation(
+            url: current.url,
+            title: title,
+            content: content,
+            startIndex: update.startIndex ?? current.startIndex,
+            endIndex: update.endIndex ?? current.endIndex)
+    }
+
+    private static func responsesChatPreferredCitationTitle(
+        _ current: MessageCitation,
+        update: MessageCitation
+    ) -> String {
+        let host = URL(string: current.url)?.host
+        let currentIsFallback = current.title == host
+        let updateIsFallback = update.title == host
+        if currentIsFallback, !updateIsFallback {
+            return update.title
+        }
+        if !currentIsFallback, updateIsFallback {
+            return current.title
+        }
+        return update.title.count > current.title.count
+            ? update.title
+            : current.title
     }
 
     private static func responsesChatUsage(

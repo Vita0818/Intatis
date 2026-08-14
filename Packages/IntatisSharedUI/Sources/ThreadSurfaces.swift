@@ -83,6 +83,9 @@ enum IntatisThreadErrorPresentation {
         items: [CodeItem],
         errorTexts: [String]
     ) -> [IntatisThreadErrorEntry] {
+        let latestSubmissionID = items.reversed().first(where: {
+            $0.kind == .user && $0.submissionID != nil
+        })?.submissionID
         var orderedFingerprints: [String] = []
         var entriesByFingerprint: [String: IntatisThreadErrorEntry] = [:]
 
@@ -113,7 +116,10 @@ enum IntatisThreadErrorPresentation {
         }
 
         for item in items {
-            if let candidate = candidate(for: item) {
+            if let candidate = candidate(
+                for: item,
+                latestSubmissionID: latestSubmissionID
+            ) {
                 insert(candidate)
             }
         }
@@ -161,7 +167,10 @@ enum IntatisThreadErrorPresentation {
         }
     }
 
-    private static func candidate(for item: CodeItem) -> Candidate? {
+    private static func candidate(
+        for item: CodeItem,
+        latestSubmissionID: SubmissionID?
+    ) -> Candidate? {
         let advice = item.recoveryAdvice
 
         if item.kind == .user,
@@ -175,6 +184,7 @@ enum IntatisThreadErrorPresentation {
                     ?? IntatisLocalization.string("Needs attention"),
                 supportingDetails: [advice?.title, advice?.detail],
                 retrySubmissionID: failure?.retryable == true
+                    && item.submissionID == latestSubmissionID
                     ? item.submissionID
                     : nil,
                 titlePriority: 2)

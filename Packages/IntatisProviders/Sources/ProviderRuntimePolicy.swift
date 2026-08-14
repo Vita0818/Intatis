@@ -24,20 +24,20 @@ public struct ProviderRuntimePolicy: Equatable, Sendable {
     }
 
     public static let streaming = ProviderRuntimePolicy(
-        maxAttempts: 2,
+        maxAttempts: 6,
         requestTimeoutSeconds: 120,
-        initialRetryDelaySeconds: 0.25,
-        maxRetryDelaySeconds: 2)
+        initialRetryDelaySeconds: 1,
+        maxRetryDelaySeconds: 16)
 
     /// Tool-calling Agent requests can legitimately spend longer reasoning
     /// before their first response byte than interactive Chat requests. Keep
     /// this separate from `streaming` so Chat responsiveness does not drift
     /// when Code/Cowork execution budgets are adjusted.
     public static let agentStreaming = ProviderRuntimePolicy(
-        maxAttempts: 2,
+        maxAttempts: 6,
         requestTimeoutSeconds: 180,
-        initialRetryDelaySeconds: 0.25,
-        maxRetryDelaySeconds: 2)
+        initialRetryDelaySeconds: 1,
+        maxRetryDelaySeconds: 16)
 
     public static let nonStreaming = ProviderRuntimePolicy(
         maxAttempts: 2,
@@ -63,8 +63,8 @@ enum ProviderRuntime {
     static func shouldRetry(error: Error,
                             attempt: Int,
                             policy: ProviderRuntimePolicy,
-                            receivedResponseBytes: Bool = false) -> Bool {
-        guard !receivedResponseBytes, attempt < policy.maxAttempts else { return false }
+                            deliveredSemanticOutput: Bool = false) -> Bool {
+        guard !deliveredSemanticOutput, attempt < policy.maxAttempts else { return false }
         return isRetryable(error)
     }
 

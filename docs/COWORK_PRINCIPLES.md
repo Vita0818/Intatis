@@ -37,7 +37,7 @@ AgentInvocation  现有 TaskContract + TaskGraph + AgentScheduler 的一次 agen
 - `AgentInvocation` 完成只产生候选结果，不能自动把关联 `WorkTask` 标成完成。
 - `WorkTask` 完成必须由 `task_update` 显式提交 result，并在有 acceptance criteria 时提交 evidence；依赖、revision 与状态转换由 `WorkTaskGraph` 校验。
 - `Goal` 完成必须经过独立 `GoalVerifier` 对 success criteria 与 host-derived `validationEvidence` 的审计；WorkTask result/evidence 只是 agent-reported，不能由 main/worker、`TaskContract` 终态、WorkTask 数量或 UI 文案自行宣告完成。
-- `ContinuationRun` 是 host-driven execution/checkpoint 边界，不是递归 `AgentLoop`。provider/runtime interruption 终结为 `interrupted`；Continue/Resume 创建新 Run。同一 Session 的 WorkTask 可跨多个 Run，并关联多个先后 invocation。
+- `ContinuationRun` 是 host-driven execution/checkpoint 边界，不是递归 `AgentLoop`。provider/runtime interruption 终结为 `interrupted`；Continue/Resume 创建新 Run。同一 Session 的 WorkTask 可跨多个 Run，并关联多个先后 invocation。GUI 对一个已失败 submission 点击 Retry 时，如果它的 root 绑定了 terminal Run，宿主也必须创建可见的 fresh continuation submission、fresh root 与 fresh Run，保留原提交冻结的 exact main binding；不得把旧 task 重新排入旧 Run，也不得删除旧失败事实。只有无 Run 的 terminal task 与 restored nonterminal exact task继续使用原 task/submission 的有界恢复规则。
 - `WorkTask` 不含 Run、Goal、Agent 或 Turn ownership；Goal/Run/Turn/invocation 的终态不传播 WorkTask 状态，Goal 与 WorkTask 也不互相推导终态。
 - `TaskContract` 这个既有源码类型保留兼容，但在产品/架构语义里称为 **AgentInvocation execution contract**；不得把它重新投影成 Goal 或 WorkTask。
 
@@ -168,7 +168,7 @@ Permission Reviewer 是独立控制面，不是普通 worker：使用结构化 `
 
 Goal Verifier 是另一条独立控制面，职责仅是判定 Goal 是否已有充分证据完成。它不是 Permission Reviewer，也不是普通 agent：使用独立 system/context、无工具 provider 请求与有界 timeout/cancel，默认同样不注入 sampling 或 output 上限；不能写 EventLog 或执行 workspace 动作。WorkTask result/evidence 是 agent-reported，不是完成证明；只有 host 从同一 Goal 的 durable 成功 tool-execution settlement 经 validation-tool allowlist 派生的 `validationEvidence` 才能作为 completion proof。malformed、tool call、缺完成标记、provider/usage failure、timeout/cancel 必须 fail safe 为 `continue`，不能误报 Goal 完成。只有 host 校验 verifier 返回的 requirement/evidence 与这些 host-bound evidence 一致后，才可追加 Goal audit/completed 事件。
 
-Goal 生命周期必须由 host 串行化：start、ordinary turn、Goal mutation 与 stop/shutdown 分别有 single-flight/mutation/stop gate；pending durable stop 未结算前不得启动新 run，start 取消后若已创建 continuation，必须先 scoped cancel、等待退出并 checkpoint 才返回失败。restore 必须持续暂停 scheduler，直到 roster/reviewer/main 与 Goal recovery/reconcile 完成。GUI 随后只释放新工作并继续围栏 restored roots；CLI 才执行显式 data-plane resume。Cowork `/goal` 是明确 host action；普通自然语言只有在窄、确定性的中英文持续目标分类器命中时才可为本轮提供 create intent，复杂请求、Goal 提及、一次性目标、引用示例或附件内容不得提升权限。
+Goal 生命周期必须由 host 串行化：start、ordinary turn、Goal mutation 与 stop/shutdown 分别有 single-flight/mutation/stop gate；pending durable stop 未结算前不得启动新 run，start 取消后若已创建 continuation，必须先 scoped cancel、等待退出并 checkpoint 才返回失败。restore 必须持续暂停 scheduler，直到 roster/reviewer/main 与 Goal recovery/reconcile 完成。GUI 随后只释放新工作并继续围栏 restored roots；CLI 才执行显式 data-plane resume。Cowork `/goal` 是明确 host action；普通自然语言不做持续目标分类，不得产生 Goal create intent，模型工具表和 capability lease 也不得暴露 Goal 创建入口。
 
 ContinuationRun 还必须有模型可表达、宿主可强制执行的终止边界。只有 exact `@main` root 可见 `finish_run` / `stop_run`，且模型只能提供 completed/stopped 意图与有界 reason；所有 session/run/Goal/submission/root identity 和 source 必须从当前 invocation 注入。close installation 在 EventLog await 前先形成 actor-local admission/authorization tombstone；EventLog 再在完整已知历史与跨进程锁内对 exact RunID 安装 first-write durable close claim，且 claim 必须先于等待既有 admission、provider/tool cleanup 与 exact-run drain 落盘。Orchestrator 随后只 drain 同 run 的其余 task/message，恢复也不得复活。该 claim 不替代 run checkpoint/completed/cancelled 状态机，也不影响其他 run。普通 final 文本不能被 host 猜测成显式 claim；root failure/timeout 使用 runtime source，用户取消使用 user source，session lifecycle shutdown 使用 hostLifecycle source。
 
@@ -446,7 +446,7 @@ user turn creates a root task and waits for one terminal event
 same agent is single-flight while different agents respect the concurrency limit
 one assistant multi-call batch is neither a transaction nor a concurrency request or guarantee; batch only mutually independent calls whose correctness does not depend on host execution order
 an identity, ID, attachment, or state created by one call becomes usable only after its successful ToolResult; every causally dependent call waits for a later tool-call round and never references a planned or future object
-eligible non-root/CLI read-only crash recovery increments attempt; GUI restored root submissions stay paused/interrupted until exact submission Retry; exhausted/interrupted admission fails explicitly
+eligible non-root/CLI read-only crash recovery increments attempt; GUI restored nonterminal root submissions stay paused/interrupted until exact submission Retry, while a failed root whose Run is already terminal continues through a fresh visible submission/root/Run instead of reviving the old Run; exhausted/interrupted admission fails explicitly
 tool execution projection accepts only one prepare per execution ID, permanently quarantines duplicate prepares/conflicting terminals while retaining the first records, and rejects succeeded/not-started contradictions
 new successful settlements are explicitly committed; legacy nil+succeeded remains a completed effect that blocks whole-task retry, while legacy failed/cancelled/denied nil and explicit unknown remain uncertain
 Orchestrator restore, Goal startup/in-process launch, and whole-task retry require complete known projection history; unknown future event types and seq gaps fail closed for absence/order proofs
@@ -464,7 +464,7 @@ production task_create and task_update may prove only pre-first-WorkTask-append 
 write-capable WorkTask admission rejects overlapping expected-artifact ancestors/descendants and treats unknown write sets as workspace-wide
 delegate_task preserves the WorkTask ID, records an invocation linkage, and does not treat its result as WorkTask or Goal completion; all internal admission facts commit in one EventLog batch or not at all
 Cowork /goal creates a durable Goal; Chat/Code keep legacy Goal metadata behavior unless separately migrated
-ordinary natural-language Goal creation intent is narrow, deterministic, attachment-independent, and never bypasses schema/lease/permission/host authority
+ordinary natural language never creates a Goal; only an explicit host action may do so, and model leases expose no Goal creation tool
 ContinuationRun checkpoints/recovery are host-driven; restart never nests or recursively calls AgentLoop
 startup keeps the scheduler suspended through Goal recovery; pending stop, shutdown, and cancelled start cannot leak a live continuation
 cancellation persistence failure quarantines the task before provider dispatch and resolves scoped/global idle plus result waiters within a bounded path

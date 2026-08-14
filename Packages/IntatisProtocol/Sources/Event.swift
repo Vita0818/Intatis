@@ -85,10 +85,24 @@ public struct MessageDeltaPayload: Codable, Equatable, Sendable {
 public struct MessageCitation: Codable, Equatable, Hashable, Sendable {
     public var url: String
     public var title: String
+    /// Provider-exposed search evidence, when the exact hosted-search dialect
+    /// returns it. This is the excerpt supplied to the inner model, not a page
+    /// fetched independently by Intatis.
+    public var content: String?
+    /// Optional offsets tying this citation to the provider-generated answer.
+    public var startIndex: Int?
+    public var endIndex: Int?
 
-    public init(url: String, title: String) {
+    public init(url: String,
+                title: String,
+                content: String? = nil,
+                startIndex: Int? = nil,
+                endIndex: Int? = nil) {
         self.url = url
         self.title = title
+        self.content = content
+        self.startIndex = startIndex
+        self.endIndex = endIndex
     }
 }
 

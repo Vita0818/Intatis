@@ -203,12 +203,12 @@ extension OpenAIWireProvider: ToolCallingProvider {
                         let parser = SSEParser()
                         var acc: [ToolCallAccumKey: ToolCallAccum] = [:]
                         var finished = false
-                        var receivedAcceptedPayload = false
+                        var deliveredSemanticOutput = false
 
                         func handle(_ payload: String) throws -> Bool {
                             if payload == "[DONE]" {
-                                receivedAcceptedPayload = true
                                 if !finished {
+                                    deliveredSemanticOutput = true
                                     continuation.yield(.done(finishReason: nil))
                                     finished = true
                                 }
@@ -228,12 +228,8 @@ extension OpenAIWireProvider: ToolCallingProvider {
                             } catch {
                                 throw ProviderErrorFormatting.invalidStreamPayload(trimmed, underlying: error)
                             }
-                            // A structured provider error is not a successful
-                            // response payload. Until one of these chunks is
-                            // accepted, retrying cannot duplicate model output
-                            // or a tool call.
-                            receivedAcceptedPayload = true
                             if let u = chunk.usage {
+                                deliveredSemanticOutput = true
                                 continuation.yield(.usage(u.usage))
                             }
                             var finishReason: String?
@@ -241,6 +237,7 @@ extension OpenAIWireProvider: ToolCallingProvider {
                                 for (choiceOffset, choice) in choices.enumerated() {
                                     let choiceIndex = choice.index ?? choiceOffset
                                     if let content = choice.delta?.content, !content.isEmpty {
+                                        deliveredSemanticOutput = true
                                         continuation.yield(.textDelta(content))
                                     }
                                     if let frags = choice.delta?.tool_calls {
@@ -292,7 +289,11 @@ extension OpenAIWireProvider: ToolCallingProvider {
                                     return ToolCall(id: e.id.isEmpty ? fallbackID : e.id,
                                                     name: e.name, arguments: arguments)
                                 }
-                                if !calls.isEmpty { continuation.yield(.toolCalls(calls)) }
+                                if !calls.isEmpty {
+                                    deliveredSemanticOutput = true
+                                    continuation.yield(.toolCalls(calls))
+                                }
+                                deliveredSemanticOutput = true
                                 continuation.yield(.done(finishReason: reason))
                                 finished = true
                             }
@@ -319,7 +320,7 @@ extension OpenAIWireProvider: ToolCallingProvider {
                             if ProviderRuntime.shouldRetry(error: error,
                                                            attempt: attempt,
                                                            policy: runtimePolicy,
-                                                           receivedResponseBytes: receivedAcceptedPayload) {
+                                                           deliveredSemanticOutput: deliveredSemanticOutput) {
                                 attempt += 1
                                 try await ProviderRuntime.sleepBeforeRetry(
                                     nextAttempt: attempt,
@@ -354,12 +355,11 @@ extension OpenAIWireProvider: ToolCallingProvider {
                     while true {
                         let parser = SSEParser()
                         var completed = false
-                        var receivedAcceptedPayload = false
+                        var deliveredSemanticOutput = false
                         var emittedText = ""
 
                         func handle(_ payload: String) throws -> Bool {
                             if payload == "[DONE]" {
-                                receivedAcceptedPayload = true
                                 guard completed else {
                                     throw ProviderErrorFormatting
                                         .incompleteStream(
@@ -404,6 +404,7 @@ extension OpenAIWireProvider: ToolCallingProvider {
                                 if case .string(let delta)? = event["delta"],
                                    !delta.isEmpty {
                                     emittedText += delta
+                                    deliveredSemanticOutput = true
                                     continuation.yield(.textDelta(delta))
                                 }
 
@@ -417,15 +418,15 @@ extension OpenAIWireProvider: ToolCallingProvider {
                                 }
                                 switch itemType {
                                 case "function_call":
-                                    continuation.yield(.toolCalls([
-                                        try Self.responsesFunctionCall(
-                                            item),
-                                    ]))
+                                    let call = try Self.responsesFunctionCall(
+                                        item)
+                                    deliveredSemanticOutput = true
+                                    continuation.yield(.toolCalls([call]))
                                 case "tool_search_call":
-                                    continuation.yield(.toolCalls([
-                                        try Self.responsesToolSearchCall(
-                                            item),
-                                    ]))
+                                    let call = try Self.responsesToolSearchCall(
+                                        item)
+                                    deliveredSemanticOutput = true
+                                    continuation.yield(.toolCalls([call]))
                                 case "message":
                                     let fullText =
                                         Self.responsesMessageText(item)
@@ -436,12 +437,14 @@ extension OpenAIWireProvider: ToolCallingProvider {
                                                 emittedText.count))
                                         if !suffix.isEmpty {
                                             emittedText += suffix
+                                            deliveredSemanticOutput = true
                                             continuation.yield(
                                                 .textDelta(suffix))
                                         }
                                     } else if emittedText.isEmpty,
                                               !fullText.isEmpty {
                                         emittedText = fullText
+                                        deliveredSemanticOutput = true
                                         continuation.yield(
                                             .textDelta(fullText))
                                     }
@@ -458,11 +461,12 @@ extension OpenAIWireProvider: ToolCallingProvider {
                                     throw IntatisError.decoding(
                                         "Responses completion is missing its response ID.")
                                 }
-                                receivedAcceptedPayload = true
                                 if let usage =
                                     Self.responsesUsage(response) {
+                                    deliveredSemanticOutput = true
                                     continuation.yield(.usage(usage))
                                 }
+                                deliveredSemanticOutput = true
                                 continuation.yield(
                                     .done(finishReason: "completed"))
                                 completed = true
@@ -493,7 +497,6 @@ extension OpenAIWireProvider: ToolCallingProvider {
                             default:
                                 break
                             }
-                            receivedAcceptedPayload = true
                             return false
                         }
 
@@ -521,8 +524,8 @@ extension OpenAIWireProvider: ToolCallingProvider {
                                 error: error,
                                 attempt: attempt,
                                 policy: runtimePolicy,
-                                receivedResponseBytes:
-                                    receivedAcceptedPayload) {
+                                deliveredSemanticOutput:
+                                    deliveredSemanticOutput) {
                                 attempt += 1
                                 try await ProviderRuntime.sleepBeforeRetry(
                                     nextAttempt: attempt,

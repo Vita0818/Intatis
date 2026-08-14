@@ -180,9 +180,6 @@ public struct DeterministicPolicyGate: Sendable {
         if controls.contains(.clearGoal) {
             return .pass(reason: "clear durable goal", risk: .medium)
         }
-        if controls.contains(.createGoal) {
-            return .pass(reason: "create durable goal", risk: .medium)
-        }
         if controls.contains(.editGoal) {
             return .pass(reason: "edit durable goal", risk: .medium)
         }

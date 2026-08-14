@@ -163,7 +163,9 @@ final class ModelHistoryProtocolTests: XCTestCase {
         }
     }
 
-    func testFunctionCallOutputGoldenShapeRequiresTextOrMedia() throws {
+    func testFunctionCallOutputGoldenShapeAllowsExplicitEmptyTextOrMedia()
+        throws
+    {
         let turnID = TurnID(rawValue: "turn-output-shape")
         let agent = AgentID(rawValue: "main")
         let textOutput = ModelHistoryItemPayload.functionCallOutput(
@@ -189,11 +191,25 @@ final class ModelHistoryProtocolTests: XCTestCase {
 
         var emptyTextOutput = textOutput
         emptyTextOutput.output = ""
-        XCTAssertThrowsError(try emptyTextOutput.validate()) {
+        XCTAssertNoThrow(try emptyTextOutput.validate())
+        let emptyTextData = try JSONEncoder().encode(emptyTextOutput)
+        let emptyTextObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: emptyTextData)
+                as? [String: Any])
+        XCTAssertEqual(emptyTextObject["output"] as? String, "")
+        XCTAssertEqual(
+            try JSONDecoder().decode(
+                ModelHistoryItemPayload.self,
+                from: emptyTextData),
+            emptyTextOutput)
+
+        var missingTextOutput = textOutput
+        missingTextOutput.output = nil
+        XCTAssertThrowsError(try missingTextOutput.validate()) {
             XCTAssertEqual(
                 $0 as? ModelHistoryItemPayloadValidationError,
                 .invalidShape(
-                    "text-only function-call output cannot be empty"))
+                    "function-call output fields are inconsistent"))
         }
 
         let reference = ModelHistoryImageReference(

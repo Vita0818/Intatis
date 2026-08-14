@@ -1,7 +1,7 @@
 # TESTING
 
 文档状态：当前验证矩阵
-最近核对：2026-08-13
+最近核对：2026-08-14
 产品基线：v0.48（build 48）
 
 历史测试数量、性能数字和事故复验保留在 Git 历史及 dated reports；它们不能替代当前
@@ -56,6 +56,11 @@ swift test --filter IntatisAgentKernelTests
 swift test --filter IntatisCoworkTests
 swift test --filter IntatisSharedUITests
 ```
+
+修改共享provider streaming runtime时，还必须覆盖默认initial + 5 reconnects及1/2/4/8/16秒退避、
+status/heartbeat/尚未yield的tool-call fragment后可重连、text/完整tool call/usage/done任一交付后禁止重放、
+取消不重连，以及hosted-search unsupported fallback仍使用独立typed acceptance fence。测试不得继续把
+“收到任意raw byte”等同于“consumer已经收到语义输出”。
 
 修改 Cowork automatic permission sidecar / reviewer 时，至少运行：
 
@@ -672,8 +677,10 @@ INTATIS_REAL_MULTIMODAL_SMOKE=1 swift test \
   当前 user image 与历史 FCO image，证明 same-call sidecar 可摘要媒体证据、reviewer 仍只接收文本摘要而
   不重发完整像素/PDF，并且 valid allow 后只执行 exact reviewed business call；
 - Cowork Retry planner矩阵必须证明outbox canonicalization保持attempt 1、restored queued exact resume
-  不递增、restored running durable requeue只对齐下一exact attempt、只有failed/cancelled whole-task
-  retry递增，并且所有分支保持同一SubmissionID/冻结payload/附件IDs且不重复user event；
+  不递增、restored running durable requeue只对齐下一exact attempt；无Run的failed/cancelled task仍在原
+  submission/task上有界递增，而terminal Run上的failed root必须创建fresh可见continuation
+  submission/root/Run、复用原冻结main binding且不复制one-shot external context，并证明旧Run/旧失败
+  事实不变、旧按钮在新submitted intent出现后消失；
 - macOS Code/Cowork GUI与CLI产品接线编译；iOS仍不链接AgentKernel/Tools/Cowork。fake provider只能证明
   request shape与事件顺序，真实OpenAI Responses user/FCO image smoke必须另列且需要凭据/网络。
 
@@ -1128,6 +1135,23 @@ INTATIS_REAL_MULTIMODAL_SMOKE=1 swift test \
 - 当前未启动 App、未授予真实麦克风权限，也未以真实 credential/network 调用线上
   `audio/transcriptions`，因此录音设备、具体 provider 方言、模型可用性、计费与运行态像素仍为
   `UNKNOWN`，需要下一步手动 smoke；本轮未执行签名、公证、staple、Gatekeeper 或发行打包。
+
+2026-08-14 provider streaming reconnect 与 Cowork terminal-Run Retry 最小修复的直接证据：
+
+- `IntatisMac` macOS Debug unsigned build 通过：
+  `xcodebuild -quiet -project Intatis.xcodeproj -scheme IntatisMac -configuration Debug
+  -destination platform=macOS -derivedDataPath /tmp/IntatisDerivedData-retryfix
+  COMPILER_INDEX_STORE_ENABLE=NO CODE_SIGNING_ALLOWED=NO build`，仅有多架构 destination 选择 warning；
+- `IntatisProvidersToolCallingTests` 36/36、0 failures；覆盖错误型 SSE 后重连、首次语义输出前重连，
+  以及 text/完整 tool call/usage/done 已交付后不盲重放。完整 `IntatisProvidersTests` 为
+  203/204：唯一失败是旧断言
+  `testOpenAIStreamingDoesNotRetryAfterResponseBytes`，其 fixture 只有尚未组成完整 SSE event 的 raw
+  fragment，仍把“收到任意 byte”当成 replay fence，与当前批准的 consumer semantic-yield 合同冲突；
+  本轮按仓库修改边界未改测试源码，也未把生产实现退回旧合同；
+- `ThreadLayoutTests` 21/21、0 failures；完整 `IntatisSharedUITests` filter 在约 70 秒无输出后
+  人工中止（exit 130），不记为通过；
+- `git diff --check` 通过。未运行真实 provider/credential/network、网络断线注入、GUI 点击、iOS、
+  签名、公证或发行打包 smoke。
 
 2026-08-13 Permission Reviewer plain-text verdict 格式修复的直接证据：
 

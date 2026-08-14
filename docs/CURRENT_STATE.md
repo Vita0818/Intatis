@@ -135,11 +135,14 @@ macOS 是完整产品：Chat、Code、Cowork、Settings 和本地诊断导出。
   图片/PDF证据压缩进 same-call sidecar，reviewer 不会因此收到完整像素或整份文档。上下文压缩的
   summarizer会看见完整active window中的用户/工具图片；checkpoint成功后所有旧原图只由摘要接替，
   replacement不保留attachment/ref，但ArtifactStore blob与审计事实不删除。
-- Cowork显式Retry由纯`SubmittedIntentRetryPlanner`按canonical task状态决定：outbox canonicalization
-  继续保持attempt 1；restored queued exact task不递增attempt或改写queued事件，restored running已经由
-  Orchestrator durable requeue到下一attempt时只对齐该exact attempt；只有failed/cancelled whole-task
-  execution retry才递增，created/assigned/running或不一致状态fail closed。所有分支都复用同一
-  SubmissionID、冻结payload/附件IDs与root task，不重复user event。
+- Cowork显式Retry仍先由纯`SubmittedIntentRetryPlanner`按canonical task状态决定：outbox
+  canonicalization继续保持attempt 1；restored queued exact task不递增attempt或改写queued事件，
+  restored running已经由Orchestrator durable requeue到下一attempt时只对齐该exact attempt；
+  created/assigned/running或不一致状态fail closed。failed/cancelled root若没有ContinuationRun，仍可在
+  同一SubmissionID/root task上递增attempt；若绑定的ContinuationRun已经terminal，GUI不会复活旧Run
+  或调用`Orchestrator.retry`，而是通过现有outbox/EventLog admission创建一条可见的短continuation
+  message、全新SubmissionID、root task和Run，并复用原提交冻结的`@main` exact binding。旧Run与旧失败
+  submission保持terminal；新提交出现后，旧错误仍可审计但不再保留可重复点击的Retry按钮。
 - macOS Chat/Code/Cowork 与 iOS Chat 的 composer 已在 Send/Stop 左侧接入同一个语音输入按钮。
   第一次点击开始录音，第二次点击停止并通过顶层 canonical `transcription_model` 指定的 exact
   provider/model 调用 `audio/transcriptions`；转写结果追加到完成时仍然可编辑的当前草稿，不自动
@@ -367,6 +370,10 @@ profiles 与外部 MCP client。macOS/Linux 的 stdio、sandbox、bwrap/guard �
   OAuth/callback/task 和 process ownership 仍受产品边界与权限控制。
 - Provider catalog 保留 model options/variant/adapter 语义；credential 只从受控 reference
   懒加载，不进入 EventLog、projection、诊断包或文档。
+- OpenAI-compatible Chat 与 Agent streaming 现在默认允许首次请求后最多5次reconnect，退避为
+  1/2/4/8/16秒；non-streaming仍只做一次retry。流式重放围栏以consumer实际收到text、完整tool call、
+  usage或done为准，raw byte、heartbeat/status或尚未交付的tool-call fragment不再误阻断重连；一旦已交付
+  任一语义输出，就保持partial并失败，不盲目重放。
 
 ## Chat 与 Agent 托管搜索
 
@@ -439,7 +446,9 @@ profiles 与外部 MCP client。macOS/Linux 的 stdio、sandbox、bwrap/guard �
   `.error`、失败 execution row、`recoveryAdvice`、失败 submission，以及 Code 的 voice/composer
   和 Cowork 的 voice/composer/inference/projection/session-storage 页面级错误都会进入同一列表；
   相同规范化文案只显示一次。右侧 rail 最底部只生成一张沿用现有 section 样式的“错误信息”
-  圆角卡片，无错误时不渲染卡片或占位。失败 submission 的 Retry 一并迁入该卡片；主 thread
+  圆角卡片，无错误时不渲染卡片或占位。失败 submission 的 Retry 一并迁入该卡片，但只允许当前
+  thread中最新的submitted intent携带按钮；创建新continuation后旧失败仍显示审计信息而不再可重试。
+  主 thread
   仅保留用户原文和已有 partial agent 正文，不再显示 `Needs attention`、错误行、失败 trace 或
   恢复建议。该收口只生成 presentation copy，不修改 EventLog、projection 或 durable failure facts。
 - rail 现在是 thread 上不参与布局协商的 `.overlay(alignment: .trailing)`，并关闭 inspector

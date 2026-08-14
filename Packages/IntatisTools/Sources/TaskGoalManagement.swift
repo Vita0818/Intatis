@@ -198,7 +198,6 @@ public struct GoalEditRequest: Equatable, Sendable {
 }
 
 public protocol GoalManager: Sendable {
-    func createGoal(_ request: GoalCreateRequest) async throws -> Goal
     func currentGoal() async throws -> Goal?
     func editGoal(_ request: GoalEditRequest) async throws -> Goal
     func transitionGoal(_ goalID: GoalID,

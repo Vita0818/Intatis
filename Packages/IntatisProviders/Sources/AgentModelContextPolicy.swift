@@ -4,9 +4,11 @@ import IntatisProtocol
 /// Exact, non-wire model metadata used to reason about context-window limits.
 ///
 /// The values mirror Codex model metadata but remain separate from provider
-/// request options. A missing value stays unknown: callers must not infer a
-/// context window from a model slug.
+/// request options. Missing raw/max metadata uses the product-wide fallback;
+/// callers must not infer a context window from a model slug.
 public struct AgentModelContextPolicy: Codable, Equatable, Sendable {
+    public static let defaultContextWindowTokens = 1_000_000
+    public static let defaultAutomaticCompactionPercent = 90
     public static let defaultEffectiveContextWindowPercent = 95
 
     /// Model-advertised context window.
@@ -36,20 +38,29 @@ public struct AgentModelContextPolicy: Codable, Equatable, Sendable {
         self.compHash = compHash
     }
 
-    /// Legacy/default profile value. With no raw/max/override, automatic
-    /// compaction remains disabled.
+    /// Legacy/default profile value. Its metadata remains unspecified for
+    /// encoding and fingerprinting, while resolved runtime limits use the
+    /// product-wide context-window fallback.
     public static let unspecified = AgentModelContextPolicy()
 
-    /// Codex resolves the primary context window first, then its maximum value.
+    /// Resolves the primary context window first, then its maximum value, then
+    /// the product-wide fallback when neither is explicitly configured.
     public var resolvedContextWindowTokens: Int? {
-        contextWindowTokens ?? maxContextWindowTokens
+        contextWindowTokens
+            ?? maxContextWindowTokens
+            ?? Self.defaultContextWindowTokens
     }
 
-    /// Codex derives 90% of the resolved window and clamps an explicit
-    /// threshold to that value. An explicit threshold remains usable when the
-    /// raw window is unknown.
+    /// Derives the default percentage of the resolved window and clamps an
+    /// explicit threshold to that value. An explicit threshold remains usable
+    /// when the raw window is unknown.
     public var resolvedAutoCompactTokenLimit: Int? {
-        let derived = resolvedContextWindowTokens.map(Self.ninetyPercent)
+        let derived = resolvedContextWindowTokens.map {
+            Self.percent(
+                $0,
+                numerator: Self.defaultAutomaticCompactionPercent,
+                denominator: 100)
+        }
         switch (derived, autoCompactTokenLimit) {
         case (.some(let derived), .some(let configured)):
             return min(derived, configured)
@@ -235,10 +246,6 @@ public struct AgentModelContextPolicy: Codable, Equatable, Sendable {
             && value.unicodeScalars.allSatisfy {
                 !CharacterSet.controlCharacters.contains($0)
             }
-    }
-
-    private static func ninetyPercent(_ value: Int) -> Int {
-        percent(value, numerator: 9, denominator: 10)
     }
 
     /// Overflow-safe floor(value * numerator / denominator) for a positive
