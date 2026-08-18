@@ -816,14 +816,16 @@ final class ChatSessionAutoTitleTests: XCTestCase {
         XCTAssertEqual(retryResult, .title("标题重试边界"))
         XCTAssertEqual(preByteHTTP.requestCount, 2)
 
-        let partialSSE = """
+        let partialSSE = #"""
         data: {"choices":[{"delta":{"content":"partial"}}]}
 
-        """
+        data: {"error":{"message":"Network connection lost","code":502}}
+
+        """#
         let postByteHTTP = AutoTitleSequencedHTTP([
             AutoTitleHTTPAttempt(
                 chunks: [Data(partialSSE.utf8)],
-                error: URLError(.networkConnectionLost)),
+                error: nil),
             AutoTitleHTTPAttempt(
                 chunks: [Data(completedSSE.utf8)],
                 error: nil),

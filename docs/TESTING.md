@@ -1,8 +1,18 @@
 # TESTING
 
+## 外部依赖与禁止兜底验证（Vitemis 强制规则）
+
+本项目继承 `/Users/vita/Vitemis/docs/DEPENDENCY_POLICY.md`。涉及外部能力的变更必须验证：
+
+- exact 外部依赖可用时只调用其官方 API/扩展点，不调用第一方重复实现。
+- 依赖缺失、版本不兼容或构建/签名/许可证/平台/安全条件不成立时，产生明确、可诊断失败并停止该能力。
+- 失败路径不会切换到 legacy、另一 provider/backend、adapter/shim、cache、mock、简化实现或不完整路径。
+- 测试 double 只存在于测试 target，不进入 production selection 或 runtime fallback。
+- Review 检查新增 wrapper/adapter/facade 是否仅为官方 API 必需的最薄接线；发现核心能力复制、第二实现或静默降级即判定失败。
+
 文档状态：当前验证矩阵
 最近核对：2026-08-14
-产品基线：v0.48（build 48）
+产品基线：v0.55（build 55）
 
 历史测试数量、性能数字和事故复验保留在 Git 历史及 dated reports；它们不能替代当前
 working tree 的验证。这里只记录现行命令、release gate 和最近一次真实结果。
@@ -27,11 +37,11 @@ scripts/check-version-consistency.sh
 
 必须同时满足：
 
-- `project.yml`：`MARKETING_VERSION=0.48`，`CURRENT_PROJECT_VERSION=48`；
-- macOS/iOS 参考 Info.plist：`0.48 (48)`；
+- `project.yml`：`MARKETING_VERSION=0.55`，`CURRENT_PROJECT_VERSION=55`；
+- macOS/iOS 参考 Info.plist：`0.55 (55)`；
 - 生成的 `Intatis.xcodeproj`：相同版本；
 - README、文档索引、CURRENT_STATE 和 PROJECT_MAP：相同当前基线；
-- 最终 App bundle：`CFBundleShortVersionString=0.48`、`CFBundleVersion=48`。
+- 最终 App bundle：`CFBundleShortVersionString=0.55`、`CFBundleVersion=55`。
 
 旧设计文档、依赖版本、协议 schema 和 dated reports 中的其他 v0.x 不属于该一致性检查。
 
@@ -443,7 +453,7 @@ recovery App metadata/architecture/signature/entitlements 重新验证；超时�
 
 发行脚本必须在输出 `dist/` 前完成：
 
-1. v0.48/build 48 一致性检查；
+1. v0.55/build 55 一致性检查；
 2. `IntatisMac` universal Release；
 3. Developer ID Application + secure timestamp + Hardened Runtime；
 4. signed entitlements 不含 App Sandbox；
@@ -1349,7 +1359,7 @@ INTATIS_REAL_MULTIMODAL_SMOKE=1 swift test \
 只有以下条件同时满足才能写 release GO：
 
 - 当前 working tree 相关 tests/builds 通过，已知失败有明确处置；
-- 最终 App/ZIP/DMG 元数据为 `0.48 (48)`；
+- 最终 App/ZIP/DMG 元数据为 `0.55 (55)`；
 - Developer ID、notarization、staple、codesign、Gatekeeper 全部通过；
 - NOTICE/ThirdPartyNotices 和最终 bundle resource/link inventory 一致；
 - 关键真实环境矩阵完成，未完成项以明确的风险接受记录处理。

@@ -1,19 +1,18 @@
 # CURRENT_STATE
 
 文档状态：当前源码摘要
-最近核对：2026-08-13
-产品基线：v0.48（build 48）
+最近核对：2026-08-18
+产品基线：v0.55（build 55）
 
 ## 版本与发行状态
 
-- `HEAD` 与 `origin/main` 当前均为标题为 `v0.47` 的提交 `53f3320`。仓库没有 Git tag；该
-  commit 标题不是产品版本事实源，`project.yml` 把当前产品基线定义为 `0.48 (48)`。
-- `MARKETING_VERSION` / `CURRENT_PROJECT_VERSION` 已推进为 `0.48 (48)`。两个仓库参考
+- `HEAD` 与 `origin/main` 当前均为标题为 `v0.54` 的提交 `120eda6`。仓库没有 Git tag；该
+  commit 标题不是产品版本事实源，`project.yml` 把当前工作树的产品基线定义为 `0.55 (55)`。
+- `MARKETING_VERSION` / `CURRENT_PROJECT_VERSION` 已推进为 `0.55 (55)`。两个仓库参考
   Info.plist、README、文档入口和发行脚本使用同一基线。
-- 2026-08-11 已重新生成 Xcode 工程并通过 v0.48 版本一致性门；`IntatisMac` unsigned
-  universal Release 与 `IntatisiOS` generic Simulator Debug 均构建通过，最终 bundle 均为
-  `0.48 (48)`，macOS 可执行文件包含 `x86_64 arm64`。
-- 本机 `/Applications/Intatis.app` 已安装上述当前工作树的 `0.48 (48)` ad-hoc Hardened
+- v0.55 的 Xcode 工程生成、版本门、SwiftPM、shipping target、Developer ID、公证和安装验证正在
+  本轮执行；在对应命令完成并读回最终产物前，不沿用 v0.48 的构建证据宣称 v0.55 已通过。
+- 本机 `/Applications/Intatis.app` 当前仍是先前的 `0.48 (48)` ad-hoc Hardened
   Runtime 开发构建；bundle identifier 为 `com.Vita0818.IntatisMac`，严格 codesign 校验通过，
   embedded entitlements 为 audio input=true、JIT=false 且 library validation 未关闭；安装副本与
   已验证 staging 副本的可执行文件 SHA-256 一致，且无 quarantine xattr。安装前的
@@ -21,9 +20,10 @@
   Developer ID 公证发行产物。
 - macOS 只发行 `IntatisMac` Developer ID/direct-distribution 产品；不做 Mac App Store。
   `IntatisMacAppStore` 仍是 legacy source target，不进入默认构建、测试或 release gate。
-- 用户宿主终端已报告两个有效 codesigning identity，其中 Developer ID Application 可被发行
-  脚本选取；`Intatis-Notary` Keychain profile 也已配置。v0.48 最终 App/DMG 尚未完成 Apple
-  notarization、staple 与 Gatekeeper 全链路，因此仍不得描述为正式 release。
+- 当前宿主有一个可由发行脚本精确选取的 Developer ID Application identity；
+  `Intatis-Notary` Keychain profile 可访问。2026-08-18 只读查询确认历史两条 submission 均为
+  `Accepted`、`In Progress=0`；v0.55 尚未提交 Apple，也尚未取得 App/DMG staple 与 Gatekeeper
+  全链路证据，因此仍不得描述为正式 release。
 
 ## 当前产品面
 

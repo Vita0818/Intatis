@@ -686,8 +686,7 @@ final class IntatisProvidersTests: XCTestCase {
     func testOpenAIStreamingThrowsWhenCompletionMarkerMissing() async throws {
         let sse = """
         data: {"choices":[{"delta":{"content":"partial"}}]}
-
-        """
+        """ + "\n\n"
         let provider = OpenAIWireProvider(endpoint: openAIEndpoint,
                                           apiKey: "k",
                                           http: FakeHTTP(chunks: [Data(sse.utf8)]))
@@ -1055,17 +1054,16 @@ final class IntatisProvidersTests: XCTestCase {
     }
 
     func testOpenAIStreamingDoesNotRetryAfterResponseBytes() async throws {
-        let sse = """
+        let sse = #"""
         data: {"choices":[{"delta":{"content":"partial"}}]}
 
-        """
+        data: {"error":{"message":"Network connection lost","code":502}}
+
+        """#
         let http = SequencedHTTP(attempts: [
             StreamAttempt(
                 chunks: [Data(sse.utf8)],
-                error: ProviderErrorFormatting.httpStatus(
-                    503,
-                    body: Data(#"{"error":{"message":"upstream failed mid-stream"}}"#.utf8),
-                    operation: "streaming request")),
+                error: nil),
             StreamAttempt(chunks: [Data("data: [DONE]\n\n".utf8)], error: nil),
         ])
         let provider = OpenAIWireProvider(
@@ -1077,19 +1075,22 @@ final class IntatisProvidersTests: XCTestCase {
                                                  initialRetryDelaySeconds: 0,
                                                  maxRetryDelaySeconds: 0))
 
+        var text = ""
         do {
             for try await chunk in provider.stream(ChatRequest(model: ModelID(rawValue: "m"),
                                                                messages: [ChatMessage(role: .user, content: "hi")])) {
-                if case .delta = chunk {
+                if case .delta(let value) = chunk {
+                    text += value
                     // The important invariant is that a stream that has already
-                    // yielded response bytes is not retried, because that can
+                    // delivered semantic output is not retried, because that can
                     // duplicate text or tool calls.
                 }
             }
             XCTFail("expected mid-stream provider error")
         } catch {
+            XCTAssertEqual(text, "partial")
             XCTAssertEqual(http.attemptCount, 1)
-            XCTAssertTrue(error.localizedDescription.contains("HTTP 503"))
+            XCTAssertTrue(error.localizedDescription.contains("Network connection lost"))
         }
     }
 

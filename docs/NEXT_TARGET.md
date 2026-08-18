@@ -1,16 +1,16 @@
 # NEXT_TARGET
 
 文档状态：唯一活跃目标
-最近核对：2026-08-11
-产品基线：v0.48（build 48）
+最近核对：2026-08-18
+产品基线：v0.55（build 55）
 
-## 目标：完成 v0.48 Developer ID 直接分发候选
+## 目标：完成 v0.55 Developer ID 直接分发候选
 
-把当前 v0.48 源码收敛为可验证、可安装、可直接分发的 macOS ZIP/DMG；不走 App Store。
+把当前 v0.55 源码收敛为可验证、可安装、可直接分发的 macOS ZIP/DMG；不走 App Store。
 
 ## 已完成
 
-- 版本事实源已推进为 `0.48 (48)`。
+- 版本事实源已推进为 `0.55 (55)`。
 - 新增版本一致性检查，覆盖 `project.yml`、参考 Info.plist、当前入口文档和生成工程。
 - `IntatisMac` 显式启用 Hardened Runtime。
 - `scripts/package-macos-release.sh` 已实现 universal Release、Developer ID App/DMG
@@ -18,12 +18,11 @@
   ZIP/DMG SHA-256 清单；不构建 legacy App Store target。
 - 当前仓库文档已重新划分为当前规范和历史证据，README/状态/测试不再以旧 v0.9/v0.16
   里程碑冒充当前版本。
-- Xcode 工程已重新生成，v0.48 版本一致性门已通过；macOS universal Release 与 iOS
-  Simulator Debug 均构建通过，最终 bundle 均为 `0.48 (48)`，macOS 可执行文件包含
-  `x86_64 arm64`。
-- 本机 `/Applications/Intatis.app` 已安装 `0.48 (48)` ad-hoc Hardened Runtime 开发构建，
+- v0.55 的 Xcode 工程生成、版本一致性、macOS universal Release 与 iOS Simulator Debug
+  正在本轮重新验证；旧 v0.48 构建证据不替代本轮结果。
+- 本机 `/Applications/Intatis.app` 当前仍安装 `0.48 (48)` ad-hoc Hardened Runtime 开发构建，
   严格 codesign、entitlements、无 quarantine 与 staging 可执行文件一致性均已验收。安装前的
-  `0.40 (40)` 保留为 `~/.Trash/Intatis-before-install-20260811-201644.app` 可恢复备份。该开发安装不能作为 v0.48 Developer ID
+  `0.40 (40)` 保留为 `~/.Trash/Intatis-before-install-20260811-201644.app` 可恢复备份。该开发安装不能作为 v0.55 Developer ID
   公证发行证据。
 - AgentKernel soft-token-budget stale fixture 已在不改生产预算保护的前提下收口；focused
   用例、169 项 AgentKernel suite 与完整 `swift test` 均通过。
@@ -31,16 +30,15 @@
   notarytool Keychain profile；凭据和私钥均未写入仓库。
 - 发行脚本已支持构建/公证分段切换网络：GitHub 依赖解析和签名阶段保持代理/VPN，暂停后
   关闭会阻断 Apple 的代理/VPN，再原地继续公证，无需重新构建。
-- Apple 已接收两次 v0.36 App submission，但查询时均长时间保持 `In Progress`；它们不能作为
-  v0.48 公证证据。旧脚本的无输出
+- Apple 已接收两次旧 App submission；2026-08-18 只读查询确认两条均已 `Accepted`、
+  `In Progress=0`。它们不能作为 v0.55 公证证据。旧脚本的无输出
   `--wait` 已被用户中断，且旧临时 App 已清理。发行脚本现改为显示 upload/status、保存
   submission ID、默认 30 分钟有界等待，并在超时/中断时保留可恢复签名 App/DMG。
 
 ## 剩余 release gate
 
-1. 先用 `xcrun notarytool history --keychain-profile Intatis-Notary` 查看现有两条 v0.36
-   submission；在它们仍为 `In Progress` 时不要继续上传。
-2. 现有提交到达 terminal 后，在代理/VPN开启时只运行一次：
+1. 运行 v0.55 版本一致性、SwiftPM、shipping target、bundle metadata/architecture 与发行脚本预检。
+2. 本地门槛通过后，在代理/VPN开启时只运行一次：
 
    ```sh
    INTATIS_PAUSE_BEFORE_NOTARIZATION=1 \
