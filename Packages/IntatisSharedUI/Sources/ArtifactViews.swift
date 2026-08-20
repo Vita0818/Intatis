@@ -38,7 +38,7 @@ public struct ArtifactInspector: View {
 
     public var body: some View {
         if artifacts.isEmpty && progress.isEmpty {
-            Text("No artifacts yet").font(.caption).foregroundStyle(.secondary)
+            Text("No artifacts yet").font(IntatisTypography.system(.caption)).foregroundStyle(.secondary)
         } else {
             ForEach(progress) { ArtifactProgressRow(progress: $0) }
             ForEach(artifacts) { ArtifactCardView(artifact: $0) }
@@ -52,10 +52,10 @@ struct ArtifactProgressRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Text(localizedState).font(.caption.bold())
+                Text(localizedState).font(IntatisTypography.system(.caption, bold: true))
                 Spacer(minLength: 6)
                 Text("\(Int(clampedProgress * 100))%")
-                    .font(.caption)
+                    .font(IntatisTypography.system(.caption))
                     .foregroundStyle(.secondary)
             }
             ProgressView(value: clampedProgress)
@@ -85,10 +85,10 @@ struct ArtifactCardView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(localizedKind).font(.caption.bold())
+            Text(localizedKind).font(IntatisTypography.system(.caption, bold: true))
             content
             if let prompt = artifact.prompt {
-                Text(prompt).font(.caption2).foregroundStyle(.secondary).lineLimit(3)
+                Text(prompt).font(IntatisTypography.system(.caption2)).foregroundStyle(.secondary).lineLimit(3)
             }
         }
         .padding(8)
@@ -100,9 +100,9 @@ struct ArtifactCardView: View {
         case "image":
             imagePreview
         case "transcript":
-            Text(fileText).font(.caption).textSelection(.enabled).lineLimit(8)
+            Text(fileText).font(IntatisTypography.system(.caption)).textSelection(.enabled).lineLimit(8)
         default:
-            Text(artifact.mime).font(.caption).foregroundStyle(.secondary)
+            Text(artifact.mime).font(IntatisTypography.system(.caption)).foregroundStyle(.secondary)
         }
     }
 
@@ -112,17 +112,17 @@ struct ArtifactCardView: View {
             Image(nsImage: image).resizable().scaledToFit()
                 .frame(maxHeight: 180).clipShape(RoundedRectangle(cornerRadius: 6))
         } else {
-            Text("(image unavailable)").font(.caption).foregroundStyle(.secondary)
+            Text("(image unavailable)").font(IntatisTypography.system(.caption)).foregroundStyle(.secondary)
         }
         #elseif canImport(UIKit)
         if let image = UIImage(contentsOfFile: artifact.path) {
             Image(uiImage: image).resizable().scaledToFit()
                 .frame(maxHeight: 180).clipShape(RoundedRectangle(cornerRadius: 6))
         } else {
-            Text("(image unavailable)").font(.caption).foregroundStyle(.secondary)
+            Text("(image unavailable)").font(IntatisTypography.system(.caption)).foregroundStyle(.secondary)
         }
         #else
-        Text("(image)").font(.caption).foregroundStyle(.secondary)
+        Text("(image)").font(IntatisTypography.system(.caption)).foregroundStyle(.secondary)
         #endif
     }
 

@@ -75,7 +75,7 @@ struct CoworkAgentConversationFixtureView: View {
         HStack(spacing: 12) {
             VStack(alignment: .leading, spacing: 2) {
                 Text(controller.status)
-                    .font(.caption.monospaced())
+                    .font(IntatisTypography.system(.caption, design: .monospaced))
                     .lineLimit(2)
                     .accessibilityIdentifier("cowork.agent.fixture.status")
                 Text(
@@ -84,7 +84,7 @@ struct CoworkAgentConversationFixtureView: View {
                         + "incidents \(controller.processHeartbeatIncidentCount) · "
                         + "switch requests \(controller.switchRequestCount) · "
                         + "8 × 1,000 rows · 4-agent 500 delta/s burst · ≤16 visible")
-                    .font(.caption2.monospacedDigit())
+                    .font(IntatisTypography.system(.caption2, monospacedDigits: true))
                     .foregroundStyle(.secondary)
                     .accessibilityIdentifier("cowork.agent.fixture.metrics")
             }

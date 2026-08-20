@@ -102,9 +102,9 @@ struct RendererFixtureView: View {
     private var fixtureHeader: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Intatis renderer fixture")
-                .font(.title.bold())
+                .font(IntatisTypography.system(.title, bold: true))
             Text("Offline · SwiftStreamingMarkdown derivative · swift-markdown 0.8.0")
-                .font(.subheadline)
+                .font(IntatisTypography.system(.subheadline))
                 .foregroundStyle(.secondary)
 
             Picker("Renderer", selection: rendererModeSelection) {
@@ -124,18 +124,18 @@ struct RendererFixtureView: View {
             .accessibilityIdentifier("renderer.fixture.stage")
 
             Text("Active workload: \(fixtureStage.title)")
-                .font(.caption.monospaced())
+                .font(IntatisTypography.system(.caption, design: .monospaced))
                 .foregroundStyle(.secondary)
                 .accessibilityIdentifier("renderer.fixture.stage-status")
 
             Text("Math mode: \(mathModeTitle)")
-                .font(.caption.monospaced())
+                .font(IntatisTypography.system(.caption, design: .monospaced))
                 .foregroundStyle(.secondary)
                 .accessibilityIdentifier("renderer.fixture.math-mode")
 
             if let rendererLaunchOverride {
                 Text("Current launch override: \(rendererLaunchOverride == .plainSafe ? "Plain safe" : "Rich Markdown"). Picker stores the next unforced launch mode.")
-                    .font(.caption)
+                    .font(IntatisTypography.system(.caption))
                     .foregroundStyle(.secondary)
                     .accessibilityIdentifier("renderer.fixture.mode-override")
             }
@@ -202,7 +202,7 @@ struct RendererFixtureView: View {
                     ForEach(Self.mathHistoryMessages) { row in
                         VStack(alignment: .leading, spacing: 5) {
                             Text(row.label)
-                                .font(.caption)
+                                .font(IntatisTypography.system(.caption))
                                 .foregroundStyle(.secondary)
                             message(
                                 id: row.id,
@@ -230,7 +230,7 @@ struct RendererFixtureView: View {
                     }
                     .accessibilityIdentifier("renderer.fixture.math-stream.advance")
                     Text("Stage \(mathStreamStage + 1) / \(Self.mathStreamingSources.count)")
-                        .font(.caption)
+                        .font(IntatisTypography.system(.caption))
                         .foregroundStyle(.secondary)
                         .accessibilityIdentifier("renderer.fixture.math-stream.status")
                     message(
@@ -247,7 +247,7 @@ struct RendererFixtureView: View {
                     }
                     .accessibilityIdentifier("renderer.fixture.advance")
                     Text("Stage \(streamStage + 1) / \(Self.streamingSources.count)")
-                        .font(.caption)
+                        .font(IntatisTypography.system(.caption))
                         .foregroundStyle(.secondary)
                         .accessibilityIdentifier("renderer.fixture.stream-status")
                     message(
@@ -316,7 +316,7 @@ struct RendererFixtureView: View {
                 }
 
                 Text(incidentReplay.status)
-                    .font(.caption.monospaced())
+                    .font(IntatisTypography.system(.caption, design: .monospaced))
                     .foregroundStyle(incidentReplay.hasFailed ? .red : .secondary)
                     .textSelection(.enabled)
                     .accessibilityIdentifier("renderer.fixture.incident.status")
@@ -325,7 +325,7 @@ struct RendererFixtureView: View {
                     ForEach(incidentReplay.rows) { row in
                         VStack(alignment: .leading, spacing: 5) {
                             Text("@\(row.agent)")
-                                .font(.caption)
+                                .font(IntatisTypography.system(.caption))
                                 .foregroundStyle(.secondary)
                             message(
                                 id: row.id,
@@ -377,7 +377,7 @@ struct RendererFixtureView: View {
     ) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             Text(title.uppercased())
-                .font(.caption.bold())
+                .font(IntatisTypography.system(.caption, bold: true))
                 .foregroundStyle(style.tertiaryText)
             content()
         }
@@ -661,7 +661,7 @@ private struct RendererHeartbeatStallFixtureView: View {
             didFinish
                 ? "Intentional 3 s MainActor block completed"
                 : "Waiting to run one intentional 3 s MainActor block")
-            .font(.caption.monospaced())
+            .font(IntatisTypography.system(.caption, design: .monospaced))
             .foregroundStyle(.secondary)
             .accessibilityIdentifier(
                 "renderer.fixture.heartbeat-stall.status")
@@ -1311,7 +1311,7 @@ private struct RendererThreadBurstFixtureView: View {
         VStack(spacing: 0) {
             HStack(spacing: 12) {
                 Text(model.status)
-                    .font(.caption.monospaced())
+                    .font(IntatisTypography.system(.caption, design: .monospaced))
                     .foregroundStyle(model.hasFailed ? .red : .secondary)
                     .lineLimit(2)
                     .textSelection(.enabled)

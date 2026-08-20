@@ -11,7 +11,7 @@
 - Review 检查新增 wrapper/adapter/facade 是否仅为官方 API 必需的最薄接线；发现核心能力复制、第二实现或静默降级即判定失败。
 
 文档状态：当前验证矩阵
-最近核对：2026-08-14
+最近核对：2026-08-19
 产品基线：v0.55（build 55）
 
 历史测试数量、性能数字和事故复验保留在 Git 历史及 dated reports；它们不能替代当前
@@ -515,6 +515,8 @@ recovery App metadata/architecture/signature/entitlements 重新验证；超时�
   不出现旧 accent 蓝色描边；assistant/agent/system（包括失败/中断回复）直接位于 canvas，
   正常 tool/permission/task 等专用结构化卡片仍保留各自容器；
 - composer 单行/多行、model menu、usage、Send/Stop；
+- iOS composer 获得焦点后，Send 按钮与键盘提交都应立即收起键盘；重新聚焦后在消息区上下拖动应
+  交互式收起键盘，stream completion、输入框重新启用和自动滚动不得再次弹出；macOS focus 不变；
 - Cowork wide rail、narrow permission fallback、Goal/Tasks/Agents；
 - Code/Cowork 当前 page 的 `.error`、失败 execution row、recovery advice、失败 submission 与全部
   host 页面级错误只在右栏最底部同一张“错误信息”圆角卡片内显示；相同文案去重，Cowork Retry
@@ -743,6 +745,82 @@ INTATIS_REAL_MULTIMODAL_SMOKE=1 swift test \
   线上 provider smoke 必须单独记录，不能从离线测试或编译外推。
 
 ## 最近一次真实结果
+
+### JetBrains Mono 全局英文字体发布门槛
+
+JetBrains Mono 是 macOS/iOS 第一方统一英文字体。Debug、Release 与发行构建都必须在普通、无参数
+启动时使用同一条正式路径，不得存在 system-font opt-out 或实验参数。至少验证：
+
+```sh
+swift test --filter IntatisTypographyTests
+swift test --filter 'MessageRenderingTests|ThreadLayoutTests|CoworkInferencePresentationTests'
+swift test --package-path Vendor/SwiftStreamingMarkdown \
+  --filter FirstReleaseContractTests
+xcodegen generate
+xcodebuild -quiet -project Intatis.xcodeproj -scheme IntatisMac \
+  -configuration Debug -destination 'platform=macOS' \
+  COMPILER_INDEX_STORE_ENABLE=NO CODE_SIGNING_ALLOWED=NO build
+xcodebuild -quiet -project Intatis.xcodeproj -scheme IntatisiOS \
+  -configuration Debug -destination 'generic/platform=iOS Simulator' \
+  COMPILER_INDEX_STORE_ENABLE=NO CODE_SIGNING_ALLOWED=NO build
+```
+
+还必须逐字节核对两端最终 App 中两个 TTF 和 OFL 的 SHA-256；无参数启动至少一个 macOS
+fixture 与一个隔离 iOS Simulator，确认正式字体可见且进程不会因 registration/resource mismatch
+退出。Core Text
+probe 应分别观察英文使用 JetBrains Mono、中文使用系统 CJK fallback。source scan 必须证明第一方
+production SwiftUI 的 direct `.font(.system/semantic...)` 已进入 product typography seam；vendor code block
+只能读取现有 `MarkdownRenderConfig`，默认配置行为不变。
+
+正式 release 须核对 exact dependency closure；Simulator/fixture 不能替代 Dark、超大 Dynamic Type、VoiceOver、
+真实长中英混排、系统 sheet/menu/control、真机和正式签名/公证验证。
+
+2026-08-19 当前直接证据：
+
+- 官方 v2.304 两份 TTF、OFL 与仓库/两端 Debug App bundle 的 SHA-256 分别一致为
+  `662a196d...cac016`、`f115aaa1...63f2`、`30f0c136...ac4ad`；最终两个 bundle 均为 `0.55 (55)`；
+- 两份 TTF 已收口到 `IntatisSharedUI` 的 `Bundle.module`；四个 App 各自只含一个
+  `Intatis_IntatisSharedUI.bundle` 和 exactly 2 个 JetBrains TTF，没有残留 App-root duplicate；
+- `IntatisTypographyTests` 在 Debug 与 Release 配置各 2/2；测试冻结 JetBrains Mono 为每个共享
+  typography role 的正式 design；
+  Debug 下与 `MessageRenderingTests` 41、`ThreadLayoutTests` 22、
+  `CoworkInferencePresentationTests` 8 合计 73/73、0 failures；vendored Markdown 完整 suite 为
+  79 XCTest + 11 Swift Testing、0 failures；
+- macOS/iOS Debug 与 Release unsigned build 均退出 0，只报告仓库既有 warnings；Release macOS
+  executable 为 `x86_64 arm64`，四个最终 App 均为 `0.55 (55)`，Release bundles 的两份 TTF/OFL
+  hash 也与仓库一致；四个 build 已在正式字体接线后重新执行；
+- 当前 iPhone 17 Pro 隔离 Simulator 已在**没有任何字体参数**时启动成功，`New chat`、model label 与
+  composer placeholder 均显示 JetBrains Mono；macOS Renderer Fixture 也在没有字体参数时启动并
+  稳定存活；
+- Core Text run probe 报告英文为 `JetBrainsMono-Regular`、中文为 `PingFangSC-Regular`；
+- 尚未完成 Dark、超大 Dynamic Type、VoiceOver、真实长中英混排、系统 sheet/menu/control、真机、
+  正式签名/公证；因此本条是字体接线证据，不是整个 v0.55 release GO。
+
+2026-08-19 iOS large title 收窄的直接证据：
+
+- `IOSRootView` 的当前 session 与 Settings 标题继续使用 JetBrains Mono large-title role 和
+  `@ScaledMetric(relativeTo: .largeTitle)`，但 iOS-only nominal size 从共享 30pt 收窄为 22pt；
+  抽屉品牌字号、共享 `IntatisTypography` 事实源和 macOS 标题均未修改；
+- `IntatisTypographyTests` 1/1、0 failures，确认共享 `.largeTitle` 仍为 30pt；
+- `IntatisiOS` generic Simulator Debug unsigned build 退出 0，最终 bundle 为 `0.55 (55)`，只出现
+  仓库既有 unused-result / deprecated `onChange` warnings；
+- 新构建已安装并启动于 iPhone 17 Pro Simulator。Light 主界面截图确认 `New chat` 标题在 64pt
+  header 内保持居中、无截断且未挤压两侧 sidebar/New 按钮，底部 composer 几何未变化；Settings
+  使用同一 22pt override。未运行完整 SwiftPM suite、Dark、超大 Dynamic Type、VoiceOver 或真机矩阵。
+
+2026-08-19 iOS Chat 键盘 dismissal 修复的直接证据：
+
+- `IntatisThreadComposer` 的 Send 按钮与键盘提交改为共用同一个 guarded `submit()`；iOS 在调用
+  `ChatViewModel.send()` 前先把本地 FocusState 设为 `false`，macOS 条件分支不改变既有焦点行为；
+- shared Chat 消息 `ScrollView` 只在 iOS 增加 `.scrollDismissesKeyboard(.interactively)`，模型输出、
+  自动滚动与输入重新启用不再拥有重新聚焦入口；
+- `ThreadLayoutTests` 22/22、0 failures，新增 source-shape 回归同时冻结 Send/Return 两条提交路径、
+  iOS-only FocusState 清理和 interactive scroll dismissal；
+- `IntatisiOS` generic Simulator Debug unsigned build 退出 0，最终 bundle 为 `0.55 (55)`，只出现仓库
+  既有 unused-result / deprecated `onChange` warnings；隔离的临时 iPhone 17 Pro Simulator 已成功启动
+  当前 App，且未读取或使用真实 provider 配置；
+- 当前 Computer Use 服务不能识别 Xcode Simulator，已安装的 `simctl io` 也不提供 touch/HID 注入，
+  因此没有把真实 Send 后键盘动画或消息区下拉手势伪报为自动化通过；这两项仍需人工点按确认。
 
 2026-08-11 本机 LibreOffice 26.8 替换与真实链路证据：
 

@@ -6,6 +6,7 @@ import IntatisConversation
 import IntatisCore
 import IntatisMCP
 import IntatisProtocol
+import IntatisSharedUI
 import MCP
 import SwiftUI
 
@@ -584,15 +585,15 @@ private struct MCPInteractionHeader: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
             Text(title)
-                .font(.title2.bold())
+                .font(IntatisTypography.system(.title2, bold: true))
             Text(
                 "\(server.serverID.rawValue) · \(server.serverRevision.rawValue)")
-                .font(.caption.monospaced())
+                .font(IntatisTypography.system(.caption, design: .monospaced))
                 .foregroundStyle(.secondary)
                 .textSelection(.enabled)
             if queuedCount > 0 {
                 Text("\(queuedCount) more MCP requests waiting")
-                    .font(.caption)
+                    .font(IntatisTypography.system(.caption))
                     .foregroundStyle(.orange)
             }
         }
@@ -609,22 +610,22 @@ private struct MCPConnectionConsentSheet: View {
         VStack(alignment: .leading, spacing: 16) {
             VStack(alignment: .leading, spacing: 5) {
                 Text("Allow Exact MCP Connections?")
-                    .font(.title2.bold())
+                    .font(IntatisTypography.system(.title2, bold: true))
                 Text(
                     "Session \(presentation.challenge.sessionID.rawValue) · Agent \(presentation.challenge.agentID.rawValue) · \(presentation.challenge.activationReason.rawValue)")
-                    .font(.caption.monospaced())
+                    .font(IntatisTypography.system(.caption, design: .monospaced))
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
                 if center.queuedCount > 0 {
                     Text(
                         "\(center.queuedCount) more MCP requests waiting")
-                        .font(.caption)
+                        .font(IntatisTypography.system(.caption))
                         .foregroundStyle(.orange)
                 }
             }
             Text(
                 "The provider request is paused. Allowing writes durable consent for only the exact immutable server revision, Agent authority, account/environment, roots, network policy, sandbox policy, and launch artifact shown below. Test and sign-in authorization never counts as this consent.")
-                .font(.callout)
+                .font(IntatisTypography.system(.callout))
                 .foregroundStyle(.secondary)
             ScrollView {
                 LazyVStack(
@@ -680,16 +681,16 @@ private struct MCPConnectionConsentSheet: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(
                         "\(item.alias) — \(item.definition.configuration.displayName)")
-                        .font(.headline)
+                        .font(IntatisTypography.system(.headline))
                     Text(
                         "\(identity.server.serverID.rawValue) · \(identity.server.serverRevision.rawValue)")
-                        .font(.caption.monospaced())
+                        .font(IntatisTypography.system(.caption, design: .monospaced))
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
                 }
                 Spacer()
                 Text(identity.transport.rawValue)
-                    .font(.caption.monospaced())
+                    .font(IntatisTypography.system(.caption, design: .monospaced))
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
                     .background(
@@ -746,7 +747,7 @@ private struct MCPConnectionConsentSheet: View {
     ) -> some View {
         LabeledContent(label) {
             Text(value)
-                .font(.caption.monospaced())
+                .font(IntatisTypography.system(.caption, design: .monospaced))
                 .textSelection(.enabled)
                 .multilineTextAlignment(.trailing)
         }
@@ -773,7 +774,7 @@ private struct MCPConnectionConsentSheet: View {
                 stdio.launchArtifact.fingerprint)
             VStack(alignment: .leading, spacing: 5) {
                 Text("Complete launch closure")
-                    .font(.caption.weight(.semibold))
+                    .font(IntatisTypography.system(.caption, weight: .semibold))
                 ForEach(
                     Array(
                         stdio.launchArtifact.files
@@ -786,11 +787,11 @@ private struct MCPConnectionConsentSheet: View {
                     ) {
                         Text(
                             "\(file.role.rawValue) · \(file.canonicalPath)")
-                            .font(.caption.monospaced())
+                            .font(IntatisTypography.system(.caption, design: .monospaced))
                             .textSelection(.enabled)
                         Text(
                             "\(file.sha256) · \(file.byteCount) bytes")
-                            .font(.caption2.monospaced())
+                            .font(IntatisTypography.system(.caption2, design: .monospaced))
                             .foregroundStyle(.secondary)
                             .textSelection(.enabled)
                     }
@@ -844,7 +845,7 @@ private struct MCPOAuthApprovalSheet: View {
                 queuedCount: center.queuedCount)
             Text(
                 "Intatis will open the authorization page only after you continue. The callback is bound to a one-shot local loopback address; this does not connect the MCP server.")
-                .font(.callout)
+                .font(IntatisTypography.system(.callout))
                 .foregroundStyle(.secondary)
             LabeledContent("Resource") {
                 Text(presentation.canonicalResource)
@@ -856,7 +857,7 @@ private struct MCPOAuthApprovalSheet: View {
             }
             LabeledContent("Account reference") {
                 Text(presentation.accountReference.rawValue)
-                    .font(.body.monospaced())
+                    .font(IntatisTypography.system(.body, design: .monospaced))
                     .textSelection(.enabled)
             }
             LabeledContent("Scopes") {
@@ -870,7 +871,7 @@ private struct MCPOAuthApprovalSheet: View {
                 Label(
                     "This authorization server will dynamically register a new OAuth client before sign-in. Continue only if you trust the exact authorization origin shown above.",
                     systemImage: "person.badge.key")
-                    .font(.callout)
+                    .font(IntatisTypography.system(.callout))
                     .foregroundStyle(.orange)
             }
             HStack {
@@ -915,7 +916,7 @@ private struct MCPSamplingRequestSheet: View {
                 queuedCount: center.queuedCount)
             Text(
                 "The server is asking Intatis to run a provider-neutral model request. Approval here does not grant tools or access to the current Agent conversation. You will review the model result separately.")
-                .font(.callout)
+                .font(IntatisTypography.system(.callout))
                 .foregroundStyle(.secondary)
             LabeledContent("Messages") {
                 Text("\(presentation.parameters.messages.count)")
@@ -985,7 +986,7 @@ private struct MCPSamplingResultSheet: View {
                 queuedCount: center.queuedCount)
             Text(
                 "The model has completed. The result remains local until you explicitly return it to the requesting MCP server.")
-                .font(.callout)
+                .font(IntatisTypography.system(.callout))
                 .foregroundStyle(.secondary)
             LabeledContent("Model") {
                 Text(presentation.result.model)
@@ -994,7 +995,7 @@ private struct MCPSamplingResultSheet: View {
                 Text(
                     presentation.inferenceBinding
                         .inferenceProfileRevision.rawValue)
-                    .font(.body.monospaced())
+                    .font(IntatisTypography.system(.body, design: .monospaced))
             }
             MCPJSONPreview(value: presentation.result)
                 .frame(minHeight: 260)
@@ -1033,7 +1034,7 @@ private struct MCPElicitationSheet: View {
             switch presentation.parameters {
             case .form(let form):
                 Text(form.message)
-                    .font(.callout)
+                    .font(IntatisTypography.system(.callout))
                 MCPDynamicForm(
                     schema: form.requestedSchema,
                     values: $formValues)
@@ -1041,18 +1042,18 @@ private struct MCPElicitationSheet: View {
                     Label(
                         validationMessage,
                         systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption)
+                        .font(IntatisTypography.system(.caption))
                         .foregroundStyle(.red)
                 }
             case .url(let value):
                 Text(value.message)
-                    .font(.callout)
+                    .font(IntatisTypography.system(.callout))
                 LabeledContent("Destination host") {
                     Text(presentation.highlightedHost ?? "Unknown")
-                        .font(.body.monospaced())
+                        .font(IntatisTypography.system(.body, design: .monospaced))
                 }
                 Text(value.url)
-                    .font(.caption.monospaced())
+                    .font(IntatisTypography.system(.caption, design: .monospaced))
                     .textSelection(.enabled)
                     .padding(10)
                     .background(.quaternary, in:
@@ -1065,7 +1066,7 @@ private struct MCPElicitationSheet: View {
                 }
                 Text(
                     "Intatis does not prefetch this URL and never receives credentials or other data entered in the external browser.")
-                    .font(.caption)
+                    .font(IntatisTypography.system(.caption))
                     .foregroundStyle(.secondary)
             }
             HStack {
@@ -1151,11 +1152,11 @@ private struct MCPDynamicForm: View {
             VStack(alignment: .leading, spacing: 14) {
                 if let title = schema.title {
                     Text(title)
-                        .font(.headline)
+                        .font(IntatisTypography.system(.headline))
                 }
                 if let description = schema.description {
                     Text(description)
-                        .font(.caption)
+                        .font(IntatisTypography.system(.caption))
                         .foregroundStyle(.secondary)
                 }
                 ForEach(schema.properties.keys.sorted(), id: \.self) {
@@ -1208,7 +1209,7 @@ private struct MCPDynamicFormField: View {
                 }
             case "array":
                 Text(label)
-                    .font(.caption.bold())
+                    .font(IntatisTypography.system(.caption, bold: true))
                 ForEach(options, id: \.value) { option in
                     Toggle(
                         option.title,
@@ -1234,7 +1235,7 @@ private struct MCPDynamicFormField: View {
             if let description =
                 definition["description"]?.stringValue {
                 Text(description)
-                    .font(.caption2)
+                    .font(IntatisTypography.system(.caption2))
                     .foregroundStyle(.secondary)
             }
         }
@@ -1391,7 +1392,7 @@ private struct MCPJSONPreview<T: Encodable>: View {
     var body: some View {
         ScrollView {
             Text(text)
-                .font(.caption.monospaced())
+                .font(IntatisTypography.system(.caption, design: .monospaced))
                 .frame(
                     maxWidth: .infinity,
                     alignment: .leading)

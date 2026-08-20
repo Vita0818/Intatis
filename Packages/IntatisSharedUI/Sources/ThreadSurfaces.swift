@@ -310,7 +310,7 @@ struct IntatisThreadErrorList: View {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                     if let title = error.title {
                         Text(title)
-                            .font(.caption.bold())
+                            .font(IntatisTypography.system(.caption, bold: true))
                             .foregroundStyle(style.primaryText)
                             .fixedSize(horizontal: false, vertical: true)
                     }
@@ -321,7 +321,7 @@ struct IntatisThreadErrorList: View {
                             onRetrySubmission(submissionID)
                         }
                         .buttonStyle(.borderless)
-                        .font(.caption.bold())
+                        .font(IntatisTypography.system(.caption, bold: true))
                         .accessibilityIdentifier(
                             "submission.\(submissionID.rawValue).retry")
                     }
@@ -329,7 +329,7 @@ struct IntatisThreadErrorList: View {
             }
             ForEach(error.details, id: \.self) { detail in
                 Text(detail)
-                    .font(.caption)
+                    .font(IntatisTypography.system(.caption))
                     .foregroundStyle(style.secondaryText)
                     .fixedSize(horizontal: false, vertical: true)
                     .textSelection(.enabled)
@@ -1514,7 +1514,7 @@ public struct IntatisJumpToLatestButton: View {
             Label(
                 IntatisLocalization.string("Jump to latest"),
                 systemImage: "arrow.down.to.line")
-                .font(.caption.bold())
+                .font(IntatisTypography.system(.caption, bold: true))
         }
         .buttonStyle(.bordered)
         .controlSize(.small)
@@ -1641,7 +1641,7 @@ public struct IntatisThreadHistoryPager: View {
             }
 
             Text(rangeLabel)
-                .font(.caption)
+                .font(IntatisTypography.system(.caption))
                 .foregroundStyle(.secondary)
                 .monospacedDigit()
 
@@ -1663,7 +1663,7 @@ public struct IntatisThreadHistoryPager: View {
                 .accessibilityIdentifier("\(accessibilityPrefix).latest")
             }
         }
-        .font(.caption.bold())
+        .font(IntatisTypography.system(.caption, bold: true))
         .buttonStyle(.bordered)
         .controlSize(.small)
         .padding(.vertical, 4)
@@ -2008,7 +2008,7 @@ public extension View {
     /// Gives native compact glass buttons a stable visual diameter instead of
     /// leaving their size to each SF Symbol's intrinsic bounds.
     func intatisComposerIconLabel() -> some View {
-        font(.system(size: 15, weight: .semibold))
+        font(IntatisTypography.system(size: 15, weight: .semibold))
             .frame(
                 width: IntatisComposerControlMetrics.iconLabelExtent,
                 height: IntatisComposerControlMetrics.iconLabelExtent)
@@ -2052,10 +2052,10 @@ public struct IntatisTurnStatsSummaryView: View {
     public var body: some View {
         HStack(spacing: 7) {
             Image(systemName: "speedometer")
-                .font(.system(size: 11, weight: .semibold))
+                .font(IntatisTypography.system(size: 11, weight: .semibold))
                 .foregroundStyle(style.tertiaryText)
             Text(summary)
-                .font(.system(size: 12, weight: .medium))
+                .font(IntatisTypography.system(size: 12, weight: .medium))
                 .foregroundStyle(style.secondaryText)
                 .lineLimit(1)
                 .truncationMode(.middle)
@@ -2229,7 +2229,7 @@ public struct IntatisComposerUsageStrip: View {
                 .foregroundStyle(style.secondaryText)
                 .monospacedDigit()
         }
-        .font(.system(size: 11, weight: .medium))
+        .font(IntatisTypography.system(size: 11, weight: .medium))
         .lineLimit(1)
     }
 
@@ -2329,14 +2329,14 @@ public struct IntatisSessionHistoryList: View {
         VStack(alignment: .leading, spacing: 9) {
             HStack(spacing: 8) {
                 Text(title)
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(IntatisTypography.system(size: 12, weight: .semibold))
                     .foregroundStyle(style.secondaryText)
                     .lineLimit(1)
                 Spacer(minLength: 0)
                 Button(action: onNew) {
                     Label(newTitle, systemImage: "plus")
                         .labelStyle(.iconOnly)
-                        .font(.system(size: 12, weight: .semibold))
+                        .font(IntatisTypography.system(size: 12, weight: .semibold))
                         .frame(width: 24, height: 24)
                 }
                 .controlSize(.small)
@@ -2350,7 +2350,7 @@ public struct IntatisSessionHistoryList: View {
 
             if items.isEmpty {
                 Text(emptyTitle)
-                    .font(.system(size: 12, weight: .medium))
+                    .font(IntatisTypography.system(size: 12, weight: .medium))
                     .foregroundStyle(style.tertiaryText)
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(.vertical, 8)
@@ -2403,19 +2403,19 @@ private struct IntatisSessionHistoryRow: View {
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
             Image(systemName: item.systemImage)
-                .font(.system(size: 12, weight: .medium))
+                .font(IntatisTypography.system(size: 12, weight: .medium))
                 .foregroundStyle(item.isSelected ? style.accent : style.tertiaryText)
                 .frame(width: 16, height: 16)
                 .padding(.top, 1)
             VStack(alignment: .leading, spacing: 2) {
                 Text(item.title)
-                    .font(.system(size: 12, weight: item.isSelected ? .semibold : .medium))
+                    .font(IntatisTypography.system(size: 12, weight: item.isSelected ? .semibold : .medium))
                     .foregroundStyle(item.isSelected ? style.primaryText : style.secondaryText)
                     .lineLimit(1)
                     .truncationMode(.middle)
                 if !item.detail.isEmpty {
                     Text(item.detail)
-                        .font(.system(size: 11, weight: .regular))
+                        .font(IntatisTypography.system(size: 11, weight: .regular))
                         .foregroundStyle(style.tertiaryText)
                         .lineLimit(1)
                         .truncationMode(.middle)
@@ -2451,10 +2451,10 @@ public struct IntatisRecoveryAdviceView: View {
             Label(
                 IntatisLocalization.string(advice.title),
                 systemImage: advice.retryable ? "arrow.clockwise" : "info.circle")
-                .font(.caption.bold())
+                .font(IntatisTypography.system(.caption, bold: true))
                 .foregroundStyle(tint)
             Text(IntatisLocalization.string(advice.detail))
-                .font(.caption)
+                .font(IntatisTypography.system(.caption))
                 .foregroundStyle(style.secondaryText)
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -2719,8 +2719,7 @@ public struct IntatisThreadComposer: View {
             .lineLimit(1...6)
             .focused($focused)
             .onSubmit {
-                guard stopAction == nil, canSend else { return }
-                onSend()
+                submit()
             }
             .disabled(isInputDisabled)
             .accessibilityIdentifier("thread.composer.input")
@@ -2755,7 +2754,7 @@ public struct IntatisThreadComposer: View {
     }
 
     private var sendButton: some View {
-        Button(action: onSend) {
+        Button(action: submit) {
             Label(IntatisLocalization.string("Send"), systemImage: "arrow.up")
                 .intatisComposerIconLabel()
         }
@@ -2763,6 +2762,14 @@ public struct IntatisThreadComposer: View {
         .disabled(!canSend)
         .accessibilityLabel(IntatisLocalization.string("Send"))
         .accessibilityIdentifier("thread.composer.send")
+    }
+
+    private func submit() {
+        guard stopAction == nil, canSend else { return }
+        #if os(iOS)
+        focused = false
+        #endif
+        onSend()
     }
 
     private func stopButton(
@@ -2948,7 +2955,7 @@ public struct IntatisThreadThinkingRow: View {
                 IntatisThinkingElapsedLabel(
                     label: label,
                     phaseID: phaseID)
-                    .font(.system(size: 12, weight: .medium))
+                    .font(IntatisTypography.system(size: 12, weight: .medium))
                     .foregroundStyle(style.secondaryText)
                 Spacer(minLength: 0)
             }

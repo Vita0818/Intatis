@@ -1,7 +1,7 @@
 # CURRENT_UI_COLOR_SYSTEM — 系统原生表面与 Liquid Glass 规范
 
 文档状态：当前 UI 实施规范
-最近核对日期：2026-08-13
+最近核对日期：2026-08-19
 产品基线：v0.55（build 55）
 
 > Intatis 不再把“系统外观”解释为固定的纯白和纯黑。页面、侧栏、内容层与控制层均使用 Apple 平台的动态语义资源；在支持的系统上，导航与交互控件采用原生 Liquid Glass。`docs/UI_COLOR_SYSTEM.md` 只保存上一版香槟金 / 暖中性色方案，不随当前方案修改。
@@ -92,7 +92,7 @@
 - `Packages/IntatisSharedUI/Sources/Views.swift`：共享 Chat 消息和 composer；仅用户消息使用 glass 气泡，其余对话角色继承系统 canvas。
 - `Packages/IntatisSharedUI/Sources/CodeViews.swift`、`CoworkViews.swift`、`ArtifactViews.swift`：各产品面的内容层 / 功能层映射。
 - `Apps/IntatisMac/Sources/IntatisChatScreen.swift`、`IntatisMacApp.swift`：macOS Chat、设置与 home CTA。
-- `Apps/IntatisiOS/Sources/IntatisiOSApp.swift`：iOS serif 标题角色、顶部 session header、
+- `Apps/IntatisiOS/Sources/IntatisiOSApp.swift`：iOS JetBrains Mono 标题角色、顶部 session header、
   macOS 同层级抽屉、两排 composer 接线、Settings 与根 Icon Composer resource 选择。
 
 Apple 官方设计与 API 依据：
@@ -111,7 +111,7 @@ Apple 官方设计与 API 依据：
 - Liquid Glass 主要出现在导航和交互功能层；内容层例外只包括用户消息气泡与用户明确指定的 Cowork 紧凑 trailing status rail。仅用户消息有外层对话气泡且不得叠加 accent 蓝色描边；assistant / agent / system（包括失败 / 中断回复）直接位于系统 canvas。专用结构化卡片继续使用 Material，页面与长 transcript 不整片玻璃化。
 - 支持的系统上使用真实 `glassEffect` / glass button；旧系统 fallback 仍由系统语义 Material / control 渲染。
 - macOS Chat / Code / Cowork 与 iOS Chat 的 Light / Dark 运行态都经过视觉核对；不能只用源码搜索或固定像素值推断。
-- thread header 显示 session display name；Code / Cowork header 使用紧凑顶部留白且 Cowork 不常驻 permission-reviewer 横幅；消息无 agent 头像与通用 Agent badge；正常 agent 回复无外层卡片；agent 名称旁有本地化三级时间元数据；macOS sidebar 模式为带图标的竖向三行且仅选中行使用玻璃，Recent New `+` 为 30×30 原生圆形 glass；macOS composer 第一排保持 40pt、关闭态仅模型名的 model/profile glass 菜单左、usage 右，第二排保持已有 action 左、输入居中、voice 紧邻唯一 Send/Stop 左侧。iOS 顶部固定 sidebar/session/new，抽屉为 serif `Intatis`、选中 Chat、Recent/New 和底部 Settings，空页无 onboarding/建议卡；底部同样为 model/usage 第一排和 paperclip/input/voice/Send-or-Stop 第二排。两平台标题使用系统 serif、正文与控件使用系统 sans；两平台第二排 action/voice/stop/Send 与单行输入均为 40pt，输入变为多行时按钮底边不漂移；Cowork 宽屏 rail 第一位为权限审查、其后为 Agents/Goal/Tasks 且无 Git，pending 时 rail 固定；无法容纳 rail 时只显示一个权限兜底卡且不复制 Goal/Tasks。
+- thread header 显示 session display name；Code / Cowork header 使用紧凑顶部留白且 Cowork 不常驻 permission-reviewer 横幅；消息无 agent 头像与通用 Agent badge；正常 agent 回复无外层卡片；agent 名称旁有本地化三级时间元数据；macOS sidebar 模式为带图标的竖向三行且仅选中行使用玻璃，Recent New `+` 为 30×30 原生圆形 glass；macOS composer 第一排保持 40pt、关闭态仅模型名的 model/profile glass 菜单左、usage 右，第二排保持已有 action 左、输入居中、voice 紧邻唯一 Send/Stop 左侧。iOS 顶部固定 sidebar/session/new，抽屉为 JetBrains Mono `Intatis`、选中 Chat、Recent/New 和底部 Settings，空页无 onboarding/建议卡；底部同样为 model/usage 第一排和 paperclip/input/voice/Send-or-Stop 第二排。两平台第一方英文字形统一使用 JetBrains Mono，标题/正文/控件仍由语义字号和字重区分；中文继续走 Apple CJK fallback。两平台第二排 action/voice/stop/Send 与单行输入均为 40pt，输入变为多行时按钮底边不漂移；Cowork 宽屏 rail 第一位为权限审查、其后为 Agents/Goal/Tasks 且无 Git，pending 时 rail 固定；无法容纳 rail 时只显示一个权限兜底卡且不复制 Goal/Tasks。
 - macOS 与 iOS touched targets 均可编译，全量 SwiftPM 测试通过。
 
 静态复核重点：
@@ -178,17 +178,25 @@ rg -n 'glassEffect|GlassEffectContainer|buttonStyle\(\.glass|regularMaterial|win
 
 ## 14. 2026-08-02 iOS 与 macOS 设计语言统一（取代同日全局 serif 记录）
 
-- iOS 不再在 App 根视图设置全局 `.fontDesign(.serif)`。与 macOS 相同，serif 只用于
-  品牌 `Intatis`、当前 session 和 Settings 页面标题；正文、composer、按钮、菜单、
-  表单与状态使用 Apple 系统 sans + Dynamic Type。Markdown/plain fallback、代码块、
-  公式和第三方声明继续与 macOS 共用 renderer 的语义字体，不增加字体文件。
-- 顶部中央从 model picker 改为 serif session title；model 选择移入 composer 第一排，
-  使用 13pt semibold sans、向下 chevron 与原生 interactive Liquid Glass capsule。
+- iOS 不再在 App 根视图设置全局 `.fontDesign(.serif)`。当时的角色区分只影响
+  品牌 `Intatis`、当前 session、Settings 页面标题与正文/控件的语义层级。Markdown/plain fallback、代码块、
+  公式和第三方声明继续与 macOS 共用 renderer 的语义字体。第 23 节的后续正式决定将这些
+  英文字形统一为 JetBrains Mono，并取代本节关于 Apple serif/sans family 的旧基线；本节的语义角色、
+  字号、字重和 Dynamic Type 合同继续有效。
+- iOS 当前 session 与 Settings 的 large-title nominal size 为 22pt，并继续通过
+  `@ScaledMetric(relativeTo: .largeTitle)` 响应 Dynamic Type；共享
+  `IntatisTypography.largeTitle` 的 30pt 事实源和 macOS 标题尺寸不变，抽屉品牌标题也保持原值。
+- 顶部中央从 model picker 改为 session title；model 选择移入 composer 第一排，
+  使用 13pt semibold 语义字体、向下 chevron 与原生 interactive Liquid Glass capsule。
   有 turn stats 时同排右侧显示共享 usage strip；第二排继续是
   paperclip/input/voice/Send-or-Stop，voice 紧邻唯一主操作左侧。
-- 左抽屉采用 macOS 的同一信息层级：serif `Intatis`、选中 Chat 玻璃模式行、`Recent`
+- iOS 的 Send 按钮和键盘提交在调用 Chat send 前先释放 composer FocusState；消息 ScrollView
+  使用 `.scrollDismissesKeyboard(.interactively)`，允许用户在消息区拖动收起键盘。模型输出完成、
+  输入框重新启用或自动滚动都不得重新取得输入焦点；该行为不改变 macOS composer focus。
+- 左抽屉采用 macOS 的同一信息层级：`Intatis`、选中 Chat 玻璃模式行、`Recent`
   session history/New 与底部 Settings；删除旧顶部 gear、假 search 占位和底部大 Chat CTA。
-  Settings 使用 serif 页面标题，原生 toolbar、section、说明和字段保持 sans。
+  Settings 使用页面标题语义角色，原生 toolbar、section、说明和字段保持正文/控件语义角色；
+  两者的英文字形均由 JetBrains Mono 提供。
 - iPhone 17e Simulator 已检查 Light/Dark 主界面、Light 抽屉、Settings 与主屏幕安装态；
   根 `Intatis.icon` 的 2026-08-02 22:26:51 版本正确显示为新版指针图标。对比图与详细
   severity review 见根目录 `design-qa.md`。
@@ -330,3 +338,23 @@ rg -n 'glassEffect|GlassEffectContainer|buttonStyle\(\.glass|regularMaterial|win
   unsigned build 与 IntatisiOS generic Simulator Debug unsigned build 均通过。测试直接复现同一 timeout
   同时来自失败 submission 与 `.error` 的截图场景，确认右栏去重为一项并保留 Retry；未启动 App 或
   fixture，长错误滚动、Light/Dark 与窄宽实际像素仍需手动观察。
+
+## 23. 2026-08-19 JetBrains Mono 全局英文字体正式规范
+
+- 用户在视觉试用后明确批准保留 JetBrains Mono。macOS/iOS 所有正常 Debug、Release 与发行构建都
+  使用它作为第一方可控界面的统一英文字体；不再提供实验参数、system-font opt-out 或第二套默认字体。
+- 正式接线保留所有现有名义字号、字重、iOS 22pt session/Settings override、`@ScaledMetric` 与 Markdown
+  Dynamic Type scale，只替换英文字形 family。第一方 SwiftUI 的共享 role、直接 semantic/system font
+  call sites、plain message、rich paragraph/heading/list/table/inline-code 与 code-block body 均接入同一
+  product typography seam；没有通过运行时 swizzle 或第二 renderer 伪造。
+- 两份官方 JetBrains Mono 2.304 variable TTF 原样进入 `IntatisSharedUI` 的 SwiftPM resource bundle，
+  macOS/iOS 与 SharedUI tests 通过 `Bundle.module` 使用同一份 bytes。App 启动先校验固定
+  SHA-256、完整 PostScript-name inventory、Core Text process registration 和 registered-font bundle URL；
+  缺资源、篡改、同名冲突或解析漂移会明确终止实验，不使用系统安装字体或另一 family 兜底。
+- JetBrains Mono 没有 CJK 字形；中文继续由 Core Text glyph fallback 使用系统 CJK font。该边界符合
+  “只改英文字体”，但中英混排字宽、baseline 与视觉节奏仍须由用户实际观察，不能从单一截图外推。
+- 当前 iPhone 17 Pro 隔离 Simulator 的无参数 Light 启动已看到 JetBrains Mono 的 `New chat`、model
+  label 与 composer placeholder；macOS 隔离 Renderer Fixture 也在无字体参数下稳定存活。自动化尚未覆盖
+  Dark、超大 Dynamic Type、VoiceOver、真实长中英混排、全部系统 sheet/menu/control 与真机。
+- 正式发布须继续完成 release/accessibility/license/bundle gate；尤其要验证 Dark、超大 Dynamic Type、
+  VoiceOver、真实中英混排、真机与正式签名/公证。字体选型本身已经定案，不再要求删除这些资源。

@@ -34,7 +34,7 @@ struct CodeBlockView: View {
     ScrollView(.horizontal) {
       HStack(alignment: .top) {
         Text(code)
-          .font(Typography.codeTextFonts)
+          .font(Font(config.inlineStyle.codeTextFont))
           .foregroundStyle(Color.Theme.Component.CodeBlock.Foreground.FunctionParameter)
           .textSelection(.enabled)
           .transition(.opacity)
@@ -53,7 +53,7 @@ struct CodeBlockView: View {
     VStack(spacing: 0) {
       HStack(alignment: .top) {
         Text(language)
-          .font(Typography.smallTextFonts)
+          .font(config.tableStyle.textFonts)
           .foregroundStyle(foregroundColor)
         Spacer()
         Button {
@@ -69,7 +69,7 @@ struct CodeBlockView: View {
           HStack(alignment: .firstTextBaseline, spacing: 6.0) {
             Image(systemName: "doc.on.doc")
             Text(copied ? String.codeCopiedLabel : String.codeCopyLabel)
-              .font(Typography.smallTextFonts)
+              .font(config.tableStyle.textFonts)
           }
           .foregroundStyle(foregroundColor)
           .contentShape(Rectangle())

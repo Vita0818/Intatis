@@ -6,6 +6,7 @@ import IntatisConversation
 import IntatisCore
 import IntatisMCP
 import IntatisProtocol
+import IntatisSharedUI
 import SwiftUI
 
 struct MCPProductAgentDescriptor:
@@ -645,10 +646,10 @@ struct MCPProjectSettingsView: View {
             HStack {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("MCP Project Settings")
-                        .font(.title2.bold())
+                        .font(IntatisTypography.system(.title2, bold: true))
                     Text(
                         "Session \(model.host.sessionID.rawValue)")
-                        .font(.caption.monospaced())
+                        .font(IntatisTypography.system(.caption, design: .monospaced))
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
                 }
@@ -738,10 +739,10 @@ struct MCPProjectSettingsView: View {
             HStack {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Authorized Roots")
-                        .font(.headline)
+                        .font(IntatisTypography.system(.headline))
                     Text(
                         "Publish the current exact Agent workspace leases and root identities. This sends roots/listChanged when supported, advances durable policy, and retires every old connection generation.")
-                        .font(.callout)
+                        .font(IntatisTypography.system(.callout))
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
@@ -767,13 +768,13 @@ struct MCPProjectSettingsView: View {
                     model.state.rootsPolicyRevision {
                 Text(
                     "Current policy revision: \(revision.rawValue)")
-                    .font(.caption.monospaced())
+                    .font(IntatisTypography.system(.caption, design: .monospaced))
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
             } else {
                 Text(
                     "No MCP roots policy has been published for this session.")
-                    .font(.caption)
+                    .font(IntatisTypography.system(.caption))
                     .foregroundStyle(.secondary)
             }
         }
@@ -782,7 +783,7 @@ struct MCPProjectSettingsView: View {
     private var attachedServers: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Attached Servers")
-                .font(.headline)
+                .font(IntatisTypography.system(.headline))
             if model.state.attachments.isEmpty {
                 ContentUnavailableView(
                     "No attached MCP servers",
@@ -833,14 +834,14 @@ struct MCPProjectSettingsView: View {
     private var agentAccess: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Agent Access")
-                .font(.headline)
+                .font(IntatisTypography.system(.headline))
             Text(
                 "Absence of an exact grant is denial. New workers start with zero MCP access. The permission reviewer always has zero access and cannot be targeted. Child access is the intersection of the selected template, parent ancestry, live CapabilityLease ceiling, attachment policy, and server filter.")
-                .font(.callout)
+                .font(IntatisTypography.system(.callout))
                 .foregroundStyle(.secondary)
             Grid(alignment: .leading, horizontalSpacing: 12) {
                 GridRow {
-                    Text("Agent").font(.caption.bold())
+                    Text("Agent").font(IntatisTypography.system(.caption, bold: true))
                     ForEach(
                         model.state.attachments.values.sorted {
                             $0.server.serverID.rawValue
@@ -849,7 +850,7 @@ struct MCPProjectSettingsView: View {
                         id: \.attachmentID
                     ) { attachment in
                         Text(serverName(attachment))
-                            .font(.caption.bold())
+                            .font(IntatisTypography.system(.caption, bold: true))
                             .lineLimit(1)
                     }
                 }
@@ -859,11 +860,11 @@ struct MCPProjectSettingsView: View {
                         VStack(alignment: .leading, spacing: 2) {
                             Text(agent.displayName)
                             Text(agent.agentID.rawValue)
-                                .font(.caption2.monospaced())
+                                .font(IntatisTypography.system(.caption2, design: .monospaced))
                                 .foregroundStyle(.secondary)
                             if agent.isWorker {
                                 Text("Worker")
-                                    .font(.caption2)
+                                    .font(IntatisTypography.system(.caption2))
                                     .foregroundStyle(.secondary)
                             }
                         }
@@ -894,7 +895,7 @@ struct MCPProjectSettingsView: View {
             || agent.agentID.rawValue
                 == "permission-reviewer" {
             Label("No access", systemImage: "lock.fill")
-                .font(.caption)
+                .font(IntatisTypography.system(.caption))
                 .foregroundStyle(.secondary)
         } else if let grant = grant(
             agent: agent,
@@ -924,9 +925,9 @@ struct MCPProjectSettingsView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(
                         "\(grant.capabilities.count) capabilities")
-                        .font(.caption)
+                        .font(IntatisTypography.system(.caption))
                     Text(grant.approvalModeCeiling.rawValue)
-                        .font(.caption2)
+                        .font(IntatisTypography.system(.caption2))
                         .foregroundStyle(.secondary)
                 }
             }
@@ -938,7 +939,7 @@ struct MCPProjectSettingsView: View {
                     attachment: attachment,
                     existing: nil)
             }
-            .font(.caption)
+            .font(IntatisTypography.system(.caption))
         }
     }
 
@@ -1071,14 +1072,14 @@ private struct MCPAttachmentRow: View {
                         : Color.green)
             VStack(alignment: .leading, spacing: 3) {
                 Text(attachment.server.serverID.rawValue)
-                    .font(.body.monospaced())
+                    .font(IntatisTypography.system(.body, design: .monospaced))
                 Text(
                     "\(attachment.policy.required ? "Required" : "Optional") · \(attachment.policy.approvalMode.rawValue) · \(attachment.policy.parallelCalls ? "parallel" : "serial")")
-                    .font(.caption)
+                    .font(IntatisTypography.system(.caption))
                     .foregroundStyle(.secondary)
                 Text(
                     attachment.server.serverRevision.rawValue)
-                    .font(.caption2.monospaced())
+                    .font(IntatisTypography.system(.caption2, design: .monospaced))
                     .foregroundStyle(.secondary)
             }
             Spacer()
@@ -1152,7 +1153,7 @@ private struct MCPAttachServerSheet: View {
                 }
                 Text(
                     "Attach records the current immutable server revision in the Session EventLog. It does not connect and it grants no Agent access.")
-                    .font(.caption)
+                    .font(IntatisTypography.system(.caption))
                     .foregroundStyle(.secondary)
             }
             .formStyle(.grouped)
@@ -1280,7 +1281,7 @@ private struct MCPAttachmentPolicySheet: View {
                     deny: $promptDeny)
                 Text(
                     "Saving publishes a fresh policy revision and revocation generation. Existing connection authority must be re-established explicitly.")
-                    .font(.caption)
+                    .font(IntatisTypography.system(.caption))
                     .foregroundStyle(.secondary)
             }
             .formStyle(.grouped)
@@ -1490,10 +1491,10 @@ private struct MCPGrantEditorSheet: View {
                             : effective.map(\.rawValue)
                                 .sorted()
                                 .joined(separator: ", "))
-                        .font(.body.monospaced())
+                        .font(IntatisTypography.system(.body, design: .monospaced))
                     Text(
                         "The saved grant uses only this intersection. A template never expands the Agent CapabilityLease, parent ceiling, attachment, or server policy.")
-                        .font(.caption)
+                        .font(IntatisTypography.system(.caption))
                         .foregroundStyle(.secondary)
                 }
             }

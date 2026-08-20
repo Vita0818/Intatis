@@ -124,6 +124,9 @@ struct ThreadView: View {
                     .padding(.horizontal, 16)
                     .padding(.top, 16)
                 }
+                #if os(iOS)
+                .scrollDismissesKeyboard(.interactively)
+                #endif
                 .onAppear {
                     scrollToBottom(proxy, animated: false)
                 }
@@ -133,7 +136,7 @@ struct ThreadView: View {
             }
             if let errorText = presentedErrorText {
                 Text(errorText)
-                    .font(.caption)
+                    .font(IntatisTypography.system(.caption))
                     .foregroundStyle(.red)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal)
@@ -335,14 +338,14 @@ public struct IntatisMessageCitationsView: View {
         if !links.isEmpty {
             VStack(alignment: .leading, spacing: 6) {
                 Text(IntatisLocalization.string("Sources"))
-                    .font(.caption.weight(.semibold))
+                    .font(IntatisTypography.system(.caption, weight: .semibold))
                     .foregroundStyle(.secondary)
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 6) {
                         ForEach(links) { link in
                             Link(destination: link.url) {
                                 Label(link.title, systemImage: "link")
-                                    .font(.caption)
+                                    .font(IntatisTypography.system(.caption))
                                     .lineLimit(1)
                             }
                             .buttonStyle(.bordered)

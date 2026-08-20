@@ -3,8 +3,9 @@ import Foundation
 import SwiftUI
 
 /// User-accessible, renderer-independent presentation of the notices shipped
-/// in the final app bundle. It deliberately uses verbatim system text so legal
-/// notices remain readable even when rich Markdown is disabled or unavailable.
+/// in the final app bundle. It deliberately uses verbatim SwiftUI text so legal
+/// notices remain readable even when rich Markdown is disabled or unavailable;
+/// the Debug-only typography experiment may still replace its English glyphs.
 public struct IntatisThirdPartyNoticesView: View {
     private let text: String
 
@@ -15,7 +16,7 @@ public struct IntatisThirdPartyNoticesView: View {
     public var body: some View {
         ScrollView {
             Text(verbatim: text)
-                .font(.system(.footnote, design: .monospaced))
+                .font(IntatisTypography.system(.footnote, design: .monospaced))
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(20)

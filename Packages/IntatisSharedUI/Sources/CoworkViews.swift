@@ -1059,7 +1059,7 @@ public struct CoworkShell: View {
     @ViewBuilder private var agentStatusList: some View {
         if agents.isEmpty {
             Text("No agents in this session")
-                .font(.caption)
+                .font(IntatisTypography.system(.caption))
                 .foregroundStyle(threadStyle.tertiaryText)
         } else {
             LazyVStack(alignment: .leading, spacing: 5) {
@@ -1098,17 +1098,17 @@ public struct CoworkShell: View {
     private func agentStatusRowContent(_ agent: CoworkAgentInfo) -> some View {
         return HStack(alignment: .center, spacing: 10) {
             Image(systemName: statusIconName(for: agent.status))
-                .font(.system(size: 13, weight: .semibold))
+                .font(IntatisTypography.system(size: 13, weight: .semibold))
                 .foregroundStyle(statusColor(for: agent.status))
                 .frame(width: 20, height: 20)
             VStack(alignment: .leading, spacing: 3) {
                 Text("@\(agent.name)")
-                    .font(.body.weight(.semibold))
+                    .font(IntatisTypography.system(.body, weight: .semibold))
                     .foregroundStyle(threadStyle.primaryText)
                     .lineLimit(1)
                 if let inferenceLabel = agent.inferenceDisplayLabel {
                     Text(inferenceLabel)
-                        .font(.callout)
+                        .font(IntatisTypography.system(.callout))
                         .foregroundStyle(agent.isAttached
                             && agent.inferenceResolution.requiresAttention
                             ? threadStyle.accent
@@ -1121,7 +1121,7 @@ public struct CoworkShell: View {
             Spacer(minLength: 10)
             if agent.isAttached && agent.inferenceResolution.requiresAttention {
                 Image(systemName: "exclamationmark.triangle.fill")
-                    .font(.caption)
+                    .font(IntatisTypography.system(.caption))
                     .foregroundStyle(threadStyle.accent)
                     .accessibilityLabel(agent.inferenceDisplayLabel
                         ?? IntatisLocalization.string("Inference unavailable"))
@@ -1162,19 +1162,19 @@ public struct CoworkShell: View {
                 VStack(alignment: .leading, spacing: 9) {
                     HStack(alignment: .firstTextBaseline, spacing: 7) {
                         Label(displayStatus(goal.status), systemImage: statusIconName(for: goal.status))
-                            .font(.caption.bold())
+                            .font(IntatisTypography.system(.caption, bold: true))
                             .foregroundStyle(statusColor(for: goal.status))
                             .lineLimit(1)
                             .accessibilityIdentifier("cowork.goal.status")
                         Spacer(minLength: 6)
                         Label(formatElapsed(goal.elapsedSeconds(at: timeline.date)), systemImage: "timer")
-                            .font(.caption.monospacedDigit())
+                            .font(IntatisTypography.system(.caption, monospacedDigits: true))
                             .foregroundStyle(threadStyle.secondaryText)
                             .lineLimit(1)
                     }
 
                     Text(goal.objective)
-                        .font(.callout.weight(.semibold))
+                        .font(IntatisTypography.system(.callout, weight: .semibold))
                         .foregroundStyle(threadStyle.primaryText)
                         .fixedSize(horizontal: false, vertical: true)
                         .textSelection(.enabled)
@@ -1192,7 +1192,7 @@ public struct CoworkShell: View {
 
                     if let auditSummary = auditSummary(for: goal) {
                         Label(auditSummary, systemImage: "checkmark.shield")
-                            .font(.caption)
+                            .font(IntatisTypography.system(.caption))
                             .foregroundStyle(threadStyle.secondaryText)
                             .fixedSize(horizontal: false, vertical: true)
                     }
@@ -1201,7 +1201,7 @@ public struct CoworkShell: View {
                         Text(IntatisLocalization.format(
                             "Revision %lld",
                             Int64(goal.revision)))
-                            .font(.caption)
+                            .font(IntatisTypography.system(.caption))
                             .foregroundStyle(threadStyle.tertiaryText)
                     }
 
@@ -1210,7 +1210,7 @@ public struct CoworkShell: View {
             }
         } else {
             Text("No active goal")
-                .font(.caption)
+                .font(IntatisTypography.system(.caption))
                 .foregroundStyle(threadStyle.tertiaryText)
         }
     }
@@ -1218,10 +1218,10 @@ public struct CoworkShell: View {
     private func goalMetric(_ title: String, value: String) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(IntatisLocalization.string(title).uppercased())
-                .font(.caption.bold())
+                .font(IntatisTypography.system(.caption, bold: true))
                 .foregroundStyle(threadStyle.tertiaryText)
             Text(value)
-                .font(.caption.monospacedDigit())
+                .font(IntatisTypography.system(.caption, monospacedDigits: true))
                 .foregroundStyle(threadStyle.primaryText)
                 .lineLimit(2)
         }
@@ -1261,14 +1261,14 @@ public struct CoworkShell: View {
                     }
                 }
             }
-            .font(.caption.bold())
+            .font(IntatisTypography.system(.caption, bold: true))
         }
     }
 
     @ViewBuilder private var workTasksContent: some View {
         if workTasks.tasks.isEmpty {
             Text("No work tasks yet")
-                .font(.caption)
+                .font(IntatisTypography.system(.caption))
                 .foregroundStyle(threadStyle.tertiaryText)
         } else {
             VStack(alignment: .leading, spacing: 8) {
@@ -1277,13 +1277,13 @@ public struct CoworkShell: View {
                         "%lld / %lld complete",
                         Int64(workTasks.completedCount),
                         Int64(workTasks.totalCount)))
-                        .font(.caption.bold())
+                        .font(IntatisTypography.system(.caption, bold: true))
                         .foregroundStyle(threadStyle.secondaryText)
                     if workTasks.runningCount > 0 {
                         Text(IntatisLocalization.format(
                             "· %lld running",
                             Int64(workTasks.runningCount)))
-                            .font(.caption)
+                            .font(IntatisTypography.system(.caption))
                             .foregroundStyle(threadStyle.accent)
                     }
                     Spacer(minLength: 0)
@@ -1348,7 +1348,7 @@ public struct CoworkShell: View {
     ) -> some View {
         VStack(alignment: .leading, spacing: 14) {
             Label(IntatisLocalization.string(title), systemImage: systemImage)
-                .font(.title3.weight(.semibold))
+                .font(IntatisTypography.system(.title3, weight: .semibold))
                 .foregroundStyle(threadStyle.primaryText)
             content()
         }
@@ -1364,11 +1364,11 @@ public struct CoworkShell: View {
             HStack(alignment: .top, spacing: 8) {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("@\(project.mainAgentName)")
-                        .font(.caption.bold())
+                        .font(IntatisTypography.system(.caption, bold: true))
                         .foregroundStyle(threadStyle.primaryText)
                         .lineLimit(1)
                     Text(project.defaultModel)
-                        .font(.caption2)
+                        .font(IntatisTypography.system(.caption2))
                         .foregroundStyle(threadStyle.secondaryText)
                         .lineLimit(1)
                         .truncationMode(.middle)
@@ -1402,11 +1402,11 @@ public struct CoworkShell: View {
     private func overviewMetric(_ title: String, _ value: String) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(IntatisLocalization.string(title).uppercased())
-                .font(.caption2.bold())
+                .font(IntatisTypography.system(.caption2, bold: true))
                 .foregroundStyle(threadStyle.tertiaryText)
                 .lineLimit(1)
             Text(value)
-                .font(.system(size: 15, weight: .semibold))
+                .font(IntatisTypography.system(size: 15, weight: .semibold))
                 .foregroundStyle(threadStyle.primaryText)
                 .lineLimit(1)
         }
@@ -1494,7 +1494,7 @@ public struct CoworkShell: View {
             if let onShowProjectSettings {
                 Button(action: onShowProjectSettings) {
                     Label("Project Settings", systemImage: "slider.horizontal.3")
-                        .font(.caption.bold())
+                        .font(IntatisTypography.system(.caption, bold: true))
                 }
                 .intatisGlassButton()
                 .disabled(isWorking)
@@ -1505,7 +1505,7 @@ public struct CoworkShell: View {
     @ViewBuilder private var workspaceDirectoryList: some View {
         if project.workspaces.isEmpty {
             Text("No workspace directories")
-                .font(.caption)
+                .font(IntatisTypography.system(.caption))
                 .foregroundStyle(threadStyle.tertiaryText)
         } else {
             VStack(alignment: .leading, spacing: 6) {
@@ -1513,21 +1513,21 @@ public struct CoworkShell: View {
                     VStack(alignment: .leading, spacing: 2) {
                         HStack(spacing: 6) {
                             Image(systemName: workspace.isPrimary ? "house" : "folder")
-                                .font(.caption2)
+                                .font(IntatisTypography.system(.caption2))
                                 .foregroundStyle(workspace.isPrimary ? threadStyle.accent : threadStyle.secondaryText)
                             Text(workspace.displayName)
-                                .font(.caption.bold())
+                                .font(IntatisTypography.system(.caption, bold: true))
                                 .foregroundStyle(threadStyle.primaryText)
                                 .lineLimit(1)
                             Spacer(minLength: 6)
                             if let agentName = workspace.agentName {
                                 Text("@\(agentName)")
-                                    .font(.caption2.bold())
+                                    .font(IntatisTypography.system(.caption2, bold: true))
                                     .foregroundStyle(threadStyle.secondaryText)
                             }
                         }
                         Text(workspace.path)
-                            .font(.caption2)
+                            .font(IntatisTypography.system(.caption2))
                             .foregroundStyle(threadStyle.secondaryText)
                             .lineLimit(1)
                             .truncationMode(.middle)
@@ -1540,10 +1540,10 @@ public struct CoworkShell: View {
     private var inspectorHeader: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Inspector")
-                .font(.system(size: 16, weight: .semibold))
+                .font(IntatisTypography.system(size: 16, weight: .semibold))
                 .foregroundStyle(threadStyle.primaryText)
             Text("Agents, tasks, and workspace status")
-                .font(.caption)
+                .font(IntatisTypography.system(.caption))
                 .foregroundStyle(threadStyle.secondaryText)
         }
     }
@@ -1551,7 +1551,7 @@ public struct CoworkShell: View {
     @ViewBuilder private var agentRosterList: some View {
         if agents.isEmpty {
             Text("No agents in this session")
-                .font(.caption)
+                .font(IntatisTypography.system(.caption))
                 .foregroundStyle(threadStyle.tertiaryText)
         } else {
             LazyVStack(alignment: .leading, spacing: 2) {
@@ -1566,7 +1566,7 @@ public struct CoworkShell: View {
         let allTasks = summary.runningTasks + summary.failedTasks + summary.recentCompletedTasks
         if allTasks.isEmpty {
             Text("No structured task events in the current projection.")
-                .font(.caption)
+                .font(IntatisTypography.system(.caption))
                 .foregroundStyle(threadStyle.tertiaryText)
                 .fixedSize(horizontal: false, vertical: true)
         } else {
@@ -1592,7 +1592,7 @@ public struct CoworkShell: View {
                                                  @ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             Text(IntatisLocalization.string(title).uppercased())
-                .font(.caption2.bold())
+                .font(IntatisTypography.system(.caption2, bold: true))
                 .foregroundStyle(threadStyle.tertiaryText)
             content()
         }
@@ -1604,11 +1604,11 @@ public struct CoworkShell: View {
     private func inspectorRow(_ title: String, value: String) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Text(IntatisLocalization.string(title))
-                .font(.caption)
+                .font(IntatisTypography.system(.caption))
                 .foregroundStyle(threadStyle.secondaryText)
             Spacer(minLength: 8)
             Text(value)
-                .font(.caption.bold())
+                .font(IntatisTypography.system(.caption, bold: true))
                 .foregroundStyle(threadStyle.primaryText)
         }
     }
@@ -1639,10 +1639,10 @@ public struct CoworkShell: View {
     private func metric(_ title: String, _ value: Int) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(IntatisLocalization.string(title))
-                .font(.caption2.bold())
+                .font(IntatisTypography.system(.caption2, bold: true))
                 .foregroundStyle(threadStyle.tertiaryText)
             Text("\(value)")
-                .font(.system(size: 15, weight: .semibold))
+                .font(IntatisTypography.system(size: 15, weight: .semibold))
                 .foregroundStyle(threadStyle.primaryText)
         }
         .padding(.horizontal, 11)
@@ -1666,23 +1666,23 @@ public struct CoworkShell: View {
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 5) {
                         Text("@\(agent.name)")
-                            .font(.caption.bold())
+                            .font(IntatisTypography.system(.caption, bold: true))
                             .foregroundStyle(threadStyle.primaryText)
                             .lineLimit(1)
                         Text(intatisLocalizedAgentRole(agent.role))
-                            .font(.caption2.bold())
+                            .font(IntatisTypography.system(.caption2, bold: true))
                             .foregroundStyle(threadStyle.secondaryText)
                             .lineLimit(1)
                     }
                     Text(agent.statusLine)
-                        .font(.caption2)
+                        .font(IntatisTypography.system(.caption2))
                         .foregroundStyle(threadStyle.secondaryText)
                         .lineLimit(1)
                 }
                 Spacer(minLength: 8)
                 if selected {
                     Image(systemName: "checkmark.circle.fill")
-                        .font(.caption)
+                        .font(IntatisTypography.system(.caption))
                         .foregroundStyle(threadStyle.accent)
                 }
             }
@@ -1702,12 +1702,12 @@ public struct CoworkShell: View {
         VStack(alignment: .leading, spacing: 7) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Text("@\(agent.name)")
-                    .font(.caption.bold())
+                    .font(IntatisTypography.system(.caption, bold: true))
                     .foregroundStyle(threadStyle.primaryText)
                     .lineLimit(1)
                 Spacer(minLength: 8)
                 Text(intatisLocalizedRawStatus(agent.status))
-                    .font(.caption2.bold())
+                    .font(IntatisTypography.system(.caption2, bold: true))
                     .foregroundStyle(statusColor(for: agent.status))
                     .lineLimit(1)
                 if agent.canRemove, let onRemoveAgent {
@@ -1723,7 +1723,7 @@ public struct CoworkShell: View {
                 }
             }
             Text(agent.workspace)
-                .font(.caption2)
+                .font(IntatisTypography.system(.caption2))
                 .foregroundStyle(threadStyle.secondaryText)
                 .lineLimit(1)
                 .truncationMode(.middle)
@@ -1762,7 +1762,7 @@ public struct CoworkShell: View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(alignment: .firstTextBaseline, spacing: 6) {
                 Text(task.title)
-                    .font(.callout.weight(.semibold))
+                    .font(IntatisTypography.system(.callout, weight: .semibold))
                     .foregroundStyle(threadStyle.primaryText)
                     .lineLimit(1)
                 Spacer(minLength: 6)
@@ -1772,13 +1772,13 @@ public struct CoworkShell: View {
                         .disabled(actionDisabled)
                 }
                 Text(intatisLocalizedDisplayStatus(task.status))
-                    .font(.caption2.bold())
+                    .font(IntatisTypography.system(.caption2, bold: true))
                     .foregroundStyle(statusColor(for: task.status))
                     .lineLimit(1)
             }
             if !task.detail.isEmpty {
                 Text(task.detail)
-                    .font(.caption2)
+                    .font(IntatisTypography.system(.caption2))
                     .foregroundStyle(threadStyle.secondaryText)
                     .lineLimit(3)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1841,7 +1841,7 @@ public struct CoworkShell: View {
                     LazyHStack(spacing: 8) {
                         if agents.isEmpty {
                             Text("No agents in this session")
-                                .font(.caption)
+                                .font(IntatisTypography.system(.caption))
                                 .foregroundStyle(threadStyle.secondaryText)
                                 .padding(.horizontal, 12)
                                 .padding(.vertical, 9)
@@ -1853,7 +1853,7 @@ public struct CoworkShell: View {
                         if let onAddAgent {
                             Button(action: onAddAgent) {
                                 Label("Attach", systemImage: "plus")
-                                    .font(.caption.bold())
+                                    .font(IntatisTypography.system(.caption, bold: true))
                             }
                             .intatisGlassButton()
                         }
@@ -1880,14 +1880,14 @@ public struct CoworkShell: View {
         } label: {
             HStack(spacing: 7) {
                 Text("@\(agent.name)")
-                    .font(.caption.bold())
+                    .font(IntatisTypography.system(.caption, bold: true))
                     .foregroundStyle(selected ? threadStyle.accent : threadStyle.primaryText)
                 Text(intatisLocalizedRawStatus(agent.status))
-                    .font(.caption2)
+                    .font(IntatisTypography.system(.caption2))
                     .foregroundStyle(threadStyle.secondaryText)
                 if selected {
                     Image(systemName: "checkmark.circle.fill")
-                        .font(.caption2)
+                        .font(IntatisTypography.system(.caption2))
                         .foregroundStyle(threadStyle.accent)
                 }
             }
@@ -1903,15 +1903,15 @@ public struct CoworkShell: View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Text("@\(agent.name)")
-                    .font(.caption.bold())
+                    .font(IntatisTypography.system(.caption, bold: true))
                     .foregroundStyle(threadStyle.primaryText)
                 Spacer(minLength: 8)
                 Text(intatisLocalizedRawStatus(agent.status))
-                    .font(.caption2.bold())
+                    .font(IntatisTypography.system(.caption2, bold: true))
                     .foregroundStyle(threadStyle.accent)
             }
             Text(agent.workspace)
-                .font(.caption2)
+                .font(IntatisTypography.system(.caption2))
                 .foregroundStyle(threadStyle.secondaryText)
                 .lineLimit(1)
                 .truncationMode(.middle)
@@ -1960,11 +1960,11 @@ public struct CoworkShell: View {
     private func agentDetailRow(_ title: String, value: String) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Text(IntatisLocalization.string(title))
-                .font(.caption2)
+                .font(IntatisTypography.system(.caption2))
                 .foregroundStyle(threadStyle.secondaryText)
             Spacer(minLength: 8)
             Text(value)
-                .font(.caption2.bold())
+                .font(IntatisTypography.system(.caption2, bold: true))
                 .foregroundStyle(threadStyle.primaryText)
                 .lineLimit(1)
                 .truncationMode(.middle)
@@ -2376,13 +2376,13 @@ private struct CoworkWorkTaskRow: View {
             taskMarker
             VStack(alignment: .leading, spacing: 3) {
                 Text(task.title)
-                    .font(.caption.bold())
+                    .font(IntatisTypography.system(.caption, bold: true))
                     .foregroundStyle(task.isCompleted ? style.secondaryText : style.primaryText)
                     .strikethrough(task.isCompleted, color: style.secondaryText)
                     .fixedSize(horizontal: false, vertical: true)
                 HStack(alignment: .firstTextBaseline, spacing: 5) {
                     Text(displayStatus)
-                        .font(.caption.bold())
+                        .font(IntatisTypography.system(.caption, bold: true))
                         .foregroundStyle(statusColor)
                         .lineLimit(1)
                 }
@@ -2428,7 +2428,7 @@ private struct CoworkWorkTaskRow: View {
             Circle()
                 .stroke(statusColor, lineWidth: 1)
             Text("\(ordinal)")
-                .font(.system(size: 10, weight: .semibold))
+                .font(IntatisTypography.system(size: 10, weight: .semibold))
                 .foregroundStyle(statusColor)
                 .lineLimit(1)
                 .minimumScaleFactor(0.6)
@@ -2466,10 +2466,10 @@ private struct CoworkWorkTaskRow: View {
     private func detailBlock(_ title: String, value: String) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(IntatisLocalization.string(title).uppercased())
-                .font(.caption.bold())
+                .font(IntatisTypography.system(.caption, bold: true))
                 .foregroundStyle(style.tertiaryText)
             Text(value)
-                .font(.caption)
+                .font(IntatisTypography.system(.caption))
                 .foregroundStyle(style.secondaryText)
                 .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
@@ -2481,17 +2481,19 @@ private struct CoworkWorkTaskRow: View {
                             monospaced: Bool = false) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(IntatisLocalization.string(title).uppercased())
-                .font(.caption.bold())
+                .font(IntatisTypography.system(.caption, bold: true))
                 .foregroundStyle(style.tertiaryText)
             ForEach(Array(values.enumerated()), id: \.offset) { _, value in
                 HStack(alignment: .top, spacing: 5) {
                     Text("•")
                     Text(value)
-                        .font(monospaced ? .caption.monospaced() : .caption)
+                        .font(IntatisTypography.system(
+                            .caption,
+                            design: monospaced ? .monospaced : .default))
                         .fixedSize(horizontal: false, vertical: true)
                         .textSelection(.enabled)
                 }
-                .font(.caption)
+                .font(IntatisTypography.system(.caption))
                 .foregroundStyle(style.secondaryText)
             }
         }
@@ -2540,7 +2542,7 @@ private struct CoworkTaskLineRow: View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
                 Text(task.title)
-                    .font(.caption.bold())
+                    .font(IntatisTypography.system(.caption, bold: true))
                     .foregroundStyle(style.primaryText)
                     .lineLimit(1)
                 Spacer(minLength: 6)
@@ -2550,12 +2552,12 @@ private struct CoworkTaskLineRow: View {
                         .disabled(actionDisabled)
                 }
                 Text(intatisLocalizedDisplayStatus(task.status))
-                    .font(.caption)
+                    .font(IntatisTypography.system(.caption))
                     .foregroundStyle(style.secondaryText)
             }
             if !task.detail.isEmpty {
                 Text(task.detail)
-                    .font(.caption)
+                    .font(IntatisTypography.system(.caption))
                     .foregroundStyle(style.secondaryText)
                     .lineLimit(2)
             }
@@ -2572,7 +2574,7 @@ private struct CoworkEmptyThreadView: View {
         VStack(spacing: 12) {
             Spacer()
             Image(systemName: "person.2")
-                .font(.system(size: 30, weight: .semibold))
+                .font(IntatisTypography.system(size: 30, weight: .semibold))
                 .foregroundStyle(style.accent)
                 .frame(width: 76, height: 76)
             Spacer()

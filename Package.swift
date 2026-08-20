@@ -254,7 +254,11 @@ let package = Package(
                     condition: .when(platforms: [.macOS, .iOS])
                 ),
             ],
-            path: "Packages/IntatisSharedUI/Sources"
+            path: "Packages/IntatisSharedUI/Sources",
+            resources: [
+                .copy("Resources/JetBrainsMono[wght].ttf"),
+                .copy("Resources/JetBrainsMono-Italic[wght].ttf"),
+            ]
         ),
         // v0.6 — CLI: Swift-native `intatis` command (chat + code agent), talks to
         // any OpenAI-compatible endpoint via env vars.

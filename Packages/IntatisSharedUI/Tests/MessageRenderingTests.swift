@@ -967,8 +967,18 @@ final class MessageRenderingTests: XCTestCase {
             style: .standard(.light),
             typography: .accessibility3)
         XCTAssertEqual(
-            baseline.paragraphStyle.textFonts,
-            MarkdownRenderConfig.default.paragraphStyle.textFonts)
+            baseline.paragraphStyle.textFonts.normal.pointSize,
+            MarkdownRenderConfig.default.paragraphStyle.textFonts.normal.pointSize,
+            accuracy: 0.001)
+        XCTAssertEqual(
+            baseline.paragraphStyle.textFonts.preferredLineHeight,
+            MarkdownRenderConfig.default.paragraphStyle.textFonts.preferredLineHeight)
+        XCTAssertEqual(
+            baseline.paragraphStyle.textFonts.normal.fontName,
+            "JetBrainsMono-Regular")
+        XCTAssertEqual(
+            baseline.paragraphStyle.textFonts.bold?.fontName,
+            "JetBrainsMono-Regular_SemiBold")
         XCTAssertEqual(
             scaled.paragraphStyle.textFonts.normal.pointSize,
             baseline.paragraphStyle.textFonts.normal.pointSize

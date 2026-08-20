@@ -1,7 +1,7 @@
 # NEXT_TARGET
 
 文档状态：唯一活跃目标
-最近核对：2026-08-18
+最近核对：2026-08-19
 产品基线：v0.55（build 55）
 
 ## 目标：完成 v0.55 Developer ID 直接分发候选
@@ -59,6 +59,8 @@
 - 不为 App Store App Sandbox 裁剪 terminal、Git、MCP、Skills 或 workspace 能力。
 - 不实现诊断日志远程上传。
 - 不在缺证书、公证或 Gatekeeper 证据时输出“正式发行”结论。
+- 不用字体截图替代 Dynamic Type、VoiceOver、中英混排、final bundle/hash/license/size 等正式验收；
+  不覆盖已有签名/公证 recovery artifact。
 - 不把历史 v0.10/v0.16 文档批量改名为当前版本；它们是历史证据。
 
 目标完成后删除本文件或替换为下一个单一目标，不再追加已完成里程碑流水账。

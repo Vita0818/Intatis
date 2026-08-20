@@ -100,6 +100,12 @@ final class FirstReleaseContractTests: XCTestCase {
     XCTAssertTrue(source.contains(".buttonStyle(.plain)"))
     XCTAssertTrue(source.contains("UIPasteboard.general.string = code"))
     XCTAssertTrue(source.contains("NSPasteboard.general.setString(code, forType: .string)"))
+    XCTAssertTrue(source.contains("Font(config.inlineStyle.codeTextFont)"))
+    XCTAssertEqual(
+      source.components(separatedBy: ".font(config.tableStyle.textFonts)").count - 1,
+      2
+    )
+    XCTAssertFalse(source.contains(".font(Typography.codeTextFonts)"))
     XCTAssertFalse(source.contains(".onTapGesture"))
   }
 

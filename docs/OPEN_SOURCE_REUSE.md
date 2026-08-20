@@ -2,7 +2,7 @@
 
 文档状态：当前开源复用政策
 生效日期：2026-07-12
-最近核对：2026-08-05
+最近核对：2026-08-19
 产品基线：v0.55（build 55）
 
 ## 项目立场
@@ -439,6 +439,32 @@ external-runtime 以独立 helper/process/service 运行上游实现
   生成 SBOM、固定 Rust toolchain 与双架构 binary hash，并完成 Developer ID
   签名、公证和 clean-machine sandbox 验证；未完成时生产调用必须返回
   `backend_missing`，不得下载或切换到另一个 EPUB backend。
+
+## JetBrains Mono 英文字体正式采用结论
+
+- 用户于 2026-08-19 先要求全局试用 JetBrains Mono，随后明确批准保留为 macOS/iOS 第一方统一
+  英文字体。上游固定为
+  `https://github.com/JetBrains/JetBrainsMono` tag `v2.304`、commit
+  `cd5227bd1f61dff3bbd6c814ceaf7ffd95e947d9`；官方页面与仓库均声明 SIL Open Font License
+  1.1，可用于商业与非商业应用。
+- 复用类型为 `vendored`、unmodified font binaries。只采用两个官方 variable TTF：
+  `fonts/variable/JetBrainsMono[wght].ttf`（303,144 bytes，SHA-256
+  `662a196d58f1183bf2d77428b6d5283fe3f45161ab021bea4036bc98e5cac016`）和
+  `fonts/variable/JetBrainsMono-Italic[wght].ttf`（308,888 bytes，SHA-256
+  `f115aaa12113718c02ce72864fe6823b87241bc23d3e44cf1220155f861063f2`）。完整 OFL 原文
+  SHA-256 为 `30f0c136e3c88e422d0791acd97238870f9054a9729bc34cf2ff0d4ed8cac4ad`。
+- 没有采用上游源码、构建脚本、static/web font 全集、IDE integration、Logo、截图或品牌文案。
+  完整 file-level provenance、PostScript inventory 与运行边界见
+  `ThirdPartyNotices/JetBrainsMono.md`；根 `NOTICE.md` 和完整许可证已同步登记。
+- 产品接线只使用 Apple Core Text 官方 process registration API。普通启动、Debug/Release 与发行构建
+  使用同一条 JetBrains Mono 路径，没有 system-font opt-out 或实验参数；使用前验证 bundle bytes、
+  完整 descriptor 集与注册后 URL identity。任一缺失、冲突或漂移都使 App 启动 fail closed，不读取
+  用户安装的同名字体，也不切换另一字体。
+- JetBrains Mono 不覆盖中文。Core Text probe 已确认英文 run 为 `JetBrainsMono-Regular`、中文 run
+  为 `PingFangSC-Regular`；这只是当前 Apple 平台的 glyph fallback 观察，不把 PingFang vendor 成
+  Intatis 资源。正式字体接线不改变文本字节、本地化、EventLog、provider prompt、权限或 iOS 产品边界。
+- 两份 exact TTF 已获产品采用批准。正式发布仍须完成大小、Dynamic Type、VoiceOver、中文 fallback、
+  两端最终 bundle 与许可证验收；任何 exact dependency closure 漂移须重新审查，但无需删除已批准资源。
 
 ## 上游升级规则
 

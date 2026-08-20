@@ -13,6 +13,22 @@ third-party names, logos, icons, screenshots, UI assets, trademarks, or brand
 copy as its product identity. Open-source reuse does not bypass Intatis'
 permission, workspace, event-log, secret, or Apple-platform boundaries.
 
+## JetBrains Mono product typography
+
+Intatis bundles two unmodified variable-font files from **JetBrains Mono
+2.304** (`JetBrains/JetBrainsMono`, tag `v2.304`, commit
+`cd5227bd1f61dff3bbd6c814ceaf7ffd95e947d9`) under the SIL Open Font License
+1.1. Following the initial visual trial, the user approved JetBrains Mono on
+2026-08-19 as the unified first-party English product typeface for macOS and
+iOS. It is now an unconditional product resource rather than a runtime A/B.
+
+The exact file inventory, hashes, adoption/exclusion scope, fail-closed Core
+Text registration boundary, and CJK fallback observation are recorded in
+`ThirdPartyNotices/JetBrainsMono.md`. The complete OFL-1.1 text is preserved at
+`ThirdPartyNotices/Licenses/JetBrainsMono-2.304-OFL-1.1.txt`. Any resource,
+hash, descriptor-inventory, license, or final-bundle drift remains a release
+failure; the approved exact resources themselves are not a release blocker.
+
 ## Open Knowledge Format v0.2 standard
 
 Intatis pins the unmodified, self-contained Open Knowledge Format v0.2

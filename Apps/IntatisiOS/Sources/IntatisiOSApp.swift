@@ -270,9 +270,9 @@ struct IOSRootView: View {
     @ScaledMetric(relativeTo: .title)
     private var brandTitleSize: CGFloat = IntatisTypography.spec(for: .brand).nominalPointSize
     @ScaledMetric(relativeTo: .largeTitle)
-    private var sessionTitleSize: CGFloat = IntatisTypography.spec(for: .largeTitle).nominalPointSize
+    private var sessionTitleSize: CGFloat = 22
     @ScaledMetric(relativeTo: .largeTitle)
-    private var settingsTitleSize: CGFloat = IntatisTypography.spec(for: .largeTitle).nominalPointSize
+    private var settingsTitleSize: CGFloat = 22
     @ScaledMetric(relativeTo: .body)
     private var settingsRowSize: CGFloat = 13
     @ScaledMetric(relativeTo: .caption)
@@ -1089,10 +1089,15 @@ private struct IOSChatModelMenu: View {
 struct IntatisiOSApp: App {
     @StateObject private var env = IOSAppEnvironment()
 
+    init() {
+        IntatisTypography.prepareJetBrainsMonoTypography()
+    }
+
     var body: some Scene {
         WindowGroup {
             IOSRootView()
                 .environmentObject(env)
+                .font(IntatisTypography.globalFont)
         }
     }
 }

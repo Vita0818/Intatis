@@ -701,14 +701,14 @@ private struct SessionRenameSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("Rename Session")
-                .font(.headline)
+                .font(IntatisTypography.system(.headline))
             TextField("Session name", text: $name)
                 .textFieldStyle(.roundedBorder)
                 .onSubmit(rename)
 
             if let errorText {
                 Text(errorText)
-                    .font(.caption)
+                    .font(IntatisTypography.system(.caption))
                     .foregroundStyle(.red)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -848,7 +848,7 @@ private struct IntatisSidebarModeRow: View {
     private var content: some View {
         HStack(spacing: 10) {
             Image(systemName: systemImage)
-                .font(.system(size: 14, weight: .semibold))
+                .font(IntatisTypography.system(size: 14, weight: .semibold))
                 .foregroundStyle(selected
                     ? IntatisTheme.accent(scheme)
                     : IntatisTheme.softText(scheme))
@@ -873,7 +873,7 @@ private struct IntatisSidebarSettingsRow: View {
     var body: some View {
         HStack(spacing: 9) {
             Image(systemName: "gearshape")
-                .font(.system(size: 13, weight: .medium))
+                .font(IntatisTypography.system(size: 13, weight: .medium))
                 .foregroundStyle(selected ? IntatisTheme.accent(scheme) : IntatisTheme.softText(scheme))
                 .frame(width: 20)
             Text(IntatisLocalization.string("Settings"))

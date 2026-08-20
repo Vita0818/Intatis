@@ -12,7 +12,7 @@
 - 只有用户针对 exact 依赖、exact 范围和退出条件作出的新明文决定才能例外。
 
 文档状态：当前回归禁区
-最近核对：2026-08-13
+最近核对：2026-08-19
 产品基线：v0.55（build 55）
 
 ## macOS 分发不变量
@@ -479,6 +479,11 @@
   取代该部分。任何改动必须同步更新 vendored patch ledger 与对应平台测试。
 - 2026-07-18 GUI/CU adverse evidence 必须永久保留为历史发行风险：Force Quit 的 129.63 GB 是 application-memory UI 读数而非精确 RSS/footprint；CPU diagnostic incident `FA228932-2C40-4AC2-A0C2-62EF41342B4A` 的 sampled footprint 为 109.16 MB→803.30 MB。根因/retaining edge 仍为 `UNKNOWN`，不得伪称已归因。2026-07-24 单实例 hard-watchdog 的 math-disabled/enabled A/B、1/32/structure/history/stream 短时 stages 和 Light/Dark 约 47 秒 Computer Use 均通过、无残留；这些结果关闭了“未受控重跑”和公式不可见，但短于历史 160 秒窗口，也未验证真实 clipboard/VoiceOver 或 malloc retaining edge。以后所有 GUI 验收仍必须由父进程保证单实例、wall/RSS/footprint/CPU hard watchdog、越界终止和残留清理；不得并发启动多个 validation app，也不得用一个短时 stage 把 renderer 标为 release-ready。
 - renderer/依赖变更必须更新 `NOTICE.md` 与 `ThirdPartyNotices/`，并复验 macOS/iOS 最终 app bundle 中声明文件可访问且与仓库内容 hash 一致。当前 iosMath 的八套数学字体及许可证只允许通过其独立 SwiftPM resource bundle 分发：`fonts/` payload 固定为 26 files / 7,234,424 bytes，完整 Xcode/SwiftPM bundle 加生成的根 `Info.plist` 后为 27 files；不得把两种口径混写。不得夹带 Cambria Math、highlight.js/CSS、Copilot 品牌资产或未声明字体/资源，发现即发布 fail closed。
+- JetBrains Mono 正式字体资源只允许 `ThirdPartyNotices/JetBrainsMono.md` 登记的 v2.304 两份 unmodified
+  variable TTF 与 exact OFL 文本；文件名、byte count、SHA-256、PostScript inventory 或上游 commit
+  任一变化都必须重新做 font/asset license 与 final-bundle review。vendored Markdown patch group 13
+  只能让 code block 使用既有 `MarkdownRenderConfig` font，默认 config 行为必须不变；不得把 JetBrains
+  注册、产品字体策略或第二 typography registry 写进第三方 derivative。
 
 ## 数据格式禁区
 
@@ -701,13 +706,23 @@
 ## 回归要求
 
 - iOS 必须保持 macOS 真子集：**不得**链接 Tools/Permission/AgentKernel/Cowork 或 shell/git/patch 模块。
-- iOS Chat 必须沿用 macOS 的设计角色而非全局改字体：品牌 `Intatis`、session 名称和
-  Settings 页面标题使用 Apple 系统 serif；正文、按钮、菜单、表单、状态与输入使用
-  系统 sans，Markdown/代码/公式继续服从共享 renderer 的语义字体。抽屉保持
+- 正式默认 typography 由 `IntatisTypography` 统一拥有：2026-08-19 用户已批准把第一方英文字形路由到
+  exact bundled JetBrains Mono 2.304，并保留既有名义字号、字重和 Dynamic Type 语义层级。不得增加
+  system-font opt-out、旧实验参数、UserDefaults/设置选择或 release-script alternate default。资源必须
+  先通过固定 SHA-256、完整 PostScript inventory、Core Text process registration 与 exact bundle-URL
+  revalidation；任一失败都必须在启动时 fail closed，禁止读取用户安装字体、system mono 或另一 family
+  兜底。中文必须继续由 Apple glyph fallback 处理，禁止为此新增未审查 CJK 字体。正式发布须重跑完整
+  release/accessibility/license/bundle gate，但不得再要求删除已批准的 exact 字体资源。
+- iOS Chat 的正式默认必须沿用 macOS 的字体 family 与设计角色：品牌 `Intatis`、session 名称、
+  Settings 页面标题、正文、按钮、菜单、表单、状态与输入的英文字形统一使用 JetBrains Mono，
+  Markdown/代码/公式继续服从共享 renderer 的语义字体。抽屉保持
   `Intatis` → 选中 Chat → `Recent`/New → 底部 Settings；顶部保持 sidebar/session/New；
   底部 composer 保持 model/usage 第一排与 paperclip/input/voice/唯一 Send-or-Stop 第二排；voice
-  必须紧邻主操作左侧。
-  不得恢复全局 `.fontDesign(.serif)`、顶部 model picker、抽屉底部假 search/Chat CTA，
+  必须紧邻主操作左侧。iOS session 与 Settings large title 使用 22pt nominal size 并继续按
+  `.largeTitle` Dynamic Type 缩放；不得为此修改共享 30pt `IntatisTypography.largeTitle` 或 macOS 标题。
+  iOS Send/键盘提交必须先释放 composer FocusState，消息 ScrollView 必须保持 interactive keyboard
+  dismissal；stream completion、输入重新启用和自动滚动不得让键盘重新弹出。macOS 既有 focus 行为不变。
+  不得恢复全局 `.fontDesign(.serif)`、system-font alternate default、顶部 model picker、抽屉底部假 search/Chat CTA，
   也不得因复用 macOS 视觉而让 iOS 增加本地附件、workspace 或 agent 能力。
 - 根 `Intatis.icon` 是 `IntatisMac` 与 `IntatisiOS` 的 canonical Apple 图标源；两个
   shipping target 都必须以 `ASSETCATALOG_COMPILER_APPICON_NAME=Intatis` 编译它，

@@ -1,7 +1,7 @@
 # PROJECT_MAP
 
 文档状态：当前仓库地图
-最近自查日期：2026-08-18
+最近自查日期：2026-08-19
 产品基线：v0.55（build 55）
 
 本文描述当前仓库结构。判断依据来自 `Package.swift`、`project.yml`、`Makefile`、源码、测试文件和脚本。
@@ -10,6 +10,27 @@ macOS 唯一发行 target 是 Developer ID/direct-distribution `IntatisMac`。
 `IntatisMacAppStore` 仍列在地图中只是因为源码和 `project.yml` 尚未删除它；
 它是 legacy/non-shipping target，不是产品面、架构约束或默认验收项。分发
 合同见 `docs/MACOS_DISTRIBUTION.md`。
+
+## 2026-08-19 JetBrains Mono 正式产品字体地图
+
+- `Packages/IntatisSharedUI/Sources/Resources/JetBrainsMono[wght].ttf` 与
+  `JetBrainsMono-Italic[wght].ttf` 是官方 JetBrains Mono 2.304 的两份 unmodified variable fonts；
+  `Package.swift` 把它们作为 `IntatisSharedUI` resources，使 macOS/iOS App 与 SharedUI tests 使用同一
+  `Bundle.module`。它们不是系统安装依赖，也没有 App-only duplicate copy。
+- `Packages/IntatisSharedUI/Sources/IntatisTypography.swift` 拥有固定 resource/hash/
+  PostScript inventory、Core Text process registration、exact bundle-URL revalidation，以及 shared
+  role/direct semantic font lowering。`Apps/IntatisMac/Sources/IntatisMacApp.swift` 与
+  `Apps/IntatisiOS/Sources/IntatisiOSApp.swift` 只负责在 App init 预检和给未显式设置字体的 root Text
+  注入默认 product font。
+- `Packages/IntatisSharedUI/Sources/MessageRendering/IntatisMicrosoftMarkdownPipeline.swift` 把
+  既有 `MarkdownRenderConfig` 的 paragraph/heading/list/table/link/code fonts 变为同一 family；
+  `Vendor/SwiftStreamingMarkdown/Sources/MarkdownText/UI/CodeBlockView.swift` 的 patch group 13 只让
+  code-block leaves 遵守已经存在的 config font，不引入第二字体 registry。
+- macOS/iOS 普通构建、Debug/Release 与发行启动统一使用 JetBrains Mono 英文字体，不存在运行时
+  system-font opt-out。中文由 Core Text 系统 CJK glyph fallback 处理。
+- provenance/许可证位于 `ThirdPartyNotices/JetBrainsMono.md` 与
+  `ThirdPartyNotices/Licenses/JetBrainsMono-2.304-OFL-1.1.txt`。两份 exact TTF 是 v0.55 release
+  resource；其 inventory/hash/license/final-bundle gate 必须保持通过。
 
 ## 2026-08-10 模型驱动 Knowledge 接线地图
 
@@ -104,7 +125,7 @@ macOS 唯一发行 target 是 Developer ID/direct-distribution `IntatisMac`。
 - `Packages/IntatisConversation/Sources/SessionActivityHistoryStore.swift` 是 app-facing recent-session recency projection：一次读取 EventLog，同时统计 event count，并 newest-first 查找 durable `turn_outcome`；只有 legacy session 回退 assistant/agent completion。file size/mtime 只作为 cache invalidation signature，`SessionHistoryStore` 的文件 mtime 不再是 UI 排序权威。
 - `Apps/IntatisMac/Sources/SessionRuntimeManager.swift` 继续持有 exact session runtime，并直接组合各 ViewModel 的 published data-plane activity，发布 active→idle 的低频 settlement；`IntatisMacRootView.swift` 只重扫该 settlement 所属的 Chat / Code / Cowork 列表。macOS 与 iOS 的 `AppConfig` / `IOSConfig` 都通过 Conversation projection 取得同一排序，iOS 也在 Chat busy→idle 后刷新 history。
 - `Packages/IntatisSharedUI/Sources/ThreadSurfaces.swift` 负责 composer 唯一主操作位的 Send↔native destructive Stop 切换，以及 phase-local `IntatisThinkingElapsedLabel`；Mac Chat、共享 Code / Cowork 接入同一 Stop 几何与取消入口。
-- `Packages/IntatisSharedUI/Sources/IntatisTypography.swift` 是 macOS/iOS 共用的字体角色事实源：品牌与页面标题使用系统 serif，Chat/正文/控件使用系统 sans，技术值使用系统 monospaced；iOS 在相同名义字号与字重之上通过 `@ScaledMetric` 保留 Dynamic Type。
+- `Packages/IntatisSharedUI/Sources/IntatisTypography.swift` 是 macOS/iOS 共用的字体角色事实源：第一方英文统一使用 exact bundled JetBrains Mono 2.304，品牌、标题、正文、caption、metadata 与代码继续由同一组语义角色区分名义字号/字重；中文由 Apple Core Text CJK fallback 处理。iOS 在相同语义角色之上通过 `@ScaledMetric` 保留 Dynamic Type，并对 session/Settings large title 使用 iOS-only 22pt override。
 
 ## 目录结构总览
 
@@ -173,7 +194,7 @@ Intatis/
 | `IntatisAgentKernel` | lib | Core, Protocol, Providers, Tools, Permission, Conversation, Artifacts, MCP, Skills | 共享 headless 单 agent runtime（AgentRuntime/RuntimeEnvironmentManifest/AgentLoop/ContextBuilder/ContextProjector/AgentModelHistoryProjector/AgentModelHistoryCompactor/AgentTokenEstimator/AgentExecutionBudget/PermissionResponder），以及把 exact agent route 绑定到普通 Tool executor 的 `ProviderHostedWebSearchToolService`；稳定 Code/Cowork 主线程支持 durable replacement-history checkpoint，每次 provider dispatch 冻结 exact `AgentRequestToolSnapshot` |
 | `IntatisCowork` | lib | Core, Protocol, Providers, Tools, Permission, Conversation, AgentKernel, Skills | 多 agent 编排与 Goal 控制面（Orchestrator/AgentScheduler/MessageBus/Mediator/AgentRegistry/WorkTaskTools/GoalTools/GoalVerifierControlPlane/CoordinatorTools/AgentPermissionResponder/PermissionReviewControlPlane）；Orchestrator 只在 exact route、bound service 与独立 hosted-search lease capability 同时成立时注册该工具 |
 | `IntatisMultimodal` | lib | Core, Protocol, Providers, Artifacts, Conversation | 图像/视频/转写 → artifacts |
-| `IntatisSharedUI` | lib | Core, Protocol, Providers, Conversation, Artifacts, `Vendor/SwiftStreamingMarkdown` thin derivative（Microsoft v0.6.0 basis；传递 exact iosMath 2.5.0，仅 iOS/macOS） | 跨平台 SwiftUI；`ComposerAttachments.swift` 提供 Chat/Code/Cowork 共用的 security-scoped 文件读取、ArtifactStore 保存/读回校验与 image MIME provider 解析，其中PNG/JPEG扩展使用确定性canonical MIME映射、其他格式才查询系统type database，不把 base64 写入 EventLog。`MessageRendering` 以 `.microsoft` / `.plainSafe` 做产品熔断，rich 结构/原生布局与 code-aware `$...$` / `\(...\)` inline、`$$...$$` / `\[...\]` display 公式由经审计的 Microsoft 派生包负责；iosMath 只提供 Apple-native TeX parse/layout，plain-safe 完全绕开二者。公式通过两平台 TextKit 2 live `MTMathUILabel` attachment 以 intrinsic size 展示，不设公式数量、单式字节或固定附件尺寸上限；semantic appearance 与 Dynamic Type revision 控制更新，不保留 raster cache。Intatis 只做语法无关的 64 KiB whole-message admission、process-wide 1-running/32-pending latest-only Markdown parse permits、每 view 最新 raw revision、50 ms incomplete parse debounce、100 ms fixed-window raw leading/trailing projection、stale publication guard与安全链接；window-local scroll coordinator 保持 geometry observation-only、100 ms follow cadence、one-shot rich settle 与每行 150 ms viewport dwell。macOS Chat/Code/Cowork 的 transcript 通过 `IntatisThreadHistoryWindow` 使用最多 16-row eager page 与 Earlier/Newer/Latest；Cowork 另由 window-local `CoworkAgentThreadPresentationModel` 管理 historical agent selection/generation/per-agent boundary，固定 ScrollView 与 16 row slots，以 selection/content 300 ms quiet gate 阻止切换或持续增量反复挂载 AppKit rich subtree，并用 stable-ID lazy Agents rail 承载 detached identity；共享 iOS 兼容路径仍保留 adaptive container。vendored AppKit paragraph 使用 proposal-owned exact width 和 one-entry measurement memo。`ExecutionTracePresentation.swift` 另在 Code/Cowork 展示边界默认隐藏 verbose tool/patch/note trace 和由 `CodeProjection` 标记的同-task exact `task_completed` 回答镜像，同时保留 `.agentToAgent` 的媒介化 agent 通信；后台启动参数/环境变量仍可 opt in 恢复完整 trace。它不改变 EventLog 或 durable task settlement。当前仍不分发语法高亮或远程 Markdown 图片 |
+| `IntatisSharedUI` | lib | Core, Protocol, Providers, Conversation, Artifacts, `Vendor/SwiftStreamingMarkdown` thin derivative（Microsoft v0.6.0 basis；传递 exact iosMath 2.5.0，仅 iOS/macOS） | 跨平台 SwiftUI；自身 resource bundle 分发两份 exact JetBrains Mono product TTF，使两端 App 与 tests 使用同一 `Bundle.module`。`ComposerAttachments.swift` 提供 Chat/Code/Cowork 共用的 security-scoped 文件读取、ArtifactStore 保存/读回校验与 image MIME provider 解析，其中PNG/JPEG扩展使用确定性canonical MIME映射、其他格式才查询系统type database，不把 base64 写入 EventLog。`MessageRendering` 以 `.microsoft` / `.plainSafe` 做产品熔断，rich 结构/原生布局与 code-aware `$...$` / `\(...\)` inline、`$$...$$` / `\[...\]` display 公式由经审计的 Microsoft 派生包负责；iosMath 只提供 Apple-native TeX parse/layout，plain-safe 完全绕开二者。公式通过两平台 TextKit 2 live `MTMathUILabel` attachment 以 intrinsic size 展示，不设公式数量、单式字节或固定附件尺寸上限；semantic appearance 与 Dynamic Type revision 控制更新，不保留 raster cache。Intatis 只做语法无关的 64 KiB whole-message admission、process-wide 1-running/32-pending latest-only Markdown parse permits、每 view 最新 raw revision、50 ms incomplete parse debounce、100 ms fixed-window raw leading/trailing projection、stale publication guard与安全链接；window-local scroll coordinator 保持 geometry observation-only、100 ms follow cadence、one-shot rich settle 与每行 150 ms viewport dwell。macOS Chat/Code/Cowork 的 transcript 通过 `IntatisThreadHistoryWindow` 使用最多 16-row eager page 与 Earlier/Newer/Latest；Cowork 另由 window-local `CoworkAgentThreadPresentationModel` 管理 historical agent selection/generation/per-agent boundary，固定 ScrollView 与 16 row slots，以 selection/content 300 ms quiet gate 阻止切换或持续增量反复挂载 AppKit rich subtree，并用 stable-ID lazy Agents rail 承载 detached identity；共享 iOS 兼容路径仍保留 adaptive container。vendored AppKit paragraph 使用 proposal-owned exact width 和 one-entry measurement memo。`ExecutionTracePresentation.swift` 另在 Code/Cowork 展示边界默认隐藏 verbose tool/patch/note trace 和由 `CodeProjection` 标记的同-task exact `task_completed` 回答镜像，同时保留 `.agentToAgent` 的媒介化 agent 通信；后台启动参数/环境变量仍可 opt in 恢复完整 trace。它不改变 EventLog 或 durable task settlement。当前仍不分发语法高亮或远程 Markdown 图片 |
 
 `IntatisMCPConformanceClient` 是只供固定 conformance runner 启动的开发期 executable，不是发行 product，也不是 MCP Server。
 
@@ -183,7 +204,7 @@ Intatis/
 |---|---|---|---|---|
 | `IntatisMac` | application | macOS 26+ | `com.Vita0818.IntatisMac` | 完整 Chat/Code/Cowork + Skills；Chat 的透明 hosted search 合同不变，Code/Cowork 对受支持的 exact agent route 另注册独立 `hosted_web_search` Tool，无 UI 或浏览器耦合。Code/Cowork exact `@main` 在 canonical `embedding_model` + `reranker_model` 均可解析时经 optional augmenter 获得 `build_knowledge` / path-aware `search_knowledge`，外部目录由 exact NSOpenPanel/security-scoped bookmark + `KnowledgeLease` 授权；缺配置时不广告工具并在现有状态面提示。无 Knowledge 管理 UI，Chat/reviewer/GoalVerifier/普通 worker/iOS 无此工具面。DeveloperID/non-sandbox workbench 支持 stdio/HTTP 与显式启用的全局 Skill roots |
 | `IntatisMacAppStore` | legacy application（非发行） | macOS 26+ | `com.Vita0818.IntatisMac` | 源码中尚未删除的旧 App Sandbox/HTTP-only target；不属于产品、默认构建、回归或 release gate |
-| `IntatisiOS` | application | iOS 26+ | `com.Vita0818.Intatis` | 7 个 chat 子集 products；iOS root 在唯一原生 `NavigationStack` 内组合 Chat canvas、顶部 sidebar/session/new、82% 的 `Intatis`/Chat/Recent/New/Settings 抽屉与两排 composer（model/usage；paperclip/input/voice/Send-or-Stop）；品牌/session/Settings 标题为系统 serif，正文与控件为系统 sans；Settings 支持系统 Files 导入 Intatis JSON/JSONC；根 `Intatis.icon` 编译为 iPhone/iPad 主图标；与 macOS 共用当前 exact-route hosted-search planner和 Chat-only 自动命名协调器，并通过 per-session revision/seq metadata relay 即时更新对应标题；无可见搜索 UI并支持结构化 citations；通用照片/文件附件尚未接通；无 `IntatisKnowledge`/MCP client runtime/transport/product surface，也无 Tools/Permission/AgentKernel/Cowork |
+| `IntatisiOS` | application | iOS 26+ | `com.Vita0818.Intatis` | 7 个 chat 子集 products；iOS root 在唯一原生 `NavigationStack` 内组合 Chat canvas、顶部 sidebar/session/new、82% 的 `Intatis`/Chat/Recent/New/Settings 抽屉与两排 composer（model/usage；paperclip/input/voice/Send-or-Stop）；第一方英文统一使用 JetBrains Mono，标题/正文/控件继续由语义字号与字重区分，中文使用 Apple CJK fallback；Settings 支持系统 Files 导入 Intatis JSON/JSONC；根 `Intatis.icon` 编译为 iPhone/iPad 主图标；与 macOS 共用当前 exact-route hosted-search planner和 Chat-only 自动命名协调器，并通过 per-session revision/seq metadata relay 即时更新对应标题；无可见搜索 UI并支持结构化 citations；通用照片/文件附件尚未接通；无 `IntatisKnowledge`/MCP client runtime/transport/product surface，也无 Tools/Permission/AgentKernel/Cowork |
 | `intatis-cli` | executable | CLI（macOS/Linux） | — | Code/Cowork + Skills + external MCP client；Code/Cowork exact route 可按 capability/lease 注册独立 provider-hosted `hosted_web_search`。两个 Knowledge role 配齐时 shipping Code/Cowork 组合 concrete Knowledge augmenter，支持自然语言 workspace/external `store_path`、显式 permission 后的 exact CLI `KnowledgeLease`、build/search/rerank；缺配置时提示且不广告工具。没有 mount command 或独立 Knowledge UI；macOS/Linux 支持 stdio/HTTP，CLI 持有 exact session MCP owner |
 
 Chat 托管搜索的用户确认合同见 `docs/CHAT_HOSTED_SEARCH.md`。目标 runtime 只有当前所选 exact
@@ -273,15 +294,15 @@ route，使用 required hosted-search request，且只经 `ToolRegistry` / `Tool
   生成一张非空“错误信息”卡片，Cowork 通过 exact `SubmissionID` 保留 Retry。EventLog、
   projection、runtime 与 permission 语义不变。
 - iOS UI 信息架构：`Apps/IntatisiOS/Sources/IntatisiOSApp.swift` 保持单一
-  `NavigationStack` + Chat-only root；顶部为 sidebar、serif session title 与 New，约
-  82% 左抽屉复用 `IntatisSessionHistoryList`，组织 serif `Intatis`、选中 Chat、Recent/New
+  `NavigationStack` + Chat-only root；顶部为 sidebar、JetBrains Mono session title 与 New，约
+  82% 左抽屉复用 `IntatisSessionHistoryList`，组织 JetBrains Mono `Intatis`、选中 Chat、Recent/New
   和底部 Settings。底部通过 `ThreeColumnShell` 参数化共享两排 composer：第一排是
   model glass `Menu` 与可用 usage，第二排是 paperclip Chat 功能菜单、输入、voice 和唯一
   Send/Stop；voice 紧邻主操作左侧，iOS 的 glass merge spacing 固定为 0，使各个 8pt 间隔的
   控件保持独立形状；composer 专用 icon modifier 给 action/voice/Send/Stop 统一 40×40 外框，并在
   iOS 使用 `.small` native control size 纠正 `.regular` glass 的可见膨胀，macOS 仍使用 `.regular`。
   关闭状态支持从 24pt 左缘水平右滑打开抽屉；侧栏内水平左滑关闭，两者都用
-  方向优势阈值避免抢占聊天和 Recent 的垂直滚动。品牌/session/Settings 标题使用系统 serif，正文与原生控件使用系统 sans；
+  方向优势阈值避免抢占聊天和 Recent 的垂直滚动。第一方英文统一使用 JetBrains Mono，标题/正文/原生控件继续由语义字号与字重区分，中文使用 Apple CJK fallback；
   根 `Intatis.icon` 由 iOS target 编译为主图标。产品图仍不链接本地 agent/workspace。
 - 2026-07-31/08-02 conversation chrome（由 2026-08-13 用户气泡表面收口补充）：`ThreadSurfaces.swift` 还定义 user-header policy、低对比结构化 surface、可选 subtitle 的 workspace thread header、单行 session history row 与原生 `GlassEffectContainer`/glass surface helper；`Views.swift` / `IntatisChatScreen.swift` / `CodeViews.swift` 统一省略 user sender label，并只让 user row 使用原生 regular Liquid Glass 气泡，assistant/agent/system 对话行直接继承 canvas；active Chat/Code/Cowork header 只显示 session title。`CodeViews.swift` 的 `PermissionCard` / `PermissionResolutionNoticeView` 使用默认折叠、structured secret-safe details、窄宽自适应 actions，并支持由 Cowork rail 接管外层 surface；`CoworkViews.swift` 把 pending/resolved permission 放到 glass rail 第一位；`IntatisMacRootView.swift` 的 sidebar 品牌块只保留 `Intatis`，Recent item 只传 session name 而不生成 event/date/path/runtime detail；`PhaseCPermissionFixtureView.swift` 提供不接 provider/EventLog/executor 的真实生产组件视觉验收面。
 - 当前 UI 配色规范：`docs/CURRENT_UI_COLOR_SYSTEM.md`（系统原生表面 + Liquid Glass：动态 macOS window / sidebar、仅用户消息使用 regular glass 气泡、其余 conversation row 继承 canvas、专用结构化内容 Material、导航与交互功能层玻璃、系统语义色、iOS 边界与验收清单）

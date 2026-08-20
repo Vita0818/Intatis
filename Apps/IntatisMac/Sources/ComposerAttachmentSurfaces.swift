@@ -55,7 +55,7 @@ struct IntatisMacComposerAttachmentAccessory: View {
                             .font(IntatisTypography.body(13, .semibold))
                             .foregroundStyle(.primary)
                         Image(systemName: "chevron.down")
-                            .font(.system(size: 10, weight: .semibold))
+                            .font(IntatisTypography.system(size: 10, weight: .semibold))
                             .foregroundStyle(.secondary)
                             .accessibilityHidden(true)
                     }

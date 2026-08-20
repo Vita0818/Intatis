@@ -132,6 +132,28 @@ final class ThreadLayoutTests: XCTestCase {
             .regular)
     }
 
+    func testIOSChatDismissesKeyboardOnSubmitAndInteractiveThreadDrag() throws {
+        let testFile = URL(fileURLWithPath: #filePath)
+        let packageRoot = testFile
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let viewsSource = try String(
+            contentsOf: packageRoot.appendingPathComponent("Sources/Views.swift"),
+            encoding: .utf8)
+        let composerSource = try String(
+            contentsOf: packageRoot.appendingPathComponent("Sources/ThreadSurfaces.swift"),
+            encoding: .utf8)
+
+        XCTAssertTrue(viewsSource.contains(
+            "#if os(iOS)\n                .scrollDismissesKeyboard(.interactively)"))
+        XCTAssertTrue(composerSource.contains("Button(action: submit)"))
+        XCTAssertTrue(composerSource.contains(".onSubmit {\n                submit()"))
+        XCTAssertTrue(composerSource.contains(
+            "#if os(iOS)\n        focused = false\n        #endif"))
+        XCTAssertTrue(composerSource.contains(
+            "guard stopAction == nil, canSend else { return }"))
+    }
+
     func testSidebarOpenGestureRequiresLeadingEdgeHorizontalIntent() {
         XCTAssertTrue(IntatisSidebarGesturePolicy.shouldOpen(
             startX: 8,

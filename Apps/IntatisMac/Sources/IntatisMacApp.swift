@@ -825,7 +825,7 @@ struct WorkspaceSessionHome: View {
 
                     VStack(alignment: .leading, spacing: 14) {
                         Image(systemName: icon)
-                            .font(.system(size: 28, weight: .semibold))
+                            .font(IntatisTypography.system(size: 28, weight: .semibold))
                             .foregroundStyle(IntatisTheme.accent(scheme))
                             .frame(width: 64, height: 64)
                         Text(primaryTitle)
@@ -1354,16 +1354,16 @@ struct CoworkSessionView: View {
     private var goalEditorSheet: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("Edit Goal")
-                .font(.title2.bold())
+                .font(IntatisTypography.system(.title2, bold: true))
             Text("Edit the durable objective and its requirements. Enter one success criterion or constraint per line. Leaving token budget empty means no Goal budget. A paused Goal remains paused.")
-                .font(.callout)
+                .font(IntatisTypography.system(.callout))
                 .foregroundStyle(.secondary)
 
             VStack(alignment: .leading, spacing: 6) {
                 Text("Objective")
-                    .font(.caption.bold())
+                    .font(IntatisTypography.system(.caption, bold: true))
                 TextEditor(text: $goalObjectiveDraft)
-                    .font(.body)
+                    .font(IntatisTypography.system(.body))
                     .frame(minWidth: 500, minHeight: 90)
                     .padding(8)
                     .overlay {
@@ -1377,14 +1377,14 @@ struct CoworkSessionView: View {
             VStack(alignment: .leading, spacing: 6) {
                 HStack {
                     Text("Success criteria")
-                        .font(.caption.bold())
+                        .font(IntatisTypography.system(.caption, bold: true))
                     Spacer()
                     Text("One per line")
-                        .font(.caption2)
+                        .font(IntatisTypography.system(.caption2))
                         .foregroundStyle(.tertiary)
                 }
                 TextEditor(text: $goalSuccessCriteriaDraft)
-                    .font(.body)
+                    .font(IntatisTypography.system(.body))
                     .frame(minHeight: 82)
                     .padding(8)
                     .overlay {
@@ -1398,14 +1398,14 @@ struct CoworkSessionView: View {
             VStack(alignment: .leading, spacing: 6) {
                 HStack {
                     Text("Constraints")
-                        .font(.caption.bold())
+                        .font(IntatisTypography.system(.caption, bold: true))
                     Spacer()
                     Text("One per line")
-                        .font(.caption2)
+                        .font(IntatisTypography.system(.caption2))
                         .foregroundStyle(.tertiary)
                 }
                 TextEditor(text: $goalConstraintsDraft)
-                    .font(.body)
+                    .font(IntatisTypography.system(.body))
                     .frame(minHeight: 82)
                     .padding(8)
                     .overlay {
@@ -1418,7 +1418,7 @@ struct CoworkSessionView: View {
 
             VStack(alignment: .leading, spacing: 6) {
                 Text("Token budget (optional)")
-                    .font(.caption.bold())
+                    .font(IntatisTypography.system(.caption, bold: true))
                 TextField("No budget", text: $goalTokenBudgetDraft)
                     .textFieldStyle(.roundedBorder)
                     .frame(maxWidth: 220)
@@ -1428,7 +1428,7 @@ struct CoworkSessionView: View {
 
             if let validationMessage = goalEditorValidationMessage {
                 Label(validationMessage, systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
+                    .font(IntatisTypography.system(.caption))
                     .foregroundStyle(.red)
                     .fixedSize(horizontal: false, vertical: true)
                     .accessibilityIdentifier("cowork.goal.editor.validation")
@@ -1524,7 +1524,7 @@ private struct CoworkInferenceAccessory: View {
                         .lineLimit(1)
                         .truncationMode(.middle)
                     Image(systemName: "chevron.down")
-                        .font(.system(size: 10, weight: .semibold))
+                        .font(IntatisTypography.system(size: 10, weight: .semibold))
                         .foregroundStyle(IntatisTheme.tertiaryText(scheme))
                         .accessibilityHidden(true)
                 }
@@ -1679,6 +1679,10 @@ struct IntatisMacApp: App {
     private var applicationDelegate
     #endif
 
+    init() {
+        IntatisTypography.prepareJetBrainsMonoTypography()
+    }
+
     private var launchAppearance: ColorScheme? {
         #if DEBUG || INTATIS_RENDERER_VALIDATION
         let arguments = ProcessInfo.processInfo.arguments
@@ -1751,6 +1755,7 @@ private struct IntatisProductionRootView: View {
     var body: some View {
         IntatisMacRootView(runtimeManager: env.runtimeManager)
             .environmentObject(env)
+            .font(IntatisTypography.globalFont)
             .preferredColorScheme(launchAppearance)
     }
 }

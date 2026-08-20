@@ -2,7 +2,7 @@
 
 文档状态：当前发行合同
 生效日期：2026-07-28
-最近核对：2026-08-18
+最近核对：2026-08-19
 产品基线：v0.55（build 55）
 
 ## 产品决策
@@ -32,6 +32,12 @@ Intatis 的 macOS 产品只通过 Developer ID 签名、公证和直接下载分
 
 iOS 当前仍是独立的 chat 子集。本决策不自动删除或扩大 iOS 产品面，也不改变
 iOS 自身的系统 sandbox 与 target-linkage 限制。
+
+2026-08-19 用户已批准 JetBrains Mono 为 macOS/iOS 统一的第一方英文字体。两份 exact v2.304 TTF
+随 `IntatisSharedUI` resources 进入 Debug、Release 与正式 bundle；没有 system-font opt-out 或实验打包
+分支。正式 release build 必须核对 exact resource inventory/hash、OFL、bundle size、Dynamic Type、
+VoiceOver 与中英混排，并在任一漂移时 fail closed。字体选型不再单独阻断发行；签名、公证、Gatekeeper
+和 clean-machine 等其余发行门槛仍须全部满足，且不得覆盖既有 notarization recovery artifact。
 
 ## 直分发打包入口
 

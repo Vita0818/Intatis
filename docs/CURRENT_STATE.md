@@ -1,7 +1,7 @@
 # CURRENT_STATE
 
 文档状态：当前源码摘要
-最近核对：2026-08-18
+最近核对：2026-08-19
 产品基线：v0.55（build 55）
 
 ## 版本与发行状态
@@ -413,12 +413,20 @@ profiles 与外部 MCP client。macOS/Linux 的 stdio、sandbox、bwrap/guard �
   该气泡使用原生 `Glass.regular` 且不再叠加 accent 蓝色描边。assistant/agent/system 对话正文
   （包括失败/中断回复）直接落在 conversation canvas；tool、error、permission、Goal/Task 等
   专用结构化状态继续使用 Material 边界。
-- iOS 与 macOS 已统一品牌/session/Settings 的 serif 标题和系统 sans 正文/控件，两端使用
+- iOS 与 macOS 的标题/正文继续共享语义字号、字重和 Dynamic Type 层级，两端使用
   model/usage + action/input/voice/Send-or-Stop 的两排 composer；voice 始终紧邻主操作左侧，
   不占用或复制唯一的 Send↔Stop 槽位。composer 的 compact secondary/voice control 另显式固定
   40pt 外层布局与圆形 `contentShape`，使屏幕上完整圆形控件与真实点击区域一致，而不是只让内部
   SF Symbol 字形响应点击。macOS Chat 与 Cowork 的 paperclip、附件数量/移除菜单、文件 importer
   和 URL drop modifier 现在是同一套共享 surface；Code 与 iOS Chat 的现有能力边界不随之扩大。
+- 2026-08-19 用户已批准把 JetBrains Mono 保留为正式全局英文字体：macOS/iOS 普通构建和启动把第一方
+  SwiftUI role/direct font、plain/rich message 与现有 Markdown configuration 路由到官方 JetBrains
+  Mono 2.304 variable fonts，不再保留实验参数或 system-font opt-out。两份 TTF 由
+  `IntatisSharedUI` 的 `Bundle.module` 单一持有，使两端 App 和 tests 使用
+  同一 bytes；启动时会校验 bundle hash、PostScript
+  inventory、process registration 与 exact resource URL，失败不回退用户安装字体或另一 family。
+  中文继续通过 Core Text glyph fallback 使用系统 CJK font。字体决定已收口；发布仍须完成正常的
+  无障碍、中英混排、许可证和最终 bundle gate。
 - rich text 使用仓内经审计的 Microsoft SwiftStreamingMarkdown thin derivative 与
   exact iosMath Apple-native 数学排版；plain-safe 仍是运行时救援路径。
 - macOS Chat/Code/Cowork history 使用最多 16-row eager page 与显式分页，避免旧的 rich +
@@ -473,10 +481,18 @@ profiles 与外部 MCP client。macOS/Linux 的 stdio、sandbox、bwrap/guard �
   terminal Seatbelt/default-network-deny 与 iOS linkage boundary 均保留。
 - 旧 schema 与未知 future event 的兼容/fail-closed 规则不得因文档或版本更新而改变。
 - 第三方代码、prompt、字体和依赖来源以 `NOTICE.md`、`ThirdPartyNotices/`、vendor ledger
-  与 `docs/OPEN_SOURCE_REUSE.md` 为准。本轮版本/文档校准没有新增依赖。
+  与 `docs/OPEN_SOURCE_REUSE.md` 为准。JetBrains Mono 两份 unmodified font resource 已按 v2.304
+  exact commit、SHA-256 与 OFL-1.1 登记；它们是正式 product resources，不是 executable runtime。
 
 ## 最近验证状态
 
+- 2026-08-19 JetBrains Mono 正式英文字体接线：SharedUI typography/render/layout focused
+  73/73，vendored Markdown 79 XCTest + 11 Swift Testing，全部 0 failures；macOS/iOS Debug 与
+  Release unsigned builds 均通过，Release macOS 为 `x86_64 arm64`，四个 App 读回 `0.55 (55)`。
+  两份 TTF/OFL 在仓库及四个 App bundle 中 hash 一致；隔离 iOS Simulator 和 macOS renderer
+  fixture 均已无字体参数启动，Core Text probe 观察到英文 JetBrains Mono、中文 PingFang fallback。
+  未验证 Dark、超大 Dynamic Type、VoiceOver、真机或正式签名/公证；这些仍是正常 release gate，
+  因而当前证据不等于整个 v0.55 release GO。
 - 2026-08-13 AuthorizationSidecar 绑定域分离与副作用完成 cast 删除：business-args digest 只核对
   stripped canonical business arguments，custom authorization identity digest 只核对宿主授权快照；两者
   不再交叉比较。AgentLoop 已删除 denied/failed side-effect ledger、EventLog restore、final completion

@@ -604,6 +604,47 @@ Current patch-group-12 evidence (2026-07-31):
   validation were not run for patch group 12. The automated evidence above
   does not by itself establish renderer release readiness.
 
+### 13. Honor the existing render configuration in code-block chrome
+
+Path:
+
+- `Sources/MarkdownText/UI/CodeBlockView.swift`
+
+Changes and reason:
+
+- Replace the three direct `Typography` reads in the code block with the
+  already supplied `MarkdownRenderConfig`: the code body uses
+  `inlineStyle.codeTextFont`, while the language and Copy labels use
+  `tableStyle.textFonts`.
+- Default rendering is unchanged because the default configuration exposes
+  the same `Typography.codeTextFonts.normal` and `Typography.smallTextFonts`
+  values. The change only makes the package's existing public font
+  configuration effective for these leaves.
+- This is used by Intatis' JetBrains Mono product typography. No JetBrains
+  resource, registration logic, or product-font policy is added to the
+  vendored renderer itself.
+
+Regression obligations:
+
+- The vendor suite must confirm default code body/language/Copy rendering and
+  byte-exact Copy behavior remain intact.
+- A root integration test must confirm a caller-supplied code font reaches the
+  code-block body through `MarkdownRenderConfig`.
+- This patch must remain a use of the existing configuration API, not become a
+  second typography registry inside the derivative.
+
+2026-08-19 direct evidence:
+
+- The complete vendor suite passed: 79 XCTest tests plus 11 Swift Testing
+  tests, zero failures. The focused `FirstReleaseContractTests` subset was
+  7/7 and now freezes both config-driven code/body labels and the existing
+  native Copy contract.
+- The consuming Intatis SharedUI typography/rendering/layout suites passed
+  73/73. macOS and iOS Debug and Release app products built successfully; the
+  Release macOS executable contains `x86_64 arm64`.
+- This evidence validates the narrow configuration patch. The product-font
+  decision remains owned by Intatis; device/accessibility gates stay open.
+
 ## Current validation evidence
 
 Unless explicitly identified as patch-group-10 or patch-group-12 evidence

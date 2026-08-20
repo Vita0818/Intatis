@@ -763,24 +763,27 @@ final class IntatisMicrosoftMarkdownRenderState: ObservableObject {
         return MarkdownRenderConfig(
             shouldAnimateText: false,
             blockQuoteStyle: .init(
-                textFonts: defaults.blockQuoteStyle.textFonts.intatisScaled(by: scale),
+                textFonts: defaults.blockQuoteStyle.textFonts
+                    .intatisJetBrainsMono(by: scale),
                 textColor: style.secondaryText),
             headingStyle: .init(
-                h1Font: defaults.headingStyle.h1Font.intatisScaled(by: scale),
-                h2Font: defaults.headingStyle.h2Font.intatisScaled(by: scale),
-                h3Font: defaults.headingStyle.h3Font.intatisScaled(by: scale),
-                h4Font: defaults.headingStyle.h4Font.intatisScaled(by: scale),
-                h5Font: defaults.headingStyle.h5Font.intatisScaled(by: scale),
-                h6Font: defaults.headingStyle.h6Font.intatisScaled(by: scale),
+                h1Font: defaults.headingStyle.h1Font.intatisJetBrainsMono(by: scale),
+                h2Font: defaults.headingStyle.h2Font.intatisJetBrainsMono(by: scale),
+                h3Font: defaults.headingStyle.h3Font.intatisJetBrainsMono(by: scale),
+                h4Font: defaults.headingStyle.h4Font.intatisJetBrainsMono(by: scale),
+                h5Font: defaults.headingStyle.h5Font.intatisJetBrainsMono(by: scale),
+                h6Font: defaults.headingStyle.h6Font.intatisJetBrainsMono(by: scale),
                 textColor: style.primaryText),
             orderedListStyle: .init(
-                textFonts: defaults.orderedListStyle.textFonts.intatisScaled(by: scale),
+                textFonts: defaults.orderedListStyle.textFonts
+                    .intatisJetBrainsMono(by: scale),
                 textColor: style.primaryText),
             paragraphStyle: .init(
-                textFonts: defaults.paragraphStyle.textFonts.intatisScaled(by: scale),
+                textFonts: defaults.paragraphStyle.textFonts
+                    .intatisJetBrainsMono(by: scale),
                 textColor: style.primaryText),
             tableStyle: .init(
-                textFonts: defaults.tableStyle.textFonts.intatisScaled(by: scale),
+                textFonts: defaults.tableStyle.textFonts.intatisJetBrainsMono(by: scale),
                 headerTextColor: style.primaryText,
                 regularTextColor: style.primaryText,
                 headerBackgroundColor: style.stroke.opacity(0.12),
@@ -788,13 +791,15 @@ final class IntatisMicrosoftMarkdownRenderState: ObservableObject {
                 actionButtonColor: style.secondaryText),
             inlineStyle: .init(
                 boldTextColor: style.primaryText,
-                linkTextFont: intatisScaledFont(
+                linkTextFont: intatisJetBrainsMonoFont(
                     defaults.inlineStyle.linkTextFont,
-                    by: scale),
+                    by: scale,
+                    weight: .regular),
                 linkTextColor: style.accent,
-                codeTextFont: intatisScaledFont(
+                codeTextFont: intatisJetBrainsMonoFont(
                     defaults.inlineStyle.codeTextFont,
-                    by: scale),
+                    by: scale,
+                    weight: .regular),
                 codeTextColor: style.primaryText,
                 codeBackgroundColor: style.stroke.opacity(0.18),
                 codeUnderlineColor: style.stroke),
@@ -812,28 +817,32 @@ final class IntatisMicrosoftMarkdownRenderState: ObservableObject {
 }
 
 private extension TextFonts {
-    func intatisScaled(by scale: CGFloat) -> TextFonts {
-        guard scale != 1 else { return self }
+    func intatisJetBrainsMono(by scale: CGFloat) -> TextFonts {
         return TextFonts(
-            normal: intatisScaledFont(normal, by: scale),
-            italic: italic.map { intatisScaledFont($0, by: scale) },
-            bold: bold.map { intatisScaledFont($0, by: scale) },
-            boldItalic: boldItalic.map { intatisScaledFont($0, by: scale) },
+            normal: intatisJetBrainsMonoFont(normal, by: scale, weight: .regular),
+            italic: italic.map {
+                intatisJetBrainsMonoFont($0, by: scale, weight: .regular, italic: true)
+            },
+            bold: bold.map {
+                intatisJetBrainsMonoFont($0, by: scale, weight: .semibold)
+            },
+            boldItalic: boldItalic.map {
+                intatisJetBrainsMonoFont($0, by: scale, weight: .semibold, italic: true)
+            },
             preferredLetterSpacing: preferredLetterSpacing.map { $0 * scale },
             preferredLineHeight: preferredLineHeight.map { $0 * scale })
     }
 }
 
-private func intatisScaledFont(
+private func intatisJetBrainsMonoFont(
     _ font: MDFont,
-    by scale: CGFloat
+    by scale: CGFloat,
+    weight: Font.Weight,
+    italic: Bool = false
 ) -> MDFont {
-    guard scale != 1 else { return font }
-    let size = font.pointSize * scale
-#if canImport(AppKit)
-    return NSFont(descriptor: font.fontDescriptor, size: size) ?? font
-#elseif canImport(UIKit)
-    return UIFont(descriptor: font.fontDescriptor, size: size)
-#endif
+    return IntatisTypography.jetBrainsMonoPlatformFont(
+        size: font.pointSize * scale,
+        weight: weight,
+        italic: italic)
 }
 #endif
