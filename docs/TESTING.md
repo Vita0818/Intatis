@@ -512,6 +512,8 @@ recovery App metadata/architecture/signature/entitlements 重新验证；超时�
   detach 当前 agent 后它仍留在同一列表、状态图标变为 detached、选择和历史页不跳回 main，
   且所有运行时操作禁用；`@permission-reviewer` 为 status-only；两个窗口选择互不覆盖；切走再
   返回仍恢复各 agent 自己的 Earlier/Newer/Latest boundary；查看 worker 时 composer 仍路由 `@main`；
+  Agents header 使用 `person.2.fill`，row status 使用 20pt/30pt hierarchical 圆形 SF Symbols，且
+  running/blocked/limited/pending/completed/cancelled/detached 不是同一个只靠颜色变化的 glyph；
 - long rich response、Markdown/table/code/math 和 plain-safe fallback；
 - macOS rich assistant/agent message 直接左键拖拽可在同一 rendered document 内正向/反向跨 heading、
   paragraph、list item、block quote、table cell 与 code body；拖动期间 ranges 连续，mouse-up 后所有
@@ -529,6 +531,13 @@ recovery App metadata/architecture/signature/entitlements 重新验证；超时�
 - macOS Chat、iOS Chat、Code、Cowork 仅用户消息显示 trailing 原生 regular Liquid Glass 气泡，
   不出现旧 accent 蓝色描边；assistant/agent/system（包括失败/中断回复）直接位于 canvas，
   正常 tool/permission/task 等专用结构化卡片仍保留各自容器；
+- macOS Chat/Code/Cowork 用户气泡为 20pt continuous rounded rectangle；短消息随正文收缩，
+  Code/Cowork 不显示 queued/running/completed/cancelled submission status row，失败/Retry 仍只在右栏；
+  permission card/notice 保持原样。`Jump to latest` 为带本地化 help/VoiceOver label 的 icon-only 原生
+  large 圆形 glass `arrow.down`，并按包含 sidebar 的整个 app-window content 横向居中；测试须覆盖
+  Chat/Cowork full-detail surface、Code thread+inspector surface、sidebar/inspector resize 与 nil-host
+  fixture fallback。Cowork 不再按 rail clearance 右移。Cowork Tasks 默认态只显示 `Tasks` + completed/total、单一 status marker、
+  标题和可选 trailing disclosure；展开后 detail/result/evidence/dependency/invocation links 仍可读；
 - composer 单行/多行、model menu、usage、Send/Stop；macOS 第一排只保留 Context，iOS Chat 继续完整
   latest-turn usage；
 - iOS composer 获得焦点后，Send 按钮与键盘提交都应立即收起键盘；重新聚焦后在消息区上下拖动应
@@ -761,6 +770,49 @@ INTATIS_REAL_MULTIMODAL_SMOKE=1 swift test \
   线上 provider smoke 必须单独记录，不能从离线测试或编译外推。
 
 ## 最近一次真实结果
+
+### 2026-08-21 macOS 对话 chrome 与 Cowork Tasks 收口
+
+- macOS Chat 与共享 Code/Cowork 用户气泡继续使用官方 SwiftUI `Glass.regular`，只把 continuous
+  corner radius 从 16 调为 20。Code/Cowork 删除 user row 内 ordinary submission status renderer，
+  同时移除会把短消息撑到最大宽度的内部 status `Spacer`；Submission/EventLog/projection 和右栏
+  failure/Retry 未改。Permission card/notice 源码、位置和运行态截图保持原样。
+- `IntatisJumpToLatestButton` 改为 `arrow.down` + native large circular glass control，保留本地化 help、
+  VoiceOver label 和原 accessibility identifier。Chat/Code/Cowork overlay 改为 `.bottom`；macOS root
+  注入当前 window content width，纯 layout policy 再用 detail 与 overlay surface width 补偿真实 sidebar/
+  inspector，使最终中心等于整个 app window 中心。Cowork 删除 rail `trailingContentMargin` 偏移，
+  ScrollView 仍跨越 thread + rail；standalone fixture offset 为零。Cowork Tasks 把 progress 合并进 header，row 收口为
+  单一 marker、两行以内标题和可选 trailing chevron；status 继续通过 accessibility value/help 暴露，
+  detail disclosure 仍展示完整 durable facts。
+- Agents card 的 header 改为系统 `person.2.fill`；row status 最终从原始 13pt/20pt 明显放大到 20pt/30pt，并使用
+  hierarchical 圆形 SF Symbol family。running 不再显示媒体式 `play.circle.fill`，failure/blocked/
+  limited/cancelled 也不再混用 triangle、octagon、gauge 或 slash；没有新增自绘 icon 或图片资源。
+- `jq empty Apps/SharedResources/Localizable.xcstrings` 通过；新增 Show/Hide task details 的 English/
+  简体中文字符串。`ThreadLayoutTests` 29/29、0 failures，新增 source-shape 回归冻结 20pt glass、
+  submission status row 缺席、large 圆形且 whole-window 居中的 Jump button 和 compact Tasks；新增纯
+  geometry test 冻结 sidebar/inspector compensation 与 nil-host fallback；Agent status follow-up 另与
+  `CoworkInferencePresentationTests` 8/8 组合为 37/37、0 failures；`swift build
+  --disable-automatic-resolution` 退出 0。
+- `xcodegen generate` 退出 0；`IntatisMac` macOS Debug unsigned build（`ENABLE_DEBUG_DYLIB=NO`、
+  独立 `/private/tmp/IntatisDerivedData-ui-pass`）退出 0，只有仓库既有 warnings。另以现有
+  `.CoworkAgentConversationFixture` bundle suffix 构建离线 production-surface fixture，退出 0。
+  `IntatisiOS` generic Simulator Debug unsigned build 也退出 0，证明共享 ThreadSurfaces/String Catalog
+  没有破坏 iOS Chat 子集；iOS 用户气泡半径未随本次 macOS pass 修改。
+- Agent status follow-up 重新运行 `xcodegen generate`，并分别以
+  `/private/tmp/IntatisDerivedData-agent-symbols` 与
+  `/private/tmp/IntatisDerivedData-ios-agent-symbols` 构建 macOS/iOS Debug，均退出 0；unique
+  `.CoworkAgentConversationFixture` 也在 `/private/tmp/IntatisUIAgentStatusFixtureBuild` 构建通过。
+- Computer Use 在刚构建的真实 Cowork session 中确认：短用户消息为紧凑胶囊感玻璃气泡且无
+  `Completed` 等 status；Tasks 显示 `Tasks 0/1` 与一行 marker/title/disclosure；既有
+  `finish_run approved` permission notice 仍存在。离线 fixture 的 Earlier 页同时确认圆形下箭头
+  `Jump to latest` 可见、尺寸更实用、位于 fixture 整体横向中线且 AX label 正确；整个 app window 的
+  sidebar/inspector 补偿由纯 geometry test 精确验证。真实 app/fixture 均未调用 provider、修改 workspace
+  或发送消息。
+  Agent status follow-up 的新 fixture 还确认 `person.2.fill` header、20pt/30pt hierarchical
+  `ellipsis.circle.fill` running markers 清晰可见，行高、选中背景、名称与模型标签均未挤压；fixture
+  关闭前未触发任何数据面动作。
+  未验证 Dark、Reduce Transparency、Increase Contrast、VoiceOver 实际朗读、多任务长列表或 iOS 像素；
+  这些仍是手动矩阵。
 
 ### 2026-08-21 固定只读工具默认放行
 

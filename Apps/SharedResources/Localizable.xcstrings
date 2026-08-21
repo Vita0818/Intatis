@@ -6605,6 +6605,23 @@
         }
       }
     },
+    "Hide task details" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hide task details"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "隐藏任务详情"
+          }
+        }
+      }
+    },
     "HIGH" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -12581,6 +12598,23 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "显示检查器"
+          }
+        }
+      }
+    },
+    "Show task details" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Show task details"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "显示任务详情"
           }
         }
       }

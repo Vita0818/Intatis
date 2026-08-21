@@ -633,6 +633,7 @@ private struct CoworkStatusRailRenderBoundary<Content: View>: View, Equatable {
 /// the roster/inspector exposes the sub-agent activity Main schedules.
 public struct CoworkShell: View {
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.intatisWindowContentWidth) private var windowContentWidth
 
     private let threadPage: CoworkAgentThreadPage
     private let presentationScope: IntatisThreadPresentationScope
@@ -852,7 +853,13 @@ public struct CoworkShell: View {
                     inspectorIsVisible: inspectorLayout.isVisible,
                     showsPermissionFallback: pending != nil
                         && !inspectorLayout.isVisible,
-                    trailingStatusRailWidth: trailingStatusRailWidth)
+                    trailingStatusRailWidth: trailingStatusRailWidth,
+                    jumpHorizontalOffset:
+                        IntatisWindowCenteredOverlayLayoutPolicy
+                            .horizontalOffset(
+                                windowWidth: windowContentWidth,
+                                detailWidth: rawWidth,
+                                overlaySurfaceWidth: rawWidth))
                     .frame(
                         width: rawWidth,
                         height: rawHeight,
@@ -894,7 +901,8 @@ public struct CoworkShell: View {
                               inspectorIsAvailable: Bool,
                               inspectorIsVisible: Bool,
                               showsPermissionFallback: Bool,
-                              trailingStatusRailWidth: CGFloat) -> some View {
+                              trailingStatusRailWidth: CGFloat,
+                              jumpHorizontalOffset: CGFloat) -> some View {
         VStack(spacing: 0) {
             header(
                 layout: layout,
@@ -905,7 +913,8 @@ public struct CoworkShell: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             thread(
                 layout: layout,
-                trailingContentMargin: trailingStatusRailWidth)
+                trailingContentMargin: trailingStatusRailWidth,
+                jumpHorizontalOffset: jumpHorizontalOffset)
             if showsPermissionFallback {
                 permissionFallbackArea(layout: layout)
                     .frame(width: layout.rawWidth)
@@ -1051,7 +1060,7 @@ public struct CoworkShell: View {
     }
 
     private var agentStatusSection: some View {
-        rightRailSection("Agents", systemImage: "person.2") {
+        rightRailSection("Agents", systemImage: "person.2.fill") {
             agentStatusList
         }
     }
@@ -1098,9 +1107,10 @@ public struct CoworkShell: View {
     private func agentStatusRowContent(_ agent: CoworkAgentInfo) -> some View {
         return HStack(alignment: .center, spacing: 10) {
             Image(systemName: statusIconName(for: agent.status))
-                .font(IntatisTypography.system(size: 13, weight: .semibold))
+                .symbolRenderingMode(.hierarchical)
+                .font(.system(size: 20, weight: .semibold))
                 .foregroundStyle(statusColor(for: agent.status))
-                .frame(width: 20, height: 20)
+                .frame(width: 30, height: 30)
             VStack(alignment: .leading, spacing: 3) {
                 Text("@\(agent.name)")
                     .font(IntatisTypography.system(.body, weight: .semibold))
@@ -1150,9 +1160,31 @@ public struct CoworkShell: View {
     }
 
     private var workTasksSection: some View {
-        rightRailSection("Session Tasks", systemImage: "checklist") {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Label(
+                    IntatisLocalization.string("Tasks"),
+                    systemImage: "checklist")
+                    .font(IntatisTypography.system(.title3, weight: .semibold))
+                    .foregroundStyle(threadStyle.primaryText)
+                Spacer(minLength: 8)
+                Text("\(workTasks.completedCount)/\(workTasks.totalCount)")
+                    .font(IntatisTypography.system(
+                        .caption,
+                        monospacedDigits: true))
+                    .foregroundStyle(threadStyle.secondaryText)
+                    .accessibilityLabel(IntatisLocalization.format(
+                        "%lld / %lld complete",
+                        Int64(workTasks.completedCount),
+                        Int64(workTasks.totalCount)))
+            }
             workTasksContent
         }
+        .padding(18)
+        .frame(
+            width: IntatisCoworkStatusRailLayoutPolicy.cardWidth,
+            alignment: .leading)
+        .intatisClearLiquidGlass(cornerRadius: 22)
         .accessibilityIdentifier("cowork.tasks.card")
     }
 
@@ -1271,31 +1303,10 @@ public struct CoworkShell: View {
                 .font(IntatisTypography.system(.caption))
                 .foregroundStyle(threadStyle.tertiaryText)
         } else {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    Text(IntatisLocalization.format(
-                        "%lld / %lld complete",
-                        Int64(workTasks.completedCount),
-                        Int64(workTasks.totalCount)))
-                        .font(IntatisTypography.system(.caption, bold: true))
-                        .foregroundStyle(threadStyle.secondaryText)
-                    if workTasks.runningCount > 0 {
-                        Text(IntatisLocalization.format(
-                            "· %lld running",
-                            Int64(workTasks.runningCount)))
-                            .font(IntatisTypography.system(.caption))
-                            .foregroundStyle(threadStyle.accent)
-                    }
-                    Spacer(minLength: 0)
-                }
-
-                ForEach(Array(workTasks.tasks.enumerated()), id: \.element.id) { index, task in
-                    if index > 0 {
-                        Divider().opacity(0.25)
-                    }
+            VStack(alignment: .leading, spacing: 12) {
+                ForEach(workTasks.tasks) { task in
                     CoworkWorkTaskRow(
                         task: task,
-                        ordinal: task.ordinal ?? index + 1,
                         style: threadStyle)
                 }
             }
@@ -1807,19 +1818,21 @@ public struct CoworkShell: View {
     private func statusIconName(for status: String) -> String {
         switch normalizedStatus(status) {
         case "failed", "error", "rejected":
-            return "exclamationmark.triangle.fill"
+            return "exclamationmark.circle.fill"
         case "active", "in_progress", "inprogress", "running", "thinking", "tool":
-            return "play.circle.fill"
+            return "ellipsis.circle.fill"
         case "blocked":
-            return "exclamationmark.octagon.fill"
+            return "pause.circle.fill"
         case "budget_limited", "usage_limited":
-            return "gauge.with.dots.needle.67percent"
-        case "assigned", "paused", "pending", "queued", "ready", "mailbox":
+            return "hourglass.circle.fill"
+        case "paused":
+            return "pause.circle.fill"
+        case "assigned", "pending", "queued", "ready", "mailbox":
             return "clock.fill"
         case "completed", "complete", "done":
             return "checkmark.circle.fill"
         case "cancelled", "canceled":
-            return "slash.circle.fill"
+            return "xmark.circle.fill"
         case "detached", "removed", "cleaned":
             return "minus.circle.fill"
         default:
@@ -1995,7 +2008,8 @@ public struct CoworkShell: View {
 
     @ViewBuilder private func thread(
         layout: IntatisThreadContentLayout,
-        trailingContentMargin: CGFloat
+        trailingContentMargin: CGFloat,
+        jumpHorizontalOffset: CGFloat
     ) -> some View {
         let historyWindow = threadHistoryWindow
         let pageScope = threadPresentationScope
@@ -2040,10 +2054,7 @@ public struct CoworkShell: View {
                             CodeItemRow(
                                 item: item,
                                 style: threadStyle,
-                                layout: layout,
-                                onRetrySubmission: onRetrySubmission == nil
-                                    ? nil
-                                    : retrySubmission)
+                                layout: layout)
                         }
                         if showsVisibleThinkingIndicator {
                             IntatisThreadThinkingRow(
@@ -2105,7 +2116,11 @@ public struct CoworkShell: View {
                                 "cowork.agent-thread.empty")
                     }
                 }
-                .overlay(alignment: .bottomTrailing) {
+                // The ScrollView spans the entire Cowork detail canvas,
+                // including the area beneath the trailing rail. Center the
+                // floating action on that canvas, not on the transcript or
+                // the rail-adjusted content margin.
+                .overlay(alignment: .bottom) {
                     if historyWindow.hasLater
                         || scrollCoordinator.followState == .detachedByUser {
                         IntatisJumpToLatestButton(
@@ -2119,7 +2134,7 @@ public struct CoworkShell: View {
                                     perform: scrollPerformer(proxy))
                             }
                         }
-                        .padding(.trailing, trailingContentMargin)
+                        .offset(x: jumpHorizontalOffset)
                     }
                 }
                 .onAppear {
@@ -2349,47 +2364,59 @@ public struct CoworkShell: View {
 
 private struct CoworkWorkTaskRow: View {
     let task: CoworkWorkTaskLine
-    let ordinal: Int
     let style: IntatisThreadStyle
     @State private var isExpanded = false
 
     var body: some View {
-        Group {
+        VStack(alignment: .leading, spacing: 0) {
             if task.hasExpandedDetails {
-                DisclosureGroup(isExpanded: $isExpanded) {
-                    taskDetails
-                        .padding(.top, 7)
-                        .padding(.leading, 30)
+                Button {
+                    isExpanded.toggle()
                 } label: {
-                    taskLabel
+                    taskLabel(showsDisclosure: true)
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel(task.title)
+                .accessibilityValue(displayStatus)
+                .accessibilityHint(IntatisLocalization.string(
+                    isExpanded ? "Hide task details" : "Show task details"))
+
+                if isExpanded {
+                    taskDetails
+                        .padding(.top, 8)
+                        .padding(.leading, 32)
+                }
             } else {
-                taskLabel
+                taskLabel(showsDisclosure: false)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(task.title)
+                    .accessibilityValue(displayStatus)
             }
         }
-        .padding(.vertical, 2)
+        .padding(.vertical, 3)
         .accessibilityIdentifier("cowork.task.\(task.id)")
+        .help(displayStatus)
     }
 
-    private var taskLabel: some View {
-        HStack(alignment: .top, spacing: 8) {
+    private func taskLabel(showsDisclosure: Bool) -> some View {
+        HStack(alignment: .center, spacing: 10) {
             taskMarker
-            VStack(alignment: .leading, spacing: 3) {
-                Text(task.title)
-                    .font(IntatisTypography.system(.caption, bold: true))
-                    .foregroundStyle(task.isCompleted ? style.secondaryText : style.primaryText)
-                    .strikethrough(task.isCompleted, color: style.secondaryText)
-                    .fixedSize(horizontal: false, vertical: true)
-                HStack(alignment: .firstTextBaseline, spacing: 5) {
-                    Text(displayStatus)
-                        .font(IntatisTypography.system(.caption, bold: true))
-                        .foregroundStyle(statusColor)
-                        .lineLimit(1)
-                }
-            }
+            Text(task.title)
+                .font(IntatisTypography.system(.callout, weight: .semibold))
+                .foregroundStyle(
+                    task.isCompleted ? style.secondaryText : style.primaryText)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
+            if showsDisclosure {
+                Image(systemName: "chevron.right")
+                    .font(IntatisTypography.system(size: 10, weight: .semibold))
+                    .foregroundStyle(style.tertiaryText)
+                    .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                    .accessibilityHidden(true)
+            }
         }
+        .contentShape(Rectangle())
     }
 
     @ViewBuilder private var taskMarker: some View {
@@ -2398,43 +2425,39 @@ private struct CoworkWorkTaskRow: View {
             Image(systemName: "checkmark.circle.fill")
                 .foregroundStyle(.green)
                 .frame(width: 22, height: 22)
+                .accessibilityHidden(true)
         case "in_progress", "inprogress", "running":
             ProgressView()
                 .progressViewStyle(.circular)
                 .controlSize(.small)
                 .frame(width: 22, height: 22)
+                .accessibilityHidden(true)
         case "blocked":
             Image(systemName: "exclamationmark.octagon.fill")
                 .foregroundStyle(.orange)
                 .frame(width: 22, height: 22)
+                .accessibilityHidden(true)
         case "failed", "error":
             Image(systemName: "xmark.circle.fill")
                 .foregroundStyle(style.error)
                 .frame(width: 22, height: 22)
+                .accessibilityHidden(true)
         case "cancelled", "canceled":
             Image(systemName: "slash.circle")
                 .foregroundStyle(style.tertiaryText)
                 .frame(width: 22, height: 22)
-        case "pending", "queued":
-            Image(systemName: "clock")
-                .foregroundStyle(style.tertiaryText)
-                .frame(width: 22, height: 22)
+                .accessibilityHidden(true)
         default:
-            numberedMarker
+            neutralMarker
         }
     }
 
-    private var numberedMarker: some View {
-        ZStack {
-            Circle()
-                .stroke(statusColor, lineWidth: 1)
-            Text("\(ordinal)")
-                .font(IntatisTypography.system(size: 10, weight: .semibold))
-                .foregroundStyle(statusColor)
-                .lineLimit(1)
-                .minimumScaleFactor(0.6)
-        }
-        .frame(width: 22, height: 22)
+    private var neutralMarker: some View {
+        Circle()
+            .stroke(statusColor, lineWidth: 1.2)
+            .frame(width: 18, height: 18)
+            .frame(width: 22, height: 22)
+            .accessibilityHidden(true)
     }
 
     private var taskDetails: some View {

@@ -1,6 +1,46 @@
 #if canImport(SwiftUI)
 import SwiftUI
 
+private struct IntatisWindowContentWidthKey: EnvironmentKey {
+    static let defaultValue: CGFloat? = nil
+}
+
+public extension EnvironmentValues {
+    /// Width of the complete app-window content canvas when a host can prove
+    /// it. Standalone previews and fixtures intentionally fall back to nil.
+    var intatisWindowContentWidth: CGFloat? {
+        get { self[IntatisWindowContentWidthKey.self] }
+        set { self[IntatisWindowContentWidthKey.self] = newValue }
+    }
+}
+
+/// Places an overlay on the full app-window horizontal midpoint while the
+/// overlay itself remains owned by a leading detail/thread surface.
+public enum IntatisWindowCenteredOverlayLayoutPolicy {
+    public static func horizontalOffset(
+        windowWidth rawWindowWidth: CGFloat?,
+        detailWidth rawDetailWidth: CGFloat,
+        overlaySurfaceWidth rawOverlaySurfaceWidth: CGFloat
+    ) -> CGFloat {
+        guard let rawWindowWidth,
+              rawWindowWidth.isFinite,
+              rawWindowWidth > 0,
+              rawDetailWidth.isFinite,
+              rawDetailWidth > 0,
+              rawOverlaySurfaceWidth.isFinite,
+              rawOverlaySurfaceWidth > 0,
+              rawWindowWidth >= rawDetailWidth,
+              rawDetailWidth >= rawOverlaySurfaceWidth
+        else {
+            return 0
+        }
+
+        return rawDetailWidth
+            - rawWindowWidth / 2
+            - rawOverlaySurfaceWidth / 2
+    }
+}
+
 public struct IntatisSplitColumnLayout: Equatable {
     public var sidebarMin: CGFloat
     public var sidebarIdeal: CGFloat

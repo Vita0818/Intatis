@@ -261,8 +261,10 @@ rg -n 'glassEffect|GlassEffectContainer|buttonStyle\(\.glass|regularMaterial|win
   Material 或 `.bar` 背景。rail 使用更宽的稳定几何和更小的 leading inset，让原生 Liquid Glass
   section 明确浮在画布上而不是形成独立侧栏；最右透明命中边界与主滚动条合同不变。
 - Agents section 使用更大的原生标题、18pt 内容 inset、52pt 最小行高和系统 semantic text/status
-  color。选中 ordinary agent 只显示 accent 蓝色圆角背景，不再叠加 checkmark；detached 和控制面
-  identity 继续由既有状态图标及是否可点击表达，颜色不是唯一状态通道。
+  color。header 使用系统 `person.2.fill`；每行 status marker 直接使用 20pt SF Symbol、30pt 槽位与
+  hierarchical rendering，并统一为圆形 symbol family，不叠加自绘圆底或图片资产。选中 ordinary
+  agent 只显示 accent 蓝色圆角背景，不再叠加 checkmark；detached 和控制面 identity 继续由不同
+  原生 symbol 及是否可点击表达，颜色不是唯一状态通道。
 - Agents 按 identity 第一次 durable admission 的创建顺序稳定显示。实时消息、运行状态、detach
   或 reattach 不会重排列表，从而避免用户点击目标移动，也避免为 last-message 排序扫描长会话。
 - rail 的“割裂”按光学层级处理，而不是再增加背景板：各 passive section 使用系统原生
@@ -389,3 +391,33 @@ rg -n 'glassEffect|GlassEffectContainer|buttonStyle\(\.glass|regularMaterial|win
   交互变更外推到 iOS。
 - footer 不进入 Markdown renderer、没有 Material/Glass/card 或固定颜色，因此不改变 rich admission、
   paragraph layout、16-row paging、Cowork rail 或用户气泡合同。
+
+## 25. 2026-08-21 macOS 气泡、Jump 与 Tasks 紧凑化
+
+- macOS Chat/Code/Cowork 用户消息仍是唯一 `Glass.regular` 对话气泡；材质、语义色、trailing
+  alignment、`messageMaxWidth` 与 gutter 不变。continuous corner radius 统一为 20pt，使单行 intrinsic
+  content 呈现接近胶囊的形状，多行/附件消息仍保持圆角矩形。
+- Code/Cowork user row 不再渲染 queued/running/completed/cancelled submission status。此前 status
+  HStack 的 `Spacer` 会把短消息撑满允许宽度；删除整个 presentation row 后气泡随正文收缩。
+  SubmissionID/status/EventLog/projection、失败右栏和 Retry 不变；permission card/notice 完全不属于本次删减。
+- `Jump to latest` 复用已有 native glass helper，但使用 `.large` control size 与 13pt arrow，显示更实用的
+  圆形 `arrow.down`；视觉文字删除，但本地化 help、VoiceOver label 与 identifier 保留。macOS root
+  注入完整 window content width，纯 layout policy 用 window/detail/overlay-surface widths 补偿实际
+  sidebar 与 Code inspector；因此 Chat/Code/Cowork 都落在包含 sidebar 的整个 app window 横向中线。
+  Cowork 的 ScrollView 继续跨越 thread + rail，并删除 rail clearance 的 trailing offset；standalone
+  fixture 缺 window host 时回退自身中线。没有新增自绘图标、颜色、材质或 shape fallback，也不读取
+  screen-global geometry或写 PreferenceKey。
+- Cowork Tasks 的 `Glass.clear` card 外表面和 durable projection 不变。默认 header 只显示 `Tasks` 与
+  completed/total；row 只显示一个 status marker、标题与可选 trailing disclosure。可见 Ready/Completed
+  文案、ordinal、leading disclosure、strikethrough 和独立 progress 行均删除；status 通过 AX value/help
+  保留，展开后仍显示 detail/result/evidence/dependencies/invocations。
+- Agents header 与 row status 都直接使用系统 SF Symbols。header 为 `person.2.fill`；status marker 最终从
+  原始 13pt/20pt 明显放大到 20pt/30pt，并使用 hierarchical 圆形 symbol family，删除媒体式 play、triangle、
+  octagon、gauge 与 slash 的混合外观；没有自绘 icon、额外图片资源或自定义圆底。
+- `ThreadLayoutTests` 29/29、SwiftPM build、IntatisMac Debug、IntatisiOS Simulator Debug 与离线
+  Cowork fixture build 通过。
+  Computer Use 已在真实 Cowork session 观察短气泡和 compact Tasks，并在 fixture Earlier 页观察放大后
+  位于 fixture 整体中线的圆形 Jump button；whole-window sidebar/inspector 补偿由纯 geometry test 冻结。
+  新 agent-status fixture 另确认 `person.2.fill` header 与 20pt/30pt hierarchical 圆形 SF Symbols
+  没有挤压名称、模型标签、选中背景或 52pt row geometry。
+  Light 视觉通过，Dark/Reduce Transparency/Increase Contrast/VoiceOver 仍需后续手动矩阵。

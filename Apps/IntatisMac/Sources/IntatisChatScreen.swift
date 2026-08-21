@@ -76,6 +76,7 @@ private struct IntatisChatSessionScreen: View {
     @Environment(\.colorScheme) private var scheme
     @State private var historyWindowUpperBound: Int?
     @State private var showAttachmentImporter = false
+    @Environment(\.intatisWindowContentWidth) private var windowContentWidth
     private static let bottomAnchorID = "intatis-chat-thread-bottom"
 
     var body: some View {
@@ -196,13 +197,18 @@ private struct IntatisChatSessionScreen: View {
                 .onChange(of: chatScrollSignature) { _ in
                     scrollToBottom(proxy)
                 }
-                .overlay(alignment: .bottomTrailing) {
+                .overlay(alignment: .bottom) {
                     if historyWindow.hasLater {
                         IntatisJumpToLatestButton(
                             accessibilityIdentifier: "chat.jump-to-latest"
                         ) {
                             historyWindowUpperBound = nil
                         }
+                        .offset(x: IntatisWindowCenteredOverlayLayoutPolicy
+                            .horizontalOffset(
+                                windowWidth: windowContentWidth,
+                                detailWidth: layout.rawWidth,
+                                overlaySurfaceWidth: layout.rawWidth))
                     }
                 }
             }
@@ -477,7 +483,7 @@ struct IntatisMessageBubble: View {
             bubbleBody
                 .padding(.horizontal, 15)
                 .padding(.vertical, 11)
-                .intatisLiquidGlass(cornerRadius: 16)
+                .intatisLiquidGlass(cornerRadius: 20)
         } else {
             bubbleBody
                 .padding(.vertical, 8)

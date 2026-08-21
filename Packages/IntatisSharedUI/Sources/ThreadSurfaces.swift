@@ -1514,11 +1514,13 @@ public struct IntatisJumpToLatestButton: View {
         Button(action: action) {
             Label(
                 IntatisLocalization.string("Jump to latest"),
-                systemImage: "arrow.down.to.line")
-                .font(IntatisTypography.system(.caption, bold: true))
+                systemImage: "arrow.down")
+                .font(IntatisTypography.system(size: 13, weight: .semibold))
         }
-        .buttonStyle(.bordered)
-        .controlSize(.small)
+        .intatisCompactIconButton(controlSize: .large)
+        .contentShape(Circle())
+        .help(IntatisLocalization.string("Jump to latest"))
+        .accessibilityLabel(IntatisLocalization.string("Jump to latest"))
         .accessibilityIdentifier(accessibilityIdentifier)
         .padding(12)
     }
@@ -1951,9 +1953,12 @@ public extension View {
 
     /// Shared geometry for compact icon-only actions. The visual treatment is
     /// still supplied by SwiftUI's native glass/bordered button styles.
-    func intatisCompactIconButton(prominent: Bool = false) -> some View {
+    func intatisCompactIconButton(
+        prominent: Bool = false,
+        controlSize: ControlSize = .regular
+    ) -> some View {
         labelStyle(.iconOnly)
-            .controlSize(.regular)
+            .controlSize(controlSize)
             .buttonBorderShape(.circle)
             .intatisGlassButton(prominent: prominent)
     }

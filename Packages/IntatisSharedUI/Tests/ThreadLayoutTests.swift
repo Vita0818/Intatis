@@ -213,6 +213,40 @@ final class ThreadLayoutTests: XCTestCase {
             .constrained(isTrailing: false, maxWidth: 560, gutter: 48))
     }
 
+    func testWindowCenteredOverlayAccountsForSidebarAndInspectorWidths() {
+        let windowWidth: CGFloat = 1_200
+        let sidebarWidth: CGFloat = 236
+        let detailWidth = windowWidth - sidebarWidth
+
+        let fullDetailOffset =
+            IntatisWindowCenteredOverlayLayoutPolicy.horizontalOffset(
+                windowWidth: windowWidth,
+                detailWidth: detailWidth,
+                overlaySurfaceWidth: detailWidth)
+        XCTAssertEqual(fullDetailOffset, -sidebarWidth / 2)
+        XCTAssertEqual(
+            sidebarWidth + detailWidth / 2 + fullDetailOffset,
+            windowWidth / 2)
+
+        let inspectorWidth: CGFloat = 292
+        let threadWidth = detailWidth - inspectorWidth
+        let threadOffset =
+            IntatisWindowCenteredOverlayLayoutPolicy.horizontalOffset(
+                windowWidth: windowWidth,
+                detailWidth: detailWidth,
+                overlaySurfaceWidth: threadWidth)
+        XCTAssertEqual(
+            sidebarWidth + threadWidth / 2 + threadOffset,
+            windowWidth / 2)
+
+        XCTAssertEqual(
+            IntatisWindowCenteredOverlayLayoutPolicy.horizontalOffset(
+                windowWidth: nil,
+                detailWidth: detailWidth,
+                overlaySurfaceWidth: detailWidth),
+            0)
+    }
+
     func testUserMessagesDoNotRepeatAnIdentityHeader() {
         XCTAssertFalse(IntatisMessageHeaderPolicy.showsIdentity(for: .user))
         XCTAssertTrue(IntatisMessageHeaderPolicy.showsIdentity(for: .assistant))
@@ -349,7 +383,7 @@ final class ThreadLayoutTests: XCTestCase {
             to: "struct IntatisComposer: View")
         XCTAssertTrue(macMessageBubble.contains("if isUser {"))
         XCTAssertTrue(macMessageBubble.contains(
-            ".intatisLiquidGlass(cornerRadius: 16)"))
+            ".intatisLiquidGlass(cornerRadius: 20)"))
         XCTAssertFalse(macMessageBubble.contains(".intatisContentSurface("))
         XCTAssertFalse(macMessageBubble.contains("userSelectionStroke"))
         XCTAssertFalse(macMessageBubble.contains("isUninterruptedAgentReply"))
@@ -364,10 +398,157 @@ final class ThreadLayoutTests: XCTestCase {
             to: "private func bubbleBody")
         XCTAssertTrue(codeBubbleContent.contains("if isUser {"))
         XCTAssertTrue(codeBubbleContent.contains(
-            ".intatisLiquidGlass(cornerRadius: 16)"))
+            ".intatisLiquidGlass(cornerRadius: 20)"))
         XCTAssertFalse(codeBubbleContent.contains("item.isFailure"))
         XCTAssertFalse(codeBubbleContent.contains(".intatisContentSurface("))
         XCTAssertFalse(codeSource.contains("private func bubbleStroke(isUser:"))
+        XCTAssertFalse(codeSource.contains("submissionStatusView"))
+        XCTAssertFalse(codeSource.contains("submissionStatusLabel"))
+    }
+
+    func testJumpToLatestUsesNativeCircularGlassIcon() throws {
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: packageRoot
+                .appendingPathComponent("Sources/ThreadSurfaces.swift"),
+            encoding: .utf8)
+        let start = try XCTUnwrap(source.range(
+            of: "public struct IntatisJumpToLatestButton: View"))
+        let end = try XCTUnwrap(source.range(
+            of: "public enum IntatisThreadHistoryWindowPolicy",
+            range: start.upperBound..<source.endIndex))
+        let buttonSource = source[start.lowerBound..<end.lowerBound]
+
+        XCTAssertTrue(buttonSource.contains("systemImage: \"arrow.down\""))
+        XCTAssertTrue(buttonSource.contains(
+            ".intatisCompactIconButton(controlSize: .large)"))
+        XCTAssertTrue(buttonSource.contains(".contentShape(Circle())"))
+        XCTAssertTrue(buttonSource.contains(".accessibilityLabel("))
+        XCTAssertTrue(buttonSource.contains(".help("))
+        XCTAssertFalse(buttonSource.contains("arrow.down.to.line"))
+        XCTAssertFalse(buttonSource.contains(".buttonStyle(.bordered)"))
+
+        let repositoryRoot = packageRoot
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let macChatSource = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Apps/IntatisMac/Sources/IntatisChatScreen.swift"),
+            encoding: .utf8)
+        let codeSource = try String(
+            contentsOf: packageRoot.appendingPathComponent(
+                "Sources/CodeViews.swift"),
+            encoding: .utf8)
+        let coworkSource = try String(
+            contentsOf: packageRoot.appendingPathComponent(
+                "Sources/CoworkViews.swift"),
+            encoding: .utf8)
+        for source in [macChatSource, codeSource, coworkSource] {
+            XCTAssertTrue(source.contains(".overlay(alignment: .bottom)"))
+            XCTAssertFalse(source.contains(
+                ".overlay(alignment: .bottomTrailing)"))
+            XCTAssertTrue(source.contains(
+                "IntatisWindowCenteredOverlayLayoutPolicy"))
+        }
+        XCTAssertFalse(coworkSource.contains(
+            ".padding(.trailing, trailingContentMargin)"))
+
+        let macRootSource = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Apps/IntatisMac/Sources/IntatisMacRootView.swift"),
+            encoding: .utf8)
+        XCTAssertTrue(macRootSource.contains(
+            "\\.intatisWindowContentWidth"))
+    }
+
+    func testCoworkTasksUseCompactHeaderAndSingleStatusMarker() throws {
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: packageRoot
+                .appendingPathComponent("Sources/CoworkViews.swift"),
+            encoding: .utf8)
+
+        let sectionStart = try XCTUnwrap(source.range(
+            of: "private var workTasksSection: some View"))
+        let sectionEnd = try XCTUnwrap(source.range(
+            of: "private func formatElapsed",
+            range: sectionStart.upperBound..<source.endIndex))
+        let sectionSource = source[
+            sectionStart.lowerBound..<sectionEnd.lowerBound]
+        XCTAssertTrue(sectionSource.contains(
+            "IntatisLocalization.string(\"Tasks\")"))
+        XCTAssertTrue(sectionSource.contains(
+            "Text(\"\\(workTasks.completedCount)/\\(workTasks.totalCount)\")"))
+        XCTAssertFalse(sectionSource.contains("Session Tasks"))
+        XCTAssertFalse(sectionSource.contains("· %lld running"))
+
+        let rowStart = try XCTUnwrap(source.range(
+            of: "private struct CoworkWorkTaskRow: View"))
+        let rowEnd = try XCTUnwrap(source.range(
+            of: "private struct CoworkTaskLineRow: View",
+            range: rowStart.upperBound..<source.endIndex))
+        let rowSource = source[rowStart.lowerBound..<rowEnd.lowerBound]
+        XCTAssertTrue(rowSource.contains("systemName: \"chevron.right\""))
+        XCTAssertTrue(rowSource.contains("neutralMarker"))
+        XCTAssertTrue(rowSource.contains(".accessibilityValue(displayStatus)"))
+        XCTAssertFalse(rowSource.contains("DisclosureGroup"))
+        XCTAssertFalse(rowSource.contains("let ordinal:"))
+        XCTAssertFalse(rowSource.contains("Text(displayStatus)"))
+        XCTAssertFalse(rowSource.contains(".strikethrough("))
+    }
+
+    func testCoworkAgentStatusUsesLargerNativeCircularSymbols() throws {
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: packageRoot
+                .appendingPathComponent("Sources/CoworkViews.swift"),
+            encoding: .utf8)
+
+        XCTAssertTrue(source.contains(
+            "rightRailSection(\"Agents\", systemImage: \"person.2.fill\")"))
+
+        let rowStart = try XCTUnwrap(source.range(
+            of: "private func agentStatusRowContent("))
+        let rowEnd = try XCTUnwrap(source.range(
+            of: "private var goalCardSection",
+            range: rowStart.upperBound..<source.endIndex))
+        let rowSource = source[rowStart.lowerBound..<rowEnd.lowerBound]
+        XCTAssertTrue(rowSource.contains(
+            ".symbolRenderingMode(.hierarchical)"))
+        XCTAssertTrue(rowSource.contains(
+            ".font(.system(size: 20, weight: .semibold))"))
+        XCTAssertTrue(rowSource.contains(
+            ".frame(width: 30, height: 30)"))
+
+        let iconStart = try XCTUnwrap(source.range(
+            of: "private func statusIconName(for status: String)"))
+        let iconEnd = try XCTUnwrap(source.range(
+            of: "private func normalizedStatus(_ status: String)",
+            range: iconStart.upperBound..<source.endIndex))
+        let iconSource = source[iconStart.lowerBound..<iconEnd.lowerBound]
+        for systemName in [
+            "exclamationmark.circle.fill",
+            "ellipsis.circle.fill",
+            "pause.circle.fill",
+            "hourglass.circle.fill",
+            "clock.fill",
+            "checkmark.circle.fill",
+            "xmark.circle.fill",
+            "minus.circle.fill",
+            "circle",
+        ] {
+            XCTAssertTrue(iconSource.contains("return \"\(systemName)\""))
+        }
+        XCTAssertFalse(iconSource.contains("play.circle.fill"))
+        XCTAssertFalse(iconSource.contains("exclamationmark.triangle.fill"))
+        XCTAssertFalse(iconSource.contains("gauge.with.dots.needle"))
+        XCTAssertFalse(iconSource.contains("slash.circle.fill"))
     }
 
     func testThreadErrorsCollectEveryConversationSourceAndLeaveTranscriptClean() throws {

@@ -49,6 +49,7 @@ public struct CodeShell: View {
     @Binding private var showsInspector: Bool
     @StateObject private var scrollCoordinator = IntatisThreadScrollCoordinator()
     @State private var historySelection: IntatisThreadHistorySelection?
+    @Environment(\.intatisWindowContentWidth) private var windowContentWidth
 
     public init(items: [CodeItem],
                 presentationScope: IntatisThreadPresentationScope,
@@ -127,7 +128,12 @@ public struct CodeShell: View {
             threadColumn(
                 layout: IntatisThreadContentLayout(
                     rawWidth: inspectorLayout.threadWidth),
-                inspectorIsAvailable: rawWidth >= 940)
+                inspectorIsAvailable: rawWidth >= 940,
+                jumpHorizontalOffset:
+                    IntatisWindowCenteredOverlayLayoutPolicy.horizontalOffset(
+                        windowWidth: windowContentWidth,
+                        detailWidth: rawWidth,
+                        overlaySurfaceWidth: inspectorLayout.threadWidth))
                 .frame(width: inspectorLayout.threadWidth)
                 .frame(maxHeight: .infinity)
             if inspectorLayout.isVisible {
@@ -149,13 +155,16 @@ public struct CodeShell: View {
 
     private func threadColumn(
         layout: IntatisThreadContentLayout,
-        inspectorIsAvailable: Bool
+        inspectorIsAvailable: Bool,
+        jumpHorizontalOffset: CGFloat
     ) -> some View {
         VStack(spacing: 0) {
             header(
                 layout: layout,
                 inspectorIsAvailable: inspectorIsAvailable)
-            thread(layout: layout)
+            thread(
+                layout: layout,
+                jumpHorizontalOffset: jumpHorizontalOffset)
             permissionArea(layout: layout)
             composerArea(layout: layout)
         }
@@ -197,7 +206,10 @@ public struct CodeShell: View {
             }
     }
 
-    @ViewBuilder private func thread(layout: IntatisThreadContentLayout) -> some View {
+    @ViewBuilder private func thread(
+        layout: IntatisThreadContentLayout,
+        jumpHorizontalOffset: CGFloat
+    ) -> some View {
         if displayedItems.isEmpty && !showsThinkingIndicator {
             CodeEmptyThreadView(style: threadStyle)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -270,7 +282,7 @@ public struct CodeShell: View {
                     .padding(.top, 16)
                 }
                 .scrollContentBackground(.hidden)
-                .overlay(alignment: .bottomTrailing) {
+                .overlay(alignment: .bottom) {
                     if historyWindow.hasLater
                         || scrollCoordinator.followState == .detachedByUser {
                         IntatisJumpToLatestButton(
@@ -284,6 +296,7 @@ public struct CodeShell: View {
                                     perform: scrollPerformer(proxy))
                             }
                         }
+                        .offset(x: jumpHorizontalOffset)
                     }
                 }
                 .onAppear {
@@ -478,16 +491,13 @@ struct CodeItemRow: View {
     let item: CodeItem
     let style: IntatisThreadStyle
     let layout: IntatisThreadContentLayout
-    let onRetrySubmission: ((SubmissionID) -> Void)?
 
     init(item: CodeItem,
          style: IntatisThreadStyle = .standard(.light),
-         layout: IntatisThreadContentLayout = IntatisThreadContentLayout(rawWidth: 900),
-         onRetrySubmission: ((SubmissionID) -> Void)? = nil) {
+         layout: IntatisThreadContentLayout = IntatisThreadContentLayout(rawWidth: 900)) {
         self.item = item
         self.style = style
         self.layout = layout
-        self.onRetrySubmission = onRetrySubmission
     }
 
     var body: some View {
@@ -568,7 +578,7 @@ struct CodeItemRow: View {
             bubbleBody(title: title, body: body, isUser: isUser, tags: tags)
                 .padding(.horizontal, 15)
                 .padding(.vertical, 11)
-                .intatisLiquidGlass(cornerRadius: 16)
+                .intatisLiquidGlass(cornerRadius: 20)
         } else {
             bubbleBody(title: title, body: body, isUser: false, tags: tags)
                 .padding(.vertical, 8)
@@ -637,77 +647,11 @@ struct CodeItemRow: View {
                 }
                 #endif
             }
-            if isUser,
-               let submissionID = item.submissionID,
-               let submissionStatus = item.submissionStatus,
-               submissionStatus != .failed,
-               item.submissionFailure == nil {
-                submissionStatusView(
-                    id: submissionID,
-                    status: submissionStatus,
-                    failure: item.submissionFailure)
-            }
         }
     }
 
     private func displayTitle(_ title: String) -> String {
         title == "Agent" ? "Intatis" : title
-    }
-
-    private func submissionStatusView(
-        id: SubmissionID,
-        status: SubmissionStatus,
-        failure: SubmissionFailure?
-    ) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Image(systemName: submissionStatusIcon(status))
-                .foregroundStyle(status == .failed || status == .cancelled
-                    ? style.error
-                    : style.secondaryText)
-                .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(submissionStatusLabel(status))
-                    .font(IntatisTypography.system(.caption2, bold: true))
-                    .foregroundStyle(status == .failed || status == .cancelled
-                        ? style.error
-                        : style.secondaryText)
-                if let failure {
-                    Text(failure.message)
-                        .font(IntatisTypography.system(.caption2))
-                        .foregroundStyle(style.secondaryText)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-            Spacer(minLength: 4)
-            if failure?.retryable == true, let onRetrySubmission {
-                Button("Retry") { onRetrySubmission(id) }
-                    .buttonStyle(.borderless)
-                    .font(IntatisTypography.system(.caption, bold: true))
-                    .accessibilityIdentifier("submission.\(id.rawValue).retry")
-            }
-        }
-        .accessibilityElement(children: .contain)
-        .accessibilityIdentifier("submission.\(id.rawValue).status")
-    }
-
-    private func submissionStatusLabel(_ status: SubmissionStatus) -> String {
-        switch status {
-        case .queued: return IntatisLocalization.string("Queued locally")
-        case .running: return IntatisLocalization.string("Running")
-        case .completed: return IntatisLocalization.string("Completed")
-        case .failed: return IntatisLocalization.string("Needs attention")
-        case .cancelled: return IntatisLocalization.string("Cancelled")
-        }
-    }
-
-    private func submissionStatusIcon(_ status: SubmissionStatus) -> String {
-        switch status {
-        case .queued: return "clock"
-        case .running: return "arrow.triangle.2.circlepath"
-        case .completed: return "checkmark.circle.fill"
-        case .failed: return "exclamationmark.circle.fill"
-        case .cancelled: return "xmark.circle.fill"
-        }
     }
 
     private func card(icon: String, title: String, body: String, tint: Color) -> some View {

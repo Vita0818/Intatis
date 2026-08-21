@@ -106,6 +106,15 @@ struct IntatisMacRootView: View {
     }
 
     var body: some View {
+        GeometryReader { proxy in
+            root
+                .environment(
+                    \.intatisWindowContentWidth,
+                    proxy.size.width)
+        }
+    }
+
+    private var root: some View {
         NavigationSplitView {
             IntatisSidebar(
                 items: items,

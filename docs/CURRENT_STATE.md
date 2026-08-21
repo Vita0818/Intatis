@@ -423,6 +423,18 @@ profiles 与外部 MCP client。macOS/Linux 的 stdio、sandbox、bwrap/guard �
   该气泡使用原生 `Glass.regular` 且不再叠加 accent 蓝色描边。assistant/agent/system 对话正文
   （包括失败/中断回复）直接落在 conversation canvas；tool、error、permission、Goal/Task 等
   专用结构化状态继续使用 Material 边界。
+- macOS Chat/Code/Cowork 的用户气泡现使用 20pt continuous rounded rectangle；单行消息接近胶囊，
+  多行/附件消息仍保持圆角矩形。Code/Cowork 不再在用户气泡内显示 queued/running/completed/
+  cancelled submitted-intent 生命周期标签，底层 SubmissionID/status/EventLog/projection 与失败/Retry
+  右栏路由不变。共享 `Jump to latest` 使用稍大的原生 large 圆形 glass 下箭头，并保留 help/VoiceOver
+  标签；macOS root 注入每个窗口的完整 content width，Chat/Code/Cowork 再结合各自 detail/thread
+  surface width 计算 offset，使按钮落在包含 sidebar 的整个 app window 横向中线，不再按 transcript、
+  inspector 或 Cowork rail clearance 偏移。standalone fixture 缺 window host 时安全回退自身中线。
+  Cowork `Tasks` 卡默认只显示标题内完成分数，以及每行一个状态 marker、任务名和有详情时的
+  trailing disclosure；durable WorkTask status、详情、result/evidence/dependencies/invocation links 不变。
+  `Agents` header 与每行状态标记全部直接使用 SF Symbols；header 为 `person.2.fill`，状态标记使用
+  20pt 系统 symbol font、30pt 固定槽位和 hierarchical rendering，并统一为圆形语义符号，不包含
+  自绘 icon、图片资源或自定义圆底。durable agent status、创建顺序、选择与控制面 status-only 边界不变。
 - iOS 与 macOS 的标题/正文继续共享语义字号、字重和 Dynamic Type 层级。macOS Chat/Code/Cowork
   composer 第一排只保留 model/profile 与会话级 Context；每条已完成 assistant/agent 回复在正文
   下方显示无文字的 `doc.on.doc` 复制按钮，以及该 exact turn 可证明的 Input/Cached/Output/Time。
