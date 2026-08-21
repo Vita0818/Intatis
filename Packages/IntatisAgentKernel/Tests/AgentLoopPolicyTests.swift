@@ -1382,6 +1382,22 @@ final class AgentLoopPolicyTests: XCTestCase {
         XCTAssertEqual(results.first?.outcome, .failed)
         XCTAssertEqual(results.first?.failureSource, .runtimeFailed)
         XCTAssertEqual(results.last?.outcome, .succeeded)
+        XCTAssertFalse(events.contains { envelope in
+            if case .permissionRequest = envelope.event { return true }
+            return false
+        })
+        let permissionResolutions = events.compactMap {
+            envelope -> PermissionResolvedPayload? in
+            guard case .permissionResolved(let payload) = envelope.event
+            else { return nil }
+            return payload
+        }
+        XCTAssertEqual(permissionResolutions.count, 2)
+        XCTAssertTrue(permissionResolutions.allSatisfy {
+            $0.decision == .allow
+                && $0.requestId == nil
+                && $0.source == .deterministicPolicy
+        })
         let settlements = events.compactMap {
             envelope -> ToolExecutionSettledPayload? in
             guard case .toolExecutionSettled(let payload) = envelope.event

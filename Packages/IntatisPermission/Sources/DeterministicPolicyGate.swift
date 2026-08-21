@@ -44,7 +44,8 @@ public struct DeterministicPolicyGate: Sendable {
 
         // 3. Fixed structured readers may use a sandboxed parser/OCR process
         // without gaining arbitrary shell or workspace mutation authority.
-        // They still pass through the reviewer route as process execution.
+        // Their existing exact read-only classification is allowed without a
+        // reviewer while the network prohibition remains final.
         if call.sideEffect == .exec,
            call.intent.isStructuredReadOnlyExecution {
             guard call.risksNetwork == false else {
@@ -52,7 +53,7 @@ public struct DeterministicPolicyGate: Sendable {
                     reason: "structured read-only execution cannot access the network",
                     risk: .high)
             }
-            return .pass(
+            return .allow(
                 reason: "run fixed structured read-only document backend",
                 risk: .medium)
         }
@@ -92,16 +93,14 @@ public struct DeterministicPolicyGate: Sendable {
             return evaluateWrite(call, ctx)
         }
 
-        // Mounted knowledge is read-only at the filesystem/data layer, but it
-        // can inject untrusted external assertions into the answering model.
-        // Keep that trust-boundary decision on the same reviewer/correlation
-        // path as the frozen RAG contract instead of inheriting the generic
-        // auto-allow used by ordinary local file reads.
+        // A host-mounted local knowledge snapshot belongs to the existing
+        // read-only allow set. Network-backed knowledge retains a network
+        // effect and is handled by the earlier review path.
         if call.toolName == "search_knowledge",
            call.sideEffect == .readOnly,
            call.risksNetwork == false,
            call.intent.action == "knowledge.search.local" {
-            return .pass(
+            return .allow(
                 reason: "search host-mounted untrusted knowledge evidence",
                 risk: .low)
         }

@@ -62,7 +62,7 @@ final class IntatisPermissionTests: XCTestCase {
         }
     }
 
-    func testGateLocalKnowledgeSearchPassesToReviewerInsteadOfGenericReadAllow() {
+    func testGateAllowsLocalKnowledgeSearchWithoutReviewer() {
         let intent = PermissionIntent(
             action: "knowledge.search.local",
             resources: [PermissionResource(
@@ -70,13 +70,13 @@ final class IntatisPermissionTests: XCTestCase {
                 value: "knowledge_base:host-bound")],
             dataEffects: [.read],
             replayPolicy: .safeToReplay)
-        guard case .pass(let reason, let risk) = gate.evaluate(
+        guard case .allow(let reason, let risk) = gate.evaluate(
             call(
                 "search_knowledge",
                 .readOnly,
                 intent: intent),
             ctx(profile: .reviewed)) else {
-            return XCTFail("local knowledge search should reach the reviewer route")
+            return XCTFail("local knowledge search should use the read-only allow route")
         }
         XCTAssertEqual(reason, "search host-mounted untrusted knowledge evidence")
         XCTAssertEqual(risk, .low)
@@ -137,7 +137,7 @@ final class IntatisPermissionTests: XCTestCase {
         }
     }
 
-    func testGateStructuredDocumentReaderPassesUnderReadOnlyWithoutShellAuthority() {
+    func testGateAllowsStructuredDocumentReaderUnderReadOnlyWithoutShellAuthority() {
         let intent = PermissionIntent(
             action: "document.read",
             resources: [PermissionResource(
@@ -154,14 +154,14 @@ final class IntatisPermissionTests: XCTestCase {
 
         XCTAssertTrue(intent.isReadOnlyWorkspaceCompatible)
         XCTAssertTrue(intent.isStructuredReadOnlyExecution)
-        guard case .pass(let reason, let risk) = gate.evaluate(
+        guard case .allow(let reason, let risk) = gate.evaluate(
             call(
                 "read_docx",
                 .exec,
                 paths: ["report.docx"],
                 intent: intent),
             ctx(profile: .readOnly, allowsShell: false)) else {
-            return XCTFail("fixed structured read-only execution should reach review")
+            return XCTFail("fixed structured read-only execution should allow without review")
         }
         XCTAssertEqual(reason, "run fixed structured read-only document backend")
         XCTAssertEqual(risk, .medium)

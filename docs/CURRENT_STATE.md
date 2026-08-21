@@ -108,8 +108,9 @@ macOS 是完整产品：Chat、Code、Cowork、Settings 和本地诊断导出。
   以及 XLSX write、Calc round-trip、公式文本与 data-only cache `4`、preview/export；不会自动降级。
   五个格式 reader 的真实 runtime smoke 均已通过；另以用户提供的外部 Intatis-test corpus 中
   一份稀疏 XLSX 与三份 PPTX 运行只读复制后的回归，
-  4/4 通过，稀疏表不再进入 openpyxl `EmptyCell` 手写投影。结构化普通读取 intent 仍经进程权限
-  审查，但标记为 `safeToReplay`；解析失败会 durable settle 为 failed/unknown、返回模型并继续同批
+  4/4 通过，稀疏表不再进入 openpyxl `EmptyCell` 手写投影。结构化普通读取 intent 继续保留固定
+  进程、路径、lease 与 durable ticket 边界，但由 deterministic gate 默认放行，不创建权限请求或调用
+  reviewer，并标记为 `safeToReplay`；解析失败会 durable settle 为 failed/unknown、返回模型并继续同批
   后续文件，不会升级成整个 turn 的终止错误。当前 `maxCharacters` 只约束最终返回给模型的
   Markdown；Docling 仍会先完成整份文档转换与 Markdown 导出。生产 runner 已有输入文件/归档展开
   上限、超时、取消与进程清理，但尚无独立 RSS 内存上限，因此超大或极端复杂文档仍是明确的资源
@@ -340,9 +341,10 @@ profiles 与外部 MCP client。macOS/Linux 的 stdio、sandbox、bwrap/guard �
   一个 AgentLoop turn 的离线 E2E 已对两个外部 store 完成 build/search/rerank/citation，证明证据与
   snapshot 不串库；随后用 fresh host generation 重新取得 external authority、打开 durable current
   pointer 并再次 search/rerank/citation，证明不依赖进程内旧 handle。
-- local-only `search_knowledge` 虽然不写文件、不联网，仍把知识正文带入 answering model，因此
-  deterministic gate 对 exact instance intent 返回 `pass`，继续经过 reviewer、PermissionEngine、
-  authorization correlation 与 durable lifecycle；不会继承普通本地 read 的自动放行。
+- local-only `search_knowledge` 不写文件、不联网，复用现有只读默认放行路径；deterministic gate 对
+  exact local instance intent 直接 `allow`，不创建权限请求或调用 reviewer，但仍保留 ToolRegistry、
+  CapabilityLease、authorization correlation 与 durable execution lifecycle。network-backed
+  `search_knowledge` 继续按网络工具进入权限审查。
 - successful evidence 在返回前复核 concept/source/hash/可选 source locator；AgentLoop 又把它限制为
   current-turn citation，并在 final commit 前通过 exact registration 重新打开 snapshot 做异步机械
   重验。urgent purge 会关闭 admission、cancel/drain、使 current pointer 持久失活并清 receipt；不会
@@ -512,6 +514,16 @@ profiles 与外部 MCP client。macOS/Linux 的 stdio、sandbox、bwrap/guard �
 
 ## 最近验证状态
 
+- 2026-08-21 固定只读工具默认放行：`DeterministicPolicyGate` 仅把两个既有
+  `pass` 结果改为 `allow`，使 `structured_read_only` 集合中的
+  `read_docx` / `read_pptx` / `read_xlsx` / `read_html` / `read_epub` /
+  `document_ocr`，以及 local-only `search_knowledge` 不再创建权限请求或调用 reviewer。
+  network-backed Knowledge、写入、通用 exec、destructive、协议、sidecar、EventLog、responder、
+  reviewer 与 Cowork 控制面均未修改。聚焦 suites 共 169 tests、0 failures：
+  IntatisPermission 56、SearchKnowledge 4、ToolRegistryLease 27、AgentLoopPolicy 37、
+  DocumentReadToolSplit 4、AutomaticPermissionReview 39、ModelDrivenKnowledgeAgentLoop 2。
+  首次受管沙箱内运行在 SwiftPM manifest 的 `sandbox-exec` 初始化前失败；同一命令在允许真实
+  SwiftPM sandbox 的宿主环境重跑通过。未运行完整 `swift test`、App build 或真实 provider smoke。
 - 2026-08-21 `IntatisMacAppStore` target 删除：`project.yml` 已删除 App Store application target 与
   shared scheme，`Apps/IntatisMac/IntatisMac.AppStore.entitlements` 已删除，Mac App 源码中的
   `INTATIS_MAC_APP_STORE` 条件编译分支已收敛为唯一 Developer ID 路径；`Package.swift`/MCP stdio

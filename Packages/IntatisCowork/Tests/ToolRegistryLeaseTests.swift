@@ -404,18 +404,12 @@ final class ToolRegistryLeaseTests: XCTestCase {
         XCTAssertEqual(revalidated.first?.retrievalSnapshot, "snap_host_bound")
 
         let events = await log.replay()
-        let permissionRequest = try XCTUnwrap(
-            events.compactMap { envelope -> PermissionRequestPayload? in
-                guard case .permissionRequest(let payload) = envelope.event,
-                      payload.tool == "search_knowledge" else {
-                    return nil
-                }
-                return payload
-            }.first)
-        XCTAssertEqual(permissionRequest.context?.toolCallID, "host-search-call")
-        XCTAssertEqual(
-            permissionRequest.context?.authorization?.requiredCapabilities,
-            [.searchKnowledge])
+        XCTAssertFalse(events.contains { envelope in
+            guard case .permissionRequest(let payload) = envelope.event else {
+                return false
+            }
+            return payload.tool == "search_knowledge"
+        })
         let permissionSettlement = try XCTUnwrap(
             events.compactMap { envelope -> PermissionResolvedPayload? in
                 guard case .permissionResolved(let payload) = envelope.event,
@@ -424,8 +418,12 @@ final class ToolRegistryLeaseTests: XCTestCase {
                 }
                 return payload
             }.first)
-        XCTAssertEqual(permissionSettlement.requestId, permissionRequest.requestId)
+        XCTAssertNil(permissionSettlement.requestId)
         XCTAssertEqual(permissionSettlement.decision, .allow)
+        XCTAssertEqual(permissionSettlement.source, .deterministicPolicy)
+        XCTAssertEqual(
+            permissionSettlement.authorization?.requiredCapabilities,
+            [.searchKnowledge])
 
         let prepared = try XCTUnwrap(
             events.compactMap { envelope -> ToolExecutionPreparedPayload? in

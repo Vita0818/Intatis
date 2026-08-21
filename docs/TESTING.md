@@ -163,8 +163,8 @@ swift test --filter ToolRegistryLeaseTests
   stable evidence ID、真实 direct success，以及 final 前 exact snapshot reopen/hash/locator revalidation；
 - Code/Cowork opt-in 走真实 AgentLoop 的 capability/permission/prepared/tool_result/settled 链，mailbox
   窄 capability 时工具完全缺席，close/shutdown 会 cancel/drain mount；snapshot-bound dynamic
-  registration 必须保留 instance-owned local/remote intent，本地 `search_knowledge` 即使 read-only 也要
-  从 deterministic gate 的 `pass` 进入 reviewer/PermissionEngine，不能继承普通文件读取的 auto-allow。
+  registration 必须保留 instance-owned local/remote intent，本地 `search_knowledge` 复用现有只读
+  deterministic allow 且不产生 permission/reviewer lifecycle，network-backed instance 仍进入审查。
 - canonical `embedding_model` / `reranker_model` decode 与 exact independent route；Knowledge-only provider
   可以没有普通 inference models。任一 role/dialect 不可用时，secret、network、store 与 bookmark
   副作用前 fail closed；credential 必须在真实 embedding/rerank dispatch 内才解析；official-shaped
@@ -305,7 +305,8 @@ write/read/preview/export/PDF read，以及 XLSX write/Calc round-trip/formula-c
 - stdout/stderr 限制不得误作生成文件限制；单文件、聚合生成字节与 entry 数预算必须在进程运行期及
   退出后都生效，不能只在 backend 完成后检查 staging；
 - read-only worker 只拿 `read_pdf`、五个 exact reader capability 与 `document_ocr`；五个普通 reader
-  只能通过 exact `structured_read_only + safeToReplay` 权限形状执行。首个 reader 解析失败必须写
+  只能通过 exact `structured_read_only + safeToReplay` 权限形状执行，并由 deterministic gate 默认
+  放行而不产生 permission request 或 reviewer dispatch。首个 reader 解析失败必须写
   failed/unknown settlement、允许同批后续 reader 继续并允许模型给出最终回答；其他 executor error
   同样必须把 failed/unknown observation 返回模型，不得升级成通用整轮终止。read-write
   worker/coordinator 才拿 render/export/write。
@@ -760,6 +761,23 @@ INTATIS_REAL_MULTIMODAL_SMOKE=1 swift test \
   线上 provider smoke 必须单独记录，不能从离线测试或编译外推。
 
 ## 最近一次真实结果
+
+### 2026-08-21 固定只读工具默认放行
+
+- 生产行为只在 `DeterministicPolicyGate` 的两个既有分支中从 `pass` 改为 `allow`：
+  `structured_read_only` 固定 reader/OCR 与 local-only `search_knowledge`。没有修改协议、sidecar、
+  EventLog、PermissionResponder、reviewer/control plane、工具 descriptor、CapabilityLease 或
+  WorkspaceLease；network-backed Knowledge 和其他网络/写入/通用 exec/destructive 工具仍按原路径审查。
+- 聚焦 suites 共 169 tests、0 failures：`IntatisPermissionTests.xctest` 56、
+  `SearchKnowledgeToolTests` 4、`ToolRegistryLeaseTests` 27、`AgentLoopPolicyTests` 37、
+  `DocumentReadToolSplitTests` 4、`AutomaticPermissionReviewTests` 39、
+  `ModelDrivenKnowledgeAgentLoopTests` 2。它们覆盖 direct gate、六个固定结构化只读工具的 existing intent、
+  local Knowledge 无 `permission_request`、authorization/capability/durable ticket 仍存在、automatic
+  reviewer 其他路径不回归，以及 model-driven network/build 路径仍受原权限边界。
+- 首次在受管沙箱中运行时，SwiftPM manifest 在源码编译前因
+  `sandbox-exec: sandbox_apply: Operation not permitted` 失败；同一聚焦命令在允许 SwiftPM 自身
+  sandbox 的宿主环境退出 0。未运行完整 `swift test`、macOS/iOS App build、真实文档 runtime、
+  credential/network 或真实 reviewer provider smoke。
 
 ### 2026-08-21 `IntatisMacAppStore` target 删除
 

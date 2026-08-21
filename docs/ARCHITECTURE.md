@@ -210,8 +210,8 @@ durable prepared/result/settled 事件，不存在 Knowledge 私有执行旁路�
 
 `search_knowledge` 的动态 descriptor 会随 snapshot/schema/local-or-network semantics 一起进入
 registry identity；descriptor-aware permission intent/preview 必须继续使用同一 instance semantics。
-local-only route 也属于把外部断言注入模型的 trust boundary，因此 deterministic gate 返回 `pass`
-并继续走 reviewer/PermissionEngine，而不是套用普通 read-only 文件工具的自动 allow。
+local-only route 复用现有 read-only 默认放行路径，不创建权限请求或调用 reviewer；network-backed
+route 继续按网络 effect 进入 reviewer/PermissionEngine。
 
 08-09 的 `KnowledgeBundleBuildService` 是 host-owned build/publish seam，当时还不是 model-facing
 tool。它要求调用者传入并复核 exact resolved authorization，但自身不生成 durable ticket；08-10
@@ -1080,7 +1080,8 @@ provider tool_call -> AgentLoop schema validation
 - PDFKit/WKWebView 是 Apple-native renderer 例外，不称为开源后端；pdfcpu 在本合同中只做 strict validate/info，不做 PDF 编辑。
 - read-only worker 获得 `read_pdf`、五个固定格式 reader 与 `document_ocr`。process-backed reader/OCR
   仍以 host-authored `structured_read_only` intent 标记，只能声明 read/execute、不能声明网络、工作区
-  写入或通用 shell；DeterministicPolicyGate 只为该 exact 形状进入正常 reviewer/permission 流。
+  写入或通用 shell；DeterministicPolicyGate 对该 exact 形状直接 `allow`，不创建权限请求或调用
+  reviewer。
   `document_render`、`document_export_pdf`、`document_write` 只向 read-write worker/coordinator 签发。
 - 五个普通 reader 的 replay policy 是 `safeToReplay`：进程开始后的解析失败原子写入 failed
   `tool_result` 与 failed/unknown settlement，作为 observation 返回主模型，并继续同批其他文件；
@@ -1639,7 +1640,7 @@ OpenAI-compatible embeddings + SiliconFlow v1 rerank dialect；Cohere v2 reranke
 - `PathConfinement.resolve`：拒 `..` 遍历与越界绝对路径。Tools 执行与权限门均使用。
 
 ### 权限 3 层门
-1. `DeterministicPolicyGate`（纯函数、模型无关、runs first、`deny` 终局）：输入包含结构化 `PermissionIntent(action/resources/metadata/dataEffects/controlEffects/risks/replayPolicy)`。locked、敏感路径、路径越界、shell disabled、read-only lease 下真实 mutate/exec/network/destructive，以及 read-only parent 试图授予 child read-write workspace 都 hard deny；普通只读数据操作 allow；exact `rename_session` + `session.rename` + sole `tool:current_session` + no path/network/data/control effects 的调用作为 low-risk local metadata mutation allow，任何 near-miss 回到普通保守规则；其余需要审查的写入、网络、exec、destructive 和 agent/task/message/workspace 控制面操作返回 `pass`。WorkspaceLease 是权限 ceiling，不是“本次调用已经写文件”的判据。
+1. `DeterministicPolicyGate`（纯函数、模型无关、runs first、`deny` 终局）：输入包含结构化 `PermissionIntent(action/resources/metadata/dataEffects/controlEffects/risks/replayPolicy)`。locked、敏感路径、路径越界、shell disabled、read-only lease 下真实 mutate/exec/network/destructive，以及 read-only parent 试图授予 child read-write workspace 都 hard deny；普通只读数据操作、exact `structured_read_only` 固定 reader/OCR 与 local-only `search_knowledge` allow 且不进入 reviewer；exact `rename_session` + `session.rename` + sole `tool:current_session` + no path/network/data/control effects 的调用作为 low-risk local metadata mutation allow，任何 near-miss 回到普通保守规则；其余需要审查的写入、网络、通用 exec、destructive 和 agent/task/message/workspace 控制面操作返回 `pass`。WorkspaceLease 是权限 ceiling，不是“本次调用已经写文件”的判据。
 2. reviewer（模型评审）只见 gate `pass`，只能收窄，**不能**覆盖硬 deny。非 Cowork host 可注入 `ModelPermissionReviewer`；production Cowork 不注入该 reviewer，而把同一次 `pass -> askUser` 请求交给 durable `PermissionReviewControlPlane`。同一调用不得同时配置两条模型审查路径。
 3. `PermissionEngine`（组合）：`pass` 且无 in-engine reviewer → `askUser`，由当前 responder 处理。Cowork 自动模式 responder 只有 allow/deny、无人工 fallback；人工模式只能由用户显式切换。
 

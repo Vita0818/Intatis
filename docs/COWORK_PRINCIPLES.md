@@ -405,7 +405,7 @@ worker prompt does not advertise coordinator powers
 task contract appears in context
 context projection hides unrelated raw global transcript
 capability lease controls tool registry
-worker receives only read-only document/media tools and no git-control/git-remote/browser/network tools by default
+worker receives only read-only document/media tools and no git-control/git-remote/browser/network tools by default; exact structured_read_only reader/OCR calls use the existing deterministic allow path without reviewer dispatch
 read-write shell-capable worker sees managed exec_command/write_stdin, while read-only worker/reviewer/disabled host sees neither and no production registry exposes raw run_shell
 terminal session ownership includes exact session/agent/task/attempt/workspace identity; another owner, a replaced root, revoked lease, task terminal, cancel, or shutdown cannot retain control
 write_stdin is independently authorized, cannot bypass dangerous-command hard deny through split input or mutable line editing, cursor/completion/history/escape/keymap changes fail closed, partial-write uncertainty terminates the session, and neither raw input nor delayed echo is persisted

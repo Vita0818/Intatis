@@ -66,7 +66,7 @@ final class DocumentReadToolSplitTests: XCTestCase {
             ToolArgs(raw: #"{"maxCharacters":12000}"#)))
     }
 
-    func testReadersAreReviewedProcessExecutionsButSafeToReplay() {
+    func testReadersAreStructuredReadOnlyProcessExecutionsAndSafeToReplay() {
         let workspace = URL(fileURLWithPath: "/workspace")
         let cases: [(PermissionIntent, DocumentFormat)] = [
             (ReadDOCXTool().permissionIntent(

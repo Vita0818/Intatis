@@ -289,7 +289,7 @@ public struct SearchKnowledgeTool: Tool {
     /// therefore registered through the dynamic descriptor initializer. Keep
     /// the instance-owned local/remote trust semantics when ToolRegistry asks
     /// for the descriptor-aware form; falling back to `PermissionIntent.derived`
-    /// here would turn local knowledge into an ordinary auto-allowed read.
+    /// here would erase the local/network execution distinction.
     public func permissionIntent(
         _ args: ToolArgs,
         descriptor: ToolDescriptor,
