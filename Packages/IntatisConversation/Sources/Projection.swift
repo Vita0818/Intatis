@@ -16,6 +16,7 @@ public struct ChatMessageView: Identifiable, Equatable, Sendable {
     public var recoveryAdvice: RuntimeRecoveryAdvice?
     public var citations: [MessageCitation]
     public var attachments: [ArtifactID]
+    public var turnStats: TurnStatsSnapshot?
 
     public init(id: MessageID,
                 role: MessageRole,
@@ -27,7 +28,8 @@ public struct ChatMessageView: Identifiable, Equatable, Sendable {
                 goal: String? = nil,
                 recoveryAdvice: RuntimeRecoveryAdvice? = nil,
                 citations: [MessageCitation] = [],
-                attachments: [ArtifactID] = []) {
+                attachments: [ArtifactID] = [],
+                turnStats: TurnStatsSnapshot? = nil) {
         self.id = id
         self.role = role
         self.agent = agent
@@ -39,28 +41,40 @@ public struct ChatMessageView: Identifiable, Equatable, Sendable {
         self.recoveryAdvice = recoveryAdvice
         self.citations = citations
         self.attachments = attachments
+        self.turnStats = turnStats
     }
 }
 
 /// Folds an event stream into renderable messages. The UI consumes *this*, never
 /// raw model text (ARCHITECTURE.md §1.2 principle A / §3.11).
 public struct ConversationProjection: Equatable, Sendable {
+    private static let maximumPendingTurnStats = 64
     public private(set) var messages: [ChatMessageView] = []
+    private var pendingTurnStatsByMessageID: [MessageID: TurnStatsSnapshot] = [:]
 
     public init() {}
 
     public mutating func apply(_ envelope: Envelope) {
-        apply(envelope.event, timestamp: envelope.ts) { suffix in
+        apply(
+            envelope.event,
+            timestamp: envelope.ts,
+            turnStatsID: "\(envelope.session.rawValue):\(envelope.seq):turn_stats"
+        ) { suffix in
             MessageID(rawValue: "msg_\(envelope.session.rawValue)_\(envelope.seq)_\(suffix)")
         }
     }
 
     public mutating func apply(_ event: Event) {
-        apply(event, timestamp: nil) { _ in MessageID.new() }
+        apply(
+            event,
+            timestamp: nil,
+            turnStatsID: "event:turn_stats"
+        ) { _ in MessageID.new() }
     }
 
     private mutating func apply(_ event: Event,
                                 timestamp: Date?,
+                                turnStatsID: String,
                                 syntheticID: (String) -> MessageID) {
         switch event {
         case .userMessage(let p):
@@ -82,7 +96,9 @@ public struct ConversationProjection: Equatable, Sendable {
             } else {
                 messages.append(ChatMessageView(id: p.messageId, role: p.role, agent: p.agent,
                                                 text: p.textDelta, isComplete: false,
-                                                timestamp: timestamp))
+                                                timestamp: timestamp,
+                                                turnStats: takePendingTurnStats(
+                                                    for: p.messageId)))
             }
 
         case .messageCompleted(let p):
@@ -97,8 +113,15 @@ public struct ConversationProjection: Equatable, Sendable {
                 messages.append(ChatMessageView(id: p.messageId, role: p.role, agent: p.agent,
                                                 text: p.text, isComplete: true,
                                                 timestamp: timestamp,
-                                                citations: p.citations ?? []))
+                                                citations: p.citations ?? [],
+                                                turnStats: takePendingTurnStats(
+                                                    for: p.messageId)))
             }
+
+        case .turnStats(let payload):
+            applyTurnStats(TurnStatsSnapshot(
+                id: turnStatsID,
+                payload: payload))
 
         case .error(let p):
             markCurrentPartialMessageStopped(with: p)
@@ -136,7 +159,7 @@ public struct ConversationProjection: Equatable, Sendable {
              .continuationRunCreated, .continuationRunStarted, .continuationRunCheckpointed,
              .continuationRunCloseRequested,
              .continuationRunCompleted, .continuationRunInterrupted, .continuationRunCancelled,
-             .artifactProgress, .turnStats, .turnOutcome,
+             .artifactProgress, .turnOutcome,
              .mcpServerAttached, .mcpServerDetached, .mcpAttachmentPolicyUpdated,
              .mcpConsentGranted, .mcpConsentRevoked,
              .mcpControlOperationRequested, .mcpControlOperationSettled,
@@ -171,6 +194,27 @@ public struct ConversationProjection: Equatable, Sendable {
         case .user, .system:
             break
         }
+    }
+
+    private mutating func applyTurnStats(_ stats: TurnStatsSnapshot) {
+        guard stats.hasDisplayableMetrics,
+              let messageID = stats.responseMessageID else { return }
+        if let index = messages.firstIndex(where: { $0.id == messageID }) {
+            guard messages[index].role == .assistant
+                    || messages[index].role == .agent,
+                  messages[index].turnStats == nil else { return }
+            messages[index].turnStats = stats
+        } else if pendingTurnStatsByMessageID[messageID] == nil,
+                  pendingTurnStatsByMessageID.count
+                    < Self.maximumPendingTurnStats {
+            pendingTurnStatsByMessageID[messageID] = stats
+        }
+    }
+
+    private mutating func takePendingTurnStats(
+        for messageID: MessageID
+    ) -> TurnStatsSnapshot? {
+        pendingTurnStatsByMessageID.removeValue(forKey: messageID)
     }
 }
 

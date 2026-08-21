@@ -134,10 +134,14 @@ final class InferenceProfileProtocolTests: XCTestCase {
 
     func testTurnStatsSafelyAttributesExactInferenceBindingAndLegacyStatsDecode() throws {
         let exactBinding = binding()
+        let turnID = TurnID(rawValue: "turn-stats")
+        let responseMessageID = MessageID(rawValue: "message-stats")
         let stats = TurnStatsPayload(
             promptTokens: 10,
             completionTokens: 2,
             model: exactBinding.modelID.rawValue,
+            turnID: turnID,
+            responseMessageID: responseMessageID,
             agentID: AgentID(rawValue: "worker"),
             agentInferenceBinding: exactBinding)
 
@@ -145,10 +149,15 @@ final class InferenceProfileProtocolTests: XCTestCase {
             TurnStatsPayload.self,
             from: JSONEncoder().encode(stats))
         XCTAssertEqual(decoded.agentInferenceBinding, exactBinding)
+        XCTAssertEqual(decoded.turnID, turnID)
+        XCTAssertEqual(decoded.responseMessageID, responseMessageID)
 
         let legacy = #"{"promptTokens":10,"model":"gpt-5","agentID":"worker"}"#
-        XCTAssertNil(try JSONDecoder().decode(
+        let legacyDecoded = try JSONDecoder().decode(
             TurnStatsPayload.self,
-            from: Data(legacy.utf8)).agentInferenceBinding)
+            from: Data(legacy.utf8))
+        XCTAssertNil(legacyDecoded.agentInferenceBinding)
+        XCTAssertNil(legacyDecoded.turnID)
+        XCTAssertNil(legacyDecoded.responseMessageID)
     }
 }

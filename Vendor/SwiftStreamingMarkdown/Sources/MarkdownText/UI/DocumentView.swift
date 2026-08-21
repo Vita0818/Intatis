@@ -12,6 +12,10 @@ import SwiftUI
 /// pipeline).
 public struct DocumentView: View {
   @StateObject var controller: MarkdownController
+  #if os(macOS)
+  @StateObject private var documentSelectionCoordinator =
+    MarkdownDocumentSelectionCoordinator()
+  #endif
 
   let renderableDocument: RenderableDocument
   let config: MarkdownRenderConfig
@@ -32,7 +36,7 @@ public struct DocumentView: View {
   }
 
   public var body: some View {
-    BlockView(renderables: renderableDocument.renderables)
+    renderedBlocks
     .environment(\.markdownConfig, config)
     .environment(\.markdownController, controller)
     .task(id: ObjectIdentifier(renderableDocument)) {
@@ -49,6 +53,19 @@ public struct DocumentView: View {
         controller.isTextSelectionRequested = false
       }
     }
+  }
+
+  @ViewBuilder
+  private var renderedBlocks: some View {
+    #if os(macOS)
+    BlockView(renderables: renderableDocument.renderables)
+      .environment(
+        \.markdownDocumentSelectionCoordinator,
+        documentSelectionCoordinator
+      )
+    #else
+    BlockView(renderables: renderableDocument.renderables)
+    #endif
   }
 }
 

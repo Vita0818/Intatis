@@ -97,7 +97,12 @@ public struct ChatLoop: Sendable {
                     role: .assistant,
                     text: full,
                     citations: citations)))
-            await appendTurnStats(start: start, firstTokenAt: firstTokenAt, usage: usage)
+            await appendTurnStats(
+                start: start,
+                firstTokenAt: firstTokenAt,
+                usage: usage,
+                turnID: turnID,
+                responseMessageID: assistantID)
             try Task.checkCancellation()
             let completed = try await log.append(.turnOutcome(TurnOutcomePayload(
                 turnID: turnID,
@@ -134,7 +139,13 @@ public struct ChatLoop: Sendable {
         }
     }
 
-    private func appendTurnStats(start: Date, firstTokenAt: Date?, usage: Usage?) async {
+    private func appendTurnStats(
+        start: Date,
+        firstTokenAt: Date?,
+        usage: Usage?,
+        turnID: TurnID,
+        responseMessageID: MessageID
+    ) async {
         let now = Date()
         try? await log.append(.turnStats(TurnStatsPayload(
             promptTokens: usage?.promptTokens,
@@ -144,7 +155,9 @@ public struct ChatLoop: Sendable {
             contextWindowTokens: usage?.contextWindowTokens,
             ttftMillis: firstTokenAt.map { Int($0.timeIntervalSince(start) * 1000) },
             totalMillis: Int(now.timeIntervalSince(start) * 1000),
-            model: model.rawValue)))
+            model: model.rawValue,
+            turnID: turnID,
+            responseMessageID: responseMessageID)))
     }
 
     /// Rebuild prior turns from the log as provider-shaped messages.

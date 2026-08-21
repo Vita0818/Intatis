@@ -33,12 +33,29 @@ struct CodeBlockView: View {
   var codeblock: some View {
     ScrollView(.horizontal) {
       HStack(alignment: .top) {
+        #if os(macOS)
+        ParagraphView(
+          contents: NSMutableAttributedString(
+            string: code,
+            attributes: [
+              .font: config.inlineStyle.codeTextFont,
+              .foregroundColor: MDColor(
+                Color.Theme.Component.CodeBlock.Foreground.FunctionParameter
+              )
+            ]
+          ),
+          layoutMode: .unwrapped
+        )
+          .fixedSize(horizontal: true, vertical: true)
+          .transition(.opacity)
+        #else
         Text(code)
           .font(Font(config.inlineStyle.codeTextFont))
           .foregroundStyle(Color.Theme.Component.CodeBlock.Foreground.FunctionParameter)
           .textSelection(.enabled)
           .transition(.opacity)
           .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+        #endif
       }
 
     }.transaction { transaction in

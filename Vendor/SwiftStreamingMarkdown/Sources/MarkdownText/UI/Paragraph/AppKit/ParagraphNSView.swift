@@ -15,7 +15,12 @@ private struct CachedParagraphNSViewSize {
   let targetWidth: CGFloat
 }
 
-class ParagraphNSView: NSTextView {
+enum ParagraphLayoutMode: Hashable {
+  case wrapping
+  case unwrapped
+}
+
+class ParagraphNSView: NSTextView, NSGestureRecognizerDelegate {
   static let animationDuration: CFTimeInterval = ParagraphAnimationConstants.fadeInDuration
 
   private(set) var paragraphContents: NSMutableAttributedString = NSMutableAttributedString()
@@ -26,6 +31,16 @@ class ParagraphNSView: NSTextView {
   private var lastLaidOutWidth: CGFloat?
   private var retainedTextContentStorage: NSTextContentStorage?
   private var textKitTwoViewportLayoutScheduled = false
+  private var documentSelectionPanGesture: NSPanGestureRecognizer?
+  private var isCoordinatedSelectionPanActive = false
+  private var coordinatedSelectionRange: NSRange?
+  private var coordinatedSelectionBaseAttributedString: NSAttributedString?
+  private weak var documentSelectionCoordinator: MarkdownDocumentSelectionCoordinator?
+  private(set) var paragraphLayoutMode: ParagraphLayoutMode = .wrapping
+
+  var documentSelectionCoordinatorReference: MarkdownDocumentSelectionCoordinator? {
+    documentSelectionCoordinator
+  }
 
   var textContextMenu: TextContextMenu?
   var markdownController: MarkdownController?
@@ -109,9 +124,13 @@ class ParagraphNSView: NSTextView {
   /// tracked width is `0`, which yields a zero height and collapses the paragraph. A
   /// standalone container whose width we set directly always measures correctly.
   func measureSize(fittingWidth width: CGFloat) -> CGSize {
-    guard let textStorage, textStorage.length > 0, width > 0, width.isFinite else {
+    guard let textStorage, textStorage.length > 0 else {
       return .zero
     }
+    if paragraphLayoutMode == .unwrapped {
+      return measureUnwrappedSize()
+    }
+    guard width > 0, width.isFinite else { return .zero }
     let measuringTextStorage = NSTextStorage(attributedString: textStorage)
     let measuringLayoutManager = NSLayoutManager()
     let measuringContainer = NSTextContainer(size: NSSize(width: width, height: CGFloat.greatestFiniteMagnitude))
@@ -123,6 +142,21 @@ class ParagraphNSView: NSTextView {
     measuringLayoutManager.ensureLayout(for: measuringContainer)
     let usedRect = measuringLayoutManager.usedRect(for: measuringContainer)
     return CGSize(width: usedRect.width.rounded(.up), height: usedRect.height.rounded(.up))
+  }
+
+  func measureUnwrappedSize() -> CGSize {
+    guard let textStorage, textStorage.length > 0 else { return .zero }
+    let bounds = textStorage.boundingRect(
+      with: NSSize(
+        width: CGFloat.greatestFiniteMagnitude,
+        height: CGFloat.greatestFiniteMagnitude
+      ),
+      options: [.usesLineFragmentOrigin, .usesFontLeading]
+    )
+    return CGSize(
+      width: max(1, bounds.width.rounded(.up)),
+      height: max(1, bounds.height.rounded(.up))
+    )
   }
 
   override func layout() {
@@ -150,6 +184,7 @@ class ParagraphNSView: NSTextView {
     guard paragraphContents != newContents || self.lineSpacing != lineSpacing else {
       return
     }
+    documentSelectionCoordinator?.contentsWillChange(in: self)
     self.paragraphContents = newContents
     self.lineSpacing = lineSpacing
 
@@ -234,6 +269,9 @@ class ParagraphNSView: NSTextView {
     isHorizontallyResizable = false
 
     linkTextAttributes = [:]
+    selectedTextAttributes = Self.systemSelectionAttributes
+
+    installDocumentSelectionPanGesture()
 
     setContentHuggingPriority(.defaultHigh, for: .vertical)
     setContentCompressionResistancePriority(.defaultHigh, for: .vertical)
@@ -371,6 +409,209 @@ class ParagraphNSView: NSTextView {
     markdownController = controller
   }
 
+  func setDocumentSelectionCoordinator(
+    _ coordinator: MarkdownDocumentSelectionCoordinator?
+  ) {
+    guard documentSelectionCoordinator !== coordinator else { return }
+    documentSelectionCoordinator?.unregister(self)
+    documentSelectionCoordinator = coordinator
+    coordinator?.register(self)
+  }
+
+  func setParagraphLayoutMode(_ mode: ParagraphLayoutMode) {
+    guard paragraphLayoutMode != mode else { return }
+    paragraphLayoutMode = mode
+    invalidateCachedSize()
+    lastLaidOutWidth = nil
+
+    switch mode {
+    case .wrapping:
+      textContainer?.widthTracksTextView = true
+      textContainer?.lineBreakMode = .byWordWrapping
+      isHorizontallyResizable = false
+    case .unwrapped:
+      textContainer?.widthTracksTextView = false
+      textContainer?.containerSize = NSSize(
+        width: CGFloat.greatestFiniteMagnitude,
+        height: CGFloat.greatestFiniteMagnitude
+      )
+      textContainer?.lineBreakMode = .byClipping
+      isHorizontallyResizable = true
+      maxSize = NSSize(
+        width: CGFloat.greatestFiniteMagnitude,
+        height: CGFloat.greatestFiniteMagnitude
+      )
+    }
+    invalidateIntrinsicContentSize()
+    scheduleTextKitTwoViewportLayout()
+  }
+
+  func plainTextForCoordinatedSelection(in range: NSRange) -> String? {
+    guard let textStorage else { return nil }
+    let clampedRange = NSIntersectionRange(
+      range,
+      NSRange(location: 0, length: textStorage.length)
+    )
+    guard clampedRange.length > 0 else { return nil }
+    return textStorage
+      .attributedSubstring(from: clampedRange)
+      .plainTextRestoringInlineMath
+  }
+
+  func setCoordinatedSelectionRange(_ range: NSRange?) {
+    guard let range,
+          let textStorage else {
+      coordinatedSelectionRange = nil
+      setSelectedRange(NSRange(location: 0, length: 0))
+      return
+    }
+    let clampedRange = NSIntersectionRange(
+      range,
+      NSRange(location: 0, length: textStorage.length)
+    )
+    guard clampedRange.length > 0 else {
+      coordinatedSelectionRange = nil
+      setSelectedRange(NSRange(location: 0, length: 0))
+      return
+    }
+    coordinatedSelectionRange = clampedRange
+    setSelectedRange(clampedRange)
+  }
+
+  func clearCoordinatedSelection() {
+    restoreCoordinatedSelectionEmphasis()
+    coordinatedSelectionRange = nil
+    setSelectedRange(NSRange(location: 0, length: 0))
+    selectedTextAttributes = Self.systemSelectionAttributes
+  }
+
+  func clearNativeSelectionKeepingCoordinatedEmphasis() {
+    setSelectedRange(NSRange(location: 0, length: 0))
+    selectedTextAttributes = Self.systemSelectionAttributes
+  }
+
+  func activateCoordinatedSelectionAsPrimary() {
+    guard let coordinatedSelectionRange else { return }
+    // Keep a real AppKit selected range so the responder chain, Edit > Copy,
+    // and Command-C retain their native semantics. The document coordinator
+    // has already rendered the one shared selection appearance into this
+    // disposable projection, so an empty temporary-attribute dictionary
+    // prevents NSTextView from painting a second, focus-dependent highlight.
+    selectedTextAttributes = [:]
+    setSelectedRange(coordinatedSelectionRange)
+  }
+
+  func emphasizeCoordinatedSelection() {
+    guard coordinatedSelectionBaseAttributedString == nil,
+          let coordinatedSelectionRange,
+          coordinatedSelectionRange.length > 0,
+          let textStorage else {
+      return
+    }
+    coordinatedSelectionBaseAttributedString = NSAttributedString(
+      attributedString: textStorage
+    )
+    textStorage.addAttributes(
+      selectedTextAttributes,
+      range: coordinatedSelectionRange
+    )
+    textContentStorage?.primaryTextLayoutManager = textLayoutManager
+    needsDisplay = true
+  }
+
+  private static var systemSelectionAttributes: [NSAttributedString.Key: Any] {
+    [
+      .backgroundColor: NSColor.selectedTextBackgroundColor,
+      .foregroundColor: NSColor.selectedTextColor
+    ]
+  }
+
+  private func restoreCoordinatedSelectionEmphasis() {
+    guard let coordinatedSelectionBaseAttributedString,
+          let textStorage else {
+      return
+    }
+    textStorage.setAttributedString(coordinatedSelectionBaseAttributedString)
+    textContentStorage?.primaryTextLayoutManager = textLayoutManager
+    self.coordinatedSelectionBaseAttributedString = nil
+    scheduleTextKitTwoViewportLayout()
+    needsDisplay = true
+  }
+
+  override func mouseDown(with event: NSEvent) {
+    documentSelectionCoordinator?.prepareForNativeMouseDown(in: self)
+    super.mouseDown(with: event)
+  }
+
+  private func installDocumentSelectionPanGesture() {
+    guard documentSelectionPanGesture == nil else { return }
+    let gesture = NSPanGestureRecognizer(
+      target: self,
+      action: #selector(handleDocumentSelectionPan(_:))
+    )
+    gesture.buttonMask = 1
+    gesture.delaysPrimaryMouseButtonEvents = true
+    gesture.delegate = self
+    addGestureRecognizer(gesture)
+    documentSelectionPanGesture = gesture
+  }
+
+  @objc private func handleDocumentSelectionPan(
+    _ gesture: NSPanGestureRecognizer
+  ) {
+    guard let documentSelectionCoordinator else { return }
+    let location = gesture.location(in: self)
+    switch gesture.state {
+    case .began:
+      let translation = gesture.translation(in: self)
+      let anchor = NSPoint(
+        x: location.x - translation.x,
+        y: location.y - translation.y
+      )
+      isCoordinatedSelectionPanActive = true
+      documentSelectionCoordinator.beginSelection(in: self, at: anchor)
+      documentSelectionCoordinator.extendSelection(from: self, to: location)
+    case .changed:
+      documentSelectionCoordinator.extendSelection(from: self, to: location)
+    case .ended:
+      documentSelectionCoordinator.extendSelection(from: self, to: location)
+      documentSelectionCoordinator.finishSelection()
+      isCoordinatedSelectionPanActive = false
+    case .cancelled:
+      if isCoordinatedSelectionPanActive {
+        documentSelectionCoordinator.cancelSelection()
+      }
+      isCoordinatedSelectionPanActive = false
+    case .failed, .possible:
+      break
+    @unknown default:
+      if isCoordinatedSelectionPanActive {
+        documentSelectionCoordinator.cancelSelection()
+      }
+      isCoordinatedSelectionPanActive = false
+    }
+  }
+
+  func gestureRecognizerShouldBegin(_ gestureRecognizer: NSGestureRecognizer) -> Bool {
+    guard documentSelectionCoordinator != nil,
+          gestureRecognizer === documentSelectionPanGesture else {
+      return true
+    }
+    guard let event = NSApp.currentEvent else { return true }
+    guard event.clickCount <= 1 else { return false }
+    let unsupportedModifiers: NSEvent.ModifierFlags = [
+      .shift, .option, .command, .control
+    ]
+    return event.modifierFlags.intersection(unsupportedModifiers).isEmpty
+  }
+
+  func gestureRecognizer(
+    _ gestureRecognizer: NSGestureRecognizer,
+    shouldRecognizeSimultaneouslyWith otherGestureRecognizer: NSGestureRecognizer
+  ) -> Bool {
+    gestureRecognizer === documentSelectionPanGesture
+  }
+
   // MARK: - Link Clicks
 
   // swiftlint:disable:next no_any
@@ -385,6 +626,12 @@ class ParagraphNSView: NSTextView {
   // MARK: - Context Menu
 
   override func copy(_ sender: Any?) {
+    if let documentSelectionCoordinator {
+      let copied = documentSelectionCoordinator.copySelection()
+      if copied {
+        return
+      }
+    }
     guard let textStorage else {
       super.copy(sender)
       return
@@ -419,6 +666,16 @@ class ParagraphNSView: NSTextView {
       selection.plainTextRestoringInlineMath,
       forType: .string
     )
+  }
+
+  override func validateUserInterfaceItem(
+    _ item: NSValidatedUserInterfaceItem
+  ) -> Bool {
+    if item.action == #selector(copy(_:)),
+       documentSelectionCoordinator?.hasCopyableSelection == true {
+      return true
+    }
+    return super.validateUserInterfaceItem(item)
   }
 
   override func menu(for event: NSEvent) -> NSMenu? {

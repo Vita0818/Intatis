@@ -357,15 +357,9 @@ private struct AppProviderSelection: Codable, Equatable {
 enum AppConfig {
     static let legacyAPIKeyAccount = "default-openai"
 
-    /// The two macOS products share sources but compile with exact distribution
-    /// profiles. The App Store target cannot link or enable MCP stdio.
-    #if INTATIS_MAC_APP_STORE
-    static let platformProfile: PlatformProfile = .macAppStore
-    static let skillRootAccess: SkillRootAccess = .workspaceOnly
-    #else
+    /// The only macOS product is the local Developer ID workbench.
     static let platformProfile: PlatformProfile = .macDeveloperID
     static let skillRootAccess: SkillRootAccess = .workspaceAndGlobal
-    #endif
 
     static let defaultSession = SessionID(rawValue: "sess_default")
 

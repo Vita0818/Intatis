@@ -412,6 +412,15 @@ final class MessageRenderingTests: XCTestCase {
             source.contains(".onChange(of: finalRichSettleToken)"))
     }
 
+    #if os(macOS)
+    func testMacUsesDirectDocumentDragWithoutSelectMoreMenu() {
+        let config = IntatisMicrosoftMarkdownRenderState.makeConfiguration(
+            style: .standard(.light))
+
+        XCTAssertFalse(config.textSelectionConfig.isEnabled)
+    }
+    #endif
+
     @MainActor
     func testProjectionLifecycleGateDeduplicatesAndRejectsLateInvisibleInput() {
         let initial = rawRevision(text: "initial", isComplete: true)

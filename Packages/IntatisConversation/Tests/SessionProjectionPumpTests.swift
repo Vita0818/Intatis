@@ -150,7 +150,9 @@ final class SessionProjectionPumpTests:
         let barrierEnvelope = envelope(
             2,
             .turnStats(.init(
-                totalTokens: 2)))
+                totalTokens: 2,
+                responseMessageID: message,
+                agentID: agent)))
         let barrier =
             try await pump.ingest(
                 barrierEnvelope)
@@ -165,6 +167,9 @@ final class SessionProjectionPumpTests:
         XCTAssertEqual(
             barrier?.items?.last?.body,
             "AB")
+        XCTAssertEqual(
+            barrier?.items?.last?.turnStats?.totalTokens,
+            2)
         XCTAssertEqual(
             barrier?.turnStats?
                 .latest?.totalTokens,

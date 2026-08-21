@@ -10,9 +10,12 @@ struct ParagraphView: NSViewRepresentable {
   @Environment(\.openURL) var openURL
   @Environment(\.markdownConfig) var config: MarkdownRenderConfig
   @Environment(\.markdownController) var markdownController: MarkdownController?
+  @Environment(\.markdownDocumentSelectionCoordinator)
+  var documentSelectionCoordinator
 
   var contents: NSMutableAttributedString
   var lineSpacing: CGFloat?
+  var layoutMode: ParagraphLayoutMode = .wrapping
 
   func makeCoordinator() -> Coordinator {
     Coordinator()
@@ -26,9 +29,11 @@ struct ParagraphView: NSViewRepresentable {
     // paragraph gets its own view instead.
     let view = ParagraphNSView()
     view.onUrlTap = openUrlFunction
+    view.setParagraphLayoutMode(layoutMode)
     view.setParagraphContents(contents, lineSpacing: lineSpacing, animatedByWord: false)
     view.setTextContextMenu(config.resolvedTextContextMenu)
     view.setMarkdownController(markdownController)
+    view.setDocumentSelectionCoordinator(documentSelectionCoordinator)
 
     if config.shouldAnimateText {
       view.alphaValue = 0
@@ -42,23 +47,39 @@ struct ParagraphView: NSViewRepresentable {
   }
 
   func updateNSView(_ view: ParagraphNSView, context: Context) {
+    view.setParagraphLayoutMode(layoutMode)
     if view.paragraphContents != contents || view.lineSpacing != lineSpacing {
       let shouldAnimate = view.window != nil && config.shouldAnimateText
       view.setParagraphContents(contents, lineSpacing: lineSpacing, animatedByWord: shouldAnimate)
     }
     view.setTextContextMenu(config.resolvedTextContextMenu)
     view.setMarkdownController(markdownController)
+    view.setDocumentSelectionCoordinator(documentSelectionCoordinator)
+  }
+
+  static func dismantleNSView(_ view: ParagraphNSView, coordinator: Coordinator) {
+    view.setDocumentSelectionCoordinator(nil)
   }
 
   func sizeThatFits(_ proposal: ProposedViewSize, nsView: ParagraphNSView, context: Context) -> CGSize? {
+    if layoutMode == .unwrapped {
+      let measuredSize = nsView.measureSize(fittingWidth: 1)
+      return CGSize(
+        width: max(1, measuredSize.width.rounded(.up)),
+        height: max(1, measuredSize.height.rounded(.up))
+      )
+    }
     guard let width = proposal.width, width > 0, width.isFinite else {
-      return nil
+      return nsView.measureUnwrappedSize()
     }
 
-    if contents != context.coordinator.lastContents || lineSpacing != context.coordinator.lastLineSpacing {
+    if contents != context.coordinator.lastContents
+      || lineSpacing != context.coordinator.lastLineSpacing
+      || layoutMode != context.coordinator.lastLayoutMode {
       context.coordinator.measurementCache.reset()
       context.coordinator.lastContents = contents
       context.coordinator.lastLineSpacing = lineSpacing
+      context.coordinator.lastLayoutMode = layoutMode
     }
 
     let widthKey = width
@@ -89,6 +110,7 @@ struct ParagraphView: NSViewRepresentable {
     var measurementCache = ParagraphMeasurementCache()
     var lastContents: NSMutableAttributedString?
     var lastLineSpacing: CGFloat?
+    var lastLayoutMode: ParagraphLayoutMode?
   }
 
   /// A paragraph is a wrapping, horizontally flexible leaf. Returning the
@@ -108,7 +130,9 @@ struct ParagraphView: NSViewRepresentable {
 
 extension ParagraphView: @MainActor Equatable {
   static func == (lhs: ParagraphView, rhs: ParagraphView) -> Bool {
-    lhs.contents.isEqual(to: rhs.contents) && lhs.lineSpacing == rhs.lineSpacing
+    lhs.contents.isEqual(to: rhs.contents)
+      && lhs.lineSpacing == rhs.lineSpacing
+      && lhs.layoutMode == rhs.layoutMode
   }
 }
 

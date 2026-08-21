@@ -90,15 +90,10 @@ final class SDKClientOnlySurfaceTests: XCTestCase {
         }
     }
 
-    func testProductTargetLinkageKeepsIOSNoneAndAppStoreRemoteOnly() throws {
+    func testProductTargetLinkageKeepsIOSNoneAndOnlyOneMacApp() throws {
         let project = try String(
             contentsOf: repositoryRoot.appendingPathComponent("project.yml"),
             encoding: .utf8
-        )
-        let appStore = try section(
-            named: "  IntatisMacAppStore:",
-            endingAt: "  # ---- iOS app:",
-            in: project
         )
         let iOS = try section(
             named: "  IntatisiOS:",
@@ -107,16 +102,23 @@ final class SDKClientOnlySurfaceTests: XCTestCase {
         )
         let developerID = try section(
             named: "  IntatisMac:",
-            endingAt: "  # ---- macOS App Store:",
+            endingAt: "  # ---- iOS app:",
             in: project
         )
 
         XCTAssertTrue(developerID.contains("product: IntatisMCP"))
         XCTAssertTrue(developerID.contains("product: IntatisMCPStdio"))
-        XCTAssertTrue(appStore.contains("product: IntatisMCP"))
-        XCTAssertFalse(appStore.contains("product: IntatisMCPStdio"))
         XCTAssertFalse(iOS.contains("product: IntatisMCP"))
         XCTAssertFalse(iOS.contains("product: IntatisMCPStdio"))
+        XCTAssertFalse(project.contains("IntatisMacAppStore"))
+        XCTAssertFalse(project.contains("INTATIS_MAC_APP_STORE"))
+        XCTAssertFalse(project.contains("IntatisMac.AppStore.entitlements"))
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: repositoryRoot
+                .appendingPathComponent(
+                    "Apps/IntatisMac/IntatisMac.AppStore.entitlements")
+                .path
+        ))
     }
 
     private func section(

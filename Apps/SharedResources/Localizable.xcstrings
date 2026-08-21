@@ -4358,6 +4358,23 @@
         }
       }
     },
+    "Copy message" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Copy message"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "复制消息"
+          }
+        }
+      }
+    },
     "Continue in Browser" : {
       "extractionState" : "manual",
       "localizations" : {

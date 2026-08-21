@@ -645,6 +645,111 @@ Regression obligations:
 - This evidence validates the narrow configuration patch. The product-font
   decision remains owned by Intatis; device/accessibility gates stay open.
 
+### 14. Direct cross-block AppKit drag selection
+
+Paths:
+
+- `Sources/MarkdownText/UI/DocumentView.swift`
+- `Sources/MarkdownText/UI/TextSelection/MarkdownDocumentSelectionCoordinator+macOS.swift`
+- `Sources/MarkdownText/UI/Paragraph/AppKit/ParagraphNSView.swift`
+- `Sources/MarkdownText/UI/Paragraph/AppKit/ParagraphView+macOS.swift`
+- `Sources/MarkdownText/UI/CodeBlockView.swift`
+- `Sources/MarkdownText/UI/TableView.swift`
+- `Tests/MarkdownTextTests/MarkdownDocumentSelectionCoordinatorTests.swift`
+- `Tests/MarkdownTextTests/FirstReleaseContractTests.swift`
+- `Tests/MarkdownTextTests/ViewEquatableContractTests.swift`
+
+Changes and reason:
+
+- Keep the patch-group-8 prohibition on a second SwiftUI whole-document
+  `SelectionOverlay`. Each Markdown paragraph remains a real TextKit 2
+  `ParagraphNSView` with its existing layout, links, inline-math attachment,
+  accessibility, and native selection ownership.
+- Add one MainActor-owned coordinator per `DocumentView`. A delayed primary-
+  button `NSPanGestureRecognizer` begins only after an actual drag, records the
+  anchor insertion index, sorts the registered native leaves by their real
+  on-window geometry, and distributes one contiguous selected range across
+  every intervening leaf. Ordinary clicks, double/triple-click selection,
+  modifier selection, right-click menus, and links remain native AppKit
+  interactions.
+- Combine the selected native ranges for Command-C using their displayed plain
+  text, restoring inline-math literals. Vertically adjacent leaves use newline
+  separators and same-row table cells use tabs. The raw Markdown/EventLog is
+  neither rewritten nor used as a geometry overlay.
+- At mouse-up, each participating native leaf snapshots only its current
+  disposable attributed projection and applies its exact system
+  `selectedTextAttributes` to that `textStorage`. All leaves therefore use one
+  selection appearance. The first leaf retains a real native selected range so
+  the AppKit responder chain, Edit > Copy, and Command-C remain native, but its
+  temporary native selection attributes are empty for the selection lifetime;
+  NSTextView cannot paint a second focus-dependent highlight over the shared
+  projection. An ordinary click, stream replacement, or view dismantle restores
+  both the exact attributed snapshot and the system native selection
+  attributes. Parser output, `paragraphContents`, and canonical message bytes
+  never receive these transient emphasis attributes.
+- Route macOS table text and code bodies through the existing native
+  `ParagraphView` leaf. Code uses an explicit unwrapped layout mode inside the
+  existing horizontal `ScrollView`; iOS keeps its previous SwiftUI leaf
+  selection. No parser, AST, Markdown grammar, alternate renderer, or new
+  dependency is introduced.
+- Cancel a distributed selection when a streaming content replacement changes
+  character positions or when a participating native leaf is dismantled.
+
+Regression obligations:
+
+- Verify forward and reverse drags select all intervening leaves, same-row
+  table cells preserve tab order, distributed Copy produces one exact plain-
+  text value, and streaming replacement clears stale ranges.
+- Verify the pan recognizer delays only the primary mouse button, native code
+  remains unwrapped and horizontally scrollable, paragraph width ownership and
+  one-entry measurement caching do not change, and DocumentView still has no
+  SwiftUI whole-document selection overlay.
+- Run the complete vendor suite, consuming SharedUI rendering/layout tests,
+  macOS build, and real Computer Use drag checks across headings, paragraphs,
+  list items, code, and tables. Repeat Light/Dark, VoiceOver, modifier/double-
+  click, autoscroll, and long-session performance checks before release.
+
+2026-08-20 direct evidence:
+
+- `MarkdownDocumentSelectionCoordinatorTests` passed 14/14. The final complete
+  vendor run passed 79 XCTest plus 25 Swift Testing tests with zero failures;
+  Release `-warnings-as-errors` also built successfully.
+- The consuming Intatis `MessageRenderingTests` passed 42/42 and
+  `ThreadLayoutTests` passed 25/25. Root SwiftPM, normal IntatisMac Debug, and
+  generic iOS Simulator Debug builds succeeded.
+- A signed, isolated macOS fixture produced one system-accent selection from a
+  heading through a paragraph into an unwrapped code block in both directions.
+  Host pasteboard readback preserved document order, blank lines, line breaks,
+  and code indentation. A separate table fixture exposed and then closed both
+  unspecified-width collapse and unequal-height frame-order bugs; native
+  table/list DocumentView tests now freeze nonzero layout and registration
+  order.
+- This evidence does not cover cross-message selection, drag-outside-viewport
+  autoscroll, modifier/double-click interaction, VoiceOver, Light/Dark,
+  minimum-supported macOS, or a >160-second single-instance soak.
+
+2026-08-21 corrective evidence:
+
+- A user screenshot proved that the first leaf's surviving native selection
+  and the other leaves' `controlAccentColor` projection diverged when window
+  focus changed. The implementation now derives every projection highlight
+  from `selectedTextAttributes` and suppresses only the primary leaf's duplicate
+  temporary drawing while retaining its actual selected range.
+- The coordinator suite passed 14/14; the full derivative passed 79 XCTest plus
+  25 Swift Testing tests in both Debug and strict Release
+  (`-strict-concurrency=complete -warn-concurrency -warnings-as-errors`);
+  consuming MessageRendering/ThreadLayout suites passed 67/67. The first strict
+  Release attempt also exposed a test observation accessor incorrectly hidden
+  behind `#if DEBUG`; it is now module-internal read-only and the rerun passed.
+  A normal IntatisMac Debug build and a signed unique-bundle fixture both
+  succeeded.
+- Computer Use verified one identical selection appearance across paragraph and
+  code before and after switching application focus. Host pasteboard readback
+  after Command-C retained the complete distributed plain text. The installed
+  product then reproduced the user's paragraph-to-ordered-list drag with one
+  visual style. Dark, VoiceOver, Increase Contrast, modifier/double-click,
+  cross-message, viewport-edge autoscroll, and long soak remain open gates.
+
 ## Current validation evidence
 
 Unless explicitly identified as patch-group-10 or patch-group-12 evidence

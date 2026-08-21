@@ -1,7 +1,7 @@
 # CURRENT_UI_COLOR_SYSTEM — 系统原生表面与 Liquid Glass 规范
 
 文档状态：当前 UI 实施规范
-最近核对日期：2026-08-19
+最近核对日期：2026-08-21
 产品基线：v0.55（build 55）
 
 > Intatis 不再把“系统外观”解释为固定的纯白和纯黑。页面、侧栏、内容层与控制层均使用 Apple 平台的动态语义资源；在支持的系统上，导航与交互控件采用原生 Liquid Glass。`docs/UI_COLOR_SYSTEM.md` 只保存上一版香槟金 / 暖中性色方案，不随当前方案修改。
@@ -15,6 +15,11 @@
 5. Liquid Glass 不铺满页面或整段 transcript，也不作为一般长文本或数据卡片的默认背景；用户消息气泡只包裹该条用户输入，其他对话正文仍直接位于 canvas。
 6. 文本、分隔线、强调色与错误色使用系统语义资源：`.primary`、`.secondary`、系统 separator、`.accentColor`、`.red` 等。
 7. 颜色不是状态的唯一信息通道；状态同时保留文字、图标或结构提示。
+8. macOS rich message 的直接拖拽选区以每个 native leaf 的同一份系统
+   `selectedTextAttributes` 为唯一颜色事实源，即 `NSColor.selectedTextBackgroundColor` 与
+   `NSColor.selectedTextColor`；不得另用 `controlAccentColor`、固定蓝色 RGB 或透明 overlay 形成第二套
+   高亮。跨 native leaf 的强调只存在于 selection lifetime 的 disposable attributed projection，清除时
+   恢复原动态语义色与 native selection attributes。
 
 “系统原生”指由当前 Apple 平台实时解析的语义表面和材质，而不是把某一台设备上看到的像素颜色写死。取色器只能用于视觉核对，不能成为令牌来源。
 
@@ -44,7 +49,14 @@
 
 - 用户消息保持 trailing 对齐和既有宽度合同，但外层改为原生 `Glass.regular`，不再绘制蓝色细线；这是唯一对话气泡。assistant / agent / system 正文，包括失败 / 中断回复，都没有外层卡片、底色或描边，Markdown、公式与恢复建议直接显示在系统 canvas 上。
 - assistant / agent 名称右侧的消息时间属于三级只读元数据，不加 badge、图标、头像、玻璃或独立容器；它跟随系统本地化，24 小时内仅时间、7 天内星期加时间、更早为年月日加时间。
-- composer 固定为两排：第一排左侧是模型选择控件，右侧是 Context / Input / Cached / Output / Time 只读 usage；Chat/Code/Cowork 的选择器共用原生 `Menu` 语义与 40pt 高 interactive Liquid Glass 胶囊。选择按钮关闭态只显示模型名，不显示 CPU/芯片图标、provider 名或 variant/reasoning 辅助文字；弹出菜单内部仍按 provider 分组并保留 variant 明细。第二排从左到右是当前产品面已有的附件或图像 action、原生多行 `TextField`、voice、唯一主操作位；voice 始终紧邻主操作左侧。
+- composer 固定为两排：macOS 第一排左侧是模型选择控件，右侧只保留会话级 Context；Input / Cached / Output / Time 属于生成该回复的 exact turn，位于每条已完成 assistant/agent 正文下方的低噪声 footer。footer 最左是无文字 `doc.on.doc` 复制按钮，其右依次为可证明的四项统计；不增加背景、玻璃、点赞、点踩或其他反馈按钮。iOS Chat 本轮继续保留既有 model + 完整 latest-turn usage 第一排。Chat/Code/Cowork 的选择器共用原生 `Menu` 语义与 40pt 高 interactive Liquid Glass 胶囊。选择按钮关闭态只显示模型名，不显示 CPU/芯片图标、provider 名或 variant/reasoning 辅助文字；弹出菜单内部仍按 provider 分组并保留 variant 明细。第二排从左到右是当前产品面已有的附件或图像 action、原生多行 `TextField`、voice、唯一主操作位；voice 始终紧邻主操作左侧。
+- macOS reply footer 直接继承 conversation canvas，使用三级/二级语义文字与等宽数字，不绘制 card、Material、Glass、separator 或固定颜色。复制按钮只显示 SF Symbol，help/VoiceOver 仍使用本地化“Copy message”；clipboard 写入 canonical raw message text，统计值和其他 UI metadata 不进入复制结果。
+- macOS rich assistant/agent 正文可在同一条 rendered message 内直接跨 heading、paragraph、list、quote、
+  table cell 与 code body 拖拽；所有参与 leaf 在 mouse-up 后使用同一系统 selected-text 选区。首个 leaf
+  只保留不重复绘制的 native selected range 以维持 Copy responder 语义，不能再叠一层随 focus 改变的
+  原生浅/深高亮。它不是新的内容 surface，也不增加背景、card、glass 或固定蓝色；普通点击/stream
+  replacement/dismantle 恢复原 attributed colors。Command-C 复制显示 plain text；reply footer 的整条
+  raw copy 仍是独立能力。
 - composer 第二排的附件/图像 action、voice 与主操作使用 40×40 原生圆形 glass/bordered control，输入容器单行最小高度同为 40，同行 spacing 为 8；多行输入只向上增长，左右按钮保持底边对齐。主操作 idle 时是 Send，工作时在同一位置替换为 `Button(role: .destructive)` + `stop.fill` 的系统红色 Stop，不并排显示两个操作。voice 不占用该唯一槽位：第一次点击开始录音，第二次点击停止并转写，结果只进入可编辑草稿。
 - composer 的附件、图像 action、voice、Stop 与 Send 复用 `.controlSize(.regular)`、圆形 button border shape 和系统原生 glass / bordered 表现；Send 使用 prominent 语义，Stop 使用系统 destructive/red 语义且不自绘。sidebar `Recent` 旁 `+` 则使用 `.controlSize(.small)`、圆形 border shape 与原生 glass，fitting size 为 30×30。没有对应能力的 Chat / Code 不凭空增加附件入口；voice 是四个 composer 共用的输入能力，不生成设置页或自动发送。
 - iOS 复用同一两排 composer 几何：第一排左侧是关闭态只显示模型名的原生 glass
@@ -88,9 +100,10 @@
 
 - `Apps/IntatisMac/Sources/IntatisDesign.swift`：系统 window canvas、macOS 13 兼容表面、语义色与内容卡片。
 - `Apps/IntatisMac/Sources/IntatisMacRootView.swift`：系统 split-view sidebar 材质、title/竖向 icon mode/history/Settings 内部结构与 detail canvas。
-- `Packages/IntatisSharedUI/Sources/ThreadSurfaces.swift`：用户消息原生 regular glass helper、结构化内容 Material、30×30 sidebar New 圆形 glass control、原生圆形 icon controls、40pt composer/selection-menu 几何合同、两排 composer、首排 usage strip 与可选 accessories。
+- `Packages/IntatisSharedUI/Sources/ThreadSurfaces.swift`：用户消息原生 regular glass helper、结构化内容 Material、30×30 sidebar New 圆形 glass control、原生圆形 icon controls、40pt composer/selection-menu 几何合同、两排 composer、macOS Context strip、macOS icon-only copy/per-turn metrics footer、iOS full usage strip 与可选 accessories。
 - `Packages/IntatisSharedUI/Sources/Views.swift`：共享 Chat 消息和 composer；仅用户消息使用 glass 气泡，其余对话角色继承系统 canvas。
 - `Packages/IntatisSharedUI/Sources/CodeViews.swift`、`CoworkViews.swift`、`ArtifactViews.swift`：各产品面的内容层 / 功能层映射。
+- `Vendor/SwiftStreamingMarkdown/Sources/MarkdownText/UI/TextSelection/MarkdownDocumentSelectionCoordinator+macOS.swift` 与 AppKit paragraph/table/code leaves：单一 `selectedTextAttributes` 跨 block 选择、transient emphasis、Copy responder 与清理。
 - `Apps/IntatisMac/Sources/IntatisChatScreen.swift`、`IntatisMacApp.swift`：macOS Chat、设置与 home CTA。
 - `Apps/IntatisiOS/Sources/IntatisiOSApp.swift`：iOS JetBrains Mono 标题角色、顶部 session header、
   macOS 同层级抽屉、两排 composer 接线、Settings 与根 Icon Composer resource 选择。
@@ -111,7 +124,11 @@ Apple 官方设计与 API 依据：
 - Liquid Glass 主要出现在导航和交互功能层；内容层例外只包括用户消息气泡与用户明确指定的 Cowork 紧凑 trailing status rail。仅用户消息有外层对话气泡且不得叠加 accent 蓝色描边；assistant / agent / system（包括失败 / 中断回复）直接位于系统 canvas。专用结构化卡片继续使用 Material，页面与长 transcript 不整片玻璃化。
 - 支持的系统上使用真实 `glassEffect` / glass button；旧系统 fallback 仍由系统语义 Material / control 渲染。
 - macOS Chat / Code / Cowork 与 iOS Chat 的 Light / Dark 运行态都经过视觉核对；不能只用源码搜索或固定像素值推断。
-- thread header 显示 session display name；Code / Cowork header 使用紧凑顶部留白且 Cowork 不常驻 permission-reviewer 横幅；消息无 agent 头像与通用 Agent badge；正常 agent 回复无外层卡片；agent 名称旁有本地化三级时间元数据；macOS sidebar 模式为带图标的竖向三行且仅选中行使用玻璃，Recent New `+` 为 30×30 原生圆形 glass；macOS composer 第一排保持 40pt、关闭态仅模型名的 model/profile glass 菜单左、usage 右，第二排保持已有 action 左、输入居中、voice 紧邻唯一 Send/Stop 左侧。iOS 顶部固定 sidebar/session/new，抽屉为 JetBrains Mono `Intatis`、选中 Chat、Recent/New 和底部 Settings，空页无 onboarding/建议卡；底部同样为 model/usage 第一排和 paperclip/input/voice/Send-or-Stop 第二排。两平台第一方英文字形统一使用 JetBrains Mono，标题/正文/控件仍由语义字号和字重区分；中文继续走 Apple CJK fallback。两平台第二排 action/voice/stop/Send 与单行输入均为 40pt，输入变为多行时按钮底边不漂移；Cowork 宽屏 rail 第一位为权限审查、其后为 Agents/Goal/Tasks 且无 Git，pending 时 rail 固定；无法容纳 rail 时只显示一个权限兜底卡且不复制 Goal/Tasks。
+- thread header 显示 session display name；Code / Cowork header 使用紧凑顶部留白且 Cowork 不常驻 permission-reviewer 横幅；消息无 agent 头像与通用 Agent badge；正常 agent 回复无外层卡片；agent 名称旁有本地化三级时间元数据；已完成 Mac 回复底部以 icon-only copy 开始，紧随 Input/Cached/Output/Time，且无反馈按钮或额外表面；macOS sidebar 模式为带图标的竖向三行且仅选中行使用玻璃，Recent New `+` 为 30×30 原生圆形 glass；macOS composer 第一排保持 40pt、关闭态仅模型名的 model/profile glass 菜单左、Context 右，第二排保持已有 action 左、输入居中、voice 紧邻唯一 Send/Stop 左侧。iOS 顶部固定 sidebar/session/new，抽屉为 JetBrains Mono `Intatis`、选中 Chat、Recent/New 和底部 Settings，空页无 onboarding/建议卡；底部仍为 model/full-usage 第一排和 paperclip/input/voice/Send-or-Stop 第二排。两平台第一方英文字形统一使用 JetBrains Mono，标题/正文/控件仍由语义字号和字重区分；中文继续走 Apple CJK fallback。两平台第二排 action/voice/stop/Send 与单行输入均为 40pt，输入变为多行时按钮底边不漂移；Cowork 宽屏 rail 第一位为权限审查、其后为 Agents/Goal/Tasks 且无 Git，pending 时 rail 固定；无法容纳 rail 时只显示一个权限兜底卡且不复制 Goal/Tasks。
+- macOS rich message 正向/反向跨 block 拖拽应显示一套连续系统 selected-text 选区；active/inactive window
+  都不得让首个 leaf 与后续 leaf 分裂成两种颜色。清除后原文本语义色与 native selection attributes 逐属性
+  恢复，table/code 布局不变，Intatis 不显示 `Select more text` 菜单/sheet。Increase Contrast、Dark 与
+  VoiceOver 仍须单独验收，不以固定蓝色截图作唯一通过依据。
 - macOS 与 iOS touched targets 均可编译，全量 SwiftPM 测试通过。
 
 静态复核重点：
@@ -358,3 +375,17 @@ rg -n 'glassEffect|GlassEffectContainer|buttonStyle\(\.glass|regularMaterial|win
   Dark、超大 Dynamic Type、VoiceOver、真实长中英混排、全部系统 sheet/menu/control 与真机。
 - 正式发布须继续完成 release/accessibility/license/bundle gate；尤其要验证 Dark、超大 Dynamic Type、
   VoiceOver、真实中英混排、真机与正式签名/公证。字体选型本身已经定案，不再要求删除这些资源。
+
+## 24. 2026-08-20 macOS 逐回复操作与 usage footer
+
+- macOS Chat、Code、Cowork 的已完成 assistant/agent 对话行在正文最下方复用同一个无表面 footer；
+  `doc.on.doc` 是最左且唯一的消息操作，不显示文字，也不加入点赞/点踩或其他反馈动作。
+- 复制操作写入 raw EventLog/projection message text，保持 Markdown、代码围栏、公式源文本与换行；
+  footer 的统计、名称和时间不进入 clipboard。
+- `turn_stats` 的 optional `turnID` / `responseMessageID` 只把新式 exact stats 投影到对应回复；旧日志
+  缺关联时不按邻近或正文猜测。footer 依次显示可证明的 Input（prompt-cached）、Cached、Output、
+  Time；缺字段就省略，不造零值。
+- macOS composer 第一排右侧只保留 Context；iOS Chat 本轮保持完整 latest-turn usage，不把 Mac
+  交互变更外推到 iOS。
+- footer 不进入 Markdown renderer、没有 Material/Glass/card 或固定颜色，因此不改变 rich admission、
+  paragraph layout、16-row paging、Cowork rail 或用户气泡合同。

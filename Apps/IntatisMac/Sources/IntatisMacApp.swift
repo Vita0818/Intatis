@@ -11,9 +11,7 @@ import IntatisArtifacts
 import IntatisTools
 import IntatisMCP
 import IntatisSharedUI
-#if !INTATIS_MAC_APP_STORE
 import IntatisKnowledge
-#endif
 #if canImport(AppKit)
 import AppKit
 #endif
@@ -499,7 +497,6 @@ final class AppEnvironment: ObservableObject {
 
     private func makeKnowledgeToolAugmenter()
         -> HostToolRegistryAugmenter? {
-        #if !INTATIS_MAC_APP_STORE
         let configured = AppConfig.providerConfig()
         guard (try? ProviderRegistry.validateKnowledgeConfiguration(
             configured)) != nil else { return nil }
@@ -524,20 +521,15 @@ final class AppEnvironment: ObservableObject {
                         evaluationDate: formatter.string(from: Date())))
                 return try await host.augment(input)
             }
-        #else
-        return nil
-        #endif
     }
 
     private func knowledgeToolsConfigurationNotice() -> String? {
-        #if !INTATIS_MAC_APP_STORE
         do {
             try ProviderRegistry.validateKnowledgeConfiguration(
                 AppConfig.providerConfig())
         } catch {
             return error.localizedDescription
         }
-        #endif
         return nil
     }
 
@@ -1699,6 +1691,41 @@ struct IntatisMacApp: App {
             || Bundle.main.bundleIdentifier?.hasSuffix(
                 ".CoworkAgentConversationFixture") == true
     }
+
+    private var launchesMessageFooterFixture: Bool {
+        Bundle.main.bundleIdentifier?.hasSuffix(
+            ".MessageFooterFixture") == true
+    }
+
+    private var documentSelectionFixtureStage: String? {
+        let identifier = Bundle.main.bundleIdentifier
+        if identifier?.hasSuffix(".DocumentSelectionFixture") == true {
+            return "code-selection"
+        }
+        if identifier?.hasSuffix(".DocumentSelectionTableFixture") == true {
+            return "table"
+        }
+        if identifier?.hasSuffix(".DocumentSelectionFullFixture") == true {
+            return "full-static"
+        }
+        return nil
+    }
+
+    private var messageFooterFixtureArguments: [String] {
+        return ProcessInfo.processInfo.arguments + [
+            "-IntatisRendererFixtureStage",
+            "message-footer",
+        ]
+    }
+    private var documentSelectionFixtureArguments: [String] {
+        guard let documentSelectionFixtureStage else {
+            return ProcessInfo.processInfo.arguments
+        }
+        return ProcessInfo.processInfo.arguments + [
+            "-IntatisRendererFixtureStage",
+            documentSelectionFixtureStage,
+        ]
+    }
     #endif
 
     var body: some Scene {
@@ -1713,6 +1740,14 @@ struct IntatisMacApp: App {
                     .preferredColorScheme(launchAppearance)
             } else if launchesCoworkAgentConversationFixture {
                 CoworkAgentConversationFixtureView()
+                    .preferredColorScheme(launchAppearance)
+            } else if launchesMessageFooterFixture {
+                RendererFixtureView(
+                    arguments: messageFooterFixtureArguments)
+                    .preferredColorScheme(launchAppearance)
+            } else if documentSelectionFixtureStage != nil {
+                RendererFixtureView(
+                    arguments: documentSelectionFixtureArguments)
                     .preferredColorScheme(launchAppearance)
             } else if ProcessInfo.processInfo.arguments.contains("-IntatisRendererFixture") {
                 RendererFixtureView()

@@ -52,12 +52,12 @@ git status --short
 本仓库是 Apple-first、Swift-native 优先的本地 AI 工作区（Swift 多 target，SwiftPM + XcodeGen），含三个产品面：Chat（普通多模态对话）/ Code（单 agent 本地工作区）/ Cowork（多 agent 本地工作区协作）。macOS 是全量产品；iOS 是 chat 子集。允许按 `docs/OPEN_SOURCE_REUSE.md` 选择性复用兼容许可证的公开源码；当前实现是否实际包含上游代码以 `NOTICE.md` 为准。
 
 macOS 只通过 Developer ID 签名、公证和直接下载分发；不做 Mac App Store
-版本。`IntatisMacAppStore`、`.macAppStore` 与 App Store entitlements 是源码中
-尚未删除的遗留实现，不是产品面、设计约束、默认测试矩阵或 release gate。
-后续不得仅为 Mac App Store App Sandbox 裁剪功能或增加替代实现，也不要默认
-构建/修复该 target。此决定不弱化 Intatis 自有权限链、Workspace confinement、
-managed-terminal Seatbelt、Hardened Runtime、签名/公证或 iOS 平台边界；精确
-合同见 `docs/MACOS_DISTRIBUTION.md`。
+版本。旧 `IntatisMacAppStore` target、`INTATIS_MAC_APP_STORE` 编译条件与专属
+App Store entitlements 已于 2026-08-21 按用户明确要求删除；`.macAppStore` 只保留
+协议解码和隔离测试兼容，不对应任何 App target。后续不得重新引入 Mac App Store
+target，也不得仅为 App Sandbox 裁剪功能或增加替代实现。此决定不弱化 Intatis
+自有权限链、Workspace confinement、managed-terminal Seatbelt、Hardened Runtime、
+签名/公证或 iOS 平台边界；精确合同见 `docs/MACOS_DISTRIBUTION.md`。
 
 未来常规任务可以按用户要求修改业务源码；但在只要求项目自查或文档更新的任务中，只允许修改：
 
@@ -108,7 +108,7 @@ managed-terminal Seatbelt、Hardened Runtime、签名/公证或 iOS 平台边界
 - Phase L 应用生命周期：macOS 的 Chat/Code/Cowork runtime 由进程级 `AppSessionRuntimeManager` 按 exact `{SessionKind, SessionID}` 持有，窗口只持有当前展示选择；切换 mode/session、Command-W 或关闭最后窗口不得隐式 stop。删除 session 必须先精确 drain 对应 runtime，其他窗口收到 removal 后退出已删除详情。Command-Q 先关闭新操作 admission，再同时广播所有 runtime stop，并在有界 deadline 后允许进程退出；超时不伪造 settled。冷启动只 replay/reconcile：历史 active Goal durable 转为 paused（达到预算则 budget-limited），历史 running/stopping 由既有恢复路径显示 interrupted，不自动调用 provider；只有明确 Retry、Resume、Send 或 CLI `/auto|/default` 后的显式 data-plane 动作才可继续。Chat/Code/Cowork shutdown 均须取消并等待本 runtime 已登记的 provider/tool/operation task，再释放权限 waiter、subscription 与 workspace scope。
 - 平台边界：iOS 是 macOS 真子集（chat/multimodal/providers/artifacts，无 Tools/Permission/AgentKernel/Cowork）；`PlatformProfile.current` 默认 `.iOS`（最受限）。
 - macOS 分发边界：唯一发行 App 是 Developer ID/direct-distribution
-  `IntatisMac`。不得把遗留 `IntatisMacAppStore` 的 App Sandbox 限制带回
+  `IntatisMac`。不得重新引入已删除的 `IntatisMacAppStore` 或把 App Sandbox 限制带回
   产品设计、依赖选择或默认验证；不得把“无 App Store 约束”误解为可以移除
   PermissionEngine、Lease、PathConfinement、SecretScanner、Seatbelt 或
   Hardened Runtime。
@@ -123,8 +123,8 @@ managed-terminal Seatbelt、Hardened Runtime、签名/公证或 iOS 平台边界
 ## 文档索引
 
 - `docs/PROJECT_MAP.md`：目录、target、入口、关键文件、生成物和脚本地图。
-- `docs/MACOS_DISTRIBUTION.md`：macOS Developer ID 直接分发决策、遗留
-  App Store target 状态、仍须保留的运行时安全边界和默认验证矩阵。
+- `docs/MACOS_DISTRIBUTION.md`：macOS Developer ID 直接分发决策、已删除
+  App Store target 的边界、仍须保留的运行时安全边界和默认验证矩阵。
 - `docs/ARCHITECTURE.md`：总体架构、主要链路、数据模型、权限与安全机制。
 - `docs/CURRENT_STATE.md`：当前真实状态、已有能力、风险、工作区改动。
 - `docs/TESTING.md`：环境、构建、测试、lint/format 与手动验证方式。

@@ -11,7 +11,7 @@
 - Review 检查新增 wrapper/adapter/facade 是否仅为官方 API 必需的最薄接线；发现核心能力复制、第二实现或静默降级即判定失败。
 
 文档状态：当前验证矩阵
-最近核对：2026-08-19
+最近核对：2026-08-21
 产品基线：v0.55（build 55）
 
 历史测试数量、性能数字和事故复验保留在 Git 历史及 dated reports；它们不能替代当前
@@ -21,8 +21,9 @@ working tree 的验证。这里只记录现行命令、release gate 和最近一
 
 - 当前 Apple 构建环境：Xcode 27 / Swift 6.x / XcodeGen。
 - macOS 默认只验证 Developer ID/direct-distribution `IntatisMac`。
-- `IntatisMacAppStore` 是 legacy target，除非用户明确点名，否则不构建、不修复，也不作为
-  release gate。
+- `xcodegen generate` 后必须确认 target/scheme 清单中不存在已删除的
+  `IntatisMacAppStore`，源码/工程也不得恢复 `INTATIS_MAC_APP_STORE` 或专属 App Store
+  entitlements；`.macAppStore` 仅可出现在共享协议解码/隔离测试兼容路径。
 - iOS 验证只覆盖 Chat 子集，不得链接 Tools、Permission、AgentKernel、Cowork 或 MCP。
 - SwiftPM 测试中的 sandbox、managed terminal Seatbelt、Linux bwrap/guard、权限与路径
   围栏仍是产品安全边界，不能因为不做 App Store 而跳过。
@@ -511,10 +512,24 @@ recovery App metadata/architecture/signature/entitlements 重新验证；超时�
   且所有运行时操作禁用；`@permission-reviewer` 为 status-only；两个窗口选择互不覆盖；切走再
   返回仍恢复各 agent 自己的 Earlier/Newer/Latest boundary；查看 worker 时 composer 仍路由 `@main`；
 - long rich response、Markdown/table/code/math 和 plain-safe fallback；
+- macOS rich assistant/agent message 直接左键拖拽可在同一 rendered document 内正向/反向跨 heading、
+  paragraph、list item、block quote、table cell 与 code body；拖动期间 ranges 连续，mouse-up 后所有
+  leaf 使用同一系统 `selectedTextAttributes` 强调。首个 leaf 只能保留不重复绘制的 native selected range
+  维护 responder/Copy；active/inactive window 均不得出现首段浅蓝、后续深蓝的双重样式。普通 click、
+  stream replacement、mode/session/page change 与 dismantle
+  必须恢复 exact attributed projection；Intatis 不显示 `Select more text` menu/sheet，也不构造第二
+  SelectionOverlay/plain renderer。Command-C 按 document order 复制 displayed plain text，block 间换行、
+  同 table row 用 tab、inline math 恢复 literal；message footer whole-copy 仍复制 canonical raw text。
+  code 必须保持 horizontal unwrapped，table 不等高 cell 仍 row-major/非零布局；iOS/plain-safe 行为不变；
+- macOS 每条已完成 assistant/agent 回复在正文下方只有一个最左 icon-only copy action，右侧按
+  Input/Cached/Output/Time 顺序显示该 exact `responseMessageID` 的可证明字段；没有文字版 Copy、
+  点赞/点踩、card/glass 或旧 global latest usage。复制结果必须逐字等于 raw message text；旧 unbound
+  `turn_stats` 不得贴到相邻消息。Chat message-first 与 Agent stats-first 两种事件顺序都必须覆盖；
 - macOS Chat、iOS Chat、Code、Cowork 仅用户消息显示 trailing 原生 regular Liquid Glass 气泡，
   不出现旧 accent 蓝色描边；assistant/agent/system（包括失败/中断回复）直接位于 canvas，
   正常 tool/permission/task 等专用结构化卡片仍保留各自容器；
-- composer 单行/多行、model menu、usage、Send/Stop；
+- composer 单行/多行、model menu、usage、Send/Stop；macOS 第一排只保留 Context，iOS Chat 继续完整
+  latest-turn usage；
 - iOS composer 获得焦点后，Send 按钮与键盘提交都应立即收起键盘；重新聚焦后在消息区上下拖动应
   交互式收起键盘，stream completion、输入框重新启用和自动滚动不得再次弹出；macOS focus 不变；
 - Cowork wide rail、narrow permission fallback、Goal/Tasks/Agents；
@@ -745,6 +760,140 @@ INTATIS_REAL_MULTIMODAL_SMOKE=1 swift test \
   线上 provider smoke 必须单独记录，不能从离线测试或编译外推。
 
 ## 最近一次真实结果
+
+### 2026-08-21 `IntatisMacAppStore` target 删除
+
+- `project.yml` 不再声明 `IntatisMacAppStore` target 或 scheme，唯一专属文件
+  `Apps/IntatisMac/IntatisMac.AppStore.entitlements` 已删除；所有 Mac App 源码中的
+  `INTATIS_MAC_APP_STORE` 条件编译分支已删除并保留唯一 `.macDeveloperID`/workspace+global/
+  Knowledge/managed-stdio 路径。`.macAppStore` 共享 profile 只保留协议解码与隔离测试兼容。
+- `xcodegen generate` 退出 0。随后 `xcodebuild -project Intatis.xcodeproj -list` 的 App targets 精确为
+  `IntatisMac`、`IntatisiOS`；`Intatis.xcodeproj/xcshareddata/xcschemes` 精确含
+  `IntatisMac.xcscheme` 与 `IntatisiOS.xcscheme`，生成工程、Mac sources 和 entitlements 目录均不含
+  `IntatisMacAppStore`、`INTATIS_MAC_APP_STORE` 或 `IntatisMac.AppStore.entitlements`。
+- `SDKClientOnlySurfaceTests` 3/3、0 failures；新断言验证单一 Mac App、Developer ID target 继续链接
+  `IntatisMCP` + `IntatisMCPStdio`、iOS 两者都不链接，并验证 target/macro/entitlements 文件不存在。
+  保留的 `.macAppStore` 协议/remote-only 兼容由 `IntatisCoreTests.testProfilePresets` 1/1 与
+  `MCPPreparedConfigurationTests` 5/5 覆盖，合计 6/6、0 failures。
+  `scripts/check-version-consistency.sh` 输出 `Intatis version is consistent: 0.55 (build 55)`。
+- `IntatisMac` macOS Debug unsigned build（`-disableAutomaticPackageResolution`、
+  `ENABLE_DEBUG_DYLIB=NO`）退出 0；`IntatisiOS` generic Simulator Debug unsigned build也退出 0。
+  输出只有仓库既有 unused-result/`onChange` deprecation，以及旧临时 build output 引发的 stale-file
+  warnings；没有 target/link/source 编译失败。本轮未运行整仓 `swift test`、universal Release、Developer
+  ID 签名、公证、staple、Gatekeeper 或重新安装 `/Applications/Intatis.app`。
+
+### 2026-08-21 macOS 跨 block 选区单一外观 corrective
+
+- 用户提供的真实 Chat 截图暴露旧 mouse-up 路径仍有两套绘制：首个 leaf 保留 `NSTextView` native
+  selection，后续 leaf 把 `controlAccentColor` / alternate selected foreground 写入 disposable
+  `textStorage`；窗口或截图工具改变 focus 后，native selection 自动变浅而 projection 保持深蓝。
+- 当前 `ParagraphNSView` 让 native selection 与 distributed projection 共用一份系统
+  `selectedTextAttributes`。coordinator 在 mouse-up 后让所有 leaf 只显示这一个 projection；首个 leaf
+  仍保留真实 selected range 以维持 AppKit responder、Edit → Copy 与 Command-C，但临时把 native
+  selection attributes 置空，清除 selection 时恢复。没有新 overlay、renderer、依赖或 canonical 文本写入。
+- `MarkdownDocumentSelectionCoordinatorTests` 14/14，新增断言逐 leaf background/foreground 与系统
+  selection attributes 完全一致、只有 primary 保留真实 range、清除后 native attributes 与原 attributed
+  projection 均恢复。完整 vendor 为 79 XCTest + 25 Swift Testing、0 failures；SharedUI
+  `MessageRenderingTests` 42/42、`ThreadLayoutTests` 25/25，合计 67/67、0 failures。初次 strict Release
+  test 暴露 test-only coordinator observation 被错误包在 `#if DEBUG`；改为 module-internal read-only 后，
+  `-strict-concurrency=complete -warn-concurrency -warnings-as-errors` 的完整 Release suite 也以相同
+  79 XCTest + 25 Swift Testing、0 failures 通过。
+- normal `IntatisMac` Debug（`ENABLE_DEBUG_DYLIB=NO`）和 unique-bundle code-selection fixture 均构建并以
+  ad-hoc Hardened Runtime 签名通过。Computer Use 在 fixture 中真实拖拽正文→代码，并在 active/切换应用
+  focus 后都看到一套浅蓝选区；Command-C 后以宿主 `pbpaste` 读回正文与 code prefix，换行、空行和缩进
+  完整。随后在更新后的 `/Applications/Intatis.app` 中直接复现用户截图的“经常遇到这几个词”→
+  Stride/Padding/Channel 场景，首段和三项列表已显示同一种选区颜色；验证后已清除临时选区。
+- 最终安装仍为 `0.55 (55)` arm64 Debug、ad-hoc Hardened Runtime，main executable SHA-256
+  `1fdc9785519fd41449431695849a029fc330b7f9ff3b898416f221fe913116c7`；staging/installed bundle
+  `diff -qr` 无差异，strict codesign、audio-input=true、allow-jit=false、disable-library-validation=false、
+  无 Debug dylib/quarantine 均通过。strict Release test observation 修正前的中间包保留在
+  `~/.Trash/Intatis-selection-appearance-intermediate-20260821-121114.app`，executable SHA-256 为
+  `65d0a80dff1ac904db31e077703a17c6dda122487a98540ab6a8f7a7560d3130`；实际带双重选区样式的旧包保留在
+  `~/.Trash/Intatis-before-selection-appearance-20260821-120049.app`，其 executable SHA-256 仍为
+  `659683ef665e8591bdfdfc5257179afba4548c6049c6e377c75ecd3671fc12e9`。本轮未重跑 iOS build（改动
+  仅位于 `#if canImport(AppKit)`）、整仓 `swift test`、VoiceOver、Dark、
+  Increase Contrast、modifier/double-click、跨消息、拖出 viewport autoscroll 或长 soak。
+
+### 2026-08-20 macOS 单消息直接跨 block 选择
+
+- `DocumentView` 现在在 macOS 为自己的 native TextKit leaves 注入一个
+  `MarkdownDocumentSelectionCoordinator`。AppKit pan 只接普通无 modifier 的 primary-button drag；
+  ordinary click、double/triple click、modifier selection、right-click 与 link 继续由 native AppKit
+  处理。range order 使用稳定 registration，geometry 只负责命中 current leaf；table/code 的 macOS
+  plain leaves 改用现有 `ParagraphView`，code 采用 unwrapped natural measurement，iOS 仍用原 SwiftUI
+  leaf selection。Intatis macOS render config 的 `textSelectionConfig.isEnabled=false`，不再注入
+  `Select more text` menu/modal。
+- coordinator 专项 14/14、0 failures：覆盖 forward/reverse、多 paragraph、window point target、
+  unequal-height table order、真实 DocumentView table row-major/list participation、same-row tab、combined
+  pasteboard、TextKit 2 coordinator injection、unwrapped code、pan recognizer、transient system-accent
+  emphasis、ordinary-click exact attributed restore、stream replacement cancel。
+- vendor 完整 suite 为 79 XCTest + 25 Swift Testing、0 failures；vendor Release
+  `-warnings-as-errors` build 通过。Intatis `MessageRenderingTests` 42/42 与 `ThreadLayoutTests` 25/25，
+  合计 67/67；SwiftPM 全图 build、`IntatisMac` normal Debug（`ENABLE_DEBUG_DYLIB=NO`）和
+  `IntatisiOS` generic Simulator Debug 均退出 0，仅有仓库既有 warnings。
+- Computer Use 在 ad-hoc Hardened Runtime、unique bundle ID 的 code-selection fixture 中完成 heading →
+  paragraph → code 正向拖拽和 code → heading 反向拖拽；mouse-up 截图中全部参与 leaf 为系统蓝色选区，
+  无临时诊断标记。Command-C 后在宿主环境读取 general pasteboard，得到按文档顺序的 heading、paragraph
+  与 code prefix，保留代码空行、换行与缩进。table fixture 先暴露 plain native leaf 的 unspecified
+  measurement 零宽问题并在修复后实窗确认内容/网格完整；不等高 table 的 frame-order 漏 cell 问题随后
+  改为 registration-order，并由真实 DocumentView host test 冻结。full-static fixture 实窗确认 heading、
+  paragraph、quote、ordered/unordered/task lists 与 table 均使用正常 production layout；Computer Use
+  对该独立窗口出现 `noWindowsAvailable`，未把 full-static 自动 drag 伪报为通过。
+- 最终 `/Applications/Intatis.app` 为 `0.55 (55)` arm64 Debug、ad-hoc Hardened Runtime，main executable
+  SHA-256 `659683ef665e8591bdfdfc5257179afba4548c6049c6e377c75ecd3671fc12e9`；strict codesign、
+  audio-input=true、allow-jit=false、disable-library-validation=false、无 quarantine/Debug dylib均通过。
+  更新前 footer build 保留在 `~/.Trash/Intatis-before-selection-20260820-231513.app`。安装后的真实 Chat
+  自动 drag 因 Computer Use 只保留 process、连续返回 `noWindowsAvailable` 而未形成新证据；没有新增
+  crash report。未运行整仓 `swift test`、跨消息选择、拖出 viewport autoscroll、modifier/double-click
+  实际操作、VoiceOver、Light/Dark、Reduce Transparency/Increase Contrast 或 >160 秒 soak。
+
+### 2026-08-20 macOS 逐回复复制与统计 footer
+
+- `TurnStatsPayload` 以 optional `turnID` / `responseMessageID` 追加精确关联，旧 JSON 缺字段仍解码为
+  nil；`ConversationProjection` / `CodeProjection` 支持 message-first 与 stats-first，并让 legacy unbound
+  stats 只保留 latest session context。pending stats 是 presentation-only，最多保留 64 个未兑现 identity。
+- `InferenceProfileProtocolTests` 4/4；组合 focused run 中 `ThreadLayoutTests` 25/25、
+  `IntatisConversationCodeTests` + Chat stats + `SessionProjectionPumpTests` 32/32、Agent 多轮 usage 1/1，
+  合计本轮直接相关 62 tests、
+  0 failures。clipboard 测试使用 unique pasteboard，验证中文、Markdown、代码围栏、公式源文本与换行
+  exact 保真；layout source-shape 冻结 icon-only copy、四项指标、三个 Mac composer Context-only 与 iOS
+  full-usage 不变，并冻结 Chat/Code/Cowork 最后一行 stats identity 会进入 scroll signature。
+- 完整受影响 target：`IntatisProtocolTests` 107/107、`IntatisConversationTests` 209/209、
+  `IntatisAgentKernelTests` 221/221、`IntatisCoworkTests` 363/363，合计 900/900、0 failures。
+  `IntatisSharedUITests` 本轮只运行直接相关 `ThreadLayoutTests` 25/25；未把仓库已知可能静默停滞的
+  SharedUI async 全量 target 或整仓 suite 伪报为通过。
+- SwiftPM 首次 focused run 完成完整受影响图 Debug 编译，随后独立 `swift build` 也退出 0。
+  `IntatisMac` macOS Debug unsigned build 在
+  `-disableAutomaticPackageResolution` 与既有 resolved package cache 下退出 0；只有仓库既有 warning。
+  一次全新 DerivedData 尝试在任何源码编译前因 GitHub EventSource clone 的 LibreSSL
+  `SSL_ERROR_SYSCALL` 失败，不能记为产品源码失败。
+- Computer Use 只读观察确认当前构建的 assistant footer 暴露 `Copy message` icon action，Mac composer
+  只剩 Context。为了显示 synthetic 四项指标另构建了 Debug-only unique bundle fixture；Computer Use
+  对该临时 bundle ID 无法可靠取得窗口并与已安装同名 App 混淆，因此四项 footer 的真实像素、窄宽、
+  Light/Dark 与 VoiceOver 仍为 `UNKNOWN`，不能由 AX source-shape 或单元测试冒充通过。
+- `IntatisiOS` generic Simulator Debug unsigned build 也退出 0，证明 shared optional stats/projection 类型
+  没有扩大 iOS linkage，且 iOS 继续使用完整 composer usage。未运行完整 `swift test`、真实
+  provider/credential/network、正式签名、公证或发行打包；该 footer pass 当时未修改跨 block 选择，
+  后续同日的上一节已单独实现并验证该能力。
+- 本机安装 smoke 先暴露了 Xcode 27 Debug 产物的签名边界：默认 build 生成 launcher、
+  `IntatisMac.debug.dylib` 与 `__preview.dylib`；整个 bundle 以 ad-hoc Hardened Runtime 重新签名并通过
+  `codesign --verify --deep --strict` 后，真实启动仍由 dyld 以 `Library not loaded` / non-platform
+  Team ID mismatch 拒绝。没有把 `com.apple.security.cs.disable-library-validation` 改为 true；该中间
+  App 已移到 `~/.Trash/Intatis-failed-debug-dylib-20260820-211318.app`。
+- 随后运行同一 `IntatisMac` Debug build，并显式设置 `ENABLE_DEBUG_DYLIB=NO`、
+  `CODE_SIGNING_ALLOWED=NO` 与临时 `CONFIGURATION_BUILD_DIR`；`xcodebuild` 退出 0，最终 bundle 的
+  `Contents/MacOS` 只含主可执行文件，`otool -L` 不再引用 `@rpath/IntatisMac.debug.dylib`。该 bundle
+  再以 `Apps/IntatisMac/IntatisMac.DeveloperID.entitlements` 做 ad-hoc `--options runtime` 签名，
+  strict codesign 通过，runtime flag 为 `0x10002(adhoc,runtime)`，audio input=true、allow-jit=false、
+  disable-library-validation=false，且无 quarantine xattr。
+- 已验证 staging 与最终 `/Applications/Intatis.app` 的 bundle identifier 均为
+  `com.Vita0818.IntatisMac`、版本为 `0.55 (55)`、架构为 arm64、Debug dylib 不存在；最终主可执行文件
+  SHA-256 为 `6e97d059e4c00b3662b35025a2e5396ba694100017d833e585cd883f0116b8a0`，CDHash 为
+  `09baccf2552cabf1a08b3a1019572abd85eef804`。Computer Use 先从临时 bundle、再从 exact
+  `/Applications/Intatis.app` 启动成功；最终 App 保持运行，accessibility state 可见 `Copy message`
+  action 与 Context 控件。旧 `0.48 (48)` 安装位于
+  `~/.Trash/Intatis-before-install-20260820-210656.app`，可恢复。该 smoke 是本机 arm64 Debug
+  安装证据，不替代 universal Release、Developer ID、notarization、staple、Gatekeeper 或干净机器验收。
 
 ### JetBrains Mono 全局英文字体发布门槛
 

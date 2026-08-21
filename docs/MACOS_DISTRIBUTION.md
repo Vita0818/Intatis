@@ -2,7 +2,7 @@
 
 文档状态：当前发行合同
 生效日期：2026-07-28
-最近核对：2026-08-19
+最近核对：2026-08-21
 产品基线：v0.55（build 55）
 
 ## 产品决策
@@ -11,11 +11,11 @@ Intatis 的 macOS 产品只通过 Developer ID 签名、公证和直接下载分
 规划、发布或验收 Mac App Store 版本，也不再把 Mac App Store 的 App Sandbox
 限制作为产品设计、功能裁剪、依赖选择或测试矩阵的约束。
 
-当前源码中的 `IntatisMacAppStore` target、`.macAppStore` profile 和
-`IntatisMac.AppStore.entitlements` 是此前方案留下的兼容/历史实现，不是当前
-发行产品面、未来版本承诺或默认验收门。没有用户对业务源码清理的明确授权时，
-只如实标注其遗留状态，不自动删除 target、profile、entitlements 或历史测试
-记录；任何专门恢复、扩展或验证该 target 的工作也必须由用户另行明确要求。
+用户已于 2026-08-21 明确要求删除旧 Mac App Store target。当前源码和 XcodeGen
+工程定义已不再包含 `IntatisMacAppStore` target/scheme、`INTATIS_MAC_APP_STORE`
+编译条件或 `IntatisMac.AppStore.entitlements`。`.macAppStore` profile 只在共享协议
+解码和隔离测试中保留兼容语义，不对应可构建 App，也不得据此恢复第二个产品图。
+历史测试记录继续按发生时事实保留，不改写为当前构建能力。
 仓库根 `README.md` 和旧 `codex-report/` 中若仍有“双 macOS 构建”或 App Store
 规划文字，均被本文件和 `docs/CURRENT_STATE.md` 的新决策取代，只能作为历史
 背景读取。
@@ -28,7 +28,7 @@ Intatis 的 macOS 产品只通过 Developer ID 签名、公证和直接下载分
   terminal、本地 Git、浏览器/文档 helper，以及 stdio + HTTP MCP。
 - 默认 macOS 验收：SwiftPM/CLI、`IntatisMac` Developer ID 产品图，以及与改动
   相关的签名、公证、Hardened Runtime、entitlements 和 bundle/link inventory。
-- `IntatisMacAppStore` 不进入日常构建、回归、release gate 或架构权衡。
+- 生成的 Xcode 工程不得重新出现 `IntatisMacAppStore` target 或 scheme。
 
 iOS 当前仍是独立的 chat 子集。本决策不自动删除或扩大 iOS 产品面，也不改变
 iOS 自身的系统 sandbox 与 target-linkage 限制。
@@ -111,7 +111,7 @@ TERM、网络错误、Apple 长时间处理或 Invalid 也保留 recovery 目录
   MCP、global Skill roots 或其他直接分发版能力；
 - 新增进程内 Git/MCP/脚本替代实现；
 - 把 Code/Cowork 降级成 chat-only 或 HTTP-only；
-- 要求业务实现、开源依赖或测试同时满足 `IntatisMacAppStore`；
+- 重新引入 `IntatisMacAppStore`、App Store scheme、编译条件或专属 entitlements；
 - 将 App Store entitlement/linkage/build 结果列为发布阻塞项。
 
 这项决策只移除 **Mac App Store 分发所强加的 App Sandbox 产品约束**，不移除
@@ -145,5 +145,6 @@ runtime sandbox`、测试宿主 sandbox、Linux bwrap 和权限/工作区围栏�
    entitlements 和 bundle/link inventory；
 6. 触及 iOS 子集时才追加 `IntatisiOS` build/test。
 
-除非用户明确点名遗留 target，否则不要构建、修复、测试或报告
-`IntatisMacAppStore`，也不要因它失败而修改当前发行产品。
+工程生成后必须检查 target/scheme 清单，确认只有 `IntatisMac` macOS App 与
+`IntatisiOS` iOS App，不得静默恢复已删除的 `IntatisMacAppStore`。旧历史报告中的
+同名构建结果不进入当前验证矩阵，也不能触发第二套产品修复。

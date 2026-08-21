@@ -194,7 +194,7 @@ let package = Package(
             publicHeadersPath: "include"
         ),
         // Local stdio process ownership is a separate linkage boundary so the
-        // App Store target can remain remote-HTTP-only.
+        // portable MCP client core and iOS subset never acquire process launch.
         .target(
             name: "IntatisMCPStdio",
             dependencies: [

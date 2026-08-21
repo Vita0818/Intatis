@@ -2263,6 +2263,7 @@ public struct CoworkShell: View {
             lastItemID: last?.id,
             lastBodyUTF8Count: last?.body.utf8.count ?? 0,
             lastItemComplete: last?.complete ?? false,
+            lastTurnStatsID: last?.turnStats?.id,
             isWorking: historyWindow.isLatest && selectedAgentIsWorking,
             showsThinkingIndicator: showsVisibleThinkingIndicator)
     }
@@ -2330,7 +2331,7 @@ public struct CoworkShell: View {
                         action: onCancelCurrent)
                 },
                 accessory: {
-                    IntatisComposerUsageStrip(
+                    IntatisComposerContextStrip(
                         stats: latestTurnStats,
                         style: threadStyle)
                 },

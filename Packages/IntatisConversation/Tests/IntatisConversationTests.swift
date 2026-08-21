@@ -871,14 +871,34 @@ final class IntatisConversationTests: XCTestCase {
 
         try await loop.send("hi")
 
-        let stats = await log.replay().compactMap { envelope -> TurnStatsPayload? in
+        let events = await log.replay()
+        let stats = events.compactMap { envelope -> TurnStatsPayload? in
             guard case .turnStats(let payload) = envelope.event else { return nil }
             return payload
+        }.last
+        let responseMessageID = events.compactMap { envelope -> MessageID? in
+            guard case .messageCompleted(let payload) = envelope.event else {
+                return nil
+            }
+            return payload.messageId
+        }.last
+        let outcomeTurnID = events.compactMap { envelope -> TurnID? in
+            guard case .turnOutcome(let payload) = envelope.event else {
+                return nil
+            }
+            return payload.turnID
         }.last
         XCTAssertEqual(stats?.promptTokens, 7)
         XCTAssertEqual(stats?.cachedPromptTokens, 3)
         XCTAssertEqual(stats?.completionTokens, 2)
         XCTAssertEqual(stats?.totalTokens, 9)
+        XCTAssertEqual(stats?.responseMessageID, responseMessageID)
+        XCTAssertEqual(stats?.turnID, outcomeTurnID)
+
+        let projectedReply = ConversationProjection.build(
+            from: events).messages.last
+        XCTAssertEqual(projectedReply?.id, responseMessageID)
+        XCTAssertEqual(projectedReply?.turnStats?.totalTokens, 9)
     }
 
     func testChatLoopCanPersistGoalUserPayload() async throws {

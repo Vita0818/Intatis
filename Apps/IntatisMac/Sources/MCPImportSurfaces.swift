@@ -6,9 +6,7 @@ import IntatisMCP
 import IntatisProtocol
 import IntatisSharedUI
 import SwiftUI
-#if !INTATIS_MAC_APP_STORE
 import IntatisMCPStdio
-#endif
 
 enum MCPImportConflictChoice:
     String, CaseIterable, Identifiable
@@ -138,12 +136,6 @@ extension AppMCPService {
                     case .streamableHTTP:
                         artifact = nil
                     case .stdio:
-                        #if INTATIS_MAC_APP_STORE
-                        throw MCPManagementError
-                            .unsupportedTransport(
-                                .stdio,
-                                .macAppStore)
-                        #else
                         guard let files =
                                 launchClosures[
                                     proposal.proposalID],
@@ -171,7 +163,6 @@ extension AppMCPService {
                                                 .trimmingCharacters(
                                                     in: .whitespacesAndNewlines))
                                     })
-                        #endif
                     }
                     let configuration =
                         try proposal.makeConfiguration(
@@ -615,12 +606,6 @@ struct MCPImportServerSheet: View {
                                 .foregroundStyle(.secondary)
                                 .textSelection(.enabled)
                         }
-                        #if INTATIS_MAC_APP_STORE
-                        Label(
-                            "Managed stdio cannot be imported by this App Store build.",
-                            systemImage: "xmark.octagon")
-                            .foregroundStyle(.red)
-                        #else
                         let closure = launchClosure(
                             proposal.proposalID,
                             importedCommand:
@@ -673,7 +658,6 @@ struct MCPImportServerSheet: View {
                             "Declare the complete launch closure explicitly: exactly one executable plus every interpreter, script, package entrypoint, lockfile, and helper. Intatis does not infer files from imported arguments.")
                             .font(IntatisTypography.system(.caption))
                             .foregroundStyle(.secondary)
-                        #endif
                     }
                 }
             }
@@ -793,17 +777,6 @@ struct MCPImportServerSheet: View {
               !model.isWorking else {
             return false
         }
-        #if INTATIS_MAC_APP_STORE
-        if workspace.parsed.preview.proposals.contains(
-            where: {
-                if case .stdio = $0.transport {
-                    return true
-                }
-                return false
-            }) {
-            return false
-        }
-        #else
         let skipped = Set(
             workspace.plan.conflicts.compactMap {
                 model.resolutions[$0.proposalID]?
@@ -831,7 +804,6 @@ struct MCPImportServerSheet: View {
                 }
             }
         }
-        #endif
         for conflict in workspace.plan.conflicts {
             guard let value =
                     model.resolutions[

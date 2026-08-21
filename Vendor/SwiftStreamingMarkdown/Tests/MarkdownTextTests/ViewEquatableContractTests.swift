@@ -56,6 +56,16 @@ final class ViewEquatableContractTests: XCTestCase {
     )
     XCTAssertNotEqual(lhs, ParagraphView(contents: differentAttributes, lineSpacing: 5))
     XCTAssertNotEqual(lhs, ParagraphView(contents: secondContents, lineSpacing: 6))
+    #if canImport(AppKit)
+    XCTAssertNotEqual(
+      lhs,
+      ParagraphView(
+        contents: secondContents,
+        lineSpacing: 5,
+        layoutMode: .unwrapped
+      )
+    )
+    #endif
   }
 
   #if canImport(AppKit)

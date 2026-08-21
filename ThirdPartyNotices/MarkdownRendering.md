@@ -60,6 +60,17 @@ bounds paragraph measurement memoization to the latest exact width. This is a
 local derivative patch; it does not change the upstream basis, license,
 parser dependency, or iosMath dependency.
 
+The macOS derivative additionally coordinates direct mouse-drag selection
+across the existing TextKit paragraph leaves of one rendered document. It does
+not restore the removed SwiftUI whole-document `SelectionOverlay` or introduce
+a second Markdown renderer: headings, paragraphs, list contents, block quotes,
+tables, code, links, and live math attachments keep their existing native
+owners, while a document-scoped AppKit coordinator distributes the transient
+selection ranges, applies/restores system-accent emphasis only in each view's
+disposable attributed projection, and combines displayed plain text for Copy. iOS keeps
+the preceding leaf-selection path. This local patch does not change the
+upstream identity, dependency graph, or licensing.
+
 ## iosMath integration
 
 - Upstream: <https://github.com/kostub/iosMath>

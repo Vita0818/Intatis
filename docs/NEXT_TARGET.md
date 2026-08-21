@@ -1,7 +1,7 @@
 # NEXT_TARGET
 
 文档状态：唯一活跃目标
-最近核对：2026-08-19
+最近核对：2026-08-21
 产品基线：v0.55（build 55）
 
 ## 目标：完成 v0.55 Developer ID 直接分发候选
@@ -15,15 +15,25 @@
 - `IntatisMac` 显式启用 Hardened Runtime。
 - `scripts/package-macos-release.sh` 已实现 universal Release、Developer ID App/DMG
   signing、Apple notarization、staple、codesign、Gatekeeper assessment、拖放安装 DMG 和
-  ZIP/DMG SHA-256 清单；不构建 legacy App Store target。
+  ZIP/DMG SHA-256 清单；当前 XcodeGen 产品图已没有第二个 App Store target。
 - 当前仓库文档已重新划分为当前规范和历史证据，README/状态/测试不再以旧 v0.9/v0.16
   里程碑冒充当前版本。
 - v0.55 的 Xcode 工程生成、版本一致性、macOS universal Release 与 iOS Simulator Debug
   正在本轮重新验证；旧 v0.48 构建证据不替代本轮结果。
-- 本机 `/Applications/Intatis.app` 当前仍安装 `0.48 (48)` ad-hoc Hardened Runtime 开发构建，
-  严格 codesign、entitlements、无 quarantine 与 staging 可执行文件一致性均已验收。安装前的
-  `0.40 (40)` 保留为 `~/.Trash/Intatis-before-install-20260811-201644.app` 可恢复备份。该开发安装不能作为 v0.55 Developer ID
-  公证发行证据。
+- 本机 `/Applications/Intatis.app` 已安装 `0.55 (55)` arm64 Debug、ad-hoc Hardened Runtime 开发构建；
+  strict codesign、entitlements、无 quarantine、无 Xcode Debug dylib、staging/installed SHA-256 一致性
+  和 exact-path 启动均已验收。当前构建还包含 macOS 单消息 rich Markdown 直接跨 block 拖拽选择；
+  executable SHA-256 为 `1fdc9785519fd41449431695849a029fc330b7f9ff3b898416f221fe913116c7`。
+  strict Release test observation 修正前的中间 `0.55 (55)` 保留为
+  `~/.Trash/Intatis-selection-appearance-intermediate-20260821-121114.app`；选区单一外观修正前的
+  `0.55 (55)` 保留为
+  `~/.Trash/Intatis-before-selection-appearance-20260821-120049.app`；再上一份 `0.55 (55)` 保留为
+  `~/.Trash/Intatis-before-selection-20260820-231513.app`，
+  安装前的 `0.48 (48)` 保留为
+  `~/.Trash/Intatis-before-install-20260820-210656.app`，更早的 `0.40 (40)` 备份仍保留。该开发安装不能
+  作为 universal Release、Developer ID、公证、staple 或 Gatekeeper 发行证据。
+- 旧 `IntatisMacAppStore` target/scheme、条件编译分支与专属 App Sandbox entitlements 已删除；
+  生成工程当前只有 `IntatisMac` 和 `IntatisiOS` 两个 App targets。
 - AgentKernel soft-token-budget stale fixture 已在不改生产预算保护的前提下收口；focused
   用例、169 项 AgentKernel suite 与完整 `swift test` 均通过。
 - 用户宿主环境已具备有效 Developer ID Application identity，并已保存 `Intatis-Notary`
@@ -55,7 +65,7 @@
 
 ## 明确非目标
 
-- 不构建、修复或发布 `IntatisMacAppStore`。
+- 不重新引入已删除的 `IntatisMacAppStore` target/scheme、条件编译分支或专属 entitlements。
 - 不为 App Store App Sandbox 裁剪 terminal、Git、MCP、Skills 或 workspace 能力。
 - 不实现诊断日志远程上传。
 - 不在缺证书、公证或 Gatekeeper 证据时输出“正式发行”结论。

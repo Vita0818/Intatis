@@ -30,6 +30,56 @@ final class IntatisConversationCodeTests: XCTestCase {
         XCTAssertEqual(result?.isFailure, false)
     }
 
+    func testTurnStatsAttachOnlyToTheirExactReplyAcrossEventOrder() {
+        let session = SessionID(rawValue: "turn-stats-message-link")
+        let agent = AgentID(rawValue: "main")
+        let firstMessage = MessageID(rawValue: "reply-first")
+        let secondMessage = MessageID(rawValue: "reply-second")
+        func env(_ seq: Int, _ event: Event) -> Envelope {
+            Envelope(
+                seq: seq,
+                ts: Date(timeIntervalSince1970: Double(seq)),
+                session: session,
+                event: event)
+        }
+
+        let projection = CodeProjection.build(from: [
+            env(0, .turnStats(.init(
+                promptTokens: 12,
+                cachedPromptTokens: 5,
+                completionTokens: 3,
+                totalMillis: 1_250,
+                turnID: TurnID(rawValue: "turn-first"),
+                responseMessageID: firstMessage,
+                agentID: agent))),
+            env(1, .messageCompleted(.init(
+                messageId: firstMessage,
+                role: .agent,
+                agent: agent,
+                text: "First reply"))),
+            env(2, .messageCompleted(.init(
+                messageId: secondMessage,
+                role: .agent,
+                agent: agent,
+                text: "Second reply"))),
+            // A legacy unbound event remains available as latest session
+            // context, but cannot be guessed onto the adjacent reply.
+            env(3, .turnStats(.init(
+                promptTokens: 99,
+                completionTokens: 9,
+                totalMillis: 9_999,
+                agentID: agent))),
+        ])
+
+        let first = projection.items.first { $0.id == firstMessage.rawValue }
+        let second = projection.items.first { $0.id == secondMessage.rawValue }
+        XCTAssertEqual(first?.turnStats?.promptTokens, 12)
+        XCTAssertEqual(first?.turnStats?.cachedPromptTokens, 5)
+        XCTAssertEqual(first?.turnStats?.completionTokens, 3)
+        XCTAssertEqual(first?.turnStats?.totalMillis, 1_250)
+        XCTAssertNil(second?.turnStats)
+    }
+
     func testFailedTurnOutcomeInvalidatesOnlyItsCorrelatedCompletedAnswer() {
         let session = SessionID(rawValue: "failed_turn_projection")
         let agent = AgentID(rawValue: "main")

@@ -109,7 +109,10 @@ resolution of this package.
   code-aware LaTeX path. It hardens the ownership/concurrency boundary
   and the macOS native paragraph measurement boundary, giving SwiftUI sole
   ownership of paragraph width while retaining only one exact-width height
-  measurement. It retains the upstream Markdown parser and
+  measurement. Its macOS path also coordinates direct drag selection across
+  the existing native TextKit leaves of one document without restoring a
+  SwiftUI whole-document selection overlay or introducing another renderer.
+  It retains the upstream Markdown parser and
   SwiftUI/AppKit/UIKit rendering structure; the removed highlighting,
   animation, image, citation, and legacy regex-math runtimes remain absent.
   **Derivative location: `Vendor/SwiftStreamingMarkdown` in the Intatis root

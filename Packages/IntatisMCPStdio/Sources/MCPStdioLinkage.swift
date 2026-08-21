@@ -1,7 +1,7 @@
 /// Linkage marker for the local-stdio transport slice.
 ///
-/// The remote-only App Store target does not depend on this module. Merely
-/// linking it does not authorize or launch a process: only a host-minted
+/// The iOS subset does not depend on this module. Merely linking it does not
+/// authorize or launch a process: only a host-minted
 /// `MCPAuthorizedStdioLaunchTicket` can enter `ManagedPipeProcess.launch`.
 public enum MCPStdioLinkage {
     public static let supportedTransport = "stdio"

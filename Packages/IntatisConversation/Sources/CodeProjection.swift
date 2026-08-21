@@ -34,6 +34,7 @@ public struct CodeItem: Identifiable, Equatable, Sendable {
     public var submissionAttempt: Int?
     public var submissionFailure: SubmissionFailure?
     public var timestamp: Date?
+    public var turnStats: TurnStatsSnapshot?
 
     public init(id: String, kind: Kind, title: String, body: String,
                 presentationSource: PresentationSource = .conversation,
@@ -48,7 +49,8 @@ public struct CodeItem: Identifiable, Equatable, Sendable {
                 submissionStatus: SubmissionStatus? = nil,
                 submissionAttempt: Int? = nil,
                 submissionFailure: SubmissionFailure? = nil,
-                timestamp: Date? = nil) {
+                timestamp: Date? = nil,
+                turnStats: TurnStatsSnapshot? = nil) {
         self.id = id
         self.kind = kind
         self.presentationSource = presentationSource
@@ -66,6 +68,7 @@ public struct CodeItem: Identifiable, Equatable, Sendable {
         self.submissionAttempt = submissionAttempt
         self.submissionFailure = submissionFailure
         self.timestamp = timestamp
+        self.turnStats = turnStats
     }
 
     /// The normal Chat/Code/Cowork transcript deliberately hides execution
@@ -241,6 +244,8 @@ public struct TurnStatsSnapshot: Identifiable, Equatable, Sendable {
     public var ttftMillis: Int?
     public var totalMillis: Int?
     public var model: String?
+    public var turnID: TurnID?
+    public var responseMessageID: MessageID?
     public var agentID: AgentID?
     public var agentInferenceBinding: AgentInferenceBinding?
 
@@ -254,6 +259,8 @@ public struct TurnStatsSnapshot: Identifiable, Equatable, Sendable {
         self.ttftMillis = payload.ttftMillis
         self.totalMillis = payload.totalMillis
         self.model = payload.model
+        self.turnID = payload.turnID
+        self.responseMessageID = payload.responseMessageID
         self.agentID = payload.agentID
         self.agentInferenceBinding = payload.agentInferenceBinding
     }
@@ -295,6 +302,7 @@ public struct TurnStatsProjection: Equatable, Sendable {
 /// not folded here — the pending request is surfaced separately as an actionable
 /// card (the gate runs before execution).
 public struct CodeProjection: Equatable, Sendable {
+    private static let maximumPendingTurnStats = 64
     private struct TaskAttemptKey: Hashable, Sendable {
         var taskID: TaskID
         var attempt: Int?
@@ -316,6 +324,7 @@ public struct CodeProjection: Equatable, Sendable {
     private var submissionAgentByID: [SubmissionID: AgentID] = [:]
     private var toolNameByCallID: [String: String] = [:]
     private var toolAgentByCallID: [String: AgentID] = [:]
+    private var pendingTurnStatsByMessageID: [String: TurnStatsSnapshot] = [:]
     private var itemAgentIDs: [[AgentID]] = []
     private var itemIndicesByAgent: [AgentID: [Int]] = [:]
     private var visibleItemIndicesByAgent: [AgentID: [Int]] = [:]
@@ -383,7 +392,9 @@ public struct CodeProjection: Equatable, Sendable {
                 items.append(CodeItem(id: p.messageId.rawValue, kind: .agent,
                                       title: p.agent?.rawValue ?? "Agent", body: p.textDelta, complete: false,
                                       submissionID: p.submissionID,
-                                      timestamp: envelope.ts))
+                                      timestamp: envelope.ts,
+                                      turnStats: takePendingTurnStats(
+                                        for: p.messageId.rawValue)))
             }
 
         case .messageCompleted(let p):
@@ -404,8 +415,29 @@ public struct CodeProjection: Equatable, Sendable {
                 items.append(CodeItem(id: p.messageId.rawValue, kind: .agent,
                                       title: p.agent?.rawValue ?? "Agent", body: p.text,
                                       submissionID: p.submissionID,
-                                      timestamp: envelope.ts))
+                                      timestamp: envelope.ts,
+                                      turnStats: takePendingTurnStats(
+                                        for: p.messageId.rawValue)))
                 recordCompletedMessage(at: items.count - 1, from: p.agent)
+            }
+
+        case .turnStats(let payload):
+            let snapshot = TurnStatsSnapshot(
+                id: "\(envelope.session.rawValue):\(envelope.seq):turn_stats",
+                payload: payload)
+            guard snapshot.hasDisplayableMetrics,
+                  let messageID = payload.responseMessageID?.rawValue else {
+                break
+            }
+            if let index = agentIndex(messageID) {
+                guard items[index].turnStats == nil else { break }
+                items[index].turnStats = snapshot
+                mutationChange = changeForItem(at: index)
+            } else if itemIndexByID[messageID] == nil,
+                      pendingTurnStatsByMessageID[messageID] == nil,
+                      pendingTurnStatsByMessageID.count
+                        < Self.maximumPendingTurnStats {
+                pendingTurnStatsByMessageID[messageID] = snapshot
             }
 
         case .toolCall(let p):
@@ -640,7 +672,7 @@ public struct CodeProjection: Equatable, Sendable {
              .continuationRunCreated, .continuationRunStarted, .continuationRunCheckpointed,
              .continuationRunCloseRequested,
              .continuationRunCompleted, .continuationRunInterrupted, .continuationRunCancelled,
-             .artifactProgress, .turnStats,
+             .artifactProgress,
              .mcpServerAttached, .mcpServerDetached, .mcpAttachmentPolicyUpdated,
              .mcpConsentGranted, .mcpConsentRevoked,
              .mcpControlOperationRequested, .mcpControlOperationSettled,
@@ -762,6 +794,12 @@ public struct CodeProjection: Equatable, Sendable {
         guard let index = itemIndexByID[id],
               items[index].kind == .agent else { return nil }
         return index
+    }
+
+    private mutating func takePendingTurnStats(
+        for messageID: String
+    ) -> TurnStatsSnapshot? {
+        pendingTurnStatsByMessageID.removeValue(forKey: messageID)
     }
 
     private func toolName(for toolCallId: String) -> String? {

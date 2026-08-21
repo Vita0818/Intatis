@@ -26,7 +26,8 @@ client。所有运行时能力围绕结构化 EventLog、共享 AgentKernel、�
   以及只在本机生成且不上传的脱敏诊断 ZIP。
 
 macOS 唯一发行 target 是 `IntatisMac`，通过 Developer ID、Apple notarization 和直接下载
-分发。`IntatisMacAppStore` 是未删除的 legacy target，不属于产品或 release gate。
+分发。旧 `IntatisMacAppStore` target、scheme、编译条件和专属 App Sandbox entitlements 已从
+当前源码与 XcodeGen 工程定义中删除；项目不提供 Mac App Store 产品。
 
 ### iOS
 

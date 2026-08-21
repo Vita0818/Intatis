@@ -266,12 +266,12 @@ public enum MCPStdioEnvironmentResolver {
     }
 }
 
-/// DeveloperID/CLI implementation of the transport-builder seam consumed by
-/// `MCPProductionConnectionClientFactory`.
+/// Direct-distribution macOS/CLI implementation of the transport-builder seam
+/// consumed by `MCPProductionConnectionClientFactory`.
 ///
-/// The App Store target never links this module. Every launch still requires
-/// the shared control-plane admission to have begun, an exact live workspace
-/// lease, and a fresh ticket from `MCPStdioLaunchTicketIssuer`.
+/// The iOS subset never links this module. Every launch still requires the
+/// shared control-plane admission to have begun, an exact live workspace lease,
+/// and a fresh ticket from `MCPStdioLaunchTicketIssuer`.
 public struct MCPManagedStdioProductionFactory: Sendable {
     private let ticketIssuer: MCPStdioLaunchTicketIssuer
     private let context:

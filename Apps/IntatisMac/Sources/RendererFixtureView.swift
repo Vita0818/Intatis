@@ -166,6 +166,33 @@ struct RendererFixtureView: View {
                     source: Self.codeSelectionSource,
                     isComplete: true)
             }
+        case .messageFooter:
+            fixtureSection(
+                "Message footer",
+                identifier: "renderer.fixture.message-footer"
+            ) {
+                VStack(alignment: .leading, spacing: 5) {
+                    message(
+                        id: "fixture-message-footer",
+                        source: Self.messageFooterSource,
+                        isComplete: true)
+                    IntatisMessageFooter(
+                        messageID: "fixture-message-footer",
+                        rawText: Self.messageFooterSource,
+                        stats: TurnStatsSnapshot(
+                            id: "fixture-message-footer-stats",
+                            payload: TurnStatsPayload(
+                                promptTokens: 18_420,
+                                cachedPromptTokens: 15_280,
+                                completionTokens: 826,
+                                totalMillis: 7_400,
+                                turnID: TurnID(
+                                    rawValue: "fixture-message-footer-turn"),
+                                responseMessageID: MessageID(
+                                    rawValue: "fixture-message-footer"))),
+                        style: style)
+                }
+            }
         case .mathOne:
             fixtureSection("Common math delimiters", identifier: "renderer.fixture.math-one") {
                 message(
@@ -609,12 +636,20 @@ struct RendererFixtureView: View {
 
     Remote images are blocked: ![tracking pixel](https://example.com/tracker.png)
     """#
+
+    private static let messageFooterSource = #"""
+    A completed reply keeps its existing Markdown layout while the copy action and per-reply usage sit in one quiet row below the body.
+
+    - No feedback controls
+    - No additional card or glass surface
+    """#
 }
 
 private enum RendererFixtureStage: String, CaseIterable, Identifiable {
     case minimal
     case table
     case codeSelection = "code-selection"
+    case messageFooter = "message-footer"
     case mathOne = "math-one"
     case mathThirtyTwo = "math-thirty-two"
     case mathStructure = "math-structure"
@@ -633,6 +668,7 @@ private enum RendererFixtureStage: String, CaseIterable, Identifiable {
         case .minimal: "Minimal paragraph"
         case .table: "Table only"
         case .codeSelection: "Code and selection"
+        case .messageFooter: "Message footer"
         case .mathOne: "Common math delimiters"
         case .mathThirtyTwo: "More than thirty-two formulas"
         case .mathStructure: "Math across Markdown structures"

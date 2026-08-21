@@ -109,7 +109,7 @@ final class FirstReleaseContractTests: XCTestCase {
     XCTAssertFalse(source.contains(".onTapGesture"))
   }
 
-  func testSwiftUITextLeavesOwnTheirSelectionWithoutAWholeDocumentOverlay() throws {
+  func testMacLeavesShareNativeCoordinatorWithoutAWholeDocumentOverlay() throws {
     let packageRoot = URL(fileURLWithPath: #filePath)
       .deletingLastPathComponent()
       .deletingLastPathComponent()
@@ -126,10 +126,31 @@ final class FirstReleaseContractTests: XCTestCase {
       contentsOf: packageRoot.appendingPathComponent("Sources/MarkdownText/UI/DocumentView.swift"),
       encoding: .utf8
     )
+    let coordinatorSource = try String(
+      contentsOf: packageRoot.appendingPathComponent(
+        "Sources/MarkdownText/UI/TextSelection/MarkdownDocumentSelectionCoordinator+macOS.swift"
+      ),
+      encoding: .utf8
+    )
+    let paragraphSource = try String(
+      contentsOf: packageRoot.appendingPathComponent(
+        "Sources/MarkdownText/UI/Paragraph/AppKit/ParagraphNSView.swift"
+      ),
+      encoding: .utf8
+    )
 
+    // UIKit keeps its leaf-owned SwiftUI selection. macOS routes those same
+    // textual leaves through ParagraphView and one document coordinator.
     XCTAssertEqual(tableSource.components(separatedBy: ".textSelection(.enabled)").count - 1, 2)
     XCTAssertTrue(codeSource.contains(".textSelection(.enabled)"))
+    XCTAssertTrue(tableSource.contains("#if os(macOS)"))
+    XCTAssertTrue(tableSource.contains("ParagraphView(contents:"))
+    XCTAssertTrue(codeSource.contains("layoutMode: .unwrapped"))
     XCTAssertFalse(documentSource.contains(".textSelection(.enabled)"))
+    XCTAssertTrue(documentSource.contains("markdownDocumentSelectionCoordinator"))
+    XCTAssertTrue(paragraphSource.contains("NSPanGestureRecognizer"))
+    XCTAssertTrue(coordinatorSource.contains("applySelection("))
+    XCTAssertFalse(coordinatorSource.contains("SelectionOverlay"))
   }
 
   func testSelectMoreSentinelIsBrandNeutral() {

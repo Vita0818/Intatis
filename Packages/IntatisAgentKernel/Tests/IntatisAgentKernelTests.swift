@@ -660,14 +660,33 @@ final class IntatisAgentKernelTests: XCTestCase {
 
         try await loop.send("read in.txt")
 
-        let stats = await log.replay().compactMap { envelope -> TurnStatsPayload? in
+        let events = await log.replay()
+        let stats = events.compactMap { envelope -> TurnStatsPayload? in
             guard case .turnStats(let payload) = envelope.event else { return nil }
             return payload
+        }.last
+        let responseMessageID = events.compactMap { envelope -> MessageID? in
+            guard case .messageCompleted(let payload) = envelope.event,
+                  payload.text == "Done." else { return nil }
+            return payload.messageId
+        }.last
+        let outcomeTurnID = events.compactMap { envelope -> TurnID? in
+            guard case .turnOutcome(let payload) = envelope.event else {
+                return nil
+            }
+            return payload.turnID
         }.last
         XCTAssertEqual(stats?.promptTokens, 15)
         XCTAssertEqual(stats?.cachedPromptTokens, 5)
         XCTAssertEqual(stats?.completionTokens, 3)
         XCTAssertEqual(stats?.totalTokens, 18)
+        XCTAssertEqual(stats?.responseMessageID, responseMessageID)
+        XCTAssertEqual(stats?.turnID, outcomeTurnID)
+
+        let projectedReply = CodeProjection.build(from: events).items.first {
+            $0.id == responseMessageID?.rawValue
+        }
+        XCTAssertEqual(projectedReply?.turnStats?.totalTokens, 18)
     }
 
     func testInvalidJSONToolArgumentsDoNotRequestPermissionOrExecuteTool() async throws {

@@ -13,6 +13,12 @@ public struct TurnStatsPayload: Codable, Equatable, Sendable {
     public var ttftMillis: Int?
     public var totalMillis: Int?
     public var model: String?
+    /// Stable turn identity and the final visible reply produced by that turn.
+    /// Both fields are additive so legacy statistics remain decodable. A nil
+    /// response identity means the statistics are not safe to attach to a
+    /// transcript row (for example, a control-plane-only request).
+    public var turnID: TurnID?
+    public var responseMessageID: MessageID?
     /// Optional durable execution scope. These identifiers are additive so old
     /// turn_stats events remain decodable and ordinary Chat/Code turns may
     /// continue to omit Cowork-only layers.
@@ -32,6 +38,8 @@ public struct TurnStatsPayload: Codable, Equatable, Sendable {
                 ttftMillis: Int? = nil,
                 totalMillis: Int? = nil,
                 model: String? = nil,
+                turnID: TurnID? = nil,
+                responseMessageID: MessageID? = nil,
                 goalID: GoalID? = nil,
                 continuationRunID: ContinuationRunID? = nil,
                 workTaskID: WorkTaskID? = nil,
@@ -46,6 +54,8 @@ public struct TurnStatsPayload: Codable, Equatable, Sendable {
         self.ttftMillis = ttftMillis
         self.totalMillis = totalMillis
         self.model = model
+        self.turnID = turnID
+        self.responseMessageID = responseMessageID
         self.goalID = goalID
         self.continuationRunID = continuationRunID
         self.workTaskID = workTaskID

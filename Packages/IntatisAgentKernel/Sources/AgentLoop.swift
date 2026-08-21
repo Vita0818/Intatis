@@ -854,7 +854,12 @@ public struct AgentLoop: Sendable {
                 }
             }
             if pendingToolCalls.isEmpty {
-                await appendTurnStats(start: start, firstTokenAt: firstTokenAt, usage: usage)
+                await appendTurnStats(
+                    start: start,
+                    firstTokenAt: firstTokenAt,
+                    usage: usage,
+                    turnID: turnID,
+                    responseMessageID: assistantID)
                 turnStatsAppended = true
                 completedResponseEvents.append(.agentStatus(AgentStatusPayload(
                     agent: agent.name,
@@ -969,7 +974,11 @@ public struct AgentLoop: Sendable {
         }
 
         try Task.checkCancellation()
-        await appendTurnStats(start: start, firstTokenAt: firstTokenAt, usage: usage)
+        await appendTurnStats(
+            start: start,
+            firstTokenAt: firstTokenAt,
+            usage: usage,
+            turnID: turnID)
         turnStatsAppended = true
         throw AgentLoopError.maxIterationsExceeded(limit: maxIterations)
         } catch {
@@ -978,7 +987,11 @@ public struct AgentLoop: Sendable {
             // occur after entering the loop. Callers should propagate/classify
             // the thrown error, not append a second copy of the same event.
             if !turnStatsAppended {
-                await appendTurnStats(start: start, firstTokenAt: firstTokenAt, usage: usage)
+                await appendTurnStats(
+                    start: start,
+                    firstTokenAt: firstTokenAt,
+                    usage: usage,
+                    turnID: turnID)
             }
             let interruption = Self.turnInterruption(for: error)
             if interruption == nil {
@@ -1737,7 +1750,13 @@ public struct AgentLoop: Sendable {
         return regex.firstMatch(in: value, range: range) != nil
     }
 
-    private func appendTurnStats(start: Date, firstTokenAt: Date?, usage: Usage?) async {
+    private func appendTurnStats(
+        start: Date,
+        firstTokenAt: Date?,
+        usage: Usage?,
+        turnID: TurnID,
+        responseMessageID: MessageID? = nil
+    ) async {
         let now = Date()
         _ = try? await log.append(.turnStats(TurnStatsPayload(
             promptTokens: usage?.promptTokens,
@@ -1748,6 +1767,8 @@ public struct AgentLoop: Sendable {
             ttftMillis: firstTokenAt.map { Int($0.timeIntervalSince(start) * 1000) },
             totalMillis: Int(now.timeIntervalSince(start) * 1000),
             model: agent.model.rawValue,
+            turnID: turnID,
+            responseMessageID: responseMessageID,
             goalID: executionScope?.goalID ?? context.taskContract?.goalID,
             continuationRunID: executionScope?.continuationRunID ?? context.taskContract?.continuationRunID,
             workTaskID: executionScope?.workTaskID ?? context.taskContract?.workTaskID,

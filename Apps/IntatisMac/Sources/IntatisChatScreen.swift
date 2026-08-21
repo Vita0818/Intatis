@@ -219,6 +219,7 @@ private struct IntatisChatSessionScreen: View {
             last.id.rawValue,
             "\(last.text.count)",
             "\(last.isComplete)",
+            last.turnStats?.id ?? "no-stats",
             "\(historyWindow.isLatest && model.isStreaming)"
         ].joined(separator: ":")
     }
@@ -517,6 +518,13 @@ struct IntatisMessageBubble: View {
                     IntatisMessageCitationsView(
                         citations: message.citations)
                 }
+                if message.isComplete {
+                    IntatisMessageFooter(
+                        messageID: message.id.rawValue,
+                        rawText: message.text,
+                        stats: message.turnStats,
+                        style: .intatisMac(scheme))
+                }
             } else {
                 if !displayText.isEmpty {
                     Text(displayText)
@@ -607,7 +615,7 @@ struct IntatisComposer: View {
                     action: { model.cancelCurrentOperation() })
                 : nil,
             accessory: {
-                IntatisComposerUsageStrip(
+                IntatisComposerContextStrip(
                     stats: model.latestTurnStats,
                     style: .intatisMac(scheme))
             },

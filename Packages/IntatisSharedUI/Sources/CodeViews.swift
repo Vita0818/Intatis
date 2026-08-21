@@ -388,6 +388,7 @@ public struct CodeShell: View {
             lastItemID: last?.id,
             lastBodyUTF8Count: last?.body.utf8.count ?? 0,
             lastItemComplete: last?.complete ?? false,
+            lastTurnStatsID: last?.turnStats?.id,
             isWorking: historyWindow.isLatest && isWorking,
             showsThinkingIndicator: showsVisibleThinkingIndicator)
     }
@@ -457,7 +458,7 @@ public struct CodeShell: View {
                     }
                     : nil,
                 accessory: {
-                    IntatisComposerUsageStrip(
+                    IntatisComposerContextStrip(
                         stats: latestTurnStats,
                         style: threadStyle)
                 },
@@ -626,6 +627,15 @@ struct CodeItemRow: View {
                     isComplete: item.complete,
                     policy: .richText,
                     style: style)
+                #if os(macOS)
+                if item.complete {
+                    IntatisMessageFooter(
+                        messageID: item.id,
+                        rawText: item.body,
+                        stats: item.turnStats,
+                        style: style)
+                }
+                #endif
             }
             if isUser,
                let submissionID = item.submissionID,

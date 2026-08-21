@@ -477,6 +477,7 @@ struct IntatisThreadScrollSignature: Equatable, Sendable {
     let lastItemID: String?
     let lastBodyUTF8Count: Int
     let lastItemComplete: Bool
+    let lastTurnStatsID: String?
     let isWorking: Bool
     let showsThinkingIndicator: Bool
 }
@@ -2267,6 +2268,199 @@ public struct IntatisComposerUsageStrip: View {
         return formatter
     }()
 }
+
+/// Conversation-level context occupancy retained in the composer's trailing
+/// first-row position. Per-turn input/cache/output/time metrics belong to the
+/// reply that produced them and are rendered by ``IntatisMessageFooter``.
+public struct IntatisComposerContextStrip: View {
+    private let stats: TurnStatsSnapshot?
+    private let style: IntatisThreadStyle
+
+    public init(stats: TurnStatsSnapshot?, style: IntatisThreadStyle) {
+        self.stats = stats
+        self.style = style
+    }
+
+    @ViewBuilder public var body: some View {
+        if let stats, let contextValue = contextValue(for: stats) {
+            HStack(spacing: 5) {
+                Text(IntatisLocalization.string("Context"))
+                    .foregroundStyle(style.tertiaryText)
+                Text(contextValue)
+                    .foregroundStyle(style.secondaryText)
+                    .monospacedDigit()
+            }
+            .font(IntatisTypography.system(size: 11, weight: .medium))
+            .lineLimit(1)
+            .frame(maxWidth: .infinity, alignment: .trailing)
+            .accessibilityElement(children: .combine)
+        }
+    }
+
+    private func contextValue(for stats: TurnStatsSnapshot) -> String? {
+        if let promptTokens = stats.promptTokens,
+           let contextWindowTokens = stats.contextWindowTokens {
+            return "\(formatNumber(promptTokens)) / \(formatNumber(contextWindowTokens))"
+        }
+        if let promptTokens = stats.promptTokens {
+            return formatNumber(promptTokens)
+        }
+        if let contextWindowTokens = stats.contextWindowTokens {
+            return formatNumber(contextWindowTokens)
+        }
+        return nil
+    }
+
+    private func formatNumber(_ value: Int) -> String {
+        Self.numberFormatter.string(from: NSNumber(value: value)) ?? "\(value)"
+    }
+
+    private static let numberFormatter: NumberFormatter = {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        return formatter
+    }()
+}
+
+#if os(macOS)
+struct IntatisMessageTurnMetrics: Equatable, Sendable {
+    var inputTokens: Int?
+    var cachedTokens: Int?
+    var outputTokens: Int?
+    var totalMillis: Int?
+
+    init(stats: TurnStatsSnapshot?) {
+        if let promptTokens = stats?.promptTokens {
+            inputTokens = max(
+                promptTokens - (stats?.cachedPromptTokens ?? 0),
+                0)
+        } else {
+            inputTokens = nil
+        }
+        cachedTokens = stats?.cachedPromptTokens
+        outputTokens = stats?.completionTokens
+        totalMillis = stats?.totalMillis
+    }
+
+    var hasAnyValue: Bool {
+        inputTokens != nil
+            || cachedTokens != nil
+            || outputTokens != nil
+            || totalMillis != nil
+    }
+}
+
+@MainActor
+enum IntatisMessageClipboard {
+    @discardableResult
+    static func copy(
+        _ rawText: String,
+        to pasteboard: NSPasteboard = .general
+    ) -> Bool {
+        pasteboard.clearContents()
+        return pasteboard.setString(rawText, forType: .string)
+    }
+}
+
+/// Low-noise macOS action row using a native message-footer hierarchy:
+/// one icon-only copy action at the far leading edge, followed by the four
+/// metrics owned by this exact reply. It has no card, glass, or feedback
+/// controls and never participates in Markdown rendering.
+public struct IntatisMessageFooter: View {
+    private let messageID: String
+    private let rawText: String
+    private let metrics: IntatisMessageTurnMetrics
+    private let style: IntatisThreadStyle
+
+    public init(
+        messageID: String,
+        rawText: String,
+        stats: TurnStatsSnapshot?,
+        style: IntatisThreadStyle
+    ) {
+        self.messageID = messageID
+        self.rawText = rawText
+        self.metrics = IntatisMessageTurnMetrics(stats: stats)
+        self.style = style
+    }
+
+    @ViewBuilder public var body: some View {
+        if !rawText.isEmpty {
+            HStack(spacing: 10) {
+                Button {
+                    IntatisMessageClipboard.copy(rawText)
+                } label: {
+                    Image(systemName: "doc.on.doc")
+                        .font(IntatisTypography.system(
+                            size: 12,
+                            weight: .medium))
+                        .frame(width: 22, height: 22)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(style.tertiaryText)
+                .help(IntatisLocalization.string("Copy message"))
+                .accessibilityLabel(
+                    IntatisLocalization.string("Copy message"))
+                .accessibilityIdentifier(
+                    "message.\(messageID).copy")
+
+                if metrics.hasAnyValue {
+                    HStack(spacing: 14) {
+                        if let value = metrics.inputTokens {
+                            metric("Input", value: formatNumber(value))
+                        }
+                        if let value = metrics.cachedTokens {
+                            metric("Cached", value: formatNumber(value))
+                        }
+                        if let value = metrics.outputTokens {
+                            metric("Output", value: formatNumber(value))
+                        }
+                        if let value = metrics.totalMillis {
+                            metric("Time", value: formatDuration(value))
+                        }
+                    }
+                    .accessibilityElement(children: .combine)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.top, 4)
+        }
+    }
+
+    private func metric(_ label: String, value: String) -> some View {
+        HStack(spacing: 4) {
+            Text(IntatisLocalization.string(label))
+                .foregroundStyle(style.tertiaryText)
+            Text(value)
+                .foregroundStyle(style.secondaryText)
+                .monospacedDigit()
+        }
+        .font(IntatisTypography.system(size: 11, weight: .medium))
+        .lineLimit(1)
+    }
+
+    private func formatDuration(_ millis: Int) -> String {
+        if millis < 1000 {
+            return "\(millis)ms"
+        }
+        let seconds = Double(millis) / 1000
+        return seconds < 10
+            ? String(format: "%.2fs", seconds)
+            : String(format: "%.1fs", seconds)
+    }
+
+    private func formatNumber(_ value: Int) -> String {
+        Self.numberFormatter.string(from: NSNumber(value: value)) ?? "\(value)"
+    }
+
+    private static let numberFormatter: NumberFormatter = {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        return formatter
+    }()
+}
+#endif
 
 public struct IntatisSessionHistoryItem: Identifiable, Hashable {
     public var id: SessionID

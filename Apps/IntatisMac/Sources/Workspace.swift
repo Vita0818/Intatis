@@ -5,8 +5,9 @@ import IntatisCore
 import AppKit
 #endif
 
-/// Workspace folder selection. In the sandboxed App Store build this grants
-/// access via a user-selected security-scoped resource (ARCHITECTURE.md §9.1).
+/// Workspace folder selection for the direct-distribution macOS product. The
+/// selected directory remains canonical and uses the same security-scoped
+/// bookmark lifecycle for durable user-granted access.
 final class WorkspaceAccessLease: @unchecked Sendable {
     let scopedURL: URL
     let canonicalURL: URL

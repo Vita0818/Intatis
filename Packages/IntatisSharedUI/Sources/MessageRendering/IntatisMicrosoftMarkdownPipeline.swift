@@ -760,6 +760,15 @@ final class IntatisMicrosoftMarkdownRenderState: ObservableObject {
     ) -> MarkdownRenderConfig {
         let defaults = MarkdownRenderConfig.default
         let scale = typography.scale
+        #if os(macOS)
+        let textSelectionConfig = TextSelectionConfig(
+            isEnabled: false,
+            backgroundColor: nil)
+        #else
+        let textSelectionConfig = TextSelectionConfig(
+            isEnabled: true,
+            backgroundColor: nil)
+        #endif
         return MarkdownRenderConfig(
             shouldAnimateText: false,
             blockQuoteStyle: .init(
@@ -809,7 +818,7 @@ final class IntatisMicrosoftMarkdownRenderState: ObservableObject {
                 backgroundColor: style.stroke.opacity(0.14),
                 foregroundColor: style.secondaryText),
             blockSpacing: 18,
-            textSelectionConfig: .init(isEnabled: true, backgroundColor: nil),
+            textSelectionConfig: textSelectionConfig,
             thematicBreakColor: style.stroke,
             imageConfig: .disabled,
             mathConfig: IntatisMarkdownRendererLimits.mathMode.renderConfig)

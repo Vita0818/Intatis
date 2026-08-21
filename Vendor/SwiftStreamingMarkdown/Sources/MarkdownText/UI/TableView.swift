@@ -65,6 +65,19 @@ struct TableView: View {
           totalColumn: headings.count
         ))
       case .text(let content):
+        #if os(macOS)
+        ParagraphView(contents: applyTypographyThemingAndGetContent(
+          NSMutableAttributedString(attributedString: NSAttributedString(content)),
+          color: MDColor(config.tableStyle.headerTextColor)
+        ))
+          .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+          .accessibilityValue(String.itemPositionInTable(
+            rowIndex: 1,
+            totalRow: numOfRows + 1,
+            columnIndex: colIdx + 1,
+            totalColumn: headings.count
+          ))
+        #else
         Text(content)
           .foregroundStyle(config.tableStyle.headerTextColor)
           .textSelection(.enabled)
@@ -80,6 +93,7 @@ struct TableView: View {
             columnIndex: colIdx + 1,
             totalColumn: headings.count
           ))
+        #endif
       }
       Spacer()
     }
@@ -137,6 +151,21 @@ struct TableView: View {
       .applyCellBorder(colIndex: colIdx, colCount: headings.count, rowIndex: rowIdx, rowCount: numOfRows, color: config.tableStyle.borderColor)
     case .text(let attributedString):
       HStack(spacing: 0) {
+        #if os(macOS)
+        ParagraphView(contents: applyTypographyThemingAndGetContent(
+          NSMutableAttributedString(
+            attributedString: NSAttributedString(attributedString)
+          ),
+          color: MDColor(config.tableStyle.regularTextColor)
+        ))
+          .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+          .accessibilityValue(String.itemPositionInTable(
+            rowIndex: rowIdx + 2,
+            totalRow: numOfRows + 1,
+            columnIndex: colIdx + 1,
+            totalColumn: headings.count
+          ))
+        #else
         Text(attributedString)
           .foregroundStyle(config.tableStyle.regularTextColor)
           .textSelection(.enabled)
@@ -147,6 +176,7 @@ struct TableView: View {
             view.fadeInTextTransition(attributedString: attributedString)
           }
           .accessibilityValue(String.itemPositionInTable(rowIndex: rowIdx + 2, totalRow: numOfRows + 1, columnIndex: colIdx + 1, totalColumn: headings.count))
+        #endif
         Spacer()
       }
       .frame(maxHeight: .infinity)

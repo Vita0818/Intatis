@@ -10,9 +10,7 @@ import IntatisMCP
 import IntatisProtocol
 import IntatisSharedUI
 import SwiftUI
-#if !INTATIS_MAC_APP_STORE
 import IntatisMCPStdio
-#endif
 
 private struct MCPRejectingTestEventSink: MCPBrokerEventSink {
     func appendMCPBrokerEvent(_ event: Event) async throws {
@@ -457,27 +455,15 @@ final class AppMCPService: ObservableObject {
 
     private let oauthAccountsStore: MCPAppOAuthAccountStore
     private let resolveSecret: MCPProductionSecretResolver
-    #if !INTATIS_MAC_APP_STORE
     private let stdioTransportBuilder:
         MCPProductionStdioTransportBuilder
-    #endif
 
     init() {
-        #if INTATIS_MAC_APP_STORE
-        hostProfile = .macAppStore
-        #else
         hostProfile = .macDeveloperID
-        #endif
         let support = AppConfig.appSupportDir()
-        #if INTATIS_MAC_APP_STORE
-        let precommitVerifier:
-            any MCPPreparedDefinitionPrecommitVerifier =
-                MCPHTTPOnlyPreparedDefinitionPrecommitVerifier()
-        #else
         let precommitVerifier:
             any MCPPreparedDefinitionPrecommitVerifier =
                 MCPStdioPreparedDefinitionPrecommitVerifier()
-        #endif
         catalogStore = MCPServerCatalogStore(
             fileURL: support.appendingPathComponent(
                 MCPServerCatalogStore.fileName),
@@ -519,18 +505,6 @@ final class AppMCPService: ObservableObject {
         let testOutputRedactor =
             MCPResolvedSecretRedactor()
 
-        #if INTATIS_MAC_APP_STORE
-        let tester = MCPProductionConfigurationTester(
-            hostProfile: .macAppStore,
-            clientVersion: "IntatisMac",
-            resolveSecret: resolve,
-            secretRedactionRegistrar:
-                testOutputRedactor,
-            outputSanitizer:
-                testOutputRedactor,
-            buildOAuth: buildOAuth,
-            services: testServices)
-        #else
         let issuer = MCPStdioLaunchTicketIssuer {
             request in
             guard request.purpose == .isolatedTest else {
@@ -582,7 +556,6 @@ final class AppMCPService: ObservableObject {
             testWorkspace: {
                 try MCPIsolatedTestWorkspace.lease(for: $0)
             })
-        #endif
         management = MCPManagementService(
             catalogStore: catalogStore,
             testJournal: journal,
@@ -671,9 +644,8 @@ final class AppMCPService: ObservableObject {
 
     /// Builds the exact process-owned MCP client runtime used by Code/Cowork.
     ///
-    /// The caller supplies the production stdio builder because its launch
-    /// tickets are issued by the session PermissionEngine and WorkspaceLease,
-    /// not by Settings. App Store callers must pass `nil`.
+    /// Stdio launch tickets are issued by the session PermissionEngine and
+    /// WorkspaceLease, not by Settings.
     func makeShippingSessionRuntime(
         sessionID: SessionID,
         log: EventLog,
@@ -714,10 +686,6 @@ final class AppMCPService: ObservableObject {
                 policy: elicitationPolicy,
                 reviewer: MCPAppElicitationReviewService(
                     center: interactionCenter)))
-        #if INTATIS_MAC_APP_STORE
-        let buildStdio:
-            MCPProductionStdioTransportBuilder? = nil
-        #else
         let issuer = MCPStdioLaunchTicketIssuer {
             request in
             guard request.purpose == .sessionConnect,
@@ -819,7 +787,6 @@ final class AppMCPService: ObservableObject {
         let buildStdio:
             MCPProductionStdioTransportBuilder? =
                 stdioFactory.transportBuilder()
-        #endif
         let consentHandler =
             MCPAppConnectionConsentHandler(
                 log: log,
@@ -1287,11 +1254,6 @@ final class AppMCPService: ObservableObject {
                             : .pinnedPublicKeySHA256(
                                 tlsPins)))
         case .stdio:
-            #if INTATIS_MAC_APP_STORE
-            throw MCPManagementError.unsupportedTransport(
-                .stdio,
-                .macAppStore)
-            #else
             let launchInputs = draft.launchFiles
                 .filter {
                     !$0.path.trimmingCharacters(
@@ -1343,7 +1305,6 @@ final class AppMCPService: ObservableObject {
                         origins.isEmpty
                             ? .denied
                             : .exactOrigins(origins)))
-            #endif
         }
         return try MCPServerConfiguration(
             serverID: draft.originalServerID ?? .new(),
@@ -2793,19 +2754,15 @@ private struct MCPServerEditorSheet: View {
                     .tag(
                         MCPServerEditorTransport
                             .streamableHTTP)
-                #if !INTATIS_MAC_APP_STORE
                 Text("Managed stdio")
                     .tag(MCPServerEditorTransport.stdio)
-                #endif
             }
             .pickerStyle(.segmented)
         }
         if draft.transport == .streamableHTTP {
             httpForm
         } else {
-            #if !INTATIS_MAC_APP_STORE
             stdioForm
-            #endif
         }
         Section("Setup and install") {
             MCPSetupGuidanceBody(
@@ -2941,7 +2898,6 @@ private struct MCPServerEditorSheet: View {
         }
     }
 
-    #if !INTATIS_MAC_APP_STORE
     @ViewBuilder
     private var stdioForm: some View {
         Section("Exact launch closure") {
@@ -3000,12 +2956,11 @@ private struct MCPServerEditorSheet: View {
                     "Exact HTTPS origins, one per line; leave empty to deny network",
                 text: $draft.networkOrigins)
             Text(
-                "Managed stdio remains inside the permission, workspace, sandbox, and durable execution boundaries. It is not linked into the App Store build.")
+                "Managed stdio remains inside the permission, workspace, sandbox, and durable execution boundaries of the direct-distribution macOS product.")
                 .font(IntatisTypography.system(.caption))
                 .foregroundStyle(.secondary)
         }
     }
-    #endif
 
     @ViewBuilder
     private var policyForm: some View {

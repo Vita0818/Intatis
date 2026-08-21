@@ -220,6 +220,88 @@ final class ThreadLayoutTests: XCTestCase {
         XCTAssertTrue(IntatisMessageHeaderPolicy.showsIdentity(for: .system))
     }
 
+    func testPerMessageMetricsSeparateUncachedInputFromCachedTokens() {
+        let metrics = IntatisMessageTurnMetrics(stats: TurnStatsSnapshot(
+            id: "stats",
+            payload: TurnStatsPayload(
+                promptTokens: 1_250,
+                cachedPromptTokens: 1_000,
+                completionTokens: 75,
+                totalMillis: 6_250)))
+
+        XCTAssertEqual(metrics.inputTokens, 250)
+        XCTAssertEqual(metrics.cachedTokens, 1_000)
+        XCTAssertEqual(metrics.outputTokens, 75)
+        XCTAssertEqual(metrics.totalMillis, 6_250)
+        XCTAssertTrue(metrics.hasAnyValue)
+    }
+
+    @MainActor
+    func testMessageClipboardCopiesExactRawText() {
+        let pasteboard = NSPasteboard.withUniqueName()
+        defer { pasteboard.releaseGlobally() }
+        let rawText = """
+        标题 **保持 Markdown**
+
+        ```swift
+        let value = "$x^2$"
+        ```
+        """
+
+        XCTAssertTrue(IntatisMessageClipboard.copy(rawText, to: pasteboard))
+        XCTAssertEqual(pasteboard.string(forType: .string), rawText)
+    }
+
+    func testMacReplyFooterUsesOneIconThenFourMetricsAndComposerKeepsContextOnly() throws {
+        let testFile = URL(fileURLWithPath: #filePath)
+        let packageRoot = testFile
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let repositoryRoot = packageRoot
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+
+        func source(_ relativePath: String, root: URL) throws -> String {
+            try String(
+                contentsOf: root.appendingPathComponent(relativePath),
+                encoding: .utf8)
+        }
+
+        let surfaces = try source(
+            "Sources/ThreadSurfaces.swift",
+            root: packageRoot)
+        let footerStart = try XCTUnwrap(
+            surfaces.range(of: "public struct IntatisMessageFooter: View"))
+        let footerEnd = try XCTUnwrap(surfaces.range(
+            of: "public struct IntatisSessionHistoryItem",
+            range: footerStart.upperBound..<surfaces.endIndex))
+        let footer = surfaces[footerStart.lowerBound..<footerEnd.lowerBound]
+        XCTAssertTrue(footer.contains("Image(systemName: \"doc.on.doc\")"))
+        XCTAssertTrue(footer.contains("metric(\"Input\""))
+        XCTAssertTrue(footer.contains("metric(\"Cached\""))
+        XCTAssertTrue(footer.contains("metric(\"Output\""))
+        XCTAssertTrue(footer.contains("metric(\"Time\""))
+        XCTAssertFalse(footer.contains("hand.thumbsup"))
+        XCTAssertFalse(footer.contains("hand.thumbsdown"))
+
+        let macChat = try source(
+            "Apps/IntatisMac/Sources/IntatisChatScreen.swift",
+            root: repositoryRoot)
+        let code = try source("Sources/CodeViews.swift", root: packageRoot)
+        let cowork = try source("Sources/CoworkViews.swift", root: packageRoot)
+        let sharedChat = try source("Sources/Views.swift", root: packageRoot)
+        XCTAssertTrue(macChat.contains("IntatisMessageFooter("))
+        XCTAssertTrue(code.contains("IntatisMessageFooter("))
+        XCTAssertTrue(macChat.contains("last.turnStats?.id"))
+        XCTAssertTrue(code.contains("lastTurnStatsID: last?.turnStats?.id"))
+        XCTAssertTrue(cowork.contains("lastTurnStatsID: last?.turnStats?.id"))
+        XCTAssertTrue(macChat.contains("IntatisComposerContextStrip("))
+        XCTAssertTrue(code.contains("IntatisComposerContextStrip("))
+        XCTAssertTrue(cowork.contains("IntatisComposerContextStrip("))
+        XCTAssertTrue(sharedChat.contains("IntatisComposerUsageStrip("))
+        XCTAssertFalse(sharedChat.contains("IntatisMessageFooter("))
+    }
+
     func testOnlyUserConversationRowsUseNativeLiquidGlassBubble() throws {
         let testFile = URL(fileURLWithPath: #filePath)
         let packageRoot = testFile

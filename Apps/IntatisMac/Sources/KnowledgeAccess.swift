@@ -1,4 +1,4 @@
-#if canImport(SwiftUI) && !INTATIS_MAC_APP_STORE
+#if canImport(SwiftUI)
 import Foundation
 import AppKit
 import IntatisCore
