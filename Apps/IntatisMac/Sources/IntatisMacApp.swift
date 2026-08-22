@@ -425,13 +425,11 @@ final class AppEnvironment: ObservableObject {
             throw IntatisError.config(IntatisLocalization.string(
                 "Choose a resolvable default inference profile before creating Cowork."))
         }
-        guard let permissionReviewerBinding =
-                configuredPermissionReviewerBinding(
-                    snapshot: inferenceCatalogSnapshot) else {
-            primaryWorkspace.release()
-            throw IntatisError.config(IntatisLocalization.string(
-                "Configure a resolvable permission_reviewer_model before creating Cowork."))
-        }
+        // Codex App Server owns automatic approval review and binds it to the
+        // selected Responses model through its official model catalog. The
+        // legacy Intatis permission_reviewer_model is not a Cowork startup
+        // dependency on the new kernel.
+        let permissionReviewerBinding: AgentInferenceBinding? = nil
         do {
             try WorkspaceAccess.remember(
                 primaryWorkspace.scopedURL,
@@ -469,9 +467,7 @@ final class AppEnvironment: ObservableObject {
                 inferenceCatalogError ?? IntatisLocalization.string(
                     "Inference profiles are still loading. Try again in a moment."))
         }
-        let permissionReviewerBinding =
-            configuredPermissionReviewerBinding(
-                snapshot: inferenceCatalogSnapshot)
+        let permissionReviewerBinding: AgentInferenceBinding? = nil
         return try await runtimeManager.coworkRuntime(sessionID: session) { [self] in
         let coworkLog = try EventLog(session: session, fileURL: AppConfig.sessionFile(session))
         let legacyOwnedWorkspacePaths = CoworkProjectSettingsStore
@@ -577,11 +573,7 @@ final class AppEnvironment: ObservableObject {
             AgentInferenceBinding?
     ) throws -> CoworkViewModel {
         let artifactStore = try ArtifactStore(root: AppConfig.artifactsDir(session))
-        let permissionReviewerConfigurationError =
-            permissionReviewerInferenceBinding == nil
-            ? IntatisLocalization.string(
-                "The configured permission_reviewer_model is missing, invalid, or unavailable in the current inference catalog.")
-            : nil
+        let permissionReviewerConfigurationError: String? = nil
         let combinedStorageWarning = [
             sessionStorageWarning,
             knowledgeToolsConfigurationNotice(),

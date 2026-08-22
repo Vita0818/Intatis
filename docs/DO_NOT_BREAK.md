@@ -15,6 +15,69 @@
 最近核对：2026-08-22
 产品基线：v0.55（build 55）
 
+## Codex Runtime 内核不变量
+
+- Code、Cowork、CLI Code/Cowork 的 shipping turn 只能进入固定派生
+  `codex app-server`；固定版本为 `codex-cli 0.145.0-intatis.2`，上游base仍是
+  `rust-v0.145.0` exact commit。旧
+  `AgentRuntime.code` / `AgentLoop` / `Orchestrator` 可暂留用于测试和手工源码回退，但生产入口必须
+  保持 `unavailable`/不可达。任何 runtime 缺失、版本、schema、provider 或启动失败都必须明确停止，
+  不能自动或“临时”调用旧内核。`intatis exec`与其旧`runExecCommand`也必须保持禁用，不能成为
+  绕过新CLI入口的隐藏AgentLoop path。
+- 不得新增 Chat Completions→Responses translator、provider shim、Codex protocol facade、备用
+  scheduler、shadow thread、mock backend 或 cache recovery。provider 必须是 Intatis exact Responses
+  route；custom `responsesEndpoint` 只有能表达为 baseURL + `/responses` 时可接入，否则 fail closed。
+- App Server process 必须使用 session-owned isolated `CODEX_HOME`、
+  `requires_openai_auth=false` 和 provider-specific child environment credential。不得读取/复制用户
+  Codex/ChatGPT login，不得把 credential 放入 argv、JSON-RPC、stderr diagnostic、runtime mapping、
+  model catalog、EventLog、session.json 或文档。Codex `shell_environment_policy` 必须保持
+  `inherit=core`、`ignore_default_excludes=false`，并排除 `INTATIS_*`/`CODEX_HOME`；不得让shell
+  tool继承 App Server provider token。0.145.0 `features.shell_snapshot`必须保持false，因为该feature
+  在tool filter前捕获parent environment并会把token写入`CODEX_HOME/shell_snapshots`；不得为保留shell
+  convenience重新开启。isolated home若已存在该目录必须在credential注入前fail closed并要求新session；
+  host不得自动读取、清洗或删除可能已经含secret的旧snapshot。
+- `CodexRuntimeExecutable.pinnedVersion`、`ThirdPartyNotices/OpenAICodexRuntime.md`、测试用真实握手和
+  release binary inventory 必须一起升级。不得接受版本范围、`latest`、浮动 `main`、PATH 中任意
+  `codex` 或未验证的 bundle executable。
+- selected model/variant options不得静默丢失。当前解释层只允许空options或可唯一归一化为
+  `reasoning.effort`的minimal/low/medium/high/xhigh/max/ultra；exact OpenRouter adapter的
+  `options.provider`是明确例外，作为完整opaque object经`intatis_responses_provider`进入最终
+  `ResponsesApiRequest.provider`。不得枚举、解释、重命名或丢弃其children，也不得让它覆盖host-owned
+  request字段。跨进程前必须递归拒绝secret/auth/header/query/URL/endpoint material并保持结构资源边界。
+  其他top-level option仍在secret resolve/network前fail closed；不得新增控制header、generic whole-body
+  `extra_body`、proxy或协议adapter。上游有官方等价provider-body extension时应删除补丁。
+- `codex-runtime/` 必须位于 exact Intatis session directory，目录 owner-only；`runtime.json` 与
+  `models.json` 必须使用 `DurableOwnerOnlyFile` 的 no-follow/0600/atomic/durability边界。
+  `runtime.lock`必须是owner-only/no-follow/single-link并持有nonblocking cross-process `flock`整个process
+  生命周期；同session第二runtime明确拒绝。`runtime.json` schema/version/mode/workspace/thread ID不一致、
+  损坏或unsafe时fail closed。0.145.0 thread在首个turn前没有可resume rollout，因此schema-v2 mapping只能
+  在首个`turn/start`接受后写入；只start后shutdown不得留下stale ThreadID。
+- Codex rollout 是模型上下文权威，Intatis EventLog 是产品/UI/audit 投影权威；两者必须通过
+  required `runtime.json` exact ThreadID join。EventLog 已有 legacy agent history而 mapping 缺失时，
+  不得静默新建空 Codex thread、猜测历史、注入 legacy tool transcript 或宣称迁移成功；第一版只允许
+  新建 session。
+- owner-only `models.json` 只能使用 0.145.0 的 exact schema和官方 `model_catalog_json` extension；
+  `auto_review_model_override` 必须明确绑定 selected Responses model，不能隐式请求 OpenAI 默认 reviewer
+  model。不得把此配置扩写成 Intatis reviewer implementation。
+- App Server 未支持/未接线的 server request 必须返回 JSON-RPC error 并显示 typed failure。第一版
+  尤其不得用 legacy Intatis MCP/Knowledge/WorkTask/Goal/agent implementation补齐
+  `request_user_input`、dynamic tools、MCP plugin、child-thread projection 或 paginated history。
+- Code/Cowork EventLog 只可镜像 bounded、exact-token-redacted presentation facts。credential、raw
+  environment、raw stdin、未界定 command output、approval transient或整个 App Server payload 不得
+  落盘。completed assistant item 是正文权威，delta 只能增量展示。
+- cancel/shutdown 必须发送 exact `{threadId, turnId}` interrupt（若 active），关闭 stdin、终结 process
+  与 event/read tasks；必须观察到process真实退出后才可释放`runtime.lock`，TERM超时后须KILL，KILL后仍
+  无法证明退出时继续持锁并后台retire，不得允许第二owner进入同一`CODEX_HOME`。窗口切换/Command-W
+  不得隐式 stop。provider/model
+  rebind 只能在无 active turn 时重启 process并 resume同一 thread。
+- iOS/Chat target 不得链接 `IntatisCodexRuntime`、Process、shell 或 workspace agent surface。
+- 当前源码不把 Codex binary 放入 App bundle。未完成 exact Cargo lock license closure、arm64+x86_64
+  build/hash、nested Developer ID signing、Hardened Runtime/notarization/stapling/Gatekeeper 与 clean-user
+  smoke 前，不得生成或宣称独立可分发的 Codex-backed macOS release。
+
+本文后续涉及 Intatis AgentLoop/PermissionEngine/Orchestrator 的禁区仍约束 legacy 源码与兼容测试；
+它们不得被误读为新 shipping path 必须在 Codex 外再包一层同等功能。
+
 ## macOS 分发不变量
 
 - macOS 唯一发行 App 是 Developer ID/direct-distribution `IntatisMac`；不得把
@@ -35,6 +98,10 @@
 - App/DMG submission ID 必须 first-write/reuse。超时、`In Progress`、中断、网络失败
   或 `Invalid` 都必须保留恢复状态且不得自动重复提交；只有最终 ZIP、DMG 与 manifest
   全部成功落盘后才可清理恢复目录。
+- 人工可运行、安装或交给用户的macOS Debug预览必须以`ENABLE_DEBUG_DYLIB=NO`构建；最终
+  `Contents/MacOS`不得含`IntatisMac.debug.dylib`或`__preview.dylib`，主程序也不得通过`LC_LOAD_DYLIB`
+  引用它们。不得用`codesign --deep --strict`静态通过替代真实启动验证，也不得为兼容默认Xcode Debug
+  launcher而开启`disable-library-validation`。预览必须在最终交付路径实际启动并保持运行后才可交付。
 
 ## macOS 文件夹项目不变量
 
@@ -607,13 +674,13 @@
   或重新引入已删除的 `IntatisMacAppStore` target。
 - **iOS config import**：iOS 只能经用户显式操作的系统 Files picker 导入 Intatis JSON/JSONC，不得扫描 macOS home/config 路径、持续持有外部 security scope、监视或改写原文件。共享 importer 必须保持文件/数量/字符串/URL 边界与 secret-aware 投影，只把 Chat 子集复制到 app-owned schema-versioned protected snapshot；literal `options.apiKey` 必须先迁入 protected auth JSON，再让新配置生效，且不得进入 snapshot、UserDefaults、日志或 UI。env/file 引用可保留但必须提示 iOS 可用性需要复核。base model raw options、exact npm adapter 与 capability metadata不得因导入而丢失；unsupported adapter 继续在网络前 fail closed。variants 在 iOS 支持落地前不得静默任选或伪装已导入，必须忽略并显示明确 warning。iOS thread-only root 必须由 host 持有唯一 `NavigationStack`，确保顶部 sidebar/session/new、抽屉 Recent/Settings、底部 model/usage + input composer 和 Settings sheet 在已有 key 时仍可达；不得以“无 key 自动弹 sheet”替代 Settings 入口，紧凑宽度下 model label 也不得遮挡或挤出第二排 controls。导入路径不得让 iOS 链接 Tools、Permission、AgentKernel、Cowork、shell 或 workspace runtime。
 - **Chat/Code model request options**：兼容 `ProviderEndpoint` 路径中的 `provider.<id>.models.<model>.options` 是开放 JSON 请求扩展，不得按已知 provider/字段白名单解码后丢弃未知值。选中 model 的 options 必须按 model ID 到达 wire adapter；Chat 与 Code Agent 路径行为一致。`models.<model>.variants.<variant>` 是同一真实 model 的命名请求参数预设；选择 variant 后必须保留真实 model ID，只以 variant 原始字段浅覆盖基础 options，且不得把本地 `disabled` 控制字段发给 provider。顶层 `model` 必须先尝试匹配启用 provider 的完整 model key，未命中才按 `provider/model` 拆分，不能把 model ID 自身的 `/` 无条件误判为 Intatis provider 分隔符。只能由 Intatis 覆盖 `model` / `messages` / `tools` / `stream` 等真实运行时结构字段；OpenAI-compatible builder 必须移除配置 `stream_options` 与 `n` / `best_of` / `num_return_sequences` / `candidate_count`，且仅允许 host `includeUsage` 重建受控 usage shape。新式 package adapter 必须按 pinned OpenCode package 省略 `n`，不得从 parallel-safe tool metadata 自动合成 `parallel_tool_calls`；legacy wire 可保留显式 `n = 1` 与 call-level parallel 开关。单次 runtime 显式值只能在 exact adapter 支持的边界内覆盖配置默认。provider-level endpoint/auth 配置不得混入 body，model/variant options 不得镜像到 UserDefaults、EventLog 或日志；API key、Authorization 与其他 secret 仍遵守秘密边界。此开放契约不得套用到 Cowork durable catalog。
-- **Provider options 只由 exact package adapter 降级**：配置解析、variant merge、immutable profile 与 UI 展示必须保留原始 `provider.npm`、model `provider.npm`、`reasoningEffort` / `reasoning_effort` / nested `reasoning.effort`，不得回写用户 JSON/JSONC。禁止恢复跨 provider 的全局 camel/snake/nested 优先级。新 OpenCode-shaped custom provider 真正缺少 npm 时必须显式冻结 `@ai-sdk/openai-compatible`；model override 优先于 provider。显式空串或空白 npm 不是“缺失”，必须保留 exact identity 并在网络前 fail closed。Compatible adapter 才可按其 pinned SDK 语义把 camel `reasoningEffort` 生成 snake `reasoning_effort`，且必须保留独立 nested reasoning 与 `provider.require_parameters`；OpenRouter adapter 使用自己的 nested reasoning 语义。未知或未实现 npm adapter 必须在网络前 fail closed，不得按 endpoint/provider 名称猜测、不得静默回退 compatible，也不得为绕过路由错误关闭 strict routing。历史缺 adapter 的 durable 值须保持 legacy decode/fingerprint。
+- **Provider options 只由 exact package adapter 降级**：配置解析、variant merge、immutable profile 与 UI 展示必须保留原始 `provider.npm`、model `provider.npm`、`reasoningEffort` / `reasoning_effort` / nested `reasoning.effort`，不得回写用户 JSON/JSONC。禁止恢复跨 provider 的全局 camel/snake/nested 优先级。新 OpenCode-shaped custom provider 真正缺少 npm 时必须显式冻结 `@ai-sdk/openai-compatible`；model override 优先于 provider。显式空串或空白 npm 不是“缺失”，必须保留 exact identity并在网络前fail closed。Compatible adapter 才可按其 pinned SDK 语义把camel `reasoningEffort`生成snake `reasoning_effort`，且必须保留独立nested reasoning与完整`options.provider`；OpenRouter adapter使用自己的nested reasoning语义，并由Codex Runtime把该provider object作为request-owned opaque JSON透传。未知或未实现npm adapter必须在网络前fail closed，不得按endpoint/provider名称猜测、不得静默回退compatible，也不得为绕过路由错误关闭strict routing。历史缺adapter的durable值须保持legacy decode/fingerprint。
 - **Config presentation is read-only**：模型 UI 可以识别 `reasoning_effort` / `reasoningEffort` / nested `reasoning.effort` / `output_config.effort` / thinking level 或 token budget 等常见拼写，但只可展示配置中的原始值。展示投影不得改写 key/value、不得转换 provider 协议、不得回写 JSON/JSONC、不得覆盖 request options；未知 model-level metadata 必须在内存保留。没有显式 selected variant 时不得从 `variants` 中任选一个 effort 显示为当前活动值。provider/model/variant 选择状态只能是指向配置条目的 identity，不得复制第二套模型参数；variant 参数来源始终是当前配置文件。
 - **Per-agent inference catalog**：Cowork connection/profile 定义必须以 exact ID + revision 进入 versioned immutable `InferenceCatalog`；endpoint、wire、credential reference、trust metadata、model、variant、有效 options 或 declared capabilities 的语义变化都必须追加 revision并保留旧 revision，不得原地改写。current reference 只供未来 binding，不能成为现有 agent 的动态指针。macOS connection/trust identity 必须保持 opaque、不得编码 raw URL；CLI connection/trust/credential reference 必须按 route identity 隔离，不能让不同 endpoint 共用模糊 credential account。`InferenceCatalogStore` 遇到 corruption、未知 schema、过大文件或非 owner-only 权限必须 fail closed 且不得覆盖原文件；写入必须保持 owner-only 临时文件和原子替换。Reconcile 的旧值读取、revision 分配、校验和替换必须处于同一 mutation 临界区；同进程 store instances 不得利用 POSIX process-scoped lock 发生重入，跨进程必须在稳定 sidecar inode 上互斥。Sidecar 必须 no-follow/close-on-exec、当前用户所有、`0600`、普通且单链接；不得删除后重建来绕过锁、自动修复不安全既有锁，或在不支持真实跨进程锁的平台退回无锁写入。当前仅支持 OpenAI-compatible wire，不能因配置声明其他 wire 就假装可执行。
 - **Exact inference binding 与兼容性**：`AgentInferenceBinding`、`TaskContract.agentInferenceBinding`、agent lifecycle/turn-stats/authorization 中的 inference 字段只能追加式、可选演进，旧 JSONL 缺字段必须继续解码为 unresolved。Live strict Cowork 必须逐项核对 exact profile/connection revision、model/opaque durable variant、安全 route label/trust domain/egress classification 与 opaque definition digest；macOS/CLI raw variant config key 只能留在 local presentation selector，不能进入 binding/EventLog。Revision 缺失、definition 被原地改写、binding mismatch、unsupported wire 或显式声明能力不兼容时，必须在 secret/network access 前 fail closed。不得回退 catalog current、session default、同名 model、同 provider 或任意“最接近”配置；不得把 legacy unresolved agent 自动绑定到当前默认。
 - **Atomic inference resolution 与 TOCTOU**：shipping strict Cowork 只能通过一次 resolver 调用获得 `binding + model + provider`，不得先返回 provider、再从另一份 mutable state 查询 binding/model。`requiresInferenceBindings = true` 必须拒绝 provider-only public runtime factory；Orchestrator 在 admission/preflight/dispatch 复核 `Agent.model == binding.modelID`、resolved binding 全等和 resolved model 全等。Catalog candidate update 与 attach/spawn/delegate/rebind 必须共享 admission lock；锁外 async exact resolve 返回后必须重新核对 host-approved map、live roster/current binding 与 authorization fingerprint。Reviewed delegation 必须把 authorization、catalog snapshot、target binding/model/workspace/fingerprint 和 caller leases 贯穿 Mediator/resolve await 到最终 admission；target reservation 必须阻止 rebind。`delegate_task` 不得创建 agent，只能选择已经 attached 的 data-plane target；需要新 agent 时由独立 `spawn_agent` 调用完成，且必须等待其成功 ToolResult 后才能委派。最终 lock 内复核通过且 `TaskContract` binding 等于 reviewed binding 后，才可用一个 EventLog batch 原子提交委派事实并入队。AgentLoop 的 execution revalidation hook 必须在 durable tool prepare 前完成 profile resolve，并在 `await` 返回后再次校验，不能让 catalog/roster 在 suspension 期间变化后仍写入 prepared ticket。Ordinary attach 在 permission review `await` 返回后必须再次 exact-resolve，并比较 review 前、resolve 前与 commit 前的 host-approved catalog snapshot；fresh `bootstrapMainAgent` 不经过模型 review，但必须在 admission wait 前后复核空 roster/EventLog、在锁外二次 resolve，并在锁内复核 exact catalog snapshot 后才 durable admission。macOS、CLI 与生产 self-test 不得绕过该 seam；internal legacy provider seam 只能留给 isolated `@testable` fixture。
 - **Inference recovery 与隔离门禁**：GUI 与 CLI 的恢复门禁必须分开。GUI 的 durable `@main` exact resolution、reviewer/control-plane readiness 与 Goal recovery 是提交后的执行状态，不得成为 composer/本地 admission gate；释放新工作时必须继续把前一进程恢复出的 root tasks 围栏为 paused/interrupted，只有该 submission 的显式 Retry 才可释放对应历史 task，不能用普通启动或无关新消息整批 `resumePendingTasks`。CLI 仍保留自己的显式 `/auto|/default` 与 data-plane resume 边界。不得把任一 ordinary worker unresolved 升格为全局 scheduler pause，否则它的 queued task 会与 idle-only rebind busy fence 形成死锁。Scheduler 必须允许其他 agents 继续运行，并让该 worker 的 queued invocation 在 provider request 前因 exact-resolution 失败而 durable failed、撤销 task lease、清除 active/queued fence；host 随后才能显式 rebind。历史 session 缺失 durable `@main` 时不得套 current default：GUI 只能从 canonical settings/roster 走 host-authorized exact historical-main recovery，并在 main 成功后 replacement/retry reviewer；CLI 只能由 host 显式 `/agent restore-main <path> <profile-id>` 走专用历史恢复入口，再显式启用控制面。恢复登记不得调用模型。历史 active Goal 冷启动只可 reconcile/checkpoint/audit 后 durable pause（或 budget-limit）；只有显式 Resume 才可创建 continuation。Modern CLI 的 unqualified model 只能在唯一 route 匹配时自动选择；explicit reasoning 无 matching configured variant/base effort 时 fail closed，不得合成 profile。
-- **Cowork durable inference options 与安全投影**：catalog 编译保持 connection defaults → model base → variant → profile overrides 的 deep merge；仅两侧都是 plain object 时递归，array/scalar/null 由后层整体替换。调用阶段保持 resolved options → exact package adapter lowering → 受限 invocation values → clamp → runtime structural fields 的优先级。Connection/profile 必须把 provider/model adapter 作为 immutable 语义冻结；adapter 变化必须产生新 revision，旧缺字段值仍保持 legacy identity。Bound Cowork agent 的 reasoning/options 由 profile 所有，session-wide effort 不得覆盖。Durable connection 的 HTTP(S) base/chat URL 必须拒绝 user-info、query 与 fragment，不能把凭据或路由 material 藏入 URL。Durable schema 必须显式 allowlist 有界的 sampling/token/logprob 数值、少量布尔/安全 token 字符串，以及受限 `reasoning` / `thinking` / `output_config` / provider routing 子结构；unknown key、错误 shape/size/depth、secret/auth/header/query/URL/endpoint transport container、runtime structural、stream 与 multi-candidate fields 必须 fail closed，不能以“未知但安全”为由保真。新增 durable option 必须先扩展 schema 和测试。所有 Chat/Agent request 还必须无条件移除配置 `stream_options` 和候选数量控制；新式 package adapter 省略 `n` 并禁止从 tool metadata 自动合成 `parallel_tool_calls`，legacy wire 才保留旧显式控制。host output-token ceiling 另按 normalized key（忽略大小写和常见分隔符）移除竞争 token aliases并写入 host ceiling。Binding/EventLog/permission preview/roster/UI/错误文案不得包含 raw endpoint、credential value/ref 细节、headers、query 或 arbitrary options；只允许 exact identity/revision、model/variant、安全 route/trust/egress 分类和不可逆 digest 等安全字段。Credential value 只按 exact connection revision 的 reference 在真实 provider 请求边界懒加载；CLI 不得用 selected route 的 key 替换其他 route 或旧 revision，definition digest 不得在文档、UI 或日志中输出完整实际值。
+- **Cowork durable inference options 与安全投影**：catalog 编译保持 connection defaults → model base → variant → profile overrides 的 deep merge；仅两侧都是 plain object 时递归，array/scalar/null 由后层整体替换。调用阶段保持 resolved options → exact package adapter lowering → 受限 invocation values → clamp → runtime structural fields 的优先级。Connection/profile 必须把 provider/model adapter 作为 immutable 语义冻结；adapter 变化必须产生新 revision，旧缺字段值仍保持 legacy identity。Bound Cowork agent 的 reasoning/options 由 profile 所有，session-wide effort 不得覆盖。Durable connection 的 HTTP(S) base/chat URL 必须拒绝 user-info、query 与 fragment，不能把凭据或路由 material 藏入 URL。Durable schema 对 sampling/token/logprob、reasoning/thinking/output_config与其他top-level字段继续显式allowlist；exact `options.provider`子树作为provider-owned opaque JSON例外，不枚举future keys，但必须先递归拒绝secret/auth/header/query/URL/endpoint transport material并满足depth/object/array/string有限结构边界。provider子树以外的unknown key、错误shape、runtime structural、stream与multi-candidate fields继续fail closed。所有 Chat/Agent request 还必须无条件移除配置 `stream_options` 和候选数量控制；新式 package adapter 省略 `n` 并禁止从 tool metadata 自动合成 `parallel_tool_calls`，legacy wire 才保留旧显式控制。host output-token ceiling 另按 normalized key（忽略大小写和常见分隔符）移除竞争 token aliases并写入 host ceiling。Binding/EventLog/permission preview/roster/UI/错误文案不得包含 raw endpoint、credential value/ref 细节、headers、query 或 arbitrary options；只允许 exact identity/revision、model/variant、安全 route/trust/egress 分类和不可逆 digest 等安全字段。Credential value 只按 exact connection revision 的 reference 在真实 provider 请求边界懒加载；CLI 不得用 selected route 的 key 替换其他 route 或旧 revision，definition digest 不得在文档、UI 或日志中输出完整实际值。
 - **Provider config 路径引用**：`providerConfig` secret ref 只能读取当前 Intatis 自有 `intatis.json/jsonc`、旧 Intatis `config.json/jsonc` 或用户本次显式 `INTATIS_CONFIG` 指定文件；历史 UserDefaults 中其他绝对路径必须 fail closed，不能借旧元数据恢复对 `opencode.json` 或第三方配置的隐式读取。
 - **Provider 线协议**：OpenAI 兼容 HTTP/SSE（`/chat/completions` streaming）。`WireFormat.openai` 是唯一 shipped 格式。
 - **Provider tool-call delta 兼容**：tool-calling streaming 必须继续归一到既有 `ToolCall`，不得改事件 schema 或绕过权限门。解析器应保留对缺失单工具 `index`、字符串 `index`、非字符串 JSON `function.arguments` 的兼容；JSON arguments 必须作为 JSON 字符串进入工具参数解析，不得用描述性文本替代。Chat/tool-calling streaming 不得只消费 `choices.first`；同一 SSE chunk 中非首个 choice 的 content、tool_calls 与 `finish_reason` 也必须被处理，且多 choice 同时出现 `stop` 与 `tool_calls` / `function_call` 时不得把工具轮降级成普通文本完成。若 provider 以 `tool_calls` / 旧式 `function_call` finish reason 结束但未发出完整 tool-call delta 或缺 tool name，或已发出 tool-call delta 后错误以 `stop` 结束且仍缺 tool name，不得静默丢弃并合成成功，必须暴露 provider/tool-call 兼容错误。非空累计 `function.arguments` 必须在 provider 层确认可解码为完整 JSON；截断或非法 JSON 不得下放成泛化工具输入失败，空 arguments 可继续保留以兼容无参工具。

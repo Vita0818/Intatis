@@ -539,6 +539,7 @@ func makeLiveSession(
 /// The dynamic MCP snapshot is resolved before every provider dispatch.
 /// Therefore a required connection/Test/consent failure exits non-zero without
 /// sending any request to the inference provider.
+@available(*, unavailable, message: "CLI execution uses Codex App Server")
 func runExecCommand(
     _ raw: ArraySlice<String>
 ) async throws {

@@ -116,7 +116,16 @@ final class InferenceCatalogTests: XCTestCase {
             "max_tokens": .number(1024),
             "reasoning_effort": .string("xhigh"),
             "thinking": .object(["budget_tokens": .number(4096)]),
-            "provider": .object(["allow_fallbacks": .bool(false)]),
+            "provider": .object([
+                "allow_fallbacks": .bool(false),
+                "future_routing": .object([
+                    "mode": .string("provider-owned"),
+                    "weights": .array([
+                        .number(1),
+                        .number(2),
+                    ]),
+                ]),
+            ]),
         ]))
     }
 
@@ -153,7 +162,6 @@ final class InferenceCatalogTests: XCTestCase {
             ["response_format": .object(["schema": .string(privateValue)])],
             ["n": .number(8)],
             ["best_of": .number(8)],
-            ["provider": .object(["unknown_route_key": .bool(true)])],
             ["reasoning": .object(["unknown_tuning_key": .number(1)])],
         ] as [[String: JSONValue]] {
             XCTAssertThrowsError(

@@ -28,6 +28,92 @@ working tree 的验证。这里只记录现行命令、release gate 和最近一
 - SwiftPM 测试中的 sandbox、managed terminal Seatbelt、Linux bwrap/guard、权限与路径
   围栏仍是产品安全边界，不能因为不做 App Store 而跳过。
 
+## Codex Runtime 专项验证
+
+Code/Cowork/CLI 内核变更至少运行：
+
+```sh
+swift test --filter CodexRuntimeTests
+swift build --product intatis
+xcodegen generate
+xcodebuild -project Intatis.xcodeproj -scheme IntatisMac \
+  -configuration Debug -destination 'platform=macOS' \
+  ENABLE_DEBUG_DYLIB=NO build
+xcodebuild -project Intatis.xcodeproj -scheme IntatisiOS \
+  -configuration Debug \
+  -destination 'generic/platform=iOS Simulator' build
+```
+
+派生Codex Runtime还必须从exact upstream commit应用仓内patch并运行：
+
+```sh
+git apply --check 0001-responses-provider-passthrough.patch
+cargo test -p codex-model-provider-info intatis_responses_provider_preserves_opaque_object_without_changing_headers
+cargo test -p codex-core intatis_provider_config_maps_to_opaque_responses_provider_body
+cargo test -p codex-core serializes_intatis_opaque_provider_object_without_field_loss
+cargo test -p codex-api direct_serialization_preserves_websocket_request_payload
+cargo build --release -p codex-cli
+./target/release/codex --version
+```
+
+最后一行必须是`codex-cli 0.145.0-intatis.2`。patch只可在`Cargo.lock`增加
+`codex-model-provider-info`对workspace既有`serde_json`的package-edge；Cargo生成的workspace package
+version机械重写不得纳入patch，任何dependency版本漂移都必须另行审计。
+
+任何交给用户或由 Finder/LaunchServices/终端直接启动的 macOS Debug 预览包都必须显式使用
+`ENABLE_DEBUG_DYLIB=NO`。构建后须证明`Contents/MacOS`只含主`IntatisMac`可执行文件，且
+`otool -L`不引用`@rpath/IntatisMac.debug.dylib`；默认Xcode 27 Debug launcher、
+`IntatisMac.debug.dylib`和`__preview.dylib`不能进入人工可运行预览。ad-hoc `codesign --deep --strict`
+静态通过不证明library validation可启动，最终包还必须从其交付路径做真实进程启动smoke。
+
+`CodexRuntimeTests` 必须同时覆盖：
+
+- exact provider/model/Responses base URL 解析，custom endpoint 非 `/responses` fail closed；
+- credential 的 `Bearer` 归一化与所有 description/debug redaction；
+- owner-only `codex-runtime/`、`runtime.json`、`models.json` round trip；
+- exact executable discovery 与 `codex-cli 0.145.0-intatis.2` version mismatch；
+- OpenRouter exact adapter的完整`options.provider`同时通过current Code route和Cowork exact
+  `AgentInferenceBinding`，已知与未知nested字段逐值保持；生成的custom provider使用
+  `intatis_responses_provider`，没有控制header。secret/auth/header/query/URL/endpoint material必须在
+  credential resolution前fail closed且不回显；
+- test-only fake App Server 的 initialize→thread/start→turn/start→assistant delta/completed→
+  turn/completed；测试 double 不得进入 production selection；
+- 若本机有 exact pinned binary，则启动真实 `app-server`，使用 isolated temporary
+  `CODEX_HOME`、offline placeholder Responses URL/credential 完成 initialize/thread/start/shutdown。
+  该握手不得发送 turn 或真实 provider 请求；缺 binary 时测试可明确 skip，不能伪造通过；
+- 0.145.0 exact `model_catalog_json` schema、`base_instructions`、
+  `supports_parallel_tool_calls` 与 `auto_review_model_override == selected model`；不得用当前 main 的
+  schema 代替 pinned release；
+- event/request credential exact-token redaction、未知 server request JSON-RPC fail closed、approval
+  decision mapping、interrupt/termination、response/terminal notification race。
+
+CLI 无网络 smoke 可使用不可连接的 loopback Responses URL，只验证 runtime startup/exit：
+
+```sh
+INTATIS_BASE_URL=http://127.0.0.1:9/v1 \
+INTATIS_API_KEY=offline-placeholder \
+INTATIS_MODEL=offline-test-model \
+  .build/debug/intatis code /absolute/test/workspace
+# 出现 Codex Runtime 0.145.0-intatis.2 ready 后输入 /exit
+```
+
+必须确认该 smoke 使用新的 `CodexRuntimeCLI`；`intatis code|cowork` 不得进入
+`AgentRuntime.code` 或 `coworkREPL`。`intatis exec`必须明确拒绝且`runExecCommand`保持编译期
+unavailable；`intatis chat`继续使用ChatLoop。
+
+旧 session migration 必须单测/手测两类：有 valid `runtime.json` 时 resume exact thread；EventLog 已有
+legacy agent history但没有 mapping 时显示 `threadMigrationRequired`，不创建空 thread。missing/mismatched
+binary、unsafe mapping、provider不是原生 Responses、App Server schema error 都必须可诊断且没有 legacy
+fallback。
+
+真实 provider E2E 不是默认测试：只有用户明确允许该 exact route 的网络/计费调用后才能运行，并必须
+报告 model、turn status、工具/approval覆盖与 provider usage，不得打印 URL、credential 或完整响应。
+
+发行前除普通 macOS gate 外，还必须从固定 Codex source/Cargo.lock 建 arm64+x86_64，保存 binary hash与
+完整第三方 license/NOTICE closure，把 nested executable 先签名再签 outer App，并验证 notarization、staple、
+Gatekeeper、fresh-account startup 和 final bundle 中 `codex --version`。当前 external local install smoke
+不能替代该 gate。
+
 ## 版本一致性
 
 ```sh
@@ -806,6 +892,63 @@ INTATIS_REAL_MULTIMODAL_SMOKE=1 swift test \
   线上 provider smoke 必须单独记录，不能从离线测试或编译外推。
 
 ## 最近一次真实结果
+
+### 2026-08-22 Codex Runtime 第一版
+
+- `swift test --filter CodexRuntimeTests`：20/20 通过。新增覆盖current Code route与Cowork exact binding的
+  OpenRouter完整`options.provider` opaque passthrough、未知nested字段逐值保持，以及secret-bearing
+  provider object在credential resolution前fail closed；其余覆盖 Responses route/custom endpoint、
+  credential redaction、0.145.0 exact model catalog、`shell_snapshot=false` + core/secret-filtered shell
+  environment、0600/0700 storage、unsafe directory no-repair、cross-process runtime flock、strict version、
+  test-only full turn、server-initiated command approval round-trip、explicit executable override不降级、
+  legacy-without-mapping failure、旧shell snapshot目录fail-closed且不删除、untrusted JSON-RPC numeric
+  request ID、TERM-resistant version probe的有界强制结束、shutdown等待真实process exit后才释放session flock，
+  以及真实 installed `codex-cli 0.145.0-intatis.2` offline initialize/thread-start/shutdown handshake。
+- `swift test --filter IntatisProvidersTests`：204/204 通过。
+- `swift test --filter IntatisCLITests`：49/49 通过，8 个显式真实provider/Knowledge/multimodal smoke
+  按环境跳过。
+- `swift build --product intatis`：通过。
+- 完整 `swift test`：Tools 227/227（31 skipped）与 Skills 29/29通过；随后在仓库既有
+  SharedUI `ComposerVoiceInputTests` async waiter阶段长期无输出，按既有已知hang人工中断，退出130。
+  因此本轮不记为full suite通过；该hang发生在Codex target测试之后的独立SharedUI进程，不能用来
+  否定已完成focused结果，也不能被忽略为full pass。
+- `xcodegen generate`：通过。
+- `xcodebuild ... -scheme IntatisMac -configuration Debug -destination 'platform=macOS'
+  ENABLE_DEBUG_DYLIB=NO build`：通过。
+- `xcodebuild ... -scheme IntatisiOS -configuration Debug -destination 'generic/platform=iOS Simulator' build`：
+  arm64+x86_64通过；dependency graph仍为29个Chat子集targets，不含`IntatisCodexRuntime`。
+- 派生Rust验证：`codex-model-provider-info` 25/25；config→opaque body provider、Responses JSON、
+  WebSocket payload三个focused测试通过；`cargo fmt --check`与release build通过。完整`codex-api`为137/138，
+  唯一失败`upload_openai_file_reports_blob_transport_diagnostics_without_sas`在独立未打补丁upstream
+  baseline同样失败，不归因本补丁且未修改上游测试凑绿。
+- 本地HTTP假Responses E2E：真实`0.145.0-intatis.2 app-server`完成turn，抓包断言path为
+  `/v1/responses`，整个`provider` object逐值等于输入，包含`require_parameters`、
+  `allow_fallbacks`、`order`与补丁未枚举的nested `future_routing`；请求不含任何`x-intatis-*`
+  控制header。无真实key、外网或计费。
+- CLI offline startup/exit smoke：exact `codex-cli 0.145.0-intatis.2` ready并正常退出。
+- CLI loopback真实内核smoke：本机HTTP假Responses服务返回官方SSE事件，真实Codex App Server完成
+  `turn/start`并显示`local Codex turn ok`；退出后同一workspace重启resume同一ThreadID。服务关闭后
+  resume仍成功，证明恢复不依赖模型网络。
+- materialized storage核对：首个turn后写schema-v2 `runtime.json`；`runtime.json`、`models.json`、
+  `runtime.lock`均为0600。对整个新temporary runtime root扫描placeholder provider token为0命中，
+  `shell_snapshots`目录不存在。仅start/立即shutdown的真实handshake不写runtime mapping。
+- 没有运行真实外部provider/计费请求；没有构建或bundle Codex universal binary；Developer ID、
+  nested signing、公证、staple、Gatekeeper和fresh-user release gate未运行。
+- 首次gitignored预览错误使用了Xcode 27默认Debug launcher。用户在2026-08-22 16:26提供的真实
+  crash report显示进程在进入`main`前由DYLD终止：主程序引用
+  `@rpath/IntatisMac.debug.dylib`，ad-hoc重签名后的主程序和调试dylib因non-platform Team ID不一致被
+  library validation拒绝。该包虽然曾通过`codesign --deep --strict`，仍不是可启动证据；问题与
+  Codex App Server业务逻辑无关。
+- 当前`dist/Intatis-CodexRuntime-Preview.app`已用同一源码、
+  `ENABLE_DEBUG_DYLIB=NO`和`CODE_SIGNING_ALLOWED=NO`重建，再以Developer ID entitlements做ad-hoc
+  Hardened Runtime签名。`Contents/MacOS`精确只含主`IntatisMac`，`otool -L`不再引用任何
+  `IntatisMac.debug.dylib`/`__preview.dylib`，strict deep codesign通过；embedded entitlements为
+  audio-input=true、allow-jit=false、disable-library-validation=false。最终`dist`包通过`open -n`走
+  LaunchServices启动，精确进程路径读回正确并持续运行28秒，
+  随后由测试者主动TERM关闭；最终主可执行文件SHA-256为
+  `9755310454444845a6613800a6647eff605169fda36771e545975e74bb024265`。该v0.55 arm64 Debug包包含
+  新NOTICE，但仍不bundle `codex`，只适合当前已安装exact `0.145.0-intatis.2` runtime的开发机试用，不能作为
+  发行产物。
 
 ### 2026-08-22 macOS 文件夹项目第一版
 

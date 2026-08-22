@@ -14,6 +14,7 @@ import IntatisSkills
 import IntatisMCP
 import IntatisTools
 import IntatisSharedUI
+import IntatisCodexRuntime
 
 private actor ProviderRegistryBox {
     private var registry: ProviderRegistry
@@ -72,6 +73,12 @@ private actor ProviderRegistryBox {
 
     func provider(for binding: AgentInferenceBinding) async throws -> ToolCallingProvider {
         try await registry.agentInference(for: binding).provider
+    }
+
+    func responsesRuntimeRoute(
+        for binding: AgentInferenceBinding
+    ) async throws -> ResponsesRuntimeRoute {
+        try await registry.responsesRuntimeRoute(for: binding)
     }
 
     func controlPlaneProvider() async throws -> ToolCallingProvider {
@@ -370,6 +377,18 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         HostToolRegistryAugmenter?
     private var orchestrator: Orchestrator?
     private var goalRuntime: GoalRuntimeController?
+    private var codexRuntime: CodexAppServerSession?
+    private var codexRuntimeBinding: AgentInferenceBinding?
+    private var codexStartupTask:
+        Task<CodexAppServerSession, Error>?
+    private var codexEventTask: Task<Void, Never>?
+    private var codexApprovalIDs:
+        [RequestID: CodexRuntimeRequestID] = [:]
+    private var codexApprovalActions:
+        [RequestID: PermissionResponseAction] = [:]
+    private var codexWriterLease: EventLogWriterLease?
+    private var codexAllowsThreadCreation = false
+    private var codexProjectionFailed = false
     private var subscription: Task<Void, Never>?
     private var projectionPump:
         SessionProjectionPump<
@@ -473,6 +492,8 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
 
     deinit {
         subscription?.cancel()
+        codexStartupTask?.cancel()
+        codexEventTask?.cancel()
     }
 
     var hasActiveWork: Bool {
@@ -537,6 +558,11 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             guard let self else { return }
             defer { self.activeOperations.removeValue(forKey: operationID) }
             await self.registryBox.update(registry)
+            if self.isAgentWorkActive {
+                self.codexRuntimeBinding = nil
+            } else {
+                await self.resetCodexRuntime()
+            }
             await self.orchestrator?.updateAvailableInferenceProfiles(
                 bindings,
                 routingMetadata: routingMetadata,
@@ -558,6 +584,80 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
     }
 
     func start() {
+        guard !didStop, subscription == nil,
+              shutdownTask == nil else { return }
+        do {
+            if codexWriterLease == nil {
+                codexWriterLease = try log.acquireWriterLease()
+            }
+        } catch {
+            projectionError = error.localizedDescription
+            return
+        }
+        let projectionIdentity = SessionProjectionIdentity(
+            sessionID: sessionID)
+        let projectionPump = SessionProjectionPump<
+            CoworkSessionProjectionState,
+            ContinuousClock>(
+                identity: projectionIdentity,
+                clock: ContinuousClock())
+        projectionCommitFence = SessionProjectionCommitFence(
+            identity: projectionIdentity)
+        self.projectionPump = projectionPump
+        setPermissionReviewerStatus(.enabling)
+
+        subscription = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let replayed = await self.log.replay()
+                self.codexAllowsThreadCreation =
+                    !Self.containsAgentHistory(replayed)
+                let initialReplay = try await projectionPump
+                    .loadInitialReplay(replayed)
+                let initialCowork = initialReplay.cowork
+                    ?? CoworkProjection()
+                self.restoreWorkspaceAccess(for: initialCowork)
+                try await self.bootstrapCodexMainIfNeeded(
+                    existingProjection: initialCowork)
+
+                let restored = await self.log.replay()
+                let initial = try await projectionPump.synchronize(
+                    with: restored,
+                    markRestoredPermissionsNeedsRerun: true)
+                self.commitProjectionSnapshot(initial)
+                let stream = await self.log.stream(
+                    from: (restored.last?.seq ?? -1) + 1)
+                let publications = try await projectionPump.publications(
+                    consuming: stream)
+
+                self.isGoalRuntimeReady = false
+
+                for await output in publications {
+                    guard !Task.isCancelled else { break }
+                    switch output {
+                    case .snapshot(let snapshot):
+                        self.commitProjectionSnapshot(snapshot)
+                    case .failed(let failure):
+                        guard self.projectionCommitFence?.identity
+                            == projectionIdentity else { continue }
+                        self.projectionError = failure.localizedDescription
+                    }
+                }
+            } catch {
+                guard self.projectionCommitFence?.identity
+                    == projectionIdentity,
+                      !Task.isCancelled else { return }
+                let message = error.localizedDescription
+                self.projectionError = message
+                self.setPermissionReviewerStatus(.failed(message))
+            }
+        }
+    }
+
+    /// Retained temporarily only for a source-level/manual rollback. The
+    /// shipping Cowork path above never creates the Swift Orchestrator.
+    @available(*, unavailable, message: "Cowork uses Codex App Server")
+    private func retainedLegacyOrchestratorStart() {
         guard !didStop, orchestrator == nil, shutdownTask == nil else { return }
         let projectionIdentity =
             SessionProjectionIdentity(
@@ -779,6 +879,307 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
                 self.projectionError =
                     error.localizedDescription
             }
+        }
+    }
+
+    private func bootstrapCodexMainIfNeeded(
+        existingProjection: CoworkProjection
+    ) async throws {
+        if existingProjection.sessionSettings == nil {
+            _ = try await SessionProjectionStore.updateSettings(
+                in: log,
+                kind: .cowork,
+                coworkSettings: projectSettings,
+                changeKind: .created)
+        }
+        let main = AgentID(rawValue: projectSettings.mainAgentName)
+        if existingProjection.agentRoster[main] != nil { return }
+        if existingProjection.historicalAgentRoster[main] != nil {
+            throw IntatisError.config(
+                "The recovered @\(main.rawValue) identity is detached. Codex Runtime will not silently recreate a previously removed root agent.")
+        }
+        guard let binding = projectSettings.defaultInferenceProfileBinding
+                ?? inferenceProfileOptions.first?.binding,
+              let workspacePath = projectSettings.primaryWorkspace?.path
+                ?? projectSettings.workspaces.first?.path else {
+            throw IntatisError.config(
+                "Cowork requires a primary workspace and exact Responses inference binding.")
+        }
+        try await log.append(.agentAttached(AgentAttachedPayload(
+            agent: main,
+            path: workspacePath,
+            model: binding.modelID,
+            profile: PermissionProfile.reviewed.rawValue,
+            agentInferenceBinding: binding)))
+    }
+
+    private func codexSession(
+        for binding: AgentInferenceBinding
+    ) async throws -> CodexAppServerSession {
+        if let codexRuntime,
+           codexRuntimeBinding == binding {
+            return codexRuntime
+        }
+        if let codexStartupTask,
+           codexRuntimeBinding == binding {
+            return try await codexStartupTask.value
+        }
+        if codexRuntime != nil || codexStartupTask != nil {
+            guard !isAgentWorkActive else {
+                throw CodexRuntimeError.alreadyRunning
+            }
+            await resetCodexRuntime()
+        }
+        guard let workspacePath = projectSettings.primaryWorkspace?.path
+                ?? projectSettings.workspaces.first?.path else {
+            throw IntatisError.config(
+                "Cowork has no primary workspace for Codex Runtime.")
+        }
+        let route = try await registryBox.responsesRuntimeRoute(
+            for: binding)
+        let configuration = CodexRuntimeConfiguration(
+            sessionID: sessionID,
+            mode: .cowork,
+            workspaceURL: URL(fileURLWithPath: workspacePath),
+            runtimeRootURL: log.sessionDirectoryURL
+                .appendingPathComponent(
+                    "codex-runtime",
+                    isDirectory: true),
+            route: route,
+            approvalReviewer: .automatic,
+            reasoningEffort: route.reasoningEffort,
+            allowsThreadCreation: codexAllowsThreadCreation)
+        codexRuntimeBinding = binding
+        let task = Task { @MainActor [weak self] () throws
+            -> CodexAppServerSession in
+            guard let self else { throw CancellationError() }
+            let runtime = CodexAppServerSession(
+                configuration: configuration)
+            self.codexProjectionFailed = false
+            let events = await runtime.events()
+            let eventTask = Task { @MainActor [weak self] in
+                for await event in events {
+                    guard !Task.isCancelled else { return }
+                    await self?.handleCodexEvent(event)
+                }
+            }
+            self.codexEventTask = eventTask
+            do {
+                _ = try await runtime.start()
+                try Task.checkCancellation()
+                return runtime
+            } catch {
+                eventTask.cancel()
+                await runtime.shutdown()
+                throw error
+            }
+        }
+        codexStartupTask = task
+        do {
+            let runtime = try await task.value
+            codexRuntime = runtime
+            codexStartupTask = nil
+            return runtime
+        } catch {
+            codexStartupTask = nil
+            codexEventTask = nil
+            codexRuntimeBinding = nil
+            throw error
+        }
+    }
+
+    private func resetCodexRuntime() async {
+        codexStartupTask?.cancel()
+        codexStartupTask = nil
+        codexEventTask?.cancel()
+        codexEventTask = nil
+        let runtime = codexRuntime
+        codexRuntime = nil
+        codexRuntimeBinding = nil
+        codexApprovalIDs.removeAll()
+        codexApprovalActions.removeAll()
+        await runtime?.shutdown()
+    }
+
+    private func codexImageURLs(
+        for attachments: [CoworkDraftAttachment]
+    ) async throws -> [URL] {
+        var urls: [URL] = []
+        urls.reserveCapacity(attachments.count)
+        for attachment in attachments {
+            guard attachment.mime.hasPrefix("image/") else {
+                throw IntatisComposerAttachmentResolutionError.unsupported(
+                    attachment.id,
+                    mime: attachment.mime,
+                    surface: "Codex Runtime")
+            }
+            guard let ref = await artifactStore.ref(
+                for: attachment.id) else {
+                throw IntatisComposerAttachmentResolutionError.missing(
+                    attachment.id)
+            }
+            urls.append(artifactStore.absoluteURL(for: ref))
+        }
+        return urls
+    }
+
+    private func handleCodexEvent(
+        _ event: CodexRuntimeEvent
+    ) async {
+        let main = AgentID(rawValue: projectSettings.mainAgentName)
+        switch event {
+        case .ready:
+            isAgentWorkActive = false
+            setPermissionReviewerStatus(.enabled(
+                AgentID(rawValue: "codex-auto-review")))
+        case .turnStarted:
+            isAgentWorkActive = true
+        case .assistantDelta(let itemID, let text):
+            _ = await appendCodexProjectionEvent(.messageDelta(
+                MessageDeltaPayload(
+                    messageId: MessageID(
+                        rawValue: "codex:\(itemID)"),
+                    role: .agent,
+                    agent: main,
+                    textDelta: text)))
+        case .assistantCompleted(let itemID, let text):
+            _ = await appendCodexProjectionEvent(.messageCompleted(
+                MessageCompletedPayload(
+                    messageId: MessageID(
+                        rawValue: "codex:\(itemID)"),
+                    role: .agent,
+                    agent: main,
+                    text: text)))
+        case .reasoningDelta:
+            break
+        case .itemStarted(let item):
+            _ = await appendCodexProjectionEvent(.toolCall(ToolCallPayload(
+                toolCallId: "codex:\(item.id)",
+                agent: main,
+                name: item.title,
+                args: item.detail)))
+        case .itemCompleted(let item):
+            let observation = [item.status, item.detail]
+                .compactMap { $0 }
+                .filter { !$0.isEmpty }
+                .joined(separator: "\n")
+            _ = await appendCodexProjectionEvent(.toolResult(ToolResultPayload(
+                toolCallId: "codex:\(item.id)",
+                observation: observation.isEmpty
+                    ? "completed"
+                    : observation,
+                outcome: item.isFailure ? .failed : .succeeded,
+                failureSource: item.isFailure ? .runtimeFailed : nil)))
+        case .approvalRequested(let request):
+            let localID = RequestID.new()
+            codexApprovalIDs[localID] = request.requestID
+            permissionQueue.append(PendingPermission(
+                request: PermissionRequestPayload(
+                    requestId: localID,
+                    agent: main,
+                    tool: request.title,
+                    args: "",
+                    risk: .high,
+                    reason: request.summary,
+                    approvalMode: .manual),
+                requestedSeq: -1))
+            pendingPermission = permissionQueue.first
+        case .approvalResolved(let runtimeID):
+            guard let localID = codexApprovalIDs.first(where: {
+                $0.value == runtimeID
+            })?.key else { return }
+            codexApprovalIDs.removeValue(forKey: localID)
+            let action = codexApprovalActions.removeValue(forKey: localID)
+            permissionQueue.removeAll { $0.id == localID }
+            pendingPermission = permissionQueue.first
+            if let action {
+                let approved = action == .approve
+                    || action == .approveAndRemember
+                permissionNotice = PermissionResolutionNotice(
+                    id: "codex:\(runtimeID.description)",
+                    requestId: localID,
+                    tool: "Codex Runtime",
+                    decision: approved ? .allow : .deny,
+                    risk: .high,
+                    reason: approved
+                        ? "Codex Runtime request approved by user"
+                        : "Codex Runtime request declined by user",
+                    source: .user,
+                    action: action,
+                    resolvedSeq: -1)
+            }
+        case .turnCompleted(let result):
+            let outcome: TurnOutcome
+            let failureSource: ExecutionFailureSource?
+            switch result.status {
+            case "completed":
+                outcome = .completed
+                failureSource = nil
+            case "interrupted":
+                outcome = .interrupted
+                failureSource = .turnCancelled
+            default:
+                outcome = .failed
+                failureSource = .runtimeFailed
+            }
+            _ = await appendCodexProjectionEvent(.turnOutcome(
+                TurnOutcomePayload(
+                    turnID: TurnID(
+                        rawValue: "codex:\(result.turnID)"),
+                    outcome: outcome,
+                    failureSource: failureSource,
+                    reason: result.succeeded
+                        ? nil
+                        : "Codex Runtime turn ended with status \(result.status).",
+                    agentID: main)))
+            isAgentWorkActive = false
+            isWorking = false
+            if !result.succeeded {
+                composerError = result.errorMessage ?? result.status
+            }
+        case .runtimeError(let code, let message, let fatal):
+            composerError = message
+            _ = await appendCodexProjectionEvent(.error(ErrorPayload(
+                code: code,
+                message: fatal
+                    ? "Codex Runtime became unavailable."
+                    : "Codex Runtime reported a request failure.",
+                fatal: fatal)))
+            if fatal {
+                isAgentWorkActive = false
+                isWorking = false
+                setPermissionReviewerStatus(.failed(message))
+                codexRuntime = nil
+                codexStartupTask = nil
+                codexEventTask = nil
+            }
+        }
+    }
+
+    @discardableResult
+    private func appendCodexProjectionEvent(
+        _ event: Event
+    ) async -> Bool {
+        guard !codexProjectionFailed else { return false }
+        do {
+            _ = try await log.append(event)
+            return true
+        } catch {
+            codexProjectionFailed = true
+            let message = IntatisLocalization.format(
+                "Codex Runtime stopped because its Intatis projection could not be persisted: %@",
+                error.localizedDescription)
+            composerError = message
+            projectionError = message
+            isAgentWorkActive = false
+            isWorking = false
+            let runtime = codexRuntime
+            codexRuntime = nil
+            codexRuntimeBinding = nil
+            codexStartupTask = nil
+            codexEventTask = nil
+            await runtime?.shutdown()
+            return false
         }
     }
 
@@ -1035,9 +1436,18 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         subscription = nil
         let runningOrchestrator = orchestrator
         let runningGoalRuntime = goalRuntime
+        let runningCodexRuntime = codexRuntime
+        let runningCodexStartup = codexStartupTask
+        let runningCodexEvents = codexEventTask
+        runningCodexStartup?.cancel()
+        runningCodexEvents?.cancel()
         let runningOperations = Array(activeOperations.values)
         orchestrator = nil
         goalRuntime = nil
+        codexRuntime = nil
+        codexRuntimeBinding = nil
+        codexStartupTask = nil
+        codexEventTask = nil
         for operation in runningOperations { operation.cancel() }
         isWorking = false
         isAgentWorkActive = false
@@ -1059,6 +1469,11 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
             if let runningGoalRuntime {
                 await runningGoalRuntime.shutdown()
             }
+            await runningCodexRuntime?.shutdown()
+            _ = try? await runningCodexStartup?.value
+            if let runningCodexEvents {
+                await runningCodexEvents.value
+            }
             if let runningOrchestrator {
                 await runningOrchestrator.cancelAll(reason: reason)
             }
@@ -1077,6 +1492,10 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         }
         permissionWaiters.removeAll()
         permissionQueue.removeAll()
+        codexApprovalIDs.removeAll()
+        codexApprovalActions.removeAll()
+        codexWriterLease?.release()
+        codexWriterLease = nil
         if var pending = pendingPermission, pending.state.isActionable {
             pending.state = .expired
             pendingPermission = pending
@@ -1773,6 +2192,27 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
     }
 
     func retryAutomaticPermissionReview() {
+        guard acceptsNewOperations,
+              permissionReviewerStatus.canRetry,
+              let binding = nextMainInferenceBinding else { return }
+        setPermissionReviewerStatus(.enabling)
+        let operationID = UUID()
+        let operation = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.activeOperations.removeValue(forKey: operationID) }
+            do {
+                _ = try await self.codexSession(for: binding)
+            } catch {
+                let message = error.localizedDescription
+                self.composerError = message
+                self.setPermissionReviewerStatus(.failed(message))
+            }
+        }
+        activeOperations[operationID] = operation
+    }
+
+    @available(*, unavailable, message: "Cowork uses Codex auto_review")
+    private func retainedLegacyRetryAutomaticPermissionReview() {
         guard acceptsNewOperations,
               permissionReviewerStatus.canRetry,
               orchestrator != nil else { return }
@@ -2519,6 +2959,156 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
     }
 
     func send() {
+        guard acceptsNewOperations,
+              !isAcceptingSubmission,
+              !isAgentWorkActive else { return }
+        #if canImport(AVFoundation)
+        guard !voiceInput.isEngaged else { return }
+        #endif
+        guard pendingMCPExternalContexts.isEmpty else {
+            composerError = IntatisLocalization.string(
+                "This first Codex Runtime version does not import staged Intatis MCP context. Attach MCP servers through the Codex runtime before sending, or cancel the staged context.")
+            return
+        }
+        let originalInput = input
+        let originalAttachments = draftAttachments
+        let parsed: ParsedUserInput
+        if originalInput.trimmingCharacters(
+            in: .whitespacesAndNewlines).isEmpty,
+           !originalAttachments.isEmpty {
+            parsed = ParsedUserInput(text: "")
+        } else {
+            switch GoalInputParser.parse(originalInput) {
+            case .success(let value):
+                parsed = value
+            case .failure(.empty):
+                return
+            case .failure(let error):
+                composerError = Self.presentationMessage(for: error)
+                return
+            }
+        }
+        let routeInput = parsed.isGoal ? parsed.text : originalInput
+        let route = routeInput.trimmingCharacters(
+            in: .whitespacesAndNewlines).isEmpty
+            ? CoworkMentionRoute(
+                originalInput: routeInput,
+                outcome: .send(
+                    text: "",
+                    target: AgentID(
+                        rawValue: projectSettings.mainAgentName)))
+            : routeProjectInput(routeInput)
+        let text: String
+        switch route.outcome {
+        case .blocked(let error):
+            composerError = Self.presentationMessage(for: error)
+            return
+        case .send(let routedText, let target):
+            let main = AgentID(
+                rawValue: projectSettings.mainAgentName)
+            guard target == main else {
+                composerError = IntatisLocalization.string(
+                    "Codex Runtime owns Cowork subagents internally in this first version. Send the request to @main instead of addressing an Intatis legacy agent directly.")
+                return
+            }
+            text = routedText
+        }
+        guard let binding = nextMainInferenceBinding else {
+            composerError = IntatisLocalization.string(
+                "Choose one resolvable Responses model before sending to Codex Runtime.")
+            return
+        }
+
+        let main = AgentID(rawValue: projectSettings.mainAgentName)
+        var payload = UserMessagePayload(
+            text: text,
+            attachments: originalAttachments.isEmpty
+                ? nil
+                : originalAttachments.map(\.id),
+            to: main,
+            tags: parsed.tags.isEmpty ? nil : parsed.tags,
+            goal: parsed.goal,
+            submissionID: SubmissionID.new(),
+            mainAgentInferenceBinding: binding,
+            turnID: TurnID.new())
+        // Intatis external contexts are rejected above; keep the durable
+        // payload explicit rather than silently dropping staged data.
+        payload.untrustedExternalContexts = nil
+        isAcceptingSubmission = true
+        isWorking = true
+        composerError = nil
+        let operationID = UUID()
+        let operation = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                self.isAcceptingSubmission = false
+                self.isWorking = false
+                self.activeOperations.removeValue(forKey: operationID)
+            }
+            do {
+                let currentBinding = self.latestCoworkProjection
+                    .agentRoster[main]?.agentInferenceBinding
+                if currentBinding != binding {
+                    guard let workspacePath = self.projectSettings
+                        .primaryWorkspace?.path
+                        ?? self.projectSettings.workspaces.first?.path else {
+                        throw IntatisError.config(
+                            "Cowork has no primary workspace.")
+                    }
+                    try await self.log.append(.agentAttached(
+                        AgentAttachedPayload(
+                            agent: main,
+                            path: workspacePath,
+                            model: binding.modelID,
+                            profile: PermissionProfile.reviewed.rawValue,
+                            agentInferenceBinding: binding,
+                            previousAgentInferenceBinding: currentBinding,
+                            inferenceBindingChangeReason:
+                                "selected for next Codex Runtime turn")))
+                }
+                let runtime = try await self.codexSession(
+                    for: binding)
+                let imageURLs = try await self.codexImageURLs(
+                    for: originalAttachments)
+                try await self.log.append(.userMessage(payload))
+                self.codexAllowsThreadCreation = false
+                if self.input == originalInput {
+                    self.input = ""
+                }
+                if self.draftAttachments.map(\.id)
+                    == originalAttachments.map(\.id) {
+                    self.draftAttachments = []
+                }
+                self.nextMainInferenceOption = nil
+                if let goal = parsed.goal {
+                    try await runtime.setGoal(
+                        objective: goal,
+                        tokenBudget: self.projectSettings.tokenBudget)
+                }
+                _ = try await runtime.runTurn(
+                    text: text,
+                    localImageURLs: imageURLs)
+                self.composerError = nil
+            } catch {
+                let cancelled = Task.isCancelled
+                let message = error.localizedDescription
+                self.composerError = cancelled ? nil : message
+                if !cancelled {
+                    self.setPermissionReviewerStatus(.failed(message))
+                    _ = try? await self.log.append(.error(
+                        RuntimeErrorPresentation.payload(
+                            for: error,
+                            fallbackCode: "codex_runtime")))
+                }
+            }
+        }
+        activeOperations[operationID] = operation
+    }
+
+    /// Retained temporarily only for source-level/manual rollback. It has no
+    /// callable production path after the Codex Runtime migration.
+    @available(*, unavailable, message: "Cowork uses Codex App Server")
+    private func retainedLegacySubmittedIntentSend() {
         guard acceptsNewOperations, !isAcceptingSubmission else { return }
         #if canImport(AVFoundation)
         guard !voiceInput.isEngaged else { return }
@@ -2701,6 +3291,20 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
         }
         pendingMCPExternalContextCount =
             pendingMCPExternalContexts.count
+    }
+
+    private static func containsAgentHistory(
+        _ envelopes: [Envelope]
+    ) -> Bool {
+        envelopes.contains { envelope in
+            switch envelope.event {
+            case .userMessage, .messageDelta, .messageCompleted,
+                 .toolCall, .toolResult, .patchProposed, .turnOutcome:
+                return true
+            default:
+                return false
+            }
+        }
     }
 
     private static func validateMCPExternalContexts(
@@ -3154,6 +3758,27 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
               isAgentWorkActive || isGoalContinuing else {
             return
         }
+        if let codexRuntime {
+            isCancellingCurrentActivity = true
+            composerError = IntatisLocalization.string(
+                "Cancelling the current Codex Runtime turn…")
+            let operationID = UUID()
+            let operation = Task { @MainActor [weak self] in
+                defer {
+                    self?.isCancellingCurrentActivity = false
+                    self?.activeOperations.removeValue(
+                        forKey: operationID)
+                }
+                do {
+                    try await codexRuntime.interruptCurrentTurn()
+                    self?.composerError = nil
+                } catch {
+                    self?.composerError = error.localizedDescription
+                }
+            }
+            activeOperations[operationID] = operation
+            return
+        }
         isCancellingCurrentActivity = true
         composerError = IntatisLocalization.string(
             "Cancelling the current Cowork task…")
@@ -3406,6 +4031,43 @@ final class CoworkViewModel: ObservableObject, PermissionResponder {
               presented.state.isActionable else { return }
         let request = presented.request
         let requestID = request.requestId
+        if let runtimeRequestID = codexApprovalIDs[requestID],
+           let codexRuntime {
+            if var pending = pendingPermission {
+                pending.state = .resolving
+                pendingPermission = pending
+            }
+            codexApprovalActions[requestID] = action
+            let decision: CodexRuntimeApprovalDecision
+            switch action {
+            case .approve:
+                decision = .accept
+            case .approveAndRemember:
+                decision = .acceptForSession
+            case .decline:
+                decision = .decline
+            case .cancelTurn:
+                decision = .cancel
+            }
+            Task { @MainActor [weak self] in
+                do {
+                    try await codexRuntime.resolveApproval(
+                        requestID: runtimeRequestID,
+                        decision: decision)
+                } catch {
+                    guard let self else { return }
+                    self.codexApprovalActions.removeValue(
+                        forKey: requestID)
+                    if var pending = self.pendingPermission,
+                       pending.id == requestID {
+                        pending.state = .livePending
+                        self.pendingPermission = pending
+                    }
+                    self.composerError = error.localizedDescription
+                }
+            }
+            return
+        }
         guard
               let waiter = permissionWaiters.removeValue(forKey: requestID) else {
             if pendingPermission?.state == .needsRerun {

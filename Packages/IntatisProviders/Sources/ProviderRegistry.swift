@@ -89,7 +89,7 @@ public actor ProviderRegistry {
     let resolver: SecretResolver
     private let http: HTTPByteStreaming
     let dataClient: HTTPDataClient
-    private let inferenceCatalogSnapshot: InferenceCatalogSnapshot?
+    let inferenceCatalogSnapshot: InferenceCatalogSnapshot?
 
     public init(config: ProviderConfig,
                 resolver: SecretResolver,

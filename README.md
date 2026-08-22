@@ -1,12 +1,13 @@
 # Intatis
 
 当前版本：**v0.55**（build 55）
-状态：pre-1.0；v0.55 Developer ID 发行候选正在完成发布级构建、公证与安装验收。
+状态：pre-1.0；Code/Cowork/CLI 已完成 Codex Runtime 第一版接线，binary bundling 与完整产品投影仍是 v0.55 发行门槛。
 
 Intatis 是 Apple-first、Swift-native 优先的本地 AI 工作区。macOS 提供 Chat、Code、
-Cowork 三个产品面；iOS 是严格的 Chat 子集；CLI 提供 headless Code/Cowork 和外部 MCP
-client。所有运行时能力围绕结构化 EventLog、共享 AgentKernel、显式工具注册和权限链
-组织，而不是让 UI 直接调用模型或本地执行器。
+Cowork 三个产品面；iOS 是严格的 Chat 子集；CLI 提供 headless Code/Cowork。Chat 继续使用
+Swift ChatLoop；Code、Cowork 与 CLI Code/Cowork 通过最薄 Swift host 直接运行基于官方开源 Codex
+App Server 0.145.0 的窄派生 runtime `0.145.0-intatis.2`。Intatis保留自己的 UI、provider、workspace与审计投影，不使用 ChatGPT login，
+也不在 Codex失败时回退旧 AgentKernel。
 
 当前文档入口见 [`docs/README.md`](docs/README.md)，版本规则见
 [`docs/VERSIONING.md`](docs/VERSIONING.md)。历史 v0.1–v0.16 里程碑不代表当前产品版本。
@@ -17,11 +18,11 @@ client。所有运行时能力围绕结构化 EventLog、共享 AgentKernel、�
 
 - Chat：OpenAI-compatible streaming、provider/model/variant 配置、透明 hosted web search、
   citations、会话历史、多模态产物和本地诊断导出。
-- Code：单 workspace agent、文件/patch/Git、managed terminal、Skills、MCP、文档/媒体、
-  浏览器和模型驱动 Knowledge 工具；所有工具均经过 CapabilityLease、WorkspaceLease、
-  PathConfinement 与权限链。
-- Cowork：多 agent roster、FIFO scheduler、WorkTask/Goal、MessageBus/Mediator、per-agent
-  exact inference binding、独立 permission reviewer 和 goal verifier 控制面。
+- Code：保留现有单 workspace UI，执行内核为 Codex thread/turn、原生工具、sandbox和
+  approval/auto-review；macOS图片附件可作为 App Server local image。
+- Cowork：保留现有项目/agent/thread UI shell，执行内核为一个 Codex root thread及其官方
+  collaboration/subagent runtime。Intatis MCP/Knowledge/WorkTask/child roster/Goal card 的官方扩展点
+  投影仍在下一阶段，当前明确不可用且不走旧 Orchestrator。
 - Projects：Chat、Code、Cowork 各自维护独立的文件夹项目；当前模式下一个项目对应一个现存
   本地文件夹，以可折叠目录归组同模式会话。它不移动会话数据、不在用户文件夹写 Intatis 元数据，
   也不增加项目级记忆、任务或权限。
@@ -40,14 +41,18 @@ Tools、Permission、AgentKernel、Cowork、MCP 或本地 workspace/shell。
 
 ### CLI
 
-`intatis` 支持 Chat/Code/Cowork REPL、managed execution、Skills、per-agent inference
-profiles 和外部 MCP client。macOS/Linux 平台能力与 sandbox/guard 可用性按 host fail closed。
+`intatis` 支持 Chat/Code/Cowork REPL。Chat 使用 ChatLoop；`code` / `cowork` 与 macOS 共用
+Codex App Server runtime、Responses provider、streaming、approval、cancel和Goal。CLI attachment、
+MCP bridge与 `/clear` 第一版明确不可用。
 
 ## 核心不变量
 
-- `EventLog` JSONL 是 session canonical truth；projection 和 `session.json` 都可重建。
-- Chat 无工具；Code/Cowork 的每个工具调用必须先经过 ToolRegistry、lease 和三层权限门。
-- Cowork 不递归同步调用 `AgentLoop`；通信、委派和调度通过 mailbox/scheduler/event flow。
+- Chat 的 EventLog合同不变。Code/Cowork中，Codex rollout是模型上下文权威，EventLog是Intatis
+  UI/audit投影权威；`codex-runtime/runtime.json` 必须精确连接两者。
+- Chat 无工具；Code/Cowork工具、sandbox、approval与auto-review由固定官方 Codex runtime执行。
+  Intatis不得复制这些能力，也不得调用旧 AgentLoop/Orchestrator作为 fallback。
+- 每个 Codex process使用 isolated session-owned CODEX_HOME、`requires_openai_auth=false`和
+  Intatis Responses credential；不读取 ChatGPT login。
 - secret 只从受控 credential reference 懒加载，不进入 EventLog、诊断包或仓库文档。
 - iOS 是结构性子集，不靠运行时开关隐藏本地 agent 能力。
 - 第三方源码和依赖必须固定 provenance、许可证并更新 `NOTICE.md`。
@@ -59,9 +64,10 @@ profiles 和外部 MCP client。macOS/Linux 平台能力与 sandbox/guard 可用
 
 ```text
 Apps/                 macOS、iOS 与 CLI 入口
-Packages/             14 个公共库、内部 C/guard target 与测试
+Packages/             16 个公共库、内部 C/guard target 与测试（含 IntatisCodexRuntime）
 Vendor/               经审计并固定的第三方派生源码
 ThirdPartyNotices/    许可证、来源与资源清单
+ThirdPartyPatches/    固定上游commit可复现应用的最小第三方源码补丁
 Tests/                MCP conformance 与独立 parity fixtures
 docs/                 当前规范和已标记的历史设计文档
 scripts/              构建、验证、诊断和发行脚本
@@ -73,7 +79,9 @@ Package.swift         SwiftPM 产品、target 与测试图
 
 ## 开发与验证
 
-要求 Xcode 27 / Swift 6.x、XcodeGen，以及当前依赖可用。常用命令：
+要求 Xcode 27 / Swift 6.x、XcodeGen，以及 Code/Cowork开发试用所需的 exact
+`codex-cli 0.145.0-intatis.2`（默认发现 `~/.local/bin/intatis-codex`，也可由
+`INTATIS_CODEX_RUNTIME` 指定）。常用命令：
 
 ```sh
 scripts/check-version-consistency.sh
@@ -122,9 +130,9 @@ SHA-256 清单。不要把证书私钥、Apple 密码或 app-specific password �
 
 - macOS/CLI 高级配置读取 `INTATIS_CONFIG`、Intatis-owned JSON/JSONC 路径及兼容 fallback；
   不默认读取 OpenCode app 配置。
-- Cowork 自动权限审查使用顶层 `permission_reviewer_model` 固定独立模型，不新增设置 UI，也不跟随
-  当前主 Agent、会话默认模型或后续 rebind。字段缺失时只继承该 JSON 文档的顶层 `model`；显式填写
-  但无法解析、顶层兼容来源不可用或整份已选配置损坏/不可读时 fail closed。
+- 新 Codex Cowork 的自动权限审查由 App Server `auto_review`执行，并通过官方 model catalog绑定
+  当前 selected Responses model；顶层 `permission_reviewer_model` 只为 legacy/manual-rollback源码与
+  兼容配置保留，不再阻止新 Cowork启动，也不会产生第二次 Intatis reviewer dispatch。
 - Code/Cowork 的 `generate_image` 与 `edit_image` 共用顶层 `image_model` 宿主路由；主 agent
   只提交任务参数，不选择 provider/model。`edit_image` 接收工作区内的 `imagePath`、编辑 prompt
   和新的 `.png` `outputPath`。未配置时明确失败，不再暗中回退到固定模型。
@@ -142,7 +150,6 @@ SHA-256 清单。不要把证书私钥、Apple 密码或 app-specific password �
 {
   "$schema": "https://opencode.ai/config.json",
   "model": "chat/chat-model",
-  "permission_reviewer_model": "chat/reviewer-model",
   "image_model": "images/gpt-image-1",
   "transcription_model": "speech/whisper-1",
   "embedding_model": "knowledge/BAAI/bge-m3",
@@ -155,8 +162,7 @@ SHA-256 清单。不要把证书私钥、Apple 密码或 app-specific password �
         "apiKey": "{env:CHAT_API_KEY}"
       },
       "models": {
-        "chat-model": { "name": "Chat Model" },
-        "reviewer-model": { "name": "Permission Reviewer" }
+        "chat-model": { "name": "Chat Model" }
       }
     },
     "images": {
@@ -186,6 +192,29 @@ SHA-256 清单。不要把证书私钥、Apple 密码或 app-specific password �
   }
 }
 ```
+
+Codex Runtime 恢复了旧链路对 OpenRouter `options.provider` 的
+request-owned opaque passthrough：
+
+```json
+"stealth/ox-alpha": {
+  "name": "Ox Alpha",
+  "provider": { "npm": "@openrouter/ai-sdk-provider" },
+  "options": {
+    "reasoningEffort": "max",
+    "provider": {
+      "require_parameters": true,
+      "allow_fallbacks": false,
+      "order": ["openai", "azure"]
+    }
+  }
+}
+```
+
+`0.145.0-intatis.2` 不枚举或解释 `provider` 的子字段，而是把整个object原样写入原生
+Responses body；未来provider-owned字段不需要再改补丁。该通道不是generic `extra_body`，不能覆盖
+`model`、`input`、`tools`、`stream`、`reasoning`等host-owned字段；跨进程前仍执行递归
+secret/transport-key扫描与结构资源边界，非OpenRouter adapter或非object shape继续fail closed。
 
 `permission_reviewer_model` 是 Intatis 的顶层授权控制面字段，格式为
 `<provider>/<model-id>`，并引用 provider `models` 中已配置的 base profile。Intatis 在启动/恢复

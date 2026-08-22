@@ -28,8 +28,7 @@ func printHelp() {
       intatis config          Print the resolved config
       intatis selftest        Offline smoke test (no key)
       intatis mcp help        Manage external MCP servers and session access
-      intatis exec --session <id> --agent <id> [--task <id>] --prompt <text> [--yes]
-                              Run one exact durable Code/MCP turn
+      intatis exec            Disabled: legacy Swift AgentKernel path; use `intatis code`
       intatis diagnose-hang --pid <pid> [--output <directory>]
                               Capture a 10s sample and 5m Intatis logs into an owner-only bundle
       intatis help

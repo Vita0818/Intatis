@@ -4,6 +4,80 @@
 最近核对：2026-08-22
 产品基线：v0.55（build 55）
 
+## 2026-08-22 Codex Runtime 第一版
+
+用户已明确把 Code、Cowork 与 CLI Code/Cowork 的 shipping 内核切换为官方开源
+OpenAI Codex App Server；Chat 与 iOS Chat 保持现状。当前实现固定
+`rust-v0.145.0` / commit
+`25af12f7e61572b0bc18ddb1008be543b91519b0`，并应用仓内唯一最小Rust补丁生成
+`codex-cli 0.145.0-intatis.2`；host只接受该exact版本。`Packages/IntatisCodexRuntime` 是最薄宿主：负责进程/版本、稳定
+stdio JSON-RPC、thread/turn/item/interrupt/approval/Goal 生命周期、owner-only thread
+映射和 UI 投影；agent loop、工具编排、sandbox、auto-review、上下文与 subagent 均由
+Codex runtime 执行。Code/Cowork 的旧 `AgentLoop` / `Orchestrator` 发送和启动函数只保留为
+编译期 `unavailable` 的手工源码回退点，生产入口不可调用，也没有运行时 fallback。
+
+认证边界已经纠正为“Intatis provider，而非 Codex 产品账号”：每个 session 使用隔离
+`CODEX_HOME`，thread config 固定 `model_provider = "intatis"`、
+`wire_api = "responses"`、`requires_openai_auth = false`。Intatis 已有 resolver 在内存中取得
+exact credential，只通过子进程环境变量交给 runtime；不读取 ChatGPT login，不把 secret 写入
+命令行、`runtime.json`、`models.json`、EventLog 或文档。owner-only `models.json` 通过官方
+`model_catalog_json` 扩展点把 `auto_review_model_override` 绑定到当前选择的 Responses model，
+避免第三方 endpoint 被隐式请求另一个 OpenAI model；这不是 Intatis 自写 reviewer。
+
+每个新 Code/Cowork session 在既有 session 目录内拥有：
+
+- `codex-runtime/codex-home/`：Codex rollout/context/thread store；
+- `codex-runtime/runtime.json`：schema-v2、owner-only 的 Intatis SessionID→已materialize Codex thread
+  ID映射；仅start、从未接受turn的空thread不落mapping，避免下次resume指向不存在的rollout；
+- `codex-runtime/models.json`：无 secret 的 fixed model catalog。
+
+Codex rollout 是后续模型上下文的权威；EventLog 继续保存 Intatis UI/审计投影，但第一版只镜像
+assistant 文本与 bounded/redacted tool presentation，不宣称能从 EventLog 重建完整 Codex command
+history。旧 Intatis agent session 若已有 EventLog、却没有 `runtime.json`，不会静默丢上下文并新建
+thread：Code/Cowork 明确失败并要求新建 session。可以回退源码版本，但没有隐藏旧 backend。
+
+第一版已经接通 macOS Code、macOS Cowork 与 `intatis code|cowork` 的文字 turn、streaming
+assistant、工具状态、turn cancel、server-initiated command/file/permission approvals、自动审查、
+thread resume 和 `/goal`→Codex thread Goal。macOS 图片附件可转为 App Server `localImage`；
+macOS Code/Cowork都只在用户Send时解析credential并启动/恢复runtime，单纯打开Cowork不会读取key；
+Intatis 现有 MCP/Knowledge/WorkTask/Goal card/agent sidebar 尚未投影到 Codex 的 MCP、Goal 与 child
+thread API，CLI attachment、`/clear` 与旧 exact-MCP `intatis exec` 也明确不可用，不会借旧 runtime
+补齐；`intatis exec`入口和旧实现都被禁用。Codex binary 当前是
+开发机 external runtime，尚未进入 App bundle；universal build、Cargo license closure、nested
+Developer ID signing/notarization 是新的 release blocker，详见
+`ThirdPartyNotices/OpenAICodexRuntime.md`。
+
+针对exact OpenRouter配置，`ResponsesRuntimeRoute`恢复旧链路的request-owned
+`options.provider` opaque passthrough：不枚举、解释、重命名或丢弃其provider-owned子字段，经
+`intatis_responses_provider`进入`0.145.0-intatis.2`并原样写入`ResponsesApiRequest.provider`。
+该通道不是generic whole-request `extra_body`，不能覆盖`model/input/tools/stream/reasoning`等host字段；
+跨进程前仍做递归secret/transport-key扫描与结构资源边界。控制header、协议translator和proxy均不存在。
+可复现patch与退出条件位于
+`ThirdPartyPatches/OpenAICodexRuntime/`。
+
+本轮验证：Codex Runtime 20/20、Providers 204/204、CLI 49/49（8个真实网络smoke跳过）、CLI
+build、macOS Debug与iOS Simulator双架构build通过。派生Rust runtime的model-provider-info 25/25、
+三个exact core/API序列化测试与release build通过；完整codex-api为137/138，唯一失败的既有
+blob-upload诊断文案测试在未打补丁的exact upstream baseline上同样失败，确认与本补丁无关。真实本地
+假Responses API抓包以整个object相等断言证明`/v1/responses` body精确保留
+`require_parameters/allow_fallbacks/order`以及补丁未知的嵌套`future_routing`，没有任何
+`x-intatis-*` header且turn完成；未使用真实credential或计费网络。
+先前完整`swift test`在Tools 227/227与Skills 29/29通过后复现既有SharedUI
+ComposerVoiceInput async waiter hang并人工中断，仍不能记为full pass。
+
+当前gitignored `dist/Intatis-CodexRuntime-Preview.app`已在用户真实DYLD crash证据后重建：Xcode 27
+Debug build显式使用`ENABLE_DEBUG_DYLIB=NO`，bundle只含单一主Mach-O且不引用
+`IntatisMac.debug.dylib`；ad-hoc Hardened Runtime/strict codesign及最终交付路径真实启动均通过。主
+可执行文件已随本补丁重建，SHA-256为
+`9755310454444845a6613800a6647eff605169fda36771e545975e74bb024265`；LaunchServices最终路径启动
+并持续28秒后由测试者TERM清理。外置arm64 `intatis-codex` SHA-256为
+`68c7a96809d9e6f5afbf3f54834c5ea724ca263b12c8f65a02155fa2707aa334`，原official `codex`未覆盖。
+当前仍未bundle runtime，正式发行blocker不变。
+
+本节覆盖本文后面所有把 Code/Cowork shipping path 描述为 `AgentRuntime.code`、`AgentLoop`、
+`Orchestrator`、Intatis PermissionEngine 或 EventLog-only model history 的旧段落；这些段落现在只描述
+仍在仓内的 legacy/manual-rollback 实现与兼容测试，不能作为当前产品行为引用。
+
 ## 版本与发行状态
 
 - `HEAD` 与 `origin/main` 当前均为标题为 `v0.54` 的提交 `120eda6`。仓库没有 Git tag；该
@@ -76,9 +150,10 @@ macOS 是完整产品：Chat、Code、Cowork、Settings 和本地诊断导出。
   tool list 含 `rename_session`，以具体任务/结果标题调用一次；标题不得使用日期、时间、SessionID 或
   泛化占位词。后续轮次只在用户明确要求时改名。Cowork worker 不收到该指令；exact `@main` 把
   `rename_session` 作为最后一个非 run-control tool，若还需 `finish_run` / `stop_run`，只能在改名成功后调用。
-- Code 使用共享 headless `AgentRuntime.code`，提供工作区文件、patch、Git、managed
-  terminal、Skills、外部 MCP、文档/媒体、浏览器，以及与浏览器独立的 provider-hosted search
-  工具。工具可见性、lease、权限和 durable execution ticket 在执行前逐层核对。
+- Code shipping path 使用固定 Codex App Server thread/turn 与其原生 workspace tools、sandbox、
+  approval/auto-review 和 context store。原共享 `AgentRuntime.code`、Intatis managed terminal、Skills、
+  MCP/Knowledge/tool lease 链当前不在新 Code inference path；相关 UI 入口在未完成官方 Codex MCP/
+  plugin 接线时明确失败，不会转回旧内核。
 - Code/Cowork/CLI 的普通文档读取已按格式拆成 `read_pdf`、`read_docx`、`read_pptx`、
   `read_xlsx`、`read_html`、`read_epub`，另保留职责独立的 `document_ocr`、
   `document_render`、`document_export_pdf`、`document_write`。聚合 `document_read` 已从
@@ -176,9 +251,10 @@ macOS 是完整产品：Chat、Code、Cowork、Settings 和本地诊断导出。
   ArtifactStore。Flotis 的多模型对比、全局快捷键、review/clipboard 与输入法未迁入。macOS shipping
   target 同时保留 TCC usage description 与 Hardened Runtime 最小 audio-input entitlement；不启用
   App Sandbox，也不重新引入已删除的 App Store target。
-- Cowork 使用 `Orchestrator`、FIFO scheduler、MessageBus/Mediator、WorkTask/Goal、
-  per-agent exact inference binding、独立 permission reviewer 与 goal verifier 控制面。
-  AgentLoop 不同步递归调用另一个 AgentLoop。右侧 Agents 区域中的 ordinary agent 可作为
+- Cowork shipping path 使用 Codex root thread 和 upstream collaboration/subagent runtime；Intatis
+  `Orchestrator`、FIFO scheduler、MessageBus/Mediator、WorkTask 与独立 reviewer/verifier 不再处理新
+  turn。右侧 Agents/WorkTask/Goal 仍是既有 UI 投影壳，child-thread/Goal 完整投影尚未接通。仓内
+  legacy AgentLoop 不同步递归调用另一个 AgentLoop。右侧 Agents 区域中的 legacy ordinary agent 可作为
   当前窗口的只读对话选择；列表保留 session 历史上所有 durable agent，detached identity 继续
   可点击并由原状态图标显示已移除，当前选择不会跳回 `@main`。新窗口默认显示 `@main`，
   `@permission-reviewer` 等控制面 identity 仍为不可选择的状态项。

@@ -1,4 +1,5 @@
 import Foundation
+import IntatisCore
 import IntatisMCP
 
 func mcpCLIExitCode(for error: Error) -> Int32 {
@@ -36,8 +37,8 @@ struct IntatisCLI {
             case "mcp":
                 try await runMCPCommand(args.dropFirst())
             case "exec":
-                try await runExecCommand(
-                    args.dropFirst())
+                throw IntatisError.config(
+                    "intatis exec belongs to the retired Swift AgentKernel path and is disabled. Use intatis code or intatis cowork, which run Codex App Server.")
             case "diagnose-hang":
                 try await runDiagnoseHangCommand(
                     args.dropFirst())

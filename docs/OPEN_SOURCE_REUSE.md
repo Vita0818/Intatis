@@ -2,7 +2,7 @@
 
 文档状态：当前开源复用政策
 生效日期：2026-07-12
-最近核对：2026-08-19
+最近核对：2026-08-22
 产品基线：v0.55（build 55）
 
 ## 项目立场
@@ -36,7 +36,12 @@ external-runtime 以独立 helper/process/service 运行上游实现
 - 不使用泄露、反编译、绕过访问控制获得的源码或私有 prompt。
 - 不复制第三方产品名称、Logo、图标、截图、UI 资产、商标性外观或品牌文案作为 Intatis 产品身份。
 - 不把上游许可证、版权声明或来源记录删除、模糊化或错误标成 Intatis 原创。
-- 不因复用外部实现而绕过 `DeterministicPolicyGate`、`PermissionEngine`、`CapabilityLease`、`WorkspaceLease`、`PathConfinement`、`SecretScanner`、`Mediator`、durable tool ticket 或 EventLog 审计。
+- 不得让未经 exact 审查的外部实现绕过当前 shipping path 的安全/审计边界。2026-08-22 用户明确批准
+  Codex App Server 在 Code/Cowork/CLI 中**替换**旧 Intatis AgentLoop/PermissionEngine/Orchestrator
+  execution core；因此该 exact runtime 使用其官方 sandbox/approval/auto-review/thread store，而不是在
+  外面再包一层同等 Intatis core。Intatis 仍负责 workspace 选择、provider credential、process/thread
+  lifecycle、UI 与 bounded EventLog audit projection。该例外只适用于固定 Codex release/范围；不能推广到
+  Chat、iOS、其他 dependency 或把 legacy core当 fallback。
 - 不让外部 runtime 扩大 iOS 平台边界；iOS 仍不得获得本地 workspace Agent、shell、Git 或 Cowork 执行能力。
 
 ## Prompt、文案与资产
@@ -48,10 +53,33 @@ external-runtime 以独立 helper/process/service 运行上游实现
 
 ## Apple-first 实现规则
 
-- App shell、SwiftUI/AppKit 界面、EventLog、权限控制、lease、scheduler、workspace bookmark 与 iOS/macOS 平台边界优先保持 Swift 原生。
+- App shell、SwiftUI/AppKit 界面、workspace bookmark、Intatis session/UI audit 与 iOS/macOS 平台边界
+  优先保持 Swift 原生。若用户明确批准 external runtime 作为 execution kernel，其官方 permission、
+  scheduler 与 context store 可成为该产品面的权威，但事实源拆分和迁移必须持久化、可审计且 fail closed。
 - 从非 Swift 项目复用时，先判断是“选择性翻译核心逻辑”还是“隔离为外部 runtime”更合适，不做无边界的整仓移植。
 - Node/Bun/Rust/Go 等 helper 默认只可作为 macOS DeveloperID 路径的隔离组件评估；引入前必须设计签名、Hardened Runtime、sandbox、更新、进程清理、资源占用和失败降级。不得把它们隐式带入 iOS target。
-- 外部 runtime 必须通过受控协议接入 Intatis，由 Intatis 继续拥有权限决定、工作区授权、事件审计和用户可见状态；不得让上游 runtime 成为不可审计的第二事实源。
+- 外部 runtime 必须通过受控官方协议接入 Intatis。权限/上下文若由上游 runtime 权威执行，必须明确记录
+  其版本、存储、ThreadID join、approval UI 与 EventLog投影边界；不得形成没有 identity mapping、无法
+  解释恢复语义的隐藏第二事实源。
+
+## OpenAI Codex App Server 当前准入结论
+
+- 官方仓库：`https://github.com/openai/codex`；采用 `rust-v0.145.0` peeled commit
+  `25af12f7e61572b0bc18ddb1008be543b91519b0`，Apache-2.0，含 upstream NOTICE 的 Ratatui-derived
+  attribution。复用分类为 `derived external-runtime` + stable official App Server API。
+- 仓内只保存
+  `ThirdPartyPatches/OpenAICodexRuntime/0001-responses-provider-passthrough.patch`：它增加一个
+  request-owned、只占据Responses `provider`子树的opaque JSON config seam；不枚举provider-owned
+  children、不使用控制header、不提供generic whole-body、proxy/adapter，也不改agent core。派生版本为
+  `0.145.0-intatis.2`，并只复用workspace既有`serde_json`依赖版本。
+- Intatis 不复制/翻译其余 Rust core，不实现 agent loop/tool/sandbox/reviewer/context/subagent替代品；本地 Swift
+  仅负责进程/版本/JSON-RPC/Responses provider/owner-only mapping/UI projection。
+- 身份验证固定 `requires_openai_auth=false`，使用 per-session isolated `CODEX_HOME` 与 Intatis exact
+  Responses credential environment injection；不得读取 ChatGPT login。
+- 当前 source tree 不分发 Codex binary。开发发现只接受 exact `0.145.0-intatis.2`；正式 bundle须先完成 fixed
+  Cargo closure、全部许可证/NOTICE、universal binaries、nested signing/notarization 与 clean-user gate。
+- 完整 provenance、第一版功能边界、持久化/迁移与 upgrade procedure 位于
+  `ThirdPartyNotices/OpenAICodexRuntime.md`。缺条件时停止能力，不回退旧 Swift kernel。
 
 ## 每次复用前的检查清单
 

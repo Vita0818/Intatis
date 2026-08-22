@@ -2,7 +2,7 @@
 
 文档状态：当前发行合同
 生效日期：2026-07-28
-最近核对：2026-08-21
+最近核对：2026-08-22
 产品基线：v0.55（build 55）
 
 ## 产品决策
@@ -24,14 +24,42 @@ Intatis 的 macOS 产品只通过 Developer ID 签名、公证和直接下载分
 
 - 唯一发行 App target：`IntatisMac`。
 - 分发方式：Developer ID 签名、公证、直接下载或用户自建。
-- 产品能力：完整 Chat / Code / Cowork、workspace 与 global Skills、managed
-  terminal、本地 Git、浏览器/文档 helper，以及 stdio + HTTP MCP。
+- 产品能力：完整 Chat UI 与 Codex Runtime-backed Code/Cowork workspace shell。原 global Skills、
+  managed terminal、Git、browser/document helper和stdio/HTTP MCP源码仍在仓内，但在新的
+  Code/Cowork shipping turn 中只有完成Codex官方MCP/plugin接线后才能恢复产品可用性，不能走旧内核。
 - 默认 macOS 验收：SwiftPM/CLI、`IntatisMac` Developer ID 产品图，以及与改动
   相关的签名、公证、Hardened Runtime、entitlements 和 bundle/link inventory。
 - 生成的 Xcode 工程不得重新出现 `IntatisMacAppStore` target 或 scheme。
 
 iOS 当前仍是独立的 chat 子集。本决策不自动删除或扩大 iOS 产品面，也不改变
 iOS 自身的系统 sandbox 与 target-linkage 限制。
+
+## Codex Runtime auxiliary executable gate
+
+2026-08-22 的第一版源码把 OpenAI Codex App Server 作为 external runtime，固定
+基于source commit `25af12f7e61572b0bc18ddb1008be543b91519b0`和仓内provider-body passthrough patch的
+`codex-cli 0.145.0-intatis.2`。当前 `IntatisMac` Debug build仅从开发机local安装发现 exact binary；
+`project.yml` 尚未把它复制进 App bundle，因此现有打包脚本
+即使通过旧 gate，也不能被描述为“Codex-backed独立分发候选”。
+
+正式恢复 `scripts/package-macos-release.sh` 输出前必须新增并验证：
+
+1. fixed source/Cargo.lock + checked-in patch的arm64+x86_64可复现build与每架构hash；
+2. exact Rust dependency closure的全部license/NOTICE，包含upstream Ratatui-derived attribution；
+3. universal或architecture-correct nested `Contents/MacOS/codex`/auxiliary位置与final bundle inventory；
+4. nested executable先以同一Developer ID team签名并启用适用Hardened Runtime，再签outer App；
+5. outer App和DMG的notarization/staple/Gatekeeper后，在无用户预装Codex、无`~/.codex`登录的fresh
+   account中验证Intatis isolated CODEX_HOME、custom Responses provider与`codex --version`；
+6. update/rollback必须以整个已签名App版本为单位，不能从PATH悄悄切到另一Codex版本。
+
+任一门槛缺失必须阻断release；不得把external开发依赖静默当成用户先决条件，也不得bundle未审计
+单架构binary、关闭library validation、放宽entitlements或回退旧AgentLoop。
+
+开发预览不是正式release，但只要交给用户运行，也必须显式使用`ENABLE_DEBUG_DYLIB=NO`，确认
+`Contents/MacOS`只有主可执行文件且`otool -L`无`IntatisMac.debug.dylib`引用，再按现有Developer ID
+entitlements做ad-hoc Hardened Runtime签名并从最终交付路径真实启动。Xcode 27默认Debug launcher即使
+通过deep/strict codesign，仍可能因主程序与debug dylib的non-platform Team ID不一致被DYLD拒绝；不得
+通过关闭library validation规避。
 
 2026-08-19 用户已批准 JetBrains Mono 为 macOS/iOS 统一的第一方英文字体。两份 exact v2.304 TTF
 随 `IntatisSharedUI` resources 进入 Debug、Release 与正式 bundle；没有 system-font opt-out 或实验打包

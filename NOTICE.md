@@ -68,6 +68,37 @@ scope, and runtime-distribution gate are recorded in
 reproducible source/build closure; it does not claim that a universal signed
 helper binary or its release license bundle is already shipped in the App.
 
+## OpenAI Codex App Server external runtime
+
+Code, Cowork, and the corresponding CLI modes now integrate the official
+OpenAI Codex App Server as a narrowly **derived external runtime**, pinned to
+release `rust-v0.145.0` and source commit
+`25af12f7e61572b0bc18ddb1008be543b91519b0`. The reproducible local patch is
+`ThirdPartyPatches/OpenAICodexRuntime/0001-responses-provider-passthrough.patch`.
+
+- **OpenAI Codex** (`openai/codex`): Apache License 2.0, Copyright 2025
+  OpenAI. Reuse type: `derived external-runtime` + official stable stdio
+  JSON-RPC API.
+- Intatis supplies only process/version lifecycle, a `requires_openai_auth =
+  false` Responses provider projection, isolated owner-only runtime storage,
+  credential environment injection, and UI/EventLog projection. Codex owns
+  the agent loop, tools, sandbox, approval review, thread/turn/item history,
+  Goals, and subagent execution.
+- ChatGPT login is not used. The selected Intatis Responses credential is
+  never placed in runtime files, EventLog, documentation, or process
+  arguments.
+- No Codex executable is copied into this source revision or current release
+  resources. Development lookup accepts only exact
+  `codex-cli 0.145.0-intatis.2` and
+  fails explicitly if absent or mismatched; it never falls back to the former
+  Swift agent kernel.
+
+Exact upstream identity, local integration paths, authentication/persistence
+boundaries, first-version exclusions, Ratatui-derived NOTICE attribution, and
+the binary license/sign/notarization gate are recorded in
+`ThirdPartyNotices/OpenAICodexRuntime.md`. The complete Apache-2.0 text is at
+`ThirdPartyNotices/Licenses/Codex-61a44880-Apache-2.0.txt`.
+
 ## OpenAI Codex Skill Creator derivative
 
 The project-local `.agents/skills/intatis-skill-creator/` Skill is a modified
@@ -81,9 +112,10 @@ derivative of the public `skill-creator` sample in OpenAI Codex release
   validator, and metadata generator for project-local roots, Intatis
   invocation and permission semantics, secret scanning, resource bounds, and
   a Python-standard-library-only runtime.
-- The upstream `agents/openai.yaml`, icons, images, branded assets, other
-  system Skills, and Codex runtime are not copied or distributed by this
-  adoption.
+- The upstream `agents/openai.yaml`, icons, images, branded assets, and other
+  system Skills are not copied by this Skill adoption. The separately adopted
+  external Codex runtime is described in the preceding section and is not yet
+  bundled in release resources.
 
 Exact source paths, upstream blob identities, the modification and execution
 boundary, and upgrade procedure are recorded in

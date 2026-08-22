@@ -508,6 +508,21 @@ public enum InferenceRequestOptionValidation {
         }
     }
 
+    /// Validates the one opaque subtree that may cross into an external
+    /// Responses runtime without Intatis interpreting provider-owned keys.
+    public static func validateProviderPassthrough(
+        _ options: [String: JSONValue]
+    ) throws {
+        try validateNoSecretLikeMaterial([
+            "provider": .object(options),
+        ])
+        guard boundedOpaqueProviderValue(
+            .object(options),
+            depth: 0) else {
+            throw InferenceCatalogError.unsupportedDurableRequestOptions
+        }
+    }
+
     /// Source-compatible spelling retained for callers created with the first
     /// catalog draft. Durable catalog inputs receive both secret scanning and
     /// explicit-schema validation; presentation labels must call the narrower
@@ -575,20 +590,8 @@ public enum InferenceRequestOptionValidation {
                     }
                 }
             case "provider":
-                return allowedObject(value) { nestedKey, nestedValue in
-                    switch nestedKey {
-                    case "allowfallbacks", "requireparameters", "zdr":
-                        return boolean(nestedValue)
-                    case "sort", "datacollection":
-                        return safeToken(nestedValue)
-                    case "order", "only", "ignore", "preferred", "quantizations":
-                        return safeTokenArray(nestedValue)
-                    case "maxprice":
-                        return numericObject(nestedValue)
-                    default:
-                        return false
-                    }
-                }
+                guard case .object = value else { return false }
+                return boundedOpaqueProviderValue(value, depth: 0)
             default:
                 return false
             }
@@ -601,13 +604,6 @@ public enum InferenceRequestOptionValidation {
     ) -> Bool {
         guard case .object(let object) = value, object.count <= 32 else { return false }
         return object.allSatisfy { validator(normalizedKey($0.key), $0.value) }
-    }
-
-    private static func numericObject(_ value: JSONValue) -> Bool {
-        guard case .object(let object) = value, object.count <= 32 else { return false }
-        return object.allSatisfy { rawKey, nestedValue in
-            !normalizedKey(rawKey).isEmpty && finiteNumber(nestedValue)
-        }
     }
 
     private static func finiteNumber(_ value: JSONValue) -> Bool {
@@ -630,9 +626,42 @@ public enum InferenceRequestOptionValidation {
         }
     }
 
-    private static func safeTokenArray(_ value: JSONValue) -> Bool {
-        guard case .array(let values) = value, values.count <= 64 else { return false }
-        return values.allSatisfy(safeToken)
+    /// Provider-owned request options are opaque to Intatis. Keep only
+    /// structural resource bounds here; the secret/transport-key scan runs
+    /// before this function and the exact provider owns field semantics.
+    private static func boundedOpaqueProviderValue(
+        _ value: JSONValue,
+        depth: Int
+    ) -> Bool {
+        guard depth <= 8 else { return false }
+        switch value {
+        case .null, .bool:
+            return true
+        case .number(let number):
+            return number.isFinite
+        case .string(let string):
+            return string.count <= 2_048
+                && string.unicodeScalars.allSatisfy {
+                    !CharacterSet.controlCharacters.contains($0)
+                }
+        case .array(let values):
+            return values.count <= 128
+                && values.allSatisfy {
+                    boundedOpaqueProviderValue($0, depth: depth + 1)
+                }
+        case .object(let object):
+            return object.count <= 64
+                && object.allSatisfy { key, nested in
+                    !key.isEmpty
+                        && key.count <= 128
+                        && key.unicodeScalars.allSatisfy {
+                            !CharacterSet.controlCharacters.contains($0)
+                        }
+                        && boundedOpaqueProviderValue(
+                            nested,
+                            depth: depth + 1)
+                }
+        }
     }
 
     private static let deniedNormalizedKeys: Set<String> = [

@@ -11,6 +11,49 @@
 - 现有 fallback、adapter 或重复实现不构成先例，后续不得扩展。安全 fail-closed 与明确要求的旧数据解码/迁移不是功能兜底，但必须保持最窄范围，不能演化成备用产品实现。
 - 只有用户针对 exact 依赖、exact 范围和退出条件作出的新明文决定才能例外。
 
+## 2026-08-22 Code/Cowork/CLI Codex Runtime 决定（覆盖下文旧内核描述）
+
+用户已明文批准：Code、Cowork 与 CLI Code/Cowork 的 shipping agent kernel 改为官方开源
+OpenAI Codex App Server；只支持原生 Responses API；不使用 ChatGPT login；Intatis UI、provider、
+workspace与产品投影继续保留。当前 exact dependency 为派生
+`codex-cli 0.145.0-intatis.2`，基于 OpenAI Codex `rust-v0.145.0` peeled commit
+`25af12f7e61572b0bc18ddb1008be543b91519b0`。
+
+- production入口只能调用 `Packages/IntatisCodexRuntime` → `codex app-server --stdio`。旧
+  `AgentRuntime.code` / `AgentLoop` / `Orchestrator` 可暂留兼容测试与手工源码回退，但 start/send
+  已标 `unavailable`，不得恢复运行时选择、fallback、parallel/shadow backend。旧`intatis exec`与
+  `runExecCommand`也保持禁用。
+- 只用官方 App Server/API/config extension；本地只可保留 executable/version、process、JSON-RPC、
+  provider/credential、owner-only ThreadID join、UI/EventLog projection与bundle接线。不得重写 Codex
+  loop、tools、sandbox、auto-review、context、Goal、MCP或subagent core。
+- 每 session使用 isolated `CODEX_HOME`，provider固定 `wire_api=responses`、
+  `requires_openai_auth=false`；Intatis credential只进入child environment。不得读取ChatGPT/Codex
+  login或把secret写入argv/JSON-RPC/runtime files/EventLog/docs。官方shell environment policy必须
+  `inherit=core`并启用KEY/SECRET/TOKEN排除；0.145.0 `features.shell_snapshot`必须禁用，因为它会在
+  tool filter前把parent provider token持久化。isolated home若已有`shell_snapshots`必须在credential
+  注入前fail closed并要求新session，不自动读取/清理。
+- official `model_catalog_json` 按0.145.0 exact schema生成，`auto_review_model_override`绑定selected
+  Responses model。provider不支持Codex原生Responses tool shape时明确失败，不加translator。
+- 唯一本地 Rust 改动是
+  `ThirdPartyPatches/OpenAICodexRuntime/0001-responses-provider-passthrough.patch`：恢复旧链路
+  request-owned `options.provider` object 的opaque透传语义，经isolated
+  `intatis_responses_provider` config field进入原生`ResponsesApiRequest.provider`。不得枚举、解释、重命名
+  或丢弃其provider-owned子字段，也不得允许它覆盖`model/input/tools/stream/reasoning`等host-owned字段；
+  不使用控制header、generic whole-body `extra_body`、proxy或协议adapter。Intatis在跨进程前保留递归
+  secret/transport-key扫描与结构资源边界。上游有官方等价provider-body extension时应删除该patch。
+- Codex rollout是model context truth；Intatis EventLog是UI/audit projection truth；required join是
+  session `codex-runtime/runtime.json`。legacy EventLog没有mapping时第一版拒绝自动迁移并要求新建
+  session，不能静默创建空thread。
+- 当前未把Codex binary放入release bundle；正式发行前必须完成fixed Cargo closure/license/NOTICE、
+  arm64+x86_64 binary/hash、nested Developer ID签名、公证/staple/Gatekeeper/fresh-user gate。
+- Chat和iOS Chat保持原Swift ChatLoop；iOS不得链接IntatisCodexRuntime。
+- Intatis MCP/Knowledge/WorkTask/Goal card/child roster与CLI attachment/clear第一版未完整桥接；只能继续
+  走Codex官方MCP/plugin/thread扩展点，未接通时fail closed，不能调用旧内核补齐。
+
+下文“项目理解要求”中所有把 Code/Cowork shipping链路写成 AgentRuntime/AgentLoop/Orchestrator、
+Intatis三层权限或EventLog-only model history的段落，现在仅描述仓内legacy/manual-rollback实现与兼容
+测试；本节和当前源码优先。
+
 本文件继承 `/Users/vita/Vitemis/AGENTS.md` 中的 Vitemis 通用 Agent 规则。若本文件与通用规则冲突，在不违反系统和用户指令的前提下，以更具体、更严格的项目规则为准。
 
 本文是 AI Agent 每轮进入本仓库时的入口文件。执行任何代码修改、配置修改、构建脚本修改或测试源码修改之前，必须先按顺序阅读并核对下列文档：

@@ -99,8 +99,16 @@ func runMode(_ config: CLIConfig, mode startMode: Mode, workspace: URL) async th
     while true {
         let exit: REPLExit
         switch mode {
-        case .chat, .code: exit = try await chatCodeREPL(config, mode: mode, workspace: workspace)
-        case .cowork:      exit = try await coworkREPL(config, workspace: workspace)
+        case .chat:
+            exit = try await chatCodeREPL(
+                config,
+                mode: .chat,
+                workspace: workspace)
+        case .code, .cowork:
+            exit = try await codexRuntimeREPL(
+                config,
+                mode: mode,
+                workspace: workspace)
         }
         switch exit {
         case .quit: return
@@ -128,6 +136,10 @@ private let replHelp = """
 """
 
 private func chatCodeREPL(_ config: CLIConfig, mode: Mode, workspace: URL) async throws -> REPLExit {
+    guard mode == .chat else {
+        throw IntatisError.config(
+            "CLI Code/Cowork must run through Codex App Server")
+    }
     let registry = ProviderRegistry(
         config: config.providerConfig(),
         resolver: CLIExactSecretResolver(config: config))
@@ -633,6 +645,7 @@ private let coworkHelp = """
 
 """
 
+@available(*, unavailable, message: "CLI Cowork uses Codex App Server")
 private func coworkREPL(_ config: CLIConfig, workspace: URL) async throws -> REPLExit {
     let inferenceProfiles = try await CLIInferenceProfiles.load(config: config)
     let registry = ProviderRegistry(

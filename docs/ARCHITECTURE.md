@@ -18,6 +18,114 @@
 文中较早的 v0.x 只表示能力最初引入或兼容格式冻结的里程碑；除明确标为历史的段落外，
 当前架构判断以本文件、源码和 `project.yml` 为准。
 
+## 2026-08-22 Code/Cowork/CLI 内核：Codex App Server
+
+用户已明确批准以 OpenAI Codex 的官方开源 runtime 替换 Intatis 自写的 Code/Cowork agent
+内核。shipping 架构如下；本文后续所有旧 `AgentLoop` / `AgentRuntime.code` / `Orchestrator`
+流程图只保留为 legacy/manual-rollback 设计记录，不再定义生产发送路径。
+
+```text
+Intatis SwiftUI / CLI surface
+  -> Intatis selected exact provider/model + existing SecretResolver
+  -> ResponsesRuntimeRoute (no Chat Completions conversion)
+  -> per-session owner-only CodexRuntimeConfiguration
+       model_provider = "intatis"
+       wire_api = "responses"
+       requires_openai_auth = false
+       isolated CODEX_HOME
+       request-owned credential environment variable
+       request-owned opaque options.provider object
+       official model_catalog_json; auto_review_model_override = selected model
+  -> exact codex-cli 0.145.0-intatis.2 app-server --stdio
+  -> official initialize
+  -> thread/start OR exact thread/resume
+  -> turn/start / item notifications / server requests / turn/completed
+  -> Codex-owned agent loop + tools + sandbox + approval review + Goal + subagents
+  -> bounded/redacted Intatis EventLog/UI projection
+```
+
+边界：
+
+- `Packages/IntatisCodexRuntime` 只能拥有 executable discovery/version check、Process 生命周期、
+  newline-delimited JSON-RPC、官方 request/response/event 类型的最小解析、owner-only配置/ThreadID
+  接线和宿主 UI projection；不得复制 Codex agent loop、tool scheduler、sandbox、reviewer、context
+  manager、MCP 或 multi-agent 实现。
+- runtime 固定为基于 `rust-v0.145.0` peeled commit
+  `25af12f7e61572b0bc18ddb1008be543b91519b0` 的 `0.145.0-intatis.2`。唯一Rust差异是仓内可复现
+  patch把already-decoded、non-secret的request-owned `options.provider` object经isolated config field
+  原样放入`ResponsesApiRequest.provider`；缺失、版本不符、Responses URL 不可表达、schema
+  不兼容或 runtime 失败均直接报错；不得调用 legacy `AgentLoop` / `Orchestrator`、另一 provider、
+  Chat Completions adapter、mock、cache 或简化 backend。
+- App Server 是本地官方协议边界，不等于 Codex 产品账号。每个 session 的 `CODEX_HOME` 与用户
+  `~/.codex` 隔离；`requires_openai_auth=false`，因此不读取 ChatGPT login。credential 只存在于
+  Intatis resolver 内存与该子进程环境，不进入 JSON-RPC、argv 或 durable files。官方
+  `shell_environment_policy` 使用 `inherit=core`、启用默认 KEY/SECRET/TOKEN 排除并额外排除
+  `INTATIS_*`/`CODEX_HOME`，所以agent tool子进程不得继承provider credential。由于0.145.0
+  `shell_snapshot`会在该filter前持久化parent environment，host通过官方feature config固定禁用它。
+- `model_catalog_json` 是官方配置扩展点，用来声明 selected Responses model 的 0.145.0 exact
+  metadata，并将 upstream auto-review 的 reviewer model 明确绑定到同一 selected model。若目标
+  provider 不支持 Codex 发出的原生 Responses tool shape，能力失败；Intatis 不做协议翻译。
+- model/variant request options只解释Codex turn字段中可精确表达的reasoning effort；exact OpenRouter
+  adapter的`options.provider`则作为一个opaque object透传，不枚举或修改children，未来provider-owned字段
+  不需再扩补丁。它先过递归secret/transport-key扫描和结构资源边界，且只能占据最终body的`provider`
+  子树，不能覆盖host-owned request字段。其他top-level options仍在credential/network前明确拒绝；不得把
+  该窄通道扩成generic whole-body parser、proxy或协议adapter。
+- Codex rollout/thread store 是模型上下文与 upstream tool lifecycle 的权威。Intatis
+  `events.jsonl` 仍是 Intatis transcript、session settings、UI/audit projection 的权威，但它不是完整
+  Codex rollout 的副本。`codex-runtime/runtime.json` 是两者的 required identity join；没有该映射的
+  legacy agent session 不自动迁移，避免“UI 显示旧历史、模型却从空 thread 开始”的静默分叉。
+  同目录 `runtime.lock`用owner-only nonblocking `flock`保证跨进程只有一个App Server owner。
+  shutdown先关闭stdin并等待真实process exit；TERM有界超时后KILL，只有观察到退出才释放flock。
+  若KILL后仍无法证明退出，原host通过deferred retirement继续持锁，禁止第二process接管同一home。
+- App 生命周期仍由 `AppSessionRuntimeManager` 按 Intatis SessionID 持有 ViewModel；ViewModel 进一步
+  持有 exact Codex process/thread。切换窗口不 stop，删除 session/Command-Q 必须 interrupt active
+  turn、shutdown process、等待事件 task 与 workspace scope 清理。Code/Cowork同时持有既有
+  EventLogWriterLease，runtime目录另持跨进程flock；任一Codex→EventLog投影append失败都必须立即停止
+  该runtime，不能让model context继续前进而UI/audit静默落后。
+- Chat/macOS+iOS Chat 不链接或调用 `IntatisCodexRuntime`。iOS target 继续只有 Chat 子集。
+
+第一版产品投影：Code 与 Cowork 都保存 user/assistant 文本，Codex tool item 只保存 bounded、
+credential-redacted title/status/detail；raw child process output、permission transient 与 credential 不落
+EventLog。server-initiated command/file/permission request 直接映射到现有 permission card/CLI prompt，
+用户决策原样回 App Server。`request_user_input`、dynamic tools、Intatis MCP/Knowledge plugin、完整
+child-thread roster、WorkTask/Goal card 和 paginated full-history projection 尚未接通，收到未支持的
+server request 时 JSON-RPC fail closed，不得借 legacy runtime 完成。
+
+### 当前 Code 链路
+
+```text
+CodeViewModel.send
+  -> resolve exact Intatis Responses route + credential
+  -> CodexAppServerSession.start/resume
+  -> EventLog user_message (durable UI fact)
+  -> turn/start(text + optional localImage)
+  -> upstream tool/sandbox/auto-review loop
+  -> item deltas/completion -> EventLog presentation projection
+  -> turn/completed or explicit failure
+```
+
+### 当前 Cowork 链路
+
+```text
+CoworkViewModel fresh bootstrap (settings + @main presentation identity)
+  -> first Send lazily resolves exact selected inference binding -> ResponsesRuntimeRoute
+  -> one Codex root thread in cowork mode
+  -> turn/start; upstream collab tools own child agents
+  -> @main assistant/tool projection into existing Cowork shell
+```
+
+### 当前 CLI 链路
+
+```text
+intatis chat                  -> existing Swift ChatLoop
+intatis code|cowork [dir]     -> CodexRuntimeCLI -> same CodexAppServerSession
+```
+
+开发版可以从 `INTATIS_CODEX_RUNTIME`、app auxiliary executable、官方/local install 路径或
+`PATH` 发现同一个 exact dependency；这些只是 executable discovery candidates，不是 backend
+fallback。正式 macOS bundle 在完成 universal Rust build、Cargo license closure、nested code sign、
+notarization 与 clean-machine gate 前不得宣称可独立分发。
+
 ## macOS 发行架构边界
 
 macOS 唯一发行 App 是 Developer ID 签名、公证和直接分发的 `IntatisMac`。
@@ -649,7 +757,7 @@ macOS session 页面明确分成三层：
 
 | 层 | owner / identity | 内容 | session 切换 |
 |---|---|---|---|
-| Runtime | 进程级 `AppSessionRuntimeManager` + exact `{SessionKind, SessionID}` | provider / AgentLoop / Orchestrator / projection / permission / workspace scope | 保留并继续运行 |
+| Runtime | 进程级 `AppSessionRuntimeManager` + exact `{SessionKind, SessionID}` | Chat provider；Code/Cowork 的 exact Codex App Server process/thread；projection / workspace scope（legacy AgentLoop/Orchestrator 不可调用） | 保留并继续运行 |
 | Window presentation | 每个 `IntatisMacRootView` | mode、当前 session、inspector 显隐 | 只影响本窗口 |
 | Session presentation | `IntatisThreadPresentationScope` + 该窗口 thread 的 `@StateObject` | ScrollView、bottom-follow、scroll generation、临时 geometry | scope 改变即销毁/重建 |
 
@@ -816,7 +924,7 @@ composer mic -> ComposerVoiceInputController
 发送前，不产生 EventLog、ArtifactStore 或 session projection 写入。该能力复用既有配置文件/importer，
 没有单独的设置页，也没有迁入 Flotis 的多模型对比、全局快捷键、review/clipboard 或输入法链路。
 
-### Code 链路（单 agent，macOS 全量）
+### Legacy Code 链路（仅手工源码回退/兼容测试，不是 shipping path）
 
 ```text
 Code composer -> GoalInputParser (/goal metadata) -> AgentLoop.send()
@@ -1248,7 +1356,7 @@ provider tool_call -> AgentLoop schema validation
   capability，read-only/reviewer/旧 durable lease 不被静默扩权；最终网络调用仍须通过权限与 durable
   execution chain。
 
-### Cowork 链路（多 agent 编排，macOS 全量）
+### Legacy Cowork 链路（仅手工源码回退/兼容测试，不是 shipping path）
 
 Cowork 的 durable work model 包含四套独立事实：可选 `Goal`、当前 Session 内的 `WorkTask` DAG、一次执行窗口 `ContinuationRun`，以及既有 `TaskContract` / `TaskGraph` / scheduler 表示的 AgentInvocation。它们不是永久所有权层级；Run/Goal/invocation 终态不传播 WorkTask 状态，invocation completed、WorkTask completed 与 Goal completed 是三次独立权威判断。
 

@@ -1,12 +1,15 @@
 # COWORK_PRINCIPLES
 
-文档状态：当前 Cowork/AgentKernel 原则
+文档状态：legacy/manual-rollback Cowork/AgentKernel 原则
 最近核对：2026-08-22
 产品基线：v0.55（build 55）
 
 本文提炼自仓内 v0.10 历史 Cowork 设计文档、`PER_AGENT_INFERENCE_PROFILES.md` 及
-项目操作规则。旧设计文档只保留迁移 provenance；本文件是当前原则基准，**不是**完成度
-声明。修改 Cowork / AgentKernel / MessageBus / 权限 / agent 编排前必读。
+项目操作规则。旧设计文档只保留迁移 provenance；本文件继续约束仓内 legacy
+Orchestrator/AgentKernel源码与兼容测试，**不是**当前 shipping执行链或完成度声明。
+2026-08-22起，新Cowork turn由固定官方Codex App Server执行；其权威原则见
+`docs/ARCHITECTURE.md`顶部Codex Runtime节。修改legacy Cowork / AgentKernel /
+MessageBus /权限/agent编排源码时仍必读，但不得据此在Codex外重建同等core或恢复fallback。
 
 ## 1. 核心原则
 
@@ -488,7 +491,7 @@ all three mailbox authority classes retain no delegation, coordinator, mutation,
 task-scoped capability/workspace leases are enforced, revoked, and safely renewed on retry
 dynamic task/message/event text stays in a bounded, escaped user-role context block
 inference catalog reuses semantically equal revisions, appends on semantic change, retains old revisions, and rejects unsafe/corrupt/insecure definitions without overwriting the store
-Cowork durable options accept only the explicit bounded schema; unknown/shape/secret/auth/header/query/URL/endpoint/structural/stream/multi-candidate fields fail closed, while Chat/Code arbitrary ProviderEndpoint options remain lossless
+Cowork durable options keep an explicit bounded top-level schema; exact `options.provider` is an opaque provider-owned exception whose unknown children remain lossless after recursive secret/auth/header/query/URL/endpoint rejection and structural bounds, while other unknown/shape/structural/stream/multi-candidate fields fail closed and Chat/Code arbitrary ProviderEndpoint options remain lossless
 every OpenAI-compatible Chat/Agent request strips config stream_options/candidate controls and forces n=1; host includeUsage alone rebuilds the usage shape and a host token ceiling also strips competing token aliases
 legacy inference fields decode as unresolved; exact resolver never falls back to current/default and fails before secret/network access on missing/mismatched revisions
 same model with different variants/connections/credential references remains isolated across two agents in one session

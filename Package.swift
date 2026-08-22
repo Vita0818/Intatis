@@ -24,6 +24,7 @@ let package = Package(
         .library(name: "IntatisPermission", targets: ["IntatisPermission"]),
         .library(name: "IntatisMCP", targets: ["IntatisMCP"]),
         .library(name: "IntatisMCPStdio", targets: ["IntatisMCPStdio"]),
+        .library(name: "IntatisCodexRuntime", targets: ["IntatisCodexRuntime"]),
         .library(name: "IntatisAgentKernel", targets: ["IntatisAgentKernel"]),
         .library(name: "IntatisCowork", targets: ["IntatisCowork"]),
         .library(name: "IntatisMultimodal", targets: ["IntatisMultimodal"]),
@@ -209,6 +210,17 @@ let package = Package(
             ],
             path: "Packages/IntatisMCPStdio/Sources"
         ),
+        // OpenAI Codex App Server host. This target owns only process
+        // lifecycle, official JSON-RPC transport, route projection, and
+        // session/thread identity. Agent-loop, tool, sandbox, approval-review,
+        // and multi-agent behavior stay inside the pinned upstream runtime.
+        .target(
+            name: "IntatisCodexRuntime",
+            dependencies: [
+                "IntatisCore", "IntatisProtocol", "IntatisProviders",
+            ],
+            path: "Packages/IntatisCodexRuntime/Sources"
+        ),
         .target(
             name: "IntatisAgentKernel",
             dependencies: [
@@ -268,6 +280,7 @@ let package = Package(
                 "IntatisCore", "IntatisProtocol", "IntatisProviders", "IntatisConversation",
                 "IntatisArtifacts", "IntatisTools", "IntatisPermission", "IntatisAgentKernel", "IntatisCowork",
                 "IntatisMCP", "IntatisMCPStdio", "IntatisSkills", "IntatisKnowledge",
+                "IntatisCodexRuntime",
                 .product(
                     name: "Crypto",
                     package: "swift-crypto",
@@ -358,6 +371,14 @@ let package = Package(
                 ),
             ],
             path: "Packages/IntatisMCP/Tests"
+        ),
+        .testTarget(
+            name: "IntatisCodexRuntimeTests",
+            dependencies: [
+                "IntatisCodexRuntime", "IntatisCore", "IntatisProtocol",
+                "IntatisProviders",
+            ],
+            path: "Packages/IntatisCodexRuntime/Tests"
         ),
         .testTarget(
             name: "IntatisCLITests",

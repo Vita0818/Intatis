@@ -1,76 +1,91 @@
 # NEXT_TARGET
 
 文档状态：唯一活跃目标
-最近核对：2026-08-21
+最近核对：2026-08-22
 产品基线：v0.55（build 55）
 
-## 目标：完成 v0.55 Developer ID 直接分发候选
+## 目标：把 Codex Runtime 第一版收敛为可分发、可完整试用的 v0.55 候选
 
-把当前 v0.55 源码收敛为可验证、可安装、可直接分发的 macOS ZIP/DMG；不走 App Store。
+当前 Code、Cowork 与 CLI Code/Cowork 已切到基于官方 Codex App Server 0.145.0的窄派生
+`0.145.0-intatis.2`，旧 Swift agent core 没有生产 fallback。下一目标不是再写一个 adapter 或补第二套内核，而是在同一官方
+extension/API 上完成分发和产品投影。
 
 ## 已完成
 
-- 版本事实源已推进为 `0.55 (55)`。
-- 新增版本一致性检查，覆盖 `project.yml`、参考 Info.plist、当前入口文档和生成工程。
-- `IntatisMac` 显式启用 Hardened Runtime。
-- `scripts/package-macos-release.sh` 已实现 universal Release、Developer ID App/DMG
-  signing、Apple notarization、staple、codesign、Gatekeeper assessment、拖放安装 DMG 和
-  ZIP/DMG SHA-256 清单；当前 XcodeGen 产品图已没有第二个 App Store target。
-- 当前仓库文档已重新划分为当前规范和历史证据，README/状态/测试不再以旧 v0.9/v0.16
-  里程碑冒充当前版本。
-- v0.55 的 Xcode 工程生成、版本一致性、macOS universal Release 与 iOS Simulator Debug
-  正在本轮重新验证；旧 v0.48 构建证据不替代本轮结果。
-- 本机 `/Applications/Intatis.app` 已安装 `0.55 (55)` arm64 Debug、ad-hoc Hardened Runtime 开发构建；
-  strict codesign、entitlements、无 quarantine、无 Xcode Debug dylib、staging/installed SHA-256 一致性
-  和 exact-path 启动均已验收。当前构建还包含 macOS 单消息 rich Markdown 直接跨 block 拖拽选择；
-  executable SHA-256 为 `1fdc9785519fd41449431695849a029fc330b7f9ff3b898416f221fe913116c7`。
-  strict Release test observation 修正前的中间 `0.55 (55)` 保留为
-  `~/.Trash/Intatis-selection-appearance-intermediate-20260821-121114.app`；选区单一外观修正前的
-  `0.55 (55)` 保留为
-  `~/.Trash/Intatis-before-selection-appearance-20260821-120049.app`；再上一份 `0.55 (55)` 保留为
-  `~/.Trash/Intatis-before-selection-20260820-231513.app`，
-  安装前的 `0.48 (48)` 保留为
-  `~/.Trash/Intatis-before-install-20260820-210656.app`，更早的 `0.40 (40)` 备份仍保留。该开发安装不能
-  作为 universal Release、Developer ID、公证、staple 或 Gatekeeper 发行证据。
-- 旧 `IntatisMacAppStore` target/scheme、条件编译分支与专属 App Sandbox entitlements 已删除；
-  生成工程当前只有 `IntatisMac` 和 `IntatisiOS` 两个 App targets。
-- AgentKernel soft-token-budget stale fixture 已在不改生产预算保护的前提下收口；focused
-  用例、169 项 AgentKernel suite 与完整 `swift test` 均通过。
-- 用户宿主环境已具备有效 Developer ID Application identity，并已保存 `Intatis-Notary`
-  notarytool Keychain profile；凭据和私钥均未写入仓库。
-- 发行脚本已支持构建/公证分段切换网络：GitHub 依赖解析和签名阶段保持代理/VPN，暂停后
-  关闭会阻断 Apple 的代理/VPN，再原地继续公证，无需重新构建。
-- Apple 已接收两次旧 App submission；2026-08-18 只读查询确认两条均已 `Accepted`、
-  `In Progress=0`。它们不能作为 v0.55 公证证据。旧脚本的无输出
-  `--wait` 已被用户中断，且旧临时 App 已清理。发行脚本现改为显示 upload/status、保存
-  submission ID、默认 30 分钟有界等待，并在超时/中断时保留可恢复签名 App/DMG。
+- 固定 OpenAI Codex `rust-v0.145.0` / peeled commit
+  `25af12f7e61572b0bc18ddb1008be543b91519b0`；记录 Apache-2.0、upstream NOTICE 与
+  Ratatui-derived attribution。
+- checked-in patch恢复旧链路的request-owned `options.provider` opaque passthrough，只占据最终Responses
+  `provider`子树；无控制header、generic whole-body、proxy/translator，未来provider-owned字段无需再改
+  Rust。派生binary与官方`codex`分名安装，后者不被覆盖。
+- 新增 `IntatisCodexRuntime`：exact executable/version、isolated CODEX_HOME、owner-only storage、
+  stable stdio JSON-RPC、thread start/resume、turn start/wait/interrupt、item stream、command/file/
+  permission approval、Goal 与 shutdown。
+- Intatis provider 直接投影为 `wire_api=responses`、`requires_openai_auth=false`；credential只进
+  child environment，不使用 ChatGPT login。
+- 通过 official `model_catalog_json` 把 auto-review model 固定到 selected Responses model；0.145.0
+  exact catalog schema 已由真实 App Server offline handshake 验证。
+- macOS Code/Cowork 保留原 UI shell，但 shipping send/start/cancel/shutdown 只调用 Codex；旧
+  AgentLoop/Orchestrator方法编译期不可用。
+- CLI `intatis code|cowork` 使用同一 runtime；Chat 仍使用原 ChatLoop。
+- legacy EventLog session without Codex mapping 明确拒绝自动空-thread迁移；source rollback可行，
+  runtime backend fallback不存在。
+- fake full-turn协议测试、真实 pinned App Server offline handshake、CLI startup/exit smoke、macOS
+  Debug build 已通过；最终全量验证以当前工作树收口结果为准。
 
-## 剩余 release gate
+## 下一阶段必须完成
 
-1. 运行 v0.55 版本一致性、SwiftPM、shipping target、bundle metadata/architecture 与发行脚本预检。
-2. 本地门槛通过后，在代理/VPN开启时只运行一次：
+1. **Codex binary distribution closure**
 
-   ```sh
-   INTATIS_PAUSE_BEFORE_NOTARIZATION=1 \
-   INTATIS_NOTARY_PROFILE=Intatis-Notary \
-     scripts/package-macos-release.sh
-   ```
+   - 从 fixed commit/Cargo.lock + checked-in patch 产出 arm64+x86_64；保存 source/toolchain/binary hash。
+   - 完整审计并分发 Cargo dependency license/NOTICE closure。
+   - 组装 universal或明确 architecture-correct auxiliary executable。
+   - nested binary先 Developer ID签名，再签 outer App；跑 Hardened Runtime、notarization、staple、
+     Gatekeeper、fresh-user startup与 exact `codex --version`。
 
-3. 脚本显示网络切换提示后保持终端打开，关闭会阻断 Apple 的代理/VPN，再按 Return；若
-   Apple 探测失败，调整网络后按提示原地重试。
-4. 若 30 分钟后仍为 `In Progress`，不要再次上传；用脚本打印的
-   `INTATIS_RESUME_RELEASE_DIR` 命令稍后恢复同一 submission。
-5. 记录最终 ZIP/DMG 文件名、SHA-256、notarization Accepted、stapler validate、codesign、
-   Gatekeeper assessment，以及一台干净 macOS 用户环境的安装/首次启动结果。
+2. **官方 MCP/plugin 接线**
+
+   - 只使用 Codex config/plugin/MCP official extension point。
+   - 把 Intatis 已批准的 MCP server配置投影到 isolated CODEX_HOME，先做 secret/permission/provenance
+     设计；不得把原 Intatis MCP runtime当并行工具 backend。
+   - 自动权限审查等 Intatis差异能力若保留，优先做 Codex plugin/MCP；无法用官方 extension精确表达
+     时停下请求用户决定。
+
+3. **Cowork UI 完整投影**
+
+   - 通过稳定 parent/child thread与collaboration item API显示 child roster、状态和可选 transcript。
+   - 评估 stable API是否足以恢复完整 item history；experimental pagination不得未经新决定进入
+     shipping path。
+   - Intatis WorkTask卡片若继续保留，必须明确是 app-owned product metadata，经官方 MCP/plugin
+     接线，不得复制 Codex scheduler。
+
+4. **Goal/approval/interaction 完整性**
+
+   - 将 upstream thread Goal投影到现有 Goal card并实现 pause/resume/clear；Codex保持唯一 Goal执行权威。
+   - 接 `request_user_input` 与 MCP elicitation的现有 UI；unsupported request仍 fail closed。
+   - 验证 auto-review在目标非 OpenAI Responses provider上的真实 tool call；provider不支持原生 Codex
+     tool shape时明确失败，不做协议转换。
+
+5. **历史与删除生命周期**
+
+   - 设计显式、可预览、可回退的 legacy session migration或保持“新建 session”政策；禁止静默注入。
+   - session delete必须同时精确 drain process并删除该 session自己的Codex store；不得影响其他 thread。
+   - `/clear` 应调用官方 thread replacement/archive/delete语义并保留历史，不能直接删 mapping猜状态。
+
+6. **验证与发布**
+
+   - 补 UI ViewModel source-shape/fixture与 approval/cancel/resume/migration tests。
+   - 运行完整 `swift test`、macOS Debug/Release、iOS Simulator、CLI macOS/Linux gate。
+   - 完成最终 docs、NOTICE、bundle inventory、size、签名/公证和干净机测试后，才能恢复 v0.55
+     Developer ID发布目标。
 
 ## 明确非目标
 
-- 不重新引入已删除的 `IntatisMacAppStore` target/scheme、条件编译分支或专属 entitlements。
-- 不为 App Store App Sandbox 裁剪 terminal、Git、MCP、Skills 或 workspace 能力。
-- 不实现诊断日志远程上传。
-- 不在缺证书、公证或 Gatekeeper 证据时输出“正式发行”结论。
-- 不用字体截图替代 Dynamic Type、VoiceOver、中英混排、final bundle/hash/license/size 等正式验收；
-  不覆盖已有签名/公证 recovery artifact。
-- 不把历史 v0.10/v0.16 文档批量改名为当前版本；它们是历史证据。
+- 不重新实现 Codex agent loop、tool scheduler、sandbox、auto-review、context、MCP或subagent core。
+- 不新增旧 AgentLoop/Orchestrator自动 fallback、parallel/shadow backend或Chat Completions translator。
+- 不用 ChatGPT login替代 Intatis provider credential。
+- 不把 current Codex main/experimental schema冒充 pinned 0.145.0 stable contract。
+- 不让 Codex runtime进入 Chat或iOS target。
+- 不在 binary/license/sign/notarization证据缺失时宣称当前 App 已可独立分发。
 
-目标完成后删除本文件或替换为下一个单一目标，不再追加已完成里程碑流水账。
+目标完成后删除本文件或替换为下一个单一目标，不继续追加里程碑流水账。

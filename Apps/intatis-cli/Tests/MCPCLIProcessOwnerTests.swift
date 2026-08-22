@@ -334,6 +334,28 @@ final class MCPCLIProcessOwnerTests:
         }
         let configURL = root.appendingPathComponent(
             "intatis.json")
+        let codexRuntime = root.appendingPathComponent(
+            "intatis-codex")
+        let codexScript = """
+        #!/bin/sh
+        if [ "$1" = "--version" ]; then
+          echo 'codex-cli 0.145.0-intatis.2'
+          exit 0
+        fi
+        count=0
+        while IFS= read -r line; do
+          count=$((count + 1))
+          if [ "$count" = "1" ]; then
+            echo '{"id":1,"result":{"userAgent":"fake"}}'
+          elif [ "$count" = "2" ]; then
+            echo '{"id":2,"result":{"thread":{"id":"thread-cli-no-mcp","turns":[],"createdAt":0,"updatedAt":0,"status":{"type":"idle"}}}}'
+          fi
+        done
+        """
+        try Data(codexScript.utf8).write(to: codexRuntime)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: 0o700)],
+            ofItemAtPath: codexRuntime.path)
         let config: [String: Any] = [
             "model": "test/cli-no-mcp-model",
             "enabled_providers": ["test"],
@@ -378,6 +400,13 @@ final class MCPCLIProcessOwnerTests:
             "test/cli-no-mcp-model"
         environment["INTATIS_MODE"] = "code"
         environment["INTATIS_USAGE"] = "0"
+        environment["INTATIS_CODEX_RUNTIME"] =
+            codexRuntime.path
+        // Keep the shipping-process smoke's deterministic Codex session home
+        // inside this fixture. The fixture defer removes it, so a test run
+        // cannot leave empty runtime directories in the user's real
+        // Application Support tree.
+        environment["CFFIXED_USER_HOME"] = root.path
         process.environment = environment
         process.standardInput = input
         process.standardOutput = output

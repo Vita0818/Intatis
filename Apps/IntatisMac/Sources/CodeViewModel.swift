@@ -13,6 +13,7 @@ import IntatisSkills
 import IntatisArtifacts
 import IntatisMCP
 import IntatisSharedUI
+import IntatisCodexRuntime
 
 private final class CodePermissionWaiter: @unchecked Sendable {
     private let lock = NSLock()
@@ -123,6 +124,17 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
         HostToolRegistryAugmenter?
     private var mcpInternalToolRegistryLease:
         HostToolRegistryAugmentationLease?
+    private var codexRuntime: CodexAppServerSession?
+    private var codexStartupTask:
+        Task<CodexAppServerSession, Error>?
+    private var codexEventTask: Task<Void, Never>?
+    private var codexApprovalIDs:
+        [RequestID: CodexRuntimeRequestID] = [:]
+    private var codexApprovalActions:
+        [RequestID: PermissionResponseAction] = [:]
+    private var codexAllowsThreadCreation = false
+    private var codexWriterLease: EventLogWriterLease?
+    private var codexProjectionFailed = false
 
     init(sessionID: SessionID,
          workspaceAccess: WorkspaceAccessLease,
@@ -163,6 +175,8 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
     deinit {
         subscription?.cancel()
         runningOperation?.cancel()
+        codexStartupTask?.cancel()
+        codexEventTask?.cancel()
         for operation in attachmentImportOperations.values {
             operation.cancel()
         }
@@ -174,6 +188,15 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
         #if canImport(AVFoundation)
         voiceInput.updateProviderRegistry(registry)
         #endif
+        let runtime = codexRuntime
+        codexRuntime = nil
+        codexStartupTask?.cancel()
+        codexStartupTask = nil
+        codexEventTask?.cancel()
+        codexEventTask = nil
+        if let runtime {
+            Task { await runtime.shutdown() }
+        }
     }
 
     func start() {
@@ -193,6 +216,8 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
             guard let self else { return }
             do {
                 let replayed = await self.log.replay()
+                self.codexAllowsThreadCreation =
+                    !Self.containsAgentHistory(replayed)
                 let initial = try await pump.loadInitialReplay(
                     replayed)
                 self.commitProjectionSnapshot(initial)
@@ -306,7 +331,9 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
     func cancelCurrentTurn() {
         guard !isShutdown, isWorking else { return }
         runningOperation?.cancel()
-        Task { await terminal.terminateAll(reason: "Code turn cancelled") }
+        if let codexRuntime {
+            Task { try? await codexRuntime.interruptCurrentTurn() }
+        }
     }
 
     /// Records one confirmed server-prompt selection, then stages its typed
@@ -425,6 +452,11 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
         subscription = nil
         let operation = runningOperation
         operation?.cancel()
+        let codexStartupTask = codexStartupTask
+        codexStartupTask?.cancel()
+        let codexRuntime = codexRuntime
+        let codexEventTask = codexEventTask
+        codexEventTask?.cancel()
         let attachmentOperations =
             Array(attachmentImportOperations.values)
         for attachmentOperation in attachmentOperations {
@@ -435,8 +467,10 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
                 #if canImport(AVFoundation)
                 await self.voiceInput.shutdown()
                 #endif
-                await self.terminal.shutdown(reason: reason)
+                await codexRuntime?.shutdown()
             }
+            _ = try? await codexStartupTask?.value
+            if let codexEventTask { await codexEventTask.value }
             if let operation { await operation.value }
             for attachmentOperation in attachmentOperations {
                 await attachmentOperation.value
@@ -455,6 +489,13 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
                 self.pendingPermission = pending
             }
             self.runningOperation = nil
+            self.codexStartupTask = nil
+            self.codexRuntime = nil
+            self.codexEventTask = nil
+            self.codexApprovalIDs.removeAll()
+            self.codexApprovalActions.removeAll()
+            self.codexWriterLease?.release()
+            self.codexWriterLease = nil
             self.attachmentImportOperations.removeAll()
             self.isWorking = false
             self.projectionPump = nil
@@ -467,7 +508,7 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
                     try await internalLease.closeRequiringDrain()
                 } catch {
                     self.composerError = error.localizedDescription
-                    try? await self.log.append(.error(
+                    _ = try? await self.log.append(.error(
                         RuntimeErrorPresentation.payload(
                             for: error,
                             fallbackCode: "internal_tool_drain")))
@@ -481,6 +522,86 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
     }
 
     func send() {
+        guard !isShutdown, !isWorking else { return }
+        #if canImport(AVFoundation)
+        guard !voiceInput.isEngaged else { return }
+        #endif
+        guard pendingMCPExternalContexts.isEmpty else {
+            composerError = IntatisLocalization.string(
+                "This first Codex Runtime version does not import staged Intatis MCP context. Attach MCP servers through the Codex runtime before sending, or cancel the staged context.")
+            return
+        }
+        let originalInput = input
+        let originalAttachments = draftAttachments
+        let parsed: ParsedUserInput
+        if originalInput.trimmingCharacters(
+            in: .whitespacesAndNewlines).isEmpty,
+           !originalAttachments.isEmpty {
+            parsed = ParsedUserInput(text: "")
+        } else {
+            switch GoalInputParser.parse(originalInput) {
+            case .success(let value):
+                parsed = value
+            case .failure(.empty):
+                return
+            case .failure(let error):
+                composerError = error.message
+                return
+            }
+        }
+
+        var durableUserMessage = parsed.userMessagePayload
+        durableUserMessage.submissionID = SubmissionID.new()
+        durableUserMessage.turnID = TurnID.new()
+        durableUserMessage.attachments = originalAttachments.isEmpty
+            ? nil
+            : originalAttachments.map(\.id)
+        isWorking = true
+        agentState = "starting Codex Runtime"
+        composerError = nil
+        let operation = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let runtime = try await self.codexSession()
+                let imageURLs = try await self.codexImageURLs(
+                    for: originalAttachments)
+                try await self.log.append(.userMessage(
+                    durableUserMessage))
+                self.codexAllowsThreadCreation = false
+                if self.input == originalInput {
+                    self.input = ""
+                }
+                if self.draftAttachments.map(\.id)
+                    == originalAttachments.map(\.id) {
+                    self.draftAttachments = []
+                }
+                self.agentState = "Codex working"
+                _ = try await runtime.runTurn(
+                    text: parsed.text,
+                    localImageURLs: imageURLs)
+                self.composerError = nil
+            } catch {
+                let cancelled = Task.isCancelled
+                let message = error.localizedDescription
+                self.composerError = cancelled ? nil : message
+                if !cancelled {
+                    _ = try? await self.log.append(.error(
+                        RuntimeErrorPresentation.payload(
+                            for: error,
+                            fallbackCode: "codex_runtime")))
+                }
+            }
+            self.isWorking = false
+            self.agentState = "idle"
+            self.runningOperation = nil
+        }
+        runningOperation = operation
+    }
+
+    /// Retained temporarily only so a source-level/manual rollback can recover
+    /// pre-migration behavior. No production path can call it.
+    @available(*, unavailable, message: "Code uses Codex App Server")
+    private func retainedLegacyAgentLoopSend() {
         guard !isShutdown, !isWorking else { return }
         #if canImport(AVFoundation)
         guard !voiceInput.isEngaged else { return }
@@ -713,6 +834,253 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
         runningOperation = operation
     }
 
+    private func codexSession() async throws -> CodexAppServerSession {
+        if let codexRuntime { return codexRuntime }
+        if let codexStartupTask {
+            return try await codexStartupTask.value
+        }
+        if !codexAllowsThreadCreation {
+            codexAllowsThreadCreation = !Self.containsAgentHistory(
+                await log.replay())
+        }
+        if codexWriterLease == nil {
+            codexWriterLease = try log.acquireWriterLease()
+        }
+        let registry = registry
+        let route = try await registry.responsesRuntimeRoute()
+        let configuration = CodexRuntimeConfiguration(
+            sessionID: sessionID,
+            mode: .code,
+            workspaceURL: workspaceRoot,
+            runtimeRootURL: log.sessionDirectoryURL
+                .appendingPathComponent(
+                    "codex-runtime",
+                    isDirectory: true),
+            route: route,
+            approvalReviewer: .automatic,
+            reasoningEffort: route.reasoningEffort,
+            allowsThreadCreation: codexAllowsThreadCreation)
+        let task = Task { @MainActor [weak self] () throws
+            -> CodexAppServerSession in
+            guard let self else { throw CancellationError() }
+            let runtime = CodexAppServerSession(
+                configuration: configuration)
+            self.codexProjectionFailed = false
+            let events = await runtime.events()
+            let eventTask = Task { @MainActor [weak self] in
+                for await event in events {
+                    guard !Task.isCancelled else { return }
+                    await self?.handleCodexEvent(event)
+                }
+            }
+            self.codexEventTask = eventTask
+            do {
+                _ = try await runtime.start()
+                try Task.checkCancellation()
+                return runtime
+            } catch {
+                eventTask.cancel()
+                await runtime.shutdown()
+                throw error
+            }
+        }
+        codexStartupTask = task
+        do {
+            let runtime = try await task.value
+            codexRuntime = runtime
+            codexStartupTask = nil
+            return runtime
+        } catch {
+            codexStartupTask = nil
+            codexEventTask = nil
+            throw error
+        }
+    }
+
+    private func codexImageURLs(
+        for attachments: [IntatisComposerDraftAttachment]
+    ) async throws -> [URL] {
+        var urls: [URL] = []
+        urls.reserveCapacity(attachments.count)
+        for attachment in attachments {
+            guard attachment.mime.hasPrefix("image/") else {
+                throw IntatisComposerAttachmentResolutionError.unsupported(
+                    attachment.id,
+                    mime: attachment.mime,
+                    surface: "Codex Runtime")
+            }
+            guard let ref = await artifactStore.ref(
+                for: attachment.id) else {
+                throw IntatisComposerAttachmentResolutionError.missing(
+                    attachment.id)
+            }
+            urls.append(artifactStore.absoluteURL(for: ref))
+        }
+        return urls
+    }
+
+    private func handleCodexEvent(
+        _ event: CodexRuntimeEvent
+    ) async {
+        let coder = AgentID(rawValue: "Coder")
+        switch event {
+        case .ready(let identity):
+            if !isWorking {
+                agentState = "Codex \(identity.runtimeVersion) ready"
+            }
+        case .turnStarted:
+            isWorking = true
+            agentState = "Codex working"
+        case .assistantDelta(let itemID, let text):
+            _ = await appendCodexProjectionEvent(.messageDelta(
+                MessageDeltaPayload(
+                    messageId: MessageID(
+                        rawValue: "codex:\(itemID)"),
+                    role: .assistant,
+                    agent: coder,
+                    textDelta: text)))
+        case .assistantCompleted(let itemID, let text):
+            _ = await appendCodexProjectionEvent(.messageCompleted(
+                MessageCompletedPayload(
+                    messageId: MessageID(
+                        rawValue: "codex:\(itemID)"),
+                    role: .assistant,
+                    agent: coder,
+                    text: text)))
+        case .reasoningDelta:
+            agentState = "Codex reasoning"
+        case .itemStarted(let item):
+            _ = await appendCodexProjectionEvent(.toolCall(ToolCallPayload(
+                toolCallId: "codex:\(item.id)",
+                agent: coder,
+                name: item.title,
+                args: item.detail)))
+            agentState = item.kind == .collaboration
+                ? "Codex coordinating"
+                : "Codex using tools"
+        case .itemCompleted(let item):
+            let observation = [item.status, item.detail]
+                .compactMap { $0 }
+                .filter { !$0.isEmpty }
+                .joined(separator: "\n")
+            _ = await appendCodexProjectionEvent(.toolResult(ToolResultPayload(
+                toolCallId: "codex:\(item.id)",
+                observation: observation.isEmpty
+                    ? "completed"
+                    : observation,
+                outcome: item.isFailure ? .failed : .succeeded,
+                failureSource: item.isFailure ? .runtimeFailed : nil)))
+            agentState = "Codex working"
+        case .approvalRequested(let request):
+            let localID = RequestID.new()
+            codexApprovalIDs[localID] = request.requestID
+            let payload = PermissionRequestPayload(
+                requestId: localID,
+                agent: coder,
+                tool: request.title,
+                args: "",
+                risk: .high,
+                reason: request.summary,
+                approvalMode: .manual)
+            permissionQueue.append(PendingPermission(
+                request: payload,
+                requestedSeq: -1))
+            pendingPermission = permissionQueue.first
+            agentState = "waiting for permission"
+        case .approvalResolved(let runtimeID):
+            guard let localID = codexApprovalIDs.first(where: {
+                $0.value == runtimeID
+            })?.key else { return }
+            codexApprovalIDs.removeValue(forKey: localID)
+            let action = codexApprovalActions.removeValue(forKey: localID)
+            permissionQueue.removeAll { $0.id == localID }
+            pendingPermission = permissionQueue.first
+            if let action {
+                let approved = action == .approve
+                    || action == .approveAndRemember
+                permissionNotice = PermissionResolutionNotice(
+                    id: "codex:\(runtimeID.description)",
+                    requestId: localID,
+                    tool: "Codex Runtime",
+                    decision: approved ? .allow : .deny,
+                    risk: .high,
+                    reason: approved
+                        ? "Codex Runtime request approved by user"
+                        : "Codex Runtime request declined by user",
+                    source: .user,
+                    action: action,
+                    resolvedSeq: -1)
+            }
+        case .turnCompleted(let result):
+            let outcome: TurnOutcome
+            let failureSource: ExecutionFailureSource?
+            switch result.status {
+            case "completed":
+                outcome = .completed
+                failureSource = nil
+            case "interrupted":
+                outcome = .interrupted
+                failureSource = .turnCancelled
+            default:
+                outcome = .failed
+                failureSource = .runtimeFailed
+            }
+            _ = await appendCodexProjectionEvent(.turnOutcome(
+                TurnOutcomePayload(
+                    turnID: TurnID(
+                        rawValue: "codex:\(result.turnID)"),
+                    outcome: outcome,
+                    failureSource: failureSource,
+                    reason: result.succeeded
+                        ? nil
+                        : "Codex Runtime turn ended with status \(result.status).",
+                    agentID: coder)))
+            isWorking = false
+            agentState = result.succeeded
+                ? "idle"
+                : result.status
+        case .runtimeError(let code, let message, let fatal):
+            composerError = message
+            _ = await appendCodexProjectionEvent(.error(ErrorPayload(
+                code: code,
+                message: fatal
+                    ? "Codex Runtime became unavailable."
+                    : "Codex Runtime reported a request failure.",
+                fatal: fatal)))
+            if fatal {
+                isWorking = false
+                agentState = "runtime unavailable"
+                codexRuntime = nil
+                codexStartupTask = nil
+                codexEventTask = nil
+            }
+        }
+    }
+
+    @discardableResult
+    private func appendCodexProjectionEvent(
+        _ event: Event
+    ) async -> Bool {
+        guard !codexProjectionFailed else { return false }
+        do {
+            _ = try await log.append(event)
+            return true
+        } catch {
+            codexProjectionFailed = true
+            composerError = IntatisLocalization.format(
+                "Codex Runtime stopped because its Intatis projection could not be persisted: %@",
+                error.localizedDescription)
+            isWorking = false
+            agentState = "projection unavailable"
+            let runtime = codexRuntime
+            codexRuntime = nil
+            codexStartupTask = nil
+            codexEventTask = nil
+            await runtime?.shutdown()
+            return false
+        }
+    }
+
     #if canImport(AVFoundation)
     func toggleVoiceInput() {
         guard !isShutdown else { return }
@@ -750,6 +1118,20 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
         }
         pendingMCPExternalContextCount =
             pendingMCPExternalContexts.count
+    }
+
+    private static func containsAgentHistory(
+        _ envelopes: [Envelope]
+    ) -> Bool {
+        envelopes.contains { envelope in
+            switch envelope.event {
+            case .userMessage, .messageDelta, .messageCompleted,
+                 .toolCall, .toolResult, .patchProposed, .turnOutcome:
+                return true
+            default:
+                return false
+            }
+        }
     }
 
     private static func validateMCPExternalContexts(
@@ -926,6 +1308,43 @@ final class CodeViewModel: ObservableObject, PermissionResponder {
     func resolvePermission(_ action: PermissionResponseAction) {
         guard pendingPermission?.state.isActionable == true,
               let request = pendingPermission?.request else { return }
+        if let runtimeRequestID = codexApprovalIDs[request.requestId],
+           let codexRuntime {
+            if var pending = pendingPermission {
+                pending.state = .resolving
+                pendingPermission = pending
+            }
+            codexApprovalActions[request.requestId] = action
+            let decision: CodexRuntimeApprovalDecision
+            switch action {
+            case .approve:
+                decision = .accept
+            case .approveAndRemember:
+                decision = .acceptForSession
+            case .decline:
+                decision = .decline
+            case .cancelTurn:
+                decision = .cancel
+            }
+            Task { @MainActor [weak self] in
+                do {
+                    try await codexRuntime.resolveApproval(
+                        requestID: runtimeRequestID,
+                        decision: decision)
+                } catch {
+                    guard let self else { return }
+                    self.codexApprovalActions.removeValue(
+                        forKey: request.requestId)
+                    if var pending = self.pendingPermission,
+                       pending.id == request.requestId {
+                        pending.state = .livePending
+                        self.pendingPermission = pending
+                    }
+                    self.composerError = error.localizedDescription
+                }
+            }
+            return
+        }
         guard let waiter = permissionWaiters.removeValue(forKey: request.requestId) else {
             if pendingPermission?.state == .needsRerun { return }
             if var pending = pendingPermission {

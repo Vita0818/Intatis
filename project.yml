@@ -95,6 +95,8 @@ targets:
         product: IntatisMCP
       - package: Intatis
         product: IntatisMCPStdio
+      - package: Intatis
+        product: IntatisCodexRuntime
 
   # ---- iOS app: chat-only SUBSET (deliberately no workspace stack) ----
   IntatisiOS:
