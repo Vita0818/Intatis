@@ -12,7 +12,7 @@
 - 只有用户针对 exact 依赖、exact 范围和退出条件作出的新明文决定才能例外。
 
 文档状态：当前回归禁区
-最近核对：2026-08-21
+最近核对：2026-08-22
 产品基线：v0.55（build 55）
 
 ## macOS 分发不变量
@@ -35,6 +35,33 @@
 - App/DMG submission ID 必须 first-write/reuse。超时、`In Progress`、中断、网络失败
   或 `Invalid` 都必须保留恢复状态且不得自动重复提交；只有最终 ZIP、DMG 与 manifest
   全部成功落盘后才可清理恢复目录。
+
+## macOS 文件夹项目不变量
+
+- 文件夹项目只是 `{ProjectID, exact SessionKind, canonical folder path, same-kind SessionID[]}` 的
+  模式内跨 session 组织层。每个项目必须固定一个 kind，引用必须同 kind；跨模式关联必须 fail closed。
+  相同 path 可在 Chat/Code/Cowork 分别登记，但三者不得共享项目选择、session list 或新建入口。
+  不得把它扩写成新的 EventLog、session runtime、Goal、WorkTask、Agent owner、workspace
+  lease、共享模型 history、知识库、索引或配置继承层；Chat/Code/Cowork 继续使用原执行链。
+- `projects-v1.plist` 必须保持 schema-v1 binary、owner-only `0600`、no-follow、single-link、稳定
+  跨进程 lock、原子替换和读回验证；未知 schema、损坏、超限、unsafe inode 或冲突 ProjectID/path/
+  conversation reference 必须 fail closed，不能覆盖旧文件、退化到 UserDefaults 或从 Recent/mtime
+  猜测 membership。旧 global mixed-project 草稿只可按 kind 确定性拆分，不能继续作为跨模式项目运行。
+- 项目目录不得保存 security-scoped bookmark。添加项目时选择器只证明并保存 canonical path；
+  创建 Code/Cowork conversation 必须再次由用户确认 exact 文件夹，并继续把 bookmark 只写入该
+  session 的 `workspace-access.plist`。Chat 不得因项目 membership 获得路径、文件、tool 或 workspace
+  能力，项目 path 也不得进入 provider prompt/EventLog。
+- project membership 不移动、不复制、不重命名 session 目录，也不改写 session EventLog、
+  `session.json`、artifacts、SessionID 或 runtime key。一个 conversation 在自己的模式内最多属于一个
+  项目；同一 `{kind, path}` 重复添加必须幂等保留原 ProjectID 和会话引用。
+- UI 必须把项目放在当前模式的 session browser 内，使用可展开/收起的单行文件夹；不得恢复固定
+  Projects 高度、独立项目主页或跨模式 session-type 菜单。收起项目不得保留子 session 占位高度；
+  归入项目的 session 只显示在该文件夹，其他当前模式 session 显示在 `Unfiled`，二者共享一个滚动面。
+- 移除项目只能删除项目分组记录；不得删除用户文件夹、任何 session、EventLog 或 artifact，也不得
+  stop 不相关 runtime。删除 session 后项目引用清理失败只能留下不可见的 stale reference，不能回滚
+  或伪造 session 删除结果；UI 只显示当前 SessionHistory 能解析的引用。
+- 第一版只从当前模式的项目入口创建同模式 conversation。未经新的明确设计，不得自动把同路径
+  session 归组、把既有 Unfiled 会话迁入、跨会话共享上下文，或从文件夹相同推导权限与所有权。
 
 ## OKF / RAG knowledge bundle 不变量
 

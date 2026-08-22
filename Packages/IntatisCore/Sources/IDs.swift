@@ -39,6 +39,17 @@ public struct SessionID: TypedID {
     public static func new() -> SessionID { SessionID(rawValue: IDGen.random(prefix: "sess")) }
 }
 
+/// Identifies one user-selected folder project independently from any
+/// conversation stored beneath it. Project membership is app-local metadata;
+/// it does not replace a session's own identity or EventLog.
+public struct ProjectID: TypedID {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public static func new() -> ProjectID {
+        ProjectID(rawValue: IDGen.random(prefix: "project"))
+    }
+}
+
 public struct ThreadID: TypedID {
     public let rawValue: String
     public init(rawValue: String) { self.rawValue = rawValue }

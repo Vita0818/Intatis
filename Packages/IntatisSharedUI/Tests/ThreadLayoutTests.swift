@@ -463,6 +463,49 @@ final class ThreadLayoutTests: XCTestCase {
             "\\.intatisWindowContentWidth"))
     }
 
+    func testMacFolderProjectsRemainAGroupingLayerOverExistingSessions() throws {
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let repositoryRoot = packageRoot
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let rootSource = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Apps/IntatisMac/Sources/IntatisMacRootView.swift"),
+            encoding: .utf8)
+        let appSource = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Apps/IntatisMac/Sources/IntatisMacApp.swift"),
+            encoding: .utf8)
+
+        XCTAssertTrue(rootSource.contains("private struct ProjectSidebarSection"))
+        XCTAssertFalse(rootSource.contains("private struct ProjectHomeView"))
+        XCTAssertTrue(rootSource.contains(
+            "@State private var expandedProjectIDs: Set<ProjectID> = []"))
+        XCTAssertTrue(rootSource.contains("systemName: \"chevron.right\""))
+        XCTAssertTrue(rootSource.contains("if isExpanded"))
+        XCTAssertFalse(rootSource.contains(".frame(maxHeight: 230)"))
+        XCTAssertFalse(rootSource.contains("availableKinds"))
+        XCTAssertTrue(rootSource.contains("$0.kind == selection.sessionKind"))
+        XCTAssertTrue(rootSource.contains("usesOwnScrollView: false"))
+        XCTAssertTrue(rootSource.contains(
+            "historyTitle: IntatisLocalization.string(\"Unfiled\")"))
+        XCTAssertTrue(rootSource.contains("case .chat:"))
+        XCTAssertTrue(rootSource.contains("case .code:"))
+        XCTAssertTrue(rootSource.contains("case .cowork:"))
+        XCTAssertTrue(rootSource.contains(
+            "The folder and all conversations will remain on disk."))
+        XCTAssertTrue(appSource.contains("startNewProjectChatSession"))
+        XCTAssertTrue(appSource.contains("makeProjectCodeViewModel"))
+        XCTAssertTrue(appSource.contains("makeProjectCoworkViewModel"))
+        XCTAssertTrue(appSource.contains("ProjectFolderStore.associate"))
+        XCTAssertTrue(appSource.contains("expectedKind: .chat"))
+        XCTAssertTrue(appSource.contains("expectedKind: .code"))
+        XCTAssertTrue(appSource.contains("expectedKind: .cowork"))
+        XCTAssertFalse(appSource.contains("moveProjectSessionDirectory"))
+    }
+
     func testCoworkTasksUseCompactHeaderAndSingleStatusMarker() throws {
         let packageRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()

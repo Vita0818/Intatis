@@ -22,6 +22,9 @@ client。所有运行时能力围绕结构化 EventLog、共享 AgentKernel、�
   PathConfinement 与权限链。
 - Cowork：多 agent roster、FIFO scheduler、WorkTask/Goal、MessageBus/Mediator、per-agent
   exact inference binding、独立 permission reviewer 和 goal verifier 控制面。
+- Projects：Chat、Code、Cowork 各自维护独立的文件夹项目；当前模式下一个项目对应一个现存
+  本地文件夹，以可折叠目录归组同模式会话。它不移动会话数据、不在用户文件夹写 Intatis 元数据，
+  也不增加项目级记忆、任务或权限。
 - 设置：provider catalog、Intatis JSON/JSONC 配置、MCP、renderer fallback、第三方声明，
   以及只在本机生成且不上传的脱敏诊断 ZIP。
 

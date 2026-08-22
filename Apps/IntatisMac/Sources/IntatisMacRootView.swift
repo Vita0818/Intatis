@@ -49,11 +49,11 @@ enum IntatisNavItem: String, CaseIterable, Identifiable, Hashable {
         }
     }
 
-    var emptyHistoryTitle: String {
-        switch self {
-        case .chat: return IntatisLocalization.string("No chat sessions yet.")
-        case .code: return IntatisLocalization.string("No code sessions yet.")
-        case .cowork: return IntatisLocalization.string("No cowork sessions yet.")
+    init(sessionKind: SessionKind) {
+        switch sessionKind {
+        case .chat: self = .chat
+        case .code: self = .code
+        case .cowork: self = .cowork
         }
     }
 }
@@ -64,6 +64,29 @@ private struct SessionActionTarget: Identifiable {
     let title: String
 
     var id: String { "\(kind.rawValue):\(sessionID.rawValue)" }
+}
+
+private struct ProjectRemovalTarget: Identifiable {
+    let id: ProjectID
+    let title: String
+}
+
+private struct ProjectConversationSidebarItem: Identifiable {
+    let reference: ProjectConversationReference
+    let title: String
+    let systemImage: String
+    let updatedAt: Date
+    let isSelected: Bool
+    let isDeleteDisabled: Bool
+
+    var id: String { reference.id }
+}
+
+private struct ProjectSidebarItem: Identifiable {
+    let project: ProjectFolderRecord
+    let conversations: [ProjectConversationSidebarItem]
+
+    var id: ProjectID { project.id }
 }
 
 struct IntatisMacRootView: View {
@@ -85,6 +108,7 @@ struct IntatisMacRootView: View {
     @State private var coworkSessionError: String?
     @State private var renameTarget: SessionActionTarget?
     @State private var deleteTarget: SessionActionTarget?
+    @State private var projectRemovalTarget: ProjectRemovalTarget?
     @State private var sessionActionError: String?
     @State private var runtimeStatuses: [
         AppSessionRuntimeKey: AppSessionRuntimePresentationStatus
@@ -118,13 +142,22 @@ struct IntatisMacRootView: View {
         NavigationSplitView {
             IntatisSidebar(
                 items: items,
-                selection: $selection,
+                selection: selection,
                 isSettings: $isSettings,
+                projects: projectSidebarItems,
+                projectStoreError: env.projectStoreError,
                 historyItems: historyItems,
-                historyTitle: IntatisLocalization.string("Recent"),
-                emptyHistoryTitle: selection.emptyHistoryTitle,
+                historyTitle: IntatisLocalization.string("Unfiled"),
+                emptyHistoryTitle: IntatisLocalization.string(
+                    "No unfiled sessions."),
                 newSessionTitle: selection.newSessionTitle,
                 isNewDisabled: newSessionDisabled,
+                onSelectMode: selectMode,
+                onAddProject: addProject,
+                onRemoveProject: beginRemoveProject,
+                onNewProjectConversation: startNewProjectConversation,
+                onSelectProjectConversation: selectProjectConversation,
+                isProjectConversationCreationDisabled: newSessionDisabled,
                 onNewSession: startNewSelectedSession,
                 onSelectSession: resumeSelectedSession,
                 onRenameSession: beginRenameSession,
@@ -148,6 +181,7 @@ struct IntatisMacRootView: View {
         }
         .onChange(of: selection) { _ in refreshAllSessions() }
         .onChange(of: env.chatSessionID.rawValue) { _ in refreshChatSessions() }
+        .onChange(of: env.projects) { _, _ in refreshAllSessions() }
         .onReceive(runtimeManager.runtimeRemoved) { key in
             handleRemovedRuntime(key)
         }
@@ -179,10 +213,20 @@ struct IntatisMacRootView: View {
                 "\"%@\" and its Intatis event history and artifacts will be permanently deleted. Files in the linked workspace will not be changed.",
                 target.title))
         }
-        .alert("Session Action Failed", isPresented: sessionErrorPresented) {
+        .alert("Remove Project?", isPresented: projectRemovalAlertPresented, presenting: projectRemovalTarget) { target in
+            Button("Cancel", role: .cancel) {}
+            Button("Remove", role: .destructive) {
+                removeProject(target)
+            }
+        } message: { target in
+            Text(IntatisLocalization.format(
+                "Remove \"%@\" from Intatis? The folder and all conversations will remain on disk.",
+                target.title))
+        }
+        .alert("Action Failed", isPresented: sessionErrorPresented) {
             Button("OK", role: .cancel) {}
         } message: {
-            Text(sessionActionError ?? IntatisLocalization.string("The session action failed."))
+            Text(sessionActionError ?? IntatisLocalization.string("The action failed."))
         }
     }
 
@@ -278,20 +322,78 @@ struct IntatisMacRootView: View {
     }
 
     private var historyItems: [IntatisSessionHistoryItem] {
+        let filed = Set(projectSidebarItems.flatMap {
+            $0.conversations.map(\.reference)
+        })
+        return sessions(for: selection.sessionKind)
+            .filter { session in
+                !filed.contains(ProjectConversationReference(
+                    sessionID: session.id,
+                    kind: session.kind))
+            }
+            .map {
+                historyItem(
+                    $0,
+                    icon: selection.icon,
+                    selected: $0.id == selectedSessionID)
+            }
+    }
+
+    private var projectSidebarItems: [ProjectSidebarItem] {
+        env.projects.filter {
+            $0.kind == selection.sessionKind
+        }.map { project in
+            let conversations = project.conversations.compactMap {
+                reference -> ProjectConversationSidebarItem? in
+                guard let session = sessionSummary(for: reference) else {
+                    return nil
+                }
+                return ProjectConversationSidebarItem(
+                    reference: reference,
+                    title: session.displayName ?? session.id.rawValue,
+                    systemImage: selection.icon,
+                    updatedAt: session.updatedAt,
+                    isSelected: session.id == selectedSessionID,
+                    isDeleteDisabled: isDeleteDisabled(session))
+            }
+            .sorted { lhs, rhs in
+                if lhs.updatedAt != rhs.updatedAt {
+                    return lhs.updatedAt > rhs.updatedAt
+                }
+                return lhs.id < rhs.id
+            }
+            return ProjectSidebarItem(
+                project: project,
+                conversations: conversations)
+        }
+        .sorted { lhs, rhs in
+            let order = lhs.project.displayName.localizedCaseInsensitiveCompare(
+                rhs.project.displayName)
+            if order != .orderedSame { return order == .orderedAscending }
+            if lhs.project.createdAt != rhs.project.createdAt {
+                return lhs.project.createdAt < rhs.project.createdAt
+            }
+            return lhs.id.rawValue < rhs.id.rawValue
+        }
+    }
+
+    private var selectedSessionID: SessionID? {
         switch selection {
         case .chat:
-            return recentChatSessions.map {
-                historyItem($0, icon: selection.icon, selected: $0.id == env.chatSessionID)
-            }
+            return env.chatSessionID
         case .code:
-            return recentCodeSessions.map {
-                historyItem($0, icon: selection.icon, selected: $0.id == codeVM?.sessionID)
-            }
+            return codeVM?.sessionID
         case .cowork:
-            return recentCoworkSessions.map {
-                historyItem($0, icon: selection.icon, selected: $0.id == coworkVM?.sessionID)
-            }
+            return coworkVM?.sessionID
         }
+    }
+
+    private func sessionSummary(
+        for reference: ProjectConversationReference
+    ) -> AppSessionSummary? {
+        sessions(for: reference.kind).first(where: {
+            $0.id == reference.sessionID
+        })
     }
 
     private var newSessionDisabled: Bool {
@@ -327,6 +429,7 @@ struct IntatisMacRootView: View {
         refreshChatSessions()
         refreshCodeSessions()
         refreshCoworkSessions()
+        env.refreshProjects()
     }
 
     private func refreshChatSessions() {
@@ -418,6 +521,139 @@ struct IntatisMacRootView: View {
         return updated
     }
 
+    private func selectMode(_ item: IntatisNavItem) {
+        selection = item
+        isSettings = false
+        refreshAllSessions()
+    }
+
+    private func addProject() {
+        guard let workspace = WorkspaceAccess.choose(
+            prompt: IntatisLocalization.string("Choose Project Folder")) else {
+            return
+        }
+        defer { workspace.release() }
+        do {
+            _ = try env.addProject(
+                workspace: workspace,
+                kind: selection.sessionKind)
+            isSettings = false
+            refreshAllSessions()
+        } catch {
+            sessionActionError = IntatisLocalization.format(
+                "Could not add project: %@",
+                error.localizedDescription)
+        }
+    }
+
+    private func beginRemoveProject(_ projectID: ProjectID) {
+        guard let project = env.projects.first(where: {
+            $0.id == projectID
+        }) else { return }
+        projectRemovalTarget = ProjectRemovalTarget(
+            id: project.id,
+            title: project.displayName)
+    }
+
+    private func removeProject(_ target: ProjectRemovalTarget) {
+        do {
+            try env.removeProject(target.id)
+            refreshAllSessions()
+        } catch {
+            sessionActionError = IntatisLocalization.format(
+                "Could not remove project: %@",
+                error.localizedDescription)
+        }
+    }
+
+    private func selectProjectConversation(
+        _ projectID: ProjectID,
+        _ reference: ProjectConversationReference
+    ) {
+        guard env.projects.contains(where: {
+            $0.id == projectID
+                && $0.kind == selection.sessionKind
+                && $0.conversations.contains(reference)
+        }), sessionSummary(for: reference) != nil else {
+            return
+        }
+        isSettings = false
+        switch reference.kind {
+        case .chat:
+            guard let session = recentChatSessions.first(where: {
+                $0.id == reference.sessionID
+            }) else { return }
+            env.resumeChatSession(session)
+            refreshChatSessions()
+        case .code:
+            resumeCodeSession(reference.sessionID)
+        case .cowork:
+            resumeCoworkSession(reference.sessionID)
+        }
+    }
+
+    private func startNewProjectConversation(
+        _ projectID: ProjectID
+    ) {
+        guard !newSessionDisabled,
+              let project = env.projects.first(where: {
+                  $0.id == projectID && $0.kind == selection.sessionKind
+              }) else { return }
+        isSettings = false
+
+        switch project.kind {
+        case .chat:
+            do {
+                _ = try env.startNewProjectChatSession(projectID: projectID)
+                refreshAllSessions()
+            } catch {
+                guard !(error is CancellationError) else { return }
+                sessionActionError = IntatisLocalization.format(
+                    "Could not start project conversation: %@",
+                    error.localizedDescription)
+            }
+        case .code:
+            do {
+                let runtime = try env.makeProjectCodeViewModel(
+                    projectID: projectID)
+                selection = .code
+                codeVM = runtime
+                codeSessionError = nil
+                refreshAllSessions()
+            } catch {
+                guard !(error is CancellationError) else { return }
+                sessionActionError = IntatisLocalization.format(
+                    "Could not start project conversation: %@",
+                    error.localizedDescription)
+            }
+        case .cowork:
+            selection = .cowork
+            let transitionID = UUID()
+            coworkTransitionID = transitionID
+            Task { @MainActor in
+                defer {
+                    if coworkTransitionID == transitionID {
+                        coworkTransitionID = nil
+                    }
+                }
+                do {
+                    let runtime = try await env.makeProjectCoworkViewModel(
+                        projectID: projectID)
+                    guard coworkTransitionID == transitionID else { return }
+                    coworkVM = runtime
+                    coworkSessionError = nil
+                    refreshAllSessions()
+                } catch {
+                    if !(error is CancellationError) {
+                        sessionActionError = IntatisLocalization.format(
+                            "Could not start project conversation: %@",
+                            error.localizedDescription)
+                    }
+                }
+            }
+        }
+    }
+
     private func startNewSelectedSession() {
         isSettings = false
         switch selection {
@@ -449,6 +685,12 @@ struct IntatisMacRootView: View {
         Binding(
             get: { deleteTarget != nil },
             set: { if !$0 { deleteTarget = nil } })
+    }
+
+    private var projectRemovalAlertPresented: Binding<Bool> {
+        Binding(
+            get: { projectRemovalTarget != nil },
+            set: { if !$0 { projectRemovalTarget = nil } })
     }
 
     private var sessionErrorPresented: Binding<Bool> {
@@ -544,6 +786,16 @@ struct IntatisMacRootView: View {
                         CoworkProjectSettingsStore.remove(sessionID: target.sessionID)
                         WorkspaceAccess.forget(session: target.sessionID)
                     }
+                }
+                do {
+                    try env.removeProjectConversation(
+                        ProjectConversationReference(
+                            sessionID: target.sessionID,
+                            kind: target.kind))
+                } catch {
+                    sessionActionError = IntatisLocalization.format(
+                        "The session was deleted, but its project reference could not be removed: %@",
+                        error.localizedDescription)
                 }
                 refreshAllSessions()
             } catch {
@@ -751,15 +1003,24 @@ private struct SessionRenameSheet: View {
 
 // MARK: - Sidebar
 
-struct IntatisSidebar: View {
+private struct IntatisSidebar: View {
     let items: [IntatisNavItem]
-    @Binding var selection: IntatisNavItem
+    let selection: IntatisNavItem
     @Binding var isSettings: Bool
+    let projects: [ProjectSidebarItem]
+    let projectStoreError: String?
     let historyItems: [IntatisSessionHistoryItem]
     let historyTitle: String
     let emptyHistoryTitle: String
     let newSessionTitle: String
     let isNewDisabled: Bool
+    let onSelectMode: (IntatisNavItem) -> Void
+    let onAddProject: () -> Void
+    let onRemoveProject: (ProjectID) -> Void
+    let onNewProjectConversation: (ProjectID) -> Void
+    let onSelectProjectConversation:
+        (ProjectID, ProjectConversationReference) -> Void
+    let isProjectConversationCreationDisabled: Bool
     let onNewSession: () -> Void
     let onSelectSession: (SessionID) -> Void
     let onRenameSession: (SessionID) -> Void
@@ -782,18 +1043,41 @@ struct IntatisSidebar: View {
                 .padding(.horizontal, 12)
                 .padding(.bottom, 12)
 
-            IntatisSessionHistoryList(
-                title: historyTitle,
-                newTitle: newSessionTitle,
-                emptyTitle: emptyHistoryTitle,
-                items: historyItems,
-                style: .intatisMac(scheme),
-                isNewDisabled: isNewDisabled,
-                onNew: onNewSession,
-                onSelect: onSelectSession,
-                onRename: onRenameSession,
-                onDelete: onDeleteSession)
-            .padding(.horizontal, 12)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    ProjectSidebarSection(
+                        projects: projects,
+                        newConversationTitle: newSessionTitle,
+                        storeError: projectStoreError,
+                        onAddProject: onAddProject,
+                        onRemoveProject: onRemoveProject,
+                        onNewConversation: onNewProjectConversation,
+                        onSelectConversation:
+                            onSelectProjectConversation,
+                        onRenameConversation: onRenameSession,
+                        onDeleteConversation: onDeleteSession,
+                        isCreationDisabled:
+                            isProjectConversationCreationDisabled)
+
+                    Divider().opacity(0.45)
+
+                    IntatisSessionHistoryList(
+                        title: historyTitle,
+                        newTitle: newSessionTitle,
+                        emptyTitle: emptyHistoryTitle,
+                        items: historyItems,
+                        style: .intatisMac(scheme),
+                        isNewDisabled: isNewDisabled,
+                        usesOwnScrollView: false,
+                        onNew: onNewSession,
+                        onSelect: onSelectSession,
+                        onRename: onRenameSession,
+                        onDelete: onDeleteSession)
+                }
+                .padding(.horizontal, 12)
+                .padding(.bottom, 8)
+            }
+            .scrollIndicators(.automatic)
             .frame(maxHeight: .infinity, alignment: .top)
 
             Button { isSettings = true } label: {
@@ -817,10 +1101,10 @@ struct IntatisSidebar: View {
     private var modeNavigation: some View {
         VStack(spacing: 4) {
             ForEach(items) { item in
-                let isSelected = selection == item && !isSettings
+                let isSelected = selection == item
+                    && !isSettings
                 Button {
-                    selection = item
-                    isSettings = false
+                    onSelectMode(item)
                 } label: {
                     IntatisSidebarModeRow(
                         title: item.title,
@@ -833,6 +1117,221 @@ struct IntatisSidebar: View {
                 .accessibilityIdentifier("sidebar.mode.\(item.rawValue)")
             }
         }
+    }
+}
+
+private struct ProjectSidebarSection: View {
+    let projects: [ProjectSidebarItem]
+    let newConversationTitle: String
+    let storeError: String?
+    let onAddProject: () -> Void
+    let onRemoveProject: (ProjectID) -> Void
+    let onNewConversation: (ProjectID) -> Void
+    let onSelectConversation:
+        (ProjectID, ProjectConversationReference) -> Void
+    let onRenameConversation: (SessionID) -> Void
+    let onDeleteConversation: (SessionID) -> Void
+    let isCreationDisabled: Bool
+    @Environment(\.colorScheme) private var scheme
+    @State private var expandedProjectIDs: Set<ProjectID> = []
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Text(IntatisLocalization.string("Projects"))
+                    .font(IntatisTypography.system(size: 12, weight: .semibold))
+                    .foregroundStyle(IntatisTheme.softText(scheme))
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+                Button(action: onAddProject) {
+                    Label("Add Project", systemImage: "folder.badge.plus")
+                        .labelStyle(.iconOnly)
+                        .font(IntatisTypography.system(size: 12, weight: .semibold))
+                        .frame(width: 24, height: 24)
+                }
+                .controlSize(.small)
+                .buttonBorderShape(.circle)
+                .intatisGlassButton()
+                .help(IntatisLocalization.string("Add Project"))
+                .accessibilityLabel(IntatisLocalization.string("Add Project"))
+                .accessibilityIdentifier("sidebar.project.add")
+            }
+
+            if let storeError {
+                Text(storeError)
+                    .font(IntatisTypography.system(size: 11, weight: .regular))
+                    .foregroundStyle(.red)
+                    .lineLimit(3)
+            } else if projects.isEmpty {
+                Text(IntatisLocalization.string("No projects yet."))
+                    .font(IntatisTypography.system(size: 12, weight: .medium))
+                    .foregroundStyle(IntatisTheme.tertiaryText(scheme))
+                    .padding(.vertical, 4)
+            } else {
+                LazyVStack(spacing: 4) {
+                    ForEach(projects) { item in
+                        project(item)
+                    }
+                }
+                .padding(.vertical, 1)
+            }
+        }
+    }
+
+    private func project(_ item: ProjectSidebarItem) -> some View {
+        let isExpanded = expandedProjectIDs.contains(item.id)
+        return VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 4) {
+                Button {
+                    if isExpanded {
+                        expandedProjectIDs.remove(item.id)
+                    } else {
+                        expandedProjectIDs.insert(item.id)
+                    }
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: "chevron.right")
+                            .font(IntatisTypography.system(
+                                size: 9,
+                                weight: .semibold))
+                            .foregroundStyle(IntatisTheme.tertiaryText(scheme))
+                            .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                            .frame(width: 10)
+                        Image(systemName: isExpanded ? "folder.fill" : "folder")
+                            .font(IntatisTypography.system(
+                                size: 12,
+                                weight: .medium))
+                            .foregroundStyle(isExpanded
+                                ? IntatisTheme.accent(scheme)
+                                : IntatisTheme.tertiaryText(scheme))
+                            .frame(width: 16)
+                        Text(item.project.displayName)
+                            .font(IntatisTypography.system(
+                                size: 12,
+                                weight: isExpanded ? .semibold : .medium))
+                            .foregroundStyle(IntatisTheme.softText(scheme))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Spacer(minLength: 0)
+                        Text("\(item.conversations.count)")
+                            .font(IntatisTypography.system(size: 10, weight: .medium))
+                            .foregroundStyle(IntatisTheme.tertiaryText(scheme))
+                            .monospacedDigit()
+                    }
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 7)
+                    .contentShape(RoundedRectangle(
+                        cornerRadius: 8,
+                        style: .continuous))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(item.project.displayName)
+                .accessibilityValue(Text(IntatisLocalization.string(
+                    isExpanded ? "Expanded" : "Collapsed")))
+                .accessibilityIdentifier(
+                    "sidebar.project.\(item.id.rawValue)")
+                .contextMenu {
+                    Button(role: .destructive) {
+                        onRemoveProject(item.id)
+                    } label: {
+                        Label("Remove Project…", systemImage: "folder.badge.minus")
+                    }
+                }
+
+                Button {
+                    onNewConversation(item.id)
+                } label: {
+                    Image(systemName: "plus")
+                        .font(IntatisTypography.system(size: 11, weight: .semibold))
+                        .frame(width: 22, height: 22)
+                }
+                .buttonStyle(.plain)
+                .disabled(isCreationDisabled)
+                .help(newConversationTitle)
+                .accessibilityLabel(newConversationTitle)
+                .accessibilityIdentifier(
+                    "sidebar.project.\(item.id.rawValue).new")
+            }
+
+            if isExpanded {
+                if item.conversations.isEmpty {
+                    Text(IntatisLocalization.string("No conversations yet."))
+                        .font(IntatisTypography.system(
+                            size: 10,
+                            weight: .regular))
+                        .foregroundStyle(IntatisTheme.tertiaryText(scheme))
+                        .padding(.leading, 35)
+                        .padding(.vertical, 3)
+                } else {
+                    ForEach(item.conversations) { conversation in
+                        Button {
+                            onSelectConversation(
+                                item.id,
+                                conversation.reference)
+                        } label: {
+                            ProjectConversationRow(item: conversation)
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.leading, 25)
+                        .accessibilityIdentifier(
+                            "sidebar.project.conversation.\(conversation.id)")
+                        .contextMenu {
+                            Button {
+                                onRenameConversation(
+                                    conversation.reference.sessionID)
+                            } label: {
+                                Label("Rename…", systemImage: "pencil")
+                            }
+                            Divider()
+                            Button(role: .destructive) {
+                                onDeleteConversation(
+                                    conversation.reference.sessionID)
+                            } label: {
+                                Label("Delete…", systemImage: "trash")
+                            }
+                            .disabled(conversation.isDeleteDisabled)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct ProjectConversationRow: View {
+    let item: ProjectConversationSidebarItem
+    @Environment(\.colorScheme) private var scheme
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Image(systemName: item.systemImage)
+                .font(IntatisTypography.system(size: 11, weight: .medium))
+                .foregroundStyle(item.isSelected
+                    ? IntatisTheme.accent(scheme)
+                    : IntatisTheme.tertiaryText(scheme))
+                .frame(width: 14)
+            Text(item.title)
+                .font(IntatisTypography.system(
+                    size: 11,
+                    weight: item.isSelected ? .semibold : .medium))
+                .foregroundStyle(item.isSelected
+                    ? IntatisTheme.deepText(scheme)
+                    : IntatisTheme.softText(scheme))
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .overlay {
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .stroke(
+                    item.isSelected
+                        ? IntatisTheme.accent(scheme).opacity(0.36)
+                        : Color.clear,
+                    lineWidth: 1)
+        }
+        .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
     }
 }
 

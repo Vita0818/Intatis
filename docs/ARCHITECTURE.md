@@ -12,7 +12,7 @@
 - 只有用户针对 exact 依赖、exact 范围和退出条件作出的新明文决定才能例外。
 
 文档状态：当前架构规范
-最近核对：2026-08-21
+最近核对：2026-08-22
 产品基线：v0.55（build 55）
 
 文中较早的 v0.x 只表示能力最初引入或兼容格式冻结的里程碑；除明确标为历史的段落外，
@@ -681,6 +681,55 @@ Recent-session 排序不是访问历史，也不是文件系统写入历史。�
 composer 的 Send 与 Stop 是同一个主操作槽位。工作态使用 SwiftUI 原生 destructive Button、系统 `stop.fill` 和红色 tint；Chat cancel 只覆盖当前 Chat operation，Code cancel 只覆盖当前 AgentLoop turn，Cowork 普通工作使用 orchestrator task cancellation，active durable Goal 使用 GoalRuntime 的 scoped pause/checkpoint。该动作不等于 session shutdown，不关闭 EventLog subscription、runtime owner 或 permission-review control plane。Thinking 秒数是纯 presentation phase state，由可见 spinner 行的生命周期界定，不进入 EventLog、Envelope 或模型上下文。
 
 最近自查日期：2026-07-19
+
+## 2026-08-22 macOS 文件夹项目第一版
+
+这里的“项目”是每个 `SessionKind` 内部的轻量文件夹分组，不是既有 Cowork
+`CoworkProjectSettings`、Goal、WorkTask、Run、Agent 或新的执行内核。三个产品面的 session 和
+项目目录始终互相独立，项目文件夹不拥有会话数据：
+
+```text
+selected SessionKind (Chat | Code | Cowork)
+  -> 用户选择现存文件夹
+  -> canonical existing-directory path
+  -> ProjectFolderStore / projects-v1.plist
+       ProjectID + exact SessionKind + path + createdAt
+       + 0...N same-kind ProjectConversationReference
+  -> current-mode sidebar
+       collapsible folder rows
+       expanded -> same-kind sessions
+       ungrouped sessions -> Unfiled
+  -> existing runtime for that SessionKind only
+```
+
+`projects-v1.plist` 位于 Intatis Application Support，是 `0600`、no-follow、single-link、跨进程
+锁保护、原子替换并读回验证的 binary plist。它只对“哪个会话显示在哪个项目下”负责；每个 session
+的 `events.jsonl`、`session.json`、artifacts、runtime manager key 与目录名完全不变。每个项目固定
+一个 `SessionKind`，每个会话引用必须与之相同，跨模式归属在持久化边界直接拒绝；相同 canonical
+path 可在不同模式分别登记。同一模式内一个会话引用最多出现一次，重新关联只移动目录引用；同一
+`{SessionKind, canonical path}` 重复添加幂等返回原 ProjectID。第一版 global-project 草稿若含混合
+会话，兼容 reader 会按 SessionKind 确定性拆成独立项目，下一次 mutation 写回收窄后的 shape。
+合法但已不存在的 session 引用不会被伪装成会话，UI 只显示当前 SessionHistory 能解析的引用；
+session 删除成功后再清理该引用。项目目录损坏、未知 schema、不安全权限或超限时 fail closed，
+不得覆盖旧文件或退化成 UserDefaults。
+
+UI 不建立独立 project selection 或项目主页。当前模式的 Projects 与 Unfiled 共享一个 sidebar
+ScrollView；每个项目默认只占一行，以 disclosure chevron 展开/收起，不设置固定 Projects 高度。
+文件夹内的 `+` 只创建该项目所属模式的 session，不出现 Chat/Code/Cowork 类型菜单；切换模式后
+只读取该模式的项目和会话。
+
+项目目录**不保存 security-scoped bookmark**。添加项目时文件选择器的 scope 只用于证明当次
+canonical path，随后立即释放。Chat 项目内创建 session 只验证该文件夹仍是原 canonical existing
+directory，不会把路径或文件内容加入 Chat provider 请求；Code/Cowork 项目内创建 session 会再次要求用户选择并确认
+同一 exact 文件夹，然后复用现有 `WorkspaceAccess.remember`，把 opaque bookmark 只写入新 session
+自己的 `workspace-access.plist`，并由既有 RAII lease、PathConfinement、PermissionEngine 与 runtime
+生命周期持有。项目分组因此不能替代或扩大 session workspace authority。
+
+移除项目只删除这一条分组记录及其中引用，不调用 session runtime deletion，也不删除用户文件夹、
+session 目录、EventLog 或 artifact。第一版只支持从当前模式项目入口创建同模式新会话；尚无
+既有 Unfiled 会话迁入、项目级共享记忆/context、配置继承、文件索引、协作成员、任务管理或 Git
+语义，也不跟踪文件夹 rename/move；改址后由用户移除并重新添加项目，session 数据保持独立。
+以后扩展这些能力必须单独设计，不能从路径相同或项目 membership 推导权限、上下文或所有权。
 
 ## 总体架构
 
@@ -1465,6 +1514,7 @@ schema v2只表示lineage已覆盖media-aware语义。EventLog checkpoint writer
 | `SessionSettingsUpdatedPayload` / `SessionStorageMigratedPayload` | versioned session settings 全快照、显式 rename 与幂等迁移完成事实 | `session_settings_updated` / `session_storage_migrated` append-only 事件 | revision/previousRevision、session/kind/schema 必须严格连续且 overflow-safe；rename source/operation ID 为 additive optional metadata，operation first-write-wins、冲突 fail closed；Cowork settings 不授予 lease，append return/stream 使用落盘反解 canonical Envelope；legacy name/settings 与 canonical alias 必须 settings-first，migration ID 非空稳定且只有 verified migration 才能落 marker |
 | `SessionProjectionDocument` / `SessionProjectionStore` | 可删除、可重建的 session 快速投影 | `<session>/session.json` schema v2，owner-only atomic replace + stable no-follow lock | `events.jsonl` 永远获胜；`projectedThroughSeq` 只表示已验证水位。refresh 用 full canonical fold 校验 incremental result，同水位/落后 cache corruption 不能覆盖 EventLog；unknown future event 时拒绝覆盖 |
 | `SessionWorkspaceAccessDocument` / `SessionWorkspaceAccessStore` | session-owned Apple security-scoped bookmark 能力材料 | `<session>/workspace-access.plist` schema v1 binary plist，`0600` + no-follow lock + atomic replace | bookmark bytes 不进入 EventLog/session.json/UserDefaults/UI；session/path/schema/单一 primary 必须验证；shared capability 仅在 settings+roster 零引用时删除，primary 默认拒删并只允许显式事务回滚；alias 只在 scope 后 canonicalize；marker 后不得从 global legacy map 回填 |
+| `ProjectID` / `ProjectFolderRecord` / `ProjectFolderStore` | macOS 每个 SessionKind 内的文件夹项目与同模式 session 分组；不拥有会话内容或执行能力 | App Support `projects-v1.plist` schema v1 binary plist，`0600` + stable owner-only lock + atomic replace | 保存 exact kind、canonical path、createdAt 与同 kind 唯一 SessionID 引用；跨模式归属拒绝，相同 path 可按 mode 独立登记；不保存 bookmark、消息、EventLog、artifact 或 project-level context。移除只删分组；Code/Cowork 新建必须重新确认 exact 文件夹并使用各 session 自己的 bookmark；旧 global mixed record 按 kind 拆分 |
 | `UserMessagePayload` | 用户输入事件 | 随 `user_message` | `text` 是清洗后送入模型的文本；optional additive `attachments` 只保存 session `ArtifactStore` 的 ArtifactID，供 macOS Chat/Cowork 重放，绝不保存文件 bytes/base64/bookmark/path；`tags` / `goal` 是 v0.12 追加的可选元数据；`to` 可记录 Cowork 目标 agent；Cowork Phase A 的可选 `submissionID` 把同一 accepted intent 的消息、状态、root task 与重试关联；可选 `mainAgentInferenceBinding` 只冻结该 Cowork submission 在 Send 边界为 `@main` 选择的 secret-free exact binding，Chat、legacy Cowork 与 ordinary-worker direct message 为 `nil`；旧 JSONL 缺字段必须继续解码 |
 | `SubmittedIntentStore` / `SubmissionStatusChangedPayload` / `SubmittedIntentRetryPlanner` | Cowork 用户一次 Send 的本地 durable admission 与可重试执行状态 | `<session>/submitted-intent-outbox.json` schema v1（owner-only atomic file）先保存冻结 payload，再用 EventLog transaction 写唯一 `user_message + submission_status_changed(queued, attempt 1)`；后续状态 append-only | `SubmissionID` 稳定且 first-write-wins；attempt 从 1 开始，只能单调 queued→running→terminal，禁止 orphan、跳号、回退或重写 terminal；EventLog acceptance 成功后才清 outbox，canonical replay 已存在时幂等对账。outbox retry保持attempt 1；restored queued/running exact task按durable状态恢复；无Run的failed/cancelled task可递增原attempt。terminal Run上的failed root不复活：Retry创建fresh可见continuation submission/root/Run，复用原main binding但保留旧失败事实；新submitted intent出现后旧错误不再携带Retry action |
 | `ArtifactStore` / `ArtifactRef` | session 内附件和生成物的 blob 与索引 | `<session>/artifacts/blobs/<id>.<safe-ext>` + owner-only `index.json`；stable owner-only flock 内 read/merge/atomic replace | root/blobs 必须是当前 UID 的真实目录且 leaf 不跟随 symlink；blob/index/lock 为单链接 `0600`，旧 `0644` 只在固定可信路径显式收紧，`0664`/symlink/hardlink fail closed；扩展名只允许短 ASCII 字母数字并固定在 exact ID path；rename 后无法证明 durable 时返回 `commitUncertain`，不得宣称 clean rollback |

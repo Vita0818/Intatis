@@ -1,7 +1,7 @@
 # PROJECT_MAP
 
 文档状态：当前仓库地图
-最近自查日期：2026-08-21
+最近自查日期：2026-08-22
 产品基线：v0.55（build 55）
 
 本文描述当前仓库结构。判断依据来自 `Package.swift`、`project.yml`、`Makefile`、源码、测试文件和脚本。
@@ -10,6 +10,27 @@ macOS 唯一发行 target 是 Developer ID/direct-distribution `IntatisMac`。
 旧 `IntatisMacAppStore` target/scheme、编译条件和专属 entitlements 已删除；
 当前 XcodeGen 产品图只有一个 macOS App target。分发合同见
 `docs/MACOS_DISTRIBUTION.md`。
+
+## 2026-08-22 macOS 文件夹项目地图
+
+- `Packages/IntatisCore/Sources/ProjectFolderStore.swift`：`ProjectID` 对应的文件夹项目记录、
+  exact `SessionKind`、同模式 SessionID 引用和 app-global `projects-v1.plist` 事务。文件为 owner-only
+  binary plist，使用 `DurableOwnerOnlyFile` 的 no-follow/lock/atomic/durability 边界；只保存 kind/path/
+  引用，不保存 bookmark 或会话正文。旧 mixed-mode 草稿由 reader 按 kind 拆分。
+- `Apps/IntatisMac/Sources/IntatisMacApp.swift`：进程共享项目投影、add/remove/associate、项目内
+  同模式新会话 composition 与 expected-kind gate。Chat 只验证文件夹仍存在；Code/Cowork 要求用户
+  重新确认 exact 项目文件夹，再复用现有 session-owned `WorkspaceAccess.remember`。
+- `Apps/IntatisMac/Sources/IntatisMacRootView.swift`：按当前 mode 过滤的 Projects tree、折叠文件夹、
+  `Unfiled` session、同模式新会话、会话选择及“移除项目不删文件夹/会话”确认；没有项目主页、
+  固定 Projects 高度或跨模式菜单。
+- `Packages/IntatisSharedUI/Sources/ThreadSurfaces.swift`：`IntatisSessionHistoryList` 可关闭内部
+  ScrollView，使可折叠 Projects 与 Unfiled 共用一个 sidebar 滚动面；默认调用行为不变。
+- `Packages/IntatisCore/Tests/ProjectFolderStoreTests.swift` 与
+  `Packages/IntatisSharedUI/Tests/ThreadLayoutTests.swift`：存储/并发/损坏/非删除语义及 macOS
+  composition source-shape 回归。iOS 不显示文件夹项目 UI，现有 Chat-only target 边界不变。
+
+本功能不在用户项目文件夹内生成 Intatis 元数据，不移动 App Support session 目录，也不等于既有
+Cowork `CoworkProjectSettings` project mode。
 
 ## 2026-08-19 JetBrains Mono 正式产品字体地图
 
@@ -176,7 +197,7 @@ Intatis/
 
 | Target | 类型 | 依赖 | 职责 |
 |---|---|---|---|
-| `IntatisCore` | lib | — | 类型化 ID、错误、工作区路径约束、平台能力信封、会话类型、`SessionHistoryStore`、session-owned `SessionWorkspaceAccessStore`、进程级低开销 performance diagnostics 与 owner-only bounded hang bundle |
+| `IntatisCore` | lib | — | 类型化 ID、错误、工作区路径约束、平台能力信封、会话类型、`SessionHistoryStore`、无 bookmark 且按 SessionKind 隔离的 app-global `ProjectFolderStore` 分组目录、session-owned `SessionWorkspaceAccessStore`、进程级低开销 performance diagnostics 与 owner-only bounded hang bundle |
 | `IntatisProtocol` | lib | Core | 结构化事件/线协议词汇（Event/Envelope/JSONRPC/Command/CoworkEvents/Goal/WorkTask/ContinuationRun/TaskGoalEvents/ModelHistory/SessionStateEvents/InferenceProfile/PermissionIntent/PermissionReview/ToolAuthorization/ToolExecution/MultimodalEvents/TurnStats/MessageCitation/JSONValue） |
 | `IntatisProviders` | lib | Core, Protocol | OpenAI-compatible 模型访问、当前 exact Chat/agent route 的独立 `hosted_web_search` capability/planner、OpenAI `web_search` 与 OpenRouter `openrouter:web_search` dialect encoder、Chat `tool_choice:auto`/typed same-route ordinary fallback 与 Agent `required`/fail-closed mode、结构化 URL citations、bounded/secret-aware `ChatConfigurationImporter`、OpenCode-shaped npm package adapter selection/lowering、Chat/Code lossless model options、Cowork 显式 durable-options schema、exact per-agent inference catalog/resolver 与只读配置展示投影（ProviderRequestAdapter/ProviderRegistry/InferenceCatalog/InferenceCatalogStore/Capability/Endpoints/ChatProvider/OpenAIWireProvider/OpenAIToolCalling/ChatConfigurationImport/ModelConfigurationPresentation/SSE/HTTPDataClient/ImageGeneration/Transcription/VideoGeneration/ToolCalling） |
 | `IntatisArtifacts` | lib | Core, Protocol | 文件-backed blob 存储 + JSON 索引；`ArtifactImageResolver` 对 exact ArtifactID 执行 owner-only/no-follow 有界读取、PNG/JPEG 完整解码、尺寸/像素/批量限制与 SHA-256 验证，provider data URL 只在当次 request 生成 |
@@ -314,6 +335,11 @@ route，使用 required hosted-search request，且只经 `ToolRegistry` / `Tool
 - 上一版 UI 配色底稿：`docs/UI_COLOR_SYSTEM.md`（保留迁移前 macOS 香槟金/暖中性色与玻璃体系、明暗模式、语义状态色及 iOS 差异，供历史对照）
 - GUI token/turn stats：`Packages/IntatisProtocol/Sources/TurnStats.swift` 以 optional `turnID` / `responseMessageID` 把新统计绑定到最终可见回复；`ChatLoop` 与 `AgentLoop` 写入 exact identity，`Projection.swift` / `CodeProjection.swift` 支持 message-first 与 stats-first 顺序并把统计放入 bounded message/item projection，legacy unbound stats 只保留 session latest/context、不猜消息归属。`Packages/IntatisSharedUI/Sources/ThreadSurfaces.swift` 提供 macOS `IntatisComposerContextStrip`、`IntatisMessageFooter` 与 iOS 既有完整 usage strip；ViewModel 继续发布 latest stats 供会话 Context。
 - Chat/Code/Cowork session/history：`Packages/IntatisCore/Sources/SessionKind.swift`（`SessionSummary` / `SessionHistoryStore`，读取 EventLog-derived schema-v2 `session.json` 与执行安全删除）、`Apps/IntatisMac/Sources/IntatisMacRootView.swift`（mode history、右键 Rename/Delete）、`Apps/IntatisMac/Sources/IntatisMacApp.swift`、`Apps/IntatisiOS/Sources/IntatisiOSApp.swift`。macOS 与 iOS 共享最近会话扫描和 `events.jsonl` / `artifacts` 路径生成；平台层只传不同 root 与 `SessionID`。手工 Rename 与 Code/Cowork `@main` 的 `rename_session` 都先追加 EventLog settings event 再刷新 projection，不改变目录名、`SessionID` 或既有 envelope；model schema 不接受目标 session 字段。Cowork 的 `CoworkProjectSettings.swift` 负责 GUI projection 与 legacy UserDefaults migration；canonical project/workspace/future-agent exact default/default permission/token budget metadata 已由 session settings events 持久化，bookmark bytes 独立保存在 session-owned `workspace-access.plist`。
+- macOS folder projects：`ProjectFolderStore.swift` 只维护文件夹 path 与 conversation reference；
+  每个 record 固定一个 kind，跨模式 association 拒绝。`IntatisMacRootView.swift` 只从当前 mode 的
+  `SessionSummary` 投影可折叠文件夹和 Unfiled，缺失 session 引用不生成伪 row。项目新建只创建
+  同模式 session；Code/Cowork 仍先经 exact folder picker，再进入原 `makeCodeViewModel` /
+  `makeCoworkViewModel` 及 session bookmark 路径；项目删除不调用 runtime/session delete。
 - Provider：`Packages/IntatisProviders/Sources/ProviderRequestAdapter.swift`（保留 raw npm identity，reviewed compatible/OpenRouter lowering，unknown/unsupported fail closed）、`Endpoints.swift`（Chat/Code 兼容路径按 provider/model 保存 exact adapter 与任意 JSON `modelRequestOptions`，旧 Codable 缺 adapter 保持 legacy）、`InferenceCatalog.swift` / `InferenceCatalogStore.swift`（Cowork versioned immutable connection/profile catalog、adapter revision identity、OpenCode-style deep merge + explicit durable option schema）、`ModelConfigurationPresentation.swift`（只读识别原始 reasoning/thinking effort/level/budget 供 UI 展示，不参与请求）、`OpenAIWireProvider.swift` / `OpenAIToolCalling.swift`（package-aware Chat/Agent body lowering、runtime structural fields、config usage/candidate fields 清除与 host-owned `n = 1`）、`ProviderRegistry.swift`（兼容全局角色 provider + exact agent inference resolver）
 - GUI/CLI Cowork 恢复与自动权限审查：`Apps/IntatisMac/Sources/CoworkViewModel.swift`（session replay → orchestrator restore，并保持 persistent scheduler suspension → first-resolvable-main GoalVerifier freeze + 独立 config-derived reviewer binding/reviewer health → GoalRuntime start/recovery/reconcile-only pause → `startNewTasksKeepingRestoredTasksPaused`；历史 root task 只有精确 submission Retry 才解除；普通 unresolved worker 只在自己的 invocation provider dispatch 前 durable fail closed；per-agent provider resolution、安全 resolution state、host rebind；submitted intent FIFO、普通 turn scoped run、durable `/goal`、Goal/WorkTask projection、pause/resume/edit/clear、permission FIFO、cancel/retry、async stop 先 checkpoint Goal 再 `cancelAll`）、`Apps/IntatisMac/Sources/IntatisMacApp.swift` / `AppInferenceCatalog.swift`（catalog 编译/持久化/refresh、在 runtime-creation await 前冻结 canonical `permission_reviewer_model` base binding、raw variant key → opaque durable variant ID、CoworkShell submission/Goal/Tasks/profile binding、Goal edit sheet、clear confirmation、窗口级 selection + shared `AppSessionRuntimeManager`、Command-Q terminate-later）、`Apps/IntatisMac/Sources/IntatisMacRootView.swift`（session/mode transition generation guard；切换只改选择并取得 manager-cached runtime，不 stop；exact busy/delete/removal）、`Apps/intatis-cli/Sources/CLIProviderCatalog.swift` / `CLIConfig.swift`（Intatis-owned OpenCode-compatible multi-route/model/variant config、canonical `permission_reviewer_model` + missing-to-document-model compatibility、unique unqualified main model route、reasoning selection fail-closed、exact per-route credential refs）、`CLIInferenceProfiles.swift`（全部 route profile 编译、immutable catalog、独立 reviewer base binding、first-main GoalVerifier freeze）、`SelfTest.swift`（offline two-route/model/variant、retained revision、credential isolation）、`Interactive.swift`（per-workspace durable Cowork log；strict exact binding；配置 reviewer 与 `@main`/GoalVerifier 分离；non-empty missing `@main` 不自动套 default，显式 `/agent restore-main <path> <profile-id>`；`/profiles`、`/profile`、`/agent add ... --profile`、`/agent profile|rebind`；先 restore/GoalRuntime reconcile-only start，只有显式 `/auto|/default` 或 `/goal resume` 才恢复对应 data plane；`/goal <objective>|status|pause|resume|clear|edit`、退出/切 mode 前 Goal checkpoint + `cancelAll`、Code/Cowork image-generation/editing service 注入）、`Apps/intatis-cli/Sources/Terminal.swift`（渲染 `permission_review`）
 - Cowork macOS project mode：`Apps/IntatisMac/Sources/CoworkProjectSettings.swift`（EventLog-backed settings projection、legacy UserDefaults ownership/migration、future-agent exact default + settings/rebind sheet；异常时显示 workspace reauthorization / automatic-review retry Recovery 区）、`Apps/IntatisMac/Sources/CoworkViewModel.swift`（恢复后先注册 EventLog stream；fresh settings-first seven-event bootstrap；historical main repair before reviewer replacement；`SubmittedIntentStore` outbox/canonical acceptance、FIFO drain/retry；`projectSettings` / `project` 与 durable submission/Goal/WorkTask/inference projection、GUI no-mention 默认路由到 `@main`、project directory metadata add/remove）、`Apps/IntatisMac/Sources/Workspace.swift`（workspace picker、session-owned bookmark restore、RAII `WorkspaceAccessLease`）、`Packages/IntatisSharedUI/Sources/CoworkViews.swift`（composer 始终可编辑，Send 只按本地 draft/同次 persistence gate；submission failure/Retry 只进右栏错误卡；roster 安全 profile label/resolution；宽屏 rail 置顶 pending/settled permission，其后显示 `Agents` / `Goal` / compact `Tasks` 且不显示 Git；Agents header 与 30pt status 槽位只使用 hierarchical 圆形 SF Symbols，不含自绘 icon asset；Tasks 默认态为 header progress + single-marker/title/trailing disclosure，展开后保留 criteria/result/evidence/dependency/invocation detail；窄屏只为 pending approval 保留 thread 兜底，不显示 Goal/Tasks 顶部副本；默认不提供用户手动新建 agent 入口）

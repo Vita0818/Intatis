@@ -27,6 +27,8 @@ final class AppEnvironment: ObservableObject {
     @Published private(set) var chatSessionID: SessionID
     @Published private(set) var viewModel: ChatViewModel
     @Published private(set) var chatSessionError: String?
+    @Published private(set) var projects: [ProjectFolderRecord]
+    @Published private(set) var projectStoreError: String?
     @Published var needsAPIKey: Bool
 
     let runtimeManager: AppSessionRuntimeManager
@@ -38,6 +40,17 @@ final class AppEnvironment: ObservableObject {
 
     init(runtimeManager: AppSessionRuntimeManager) {
         PlatformProfile.current = AppConfig.platformProfile
+
+        let initialProjects: [ProjectFolderRecord]
+        let initialProjectStoreError: String?
+        do {
+            initialProjects = try ProjectFolderStore.load(
+                root: AppConfig.appSupportDir()).projects
+            initialProjectStoreError = nil
+        } catch {
+            initialProjects = []
+            initialProjectStoreError = error.localizedDescription
+        }
 
         self.runtimeManager = runtimeManager
         self.mcp = AppMCPService()
@@ -65,6 +78,8 @@ final class AppEnvironment: ObservableObject {
         }
         self.chatRuntime = initialChatRuntime
         self.viewModel = initialChatRuntime.viewModel
+        self.projects = initialProjects
+        self.projectStoreError = initialProjectStoreError
         self.needsAPIKey = !Self.hasAPIKey(ref: AppConfig.selectedAPIKeyRef)
 
         Task { [weak self] in
@@ -98,6 +113,66 @@ final class AppEnvironment: ObservableObject {
 
     func recentChatSessions() -> [AppSessionSummary] {
         AppConfig.recentSessions(kind: .chat)
+    }
+
+    @discardableResult
+    func addProject(
+        workspace: WorkspaceAccessLease,
+        kind: SessionKind
+    ) throws -> ProjectFolderRecord {
+        let project = try ProjectFolderStore.add(
+            root: AppConfig.appSupportDir(),
+            kind: kind,
+            path: workspace.canonicalPath)
+        refreshProjects()
+        return project
+    }
+
+    func removeProject(_ projectID: ProjectID) throws {
+        try ProjectFolderStore.remove(
+            root: AppConfig.appSupportDir(),
+            projectID: projectID)
+        refreshProjects()
+    }
+
+    func refreshProjects() {
+        do {
+            projects = try ProjectFolderStore.load(
+                root: AppConfig.appSupportDir()).projects
+            projectStoreError = nil
+        } catch {
+            projectStoreError = error.localizedDescription
+        }
+    }
+
+    @discardableResult
+    func startNewProjectChatSession(
+        projectID: ProjectID
+    ) throws -> ProjectConversationReference {
+        try validateProjectFolder(
+            projectID: projectID,
+            expectedKind: .chat)
+        let session = SessionID.new()
+        let conversation = ProjectConversationReference(
+            sessionID: session,
+            kind: .chat)
+        try associate(conversation, with: projectID)
+        do {
+            try switchChatSession(to: session)
+            return conversation
+        } catch {
+            rollbackProjectConversation(conversation)
+            throw error
+        }
+    }
+
+    func removeProjectConversation(
+        _ conversation: ProjectConversationReference
+    ) throws {
+        try ProjectFolderStore.removeConversation(
+            root: AppConfig.appSupportDir(),
+            conversation: conversation)
+        refreshProjects()
     }
 
     func deleteChatSession(_ session: SessionID) async throws {
@@ -217,6 +292,32 @@ final class AppEnvironment: ObservableObject {
         return try makeCodeViewModel(session: session, workspace: workspace)
     }
 
+    func makeProjectCodeViewModel(
+        projectID: ProjectID
+    ) throws -> CodeViewModel {
+        let workspace = try projectWorkspaceAccess(
+            projectID: projectID,
+            expectedKind: .code)
+        let session = SessionID(rawValue: IDGen.random(prefix: "code"))
+        let conversation = ProjectConversationReference(
+            sessionID: session,
+            kind: .code)
+        do {
+            try associate(conversation, with: projectID)
+        } catch {
+            workspace.release()
+            throw error
+        }
+        do {
+            return try makeCodeViewModel(
+                session: session,
+                workspace: workspace)
+        } catch {
+            rollbackProjectConversation(conversation)
+            throw error
+        }
+    }
+
     func makeCodeViewModel(session: SessionID,
                            workspace: WorkspaceAccessLease) throws -> CodeViewModel {
         if let existing = runtimeManager.cachedCodeRuntime(sessionID: session) {
@@ -275,6 +376,42 @@ final class AppEnvironment: ObservableObject {
 
     /// Build a fresh multi-agent Cowork project session bound to a primary workspace.
     func makeCoworkViewModel(primaryWorkspace: WorkspaceAccessLease) async throws -> CoworkViewModel {
+        let session = SessionID(rawValue: IDGen.random(prefix: "cowork"))
+        return try await makeCoworkViewModel(
+            session: session,
+            primaryWorkspace: primaryWorkspace)
+    }
+
+    func makeProjectCoworkViewModel(
+        projectID: ProjectID
+    ) async throws -> CoworkViewModel {
+        let workspace = try projectWorkspaceAccess(
+            projectID: projectID,
+            expectedKind: .cowork)
+        let session = SessionID(rawValue: IDGen.random(prefix: "cowork"))
+        let conversation = ProjectConversationReference(
+            sessionID: session,
+            kind: .cowork)
+        do {
+            try associate(conversation, with: projectID)
+        } catch {
+            workspace.release()
+            throw error
+        }
+        do {
+            return try await makeCoworkViewModel(
+                session: session,
+                primaryWorkspace: workspace)
+        } catch {
+            rollbackProjectConversation(conversation)
+            throw error
+        }
+    }
+
+    private func makeCoworkViewModel(
+        session: SessionID,
+        primaryWorkspace: WorkspaceAccessLease
+    ) async throws -> CoworkViewModel {
         guard let inferenceCatalogSnapshot else {
             primaryWorkspace.release()
             throw IntatisError.config(
@@ -295,7 +432,6 @@ final class AppEnvironment: ObservableObject {
             throw IntatisError.config(IntatisLocalization.string(
                 "Configure a resolvable permission_reviewer_model before creating Cowork."))
         }
-        let session = SessionID(rawValue: IDGen.random(prefix: "cowork"))
         do {
             try WorkspaceAccess.remember(
                 primaryWorkspace.scopedURL,
@@ -680,6 +816,76 @@ final class AppEnvironment: ObservableObject {
                 displayName: commit.displayName,
                 settingsRevision: commit.settingsRevision,
                 projectedThroughSeq: commit.projectedThroughSeq))
+        }
+    }
+
+    private func projectWorkspaceAccess(
+        projectID: ProjectID,
+        expectedKind: SessionKind
+    ) throws -> WorkspaceAccessLease {
+        let project = try projectRecord(
+            projectID: projectID,
+            expectedKind: expectedKind)
+        guard let workspace = WorkspaceAccess.choose(
+            prompt: IntatisLocalization.string("Choose Project Folder")) else {
+            throw CancellationError()
+        }
+        guard workspace.canonicalPath == project.path else {
+            workspace.release()
+            throw IntatisError.io(IntatisLocalization.string(
+                "Choose the exact folder registered for this project."))
+        }
+        return workspace
+    }
+
+    private func validateProjectFolder(
+        projectID: ProjectID,
+        expectedKind: SessionKind
+    ) throws {
+        let project = try projectRecord(
+            projectID: projectID,
+            expectedKind: expectedKind)
+        let url = try PathConfinement.canonicalExistingDirectory(
+            URL(fileURLWithPath: project.path, isDirectory: true))
+        guard url.path == project.path else {
+            throw ProjectFolderStoreError.invalidProject
+        }
+    }
+
+    private func projectRecord(
+        projectID: ProjectID,
+        expectedKind: SessionKind
+    ) throws -> ProjectFolderRecord {
+        guard let project = projects.first(where: { $0.id == projectID }) else {
+            throw ProjectFolderStoreError.projectNotFound
+        }
+        guard project.kind == expectedKind else {
+            throw ProjectFolderStoreError.invalidProject
+        }
+        return project
+    }
+
+    private func associate(
+        _ conversation: ProjectConversationReference,
+        with projectID: ProjectID
+    ) throws {
+        _ = try ProjectFolderStore.associate(
+            root: AppConfig.appSupportDir(),
+            projectID: projectID,
+            conversation: conversation)
+        refreshProjects()
+    }
+
+    private func rollbackProjectConversation(
+        _ conversation: ProjectConversationReference
+    ) {
+        do {
+            try ProjectFolderStore.removeConversation(
+                root: AppConfig.appSupportDir(),
+                conversation: conversation)
+            refreshProjects()
+        } catch {
+            projectStoreError = error.localizedDescription
         }
     }
 

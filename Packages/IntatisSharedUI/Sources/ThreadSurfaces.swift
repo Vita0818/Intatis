@@ -2497,6 +2497,7 @@ public struct IntatisSessionHistoryList: View {
     private let items: [IntatisSessionHistoryItem]
     private let style: IntatisThreadStyle
     private let isNewDisabled: Bool
+    private let usesOwnScrollView: Bool
     private let onNew: () -> Void
     private let onSelect: (SessionID) -> Void
     private let onRename: ((SessionID) -> Void)?
@@ -2508,6 +2509,7 @@ public struct IntatisSessionHistoryList: View {
                 items: [IntatisSessionHistoryItem],
                 style: IntatisThreadStyle,
                 isNewDisabled: Bool = false,
+                usesOwnScrollView: Bool = true,
                 onNew: @escaping () -> Void,
                 onSelect: @escaping (SessionID) -> Void,
                 onRename: ((SessionID) -> Void)? = nil,
@@ -2518,6 +2520,7 @@ public struct IntatisSessionHistoryList: View {
         self.items = items
         self.style = style
         self.isNewDisabled = isNewDisabled
+        self.usesOwnScrollView = usesOwnScrollView
         self.onNew = onNew
         self.onSelect = onSelect
         self.onRename = onRename
@@ -2554,44 +2557,52 @@ public struct IntatisSessionHistoryList: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(.vertical, 8)
             } else {
-                ScrollView {
-                    LazyVStack(spacing: 5) {
-                        ForEach(items) { item in
-                            Button {
-                                onSelect(item.id)
-                            } label: {
-                                IntatisSessionHistoryRow(item: item, style: style)
-                            }
-                            .buttonStyle(.plain)
-                            .accessibilityIdentifier(
-                                "sidebar.session.\(item.id.rawValue)")
-                            .contextMenu {
-                                if let onRename {
-                                    Button {
-                                        onRename(item.id)
-                                    } label: {
-                                        Label("Rename…", systemImage: "pencil")
-                                    }
-                                }
-                                if let onDelete {
-                                    if onRename != nil {
-                                        Divider()
-                                    }
-                                    Button(role: .destructive) {
-                                        onDelete(item.id)
-                                    } label: {
-                                        Label("Delete…", systemImage: "trash")
-                                    }
-                                    .disabled(item.isDeleteDisabled)
-                                }
-                            }
-                        }
+                if usesOwnScrollView {
+                    ScrollView {
+                        rows
                     }
-                    .padding(.vertical, 1)
+                    .scrollIndicators(.automatic)
+                } else {
+                    rows
                 }
-                .scrollIndicators(.automatic)
             }
         }
+    }
+
+    private var rows: some View {
+        LazyVStack(spacing: 5) {
+            ForEach(items) { item in
+                Button {
+                    onSelect(item.id)
+                } label: {
+                    IntatisSessionHistoryRow(item: item, style: style)
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier(
+                    "sidebar.session.\(item.id.rawValue)")
+                .contextMenu {
+                    if let onRename {
+                        Button {
+                            onRename(item.id)
+                        } label: {
+                            Label("Rename…", systemImage: "pencil")
+                        }
+                    }
+                    if let onDelete {
+                        if onRename != nil {
+                            Divider()
+                        }
+                        Button(role: .destructive) {
+                            onDelete(item.id)
+                        } label: {
+                            Label("Delete…", systemImage: "trash")
+                        }
+                        .disabled(item.isDeleteDisabled)
+                    }
+                }
+            }
+        }
+        .padding(.vertical, 1)
     }
 }
 

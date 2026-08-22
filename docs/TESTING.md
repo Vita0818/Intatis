@@ -11,7 +11,7 @@
 - Review 检查新增 wrapper/adapter/facade 是否仅为官方 API 必需的最薄接线；发现核心能力复制、第二实现或静默降级即判定失败。
 
 文档状态：当前验证矩阵
-最近核对：2026-08-21
+最近核对：2026-08-22
 产品基线：v0.55（build 55）
 
 历史测试数量、性能数字和事故复验保留在 Git 历史及 dated reports；它们不能替代当前
@@ -499,6 +499,42 @@ recovery App metadata/architecture/signature/entitlements 重新验证；超时�
 
 精确不变量见 `docs/DO_NOT_BREAK.md`。
 
+## macOS 文件夹项目验收矩阵
+
+涉及 `ProjectFolderStore`、macOS 当前模式的可折叠 Projects/Unfiled 侧栏或项目内会话创建时，至少运行：
+
+```sh
+swift test --filter ProjectFolderStoreTests
+swift test --filter ThreadLayoutTests/testMacFolderProjectsRemainAGroupingLayerOverExistingSessions
+jq empty Apps/SharedResources/Localizable.xcstrings
+xcodegen generate
+xcodebuild -quiet -project Intatis.xcodeproj -scheme IntatisMac \
+  -configuration Debug -destination 'platform=macOS' \
+  COMPILER_INDEX_STORE_ENABLE=NO CODE_SIGNING_ALLOWED=NO build
+```
+
+专项必须证明：
+
+- `projects-v1.plist` 是 schema-v1 owner-only binary plist，未知 schema、损坏、relative/control path、
+  unsafe inode、大小/数量超限和冲突 membership 均 fail closed；同 `{kind,path}` 重加幂等，相同 path
+  可按 mode 独立登记，多线程/多实例更新不丢 conversation；序列化结构不得含 `bookmarkData`、消息、
+  工具参数或 artifact；旧 mixed-mode 草稿必须按 kind 确定性拆分；
+- 每个项目固定一个 SessionKind，只能引用同模式 SessionID；跨模式 association 在写入前拒绝。同模式
+  一个 SessionID 最多属于一个项目，重新关联只移动引用，不能移动/复制/改写 session 目录或 EventLog。
+  项目删除后，用户文件夹、session EventLog 和 artifacts 逐字节保持原状；
+- 侧栏只从当前 mode 的 `SessionSummary` 解析项目 conversation；missing/stale reference 不显示为伪会话。
+  文件夹内 `+` 只创建当前模式会话，不得出现跨模式类型菜单；Chat 不取得 workspace，Code/Cowork
+  要求用户重新选择 exact project folder，并只在新 session 的 `workspace-access.plist` 保存 bookmark；
+- Projects 必须是默认收起、可展开的单行文件夹，不得有固定高度或独立项目主页；收起后不保留子会话
+  空间。Projects 与 `Unfiled` 共用 sidebar ScrollView，归档会话不在 Unfiled 重复出现；
+- 普通 Unfiled、新建/恢复/rename/delete 和 folder expansion 不互相改写。删除 project conversation
+  仍使用 exact runtime drain/session delete，随后只清理辅助 membership；删除项目不触发任何 runtime stop；
+- String Catalog 的新增 English/zh-Hans 文案 JSON 合法且格式占位符一致；macOS Light/Dark、窄侧栏、
+  多窗口 selection、folder picker cancel/wrong-folder、项目为空/多会话、移除确认与 VoiceOver 需在真实
+  App 中手动核对，不能由 source-shape test 冒充；
+- 因 `ProjectID`/store 位于 shared `IntatisCore` 且 String Catalog 为双端资源，至少补一次 iOS Debug
+  build，证明 iOS Chat-only target 仍无 Projects UI、workspace bookmark 或本地 Agent 能力。
+
 ## UI 与可访问性回归
 
 当前至少检查：
@@ -770,6 +806,32 @@ INTATIS_REAL_MULTIMODAL_SMOKE=1 swift test \
   线上 provider smoke 必须单独记录，不能从离线测试或编译外推。
 
 ## 最近一次真实结果
+
+### 2026-08-22 macOS 文件夹项目第一版
+
+- 完整 `IntatisCoreTests` 64/64、0 failures，其中 `ProjectFolderStoreTests` 10/10：覆盖 owner-only
+  binary plist、序列化无 bookmark、同模式重复 canonical folder 幂等、相同 path 跨模式独立、
+  跨模式 association 拒绝、旧 mixed-mode 草稿拆分、conversation 跨项目唯一归属、24 路并发追加
+  无丢失、relative/escape 输入拒绝、
+  未知 schema 不被覆盖，以及移除项目后用户文件与 session EventLog bytes 均保持不变；
+- 完整 `ThreadLayoutTests` 30/30、0 failures，其中 folder-project composition 1/1；冻结当前模式过滤、
+  disclosure folder、无固定高度/项目主页/跨模式菜单、共享 ScrollView/Unfiled、三种既有 runtime
+  composition 与“不移动 session 目录”的边界；
+- `jq empty Apps/SharedResources/Localizable.xcstrings` 与 `xcodegen generate` 均退出 0；
+- `swift build --disable-automatic-resolution` 退出 0；
+- `IntatisMac` macOS Debug unsigned build（`ENABLE_DEBUG_DYLIB=NO`、独立
+  `/private/tmp/IntatisDerivedData-folder-project`）退出 0，最终 App 可执行文件存在，Info.plist 读回
+  `0.55 (55)`；最终增量构建只输出 multiple matching macOS destinations warning；
+- `IntatisiOS` generic Simulator Debug unsigned build 退出 0，bundle 读回 `0.55 (55)`；source scan
+  未发现 iOS/SharedUI Projects UI 接线，既有 Chat-only target 边界不变；
+- Computer Use 对最终 macOS Debug bundle 的只读验收确认：Chat folder row 初始 AX value 为
+  `Collapsed` 且只占一行；点击后只新增该文件夹的空会话提示，再次点击完全移除子内容；Projects 与
+  Unfiled 同属一个 sidebar scroll area。切换 Code 后，Chat 项目不再出现，页面只显示 Code 自己的
+  `Projects / No projects yet / Unfiled / New code session`。没有触发 folder picker、创建/删除 session、
+  provider 或 workspace 动作，验收后已关闭临时 App；
+- 尚未运行完整 SwiftPM suite、真实 App 的 folder picker/right-folder/cancel、Light/Dark、
+  多窗口、VoiceOver、Developer ID、notarization 或 Gatekeeper。项目目录没有写入用户文件夹，也未读取
+  真实 provider/auth 配置。
 
 ### 2026-08-21 macOS 对话 chrome 与 Cowork Tasks 收口
 

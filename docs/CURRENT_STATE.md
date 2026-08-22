@@ -1,7 +1,7 @@
 # CURRENT_STATE
 
 文档状态：当前源码摘要
-最近核对：2026-08-21
+最近核对：2026-08-22
 产品基线：v0.55（build 55）
 
 ## 版本与发行状态
@@ -39,6 +39,18 @@
 
 macOS 是完整产品：Chat、Code、Cowork、Settings 和本地诊断导出。
 
+- macOS 现有侧栏增加了第一版文件夹项目：用户选择一个现存本地文件夹后，Intatis 只在
+  app support 的 owner-only binary `projects-v1.plist` 中保存稳定 ProjectID、规范化路径和
+  单一 `SessionKind` 与同模式 SessionID 引用；不会在用户文件夹内创建隐藏数据库，也不会移动或
+  复制 session 目录、EventLog、artifact 或 runtime。Chat、Code、Cowork 各自显示独立项目目录，
+  相同文件夹可在不同模式分别登记，但任何项目和会话都不得跨模式。项目在当前模式侧栏中是默认
+  收起、按需展开的单行文件夹，不再有固定高度 Projects 区域或项目主页；归入项目的会话只显示在
+  对应文件夹，其他会话显示在 `Unfiled`。文件夹内新建只创建当前模式会话，执行语义不变：Chat
+  不获得文件夹能力，Code/Cowork 每次新建时由用户重新确认 exact 项目文件夹，然后仍只把
+  security-scoped bookmark 写入该会话自己的 `workspace-access.plist`。移除项目只删除分组记录，
+  不删除项目文件夹或任何会话；本版尚不提供把既有 Unfiled 会话移入项目、项目级记忆、共享
+  context、设置继承、任务/Goal/Agent 所有权、文件索引或项目文件夹 rename/move 跟踪；文件夹
+  改址后需移除并重新添加项目，既有 session 数据仍保留。
 - Chat 使用无 Intatis Tools 的 `ChatLoop`，支持 OpenAI-compatible streaming、provider/model/
   variant 配置、provider-hosted search wire、citations、会话历史和本地图片附件。macOS Chat 已移除
   composer 中独立的“按提示词生成图片”入口，改为直接复用 Cowork 的 paperclip、系统文件选择器、
@@ -369,6 +381,9 @@ profiles 与外部 MCP client。macOS/Linux 的 stdio、sandbox、bwrap/guard �
   MCP conformance executable 和 15 个 test targets。精确清单以 `Package.swift` 为准。
 - `EventLog` 的 append-only JSONL 是 session canonical truth；`session.json` 是可重建的
   schema-v2 projection，artifact 使用独立 blob/index store。
+- `projects-v1.plist` 只是 macOS 按 `SessionKind` 隔离的跨 session 文件夹分组目录，不是 session、
+  消息或 workspace capability 的事实源；它不保存 bookmark，不能扩大或连通 Chat/Code/Cowork 的
+  既有权限、history 和恢复边界。
 - Chat/Code/Cowork 都从稳定 `TurnID` 和结构化事件投影 UI。App 窗口只持有选择；macOS
   runtime 由进程级 `AppSessionRuntimeManager` 按 exact session key 持有。
 - Code/Cowork 的工具调用必须经过 ToolRegistry、CapabilityLease、WorkspaceLease、
@@ -526,6 +541,19 @@ profiles 与外部 MCP client。macOS/Linux 的 stdio、sandbox、bwrap/guard �
 
 ## 最近验证状态
 
+- 2026-08-22 macOS 文件夹项目第一版：完整 `IntatisCoreTests` 64/64，其中
+  `ProjectFolderStoreTests` 10/10，覆盖 owner-only binary
+  plist、同模式重复文件夹幂等、相同路径跨模式独立、跨模式归属拒绝、旧混合草稿按模式拆分、
+  跨项目唯一会话归属、并发追加不丢失、损坏/未知 schema fail closed，
+  以及移除项目不修改用户文件或 session EventLog；序列化结构明确不含 `bookmarkData`。
+  完整 `ThreadLayoutTests` 30/30（含 folder-project composition 1/1），冻结当前模式过滤、可折叠
+  文件夹、无固定 230pt 区域、无项目主页/跨模式菜单，以及 Chat/Code/Cowork 既有会话入口。
+  String Catalog 通过 `jq empty`；`swift build
+  --disable-automatic-resolution`、`xcodegen generate`、`IntatisMac` Debug unsigned 与
+  `IntatisiOS` generic Simulator Debug unsigned build 均退出 0，两个最终 bundle 均读回
+  `0.55 (55)`。Computer Use 在最终 macOS build 中确认 Chat 项目默认一行收起、展开/再收起只增删
+  子内容、Projects 与 Unfiled 共用滚动面；切到 Code 后 Chat 项目完全缺席且只出现 Code 的新建入口。
+  本轮尚未运行完整 SwiftPM suite、真实文件选择/多窗口视觉交互、完整 VoiceOver 朗读、签名或发行验证。
 - 2026-08-21 固定只读工具默认放行：`DeterministicPolicyGate` 仅把两个既有
   `pass` 结果改为 `allow`，使 `structured_read_only` 集合中的
   `read_docx` / `read_pptx` / `read_xlsx` / `read_html` / `read_epub` /

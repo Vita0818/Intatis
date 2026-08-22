@@ -28,6 +28,7 @@ final class IntatisCoreTests: XCTestCase {
 
     func testIDGenPrefixAndUniqueness() {
         XCTAssertTrue(SessionID.new().rawValue.hasPrefix("sess_"))
+        XCTAssertTrue(ProjectID.new().rawValue.hasPrefix("project_"))
         XCTAssertNotEqual(MessageID.new(), MessageID.new())
     }
 

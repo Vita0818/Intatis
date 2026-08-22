@@ -1,7 +1,7 @@
 # COWORK_PRINCIPLES
 
 文档状态：当前 Cowork/AgentKernel 原则
-最近核对：2026-08-08
+最近核对：2026-08-22
 产品基线：v0.55（build 55）
 
 本文提炼自仓内 v0.10 历史 Cowork 设计文档、`PER_AGENT_INFERENCE_PROFILES.md` 及
@@ -254,6 +254,13 @@ unbounded agent spawning
 ## 5. 工作区与安全规则
 
 Cowork 可以采用项目制：一个 session 绑定一个或多个用户选择的工作目录，并有一个 `@main` 主 agent。用户默认只向 `@main` 下达项目任务；`@main` 通过工具创建、委派、调取、删除子 agent，并管理任务、上下文、未来-agent inference default、权限 profile、token budget 等 project metadata。但 project/session settings 只是本地元数据与 UI 投影；future default 不得重写现有 agent，也不得替代 task contract、exact inference binding、capability lease、workspace lease 或权限门。
+
+macOS 另有一个更外层、更轻的 folder-project 目录，但它也按 SessionKind 隔离：Cowork mode 只显示
+Cowork folder project 和 Cowork SessionID，不能包含、选择或新建 Chat/Code session。它不等于本节
+Cowork project/session settings，也不能拥有或合并 session 的 agent、Goal、WorkTask、Run、EventLog、
+history、lease 或权限。folder project 不保存 bookmark；项目内新建 Cowork 仍必须确认 exact folder，
+并按一个普通 fresh Cowork session 走完整七事件 bootstrap 和 session-owned bookmark。不得用 folder
+membership 绕过本节任何规则。
 
 Session 状态遵循一个事实源、两个不同性质的本地投影：
 
